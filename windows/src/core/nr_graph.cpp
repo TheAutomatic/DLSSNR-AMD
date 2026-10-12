@@ -185,8 +185,10 @@ static bool tchain_pair(const std::string& p, const std::string& q) {
                             ((c512 & 4) && f(p) && g(q)) || ((c512 & 8) && g(p) && q == "attn"))) ||
            ((kinds & 2) && p == "gemmvact" && vp(q)) || ((kinds & 4) && vp(p) && (q == "gemmvqkvnorm" || q == "gemmvqkvnorms")) ||
            ((kinds & 8) && p == "vitattn" && vp(q)) || ((kinds & 16) && vp(p) && q == "gemmvact") ||
-           // the decoder: C=512 -> the UPS-first C=256 run -> C=128 -> C=64 -> the C=32 fused upsample
-           ((kinds & 32) && ((g(p) && up(q)) || (up(p) && (up(q) || q == "fswinfusedup32")))) ||
+           // Keep the barrier from the C=64 persistent decoder to fused C=32.
+           // Windows ACO can corrupt temporal history with counter-only ordering
+           // at this boundary. Earlier decoder dependencies can still overlap.
+           ((kinds & 32) && ((g(p) && up(q)) || (up(p) && up(q)))) ||
            // the encoder: each level's downsample -> the next level's DS-last run
            ((kinds & 64) && ((p == "fswindsp32" && q == "fswinpds64") || (p == "fswinpds64" && q == "fswinpds128") ||
                              (p == "fswinpds128" && q == "fswinpds256"))) ||
