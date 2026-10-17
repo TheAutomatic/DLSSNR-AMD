@@ -33,6 +33,8 @@ graphics cards.
   26.9.2); see [Windows](#windows-experimental-preview). Since 0.0.5-win-preview it has
   [int4 mixed](#int4-mixed-optional), the [RenoDX style](#renodx-style-optional) and
   [NR Control](#nr-control-optiscaler-route) as well.
+- **Also worth a try:** [TheAutomatic/dlss-5-amd-project](https://github.com/TheAutomatic/dlss-5-amd-project)
+  (OptScaler(NR)), an OptiScaler-based project with several NR backends.
 
 This is an independent project. It is not affiliated with, endorsed by or supported by NVIDIA or
 AMD. DLSS is a trademark of NVIDIA Corporation.
