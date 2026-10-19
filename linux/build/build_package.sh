@@ -243,9 +243,8 @@ if [[ "$arch" == x86_64 || "$arch" == i686 ]]; then
     cp -r -- "$out/int4/parts/data" "$i4/dlssnr-amd/int4"
     cp -- "$out/int4/parts/dlssnr-int4-weights" "$i4/"
     cp -- "linux/data/int4/$NR_GPU_ARCH/dlssnr-int4.sha256" "$i4/dlssnr-int4.bin.sha256"
-    python3 linux/package/make_ini.py linux/src/pe/nr_pe_config.cpp "$i4/ini" --int4 > /dev/null
 fi
-cp -- linux/package/install.sh linux/package/README.txt "$pkg/"
+cp -- linux/package/install.sh linux/package/README.txt linux/package/lumenite.py "$pkg/"
 chmod +x "$pkg/install.sh" "$mt/extract_model.sh"
 
 # ---- archive ------------------------------------------------------------------

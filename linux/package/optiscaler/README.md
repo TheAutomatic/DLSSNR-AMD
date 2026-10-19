@@ -36,8 +36,8 @@ list with `GetModuleHandleW` (never `LoadLibrary`) and routes through its export
 | **`dlssnr_core.dll`** | **the NGX core, and feature 18** (built as `_nvngx.dll`, shipped renamed; below) | `linux/build/build_optiscaler_nr.sh` |
 | **`nvngx.dll_dlssnr.dll`** | **the forwarder, for the older lineage** | same |
 | **`nvngx_dlssnr.dll`** | **a byte copy of the forwarder** | same |
-| `dlssnr-amd/` | the model, the network's SPIR-V, the pipeline cache (and with int4 mixed its network and Vulkan layer) | `linux/build/build_package.sh`'s package |
-| `dlssnr-amd.ini` | our own settings: `[Preprocess]`, and `[Int4Mixed]` with int4 mixed | written at install |
+| `dlssnr-amd/` | the models, the network's SPIR-V, the pipeline cache, int4 mixed's network and Vulkan layer, NR Control's Vulkan layer | `linux/build/build_package.sh`'s package |
+| `dlssnr-amd.ini` | our own settings: `[Network]`, `[Preprocess]`, `[RenoDX]`, `[Log]` | written at install |
 
 The package's `install.sh <game-dir> optiscaler` does all of it. (`install_optiscaler_nr.sh` in this
 directory predates the package layout - it expects `artifacts/optiscaler/nr` and a `build/` +

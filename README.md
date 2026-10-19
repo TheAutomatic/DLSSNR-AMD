@@ -8,7 +8,9 @@ graphics cards.
   Version 310.9.16 holds two models: the 310.9.16 new model, its default and faster, and the 310.8.0 old
   model, so from 310.9.16 alone the installer installs both. Since 0.0.6-linux-preview (Linux) and
   0.0.6-win-preview-alpha (Windows) the 310.9.16 new model runs by default; the 310.8.0 old model stays selectable
-  (see [The model](#the-model)).
+  (see [The model](#the-model)). On Linux since 0.0.7 the networks carry the names in NVIDIA's DLL -
+  `CC_SMALL_FP8` (the 310.9.16 new model), `CC_SILVER_AARDWOLD` (the 310.8.0 old model) and
+  `CC_SILVER_AARDWOLD_INT4_MIXED` ([int4 mixed](#int4-mixed-optional)) - and all three can be switched in game.
 - The Linux build with the 310.9.16 new model, on an RX 9070 XT, checked against NVIDIA's own `nvngx_dlssnr.dll`
   310.9.16 run on an RTX 5090 through NGX, the same way as below. Single frames: PSNR 49.15 dB at 1080p,
   49.40 dB at 1440p and 50.59 dB at 4K, SSIM 0.997. Moving sequences: PSNR 50.6-52.3 dB at 1080p,
@@ -138,8 +140,11 @@ on Windows. Any route can also use the [RenoDX style](#renodx-style-optional).
 
 On the OptiScaler route, End opens NR Control, this project's own NR menu. On Linux it is a Vulkan layer
 in the game folder (the installer's launch options name it); on Windows the NR DLL draws it over the
-game's DirectX 11 or 12 swap chain, with nothing to set up. It always has the int4 mixed and Preprocess
-switches.
+game's DirectX 11 or 12 swap chain, with nothing to set up. On Linux it has the network selection,
+Preprocess, the `[Network]` settings (how inactive networks are kept in memory, an on-screen display of the
+running network, and the options described in [linux/package/README.txt](linux/package/README.txt)) and an
+Engine data panel that shows what the network actually gets from the game (colour format and encoding,
+exposure, motion vectors), for troubleshooting; on Windows it has the int4 mixed and Preprocess switches.
 Where the other NR settings are:
 
 - RenoDX style on: also in NR Control - Intensity, Style, Local tone, Local structure, Skin structure,
@@ -208,25 +213,22 @@ The file itself explains every setting.
 
 A second network, faster than the default one (see Performance): part of its computation runs in int4,
 a lower precision than the original network uses, so its picture differs somewhat from the default
-network's. It exists for the 310.8.0 old model only. Both Linux packages and the Windows package have it; it
-is chosen at install (after choosing the 310.8.0 old model).
+network's. It exists for the 310.8.0 old model only. Both Linux packages and the Windows package have it. On
+Linux since 0.0.7 it is always installed as the network `CC_SILVER_AARDWOLD_INT4_MIXED`; on Windows it is chosen
+at install (after choosing the 310.8.0 old model).
 
 On Windows it is choice 3 of the installer's network question (`-Network aco-int4-mixed`) and runs with
 [ACO Mode](#windows-experimental-preview) only: the AMD driver's own compiler makes slow code for the
 int4 kernels, so this version does not offer int4 mixed without ACO Mode. The rest of this section is
-about Linux; the switching, the weights and their check work the same way on Windows.
+about Linux; the weights and their check work the same way on Windows.
 
-- With the 310.8.0 old model the installer asks once (Enter = no), or pass `--int4` or `--no-int4` (`--int4`
-  implies `--old-model`).
-- With it, the Steam launch options the installer prints have `VK_ADD_LAYER_PATH` and
-  `VK_INSTANCE_LAYERS` (a Vulkan layer in the game folder that int4 mixed needs; on the OptiScaler route
-  they name NR Control's layer too). Copy the whole line.
-- Once installed it is on. In game, Ctrl+F11 (or NR Control on the OptiScaler route) switches between
-  int4 mixed and the default network, to compare them on the same picture; a switch builds the other network in the background, which takes a
-  few seconds (`KeepBoth = 1` keeps both networks in video memory and makes switching instant). The
-  settings are in `[Int4Mixed]` in `dlssnr-amd.ini`.
-- With int4 mixed, NR takes much longer to take effect when a game starts. Until then the picture goes
-  without NR; this does not mean int4 mixed is not working.
+- It is one of the three networks: choose it as the one a game starts with at install (`--model
+  CC_SILVER_AARDWOLD_INT4_MIXED`, or `--int4` as before), or switch to it in game (the drop-down in NR
+  Control or on the Add-ons page, or Ctrl+F11 to cycle the networks).
+- It needs a Vulkan layer in the game folder: besides the main Steam launch options the installer always
+  prints a second line with `VK_ADD_LAYER_PATH` and `VK_INSTANCE_LAYERS` for it; use that line to use it, and
+  copy the whole line.
+- The first time it is used its network takes longer to build; until then the picture goes without NR.
 - Its weights are made during installation from your model and the tables in the package, and checked
   against a known SHA-256. The tables (`linux/data/int4/`) come from this project's own calibration on
   1,112 game frames and darkened copies of some of them. int4 mixed is the network these tables define;
@@ -257,10 +259,12 @@ the releases, unpack it and run:
 bash install.sh "/path/to/steamapps/common/<game folder>" --dll /path/to/nvngx_dlssnr_2026_10_16.zip
 ```
 
-The folder is the one holding the game's exe. The installer lists the routes, asks whether to use the
-310.9.16 new model (Enter = yes; with the 310.8.0 old model it then asks whether to add
-[int4 mixed](#int4-mixed-optional)) and whether to turn on the [RenoDX style](#renodx-style-optional),
-extracts the model (below) and prints the Steam launch options to use. `--dll` is needed only for the first install:
+The folder is the one holding the game's exe. The installer lists the routes, asks which network a game
+starts with (Enter = `CC_SMALL_FP8`, the 310.9.16 new model; all three are installed and can be switched
+in game), whether to turn on the [RenoDX style](#renodx-style-optional) and, on the ReShade routes,
+whether to use [LumeniteFX](https://github.com/umar-afzaal/LumeniteFX) Kernel (by Afzaal) for the motion
+vectors instead of VORT (downloaded from its author's GitHub and installed unchanged; it is not part of this
+project), extracts the model (below) and prints the Steam launch options to use. `--dll` is needed only for the first install:
 the extracted model is kept and reused for every later one. Needs `bash` and `python3`. See
 [linux/package/README.txt](linux/package/README.txt).
 
@@ -298,11 +302,14 @@ model, so with it both models are extracted and installed; 310.8.0 gives the 310
 - The extracted models are kept in the package's own `dlssnr-amd/`. Later installs from that package
   without `--dll` (`-Dll` on Windows) check their SHA256 and install them from there, so the extraction runs only once per
   package. With a new package, use `--dll` once more or copy those files over.
-- Every model the package has is installed. Which one runs is `[Network] Model` in `dlssnr-amd.ini`
-  (`small` = the 310.9.16 new model, `original` = the 310.8.0 old model), set at install
-  (`--new-model` / `--old-model`, on Windows `-Model new` / `old`, or the installer's question) and changeable afterwards; it takes effect
-  after a game restart. If the 310.9.16 new model is chosen but not there (a 310.8.0 DLL), the 310.8.0 old
-  model runs and the log says why.
+- Every model the package has is installed. Which one runs is `[Network] Model` in `dlssnr-amd.ini`.
+  On Linux: `CC_SMALL_FP8` (the 310.9.16 new model), `CC_SILVER_AARDWOLD` (the 310.8.0 old model) or
+  `CC_SILVER_AARDWOLD_INT4_MIXED`, set at install (`--model`, or the installer's question) and switchable in
+  game; a network without its model (`CC_SMALL_FP8` from a 310.8.0 DLL) is greyed out in the menus with
+  the reason. On Windows: `small` = the 310.9.16 new model, `original` = the 310.8.0 old model, set at install
+  (`-Model new` / `old`, or the installer's question) and changeable afterwards; it takes effect after a game
+  restart. If the 310.9.16 new model is chosen but not there (a 310.8.0 DLL), the 310.8.0 old model runs and
+  the log says why.
 
 Two ways to run it:
 

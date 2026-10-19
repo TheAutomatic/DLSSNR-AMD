@@ -1,7 +1,6 @@
 #include "nr_pe_session.hpp"
-#if NR_INT4
-#include "nr_pe_config.hpp"   // Int4Switch
-#endif
+#include "nr_ini_network.hpp"
+#include "nr_pe_config.hpp"   // NetworkSwitch
 #include "nr_pe_log.hpp"
 #include "nr_log.hpp"
 #include "nr_screenshot.hpp"
@@ -9,9 +8,13 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <map>
+#include <set>
+#include <stdexcept>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <new>
 #include <string>
@@ -95,17 +98,129 @@ struct Session::Impl {
         uint32_t passes{4};
         bool prep{};   // RuntimeConfig::preprocess
         bool native{}; // RuntimeConfig::native_compose
-#if NR_INT4
-        int int4{};    // RuntimeConfig::int4_mixed asked for (0 default, 1 int4 mixed)
-#endif
+        int net{};     // the network it runs (nr::NetworkChoice)
         uint64_t used{};   // LRU stamp
         std::chrono::steady_clock::time_point last{};   // when it was last selected
+        bool light{};      // built inside a recording (inframe): its images in its network memory's heap
     };
     // A cached network taken up again after serving nothing for this long starts its features fresh (as after a
     // Reset), so no frame is blended with a history that old; RenoDX's own look history uses the same bound.
     static constexpr std::chrono::milliseconds kStaleHistory{250};
     std::vector<Built> cache;
     uint64_t use_stamp{};
+    // Networks of one [Int4Mixed] kind kept at once (see the adoption in ensure_runtime_), and runtimes: those built
+    // from another's network (Runtime::share_for, an extent with the same working extent) hold their own images only.
+    static constexpr size_t kMaxResident = 2;
+    static constexpr size_t kMaxEntries = 4;
+    // 0.5 s: OptiScaler's two extents (NR before and after the upscaler) are both used every frame; a game's dynamic
+    // resolution leaves sizes behind several times a second (2 s kept 13 networks, 7.2 GB).
+    static constexpr std::chrono::milliseconds kIdleDrop{500};
+    static constexpr std::chrono::seconds kNetIdle{5};
+    // A whole build (another working extent) starts only for an extent asked for kSettle times, at most kSettleGap
+    // evaluations apart: a size that moves on every frame (a game's dynamic resolution) asked for one build per frame,
+    // never ready before the size had moved again (608 builds in 200 s, a CPU core busy). Counted in evaluations,
+    // not time: a game at 5 fps is as entitled to its network as one at 200.
+    // ---- the resize path inside the frame --------------------------------------------------------------------
+    // Plans (Runtime::plan): one per working extent and configuration, lowered at the tallest frame height of that
+    // working extent so it runs every height of it. With one in the cache and a resident network whose memory holds
+    // it, a frame at a new size gets its runtime inside the recording (RuntimeConfig::deferred, ~1 ms) and runs the
+    // same frame, as NVIDIA's DLL evaluates one feature at any size. A plan is built in the background (~0.15 s) the
+    // first time its working extent is asked for.
+    struct PlanEntry {
+        VkFormat format{}; bool linear{}; float scale{}; uint32_t passes{}; bool prep{}, native{}; int net{};
+        uint32_t ww{}, wh{}, sh{};   // working extent, tallest frame height
+        std::shared_ptr<const RuntimeCore> core;
+        uint64_t used{};
+    };
+    std::vector<PlanEntry> plans;
+    static constexpr size_t kMaxPlans = 48;
+    bool build_plan{};   // the background build is a plan (RuntimeConfig::plan_only)
+    uint64_t inframe_built{}, plans_built{};
+    double inframe_ms_max{};
+    bool same_config_but_format(const Built& e, bool want_linear) const { return same_config(e, e.format, want_linear); }
+    bool same_config(const Built& e, VkFormat f, bool want_linear) const {
+        if (e.format != f || e.linear != want_linear || e.scale != model_scale || e.passes != max_passes_want ||
+            e.prep != prep_want || e.native != (native_compose || renodx_native))
+            return false;
+        return e.net == net_want;
+    }
+    // The network a runtime runs (nr::NetworkChoice).
+    static int net_of(const Runtime& r) {
+#if NR_INT4
+        if (r.int4_mixed()) return nr::kSilverAardwoldInt4;
+#endif
+        return r.network() == NetworkModel::Small ? nr::kSmallFp8 : nr::kSilverAardwold;
+    }
+    RuntimeConfig make_config(uint32_t w, uint32_t h, VkFormat f, bool want_linear) const;
+    HostDevice make_host() const;
+    TemporalConfig make_temporal() const {
+        TemporalConfig temporal; temporal.enable = true;
+        temporal.history_strength = history_strength;
+        return temporal;
+    }
+    const PlanEntry* plan_for(uint32_t w, uint32_t h, VkFormat f, bool want_linear, NetworkModel model);
+    // `tried`: the network it would have run on, when building inside the frame failed (a pipeline not made yet):
+    // the background build then makes that runtime.
+    bool inframe(uint32_t w, uint32_t h, VkFormat f, bool want_linear, std::shared_ptr<const RuntimeCore>* tried);
+    bool start_plan(uint32_t w, uint32_t h, VkFormat f, bool want_linear);
+    // While a game's dynamic resolution moves the frame size (a resize in the last kDrsActive): the plans of the
+    // working extents nearest the latest size, one at a time in the background, so a sweep finds them made.
+    static constexpr std::chrono::seconds kDrsActive{2};
+    std::chrono::steady_clock::time_point last_resize{};
+    uint32_t last_w{}, last_h{};
+    VkFormat last_format{VK_FORMAT_UNDEFINED};
+    bool last_linear{};
+    std::pair<uint32_t, uint32_t> prefetched_around{};   // the size whose neighbourhood is all planned
+    bool drs_active() const {
+        return last_resize != std::chrono::steady_clock::time_point{} &&
+               std::chrono::steady_clock::now() - last_resize < kDrsActive;
+    }
+    void prefetch();
+    // A whole network while the size moves gets this much room by area (1.25 linear): the plans of a sweep up to that
+    // run in it instead of each asking for a bigger network.
+    static constexpr double kDrsCapacity = 1.5625;
+    // The game's guides' allocation (pixels), when the frame has them: a game with dynamic resolution allocates them
+    // once at its biggest render size and renders into a corner. A whole network built while the size moves gets
+    // room for that (else kDrsCapacity), so one network and one image heap cover the whole range.
+    uint64_t size_hint_px{};
+    // [Network] Resize History (dlssnr-amd.ini): 0 (the default) a feature at a new size starts its history afresh, as
+    // NVIDIA's DLL; 1 its history is carried over, scaled to the new size (Runtime::carry_history). Re-read at most once
+    // a second, on a resize.
+    bool resize_history{};
+    std::chrono::steady_clock::time_point resize_history_read{};
+    // The runtime each feature ran on last, and the one before it (the size before a resize).
+    std::map<uint64_t, Runtime*> feature_runtime, feature_prev_runtime;
+    uint64_t carried{};
+    // The last RenoDX-style frame's decisions (renodx::Stage::facts), for the menus' engine-data panel.
+    renodx::Stage::Facts renodx_facts{};
+    bool renodx_facts_known{};
+    bool carry(VkCommandBuffer cmd, uint64_t feature);
+    // The feature being evaluated, and the network memory each feature last ran in: a new frame size of a feature
+    // takes its memory again when it fits (OptiScaler's NR before and after the upscaler keep one each, and one
+    // stream does not move between memories).
+    uint64_t current_feature{};
+    std::map<uint64_t, const void*> feature_slot;
+    // The image heap being made in the background for a network memory (Runtime::image_heap_wanted).
+    std::thread heap_thread;
+    std::mutex heap_lock;
+    bool heap_busy{}, heap_done{};
+    const void* heap_for{};
+    std::shared_ptr<ImageHeapRef> heap_made;
+    void heap_poll();
+    // Runtimes built inside frames with images of their own (no heap yet) kept at most this many.
+    static constexpr size_t kOwnImages = 2;
+    bool inframe_waiting{};
+    static constexpr uint32_t kSettle = 3;
+    static constexpr uint64_t kSettleGap = 8;
+    std::map<std::pair<uint32_t, uint32_t>, std::pair<uint32_t, uint64_t>> asked;   // extent -> count, last call
+    bool settled(uint32_t w, uint32_t h) {
+        for (auto it = asked.begin(); it != asked.end();)
+            it = calls - it->second.second > kSettleGap ? asked.erase(it) : std::next(it);
+        auto& e = asked[{w, h}];
+        e.first += 1; e.second = calls;
+        return e.first >= kSettle;
+    }
+    void trim_cache(const Built* adopting = nullptr);
     // Evicted networks wait here before they are destroyed. run_after and run_present record the network into
     // the game's own command list (vkd3d-proton's command buffer), which the game submits and the GPU runs frames
     // later: a network that served the previous frame can still be read by the GPU when its replacement is
@@ -114,9 +229,60 @@ struct Session::Impl {
     struct Retired { std::unique_ptr<Runtime> runtime; uint64_t call; std::chrono::steady_clock::time_point at; };
     std::vector<Retired> retired;
     uint64_t calls{};   // ensure_runtime calls (one per evaluation)
+    // Evaluations that ran the network and that passed the frame through (building, freeing, failed): in the log
+    // every kPassLog while any pass through, and for the whole session at its end.
+    uint64_t ran{}, passed{}, ran_total{}, passed_total{};
+    std::chrono::steady_clock::time_point pass_logged{};
+    static constexpr std::chrono::seconds kPassLog{10};
     static constexpr uint64_t kRetireCalls = 16;
     static constexpr std::chrono::seconds kRetireTime{1};
     void free_retired();
+    // ---- [Network] Residency: the networks not running ------------------------------------------------------------
+    // A network of another kind than the running one (and, with no evaluation for kNrOff, the running one too: NR off)
+    // is inactive. resident keeps them; offload moves their weights to RAM and minimal frees them; auto keeps them
+    // while the device-local heap has room:
+    // free = min(budget, heap) - usage under max(1 GiB, 10 % of the heap) frees the least recently used one (one a
+    // check; the budget lags a free, so kFreedQuiet after one); at a switch the left network stays only with 1.5x that
+    // free; above 70 % of the budget an inactive one stays at most 60 s, down to 1 s at 100 %. The running network is
+    // never freed while NR runs.
+    static constexpr std::chrono::seconds kNrOff{10};
+    static constexpr std::chrono::milliseconds kResidencyCheck{500};
+    static constexpr std::chrono::seconds kFreedQuiet{1};
+    std::chrono::steady_clock::time_point last_call{}, residency_checked{}, residency_freed{};
+    struct Vram { uint64_t heap{}, budget{}, usage{}; };
+    bool vram(Vram& v) const;   // the largest device-local heap
+    void residency(bool switched, bool nr_off);
+    // The activation arena a whole build of network `net` may take (Runtime::act_arena): one of a network of another
+    // kind - the feature's last one first, else the biggest - never one a network of `net` runs in (two networks of
+    // one kind can run in one frame: OptiScaler's NR before and after the upscaler). A new arena gets kActSlack room
+    // so the other kinds fit it (CC_SMALL_FP8 needs 4.6 % more than CC_SILVER_AARDWOLD at 1080p).
+    static constexpr double kActSlack = 1.06;
+    std::shared_ptr<ActArenaRef> act_for(int net) const;
+    // A network kept as its memory alone (auto): its weights, its share of an activation arena and its pipelines, held
+    // by a core (Runtime::share_for); its runtimes and images are freed. Asked for again, a runtime is built from it in
+    // the background (RuntimeConfig::share, ~10 ms) instead of a whole build.
+    struct Parked {
+        std::shared_ptr<const RuntimeCore> core;
+        VkFormat format{}; bool linear{}; float scale{}; uint32_t passes{}; bool prep{}, native{}; int net{};
+        uint32_t width{}, height{};
+        std::chrono::steady_clock::time_point last{};
+    };
+    std::vector<Parked> parked;
+    // Park entry `index`'s network (once per network) and drop every runtime of it.
+    void park(size_t index, const char* why);
+    // A parked network's weights moved to RAM (offload_network) on a thread of its own, one at a time, once no runtime
+    // of it is left (retired ones included: their frames may be in flight). Polled by residency().
+    std::thread offload_thread;
+    std::atomic<bool> offload_done{false};
+    bool offload_ok{};
+    std::shared_ptr<const RuntimeCore> offloading;
+    std::vector<uint8_t> offload_weights;   // the read-back, released into the network by poll_offload
+    // The parked network a background build makes a runtime from (a failed build drops it: its memory may be half back).
+    std::shared_ptr<const RuntimeCore> build_share;
+    bool start_offload(Parked& p);
+    void poll_offload();
+    // RAM below max(2 GiB, 10 %) available: offloaded networks are freed, the oldest first.
+    static bool ram_short();
     // The RenoDX-style option: one stage per feature, made at the frame's extent, format and HDR judgement.
     // A replaced or released one is kept for kRetireCalls more evaluations and kRetireTime, as networks are.
     struct RenoDXEntry {
@@ -302,9 +468,12 @@ struct Session::Impl {
     }
     // Once a frame: a recorded capture the GPU has run goes to the worker; one the worker has read is freed.
     void shot_poll() {
+        // Freed: one the worker has read, and an abandoned one (never handed) whose copies the GPU has since run.
         for (auto it = shots_out.begin(); it != shots_out.end();)
-            if ((*it)->handed && (*it)->read.load(std::memory_order_acquire)) { shot_free(**it); it = shots_out.erase(it); }
-            else ++it;
+            if ((*it)->handed ? (*it)->read.load(std::memory_order_acquire)
+                              : vkGetEventStatus(handles.device, (*it)->done) == VK_EVENT_SET) {
+                shot_free(**it); it = shots_out.erase(it);
+            } else ++it;
         if (!shot) return;
         if (vkGetEventStatus(handles.device, shot->done) == VK_EVENT_SET) {
             Shot* sh = shot.get();
@@ -319,6 +488,216 @@ struct Session::Impl {
                                 "(buffers kept)");
             shots_out.push_back(std::move(shot));
         }
+    }
+    // NR_DIAG_EXPOSURE=1, a diagnostic (off by default): on the RenoDX-style option, texel (0,0) of the game's exposure
+    // texture and 64 points (an 8 x 8 grid) of the frame before NR, the network's input and output (pass 1) and the
+    // frame after NR, copied into a host-visible slot in the frame's own command buffer, with DLSS.Pre.Exposure,
+    // DLSS.Exposure.Scale and the style. Logged once its event is set: every 30th frame, and every frame for 240 frames
+    // after the style or the intensity changed. A slot whose commands never ran stays allocated.
+    struct DiagSlot {
+        VkBuffer buffer{};
+        VkDeviceMemory memory{};
+        void* mapped{};
+        VkEvent done{};
+        bool pending{};
+        uint64_t frame{};
+        uint32_t style{};
+        float intensity{}, pre{}, scale{};
+        bool reset{};
+        VkFormat format[5]{};
+        bool have[5]{};
+    };
+    static constexpr uint32_t kDiagSlots = 16, kDiagPoints = 64, kDiagStride = 16;
+    std::vector<DiagSlot> diag;
+    DiagSlot* diag_slot = nullptr;   // this frame's, while it is being recorded
+    uint64_t diag_frame = 0, diag_burst_until = 0;
+    uint32_t diag_style = ~0u;
+    float diag_intensity = -1.0f;
+    static bool diag_on() {
+        static const bool on = [] { const char* e = std::getenv("NR_DIAG_EXPOSURE"); return e && e[0] == '1'; }();
+        return on;
+    }
+    static uint32_t diag_bytes(VkFormat f) {
+        switch (f) {
+            case VK_FORMAT_R16_SFLOAT: return 2;
+            case VK_FORMAT_R16G16_SFLOAT: case VK_FORMAT_R32_SFLOAT: case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
+            case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32: case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+            case VK_FORMAT_A2R10G10B10_UNORM_PACK32: case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_B8G8R8A8_UNORM:
+            case VK_FORMAT_R8G8B8A8_SRGB: case VK_FORMAT_B8G8R8A8_SRGB: return 4;
+            case VK_FORMAT_R16G16B16A16_SFLOAT: case VK_FORMAT_R32G32_SFLOAT: return 8;
+            case VK_FORMAT_R32G32B32A32_SFLOAT: return 16;
+            default: return 0;
+        }
+    }
+    // One texel as linear-looking RGB (8-bit and 10-bit formats: their codes over the maximum, not decoded).
+    static bool diag_texel(VkFormat f, const uint8_t* p, float rgb[3]) {
+        auto half = [](uint16_t h) {
+            const uint32_t e = (h >> 10) & 31u, m = h & 1023u;
+            const float v = e == 0 ? std::ldexp(float(m), -24) : e == 31 ? 65504.f : std::ldexp(float(m | 1024u), int(e) - 25);
+            return (h & 0x8000u) ? -v : v;
+        };
+        auto ufloat = [](uint32_t bits, int mbits) {   // no sign, 5-bit exponent
+            const uint32_t e = bits >> mbits, m = bits & ((1u << mbits) - 1u);
+            return e == 0 ? std::ldexp(float(m), -14 - mbits) : std::ldexp(float(m | (1u << mbits)), int(e) - 15 - mbits);
+        };
+        uint32_t w = 0;
+        std::memcpy(&w, p, 4);
+        float a[4]{};
+        switch (f) {
+            case VK_FORMAT_R16_SFLOAT: { uint16_t h; std::memcpy(&h, p, 2); rgb[0] = rgb[1] = rgb[2] = half(h); return true; }
+            case VK_FORMAT_R16G16_SFLOAT: case VK_FORMAT_R16G16B16A16_SFLOAT: {
+                uint16_t h[4]{};
+                std::memcpy(h, p, f == VK_FORMAT_R16G16_SFLOAT ? 4 : 8);
+                if (f == VK_FORMAT_R16G16_SFLOAT) { rgb[0] = rgb[1] = rgb[2] = half(h[0]); return true; }
+                for (int i = 0; i < 3; ++i) rgb[i] = half(h[i]);
+                return true;
+            }
+            case VK_FORMAT_R32_SFLOAT: case VK_FORMAT_R32G32_SFLOAT: std::memcpy(a, p, 4); rgb[0] = rgb[1] = rgb[2] = a[0]; return true;
+            case VK_FORMAT_R32G32B32A32_SFLOAT: std::memcpy(a, p, 12); for (int i = 0; i < 3; ++i) rgb[i] = a[i]; return true;
+            case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
+                rgb[0] = ufloat(w & 2047u, 6); rgb[1] = ufloat((w >> 11) & 2047u, 6); rgb[2] = ufloat(w >> 22, 5);
+                return true;
+            case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32: {
+                const float s = std::ldexp(1.0f, int(w >> 27) - 15 - 9);
+                rgb[0] = float(w & 511u) * s; rgb[1] = float((w >> 9) & 511u) * s; rgb[2] = float((w >> 18) & 511u) * s;
+                return true;
+            }
+            case VK_FORMAT_A2B10G10R10_UNORM_PACK32: case VK_FORMAT_A2R10G10B10_UNORM_PACK32: {
+                const bool bgr = f == VK_FORMAT_A2R10G10B10_UNORM_PACK32;
+                const float v[3] = {float(w & 1023u) / 1023.f, float((w >> 10) & 1023u) / 1023.f, float((w >> 20) & 1023u) / 1023.f};
+                for (int i = 0; i < 3; ++i) rgb[i] = v[bgr ? 2 - i : i];
+                return true;
+            }
+            case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB: case VK_FORMAT_B8G8R8A8_SRGB: {
+                const bool bgra = f == VK_FORMAT_B8G8R8A8_UNORM || f == VK_FORMAT_B8G8R8A8_SRGB;
+                for (int i = 0; i < 3; ++i) rgb[i] = p[bgra ? 2 - i : i] / 255.f;
+                return true;
+            }
+            default: return false;
+        }
+    }
+    bool diag_make(DiagSlot& d) {
+        VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bi.size = kDiagStride * (1 + 4 * kDiagPoints); bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        if (vkCreateBuffer(handles.device, &bi, nullptr, &d.buffer) != VK_SUCCESS) return false;
+        VkMemoryRequirements req{};
+        vkGetBufferMemoryRequirements(handles.device, d.buffer, &req);
+        VkPhysicalDeviceMemoryProperties mem{};
+        vkGetPhysicalDeviceMemoryProperties(handles.physical, &mem);
+        const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        uint32_t type = ~0u;
+        for (uint32_t i = 0; i < mem.memoryTypeCount && type == ~0u; ++i)
+            if ((req.memoryTypeBits & (1u << i)) && (mem.memoryTypes[i].propertyFlags & want) == want) type = i;
+        if (type == ~0u) return false;
+        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        ai.allocationSize = req.size; ai.memoryTypeIndex = type;
+        VkEventCreateInfo ei{VK_STRUCTURE_TYPE_EVENT_CREATE_INFO};
+        return vkAllocateMemory(handles.device, &ai, nullptr, &d.memory) == VK_SUCCESS &&
+               vkBindBufferMemory(handles.device, d.buffer, d.memory, 0) == VK_SUCCESS &&
+               vkMapMemory(handles.device, d.memory, 0, VK_WHOLE_SIZE, 0, &d.mapped) == VK_SUCCESS &&
+               vkCreateEvent(handles.device, &ei, nullptr, &d.done) == VK_SUCCESS;
+    }
+    void diag_free(DiagSlot& d) {
+        if (d.mapped) vkUnmapMemory(handles.device, d.memory);
+        if (d.buffer) vkDestroyBuffer(handles.device, d.buffer, nullptr);
+        if (d.memory) vkFreeMemory(handles.device, d.memory, nullptr);
+        if (d.done) vkDestroyEvent(handles.device, d.done, nullptr);
+        d = DiagSlot{};
+    }
+    // The slots the GPU has filled into the log; then this frame's slot, when this frame is one to log.
+    void diag_begin(const renodx::Settings& rs, const Session::RenoDXFrame& rf, bool reset) {
+        diag_slot = nullptr;
+        if (!diag_on()) return;
+        for (DiagSlot& d : diag) {
+            if (!d.pending || vkGetEventStatus(handles.device, d.done) != VK_EVENT_SET) continue;
+            float mean[5]{};
+            const uint32_t count[5] = {1, kDiagPoints, kDiagPoints, kDiagPoints, kDiagPoints};
+            for (int k = 0; k < 5; ++k) {
+                if (!d.have[k]) continue;
+                const auto* base = static_cast<const uint8_t*>(d.mapped) + kDiagStride * (k == 0 ? 0 : 1 + (k - 1) * kDiagPoints);
+                double sum = 0;
+                for (uint32_t n = 0; n < count[k]; ++n) {
+                    float c[3]{};
+                    if (!diag_texel(d.format[k], base + kDiagStride * n, c)) { d.have[k] = false; break; }
+                    sum += k == 0 ? c[0] : 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+                }
+                mean[k] = float(sum / count[k]);
+            }
+            char v[5][24];
+            for (int k = 0; k < 5; ++k) {
+                if (d.have[k]) std::snprintf(v[k], sizeof v[k], "%.5g", double(mean[k]));
+                else std::snprintf(v[k], sizeof v[k], "-");
+            }
+            log("[nr] diag frame %llu: style %u intensity %.2f%s | pre-exposure %.5g exposure scale %.4g exposure texel %s "
+                "(format %d) | mean luminance: frame in %s, network in %s, network out %s, frame out %s (formats %d %d %d %d)",
+                static_cast<unsigned long long>(d.frame), d.style, double(d.intensity), d.reset ? " reset" : "",
+                double(d.pre), double(d.scale), v[0], int(d.format[0]), v[1], v[2], v[3], v[4], int(d.format[1]),
+                int(d.format[2]), int(d.format[3]), int(d.format[4]));
+            vkResetEvent(handles.device, d.done);
+            d.pending = false;
+        }
+        ++diag_frame;
+        if (rs.style != diag_style || rs.intensity != diag_intensity) {
+            if (diag_style != ~0u)
+                log("[nr] diag frame %llu: style %u -> %u, intensity %.2f -> %.2f",
+                    static_cast<unsigned long long>(diag_frame), diag_style, rs.style, double(diag_intensity),
+                    double(rs.intensity));
+            diag_style = rs.style;
+            diag_intensity = rs.intensity;
+            diag_burst_until = diag_frame + 240;
+        }
+        if (diag_frame % 30 != 0 && diag_frame > diag_burst_until) return;
+        if (diag.empty()) diag.resize(kDiagSlots);
+        for (DiagSlot& d : diag) {
+            if (d.pending) continue;
+            if (!d.buffer && !diag_make(d)) { diag_free(d); continue; }
+            d.frame = diag_frame; d.style = rs.style; d.intensity = rs.intensity;
+            d.pre = rf.pre_exposure; d.scale = rf.exposure_scale; d.reset = reset;
+            for (bool& h : d.have) h = false;
+            diag_slot = &d;
+            return;
+        }
+    }
+    // `image` (in `layout`, last used by `stage` / `access`): texel (0,0) (k 0) or the 8 x 8 grid (k 1..4) into this
+    // frame's slot, and back to `layout`.
+    void diag_copy(VkCommandBuffer cmd, int k, VkImage image, VkFormat format, uint32_t w, uint32_t h, VkImageUsageFlags usage,
+                   VkImageLayout layout, VkPipelineStageFlags stage, VkAccessFlags access) {
+        if (!diag_slot || !image || !w || !h || !diag_bytes(format) || (usage && !(usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)))
+            return;
+        VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.image = image;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.oldLayout = layout; b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        b.srcAccessMask = access; b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, stage, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+        VkBufferImageCopy regions[kDiagPoints]{};
+        const uint32_t n = k == 0 ? 1 : kDiagPoints;
+        for (uint32_t i = 0; i < n; ++i) {
+            VkBufferImageCopy& r = regions[i];
+            r.bufferOffset = kDiagStride * (k == 0 ? 0 : 1 + (k - 1) * kDiagPoints + i);
+            r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            if (k) r.imageOffset = {int32_t((2 * (i % 8) + 1) * w / 16), int32_t((2 * (i / 8) + 1) * h / 16), 0};
+            r.imageExtent = {1, 1, 1};
+        }
+        vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, diag_slot->buffer, n, regions);
+        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; b.newLayout = layout;
+        b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT; b.dstAccessMask = access;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, stage | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0,
+                             nullptr, 0, nullptr, 1, &b);
+        diag_slot->format[k] = format;
+        diag_slot->have[k] = true;
+    }
+    void diag_end(VkCommandBuffer cmd) {
+        if (!diag_slot) return;
+        VkBufferMemoryBarrier bb{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+        bb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; bb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        bb.srcQueueFamilyIndex = bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bb.buffer = diag_slot->buffer; bb.size = VK_WHOLE_SIZE;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &bb, 0, nullptr);
+        vkCmdSetEvent(cmd, diag_slot->done, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        diag_slot->pending = true;
+        diag_slot = nullptr;
     }
     struct RenoDXRetired { std::unique_ptr<renodx::Stage> stage; uint64_t call; std::chrono::steady_clock::time_point at; };
     std::vector<RenoDXRetired> renodx_retired;
@@ -420,11 +799,12 @@ struct Session::Impl {
     std::mutex build_lock;
     bool building{}, build_done{}, build_linear{}, build_prep{}, build_native{};
     std::chrono::steady_clock::time_point build_started{};
-#if NR_INT4
-    // [Int4Mixed]: the network the switch asks for, the one being built, and the one running (Built::int4).
-    Int4Switch int4_switch;
-    int int4_want{}, build_int4{}, running_int4{-1};
-#endif
+    // [Network] Model: the network the switch asks for, the one being built, and the one running (Built::net).
+    NetworkSwitch net_switch;
+    int net_want{}, build_net{}, running_net{-1};
+    // What can run in this run, checked once the game's device is known (NetworkSwitch::unavailable).
+    bool availability_checked{};
+    void check_availability();
     uint32_t build_passes{kMaxPasses};
     uint32_t build_w{}, build_h{};
     VkFormat build_format{VK_FORMAT_UNDEFINED};
@@ -447,6 +827,7 @@ struct Session::Impl {
     // Model Resolution. A change rebuilds the network, like a resolution change.
     float model_scale{1.0f}, build_scale{1.0f}, built_scale{1.0f};
     bool native_compose{};   // Session::set_native_compose
+    bool motion_point{};     // Session::set_motion_point
     // The RenoDX-style option on a route without native compose (the ReShade add-on): its frames ask for the
     // DLL's own composition too, so the network RenoDX's processing wraps is the same on every route.
     bool renodx_native{};
@@ -489,6 +870,22 @@ struct Session::Impl {
     // Feature ids, handed out by Session::create_feature. Monotonic, never
     // reused, so a stale id can only ever miss.
     uint64_t next_feature{1};
+    // NVIDIA's resize semantics (310.9, measured on an RTX 5090): a
+    // feature evaluated at another extent than its last evaluation is a new feature at that extent - the frame is
+    // byte-identical to the first frame of a feature created there; its history is not read. `resized` says so for
+    // this evaluation (the caller ORs it into the frame's Reset) and remembers the extent.
+    std::map<uint64_t, std::pair<uint32_t, uint32_t>> feature_extent;
+    uint64_t resizes{};
+    bool resized(uint64_t feature, uint32_t w, uint32_t h) {
+        auto& e = feature_extent[feature];
+        const bool changed = e.first && (e.first != w || e.second != h);
+        if (changed) last_resize = std::chrono::steady_clock::now();
+        if (changed && ++resizes <= 8)
+            log("[nr] feature #%u: %ux%u -> %ux%u, history restarts (as a new feature at that extent)%s",
+                unsigned(feature), e.first, e.second, w, h, resizes == 8 ? "; not logged again" : "");
+        e = {w, h};
+        return changed;
+    }
     // One of everything per swapchain image. A binary semaphore may have exactly
     // one pending signal-wait pair, and the present waiting on ours is still
     // outstanding when the next frame is recorded - so a single one reused every
@@ -735,13 +1132,12 @@ bool Session::Impl::fits_in_memory(uint32_t w, uint32_t h, bool quiet) {
 
 bool Session::Impl::select_runtime(uint32_t w, uint32_t h, VkFormat format, bool want_linear) {
     for (auto& e : cache) {
+        if (e.runtime->stale()) continue;   // its images belong to a later runtime (dropped by trim_cache)
         if (e.width != w || e.height != h || e.format != format || e.linear != want_linear ||
             e.scale != model_scale || e.passes != max_passes_want || e.prep != prep_want ||
             e.native != (native_compose || renodx_native))
             continue;
-#if NR_INT4
-        if (e.int4 != int4_want) continue;   // [Int4Mixed]: the network the switch asks for
-#endif
+        if (e.net != net_want) continue;   // [Network] Model: the network the switch asks for
         e.used = ++use_stamp;
         const auto now = std::chrono::steady_clock::now();
         if (runtime != e.runtime.get()) {
@@ -757,9 +1153,7 @@ bool Session::Impl::select_runtime(uint32_t w, uint32_t h, VkFormat format, bool
         width = e.width; height = e.height; this->format = e.format;
         linear = e.linear; built_scale = e.scale; running_native = e.native;
         running_passes = e.passes; running_prep = e.prep;
-#if NR_INT4
-        running_int4 = e.int4;
-#endif
+        running_net = e.net;
         return true;
     }
     return false;
@@ -787,6 +1181,277 @@ void Session::Impl::free_retired() {
     }
 }
 
+bool Session::Impl::vram(Vram& v) const {
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+    props.pNext = &budget;
+    if (!handles.physical) return false;
+    vkGetPhysicalDeviceMemoryProperties2(handles.physical, &props);
+    const auto& mem = props.memoryProperties;
+    v = {};
+    for (uint32_t i = 0; i < mem.memoryHeapCount; ++i) {
+        if (!(mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) || mem.memoryHeaps[i].size <= v.heap) continue;
+        // a driver may report a budget above the heap (llama.cpp's ggml-vulkan clamps it the same way)
+        v.heap = mem.memoryHeaps[i].size;
+        v.budget = budget.heapBudget[i] ? std::min(budget.heapBudget[i], v.heap) : v.heap;
+        v.usage = budget.heapUsage[i];
+    }
+    // NR_DEBUG_VRAM_BUDGET=<MiB> (tests): a smaller budget, to see Residency under pressure
+    static const uint64_t debug_budget = [] {
+        char e[24] = {};
+        const DWORD n = GetEnvironmentVariableA("NR_DEBUG_VRAM_BUDGET", e, sizeof e);
+        return n && n < sizeof e ? uint64_t(std::atoll(e)) << 20 : 0ull;
+    }();
+    if (debug_budget && v.heap) v.budget = std::min(v.budget, debug_budget);
+    return v.heap != 0;
+}
+
+void Session::Impl::park(size_t index, const char* why) {
+    const void* net = cache[index].runtime->network_id();
+    bool held = false;
+    for (const auto& p : parked) held |= core_network(*p.core) == net;
+    if (!held) {
+        const Built& e = cache[index];
+        if (auto core = e.runtime->share_for(e.width, e.height)) {
+            release_image_heap(*core);
+            Parked p;
+            p.core = std::move(core);
+            p.format = e.format; p.linear = e.linear; p.scale = e.scale; p.passes = e.passes; p.prep = e.prep;
+            p.native = e.native; p.net = e.net; p.width = e.width; p.height = e.height; p.last = e.last;
+            parked.push_back(std::move(p));
+            log("[nr] %s at %ux%u parked: its weights stay, its runtimes and images go %s", nr::network_codename(e.net),
+                e.width, e.height, why);
+        }
+    }
+    for (size_t i = cache.size(); i-- > 0;)
+        if (cache[i].runtime->network_id() == net) drop(i, why);
+}
+
+bool Session::Impl::ram_short() {
+    MEMORYSTATUSEX m{};
+    m.dwLength = sizeof m;
+    if (!GlobalMemoryStatusEx(&m) || !m.ullTotalPhys) return false;
+    return m.ullAvailPhys < std::max<uint64_t>(2ull << 30, m.ullTotalPhys / 10);
+}
+
+bool Session::Impl::start_offload(Parked& p) {
+    // not while a build runs: it may be making a runtime from this very network (a parked one asked for again)
+    if (offloading || building || network_offloaded(*p.core)) return false;
+    const void* net = core_network(*p.core);
+    for (const auto& r : retired)
+        if (r.runtime && r.runtime->network_id() == net) return false;   // its frames may still be in flight
+    offloading = p.core;
+    offload_done = false;
+    const HostDevice host = make_host();
+    const QueueAccess access_copy = access;
+    const auto core = p.core;
+    offload_weights.clear();
+    offload_thread = std::thread([this, host, access_copy, core] {
+        // the read-back only: nothing of the network changes on this thread (poll_offload releases it)
+        HostDevice locked = host;
+        locked.queue_lock = access_copy.lock_quiet;
+        locked.queue_unlock = access_copy.unlock_quiet;
+        bool ok = false;
+        try { ok = download_network_weights(locked, *core, offload_weights); } catch (...) { ok = false; }
+        offload_ok = ok;
+        offload_done = true;
+    });
+    return true;
+}
+
+void Session::Impl::poll_offload() {
+    if (!offloading || !offload_done) return;
+    if (offload_thread.joinable()) offload_thread.join();
+    if (offload_ok) {
+        release_network(*offloading, std::move(offload_weights));
+        offload_ok = network_offloaded(*offloading);
+    }
+    offload_weights.clear();
+    for (const auto& p : parked)
+        if (p.core == offloading)
+            log("[nr] %s at %ux%u: %s", nr::network_codename(p.net), p.width, p.height,
+                offload_ok ? "its weights moved to RAM, its video memory freed" : "its weights could not be moved to RAM");
+    if (!offload_ok)   // not tried again: freed instead
+        for (size_t i = parked.size(); i-- > 0;)
+            if (parked[i].core == offloading) parked.erase(parked.begin() + long(i));
+    offloading.reset();
+}
+
+void Session::Impl::residency(bool switched, bool nr_off) {
+    const auto now = std::chrono::steady_clock::now();
+    residency_checked = now;
+    poll_offload();
+    const int mode = net_switch.file().residency;   // 0 auto, 1 resident, 2 offload, 3 minimal
+    // Of another kind and not used for a second: right after a switch the left network may still serve a feature whose
+    // new network is not built yet (net_only, touch_running).
+    auto inactive = [&](const Built& e) { return nr_off || (e.net != running_net && now - e.last > std::chrono::seconds(1)); };
+    if (mode == 1) return;
+    if (mode == 3) {
+        for (size_t i = cache.size(); i-- > 0;)
+            if (inactive(cache[i]))
+                drop(i, nr_off ? "(NR off; [Network] Residency frees it)" : "(another network runs; [Network] Residency frees it)");
+        if (!parked.empty() && !offloading) { parked.clear(); log("[nr] parked networks freed ([Network] Residency)"); }
+        return;
+    }
+    // offload and auto: a network of another kind is parked at once (its runtimes and images are of no use until it runs
+    // again, and its history restarts then anyway); with NR off the running one too (offload), or when memory is short
+    // (auto, below)
+    if (!nr_off || mode == 2)
+        for (size_t i = cache.size(); i-- > 0;)
+            if (i < cache.size() && inactive(cache[i])) park(i, nr_off ? "(NR off)" : "(another network runs)");
+    if (mode == 2) {   // offload: every parked network's weights to RAM
+        for (auto& p : parked)
+            if ((nr_off || p.net != net_want) && start_offload(p)) break;
+        if (ram_short() && !parked.empty() && !offloading) {
+            size_t lru = 0;
+            for (size_t i = 1; i < parked.size(); ++i) if (parked[i].last < parked[lru].last) lru = i;
+            log("[nr] parked %s freed (RAM is short)", nr::network_codename(parked[lru].net));
+            parked.erase(parked.begin() + long(lru));
+        }
+        return;
+    }
+    // auto: by the device-local heap's room
+    Vram v;
+    if (!vram(v) || now - residency_freed < kFreedQuiet) return;
+    const uint64_t reserve = std::max<uint64_t>(1ull << 30, v.heap / 10);
+    const uint64_t free = v.budget > v.usage ? v.budget - v.usage : 0;
+    const double pressure = v.budget ? double(v.usage) / double(v.budget) : 0.0;
+    const bool short_now = free < (switched ? reserve + reserve / 2 : reserve);
+    // the keep-alive in video memory of what is not running shrinks as the heap fills (the D3D12 Residency Starter
+    // Library's grace period): above 70 % of the budget 60 s, down to 1 s at 100 %
+    const double keep = pressure > 0.7 ? 60.0 - 59.0 * std::min(1.0, (pressure - 0.7) / 0.3) : 1e30;
+    auto log_state = [&] {
+        log("[nr] Residency auto: %.0f MiB free of a %.0f MiB budget (%.0f %% used), reserve %.0f MiB",
+            double(free) / (1 << 20), double(v.budget) / (1 << 20), pressure * 100.0, double(reserve) / (1 << 20));
+    };
+    // NR off: the running network is parked when memory is short or it outlived the keep-alive
+    if (nr_off && (short_now || std::chrono::duration<double>(now - last_call).count() > keep))
+        for (size_t i = cache.size(); i-- > 0;)
+            if (i < cache.size()) { log_state(); park(i, "(NR off)"); residency_freed = now; return; }
+    // RAM short: the oldest network in RAM goes
+    if (ram_short()) {
+        size_t lru = parked.size();
+        for (size_t i = 0; i < parked.size(); ++i)
+            if (network_offloaded(*parked[i].core) && (lru == parked.size() || parked[i].last < parked[lru].last)) lru = i;
+        if (lru < parked.size()) {
+            log("[nr] %s freed from RAM (RAM is short)", nr::network_codename(parked[lru].net));
+            parked.erase(parked.begin() + long(lru));
+        }
+    }
+    // video memory: the least recently used parked network still in it moves to RAM - not the one NR asks for now
+    // (NR back on: it is about to run again)
+    size_t lru = parked.size();
+    for (size_t i = 0; i < parked.size(); ++i)
+        if (!network_offloaded(*parked[i].core) && parked[i].core != offloading && (nr_off || parked[i].net != net_want) &&
+            (lru == parked.size() || parked[i].last < parked[lru].last))
+            lru = i;
+    if (lru == parked.size()) return;
+    const bool old = std::chrono::duration<double>(now - parked[lru].last).count() > keep;
+    if (!short_now && !old) return;
+    if (ram_short()) {
+        log_state();
+        log("[nr] parked %s at %ux%u freed (%s; RAM is short too)", nr::network_codename(parked[lru].net),
+            parked[lru].width, parked[lru].height, short_now ? "video memory is short" : "video memory is getting full");
+        parked.erase(parked.begin() + long(lru));
+    } else if (start_offload(parked[lru])) {
+        log_state();
+        log("[nr] parked %s at %ux%u: moving its weights to RAM (%s)", nr::network_codename(parked[lru].net),
+            parked[lru].width, parked[lru].height, short_now ? "video memory is short" : "video memory is getting full");
+    } else {
+        return;   // still in flight: next check
+    }
+    residency_freed = now;
+}
+
+std::shared_ptr<ActArenaRef> Session::Impl::act_for(int net) const {
+    // every network's arena, resident or parked, with its kind and its memory
+    struct Held { int net; const void* network; std::shared_ptr<ActArenaRef> act; };
+    std::vector<Held> held;
+    for (const auto& e : cache) held.push_back({e.net, e.runtime->network_id(), e.runtime->act_arena()});
+    for (const auto& p : parked) held.push_back({p.net, core_network(*p.core), core_act_arena(*p.core)});
+    std::set<const void*> busy;
+    for (const auto& h : held)
+        if (h.net == net && h.act) busy.insert(act_arena_id(*h.act));
+    const auto pref = feature_slot.find(current_feature);
+    std::shared_ptr<ActArenaRef> best;
+    for (const auto& h : held) {
+        if (h.net == net || !h.act || busy.count(act_arena_id(*h.act))) continue;
+        if (pref != feature_slot.end() && h.network == pref->second) return h.act;
+        if (!best || act_arena_bytes(*h.act) > act_arena_bytes(*best)) best = h.act;
+    }
+    return best;
+}
+
+// At most kMaxResident networks of each [Int4Mixed] kind: one per extent the session serves at once (OptiScaler's NR
+// before and after the upscaler), and kMaxEntries runtimes (several extents of one working extent share a network).
+// Extents left behind - a resolution change, a RenoDX-style resolution scale, a game's dynamic resolution - go least
+// recently used first, once unused for kIdleDrop: more extents in use at once than the caps stay, rather than being
+// rebuilt every frame. A network goes with all of its runtimes. `adopting`: a runtime about to join the cache
+// (counted, not dropped).
+void Session::Impl::trim_cache(const Built* adopting) {
+    const auto now = std::chrono::steady_clock::now();
+    // Runtimes built inside a frame whose images a later one has taken: never selected again.
+    for (size_t i = cache.size(); i-- > 0;)
+        if (cache[i].runtime->stale()) drop(i, "(its images went to a later frame size)");
+    for (int kind = 0; kind < nr::kNetworkChoices; ++kind) {
+        const auto of_kind = [kind](const Built& e) {
+            return e.net == kind;
+        };
+        for (;;) {
+            // This kind's runtimes, and its networks with their latest use.
+            struct Use { uint64_t used{}; std::chrono::steady_clock::time_point last{}; };
+            std::map<const void*, Use> nets;
+            size_t entries = 0, oldest = cache.size();
+            for (size_t i = 0; i < cache.size(); ++i) {
+                if (!of_kind(cache[i])) continue;
+                ++entries;
+                Use& u = nets[cache[i].runtime->network_id()];
+                u.used = std::max(u.used, cache[i].used); u.last = std::max(u.last, cache[i].last);
+                if (oldest == cache.size() || cache[i].used < cache[oldest].used) oldest = i;
+            }
+            if (adopting && of_kind(*adopting)) {
+                ++entries;
+                Use& u = nets[adopting->runtime->network_id()];
+                u.used = ~uint64_t(0); u.last = now;
+            }
+            // More than one network of a kind: one no feature runs in any more goes once unused for kIdleDrop (a smaller
+            // memory an upward sweep left behind), any other once unused for kNetIdle.
+            if (nets.size() > 1) {
+                const void* idle = nullptr;
+                for (const auto& [id, u] : nets) {
+                    if (!id || (adopting && id == adopting->runtime->network_id())) continue;
+                    bool referenced = false;
+                    for (const auto& fs : feature_slot) referenced |= fs.second == id;
+                    if (now - u.last > (referenced ? std::chrono::duration_cast<std::chrono::milliseconds>(kNetIdle) : kIdleDrop)) {
+                        idle = id; break;
+                    }
+                }
+                if (idle) {
+                    for (size_t i = cache.size(); i-- > 0;)
+                        if (of_kind(cache[i]) && cache[i].runtime->network_id() == idle) drop(i, "(unused for a while; another network serves)");
+                    continue;
+                }
+            }
+            if (nets.size() > kMaxResident) {
+                const void* victim = nullptr;
+                Use v{~uint64_t(0), {}};
+                for (const auto& [id, u] : nets) if (u.used < v.used) { v = u; victim = id; }
+                if (!victim || now - v.last < kIdleDrop) break;
+                for (size_t i = cache.size(); i-- > 0;)
+                    if (of_kind(cache[i]) && cache[i].runtime->network_id() == victim)
+                        drop(i, "(least recently used; more extents than are served at once)");
+                continue;
+            }
+            // One built inside a frame goes as soon as the last few evaluations did not use it (another is a millisecond
+            // away); the others once idle.
+            if (entries <= kMaxEntries || oldest == cache.size() ||
+                (cache[oldest].light ? use_stamp - cache[oldest].used < 4 : now - cache[oldest].last < kIdleDrop))
+                break;
+            drop(oldest, "(least recently used; more extents of one network than are served at once)");
+        }
+    }
+}
+
 bool Session::Impl::make_room(uint32_t w, uint32_t h) {
     if (fits_in_memory(w, h)) return true;
     if (cache.empty()) return false;
@@ -803,6 +1468,28 @@ bool Session::Impl::make_room(uint32_t w, uint32_t h) {
 bool Session::Impl::ensure_runtime(const Controls& controls, uint32_t w, uint32_t h, VkFormat format,
                                    bool want_linear) {
     const bool ok = ensure_runtime_(controls, w, h, format, want_linear);
+    ++(ok ? ran : passed);
+    last_w = w; last_h = h; last_format = format; last_linear = want_linear;
+    if (ok && runtime) {
+        runtime->set_style_grade(net_switch.file().style_grade);   // [Network] Style Grade, live
+        feature_slot[current_feature] = runtime->network_id();
+        Runtime*& last = feature_runtime[current_feature];
+        if (last != runtime) { feature_prev_runtime[current_feature] = last; last = runtime; }
+    }
+    heap_poll();
+    if (!building && drs_active()) prefetch();
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (pass_logged == std::chrono::steady_clock::time_point{}) pass_logged = now;
+        if (now - pass_logged >= kPassLog) {
+            if (passed)
+                log("[nr] last %.0f s: %llu evaluations ran the network, %llu passed the frame through (%s)",
+                    std::chrono::duration<double>(now - pass_logged).count(), (unsigned long long)ran,
+                    (unsigned long long)passed, ok ? "running now" : status.c_str());
+            ran_total += ran; passed_total += passed; ran = passed = 0;
+            pass_logged = now;
+        }
+    }
     if (ok && controls.preprocess.active() && controls.preprocess.exposure == 1) {
         const auto now = std::chrono::steady_clock::now();
         const auto m = runtime->preprocess_meter();
@@ -819,30 +1506,61 @@ bool Session::Impl::ensure_runtime(const Controls& controls, uint32_t w, uint32_
 bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32_t h, VkFormat format,
                                     bool want_linear) {
     ++calls;
+    last_call = std::chrono::steady_clock::now();
+    if (last_call - residency_checked >= kResidencyCheck) residency(false, false);
     if (!retired.empty()) free_retired();
+    if (cache.size() > kMaxResident) trim_cache();
     if (controls.preprocess.active() && !prep_want) {
         prep_want = true;
         log("[nr] preprocess asked for: networks are rebuilt able to run it (once)");
     }
-#if NR_INT4
-    int4_want = int4_switch.frame(root + "\\dlssnr-amd.ini");
-#endif
+    if (!availability_checked) check_availability();
+    net_want = net_switch.frame(root + "\\dlssnr-amd.ini");
     // Adopt a finished background build first.
     {
         std::lock_guard<std::mutex> guard(build_lock);
         if (build_done) {
             if (build_thread.joinable()) build_thread.join();
             build_done = false; building = false;
-            if (built) {
+            if (build_plan) {
+                // A plan (RuntimeConfig::plan_only): cached; its runtimes are built inside the frames that ask.
+                build_plan = false;
+                if (built && built->plan()) {
+                    PlanEntry pe;
+                    pe.format = build_format; pe.linear = build_linear; pe.scale = build_scale; pe.passes = build_passes;
+                    pe.prep = build_prep; pe.native = build_native;
+                    pe.net = net_of(*built);
+                    pe.core = built->plan();
+                    plan_extent(*pe.core, &pe.ww, &pe.wh, &pe.sh);
+                    pe.used = ++use_stamp;
+                    if (plans.size() >= kMaxPlans) {
+                        size_t oldest = 0;
+                        for (size_t i = 1; i < plans.size(); ++i) if (plans[i].used < plans[oldest].used) oldest = i;
+                        plans.erase(plans.begin() + long(oldest));
+                    }
+                    plans.push_back(std::move(pe));
+                    if (++plans_built <= 8 || plans_built % 50 == 0)
+                        log("[nr] plan for the working extent %ux%u (frames up to %u rows) in %.2f s; %zu cached",
+                            plans.back().ww, plans.back().wh, plans.back().sh, build_seconds, plans.size());
+                } else if (build_error == "nothing left to plan around this size") {
+                    prefetched_around = {build_w, build_h};
+                } else {
+                    log("[nr] a plan could not be built: %s", build_error.c_str());
+                }
+                built.reset();
+            } else if (built) {
                 Built entry;
                 entry.width = build_w; entry.height = build_h; entry.format = build_format;
                 entry.linear = build_linear; entry.scale = build_scale;
                 entry.passes = build_passes; entry.prep = build_prep; entry.native = build_native;
-#if NR_INT4
-                // what was built, not what was asked: an int4 build without what it needs is the default network
-                entry.int4 = built->int4_mixed() ? 1 : 0;
-                if (build_int4 && !entry.int4) { int4_switch.unavailable(); int4_want = 0; }   // not asked again this run
-#endif
+                // what was built, not what was asked: a network without what it needs is another one (the runtime
+                // says why); the one asked for is not asked again this run
+                entry.net = net_of(*built);
+                if (entry.net != build_net) {
+                    net_switch.unavailable(build_net, built->network_note().empty() ? "could not be built (see dlssnr-amd.log)"
+                                                                                    : built->network_note());
+                    net_want = net_switch.frame(root + "\\dlssnr-amd.ini");
+                }
                 entry.used = ++use_stamp;
                 entry.last = std::chrono::steady_clock::now();
                 entry.runtime = std::move(built);
@@ -868,13 +1586,6 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
                     if (entry.prep && !cache[i].prep && cache[i].width == entry.width &&
                         cache[i].height == entry.height)
                         drop(i, "built without the preprocess");
-#if NR_INT4
-                // [Int4Mixed] switch: unless KeepBoth, only one kind of network stays resident. The one the switch left
-                // keeps no memory once its replacement is in (switching back builds it again, the running one serving).
-                if (!int4_switch.keep_both())
-                    for (size_t i = cache.size(); i-- > 0;)
-                        if (cache[i].int4 != entry.int4) drop(i, entry.int4 ? "(default; int4 mixed is in)" : "(int4 mixed; default is in)");
-#endif
                 // A change of pass count: the network built for the other count served until now and keeps no
                 // memory once this one is in.
                 for (size_t i = cache.size(); i-- > 0;)
@@ -883,19 +1594,36 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
                         cache[i].linear == entry.linear && cache[i].scale == entry.scale &&
                         cache[i].prep == entry.prep && cache[i].native == entry.native)
                         drop(i, "(built for another pass count)");
+                // Model resolution is one value for the whole session: a network built for another one can never
+                // be selected again unless the setting goes back, and kept, every value tried stayed resident
+                // (ReShade route, 1080p, 100% -> 50% in steps: 6 networks, 865 -> 3288 MiB).
+                for (size_t i = cache.size(); i-- > 0;)
+                    if (cache[i].scale != entry.scale) drop(i, "(built for another model resolution)");
+                trim_cache(&entry);
                 cache.push_back(std::move(entry));
                 auto& adopted = cache.back();
+                // a parked network in use again: its runtime holds it now
+                for (size_t i = parked.size(); i-- > 0;)
+                    if (core_network(*parked[i].core) == adopted.runtime->network_id()) parked.erase(parked.begin() + long(i));
                 runtime = adopted.runtime.get();
                 width = adopted.width; height = adopted.height; this->format = adopted.format;
                 linear = adopted.linear; built_scale = adopted.scale; running_native = adopted.native;
                 running_passes = adopted.passes; running_prep = adopted.prep;
-#if NR_INT4
-                running_int4 = adopted.int4;
-#endif
+                running_net = adopted.net;
+                // A network switch: what happens to the networks it left ([Network] Residency)
+                residency(true, false);
+                if (Vram v; vram(v))
+                    log("[nr] %s serving; %zu runtimes, %zu parked; this process's video memory %.0f MiB (budget %.0f MiB)",
+                        nr::network_codename(running_net), cache.size(), parked.size(), double(v.usage) / (1 << 20),
+                        double(v.budget) / (1 << 20));
                 }
                 oom_failures = 0;
                 retry_at = {};
             } else {
+                // a runtime from a parked network that failed: the network goes (its weights may be half back)
+                for (size_t i = parked.size(); i-- > 0;)
+                    if (build_share && parked[i].core == build_share) parked.erase(parked.begin() + long(i));
+                build_share.reset();
                 status = build_error;
                 log("[nr] %s", status.c_str());
                 if (build_oom && oom_failures < kOomRetries) {
@@ -916,13 +1644,19 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
         }
     }
     if (select_runtime(w, h, format, want_linear)) return true;
-#if NR_INT4
-    // [Int4Mixed] switch: the running network keeps serving its frames while the other one builds, so the
+    // The resize path: a new frame size from a resident network or a cached plan, inside this recording.
+    std::shared_ptr<const RuntimeCore> tried;
+    inframe_waiting = false;
+    if (inframe(w, h, format, want_linear, &tried)) return true;
+    if (inframe_waiting) {
+        status = "making memory for the game's changing frame size; frames pass through until it is ready";
+        return false;
+    }
+    // A network switch: the running network keeps serving its frames while the other one builds, so the
     // comparison has no gap but the build itself (the first int4 build also compiles its pipelines).
-    const bool int4_only = runtime && running_int4 >= 0 && running_int4 != int4_want && width == w && height == h &&
+    const bool net_only = runtime && running_net >= 0 && running_net != net_want && width == w && height == h &&
                            this->format == format && linear == want_linear && built_scale == model_scale &&
                            running_native == (native_compose || renodx_native);
-#endif
     // A change of pass count (set_max_passes): the running network serves, at most at the passes it was built for,
     // while the one for the new count builds.
     static constexpr const char* kPassesServing =
@@ -930,14 +1664,10 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
     const bool passes_only = runtime && running_passes != max_passes_want && width == w && height == h &&
                              this->format == format && linear == want_linear && built_scale == model_scale &&
                              running_native == (native_compose || renodx_native) && running_prep == prep_want
-#if NR_INT4
-                             && running_int4 == int4_want
-#endif
+                             && running_net == net_want
         ;
     if (building) {
-#if NR_INT4
-        if (int4_only) { touch_running(); return true; }
-#endif
+        if (net_only) { touch_running(); return true; }
         if (passes_only) { touch_running(); status = kPassesServing; return true; }
         status = "building the network in the background; frames pass through until it is ready";
         return false;
@@ -963,40 +1693,78 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
     // An evicted network still holds its memory until it is freed. If the next one does not fit beside it, wait
     // for that rather than push out another: the switch keeps the running network serving, anything else passes
     // through.
-    if (!retired.empty() && !fits_in_memory(w, h, true)) {
-#if NR_INT4
-        if (int4_only) { touch_running(); return true; }
-#endif
+    // The resize path: a cached network of the same working extent and configuration gives this extent its network
+    // (Runtime::share_for) - only the images and descriptor sets are made, about 10 ms instead of a whole build, and no
+    // more arena memory.
+    std::shared_ptr<const RuntimeCore> share = tried;
+    for (const auto& e : cache) {
+        if (share) break;
+        if (!same_config(e, format, want_linear) || e.runtime->stale()) continue;
+        if ((share = e.runtime->share_for(w, h)))
+            log("[nr] %ux%u has the working extent of the %ux%u network: built from it", w, h, e.width, e.height);
+    }
+    // A parked network of this configuration (Residency auto): its memory is still there, only a runtime is made. The
+    // runtime checks the core fits this extent and makes a whole network when it does not (the log says so).
+    poll_offload();
+    for (const auto& p : parked) {
+        if (share) break;
+        if (p.net != net_want || p.format != format || p.linear != want_linear || p.scale != model_scale ||
+            p.passes != max_passes_want || p.prep != prep_want || p.native != (native_compose || renodx_native) ||
+            !core_runs(*p.core, w, h, model_scale, native_compose || renodx_native))
+            continue;
+        if (p.core == offloading) {   // its weights are on their way to RAM: built from them once they are there
+            if (net_only) { touch_running(); return true; }
+            status = "the network's weights are moving to RAM; frames pass through until it is back";
+            return false;
+        }
+        share = p.core;
+        log("[nr] %ux%u: %s is parked (its weights kept): a runtime is made from it", w, h, nr::network_codename(p.net));
+    }
+    // A frame size of a working extent no plan covers yet, with a resident network of this configuration: the plan in
+    // the background (no device memory, ~0.15 s), then its runtimes inside the frames (inframe).
+    if (!share && start_plan(w, h, format, want_linear)) {
+        if (net_only) { touch_running(); return true; }
+        if (passes_only) { touch_running(); status = kPassesServing; return true; }
+        status = "building the plan for this frame size in the background; frames pass through until it is ready";
+        return false;
+    }
+    // The size must hold before a whole network is built for it (a size moving every frame asked for one per frame) -
+    // unless no network of this configuration is resident (the first; the plans need one), or a plan for it exists and
+    // only no resident memory holds it (a sweep past the biggest network so far).
+    bool have_network = false;
+    const Built* any_net = nullptr;
+    for (const auto& e : cache)
+        if (same_config(e, format, want_linear) && !e.runtime->stale()) { have_network = true; any_net = &e; break; }
+    const bool capacity_miss = any_net && plan_for(w, h, format, want_linear, any_net->runtime->network()) != nullptr;
+    if (!share && have_network && !capacity_miss && !settled(w, h)) {
+        if (net_only) { touch_running(); return true; }
+        if (passes_only) { touch_running(); status = kPassesServing; return true; }
+        status = "the frame's size is changing; the network is built once it holds";
+        return false;
+    }
+    if (!share && !retired.empty() && !fits_in_memory(w, h, true)) {
+        if (net_only) { touch_running(); return true; }
         if (passes_only) { touch_running(); status = kPassesServing; return true; }
         status = "freeing the previous network before building another";
         return false;
     }
-    if (!make_room(w, h)) return false;
-    RuntimeConfig config;
-    config.root = root; config.width = w; config.height = h; config.colour_format = format;
-    config.linear_input = want_linear; config.white_point = white_point;
-    config.model_scale = model_scale;
-    const bool native = native_compose || renodx_native;
-    config.max_passes = native ? 1u : max_passes_want;
-    config.native_compose = native;
-    config.preprocess = prep_want;
-#if NR_INT4
-    config.int4_mixed = int4_want;
-#endif
-    // The soft knee to undo: the linear path's own encode, or OptiScaler's
-    // linear-HDR encode, which a float proxy on the OptiScaler route came
-    // through (OptiScaler encodes a float colour flagged IsHDR or AutoExposure
-    // and hands an SDR one over as it is, and only the format reaches us).
-    config.preprocess_unknee = want_linear || (native && is_linear_format(format));
-    if (native) config.model_scale = 1.0f;   // the DLL has no resample; OptiScaler scales outside
-    TemporalConfig temporal; temporal.enable = true;
-    temporal.history_strength = history_strength;
-    HostDevice host{};
-    host.instance = handles.instance; host.physical = handles.physical; host.device = handles.device;
-    // A real queue and its real family. Construction submits the weight upload
-    // and waits for it; the game is submitting to the same underlying VkQueue,
-    // so each of those submits takes the queue lock (below).
-    host.queue = access.queue; host.queue_family = access.family;
+    // a parked network whose weights are in RAM needs room too (the weights, perhaps an arena)
+    if ((!share || network_offloaded(*share)) && !make_room(w, h)) return false;
+    RuntimeConfig config = make_config(w, h, format, want_linear);
+    config.share = share;
+    // the activation arena: a whole build's own or another kind's; a parked network moved to RAM gets one back too
+    if (!share || network_offloaded(*share)) { config.act_arena = act_for(net_want); config.act_slack = kActSlack; }
+    // Room for the game's whole render range: its guides allocated bigger than this frame (a game with dynamic
+    // resolution renders into a corner of them) size even the first network, so every later size runs in it; else, while
+    // the size moves, kDrsCapacity.
+    if (!share) {
+        const double px = double(w) * double(h);
+        if (size_hint_px > uint64_t(px * 1.02)) config.capacity = std::min(4.0, double(size_hint_px) / px * 1.02);
+        else if (capacity_miss || drs_active()) config.capacity = kDrsCapacity;
+    }
+    const bool native = config.native_compose;
+    const TemporalConfig temporal = make_temporal();
+    const HostDevice host = make_host();
     // Off the render thread. Building reads the weights, creates every pipeline
     // and allocates the arena, and doing that inside the upscaler's call froze
     // the game for the duration every time the feature was first turned on. The
@@ -1004,17 +1772,15 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
     // from the render thread; the game keeps rendering unenhanced frames until
     // the build is adopted above.
     const QueueAccess access_copy = access;
+    build_share.reset();
+    for (const auto& p : parked) if (p.core == share) build_share = share;
     building = true; build_w = w; build_h = h; build_format = format; build_linear = want_linear;
     build_started = std::chrono::steady_clock::now();
     nr::g_build_stage = 1; nr::g_build_pipes_done = 0; nr::g_build_pipes_total = 0;
     build_scale = model_scale; build_passes = max_passes_want; build_prep = prep_want; build_native = native;
-#if NR_INT4
-    build_int4 = int4_want;
-#endif
+    build_net = net_want;
     status = "building the network in the background; frames pass through until it is ready";
-#if NR_INT4
-    log("[nr] network asked for: %s", int4_want ? "int4 mixed" : "default");
-#endif
+    log("[nr] network asked for: %s", nr::network_codename(net_want));
     log("[nr] building the network at %ux%u (model scale %.2f) in the background%s", w, h, model_scale,
         want_linear ? " (linear-light colour: encoding with a white point, see dlssnr-amd.ini white_point)" : "");
     build_thread = std::thread([this, host, config, temporal, access_copy] {
@@ -1033,6 +1799,14 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
             HostDevice locked = host;
             locked.queue_lock = access_copy.lock_quiet;
             locked.queue_unlock = access_copy.unlock_quiet;
+            // a parked network whose weights went to RAM (Residency offload): back first
+            if (config.share && network_offloaded(*config.share)) {
+                const auto r0 = std::chrono::steady_clock::now();
+                if (!reload_network(locked, *config.share, config.act_arena, config.act_slack))
+                    throw std::runtime_error("the network's weights could not be brought back from RAM");
+                log("[nr] network weights back from RAM in %.0f ms",
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - r0).count());
+            }
 #if NR_INT4
             try {   // an int4 mixed build that fails (its weights file damaged, from other data...) gives the default one
 #endif
@@ -1066,15 +1840,320 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
         built = std::move(made); build_error = error; build_seconds = seconds; build_done = true;
         build_oom = oom;
     });
-#if NR_INT4
-    if (int4_only && runtime != nullptr) { touch_running(); return true; }   // an [Int4Mixed] switch: the running one serves until the new one is in
-#endif
+    if (net_only && runtime != nullptr) { touch_running(); return true; }   // a network switch: the running one serves until the new one is in
     if (passes_only && runtime != nullptr) {   // a change of pass count, the same
         touch_running();
         status = kPassesServing;
         return true;
     }
     return false;
+}
+
+RuntimeConfig Session::Impl::make_config(uint32_t w, uint32_t h, VkFormat f, bool want_linear) const {
+    RuntimeConfig config;
+    config.root = root; config.width = w; config.height = h; config.colour_format = f;
+    config.linear_input = want_linear; config.white_point = white_point;
+    config.model_scale = model_scale;
+    const bool native = native_compose || renodx_native;
+    config.max_passes = native ? 1u : max_passes_want;
+    config.native_compose = native;
+    config.motion_point = motion_point;
+    config.preprocess = prep_want;
+    config.network = net_want == nr::kSmallFp8 ? 1 : 0;   // RuntimeConfig::network: 1 the small model, 0 the 310.8 one
+#if NR_INT4
+    config.int4_mixed = net_want == nr::kSilverAardwoldInt4 ? 1 : 0;
+#endif
+    // The soft knee to undo: the linear path's own encode, or OptiScaler's
+    // linear-HDR encode, which a float proxy on the OptiScaler route came
+    // through (OptiScaler encodes a float colour flagged IsHDR or AutoExposure
+    // and hands an SDR one over as it is, and only the format reaches us).
+    config.preprocess_unknee = want_linear || (native && is_linear_format(f));
+    if (native) config.model_scale = 1.0f;   // the DLL has no resample; OptiScaler scales outside
+    return config;
+}
+
+HostDevice Session::Impl::make_host() const {
+    HostDevice host{};
+    host.instance = handles.instance; host.physical = handles.physical; host.device = handles.device;
+    // A real queue and its real family. Construction submits the weight upload
+    // and waits for it; the game is submitting to the same underlying VkQueue,
+    // so each of those submits takes the queue lock (the build thread's).
+    host.queue = access.queue; host.queue_family = access.family;
+    return host;
+}
+
+// The cached plan that runs a frame of w x h: its working extent, tall enough. Null: none yet.
+const Session::Impl::PlanEntry* Session::Impl::plan_for(uint32_t w, uint32_t h, VkFormat f, bool want_linear,
+                                                        NetworkModel model) {
+    const bool native = native_compose || renodx_native;
+    uint32_t ww = 0, wh = 0;
+    bool known = false;
+    for (auto& p : plans) {
+        if (p.format != f || p.linear != want_linear || p.scale != model_scale || p.passes != max_passes_want ||
+            p.prep != prep_want || p.native != native || p.net != net_want || h > p.sh)
+            continue;
+        if (!known) { working_extent(model, native ? 1.0f : model_scale, w, h, &ww, &wh); known = true; }
+        if (p.ww == ww && p.wh == wh) { p.used = ++use_stamp; return &p; }
+    }
+    return nullptr;
+}
+
+// A frame at a size no resident runtime serves, run at once: a runtime built inside this recording from a resident
+// network of its working extent (Runtime::share_for) or from a cached plan in a resident network's memory
+// (Runtime::with_slot_of) - the memory least recently used first, so OptiScaler's NR before and after the upscaler
+// keep a memory each. False: nothing fits; the caller builds in the background.
+bool Session::Impl::inframe(uint32_t w, uint32_t h, VkFormat f, bool want_linear,
+                           std::shared_ptr<const RuntimeCore>* tried) {
+    const bool native = native_compose || renodx_native;
+    if (!native && model_scale != 1.0f) return false;   // Model Resolution below 100% submits at construction
+    // This configuration's resident networks, least recently used first.
+    std::vector<Built*> nets;
+    for (auto& e : cache)
+        if (same_config(e, f, want_linear) && !e.runtime->stale()) nets.push_back(&e);
+    // none for this colour format: a network of another format serves it (the runtime checks it can - the format only
+    // sizes its images), as a game switching its colour buffer's format at a camera cut asks
+    if (nets.empty())
+        for (auto& e : cache)
+            if (e.format != f && same_config_but_format(e, want_linear) && !e.runtime->stale()) nets.push_back(&e);
+    if (nets.empty()) return false;
+    // The memory this feature ran in last first, then the least recently used.
+    const auto pref = feature_slot.find(current_feature);
+    const void* want = pref == feature_slot.end() ? nullptr : pref->second;
+    std::sort(nets.begin(), nets.end(), [want](const Built* a, const Built* b) {
+        const bool pa = a->runtime->network_id() == want, pb = b->runtime->network_id() == want;
+        return pa != pb ? pa : a->used < b->used;
+    });
+    std::shared_ptr<const RuntimeCore> core;
+    for (Built* e : nets)
+        if ((core = e->runtime->share_for(w, h))) break;
+    if (!core)
+        if (const PlanEntry* p = plan_for(w, h, f, want_linear, nets.front()->runtime->network()))
+            for (Built* e : nets)
+                if ((core = e->runtime->with_slot_of(p->core))) break;
+    if (!core) return false;
+    // No heap in that memory yet: a couple of runtimes may take memory of their own meanwhile; then the frames pass
+    // through until the heap is made (heap_poll), rather than each new size holding its images until retired.
+    if (!image_heap_fits(*core, w, h)) {
+        size_t own = 0;
+        for (const auto& c : cache) own += c.light && c.runtime->owns_image_memory();
+        for (const auto& r : retired) own += r.runtime && r.runtime->owns_image_memory();
+        if (own >= kOwnImages) { inframe_waiting = true; return false; }
+    }
+    RuntimeConfig config = make_config(w, h, f, want_linear);
+    config.share = core;
+    config.deferred = true;
+    std::unique_ptr<Runtime> made;
+    const auto t0 = std::chrono::steady_clock::now();
+    try {
+        made = std::make_unique<Runtime>(make_host(), config, ControlMaskConfig{}, make_temporal());
+    } catch (const std::exception& e) {
+        log("[nr] %ux%u could not be built inside the frame (%s); building it in the background", w, h, e.what());
+        *tried = core;
+        return false;
+    }
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    inframe_ms_max = std::max(inframe_ms_max, ms);
+    if (++inframe_built <= 8 || inframe_built % 100 == 0)
+        log("[nr] %ux%u: runtime built inside the frame in %.2f ms (%llu so far, slowest %.2f ms)%s", w, h, ms,
+            (unsigned long long)inframe_built, inframe_ms_max, inframe_built == 8 ? "; logged every 100th from here" : "");
+    Built entry;
+    entry.width = w; entry.height = h; entry.format = f; entry.linear = want_linear; entry.scale = model_scale;
+    entry.passes = max_passes_want; entry.prep = prep_want; entry.native = native;
+    entry.net = net_of(*made);
+    entry.used = ++use_stamp;
+    entry.last = std::chrono::steady_clock::now();
+    entry.light = true;
+    entry.runtime = std::move(made);
+    trim_cache(&entry);
+    cache.push_back(std::move(entry));
+    auto& adopted = cache.back();
+    runtime = adopted.runtime.get();
+    width = adopted.width; height = adopted.height; this->format = adopted.format;
+    linear = adopted.linear; built_scale = adopted.scale; running_native = adopted.native;
+    running_passes = adopted.passes; running_prep = adopted.prep;
+    running_net = adopted.net;
+    return true;
+}
+
+bool Session::Impl::start_plan(uint32_t w, uint32_t h, VkFormat f, bool want_linear) {
+    const bool native = native_compose || renodx_native;
+    if (!native && model_scale != 1.0f) return false;
+    const Built* net = nullptr;
+    for (const auto& e : cache)
+        if (same_config(e, f, want_linear) && !e.runtime->stale()) { net = &e; break; }
+    if (!net) return false;
+    const NetworkModel model = net->runtime->network();
+    if (plan_for(w, h, f, want_linear, model)) return false;   // there is one: no memory holds it (a whole build)
+    RuntimeConfig config = make_config(w, h, f, want_linear);
+    config.plan_only = true;
+    const TemporalConfig temporal = make_temporal();
+    const HostDevice host = make_host();
+    building = true; build_plan = true;
+    build_w = w; build_h = h; build_format = f; build_linear = want_linear;
+    build_scale = model_scale; build_passes = max_passes_want; build_prep = prep_want; build_native = native;
+    build_net = net_want;
+    build_started = std::chrono::steady_clock::now();
+    build_thread = std::thread([this, host, config, temporal, model]() mutable {
+        const auto t0 = std::chrono::steady_clock::now();
+        std::unique_ptr<Runtime> made;
+        std::string error;
+        try {
+            // lowered at the tallest frame of this working extent: it runs every height of it
+            config.height = plan_height(model, config.native_compose ? 1.0f : config.model_scale, config.width,
+                                        config.height);
+            made = std::make_unique<Runtime>(host, config, ControlMaskConfig{}, temporal);
+        } catch (const std::exception& e) {
+            error = e.what();
+        }
+        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::lock_guard<std::mutex> guard(build_lock);
+        built = std::move(made); build_error = error; build_seconds = seconds; build_done = true; build_oom = false;
+    });
+    return true;
+}
+
+void Session::Impl::prefetch() {
+    const bool native = native_compose || renodx_native;
+    if (!native && model_scale != 1.0f) return;
+    if (prefetched_around == std::make_pair(last_w, last_h)) return;
+    const Built* net = nullptr;
+    for (const auto& e : cache)
+        if (same_config(e, last_format, last_linear) && !e.runtime->stale()) { net = &e; break; }
+    if (!net || plans.size() >= kMaxPlans) return;
+    // The working extents planned already for this configuration.
+    std::vector<std::pair<uint32_t, uint32_t>> covered;
+    for (const auto& p : plans)
+        if (p.format == last_format && p.linear == last_linear && p.scale == model_scale && p.passes == max_passes_want &&
+            p.prep == prep_want && p.native == native && p.net == net_want)
+            covered.push_back({p.ww, p.wh});
+    for (const auto& e : cache)
+        if (same_config(e, last_format, last_linear)) {
+            uint32_t ww = 0, wh = 0;
+            if (const auto c = e.runtime->plan()) { uint32_t sh = 0; plan_extent(*c, &ww, &wh, &sh); covered.push_back({ww, wh}); }
+        }
+    const NetworkModel model = net->runtime->network();
+    RuntimeConfig config = make_config(last_w, last_h, last_format, last_linear);
+    config.plan_only = true;
+    const TemporalConfig temporal = make_temporal();
+    const HostDevice host = make_host();
+    building = true; build_plan = true;
+    build_w = last_w; build_h = last_h; build_format = last_format; build_linear = last_linear;
+    build_scale = model_scale; build_passes = max_passes_want; build_prep = prep_want; build_native = native;
+    build_net = net_want;
+    build_started = std::chrono::steady_clock::now();
+    const std::pair<uint32_t, uint32_t> around{last_w, last_h};
+    build_thread = std::thread([this, host, config, temporal, model, covered, around]() mutable {
+        const auto t0 = std::chrono::steady_clock::now();
+        std::unique_ptr<Runtime> made;
+        std::string error;
+        try {
+            // The nearest working extent not planned, along the frame's aspect, within half to one and a half its size.
+            const float scale = config.native_compose ? 1.0f : config.model_scale;
+            const double aspect = double(around.first) / double(around.second);
+            for (uint32_t step = 8; step <= around.second / 2 && !made; step += 8)
+                for (int sign : {-1, 1}) {
+                    const int64_t hh = int64_t(around.second) + sign * int64_t(step);
+                    const uint32_t ch = uint32_t(hh), cw = uint32_t(std::lround(double(hh) * aspect));
+                    if (hh < 64 || cw < 64) continue;
+                    uint32_t ww = 0, wh = 0;
+                    working_extent(model, scale, cw, ch, &ww, &wh);
+                    if (std::find(covered.begin(), covered.end(), std::make_pair(ww, wh)) != covered.end()) continue;
+                    config.width = cw;
+                    config.height = plan_height(model, scale, cw, ch);
+                    made = std::make_unique<Runtime>(host, config, ControlMaskConfig{}, temporal);
+                    break;
+                }
+        } catch (const std::exception& e) {
+            error = e.what();
+        }
+        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::lock_guard<std::mutex> guard(build_lock);
+        if (!made && error.empty()) error = "nothing left to plan around this size";
+        built = std::move(made); build_error = error; build_seconds = seconds; build_done = true; build_oom = false;
+    });
+}
+
+// The image heap for the network memory the running runtime is in: asked for in the background when the frame size
+// moves (Runtime::image_heap_wanted), handed over here when made.
+void Session::Impl::heap_poll() {
+    {
+        std::lock_guard<std::mutex> guard(heap_lock);
+        if (heap_done) {
+            heap_done = false; heap_busy = false;
+            if (heap_thread.joinable()) heap_thread.join();
+            for (auto& e : cache)
+                if (e.runtime->network_id() == heap_for) { e.runtime->adopt_image_heap(heap_made); break; }
+            if (!heap_made) log("[nr] the image heap for the changing frame size could not be made");
+            heap_made.reset();
+        }
+        if (heap_busy) return;
+    }
+    if (!runtime || !drs_active()) return;
+    const uint64_t region = runtime->image_heap_wanted();
+    if (!region) return;
+    heap_busy = true; heap_for = runtime->network_id();
+    const HostDevice host = make_host();
+    heap_thread = std::thread([this, host, region] {
+        auto made = allocate_image_heap(host, region);
+        std::lock_guard<std::mutex> guard(heap_lock);
+        heap_made = std::move(made); heap_done = true;
+    });
+}
+
+// [Network] Resize History = 1: the feature's history from the runtime at its previous size, scaled into the one it
+// runs on now, instead of starting afresh (Runtime::carry_history). False: a fresh start (Reset), as NVIDIA's DLL.
+bool Session::Impl::carry(VkCommandBuffer cmd, uint64_t feature) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - resize_history_read > std::chrono::seconds(1)) {
+        resize_history_read = now;
+        std::string v = nr::ini_network_key(root + "\\dlssnr-amd.ini", "resize history");
+        for (auto& c : v) c = char(std::tolower(static_cast<unsigned char>(c)));
+        const bool on = v == "1" || v == "true" || v == "on" || v == "yes";
+        if (on != resize_history)
+            log("[nr] Resize History = %d: a feature at a new size %s", on ? 1 : 0,
+                on ? "keeps its history, scaled to the new size" : "starts its history afresh (as NVIDIA)");
+        resize_history = on;
+    }
+    if (!resize_history || !runtime || !feature) return false;
+    const auto it = feature_prev_runtime.find(feature);
+    if (it == feature_prev_runtime.end() || !it->second || it->second == runtime) return false;
+    const Runtime* prev = it->second;
+    bool alive = false;   // still ours: resident, or retired and not yet freed
+    for (const auto& e : cache) alive |= e.runtime.get() == prev;
+    for (const auto& r : retired) alive |= r.runtime.get() == prev;
+    if (!alive) return false;
+    const bool ok = runtime->carry_history(cmd, *prev, feature);
+    if (ok && ++carried <= 4)
+        log("[nr] feature #%u: history carried over to the new size (Resize History = 1)%s", unsigned(feature),
+            carried == 4 ? "; not logged again" : "");
+    return ok;
+}
+
+// What can run in this run, from the files installed, this build and the game's device; a UI shows the reason
+// beside a network that cannot, and the hotkey skips it. A build that falls back later says more (network_note).
+void Session::Impl::check_availability() {
+    if (!handles.device) return;
+    availability_checked = true;
+    auto exists = [&](const char* rel) {
+        const DWORD a = GetFileAttributesA((root + "\\" + rel).c_str());
+        return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
+    };
+    if (!exists("dlssnr-amd\\dlssnr-small.bin"))
+        net_switch.unavailable(nr::kSmallFp8, "needs the model of the 310.9.16 nvngx_dlssnr.dll (install.sh --dll)");
+    if (!exists("dlssnr-amd\\dlssnr.bin"))
+        net_switch.unavailable(nr::kSilverAardwold, "the model file is missing (run install.sh again)");
+#if NR_INT4
+    if (!exists("dlssnr-amd\\dlssnr.bin"))
+        net_switch.unavailable(nr::kSilverAardwoldInt4, "the model file is missing (run install.sh again)");
+    else if (!exists("dlssnr-amd\\int4\\settings.txt"))
+        net_switch.unavailable(nr::kSilverAardwoldInt4, "not installed (run install.sh again)");
+    else if (!exists("dlssnr-amd\\dlssnr-int4.bin"))
+        net_switch.unavailable(nr::kSilverAardwoldInt4, "its weights were not made at install (run install.sh again)");
+    else if (!vkGetDeviceProcAddr(handles.device, "vkCreatePipelineBinariesKHR"))
+        net_switch.unavailable(nr::kSilverAardwoldInt4, "start the game with the INT4 launch option install.sh printed");
+#else
+    net_switch.unavailable(nr::kSilverAardwoldInt4, "not in this build");
+#endif
 }
 
 void Session::Impl::release_output() {
@@ -1322,6 +2401,7 @@ void Session::set_white_point(float v) {
 }
 
 void Session::set_native_compose(bool v) { impl_->native_compose = v; }
+void Session::set_motion_point(bool v) { impl_->motion_point = v; }
 
 void Session::set_max_passes(uint32_t v) {
     // One pass: a network built for exactly one, whose single-pass paths (history
@@ -1348,9 +2428,18 @@ void Session::set_history_strength(float v) {
 }
 
 Session::~Session() {
+    {
+        const uint64_t r = impl_->ran_total + impl_->ran, p = impl_->passed_total + impl_->passed;
+        if (r + p)
+            log("[nr] session: %llu evaluations ran the network, %llu passed the frame through", (unsigned long long)r,
+                (unsigned long long)p);
+    }
     // A build still running owns nothing the session is about to destroy, but
     // it will hand back a runtime that must be destroyed too: wait for it.
     if (impl_->build_thread.joinable()) impl_->build_thread.join();
+    if (impl_->heap_thread.joinable()) impl_->heap_thread.join();
+    if (impl_->offload_thread.joinable()) impl_->offload_thread.join();
+    impl_->heap_made.reset();
     impl_->built.reset();
     impl_->runtime = nullptr;
     impl_->cache.clear();
@@ -1361,6 +2450,8 @@ Session::~Session() {
     if (impl_->stage_timing) vkDestroyQueryPool(impl_->handles.device, impl_->stage_timing, nullptr);
     // Screenshot readbacks: the worker may still be reading one it was handed (it finishes on its own).
     if (impl_->shot) impl_->shot_free(*impl_->shot);
+    for (auto& d : impl_->diag)   // NR_DIAG_EXPOSURE: a slot still in flight stays allocated
+        if (!d.pending || vkGetEventStatus(impl_->handles.device, d.done) == VK_EVENT_SET) impl_->diag_free(d);
     for (auto& sh : impl_->shots_out) {
         for (int i = 0; i < 500 && sh->handed && !sh->read.load(std::memory_order_acquire); ++i) Sleep(10);
         if (!sh->handed || sh->read.load(std::memory_order_acquire)) impl_->shot_free(*sh);
@@ -1409,14 +2500,20 @@ Session::State Session::state() const {
     State s;
     const auto& m = *impl_;
     s.running = m.runtime != nullptr;
-    if (m.runtime) { s.model_w = m.runtime->model_width(); s.model_h = m.runtime->model_height(); }
-#if NR_INT4
-    s.running_int4 = m.runtime ? m.running_int4 : -1;
-    s.want_int4 = m.int4_want;
-    s.int4_available = !m.int4_switch.is_off();
-    s.building_int4 = m.building ? m.build_int4 : -1;
-#endif
-    s.building = m.building;
+    if (m.runtime) {
+        s.model_w = m.runtime->model_width(); s.model_h = m.runtime->model_height();
+        s.prep_ev = m.runtime->preprocess_meter().first;
+    }
+    s.running_net = m.runtime ? m.running_net : -1;
+    s.want_net = m.net_want;
+    for (int n = 0; n < nr::kNetworkChoices; ++n) s.unavailable[n] = m.net_switch.reason(n);
+    s.building_net = m.building && !m.build_plan ? m.build_net : -1;
+    s.resizes = m.resizes;
+    s.carried = m.carried;
+    s.renodx_known = m.renodx_facts_known;
+    s.renodx = m.renodx_facts;
+    s.motion_without_depth = m.runtime ? m.runtime->motion_without_depth() : m.net_switch.file().motion_without_depth;
+    s.building = m.building && !m.build_plan;   // a plan is no network to wait for
     if (m.building) {
         s.building_seconds = std::chrono::duration<float>(std::chrono::steady_clock::now() - m.build_started).count();
         s.stage = nr::g_build_stage;
@@ -1425,12 +2522,18 @@ Session::State Session::state() const {
     return s;
 }
 
-void Session::set_int4(bool on) {
-#if NR_INT4
-    impl_->int4_switch.set(on);
-#else
-    (void)on;
-#endif
+void Session::set_network(int n) { impl_->net_switch.set(n); }
+
+void Session::idle() {
+    auto& m = *impl_;
+    const auto now = std::chrono::steady_clock::now();
+    if (m.last_call == std::chrono::steady_clock::time_point{} || now - m.last_call < Impl::kNrOff) return;
+    if (!m.retired.empty()) {
+        m.retired.clear();
+        log("[nr] evicted networks freed (no evaluation for %.0f s)", std::chrono::duration<double>(now - m.last_call).count());
+    }
+    if ((!m.cache.empty() || !m.parked.empty()) && now - m.residency_checked >= Impl::kResidencyCheck)
+        m.residency(false, true);
 }
 
 uint64_t Session::create_feature() {
@@ -1444,6 +2547,7 @@ void Session::release_feature(uint64_t feature) {
     // Every network this feature may have been evaluated against holds a
     // history for it. None of them is freed here; see Runtime::release_feature.
     for (auto& e : impl_->cache) e.runtime->release_feature(feature);
+    impl_->feature_extent.erase(feature);
     const auto stage = impl_->renodx.find(feature);
     if (stage != impl_->renodx.end()) {
         for (uint32_t k = 1; k < stage->second.stack; ++k) impl_->release_everywhere(Impl::stack_feature(feature, k));
@@ -1453,9 +2557,21 @@ void Session::release_feature(uint64_t feature) {
     log("[nr] feature #%u released", static_cast<unsigned>(feature));
 }
 
+// The pixels of the game's guides' allocation (the bigger of motion and depth), 0 without them: Impl::size_hint_px.
+static uint64_t guide_pixels(const Session::EngineResources& r) {
+    uint64_t px = 0;
+    for (ID3D12Resource* g : {r.motion, r.depth})
+        if (g) {
+            const D3D12_RESOURCE_DESC d = g->GetDesc();
+            px = std::max<uint64_t>(px, uint64_t(d.Width) * d.Height);
+        }
+    return px;
+}
+
 ID3D12Resource* Session::run(ID3D12Device* device, ID3D12GraphicsCommandList* list,
                              const EngineResources& resources, const Controls& controls) {
     auto& s = *impl_;
+    s.current_feature = resources.feature;   // which network memory a new frame size prefers (Impl::inframe)
     ID3D12Resource* const colour = resources.colour;
     const D3D12_RESOURCE_STATES colour_state = resources.colour_state;
     if (s.failed || !device || !list || !colour) return nullptr;
@@ -1487,6 +2603,7 @@ ID3D12Resource* Session::run(ID3D12Device* device, ID3D12GraphicsCommandList* li
     // The network's extent is the *render* resolution, which changes with the
     // upscaler's quality preset. Rebuild rather than scale: this pass is only
     // cheap because it runs at exactly the size the game rendered.
+    s.size_hint_px = guide_pixels(resources);
     if (!s.ensure_runtime(controls, colour_vk.width, colour_vk.height, colour_vk.format,
                           !resources.colour_encoded &&
                               Session::Impl::is_linear_format(colour_vk.format)))
@@ -1504,6 +2621,7 @@ ID3D12Resource* Session::run(ID3D12Device* device, ID3D12GraphicsCommandList* li
     engine.colour = frame;
     engine.feature = resources.feature;
     engine.reset = resources.reset;
+    if (s.resized(resources.feature, frame.width, frame.height) && !s.carry(cmd, resources.feature)) engine.reset = true;
     engine.motion_scale_x = resources.motion_scale_x;
     engine.motion_scale_y = resources.motion_scale_y;
     engine.depth_inverted = resources.depth_inverted;
@@ -1566,6 +2684,7 @@ bool Session::run_after(ID3D12Device* device, ID3D12GraphicsCommandList* list,
                         const EngineResources& resources, const Controls& controls,
                         ID3D12Resource* input, D3D12_RESOURCE_STATES input_state) {
     auto& s = *impl_;
+    s.current_feature = resources.feature;   // which network memory a new frame size prefers (Impl::inframe)
     if (s.failed || !device || !list || !output) return false;
     s.status.clear();
     if (!s.ensure_d3d12_device(device)) return false;
@@ -1573,6 +2692,7 @@ bool Session::run_after(ID3D12Device* device, ID3D12GraphicsCommandList* list,
     if (!cmd) { s.status = "the command list exposes no Vulkan handle"; s.failed = true; return false; }
     const auto target = colour_handle(device, output, output_state);
     if (!target.usable()) { s.status = describe_rejection(target, "output"); return false; }
+    s.size_hint_px = guide_pixels(resources);
     if (!s.ensure_runtime(controls, target.width, target.height, target.format,
                           !resources.colour_encoded &&
                               Session::Impl::is_linear_format(target.format))) return false;
@@ -1618,6 +2738,7 @@ bool Session::run_after(ID3D12Device* device, ID3D12GraphicsCommandList* list,
         fill(&engine.depth, resource_handle(device, resources.depth, resources.depth_state)))
         apply_guide_subrect(&engine.depth, resources.depth_subrect, "depth", &engine.depth_x, &engine.depth_y);
     if (input && !motion_vk) return false;   // the plain path works in place: the caller seeds
+    if (s.resized(resources.feature, frame.width, frame.height) && !s.carry(cmd, resources.feature)) engine.reset = true;
     // Full memory barriers on either side of the network, because the caller's
     // barriers are vkd3d's translation of D3D12 resource states and know
     // nothing about ours. Its "UAV -> SRV" on the output waits for compute
@@ -1878,6 +2999,13 @@ bool Session::Impl::record_renodx(VkCommandBuffer cmd, renodx::Stage& stage, con
     const bool timed = stage_timing_ready();
     const uint32_t slot = stage_slot, base = slot * kStageQueries;
     uint32_t timed_passes = 0;
+    // NR_DIAG_EXPOSURE: the game's exposure and the frame before NR (before the stage's own transitions).
+    diag_begin(rs, rf, engine.reset);
+    if (exposure)
+        diag_copy(cmd, 0, exposure->image, exposure->format, 1, 1, exposure->usage,
+                  exposure->before, exposure->before_stage, exposure->before_access);
+    diag_copy(cmd, 1, colour.image, colour.format, colour.width, colour.height, colour.usage, colour.before,
+              colour.before_stage, colour.before_access);
     // RenoDX's NR screenshot. The final picture before and after NR: the presented frame on the ReShade route,
     // OptiScaler's finished picture on its route (NR moved there for the capture, nr_pe_optifix.cpp; `clean`: no NR
     // ran on it inline). The model's input and output: the last pass's, after it ran.
@@ -1925,6 +3053,12 @@ bool Session::Impl::record_renodx(VkCommandBuffer cmd, renodx::Stage& stage, con
         if (time_net) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, stage_timing, base + 2 + 2 * timed_passes);
         runtime->record_engine(cmd, e, pass_controls(k));
         if (time_net) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, stage_timing, base + 3 + 2 * timed_passes++);
+        if (k == 0) {
+            diag_copy(cmd, 2, proxy.image, proxy.format, proxy.width, proxy.height, proxy.usage, proxy.after,
+                      proxy.after_stage, proxy.after_access);
+            diag_copy(cmd, 3, neural.image, neural.format, neural.width, neural.height, neural.usage, neural.after,
+                      neural.after_stage, neural.after_access);
+        }
         // RenoDX's model diagnostic: the last pass's proxy and network output, sRGB previews (not the displayed frame).
         if (model_capture && k + 1 == passes && !shot && proxy.format == neural.format && proxy.width == neural.width &&
             proxy.height == neural.height && screenshot::readable(proxy.format)) {
@@ -1955,6 +3089,11 @@ bool Session::Impl::record_renodx(VkCommandBuffer cmd, renodx::Stage& stage, con
     }
     try {
         stage.record(cmd, sf, network);
+        renodx_facts = stage.facts();
+        renodx_facts_known = true;
+        diag_copy(cmd, 4, output.image, output.format, output.width, output.height, output.usage, output.after,
+                  output.after_stage, output.after_access);
+        diag_end(cmd);
         if (capture) {
             shot_copy(cmd, *capture, output.image, output.after, output.after_stage, output.after_access, capture->bytes);
             shot_recorded(cmd, std::move(capture));
@@ -1985,6 +3124,7 @@ bool Session::run_renodx(ID3D12Device* device, ID3D12GraphicsCommandList* list,
                          const EngineResources& resources, const Controls& controls,
                          ID3D12Resource* input, D3D12_RESOURCE_STATES input_state, const RenoDXFrame& rf) {
     auto& s = *impl_;
+    s.current_feature = resources.feature;   // which network memory a new frame size prefers (Impl::inframe)
     if (s.failed || !device || !list || !output || !input) return false;
     if (!resources.motion && Impl::renodx_needs_motion(rf)) return false;
     s.status.clear();
@@ -2008,7 +3148,9 @@ bool Session::run_renodx(ID3D12Device* device, ID3D12GraphicsCommandList* list,
                     resources.motion_subrect.height ? resources.motion_subrect.height : motion_vk.height,
                     rf.settings, &nw, &nh);
     Controls c;
-    if (!s.renodx_runtime(controls, nw, nh, &c)) return false;
+    // NR off (NeuralUplift): the stage copies the frame through and never asks for the network - none is made or
+    // kept in use for it, so [Network] Residency sees NR off
+    if (rf.settings.nr_enabled && !s.renodx_runtime(controls, nw, nh, &c)) return false;
     renodx::Stage* stage = s.renodx_stage(resources.feature, w, h, nw, nh, target.format, rf);
     if (!stage) return false;
     ColourFrame colour{}, out{};
@@ -2036,7 +3178,35 @@ bool Session::run_renodx(ID3D12Device* device, ID3D12GraphicsCommandList* list,
                              0, 1, &mb, 0, nullptr, 0, nullptr);
     };
     ColourFrame exposure{};
-    const bool have_exposure = rf.exposure && fill(&exposure, resource_handle(device, rf.exposure, rf.exposure_state));
+    ResourceHandle exposure_vk = rf.exposure ? resource_handle(device, rf.exposure, rf.exposure_state) : ResourceHandle{};
+    // An exposure is a float (DLSS's ExposureTexture, as OptiScaler reads it); a typeless one is read as its float
+    // format. Safe for any VkFormat vkd3d-proton made it (R32_TYPELESS: R32_UINT): the stage copies its texel
+    // (vkCmdCopyImage, same size class) into its own image of this format.
+    bool exposure_typeless = false;
+    if (exposure_vk.image && exposure_vk.format == VK_FORMAT_UNDEFINED) {
+        switch (exposure_vk.dxgi) {
+            case DXGI_FORMAT_R32_TYPELESS: exposure_vk.format = VK_FORMAT_R32_SFLOAT; break;
+            case DXGI_FORMAT_R16_TYPELESS: exposure_vk.format = VK_FORMAT_R16_SFLOAT; break;
+            case DXGI_FORMAT_R32G32B32A32_TYPELESS: exposure_vk.format = VK_FORMAT_R32G32B32A32_SFLOAT; break;
+            default: break;
+        }
+        exposure_typeless = exposure_vk.format != VK_FORMAT_UNDEFINED;
+    }
+    const bool have_exposure = rf.exposure && fill(&exposure, exposure_vk);
+    {   // what became of the game's exposure texture, once per outcome (the stage's feed line says only "none")
+        static int logged = -1;
+        const int outcome = !rf.exposure ? 0 : have_exposure ? 1 : 2;
+        if (outcome != logged) {
+            logged = outcome;
+            if (outcome == 0) log("[nr] RenoDX stage: OptiScaler handed no exposure texture with this frame");
+            else if (outcome == 1) log("[nr] RenoDX stage: the game's exposure texture read (DXGI format %u, %ux%u%s)",
+                                       unsigned(exposure_vk.dxgi), exposure_vk.width, exposure_vk.height,
+                                       exposure_typeless ? ", typeless: read as float" : "");
+            else log("[nr] RenoDX stage: the game's exposure texture could not be read (DXGI format %u, %ux%u, %s)",
+                     unsigned(exposure_vk.dxgi), exposure_vk.width, exposure_vk.height,
+                     exposure_vk.image ? "a format not mapped" : "no Vulkan image");
+        }
+    }
     everything(VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
     if (!s.record_renodx(cmd, *stage, colour, out, engine, c, rf, have_exposure ? &exposure : nullptr)) return false;
     everything(VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
@@ -2050,6 +3220,7 @@ bool Session::run_present(ID3D12Device* device, ID3D12GraphicsCommandList* list,
                           ID3D12Resource* back_buffer, unsigned width, unsigned height,
                           const Controls& controls) {
     auto& s = *impl_;
+    s.current_feature = 0;   // which network memory a new frame size prefers (Impl::inframe)
     if (s.failed || !device || !list || !back_buffer) return false;
     s.status.clear();
     if (!s.ensure_d3d12_device(device)) return false;
@@ -2080,6 +3251,7 @@ bool Session::run_present(ID3D12Device* device, ID3D12GraphicsCommandList* list,
 
 bool Session::run_d3d11(const D3D11Frame& frame, const Controls& controls) {
     auto& s = *impl_;
+    s.current_feature = 0;   // which network memory a new frame size prefers (Impl::inframe)
     if (s.failed || !frame.device || !frame.target) return false;
     s.status.clear();
 
@@ -2141,7 +3313,7 @@ bool Session::run_d3d11(const D3D11Frame& frame, const Controls& controls) {
         const auto mv = frame.motion ? d3d11_image(frame.motion, frame.device) : decltype(d3d11_image(frame.motion, frame.device)){};
         uint32_t nw = target.width, nh = target.height;
         s.renodx_extent(0, target.width, target.height, mv.width, mv.height, frame.renodx->settings, &nw, &nh);
-        if (!s.renodx_runtime(controls, nw, nh, &renodx_controls)) return false;
+        if (frame.renodx->settings.nr_enabled && !s.renodx_runtime(controls, nw, nh, &renodx_controls)) return false;
         if (!(renodx_stage = s.renodx_stage(0, target.width, target.height, nw, nh, target.format, *frame.renodx)))
             return false;
     } else if (!s.ensure_runtime(controls, target.width, target.height, target.format,
@@ -2163,7 +3335,7 @@ bool Session::run_d3d11(const D3D11Frame& frame, const Controls& controls) {
 
     EngineFrame engine{};
     engine.colour = colour;
-    engine.reset = frame.reset;
+    engine.reset = frame.reset || s.resized(0, colour.width, colour.height);
     engine.motion_scale_x = frame.motion_scale_x;
     engine.motion_scale_y = frame.motion_scale_y;
     engine.depth_inverted = frame.depth_inverted;
@@ -2221,6 +3393,7 @@ bool Session::run_present_vulkan(const DeviceHandles& handles, VkQueue queue, ui
                                  VkSemaphore* signalled, bool temporal,
                                  const Controls& controls) {
     auto& s = *impl_;
+    s.current_feature = 0;   // which network memory a new frame size prefers (Impl::inframe)
     if (s.failed || !image || !queue || !handles.valid() || !signalled) return false;
     s.status.clear();
     s.handles = handles;
@@ -2340,6 +3513,7 @@ VkImageView Session::vulkan_output_view() const { return impl_->vk_output_view; 
 VkImage Session::run_vulkan(const DeviceHandles& handles, VkCommandBuffer cmd,
                             const VulkanFrame& frame, const Controls& controls) {
     auto& s = *impl_;
+    s.current_feature = frame.feature;   // which network memory a new frame size prefers (Impl::inframe)
     if (s.failed || !cmd || !frame.colour || !handles.valid()) return VK_NULL_HANDLE;
     s.status.clear();
     s.handles = handles;
@@ -2359,7 +3533,8 @@ VkImage Session::run_vulkan(const DeviceHandles& handles, VkCommandBuffer cmd,
                         frame.motion_subrect.width ? frame.motion_subrect.width : frame.motion_width,
                         frame.motion_subrect.height ? frame.motion_subrect.height : frame.motion_height,
                         frame.renodx->settings, &nw, &nh);
-        if (!s.renodx_runtime(controls, nw, nh, &renodx_controls)) return VK_NULL_HANDLE;
+        if (frame.renodx->settings.nr_enabled && !s.renodx_runtime(controls, nw, nh, &renodx_controls))
+            return VK_NULL_HANDLE;
         if (!(renodx_stage = s.renodx_stage(frame.feature, frame.width, frame.height, nw, nh, frame.colour_format,
                                             *frame.renodx)))
             return VK_NULL_HANDLE;
@@ -2368,6 +3543,8 @@ VkImage Session::run_vulkan(const DeviceHandles& handles, VkCommandBuffer cmd,
         if (!s.ensure_vk_output(frame.width, frame.height, frame.colour_format))
             return VK_NULL_HANDLE;
     }
+    s.size_hint_px = std::max(uint64_t(frame.motion ? frame.motion_width : 0) * (frame.motion ? frame.motion_height : 0),
+                              uint64_t(frame.depth ? frame.depth_width : 0) * (frame.depth ? frame.depth_height : 0));
     if (!s.ensure_runtime(controls, frame.width, frame.height, frame.colour_format,
                           (frame.upscaler_input || frame.linear_hdr) &&
                               Session::Impl::is_linear_format(frame.colour_format)))
@@ -2400,6 +3577,7 @@ VkImage Session::run_vulkan(const DeviceHandles& handles, VkCommandBuffer cmd,
     }
     engine.feature = frame.feature;
     engine.reset = frame.reset;
+    if (s.resized(frame.feature, frame.width, frame.height) && !s.carry(cmd, frame.feature)) engine.reset = true;
     engine.motion_scale_x = frame.motion_scale_x;
     engine.motion_scale_y = frame.motion_scale_y;
     engine.depth_inverted = frame.depth_inverted;
