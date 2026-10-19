@@ -5898,6 +5898,7 @@ int main(int argc, char** argv) try {
     auto& steps = S.steps; auto& x_src = S.x_src; auto& run = S.run;
     auto& reader_tokens = S.reader_tokens;
     auto& persist_err = S.persist_err;
+    auto& vit_first = S.vit_first; auto& vit_last = S.vit_last; auto& vit_last_layer = S.vit_last_layer;
     const bool host_boundary = S.host_boundary;
     auto& in_w = S.in_w; auto& in_h = S.in_h;
     auto& out_w = S.out_w; auto& out_h = S.out_h;

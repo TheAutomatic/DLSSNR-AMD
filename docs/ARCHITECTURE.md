@@ -107,14 +107,14 @@ and `SetColorSpace1` in the system's `dxgi.dll` (`windows/src/pe/nr_pe_menu.cpp`
 swap chain wrapper, so the menu lands on the frame after OptiScaler's menu and frame generation. The
 addresses come from `dlssnr-amd\nr_present_probe.exe`, which makes D3D12 and D3D11 swap chains in a
 process of its own and writes each method as a module path and offset: a swap chain made inside the game
-would be seen, and kept, by the hooks OptiScaler has there. While open, the menu is drawn with Dear ImGui
-(D3D11 or D3D12 backend, on the swap chain's device) into an 8-bit image of its own and laid
-over the back buffer in the swap chain's encoding (SDR, scRGB or HDR10, from `SetColorSpace1` and the
-format). Its contents are Linux's (`windows/src/ui/nr_control_ui.hpp`); status comes from the core in the
+would be seen, and kept, by the hooks OptiScaler has there. While open (and, closed, while the OSD of the
+running network is due), the menu is drawn with Dear ImGui (D3D11 or D3D12 backend, on the swap chain's
+device) into an 8-bit image of its own and laid over the back buffer in the swap chain's encoding (SDR,
+scRGB or HDR10, from `SetColorSpace1` and the format). Its contents are Linux's (`windows/src/ui/nr_control_ui.hpp`); status comes from the core in the
 same process, settings go through `dlssnr-amd.ini`, and keyboard and mouse come from the game window.
 
 The Windows version runs the same network through AMD's Windows shader compiler, which produces slower
-code for the largest kernels than Mesa's ACO does on Linux. With `[Network] ACO Mode = 1` it imports
+code for the largest kernels than Mesa's ACO does on Linux. With `[Network] ACO Mode = 1` (the default) it imports
 machine code made by ACO for the Linux shaders instead (`windows/data/aco/records`; int4 mixed's in
 `windows/data/aco/int4`), through
 `VK_KHR_pipeline_binary`: the driver compiles a shader with the same interface to get its pipeline

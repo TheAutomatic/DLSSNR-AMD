@@ -8,7 +8,7 @@ graphics cards.
   Version 310.9.16 holds two models: the 310.9.16 new model, its default and faster, and the 310.8.0 old
   model, so from 310.9.16 alone the installer installs both. Since 0.0.6-linux-preview (Linux) and
   0.0.6-win-preview-alpha (Windows) the 310.9.16 new model runs by default; the 310.8.0 old model stays selectable
-  (see [The model](#the-model)). On Linux since 0.0.7 the networks carry the names in NVIDIA's DLL -
+  (see [The model](#the-model)). Since 0.0.7 the networks carry the names in NVIDIA's DLL -
   `CC_SMALL_FP8` (the 310.9.16 new model), `CC_SILVER_AARDWOLD` (the 310.8.0 old model) and
   `CC_SILVER_AARDWOLD_INT4_MIXED` ([int4 mixed](#int4-mixed-optional)) - and all three can be switched in game.
 - The Linux build with the 310.9.16 new model, on an RX 9070 XT, checked against NVIDIA's own `nvngx_dlssnr.dll`
@@ -28,11 +28,11 @@ graphics cards.
   pictures and data: [docs/ngx-verification/310.8.0](docs/ngx-verification/310.8.0/NGX-VERIFICATION.md).
 - **Tested only on an RX 9070 XT.** Other cards are not guaranteed to work.
 - **The Windows version is an experimental preview and has not been tested much.** Game crashes,
-  driver resets and other unexpected problems can happen. With its default settings the network is
-  slower than on Linux. With [ACO Mode](#windows-experimental-preview) it loads machine code that was
-  made in advance with Mesa's ACO compiler (the Linux driver's compiler) and ships in the package, and
-  comes close to Linux (see [Performance](#performance)). ACO Mode has been tested on one driver version only (AMD Software
-  26.9.2); see [Windows](#windows-experimental-preview). Since 0.0.5-win-preview it has
+  driver resets and other unexpected problems can happen. With [ACO Mode](#windows-experimental-preview)
+  (on by default since 0.0.7) it loads machine code that was made in advance with Mesa's ACO compiler (the
+  Linux driver's compiler) and ships in the package, and comes close to Linux (see [Performance](#performance));
+  with the AMD driver's own compiler the network is slower. ACO Mode has been tested on one driver version only
+  (AMD Software 26.9.2); see [Windows](#windows-experimental-preview). Since 0.0.5-win-preview it has
   [int4 mixed](#int4-mixed-optional), the [RenoDX style](#renodx-style-optional) and
   [NR Control](#nr-control-optiscaler-route) as well.
 - **Also worth a try:** [TheAutomatic/dlss-5-amd-project](https://github.com/TheAutomatic/dlss-5-amd-project)
@@ -72,7 +72,7 @@ these logs:
 | Platform | Needs | State |
 | --- | --- | --- |
 | **Linux** (Steam / Proton) | Mesa 26.2 or newer, a recent Proton | The main version, used in games. |
-| **Windows** | AMD Software 26.9.2 (tested) | **Experimental preview, not tested much.** Slower than Linux by default, close to it with ACO Mode; game crashes, driver resets and other problems can happen. |
+| **Windows** | AMD Software 26.9.2 (tested) | **Experimental preview, not tested much.** Close to Linux with ACO Mode (the default), slower with the driver's own compiler; game crashes, driver resets and other problems can happen. |
 
 Both need an RX 9000 series (RDNA4) card; older cards (RX 7000 and earlier) lack the FP8 matrix
 instructions the network needs.
@@ -140,11 +140,12 @@ on Windows. Any route can also use the [RenoDX style](#renodx-style-optional).
 
 On the OptiScaler route, End opens NR Control, this project's own NR menu. On Linux it is a Vulkan layer
 in the game folder (the installer's launch options name it); on Windows the NR DLL draws it over the
-game's DirectX 11 or 12 swap chain, with nothing to set up. On Linux it has the network selection,
-Preprocess, the `[Network]` settings (how inactive networks are kept in memory, an on-screen display of the
-running network, and the options described in [linux/package/README.txt](linux/package/README.txt)) and an
-Engine data panel that shows what the network actually gets from the game (colour format and encoding,
-exposure, motion vectors), for troubleshooting; on Windows it has the int4 mixed and Preprocess switches.
+game's DirectX 11 or 12 swap chain, with nothing to set up. It has the network selection, Preprocess, the
+`[Network]` settings (how inactive networks are kept in memory, an on-screen display of the running network,
+and the options described in [linux/package/README.txt](linux/package/README.txt) and
+[windows/package/README.txt](windows/package/README.txt); on Windows also ACO Mode) and an Engine data panel
+that shows what the network actually gets from the game (colour format and encoding, exposure, motion
+vectors), for troubleshooting.
 Where the other NR settings are:
 
 - RenoDX style on: also in NR Control - Intensity, Style, Local tone, Local structure, Skin structure,
@@ -213,14 +214,14 @@ The file itself explains every setting.
 
 A second network, faster than the default one (see Performance): part of its computation runs in int4,
 a lower precision than the original network uses, so its picture differs somewhat from the default
-network's. It exists for the 310.8.0 old model only. Both Linux packages and the Windows package have it. On
-Linux since 0.0.7 it is always installed as the network `CC_SILVER_AARDWOLD_INT4_MIXED`; on Windows it is chosen
-at install (after choosing the 310.8.0 old model).
+network's. It exists for the 310.8.0 old model only. Both Linux packages and the Windows package have it, and
+since 0.0.7 it is always installed as the network `CC_SILVER_AARDWOLD_INT4_MIXED`.
 
-On Windows it is choice 3 of the installer's network question (`-Network aco-int4-mixed`) and runs with
-[ACO Mode](#windows-experimental-preview) only: the AMD driver's own compiler makes slow code for the
-int4 kernels, so this version does not offer int4 mixed without ACO Mode. The rest of this section is
-about Linux; the weights and their check work the same way on Windows.
+On Windows it runs with [ACO Mode](#windows-experimental-preview) only (the default): the AMD driver's own
+compiler makes slow code for the int4 kernels, so this version does not offer int4 mixed without ACO Mode
+(it is greyed out then). It needs no layer or launch options on Windows. The rest of this section is about
+Linux; choosing it, the weights and their check work the same way on Windows (`-Model
+CC_SILVER_AARDWOLD_INT4_MIXED` in the Windows installer).
 
 - It is one of the three networks: choose it as the one a game starts with at install (`--model
   CC_SILVER_AARDWOLD_INT4_MIXED`, or `--int4` as before), or switch to it in game (the drop-down in NR
@@ -271,12 +272,13 @@ the extracted model is kept and reused for every later one. Needs `bash` and `py
 ## Install (Windows)
 
 Download `DLSSNR-AMD-Vulkan-Windows-*-preview-x86_64.zip` from the releases, unpack it and double-click
-`install.bat`. Pick the game's exe (the one that actually runs, not a launcher), then the route, the
-model (the 310.9.16 new model or the 310.8.0 old model), the network (the default network compiled by the AMD
-driver, the default network as ACO machine code, or, with the 310.8.0 old model, [int4 mixed](#int4-mixed-optional))
-and whether to use the [RenoDX style](#renodx-style-optional). The first install asks for `nvngx_dlssnr.dll`
-(310.9.16 or 310.8.0) or a zip that contains it and extracts the models (below); later installs from the same
-package do not ask again. Read
+`install.bat`. Pick the game's exe (the one that actually runs, not a launcher), then the route, whether to
+use the [RenoDX style](#renodx-style-optional), on the ReShade routes whether to use
+[LumeniteFX](https://github.com/umar-afzaal/LumeniteFX) Kernel (by Afzaal) for the motion vectors instead of
+VORT (downloaded from its author's GitHub and installed unchanged; it is not part of this project), and which
+network a game starts with (Enter = `CC_SMALL_FP8`; all three are installed and can be switched in game). The
+first install asks for `nvngx_dlssnr.dll` (310.9.16 or 310.8.0) or a zip that contains it and extracts the
+models (below); later installs from the same package do not ask again. Read
 [windows/package/README.txt](windows/package/README.txt) and [Windows](#windows-experimental-preview)
 first.
 
@@ -302,14 +304,11 @@ model, so with it both models are extracted and installed; 310.8.0 gives the 310
 - The extracted models are kept in the package's own `dlssnr-amd/`. Later installs from that package
   without `--dll` (`-Dll` on Windows) check their SHA256 and install them from there, so the extraction runs only once per
   package. With a new package, use `--dll` once more or copy those files over.
-- Every model the package has is installed. Which one runs is `[Network] Model` in `dlssnr-amd.ini`.
-  On Linux: `CC_SMALL_FP8` (the 310.9.16 new model), `CC_SILVER_AARDWOLD` (the 310.8.0 old model) or
-  `CC_SILVER_AARDWOLD_INT4_MIXED`, set at install (`--model`, or the installer's question) and switchable in
-  game; a network without its model (`CC_SMALL_FP8` from a 310.8.0 DLL) is greyed out in the menus with
-  the reason. On Windows: `small` = the 310.9.16 new model, `original` = the 310.8.0 old model, set at install
-  (`-Model new` / `old`, or the installer's question) and changeable afterwards; it takes effect after a game
-  restart. If the 310.9.16 new model is chosen but not there (a 310.8.0 DLL), the 310.8.0 old model runs and
-  the log says why.
+- Every model the package has is installed. Which network runs is `[Network] Model` in `dlssnr-amd.ini`:
+  `CC_SMALL_FP8` (the 310.9.16 new model), `CC_SILVER_AARDWOLD` (the 310.8.0 old model) or
+  `CC_SILVER_AARDWOLD_INT4_MIXED`, set at install (`--model` on Linux, `-Model` on Windows, or the installer's
+  question) and switchable in game; a network without its model (`CC_SMALL_FP8` from a 310.8.0 DLL) is greyed
+  out in the menus with the reason.
 
 Two ways to run it:
 
@@ -346,10 +345,10 @@ card, and each frame is handed between the two through shared textures and a sha
 GPU. DirectX 9 games run on Vulkan through DXVK, because D3D9 cannot share a frame with another API.
 
 **ACO Mode.** `[Network] ACO Mode` in `dlssnr-amd.ini` chooses where the network's machine code comes
-from. Off (`ACO Mode = 0`, the default): the AMD driver compiles the network. On (`ACO Mode = 1`): the
-package carries the network as machine code made in advance with Mesa's ACO compiler (the Linux
-driver's compiler), and the AMD driver loads that code instead of compiling the network. ACO's machine
-code for this network runs faster than the AMD driver's (see Performance). It takes effect when the
+from. On (`ACO Mode = 1`, the default since 0.0.7): the package carries the network as machine code made in
+advance with Mesa's ACO compiler (the Linux driver's compiler), and the AMD driver loads that code instead of
+compiling the network. Off (`ACO Mode = 0`): the AMD driver compiles the network. ACO's machine code for this
+network runs faster than the AMD driver's (see Performance). It is in NR Control too and takes effect when the
 game restarts.
 **ACO Mode has been tested on one driver version only (AMD Software 26.9.2, RX 9070 XT). With other
 drivers it may fail: game crashes, wrong pictures or driver resets. If that happens, turn it off.**
@@ -358,9 +357,10 @@ When ACO Mode cannot be used at all, NR runs as with it off and `dlssnr-amd.log`
 
 Known issues:
 
-- With ACO Mode off it is slower than the Linux version (see Performance).
+- With ACO Mode off (the AMD driver's own compiler) it is slower than the Linux version (see Performance).
 - The first time NR runs in a game, the network compiles for about a minute before it takes effect
-  (on Linux about 10-20 seconds, with ACO Mode On a few seconds); this happens once for each game.
+  (on Linux about 10-20 seconds; ACO Mode too has the driver compile a template of each shader, which can take
+  as long); this happens once for each game.
   Until then the picture looks as without NR, which does not mean the mod is not working: give it a
   minute.
 - DirectX 9 games run entirely on DXVK, which changes their performance and behaviour; overlays such
