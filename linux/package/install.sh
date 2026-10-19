@@ -329,6 +329,14 @@ case "$kind" in
         done
         rm -rf -- "$tmp"
         for f in nvngx.dll_dlssnr.dll nvngx_dlssnr.dll dlssnr_core.dll; do put_file "$here/optiscaler/$f" "$f"; done
+        # vulkan-1.dll forwarding to winevulkan.dll, as Proton's own: with Proton's native Vulkan loader (which Steam
+        # turns on for some games) OptiScaler's menu would not show (linux/vulkan-loader/vulkan1_forwarder.c). A
+        # vulkan-1.dll the game brings itself is left alone.
+        if [[ -e "$game/vulkan-1.dll" ]]; then
+            echo "Note: the game folder has a vulkan-1.dll of its own; it is left as it is."
+        else
+            put_file "$here/optiscaler/vulkan-1.dll" vulkan-1.dll
+        fi
         # NR Control (the NR menu opened with End, a Linux Vulkan layer): recorded and removed with dlssnr-amd/
         mkdir -p -- "$game/dlssnr-amd/control"
         cp -r -- "$here/optiscaler/control/layer" "$game/dlssnr-amd/control/"
