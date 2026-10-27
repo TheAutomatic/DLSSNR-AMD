@@ -304,7 +304,7 @@ struct TemporalConfig {
     // 0.7397. This multiplies it; 1 is the original. 0 disables the output-side
     // blend and leaves only the pre block's history features.
     float history_strength = 1.0f;
-    // Variant SPIR-V directory; empty selects ROOT/build/windows/rdna4/network/temporal.
+    // Variant SPIR-V directory; empty selects ROOT/build/windows/<arch>/network/temporal (the target's).
     // These are variants, not production binaries: the temporal build
     // verifies the shipping pre/post SPIR-V are unchanged when it builds them.
     std::string shaders;

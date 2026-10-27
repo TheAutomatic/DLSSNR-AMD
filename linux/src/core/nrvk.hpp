@@ -54,6 +54,27 @@ inline void check(VkResult r, const char* what) {
 }
 #define NRVK_CHECK(expr) ::nrvk::check((expr), #expr)
 
+// The network target this host was built for: linux/build/arch/rdna3.sh compiles with
+// NR_ARCH_RDNA3=1, arch/rdna4.sh without it. One place answers every target question — the
+// matrix operand type, whether FP8 exists at all, the name for logs — so device creation,
+// adopt and every device augmentation below ask it here instead of each keeping its own copy.
+// It is a compile-time choice: the host lowering (tile shapes, weight packing, the FP16 Twin)
+// differs with the target and one binary carries one. RDNA3 (gfx11) has no FP8 matrix
+// instructions; e4m3 values travel as FP16 through the FP16 WMMA with FP32 accumulation
+// (linux/shaders/rdna3/include/coopmm.glsl).
+#ifndef NR_ARCH_RDNA3
+#define NR_ARCH_RDNA3 0
+#endif
+inline constexpr bool nr_rdna3 = NR_ARCH_RDNA3;
+inline constexpr const char* nr_target_name() { return nr_rdna3 ? "rdna3-fp16" : "rdna4-fp8"; }
+inline constexpr bool nr_target_float8() { return !nr_rdna3; }
+// The arch directory name the build uses everywhere (arch/rdna3.sh's NR_PRODUCT_SPV is
+// build/linux/<this>/network; dev-tree fallbacks in the runtime follow it).
+inline constexpr const char* nr_target_arch_dir() { return nr_rdna3 ? "rdna3" : "rdna4"; }
+inline constexpr VkComponentTypeKHR nr_target_matrix_ab() {
+    return nr_rdna3 ? VK_COMPONENT_TYPE_FLOAT16_KHR : VK_COMPONENT_TYPE_FLOAT8_E4M3_EXT;
+}
+
 struct Buffer {
     VkBuffer handle{};
     VkDeviceMemory memory{};
@@ -93,6 +114,7 @@ struct Context {
     VkPhysicalDeviceMemoryProperties mem{};
     float timestamp_period{};
     std::string gpu_name, driver_name;
+    uint32_t gpu_vendor_id = 0, gpu_device_id = 0;   // telemetry and logs look the device up by ID
     bool device_local_host_visible = false;
     // A queue borrowed from a host API (vkd3d-proton, DXVK) is externally
     // synchronised by that API's own lock. When set, the lock is taken around
@@ -106,9 +128,12 @@ struct Context {
         NRVK_CHECK(r);
     }
 
-    // The RX 9070 XT. NR_GPU overrides with a physical-device index, which is
-    // the only reason to run on anything else: the iGPU at 1002:13c0 shares
-    // /dev/dri and would otherwise be a silent wrong answer.
+    // Which device the network runs on. NR_GPU picks by enumeration index, NR_DEVICE_ID by
+    // vendor:device (e.g. 1002:1900, the 780M) and NR_GPU_UUID by UUID — exactly one of the
+    // three, for machines where enumeration order is not stable. Without any of them the
+    // target decides: rdna4-fp8 on the RX 9070 XT, rdna3-fp16 on an AMD device whose
+    // cooperative matrix offers the FP16 form — an APU counts, and more than one candidate is
+    // an error that names them, not a silent pick. No model list decides this.
     void create() {
         VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
         app.pApplicationName = "DLSS-NR-on-AMD";
@@ -122,17 +147,74 @@ struct Context {
         std::vector<VkPhysicalDevice> devices(count);
         NRVK_CHECK(vkEnumeratePhysicalDevices(instance, &count, devices.data()));
         const char* forced = getenv("NR_GPU");
+        const char* want_id = getenv("NR_DEVICE_ID");
+        const char* want_uuid = getenv("NR_GPU_UUID");
+        if ((forced != nullptr) + (want_id != nullptr) + (want_uuid != nullptr) > 1)
+            throw std::runtime_error("set only one of NR_GPU, NR_DEVICE_ID, NR_GPU_UUID");
+        uint32_t want_vendor = 0, want_device = 0;
+        bool have_id = false;
+        if (want_id) {
+            unsigned v = 0, d = 0;
+            if (sscanf(want_id, "%x:%x", &v, &d) == 2) { want_vendor = v; want_device = d; }
+            else if (sscanf(want_id, "%x", &d) == 1) { want_device = d; }
+            else throw std::runtime_error("NR_DEVICE_ID: expected vendor:device, e.g. 1002:1900");
+            have_id = true;
+        }
+        uint8_t want_uuid_bytes[VK_UUID_SIZE]{};
+        bool have_uuid = false;
+        if (want_uuid) {
+            auto nib = [](char c) {
+                return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10
+                        : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+            };
+            int hi = -1;
+            size_t filled = 0;
+            for (const char* s = want_uuid; *s; ++s) {
+                if (*s == '-') continue;
+                int v = nib(*s);
+                if (v < 0 || filled == VK_UUID_SIZE)
+                    throw std::runtime_error("NR_GPU_UUID: expected 32 hex digits");
+                if (hi < 0) hi = v;
+                else { want_uuid_bytes[filled++] = uint8_t(hi << 4 | v); hi = -1; }
+            }
+            if (hi >= 0 || filled != VK_UUID_SIZE)
+                throw std::runtime_error("NR_GPU_UUID: expected 32 hex digits");
+            have_uuid = true;
+        }
+        auto describe = [&](uint32_t i, const VkPhysicalDeviceProperties& p, const uint8_t* uuid) {
+            char u[2 * VK_UUID_SIZE + 1];
+            for (uint32_t j = 0; j < VK_UUID_SIZE; ++j) snprintf(u + 2 * j, 3, "%02x", uuid[j]);
+            char line[384];   // worst case: a 255-byte name, the id and the uuid
+            snprintf(line, sizeof line, "#%u %s %04x:%04x uuid %s", i, p.deviceName, p.vendorID,
+                     p.deviceID, u);
+            return std::string(line);
+        };
+        std::string seen;
         for (uint32_t i = 0; i < count; ++i) {
-            VkPhysicalDeviceProperties p;
-            vkGetPhysicalDeviceProperties(devices[i], &p);
-            const bool want = forced ? (i == uint32_t(atoi(forced)))
-                                     : (p.vendorID == 0x1002 && p.deviceID == 0x7550);
+            VkPhysicalDeviceIDProperties idp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+            VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+            p2.pNext = &idp;
+            vkGetPhysicalDeviceProperties2(devices[i], &p2);
+            const VkPhysicalDeviceProperties& p = p2.properties;
+            bool want;
+            if (forced) want = i == uint32_t(atoi(forced));
+            else if (have_id) want = p.deviceID == want_device && (!want_vendor || p.vendorID == want_vendor);
+            else if (have_uuid) want = std::memcmp(idp.deviceUUID, want_uuid_bytes, VK_UUID_SIZE) == 0;
+            else if (nr_rdna3) want = p.vendorID == 0x1002 && has_matrix_config(instance, devices[i], nr_target_matrix_ab());
+            else want = p.vendorID == 0x1002 && p.deviceID == 0x7550;
             if (!want) continue;
-            if (physical) throw std::runtime_error("more than one candidate GPU; set NR_GPU");
+            if (physical)
+                throw std::runtime_error("more than one candidate GPU: " + seen + " and "
+                                         + describe(i, p, idp.deviceUUID)
+                                         + "; set NR_GPU, NR_DEVICE_ID or NR_GPU_UUID");
             physical = devices[i];
             gpu_name = p.deviceName;
+            gpu_vendor_id = p.vendorID; gpu_device_id = p.deviceID;
+            seen = describe(i, p, idp.deviceUUID);
         }
-        if (!physical) throw std::runtime_error("RX 9070 XT (1002:7550) not found; set NR_GPU");
+        if (!physical)
+            throw std::runtime_error("no candidate GPU for " + std::string(nr_target_name())
+                                     + "; set NR_GPU, NR_DEVICE_ID (e.g. 1002:1900) or NR_GPU_UUID");
 
         require_matrix_config();
 
@@ -146,10 +228,11 @@ struct Context {
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
         features.pNext = &coop; coop.pNext = &fp8; fp8.pNext = &f11; f11.pNext = &f12; f12.pNext = &f13;
         vkGetPhysicalDeviceFeatures2(physical, &features);
+        const bool no_fp8 = !nr_target_float8();
         struct { bool have; const char* name; } required[] = {
             {bool(coop.cooperativeMatrix),            "cooperativeMatrix"},
-            {bool(fp8.shaderFloat8),                  "shaderFloat8"},
-            {bool(fp8.shaderFloat8CooperativeMatrix), "shaderFloat8CooperativeMatrix"},
+            {no_fp8 || bool(fp8.shaderFloat8),                  "shaderFloat8"},
+            {no_fp8 || bool(fp8.shaderFloat8CooperativeMatrix), "shaderFloat8CooperativeMatrix"},
             {bool(f12.storageBuffer8BitAccess),       "storageBuffer8BitAccess"},
             {bool(f12.shaderFloat16),                 "shaderFloat16"},
             {bool(f12.shaderInt8),                    "shaderInt8"},
@@ -164,7 +247,9 @@ struct Context {
         coop = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
         coop.cooperativeMatrix = VK_TRUE;
         fp8 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT};
-        fp8.shaderFloat8 = VK_TRUE; fp8.shaderFloat8CooperativeMatrix = VK_TRUE;
+        // The FP8 features are the rdna4-fp8 target's; rdna3-fp16 leaves the struct zeroed in
+        // the chain — explicitly disabled, not silently absent.
+        if constexpr (nr_target_float8()) fp8.shaderFloat8 = fp8.shaderFloat8CooperativeMatrix = VK_TRUE;
         f11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
         f11.storageBuffer16BitAccess = VK_TRUE;
         f12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
@@ -222,12 +307,11 @@ struct Context {
         wml.pNext = nullptr;
         wml.workgroupMemoryExplicitLayoutScalarBlockLayout = VK_FALSE;
         if (have_wml) f13.pNext = &wml;
-        const char* exts[] = {VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME,
-                              VK_EXT_SHADER_FLOAT8_EXTENSION_NAME,
-                              VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME};
+        std::vector<const char*> ext_list{VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME};
+        if constexpr (nr_target_float8()) ext_list.push_back(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
+        if (have_wml) ext_list.push_back(VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME);
         VkDeviceCreateInfo di{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
         di.pNext = &coop; di.queueCreateInfoCount = 1; di.pQueueCreateInfos = &qi;
-        std::vector<const char*> ext_list(exts, exts + (have_wml ? 3 : 2));
         // Our pipelines ask for no robust buffer / image access (Kernel::create); the feature that allows it.
         VkPhysicalDevicePipelineRobustnessFeaturesEXT prf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT};
         {
@@ -322,8 +406,8 @@ struct Context {
         // compiles a pipeline by its own VkPipelineRobustnessCreateInfo whether or not the device enabled it.
         pipeline_robustness = prf.pipelineRobustness;
         if (!c.cooperativeMatrix)             return no("cooperativeMatrix");
-        if (!f8.shaderFloat8)                 return no("shaderFloat8");
-        if (!f8.shaderFloat8CooperativeMatrix) return no("shaderFloat8CooperativeMatrix");
+        if (nr_target_float8() && !f8.shaderFloat8)                 return no("shaderFloat8");
+        if (nr_target_float8() && !f8.shaderFloat8CooperativeMatrix) return no("shaderFloat8CooperativeMatrix");
         if (!v11.storageBuffer16BitAccess)    return no("storageBuffer16BitAccess");
         if (!v12.storageBuffer8BitAccess)     return no("storageBuffer8BitAccess");
         if (!v12.shaderFloat16)               return no("shaderFloat16");
@@ -341,6 +425,7 @@ struct Context {
         vkGetPhysicalDeviceProperties2(physical, &props);
         driver_name = std::string(drv.driverName) + " / " + drv.driverInfo;
         timestamp_period = props.properties.limits.timestampPeriod;
+        gpu_vendor_id = props.properties.vendorID; gpu_device_id = props.properties.deviceID;
         // The same requirement `create` makes, and for the same reason: the
         // coopmat properties are reported per subgroup size and every fragment
         // size in this port is a wave32 one.
@@ -435,35 +520,46 @@ struct Context {
 
     // The extensions and features a host `vkCreateDevice` has to have enabled
     // for `adopt` to succeed. A layer adds these to the application's own
-    // create info on the way through; nothing else can.
+    // create info on the way through; nothing else can. The FP8 extension is
+    // the rdna4-fp8 target's.
     static const char* const* required_device_extensions(uint32_t& n) {
-        static const char* const e[] = {VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME,
-                                        VK_EXT_SHADER_FLOAT8_EXTENSION_NAME};
-        n = 2;
-        return e;
+        static const char* const with_fp8[] = {VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME,
+                                               VK_EXT_SHADER_FLOAT8_EXTENSION_NAME};
+        static const char* const without_fp8[] = {VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME};
+        if (nr_target_float8()) { n = 2; return with_fp8; }
+        n = 1;
+        return without_fp8;
     }
 
-    // The FP8 configuration the whole port rests on. Asserting it here means a
-    // driver that quietly stops reporting it fails at startup with a name,
-    // rather than in a kernel with wrong numbers.
-    void require_matrix_config() const {
+    // The 16x16x16 subgroup configuration with FP32 accumulation the target multiplies in;
+    // the operand type comes from the target (e4m3 on gfx12, f16 on gfx11). Shared by
+    // require_matrix_config and the rdna3 default device pick.
+    static bool has_matrix_config(VkInstance inst, VkPhysicalDevice pd, VkComponentTypeKHR ab) {
         auto query = reinterpret_cast<PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR>(
-            vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR"));
-        if (!query) throw std::runtime_error("vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR absent");
+            vkGetInstanceProcAddr(inst, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR"));
+        if (!query) return false;
         uint32_t n = 0;
-        NRVK_CHECK(query(physical, &n, nullptr));
+        if (query(pd, &n, nullptr) != VK_SUCCESS || !n) return false;
         std::vector<VkCooperativeMatrixPropertiesKHR> p(
             n, {VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR});
-        NRVK_CHECK(query(physical, &n, p.data()));
+        if (query(pd, &n, p.data()) != VK_SUCCESS) return false;
         for (const auto& m : p)
             if (m.MSize == 16 && m.NSize == 16 && m.KSize == 16 &&
-                m.scope == VK_SCOPE_SUBGROUP_KHR &&
-                m.AType == VK_COMPONENT_TYPE_FLOAT8_E4M3_EXT &&
-                m.BType == VK_COMPONENT_TYPE_FLOAT8_E4M3_EXT &&
+                m.scope == VK_SCOPE_SUBGROUP_KHR && m.AType == ab && m.BType == ab &&
                 m.CType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
                 m.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR && !m.saturatingAccumulation)
-                return;
-        throw std::runtime_error("e4m3 x e4m3 -> fp32 16x16x16 subgroup config not reported");
+                return true;
+        return false;
+    }
+
+    // The configuration the whole port rests on. Asserting it here means a driver that quietly
+    // stops reporting it fails at startup with a name, rather than in a kernel with wrong numbers.
+    void require_matrix_config() const {
+        if (has_matrix_config(instance, physical, nr_target_matrix_ab())) return;
+        if (!vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR"))
+            throw std::runtime_error("vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR absent");
+        throw std::runtime_error(std::string(nr_target_name())
+                                 + ": 16x16x16 subgroup matrix configuration not reported");
     }
 
     // Arenas are plain DEVICE_LOCAL, never host-visible, and the host reaches

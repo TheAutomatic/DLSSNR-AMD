@@ -1817,7 +1817,8 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         // The temporal pre/post blocks are network kernels: the ACO bundle's own SPIR-V when it is in use.
         auto shaders = std::filesystem::canonical(temporal_config.shaders.empty()
             ? (!aco.empty() ? std::filesystem::path(aco) / "shaders/temporal"
-               : installed ? data / "shaders/temporal" : root / "build/windows/rdna4/network/temporal")
+               : installed ? data / "shaders/temporal"
+                           : root / "build/windows" / nrvk::nr_target_arch_dir() / "network/temporal")
             : std::filesystem::path(temporal_config.shaders));
 #if NR_INT4
         // The int4 network's temporal pre/post variants are built with its defines (hard-swish, whose scale

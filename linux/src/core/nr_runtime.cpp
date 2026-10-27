@@ -1798,7 +1798,8 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     if (temporal_config.enable) {
         auto& t = impl_->temporal;
         auto shaders = std::filesystem::canonical(temporal_config.shaders.empty()
-            ? (installed ? data / "shaders/temporal" : root / "build/linux/rdna4/network/temporal")
+            ? (installed ? data / "shaders/temporal"
+                         : root / "build/linux" / nrvk::nr_target_arch_dir() / "network/temporal")
             : std::filesystem::path(temporal_config.shaders));
 #if NR_INT4
         // The int4 network's temporal pre/post variants are built with its defines (hard-swish, whose scale

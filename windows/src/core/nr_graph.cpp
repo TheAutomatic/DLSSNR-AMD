@@ -6907,7 +6907,7 @@ int main(int argc, char** argv) try {
         return 0;
     }
     nrvk::Telemetry tel;
-    tel.dir = nrvk::Telemetry::find(0x1002, 0x7550);
+    tel.dir = nrvk::Telemetry::find(ctx.gpu_vendor_id, ctx.gpu_device_id);
     // `--per-layer` times every dispatch inside the real frame, rather than
     // modelling the frame as "each family's kernel, run alone, times its layer
     // count" the way a per-family frame model does. The two disagree wherever the
