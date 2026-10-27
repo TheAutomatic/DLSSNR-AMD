@@ -13,6 +13,7 @@
 #                       install.sh needs --dll
 #   NR_MODEL_SMALL=dlssnr-small.bin  with NR_MODEL: the new model too (from the 310.9.16 DLL)
 #   NR_VERSION=...      override the version (default: from the git tags, linux/build/version.sh)
+#   NR_GPU_ARCH=rdna3|rdna4  the network architecture to build (default rdna4; linux/build/arch/)
 #
 # x86_64 packages also carry int4/, the int4 mixed option install.sh adds when asked for: the programs built again
 # with NR_INT4=1 (this script with NR_INT4=1 NR_PROGRAMS_ONLY=1), the int4 network, its data, the Vulkan layer and the
@@ -36,7 +37,9 @@ reshade_inc=artifacts/ref/DLSS5-Feeder/external/reshade/include
 for dir in "$minhook" "$reshade_inc" artifacts/ref/reshade-shaders artifacts/ref/vort_Shaders; do
     [[ -d "$dir" ]] || { echo "missing reference tree: $dir" >&2; exit 1; }
 done
-source linux/build/arch/rdna4.sh
+gpu_arch=${NR_GPU_ARCH:-rdna4}
+[[ -f "linux/build/arch/$gpu_arch.sh" ]] || { echo "unknown NR_GPU_ARCH: $gpu_arch" >&2; exit 2; }
+source "linux/build/arch/$gpu_arch.sh"
 
 # ---- compile ----------------------------------------------------------------
 common=(-std=c++17 -O2 -DNDEBUG -Itoolchain/Vulkan-Headers/include -Ilinux/src -Ilinux/src/core -Ilinux/src/layer -Ilinux/src/pe -I"$out")

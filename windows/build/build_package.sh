@@ -20,6 +20,9 @@
 # networks (CC_SMALL_FP8, CC_SILVER_AARDWOLD, CC_SILVER_AARDWOLD_INT4_MIXED; int4 mixed runs with ACO Mode = 1) and
 # asks only which one a game starts with. NR_INT4=0: no int4 mixed.
 #
+# NR_GPU_ARCH (default rdna4): the network architecture to build (windows/build/arch/). rdna3 has
+# no int4 mixed yet (NR_INT4 stays available once its records exist).
+#
 # D3D10/11/12 games keep the system's own D3D: the network runs on a Vulkan device of its own and the
 # frame crosses over through shared textures and a shared fence (windows/src/pe/nr_pe_bridge.hpp).
 # Only DX9 games are translated (DXVK), because D3D9 shares neither textures nor fences.
@@ -53,7 +56,9 @@ done
 for f in "$opti_zip" artifacts/ref/reshade-6.8.0/ReShade64.dll; do
     [[ -f "$f" ]] || { echo "missing: $f" >&2; exit 1; }
 done
-source windows/build/arch/rdna4.sh
+gpu_arch=${NR_GPU_ARCH:-rdna4}
+[[ -f "windows/build/arch/$gpu_arch.sh" ]] || { echo "unknown NR_GPU_ARCH: $gpu_arch" >&2; exit 2; }
+source "windows/build/arch/$gpu_arch.sh"
 
 # ---- the ReShade add-on -----------------------------------------------------------------------
 stamp=$(bash windows/build/version.sh)
@@ -129,24 +134,30 @@ else
     bash windows/build/assemble_product_data.sh "$pkg"
 fi
 # dlssnr-amd/aco/: the network as ACO's machine code, used with [Network] ACO Mode = 1 in dlssnr-amd.ini (the
-# default): one record per pipeline (windows/data/aco/records), the Linux network the records were made from
-# (linux/build/build_network.py; a record is found by its SPIR-V's hash) and the template aliases.
+# default): one record per pipeline, the Linux network the records were made from (linux/build/build_network.py;
+# a record is found by its SPIR-V's hash) and the template aliases. gfx12 records are NRPAL001 in
+# windows/data/aco; gfx11 records are NRPAL002 in windows/data/aco/rdna3, their own directory so the two
+# formats cannot overwrite each other.
+aco_data=windows/data/aco
+[[ "$NR_GPU_ARCH" == rdna3 ]] && aco_data=windows/data/aco/rdna3
 aco="$pkg/dlssnr-amd/aco"
 mkdir -p -- "$aco/records"
 rm -rf -- "$out/aco-shaders"
-python3 linux/build/build_network.py rdna4 --out "$out/aco-shaders" > /dev/null
+python3 linux/build/build_network.py "$NR_GPU_ARCH" --out "$out/aco-shaders" > /dev/null
 cp -r -- "$out/aco-shaders" "$aco/shaders"
-cp -- windows/data/aco/records/*.nrp "$aco/records/"
-cp -- windows/data/aco/shell-aliases.txt "$aco/"
-if [[ "${NR_INT4:-1}" == 1 ]]; then
-    # int4 mixed as ACO's machine code (windows/data/aco/int4/records) and the Linux int4 network the records were
+ls -- "$aco_data"/records/*.nrp >/dev/null 2>&1 || { echo "no ACO records for $NR_GPU_ARCH in $aco_data/records" >&2; exit 2; }
+cp -- "$aco_data"/records/*.nrp "$aco/records/"
+cp -- "$aco_data/shell-aliases.txt" "$aco/"
+int4_default=1; [[ "$NR_GPU_ARCH" == rdna3 ]] && int4_default=0   # gfx11 int4 mixed lands as its own change
+if [[ "${NR_INT4:-$int4_default}" == 1 ]]; then
+    # int4 mixed as ACO's machine code ($aco_data/int4/records) and the Linux int4 network the records were
     # made from (linux/build/build_network.py --int4)
     rm -rf -- "$out/aco-shaders-int4"
-    python3 linux/build/build_network.py rdna4 --int4 --out "$out/aco-shaders-int4" > /dev/null
+    python3 linux/build/build_network.py "$NR_GPU_ARCH" --int4 --out "$out/aco-shaders-int4" > /dev/null
     mkdir -p -- "$aco/int4/records"
     cp -r -- "$out/aco-shaders-int4" "$aco/int4/shaders"
-    cp -- windows/data/aco/int4/records/*.nrp "$aco/int4/records/"
-    cp -- windows/data/aco/int4/shell-aliases.txt "$aco/int4/"
+    cp -- "$aco_data"/int4/records/*.nrp "$aco/int4/records/"
+    cp -- "$aco_data/int4/shell-aliases.txt" "$aco/int4/"
     # INT4 adds kernels whose PAL template is one of the native default shaders.
     python3 - "$aco" <<'PY'
 import sys
@@ -161,10 +172,10 @@ for file in [root / 'shell-aliases.txt', root / 'int4/shell-aliases.txt']:
         aliases[name] = shell
 (root / 'shell-aliases.txt').write_text(''.join(f'{a} {b}\n' for a, b in sorted(aliases.items())))
 PY
-    # dlssnr-amd/int4/: the int4 data (one copy for both platforms, linux/data/int4/rdna4) and the SPIR-V the ACO
-    # records belong to
+    # dlssnr-amd/int4/: the int4 data (one copy for both platforms, linux/data/int4/$NR_INT4_DATA) and the SPIR-V the
+    # ACO records belong to
     mkdir -p -- "$pkg/dlssnr-amd/int4"
-    cp -r -- linux/data/int4/rdna4/{vit,swin,settings.txt} "$pkg/dlssnr-amd/int4/"
+    cp -r -- "linux/data/int4/${NR_INT4_DATA:-rdna4}"/{vit,swin,settings.txt} "$pkg/dlssnr-amd/int4/"
     cp -r -- "$out/aco-shaders-int4" "$pkg/dlssnr-amd/int4/shaders"
     "$cxx" "${common[@]}" "${NR_PRODUCT_DEFINES[@]}" -c windows/src/tools/nr_int4_weights.cpp -o "$out/int4_weights.o"
     # The generator stops before device creation. Vulkan calls abort if this contract is broken.
@@ -175,7 +186,7 @@ PY
     "$cxx" -static -o "$out/dlssnr-int4-weights.exe" "$out/int4_weights.o" "$out/nr_native_plan.o" "$out/int4_vkstub.o"
     mkdir -p -- "$pkg/model-tools"
     cp -- "$out/dlssnr-int4-weights.exe" "$pkg/model-tools/"
-    cp -- linux/data/int4/rdna4/dlssnr-int4.sha256 "$pkg/model-tools/dlssnr-int4.sha256"
+    cp -- "linux/data/int4/${NR_INT4_DATA:-rdna4}/dlssnr-int4.sha256" "$pkg/model-tools/dlssnr-int4.sha256"
 fi
 # model-tools/: the extractor install.ps1 runs when the package has no model.
 bash windows/package/model-tools/build_extract_model.sh "$out/extract" > /dev/null

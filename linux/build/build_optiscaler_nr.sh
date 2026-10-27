@@ -46,9 +46,12 @@ stamp=$(bash linux/build/version.sh)
 common=(-std=c++17 -O2 -DNDEBUG -DNR_BUILD_STAMP="\"$stamp\"" -Itoolchain/Vulkan-Headers/include -Ilinux/src -Ilinux/src/core -Ilinux/src/layer -Ilinux/src/pe -I"$out")
 [[ "${NR_INT4:-0}" == 1 ]] && common+=(-DNR_INT4=1)   # the int4 mixed build (installed only with it; build_package.sh)
 
-# The network the package ships (linux/build/arch/rdna4.sh): the host must be built
-# with the same constants as the shaders in dlssnr-amd/shaders.
-source linux/build/arch/rdna4.sh
+# The network the package ships (linux/build/arch/<arch>.sh): the host must be built
+# with the same constants as the shaders in dlssnr-amd/shaders. NR_GPU_ARCH selects the
+# architecture (default rdna4); the recipe sets NR_PRODUCT_DEFINES for it.
+gpu_arch=${NR_GPU_ARCH:-rdna4}
+[[ -f "linux/build/arch/$gpu_arch.sh" ]] || { echo "unknown NR_GPU_ARCH: $gpu_arch" >&2; exit 2; }
+source "linux/build/arch/$gpu_arch.sh"
 "$cxx" "${common[@]}" "${NR_PRODUCT_DEFINES[@]}" -c linux/src/core/nr_runtime.cpp -o "$out/nr_runtime.o"
 "$cxx" "${common[@]}" -c linux/src/core/nr_native_plan.cpp -o "$out/nr_native_plan.o"
 "$cxx" "${common[@]}" -c linux/src/core/nr_renodx.cpp -o "$out/nr_renodx.o"

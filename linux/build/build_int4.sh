@@ -11,8 +11,12 @@ set -euo pipefail
 cd -- "$(dirname -- "$0")/../.."
 out=$(realpath -m -- "${1:?usage: build_int4.sh <out dir>}")
 case "$out" in "$(pwd)"/*) ;; *) echo 'build directory must be in the project' >&2; exit 2;; esac
-source linux/build/arch/rdna4.sh
-src=linux/data/int4/$NR_GPU_ARCH
+gpu_arch=${NR_GPU_ARCH:-rdna4}
+[[ -f "linux/build/arch/$gpu_arch.sh" ]] || { echo "unknown NR_GPU_ARCH: $gpu_arch" >&2; exit 2; }
+source "linux/build/arch/$gpu_arch.sh"
+# The calibration tables are keyed by NR_INT4_DATA, not by the shader arch: rdna3 reproduces
+# the FP8 network's e4m3 values, so it shares the rdna4 tables (its recipe sets NR_INT4_DATA).
+src=linux/data/int4/${NR_INT4_DATA:-$NR_GPU_ARCH}
 [[ -f "$src/settings.txt" ]] || { echo "missing $src" >&2; exit 1; }
 rm -rf -- "$out"; mkdir -p -- "$out/layer" "$out/gen"
 

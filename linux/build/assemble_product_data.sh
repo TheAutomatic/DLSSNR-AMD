@@ -3,7 +3,7 @@
 #
 #   dlssnr-amd/dlssnr.bin             the old model's weights (only with --model)
 #   dlssnr-amd/dlssnr-small.bin       the new model's weights (only with --small-model)
-#   dlssnr-amd/shaders/               the network (linux/build/arch/rdna4.sh)
+#   dlssnr-amd/shaders/               the network (linux/build/arch/<arch>.sh; NR_GPU_ARCH selects it)
 #   dlssnr-amd/shaders/runtime/       the passes around it
 #   dlssnr-amd/shaders/temporal/      the temporal variants and motion estimator
 #   dlssnr-amd/shaders/renodx/        the RenoDX-style option's shaders (RenoDX's own, MIT)
@@ -13,7 +13,9 @@ set -euo pipefail
 start=$PWD
 cd -- "$(dirname -- "$0")/../.."
 parent=${1:?usage: assemble_product_data.sh <parent dir> [--model dlssnr.bin [--small-model dlssnr-small.bin]]}
-source linux/build/arch/rdna4.sh
+gpu_arch=${NR_GPU_ARCH:-rdna4}
+[[ -f "linux/build/arch/$gpu_arch.sh" ]] || { echo "unknown NR_GPU_ARCH: $gpu_arch" >&2; exit 2; }
+source "linux/build/arch/$gpu_arch.sh"
 dst="$parent/dlssnr-amd"
 rm -rf -- "$dst"; mkdir -p -- "$dst/shaders/runtime" "$dst/shaders/temporal"
 

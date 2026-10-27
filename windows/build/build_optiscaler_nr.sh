@@ -45,12 +45,15 @@ python3 windows/build/generate_device_chain.py toolchain/Vulkan-Headers "$out/nr
 # The version the DLL was built from (version.sh), printed in the first line of its log. Without it there is no
 # way to tell from a game whether a fix is in the binary that ran.
 stamp=$(bash windows/build/version.sh)
+# The network the package ships (windows/build/arch/<arch>.sh): the host must be built
+# with the same constants as the shaders in dlssnr-amd/shaders. NR_GPU_ARCH selects the
+# architecture (default rdna4).
+gpu_arch=${NR_GPU_ARCH:-rdna4}
+[[ -f "windows/build/arch/$gpu_arch.sh" ]] || { echo "unknown NR_GPU_ARCH: $gpu_arch" >&2; exit 2; }
+source "windows/build/arch/$gpu_arch.sh"
 common=(-std=c++17 -O2 -DNDEBUG -DNR_BUILD_STAMP="\"$stamp\"" -Itoolchain/Vulkan-Headers/include -Iwindows/src -Iwindows/src/core -Iwindows/src/pe -I"$out")
-[[ "${NR_INT4:-1}" == 1 ]] && common+=(-DNR_INT4=1)
-
-# The network the package ships (windows/build/arch/rdna4.sh): the host must be built
-# with the same constants as the shaders in dlssnr-amd/shaders.
-source windows/build/arch/rdna4.sh
+int4_default=1; [[ "$NR_GPU_ARCH" == rdna3 ]] && int4_default=0   # gfx11 int4 mixed lands as its own change
+[[ "${NR_INT4:-$int4_default}" == 1 ]] && common+=(-DNR_INT4=1)
 "$cxx" "${common[@]}" "${NR_PRODUCT_DEFINES[@]}" -c windows/src/core/nr_runtime.cpp -o "$out/nr_runtime.o"
 "$cxx" "${common[@]}" -c windows/src/core/nr_native_plan.cpp -o "$out/nr_native_plan.o"
 "$cxx" "${common[@]}" -c windows/src/core/nr_renodx.cpp -o "$out/nr_renodx.o"
