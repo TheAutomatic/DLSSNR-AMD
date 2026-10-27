@@ -168,8 +168,14 @@ static std::vector<uint32_t> g_tc_words;
 static std::vector<size_t> g_tc_err;   // error words, as indices into g_tc_words
 static size_t g_tc_base = 0;
 static bool tchain_active() {
+    if (!NR_TCHAIN_TILES || g_chain_epoch_word == 0xFFFFFFFFu) return false;
     const char* e = std::getenv("NR_TCHAIN");
-    return NR_TCHAIN_TILES && !(e && *e && std::atoi(e) == 0) && g_chain_epoch_word != 0xFFFFFFFFu;
+#if NR_ARCH_RDNA3
+    // RDNA3 initial default: explicit barriers. Chaining is opt-in via NR_TCHAIN=1.
+    return e && *e && std::atoi(e) != 0;
+#else
+    return !(e && *e && std::atoi(e) == 0);
+#endif
 }
 // Which barriers a tile counter replaces. C=512: attn -> its projection ->
 // ffwd3 -> FFN projection -> attn. ViT: expand -> contraction -> QKV, and

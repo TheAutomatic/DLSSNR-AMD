@@ -108,10 +108,16 @@ struct Record {
     uint64_t spv_hash=0,code_hash=0;
     uint32_t rsrc1=0,rsrc2=0,rsrc3=0,exec=0,wg=0,shared=0,push_bytes=0,user=0;
     int set0=-1,push=-1,grid=-1;
+    uint32_t mach=0;
+    uint32_t scratch_bytes=0;
+    bool scratch_en=false;
     std::vector<std::pair<int,int>> inlines;
     Bytes code;
     static Record parse(const Bytes& b) {
-        range(b,0,96); require(std::memcmp(b.data(),"NRPAL001",8)==0,"bad adapter record version");
+        range(b,0,96);
+        bool v1 = std::memcmp(b.data(),"NRPAL001",8)==0;
+        bool v2 = std::memcmp(b.data(),"NRPAL002",8)==0;
+        require(v1 || v2, "bad adapter record version");
         Record r;r.spv_hash=read<uint64_t>(b,8);r.code_hash=read<uint64_t>(b,16);
         r.rsrc1=read<uint32_t>(b,24);r.rsrc2=read<uint32_t>(b,28);r.rsrc3=read<uint32_t>(b,32);
         r.exec=read<uint32_t>(b,36);r.wg=read<uint32_t>(b,40);r.shared=read<uint32_t>(b,44);
@@ -119,11 +125,24 @@ struct Record {
         r.set0=read<int32_t>(b,56);r.push=read<int32_t>(b,60);r.grid=read<int32_t>(b,64);
         auto n=read<uint32_t>(b,68),sz=read<uint32_t>(b,72);
         require(n<=32 && sz && sz%4==0 && uint64_t(96)+8*n+sz==b.size(),"adapter record sizes");
-        for(size_t i=76;i<96;++i)require(b[i]==0,"adapter reserved field");
+        if (v1) {
+            for(size_t i=76;i<96;++i)require(b[i]==0,"adapter reserved field");
+            r.mach = 0;
+            r.scratch_bytes = 0;
+            r.scratch_en = false;
+        } else {
+            r.mach = read<uint32_t>(b,76);
+            r.scratch_bytes = read<uint32_t>(b,80);
+            r.scratch_en = (r.rsrc2 & 1) != 0;
+            for(size_t i=84;i<96;++i)require(b[i]==0,"adapter reserved field");
+            if (r.scratch_en) {
+                require(r.scratch_bytes > 0, "scratch_en set but scratch_bytes is 0");
+            }
+        }
         for(unsigned i=0;i<n;++i)r.inlines.emplace_back(read<int32_t>(b,96+8*i),read<int32_t>(b,100+8*i));
         r.code=Bytes(b.begin()+96+8*n,b.end());
         require(hash(r.code.data(),r.code.size())==r.code_hash,"adapter code checksum");
-        require(!(r.rsrc2&~uint32_t(0x00ff9fbe)) && !(r.rsrc3&~uint32_t(0xff0)) &&
+        require(!(r.rsrc2&~uint32_t(0x00ff9fbf)) && !(r.rsrc3&~uint32_t(0xff0)) &&
                 r.user==((r.rsrc2>>1)&31),"unsupported scratch/config");
         require(r.exec && r.exec<=sz && r.exec%4==0 && r.wg && r.wg<=1024 && r.push_bytes<=128,"adapter resource limits");
         // GFX12 rounds the shader's LDS use up to a 1 KiB allocation.
@@ -186,12 +205,19 @@ inline Bytes prologue(const Record& r, unsigned descriptor_slot = 33, uint32_t m
     };
     for(auto [dst,src]:a.moves)mov(dst,src+shift);
     if (mach == 0x41 || mach == 0x44 || mach == 0x46 || mach == 0x47) {
-        if (a.user > r.user) {
-            unsigned pal_tgid = a.user;
-            unsigned aco_tgid = r.user;
-            if ((r.rsrc2 >> 7) & 1) mov(aco_tgid++, pal_tgid++);
-            if ((r.rsrc2 >> 8) & 1) mov(aco_tgid++, pal_tgid++);
-            if ((r.rsrc2 >> 9) & 1) mov(aco_tgid++, pal_tgid++);
+        std::vector<std::pair<unsigned, unsigned>> tgid_moves;
+        unsigned pal_tgid = a.user + shift;
+        unsigned aco_tgid = r.user;
+        if ((r.rsrc2 >> 7) & 1) tgid_moves.emplace_back(aco_tgid++, pal_tgid++);
+        if ((r.rsrc2 >> 8) & 1) tgid_moves.emplace_back(aco_tgid++, pal_tgid++);
+        if ((r.rsrc2 >> 9) & 1) tgid_moves.emplace_back(aco_tgid++, pal_tgid++);
+
+        if (pal_tgid > aco_tgid) {
+            for (size_t i = 0; i < tgid_moves.size(); ++i)
+                mov(tgid_moves[i].first, tgid_moves[i].second);
+        } else if (pal_tgid < aco_tgid) {
+            for (size_t i = tgid_moves.size(); i > 0; --i)
+                mov(tgid_moves[i - 1].first, tgid_moves[i - 1].second);
         }
     }
     for(auto [reg,offset]:a.loads)ld(reg,96,offset);
@@ -264,7 +290,9 @@ inline Bytes splice(const Bytes& binary,const Record& r,unsigned push_bytes=128,
     const bool keep_code = std::getenv("NR_PAL_KEEP_CODE") != nullptr;
     const bool keep_meta = std::getenv("NR_PAL_KEEP_META") != nullptr;
     const unsigned descriptor_slot=push_bytes/4+1;
-    Elf e(binary); auto text=e.find(".text"),note=e.find(".note"),sym=e.find(".symtab");
+    Elf e(binary);
+    if(r.mach!=0)require(r.mach==e.mach,"record target architecture mismatch");
+    auto text=e.find(".text"),note=e.find(".note"),sym=e.find(".symtab");
     require(e.sections[text].align==256 && e.sections[text].addr==0,"PAL entry alignment");
     // Exactly one compute entry, no relocations, no secondary functions/data.
     const auto& sy=e.sections[sym];require(sy.entsize==24 && sy.link<e.data.size() && e.data[sym].size()%24==0,"ELF symbols");
@@ -337,7 +365,7 @@ inline Bytes splice(const Bytes& binary,const Record& r,unsigned push_bytes=128,
         cs.set(".mem_ordered",Value::boolean((r.rsrc1>>30)&1));
         cs.set(".forward_progress",Value::boolean((r.rsrc1>>31)&1));
         cs.set(".fp16_overflow",Value::boolean((r.rsrc1>>26)&1));
-        cs.set(".scratch_en",Value::boolean(false));cs.set(".scratch_memory_size",Value(0));
+        cs.set(".scratch_en",Value::boolean(r.scratch_en));cs.set(".scratch_memory_size",Value(r.scratch_bytes));
         auto& cr=p.at(".compute_registers");
         for(unsigned i=0;i<3;++i)cr.set(i==0?".tgid_x_en":i==1?".tgid_y_en":".tgid_z_en",Value::boolean((r.rsrc2>>(7+i))&1));
         cr.set(".tg_size_en",Value::boolean((r.rsrc2>>10)&1));cr.set(".tidig_comp_cnt",Value((r.rsrc2>>11)&3));
