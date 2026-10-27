@@ -25,7 +25,7 @@ inline uint64_t hash(const void* data, size_t n) {
 }
 inline Bytes load(const std::string& p) {
     std::ifstream f(p,std::ios::binary|std::ios::ate);
-    require(bool(f),"cannot open binary"); auto n=f.tellg();
+    require(bool(f),("cannot open binary: " + p).c_str()); auto n=f.tellg();
     require(n>0 && n<=64*1024*1024,"binary size outside limit");
     Bytes b(static_cast<size_t>(n)); f.seekg(0); f.read(reinterpret_cast<char*>(b.data()),n);
     require(bool(f),"cannot read binary"); return b;
