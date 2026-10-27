@@ -47,13 +47,16 @@ constexpr uint64_t kStaleAfter = 48;
 thread_local bool tl_creating = false;
 std::atomic<VkDevice> g_own_device{VK_NULL_HANDLE};
 
-const char* const kRequiredExtensions[] = {
-    VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME,
-    VK_EXT_SHADER_FLOAT8_EXTENSION_NAME,
-    VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
-    VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
-    VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME,
-};
+// The extensions the bridge's own device needs. The FP8 extension is the rdna4-fp8 target's
+// (the target block in nrvk.hpp): rdna3-fp16 multiplies FP16 operands and needs none of it.
+std::vector<const char*> network_extensions() {
+    std::vector<const char*> e{VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME,
+                               VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
+                               VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
+                               VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME};
+    if (nrvk::nr_target_float8()) e.push_back(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
+    return e;
+}
 
 template <class T> void release(T*& p) {
     if (p) { p->Release(); p = nullptr; }
@@ -212,7 +215,8 @@ bool Device::create(const LUID& luid, std::string* why) {
     vkEnumerateDeviceExtensionProperties(physical_, nullptr, &n, nullptr);
     std::vector<VkExtensionProperties> have(n);
     vkEnumerateDeviceExtensionProperties(physical_, nullptr, &n, have.data());
-    for (const char* e : kRequiredExtensions) {
+    const std::vector<const char*> required = network_extensions();
+    for (const char* e : required) {
         bool found = false;
         for (const auto& h : have) found = found || std::strcmp(h.extensionName, e) == 0;
         if (!found) {
@@ -220,7 +224,7 @@ bool Device::create(const LUID& luid, std::string* why) {
             return false;
         }
     }
-    std::vector<const char*> extensions(std::begin(kRequiredExtensions), std::end(kRequiredExtensions));
+    std::vector<const char*> extensions(required);
     bool robustness_ext = false;
     for (const auto& h : have) {
         if (std::strcmp(h.extensionName, VK_KHR_WIN32_KEYED_MUTEX_EXTENSION_NAME) == 0) keyed_mutex_ = true;
@@ -245,10 +249,11 @@ bool Device::create(const LUID& luid, std::string* why) {
     q.pNext = &coop; coop.pNext = &fp8; fp8.pNext = &f11; f11.pNext = &f12; f12.pNext = &f13; f13.pNext = &wml;
     wml.pNext = &prf;
     vkGetPhysicalDeviceFeatures2(physical_, &q);
+    const bool no_fp8 = !nrvk::nr_target_float8();
     struct { bool have; const char* name; } required[] = {
         {bool(coop.cooperativeMatrix), "cooperativeMatrix"},
-        {bool(fp8.shaderFloat8), "shaderFloat8"},
-        {bool(fp8.shaderFloat8CooperativeMatrix), "shaderFloat8CooperativeMatrix"},
+        {no_fp8 || bool(fp8.shaderFloat8), "shaderFloat8"},
+        {no_fp8 || bool(fp8.shaderFloat8CooperativeMatrix), "shaderFloat8CooperativeMatrix"},
         {bool(f11.storageBuffer16BitAccess), "storageBuffer16BitAccess"},
         {bool(f12.storageBuffer8BitAccess), "storageBuffer8BitAccess"},
         {bool(f12.shaderFloat16), "shaderFloat16"},
@@ -267,7 +272,9 @@ bool Device::create(const LUID& luid, std::string* why) {
     coop = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
     coop.cooperativeMatrix = VK_TRUE;
     fp8 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT};
-    fp8.shaderFloat8 = fp8.shaderFloat8CooperativeMatrix = VK_TRUE;
+    // The FP8 features are the rdna4-fp8 target's; rdna3-fp16 leaves the struct zeroed in
+    // the chain — explicitly disabled, not silently absent.
+    if (nrvk::nr_target_float8()) fp8.shaderFloat8 = fp8.shaderFloat8CooperativeMatrix = VK_TRUE;
     f11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
     f11.storageBuffer16BitAccess = VK_TRUE;
     f12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};

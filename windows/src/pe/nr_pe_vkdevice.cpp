@@ -77,15 +77,16 @@ VkResult VKAPI_PTR hooked_enumerate_physical_devices(VkInstance instance, uint32
 }
 
 // On Windows the game's device is DXVK's or vkd3d-proton's, created with the features they need.
-// The network also needs cooperative matrices, FP8 and the explicit workgroup memory layout;
-// vkd3d-proton enables the first two, DXVK none. They are added on the way in when the GPU has all
-// three extensions. Anything unexpected in the game's chain (a structure the size table does not
+// The network's own extensions (cooperative matrices, the explicit workgroup memory layout, and
+// FP8 on the rdna4-fp8 target — see the target block in nrvk.hpp) are added on the way in when
+// the GPU has them. Anything unexpected in the game's chain (a structure the size table does not
 // know) leaves the call exactly as the game made it, and so does a device that then fails to create.
-const char* const kNetworkExtensions[] = {
-    VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME,
-    VK_EXT_SHADER_FLOAT8_EXTENSION_NAME,
-    VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
-};
+std::vector<const char*> network_extensions() {
+    std::vector<const char*> e{VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME,
+                               VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME};
+    if (nrvk::nr_target_float8()) e.push_back(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
+    return e;
+}
 
 struct Augmented {
     std::unique_ptr<nr::DeviceFeatures> features;
@@ -111,7 +112,8 @@ bool augment(VkPhysicalDevice physical, const VkDeviceCreateInfo* info, Augmente
             if (list[i] && std::strcmp(list[i], name) == 0) return true;
         return false;
     };
-    for (const char* e : kNetworkExtensions) {
+    const std::vector<const char*> network = network_extensions();
+    for (const char* e : network) {
         bool found = false;
         for (const auto& h : have) found = found || std::strcmp(h.extensionName, e) == 0;
         if (!found) {
@@ -121,7 +123,7 @@ bool augment(VkPhysicalDevice physical, const VkDeviceCreateInfo* info, Augmente
     }
     a->extensions.assign(info->ppEnabledExtensionNames,
                          info->ppEnabledExtensionNames + info->enabledExtensionCount);
-    for (const char* e : kNetworkExtensions)
+    for (const char* e : network)
         if (!listed(e, a->extensions.data(), a->extensions.size())) a->extensions.push_back(e);
     a->features = std::make_unique<nr::DeviceFeatures>(info->pNext);
     a->features->enable();
