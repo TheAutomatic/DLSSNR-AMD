@@ -185,6 +185,7 @@ inline Bytes prologue(const Record& r, unsigned descriptor_slot = 33, uint32_t m
         word(b,0xf4000000|(dst<<6)|(base>>1));word(b,0xf8000000|off);
     };
     for(auto [dst,src]:a.moves)mov(dst,src+shift);
+    if (const char* t = std::getenv("NR_PAL_TGID_FIX")) mov(2, unsigned(std::atoi(t)));   // bisect: where this driver puts tgid.x
     for(auto [reg,offset]:a.loads)ld(reg,96,offset);
     if(r.push>=0) {word(b,0x80000000|(uint32_t(r.push)<<16)|(0x84<<8)|96);word(b,0xbf800002);}
     if(r.grid>=0)for(unsigned j=0;j<3;++j)ld(r.grid+j,100,j*4);
@@ -272,7 +273,14 @@ inline Bytes splice(const Bytes& binary,const Record& r,unsigned push_bytes=128,
         ++found;
     }
     require(found==1,"PAL compute entry count");
-    if (!keep_code) {auto pre=prologue(r,descriptor_slot,e.mach);e.data[text]=pre;e.data[text].insert(e.data[text].end(),r.code.begin(),r.code.end());}
+    // NR_PAL_PROLOGUE_ONLY (bisect): the prologue in front of the template's OWN body - does
+    // the prologue itself keep the pipeline from executing on this generation?
+    if (!keep_code && std::getenv("NR_PAL_PROLOGUE_ONLY")) {
+        auto pre=prologue(r,descriptor_slot,e.mach);
+        pre.insert(pre.end(),e.data[text].begin(),e.data[text].end());
+        write(e.data[sym],16,uint64_t(pre.size()));
+        e.data[text]=std::move(pre);
+    } else if (!keep_code) {auto pre=prologue(r,descriptor_slot,e.mach);e.data[text]=pre;e.data[text].insert(e.data[text].end(),r.code.begin(),r.code.end());}
     Bytes notes;size_t pos=0;unsigned metadata=0;
     while(pos<e.data[note].size()) {
         auto& src=e.data[note];size_t start=pos;range(src,pos,12);

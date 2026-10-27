@@ -1,0 +1,14 @@
+#version 460
+// Micro-test bisect variant: same 2-SSBO interface as g_pbtest, but every invocation writes a
+// constant pattern without reading in_v or the push constant (the bound sizes give the length).
+// If this comes back zero the dispatch/buffer plumbing is broken; if it matches the pattern,
+// the input path (in_v read or push constant) is.
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer In { uint in_v[]; };
+layout(std430, binding = 1) writeonly buffer Out { uint out_v[]; };
+layout(push_constant) uniform Push { uint mul; uint add; uint n; uint seed; } p;
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= out_v.length()) return;
+    out_v[i] = 0xdeadbe10u + i;
+}

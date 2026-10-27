@@ -265,7 +265,9 @@ int main(int argc, char** argv) {
         run(ctx, got);
         // The CPU reference: what the shader computes, exactly.
         ref.resize(elements);
-        for (uint32_t i = 0; i < elements; ++i) {
+        if (std::getenv("NR_REF_NOINPUT")) {
+            for (uint32_t i = 0; i < elements; ++i) ref[i] = 0xdeadbe30u + i;
+        } else for (uint32_t i = 0; i < elements; ++i) {
             uint32_t x = (i * 2654435761u + 12345u) ^ (push.w[3] + i);
             for (uint32_t k = 4; k < 32; ++k) x ^= push.w[k] + (i << (k & 7));
             ref[i] = x * push.w[0] + push.w[1] + i;
