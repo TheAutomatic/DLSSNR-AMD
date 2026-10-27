@@ -196,6 +196,7 @@ int main(int argc, char** argv) {
         if (case_name.empty()) {
             if (base_name.find("noinput") != std::string::npos) case_name = "noinput";
             else if (base_name.find("const") != std::string::npos) case_name = "const";
+            else if (base_name.find("scratch") != std::string::npos) case_name = "scratch";
             else if (base_name.find("ptr") != std::string::npos) case_name = "ptr";
             else if (base_name.find("test") != std::string::npos) case_name = "test";
             else case_name = "ptr"; // default network-shape kernel
@@ -470,6 +471,21 @@ int main(int argc, char** argv) {
                 for (uint32_t i = 0; i < elements; ++i) ref[i] = 0xdeadbe30u + i;
             } else if (case_name == "const") {
                 for (uint32_t i = 0; i < elements; ++i) ref[i] = 0xdeadbe10u + i;
+            } else if (case_name == "scratch") {
+                for (uint32_t idx = 0; idx < elements; ++idx) {
+                    uint32_t val = (idx * 2654435761u + 12345u) ^ idx;
+                    uint32_t v[300];
+                    for (uint32_t i = 0; i < 300; ++i) v[i] = val + i * 0x9e3779b9u;
+                    for (int iter = 0; iter < 4; ++iter) {
+                        for (uint32_t i = 0; i < 300; ++i) {
+                            uint32_t prev = (i == 0 ? 299 : i - 1);
+                            v[i] = (v[i] ^ (v[prev] >> 3)) + 0x12345u;
+                        }
+                    }
+                    uint32_t res = 0;
+                    for (uint32_t i = 0; i < 300; ++i) res ^= v[i];
+                    ref[idx] = res;
+                }
             } else if (case_name == "test") {
                 for (uint32_t i = 0; i < elements; ++i) {
                     const uint32_t x = (i * 2654435761u + 12345u) ^ (push.w[3] + i);
