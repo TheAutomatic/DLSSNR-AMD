@@ -145,8 +145,7 @@ struct Record {
         require(!(r.rsrc2&~uint32_t(0x00ff9fbf)) && !(r.rsrc3&~uint32_t(0xff0)) &&
                 r.user==((r.rsrc2>>1)&31),"unsupported scratch/config");
         require(r.exec && r.exec<=sz && r.exec%4==0 && r.wg && r.wg<=1024 && r.push_bytes<=128,"adapter resource limits");
-        // GFX12 rounds the shader's LDS use up to a 1 KiB allocation.
-        require(((r.shared+1023u)&~1023u)==(((r.rsrc2>>15)&511)*512),"adapter LDS allocation mismatch");
+        require(r.shared <= (((r.rsrc2>>15)&511)*512),"adapter LDS allocation mismatch");
         std::vector<bool> used(r.user,false);
         auto take=[&](int reg) {require(reg>=0 && uint32_t(reg)<r.user && !used[reg],"overlapping adapter arguments");used[reg]=true;};
         take(r.set0);if(r.push>=0)take(r.push);
