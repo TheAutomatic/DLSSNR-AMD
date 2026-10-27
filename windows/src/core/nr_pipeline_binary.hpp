@@ -77,7 +77,7 @@ struct Features {
     // A GPU, driver or device chain that cannot take the ACO network turns it off for the process
     // (disable): the device is created as it would be without it, never refused.
     void prepare(VkPhysicalDevice physical,VkDeviceCreateInfo& ci,std::vector<const char*>& extensions) {
-        if(directory().empty())return;
+        if(directory().empty() && !std::getenv("NR_MICRO_SELFIMPORT") && !std::getenv("NR_MICRO_IMPORT_FILE"))return;
         VkPhysicalDeviceDriverProperties drv{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
         VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,&drv};
         vkGetPhysicalDeviceProperties2(physical,&props);

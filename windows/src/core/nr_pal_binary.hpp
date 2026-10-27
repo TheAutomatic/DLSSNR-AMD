@@ -185,7 +185,15 @@ inline Bytes prologue(const Record& r, unsigned descriptor_slot = 33, uint32_t m
         word(b,0xf4000000|(dst<<6)|(base>>1));word(b,0xf8000000|off);
     };
     for(auto [dst,src]:a.moves)mov(dst,src+shift);
-    if (const char* t = std::getenv("NR_PAL_TGID_FIX")) mov(2, unsigned(std::atoi(t)));   // bisect: where this driver puts tgid.x
+    if (mach == 0x41 || mach == 0x44 || mach == 0x46 || mach == 0x47) {
+        if (a.user > r.user) {
+            unsigned pal_tgid = a.user;
+            unsigned aco_tgid = r.user;
+            if ((r.rsrc2 >> 7) & 1) mov(aco_tgid++, pal_tgid++);
+            if ((r.rsrc2 >> 8) & 1) mov(aco_tgid++, pal_tgid++);
+            if ((r.rsrc2 >> 9) & 1) mov(aco_tgid++, pal_tgid++);
+        }
+    }
     for(auto [reg,offset]:a.loads)ld(reg,96,offset);
     if(r.push>=0) {word(b,0x80000000|(uint32_t(r.push)<<16)|(0x84<<8)|96);word(b,0xbf800002);}
     if(r.grid>=0)for(unsigned j=0;j<3;++j)ld(r.grid+j,100,j*4);
@@ -261,6 +269,8 @@ inline Bytes splice(const Bytes& binary,const Record& r,unsigned push_bytes=128,
     // Exactly one compute entry, no relocations, no secondary functions/data.
     const auto& sy=e.sections[sym];require(sy.entsize==24 && sy.link<e.data.size() && e.data[sym].size()%24==0,"ELF symbols");
     unsigned found=0;
+    size_t cs_sym_pos=0;
+    uint64_t orig_entry_size=0;
     for(size_t p=0;p<e.data[sym].size();p+=24) {
         auto ix=read<uint16_t>(e.data[sym],p+6);if(ix!=text)continue;
         auto off=read<uint32_t>(e.data[sym],p);range(e.data[sy.link],off,1);
@@ -269,7 +279,8 @@ inline Bytes splice(const Bytes& binary,const Record& r,unsigned push_bytes=128,
         std::string name(e.data[sy.link].begin()+off,end);
         require(name=="_amdgpu_cs_main" && (e.data[sym][p+4]&15)==2 && read<uint64_t>(e.data[sym],p+8)==0,
                 "unsupported PAL text symbol");
-        if (!keep_code) {auto pre=prologue(r,descriptor_slot,e.mach);write(e.data[sym],p+16,uint64_t(pre.size()+r.exec));}
+        cs_sym_pos=p;
+        orig_entry_size=read<uint64_t>(e.data[sym],p+16);
         ++found;
     }
     require(found==1,"PAL compute entry count");
@@ -277,10 +288,16 @@ inline Bytes splice(const Bytes& binary,const Record& r,unsigned push_bytes=128,
     // the prologue itself keep the pipeline from executing on this generation?
     if (!keep_code && std::getenv("NR_PAL_PROLOGUE_ONLY")) {
         auto pre=prologue(r,descriptor_slot,e.mach);
+        const size_t pre_size=pre.size();
         pre.insert(pre.end(),e.data[text].begin(),e.data[text].end());
-        write(e.data[sym],16,uint64_t(pre.size()));
+        write(e.data[sym],cs_sym_pos+16,uint64_t(pre_size+orig_entry_size));
         e.data[text]=std::move(pre);
-    } else if (!keep_code) {auto pre=prologue(r,descriptor_slot,e.mach);e.data[text]=pre;e.data[text].insert(e.data[text].end(),r.code.begin(),r.code.end());}
+    } else if (!keep_code) {
+        auto pre=prologue(r,descriptor_slot,e.mach);
+        write(e.data[sym],cs_sym_pos+16,uint64_t(pre.size()+r.exec));
+        e.data[text]=pre;
+        e.data[text].insert(e.data[text].end(),r.code.begin(),r.code.end());
+    }
     Bytes notes;size_t pos=0;unsigned metadata=0;
     while(pos<e.data[note].size()) {
         auto& src=e.data[note];size_t start=pos;range(src,pos,12);
