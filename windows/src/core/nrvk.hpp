@@ -210,7 +210,9 @@ struct Context {
             if (forced) want = i == uint32_t(atoi(forced));
             else if (have_id) want = p.deviceID == want_device && (!want_vendor || p.vendorID == want_vendor);
             else if (have_uuid) want = std::memcmp(idp.deviceUUID, want_uuid_bytes, VK_UUID_SIZE) == 0;
-            else if (nr_rdna3) want = p.vendorID == 0x1002 && has_matrix_config(instance, devices[i], nr_target_matrix_ab());
+            else if (nr_rdna3) want = p.vendorID == 0x1002 &&
+                                      has_matrix_config(instance, devices[i], VK_COMPONENT_TYPE_FLOAT16_KHR) &&
+                                      !has_matrix_config(instance, devices[i], VK_COMPONENT_TYPE_FLOAT8_E4M3_EXT);
             else want = p.vendorID == 0x1002 && p.deviceID == 0x7550;
             if (!want) continue;
             if (physical)
