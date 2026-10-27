@@ -1462,6 +1462,7 @@ struct Runner {
         uint32_t gx{1}, gy{1}, gz{1};
         const void* push{};
         uint32_t push_bytes{};
+        const char* name{};
     };
 
     // Returns milliseconds for the whole recorded list, from the GPU's own
@@ -1582,9 +1583,17 @@ struct Runner {
             between.dstAccessMask = read_barrier
                 ? VK_ACCESS_SHADER_READ_BIT
                 : (VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+            const char* lim_env = std::getenv("NR_DISP_LIMIT");
+            const size_t limit = (lim_env && *lim_env) ? size_t(std::atoll(lim_env)) : steps.size();
+            const bool trace_disp = std::getenv("NR_DISP_TRACE") != nullptr;
             for (uint32_t r = 0; r < repeats; ++r)
-                for (size_t i = 0; i < steps.size(); ++i) {
+                for (size_t i = 0; i < std::min(steps.size(), limit); ++i) {
                     const Step& s = steps[i];
+                    if (trace_disp && r == 0) {
+                        std::printf("[disp %zu/%zu] %s grid=(%u, %u, %u) push_bytes=%u\n",
+                                    i, steps.size(), s.name ? s.name : "", s.gx, s.gy, s.gz, s.push_bytes);
+                        std::fflush(stdout);
+                    }
                     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.k->pipeline);
                     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.k->layout,
                                             0, 1, &s.k->set, 0, nullptr);

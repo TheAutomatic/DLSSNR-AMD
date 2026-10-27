@@ -4177,8 +4177,15 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     // Off for every flag that reasons per step: they dispatch, seed or time
     // individual layers and a merged run has no individual layers left.
     {
+#if NR_ARCH_RDNA3
+        // RDNA3: persistent Swin workgroup loops have spin/barrier deadlock issues at resolutions >= 1080p
+        // causing GPU TDR (display resets). Default to off; opt-in with NR_PERSIST=1.
+        const bool asked_off = !(std::getenv("NR_PERSIST") && *std::getenv("NR_PERSIST") == '1') ||
+                               flag(argc, argv, "--no-persist");
+#else
         const bool asked_off = flag(argc, argv, "--no-persist") ||
             (std::getenv("NR_NO_PERSIST") && *std::getenv("NR_NO_PERSIST"));
+#endif
         const char* per_step_flags[] = {"--only", "--seed-dir", "--no-barrier-after",
                                         "--barrier-stride"};
         bool per_step = flag(argc, argv, "--oracle") || flag(argc, argv, "--no-barrier") ||
@@ -5401,7 +5408,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     const std::string dupk = std::getenv("NR_DUP") ? std::string(",") + std::getenv("NR_DUP") + "," : "";
     for (const Disp& d : disp) {
         steps.push_back({&kern[d.kern], d.gx, d.gy, d.gz,
-                         d.push.data(), uint32_t(d.push.size())});
+                         d.push.data(), uint32_t(d.push.size()), d.kern.c_str()});
         if (!dupk.empty() && dupk.find("," + d.kern + ",") != std::string::npos)
             steps.push_back(steps.back());
     }
@@ -5707,7 +5714,7 @@ int NrSession::build_shared(int argc, char** argv) {
     runner.barrier_stride = c.barrier_stride; runner.chunk = c.chunk; runner.no_barrier_after = c.no_barrier_after;
     steps.clear();
     for (const Disp& d : disp)
-        steps.push_back({&kern[d.kern], d.gx, d.gy, d.gz, d.push.data(), uint32_t(d.push.size())});
+        steps.push_back({&kern[d.kern], d.gx, d.gy, d.gz, d.push.data(), uint32_t(d.push.size()), d.kern.c_str()});
     nr::logf("[nr] graph shared with the %ux%u build (same working extent) %.3fs: %s(%u pipelines)", c.source_w,
              c.source_h, timer.total(), timer.text().c_str(), unsigned(kern.size()));
     return 0;
