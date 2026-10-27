@@ -1,0 +1,14 @@
+#version 460
+// Micro-test kernel, network ABI shape: a 128-byte push block (32 dwords) forces the record
+// to carry a push POINTER beside the inline dwords, like every network kernel. Integer-exact.
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer In { uint in_v[]; };
+layout(std430, binding = 1) writeonly buffer Out { uint out_v[]; };
+layout(push_constant) uniform Push { uint w[32]; } p;
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= p.w[2]) return;
+    uint x = in_v[i] ^ (p.w[3] + i);
+    for (uint k = 4; k < 32; ++k) x ^= p.w[k] + (i << (k & 7));
+    out_v[i] = x * p.w[0] + p.w[1] + i;
+}

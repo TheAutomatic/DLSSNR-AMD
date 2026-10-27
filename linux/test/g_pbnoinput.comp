@@ -1,0 +1,12 @@
+#version 460
+// Micro-test discriminator: writes unconditionally and reads NOTHING (no in_v, no push), so
+// the only thing it needs from the ABI is binding 1's descriptor. Pattern output = the
+// pipeline runs and descriptors work; zero output = it does not run or descriptors are broken.
+// The 128-byte push block keeps the record in the network ABI shape.
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer In { uint in_v[]; };
+layout(std430, binding = 1) writeonly buffer Out { uint out_v[]; };
+layout(push_constant) uniform Push { uint w[32]; } p;
+void main() {
+    out_v[gl_GlobalInvocationID.x] = 0xdeadbe30u + gl_GlobalInvocationID.x;
+}

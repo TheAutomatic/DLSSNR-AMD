@@ -161,25 +161,38 @@ struct Arguments {
 };
 // Incoming pointers are saved before argument copies; the body keeps its
 // relative branch offsets and uses m0 for the 32-bit address high word.
-inline Bytes prologue(const Record& r,unsigned descriptor_slot=33) {
+inline Bytes prologue(const Record& r, unsigned descriptor_slot = 33, uint32_t mach = 0x4e) {
     Bytes b;Arguments a(r,descriptor_slot);
+    // Test probe (NR_PAL_SRC_BASE): shift where the argument copies read the driver's user
+    // data from, to pin a generation's user-SGPR base by experiment; unset behaves as 0.
+    const unsigned shift = [] { const char* s = std::getenv("NR_PAL_SRC_BASE"); return s ? unsigned(std::atoi(s)) : 0u; }();
     auto mov=[&](unsigned dst,unsigned src){word(b,0xbe800000|(dst<<16)|src);};
     if(a.spill>=0)mov(96,a.spill);
     if(a.grid>=0) {mov(100,a.grid);mov(101,a.grid+1);}
     if(r.rsrc2&(1<<10)) mov(102,a.user);
     word(b,0xbe804700|(98<<16)); // s_getpc_b64 s[98:99]
     word(b,0xbf800002); // dependency spacing, also safe before sext/m0
-    word(b,0xbe800f00|(97<<16)|99); // s_sext_i32_i16 s97, s99
-    word(b,0xbf800002);mov(125,97); // m0 = PAL address32 high
+    // The address32 high word, the way the target driver itself derives it from the PC
+    // (the templates say so): gfx12 sign-extends the PC high dword's low half, gfx11 uses
+    // the full high dword.
+    if (mach == 0x41 || mach == 0x44 || mach == 0x46 || mach == 0x47)
+        word(b, 0xbe800000 | (97u << 16) | 99u);   // s_mov_b32 s97, s99
+    else
+        word(b, 0xbe800f00 | (97u << 16) | 99u);   // s_sext_i32_i16 s97, s99
+    word(b, 0xbf800002);mov(125,97); // m0 = the address32 high word
     word(b,0xbf800002);
     auto ld=[&](unsigned dst,unsigned base,unsigned off) {
         word(b,0xf4000000|(dst<<6)|(base>>1));word(b,0xf8000000|off);
     };
-    for(auto [dst,src]:a.moves)mov(dst,src);
+    for(auto [dst,src]:a.moves)mov(dst,src+shift);
     for(auto [reg,offset]:a.loads)ld(reg,96,offset);
     if(r.push>=0) {word(b,0x80000000|(uint32_t(r.push)<<16)|(0x84<<8)|96);word(b,0xbf800002);}
     if(r.grid>=0)for(unsigned j=0;j<3;++j)ld(r.grid+j,100,j*4);
-    word(b,0xbfc70000);word(b,0xbf800003);
+    // The wait before the first use of the loaded arguments. gfx12 has the split waits
+    // (s_wait_kmcnt 0); gfx11 has the classic one (s_waitcnt lgkmcnt(0)). The gfx12 word is
+    // an illegal instruction on gfx11 and the pipeline silently does nothing.
+    word(b, mach == 0x41 || mach == 0x44 || mach == 0x46 || mach == 0x47 ? 0xbf89fc07u : 0xbfc70000u);
+    word(b, 0xbf800003);
     if(r.rsrc2&(1<<10))mov(r.user,102);
     // Branch over alignment padding rather than executing one nop per dword.
     size_t end=(b.size()+4+255)&~size_t(255);
@@ -191,13 +204,19 @@ inline Bytes prologue(const Record& r,unsigned descriptor_slot=33) {
 struct Section { uint32_t name,type;uint64_t flags,addr,offset,size;uint32_t link,info;uint64_t align,entsize; };
 static_assert(sizeof(Section)==64);
 struct Elf {
+    uint32_t mach = 0;   // the AMD GPU generation of the container (e_flags)
     Bytes header;std::vector<Section> sections;std::vector<Bytes> data;std::vector<std::string> names;
     explicit Elf(const Bytes& b) {
         range(b,0,64);
-        // e_flags: RDNA4 only - gfx1200 (0x48, RX 9060 series) or gfx1201 (0x4e, RX 9070 series, Radeon AI PRO R9700).
+        // e_flags: the AMD GPU generation the container's code is for. gfx12: gfx1200 0x48 (RX
+        // 9060), gfx1201 0x4e (RX 9070, Radeon AI PRO R9700); gfx11: gfx1100 0x41, gfx1103 0x44
+        // (phoenix, the 780M), gfx1102 0x46, gfx1101 0x47. The machine says how the code in the
+        // container is read; a record still has to match it to be used.
         const auto mach=read<uint32_t>(b,48);
+        this->mach = mach;
         require(std::memcmp(b.data(),"\x7f" "ELF",4)==0 && b[4]==2 && b[5]==1 && b[7]==65 &&
-                read<uint16_t>(b,16)==1 && read<uint16_t>(b,18)==224 && (mach==0x48 || mach==0x4e) &&
+                read<uint16_t>(b,16)==1 && read<uint16_t>(b,18)==224 &&
+                (mach==0x48 || mach==0x4e || mach==0x41 || mach==0x44 || mach==0x46 || mach==0x47) &&
                 read<uint64_t>(b,32)==0 && read<uint16_t>(b,56)==0 && read<uint16_t>(b,58)==64,"unsupported PAL ELF");
         auto count=read<uint16_t>(b,60),str=read<uint16_t>(b,62); auto at=read<uint64_t>(b,40);
         require(count>0 && count<256 && str<count,"ELF section count");range(b,at,size_t(count)*64);
@@ -231,6 +250,10 @@ struct Elf {
 inline Bytes splice(const Bytes& binary,const Record& r,unsigned push_bytes=128,
                     std::array<uint32_t,3> workgroup={0,0,0}) {
     require(push_bytes<=128 && push_bytes%4==0 && r.push_bytes<=push_bytes,"unsupported pipeline push range");
+    // Bisect probes (NR_PAL_KEEP_CODE / NR_PAL_KEEP_META): keep the template's own text or
+    // metadata, to attribute a driver's silent refusal to execute to one side. Test scaffolding.
+    const bool keep_code = std::getenv("NR_PAL_KEEP_CODE") != nullptr;
+    const bool keep_meta = std::getenv("NR_PAL_KEEP_META") != nullptr;
     const unsigned descriptor_slot=push_bytes/4+1;
     Elf e(binary); auto text=e.find(".text"),note=e.find(".note"),sym=e.find(".symtab");
     require(e.sections[text].align==256 && e.sections[text].addr==0,"PAL entry alignment");
@@ -245,10 +268,11 @@ inline Bytes splice(const Bytes& binary,const Record& r,unsigned push_bytes=128,
         std::string name(e.data[sy.link].begin()+off,end);
         require(name=="_amdgpu_cs_main" && (e.data[sym][p+4]&15)==2 && read<uint64_t>(e.data[sym],p+8)==0,
                 "unsupported PAL text symbol");
-        auto pre=prologue(r,descriptor_slot);write(e.data[sym],p+16,uint64_t(pre.size()+r.exec));++found;
+        if (!keep_code) {auto pre=prologue(r,descriptor_slot,e.mach);write(e.data[sym],p+16,uint64_t(pre.size()+r.exec));}
+        ++found;
     }
     require(found==1,"PAL compute entry count");
-    auto pre=prologue(r,descriptor_slot);e.data[text]=pre;e.data[text].insert(e.data[text].end(),r.code.begin(),r.code.end());
+    if (!keep_code) {auto pre=prologue(r,descriptor_slot,e.mach);e.data[text]=pre;e.data[text].insert(e.data[text].end(),r.code.begin(),r.code.end());}
     Bytes notes;size_t pos=0;unsigned metadata=0;
     while(pos<e.data[note].size()) {
         auto& src=e.data[note];size_t start=pos;range(src,pos,12);
@@ -256,7 +280,7 @@ inline Bytes splice(const Bytes& binary,const Record& r,unsigned push_bytes=128,
         pos+=12;range(src,pos,(uint64_t(ns)+3)&~uint64_t(3));
         Bytes name(src.begin()+pos,src.begin()+pos+ns);pos+=(uint64_t(ns)+3)&~uint64_t(3);
         range(src,pos,(uint64_t(ds)+3)&~uint64_t(3));size_t desc=pos;pos+=(uint64_t(ds)+3)&~uint64_t(3);
-        if(type!=32) {notes.insert(notes.end(),src.begin()+start,src.begin()+pos);continue;}
+        if(type!=32 || keep_meta) {notes.insert(notes.end(),src.begin()+start,src.begin()+pos);continue;}
         require(name==Bytes({'A','M','D','G','P','U',0}),"unexpected PAL note owner");
         auto m=unpack(Bytes(src.begin()+desc,src.begin()+desc+ds));
         auto& ver=m.at("amdpal.version");require(ver.kind==Value::Array && ver.items.size()==2 &&
@@ -299,6 +323,6 @@ inline Bytes splice(const Bytes& binary,const Record& r,unsigned push_bytes=128,
         notes.insert(notes.end(),name.begin(),name.end());while(notes.size()%4)notes.push_back(0);
         notes.insert(notes.end(),md.begin(),md.end());while(notes.size()%4)notes.push_back(0);++metadata;
     }
-    require(metadata==1,"PAL metadata note count");e.data[note]=std::move(notes);return e.build();
+    require(metadata==1 || keep_meta,"PAL metadata note count");e.data[note]=std::move(notes);return e.build();
 }
 } // namespace nr::pal
