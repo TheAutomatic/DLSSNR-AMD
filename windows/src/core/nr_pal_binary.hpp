@@ -177,6 +177,15 @@ struct Arguments {
         for(auto [dst,src]:moves)require(dst<=src,"unsupported parallel argument copy");
     }
 };
+inline bool is_gfx11(uint32_t m) {
+    // gfx11: gfx1100 0x41 (7900), gfx1101 0x47 (7800/7700), gfx1102 0x46 (7600), gfx1103 0x44 (780M)
+    // gfx115x (RDNA 3.5): gfx1150 0x43 (Strix Point / 890M), gfx1151 0x4a (Strix Halo / AI MAX+ 395)
+    return m == 0x41 || m == 0x44 || m == 0x46 || m == 0x47 || m == 0x43 || m == 0x4a;
+}
+inline bool is_gfx12(uint32_t m) {
+    return m == 0x48 || m == 0x4e;
+}
+
 // Incoming pointers are saved before argument copies; the body keeps its
 // relative branch offsets and uses m0 for the 32-bit address high word.
 inline Bytes prologue(const Record& r, unsigned descriptor_slot = 33, uint32_t mach = 0x4e) {
@@ -193,7 +202,7 @@ inline Bytes prologue(const Record& r, unsigned descriptor_slot = 33, uint32_t m
     // The address32 high word, the way the target driver itself derives it from the PC
     // (the templates say so): gfx12 sign-extends the PC high dword's low half, gfx11 uses
     // the full high dword.
-    if (mach == 0x41 || mach == 0x44 || mach == 0x46 || mach == 0x47)
+    if (is_gfx11(mach))
         word(b, 0xbe800000 | (97u << 16) | 99u);   // s_mov_b32 s97, s99
     else
         word(b, 0xbe800f00 | (97u << 16) | 99u);   // s_sext_i32_i16 s97, s99
@@ -203,7 +212,7 @@ inline Bytes prologue(const Record& r, unsigned descriptor_slot = 33, uint32_t m
         word(b,0xf4000000|(dst<<6)|(base>>1));word(b,0xf8000000|off);
     };
     for(auto [dst,src]:a.moves)mov(dst,src+shift);
-    if (mach == 0x41 || mach == 0x44 || mach == 0x46 || mach == 0x47) {
+    if (is_gfx11(mach)) {
         std::vector<std::pair<unsigned, unsigned>> tgid_moves;
         unsigned pal_tgid = a.user + shift;
         unsigned aco_tgid = r.user;
@@ -225,7 +234,7 @@ inline Bytes prologue(const Record& r, unsigned descriptor_slot = 33, uint32_t m
     // The wait before the first use of the loaded arguments. gfx12 has the split waits
     // (s_wait_kmcnt 0); gfx11 has the classic one (s_waitcnt lgkmcnt(0)). The gfx12 word is
     // an illegal instruction on gfx11 and the pipeline silently does nothing.
-    word(b, mach == 0x41 || mach == 0x44 || mach == 0x46 || mach == 0x47 ? 0xbf89fc07u : 0xbfc70000u);
+    word(b, is_gfx11(mach) ? 0xbf89fc07u : 0xbfc70000u);
     word(b, 0xbf800003);
     if(r.rsrc2&(1<<10))mov(r.user,102);
     // Branch over alignment padding rather than executing one nop per dword.
@@ -244,13 +253,14 @@ struct Elf {
         range(b,0,64);
         // e_flags: the AMD GPU generation the container's code is for. gfx12: gfx1200 0x48 (RX
         // 9060), gfx1201 0x4e (RX 9070, Radeon AI PRO R9700); gfx11: gfx1100 0x41, gfx1103 0x44
-        // (phoenix, the 780M), gfx1102 0x46, gfx1101 0x47. The machine says how the code in the
-        // container is read; a record still has to match it to be used.
+        // (phoenix, the 780M), gfx1102 0x46, gfx1101 0x47; gfx115x (RDNA 3.5): gfx1150 0x43
+        // (Strix Point / 890M), gfx1151 0x4a (Strix Halo / AI MAX+ 395). The machine says how
+        // the code in the container is read; a record still has to match it to be used.
         const auto mach=read<uint32_t>(b,48);
         this->mach = mach;
         require(std::memcmp(b.data(),"\x7f" "ELF",4)==0 && b[4]==2 && b[5]==1 && b[7]==65 &&
                 read<uint16_t>(b,16)==1 && read<uint16_t>(b,18)==224 &&
-                (mach==0x48 || mach==0x4e || mach==0x41 || mach==0x44 || mach==0x46 || mach==0x47) &&
+                (is_gfx12(mach) || is_gfx11(mach)) &&
                 read<uint64_t>(b,32)==0 && read<uint16_t>(b,56)==0 && read<uint16_t>(b,58)==64,"unsupported PAL ELF");
         auto count=read<uint16_t>(b,60),str=read<uint16_t>(b,62); auto at=read<uint64_t>(b,40);
         require(count>0 && count<256 && str<count,"ELF section count");range(b,at,size_t(count)*64);
@@ -291,8 +301,6 @@ inline Bytes splice(const Bytes& binary,const Record& r,unsigned push_bytes=128,
     const unsigned descriptor_slot=push_bytes/4+1;
     Elf e(binary);
     if(r.mach!=0) {
-        auto is_gfx11 = [](uint32_t m) { return m == 0x41 || m == 0x44 || m == 0x46 || m == 0x47; };
-        auto is_gfx12 = [](uint32_t m) { return m == 0x48 || m == 0x4e; };
         bool compatible = (r.mach == e.mach) ||
                           (is_gfx11(r.mach) && is_gfx11(e.mach)) ||
                           (is_gfx12(r.mach) && is_gfx12(e.mach));

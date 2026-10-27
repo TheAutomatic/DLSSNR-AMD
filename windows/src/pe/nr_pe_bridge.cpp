@@ -1,5 +1,6 @@
 #include "nr_pe_bridge.hpp"
 #include "nr_pipeline_binary.hpp"
+#include "nrvk.hpp"
 
 #include "nr_pe_log.hpp"
 
@@ -215,8 +216,8 @@ bool Device::create(const LUID& luid, std::string* why) {
     vkEnumerateDeviceExtensionProperties(physical_, nullptr, &n, nullptr);
     std::vector<VkExtensionProperties> have(n);
     vkEnumerateDeviceExtensionProperties(physical_, nullptr, &n, have.data());
-    const std::vector<const char*> required = network_extensions();
-    for (const char* e : required) {
+    const std::vector<const char*> required_exts = network_extensions();
+    for (const char* e : required_exts) {
         bool found = false;
         for (const auto& h : have) found = found || std::strcmp(h.extensionName, e) == 0;
         if (!found) {
@@ -224,7 +225,7 @@ bool Device::create(const LUID& luid, std::string* why) {
             return false;
         }
     }
-    std::vector<const char*> extensions(required);
+    std::vector<const char*> extensions(required_exts);
     bool robustness_ext = false;
     for (const auto& h : have) {
         if (std::strcmp(h.extensionName, VK_KHR_WIN32_KEYED_MUTEX_EXTENSION_NAME) == 0) keyed_mutex_ = true;

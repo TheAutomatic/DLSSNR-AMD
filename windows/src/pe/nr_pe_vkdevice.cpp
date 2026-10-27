@@ -4,6 +4,7 @@
 #include "nr_pe_log.hpp"
 #include "nr_device_features.hpp"
 #include "nr_pipeline_binary.hpp"
+#include "nrvk.hpp"
 
 #include <windows.h>
 #include <MinHook.h>

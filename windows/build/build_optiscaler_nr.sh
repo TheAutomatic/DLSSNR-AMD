@@ -54,6 +54,7 @@ source "windows/build/arch/$gpu_arch.sh"
 common=(-std=c++17 -O2 -DNDEBUG -DNR_BUILD_STAMP="\"$stamp\"" -Itoolchain/Vulkan-Headers/include -Iwindows/src -Iwindows/src/core -Iwindows/src/pe -I"$out")
 int4_default=1; [[ "$NR_GPU_ARCH" == rdna3 ]] && int4_default=0   # gfx11 int4 mixed lands as its own change
 [[ "${NR_INT4:-$int4_default}" == 1 ]] && common+=(-DNR_INT4=1)
+[[ "$gpu_arch" == rdna3 ]] && common+=(-DNR_ARCH_RDNA3=1)
 "$cxx" "${common[@]}" "${NR_PRODUCT_DEFINES[@]}" -c windows/src/core/nr_runtime.cpp -o "$out/nr_runtime.o"
 "$cxx" "${common[@]}" -c windows/src/core/nr_native_plan.cpp -o "$out/nr_native_plan.o"
 "$cxx" "${common[@]}" -c windows/src/core/nr_renodx.cpp -o "$out/nr_renodx.o"
