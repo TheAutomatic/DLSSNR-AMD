@@ -290,7 +290,14 @@ inline Bytes splice(const Bytes& binary,const Record& r,unsigned push_bytes=128,
     const bool keep_meta = std::getenv("NR_PAL_KEEP_META") != nullptr;
     const unsigned descriptor_slot=push_bytes/4+1;
     Elf e(binary);
-    if(r.mach!=0)require(r.mach==e.mach,"record target architecture mismatch");
+    if(r.mach!=0) {
+        auto is_gfx11 = [](uint32_t m) { return m == 0x41 || m == 0x44 || m == 0x46 || m == 0x47; };
+        auto is_gfx12 = [](uint32_t m) { return m == 0x48 || m == 0x4e; };
+        bool compatible = (r.mach == e.mach) ||
+                          (is_gfx11(r.mach) && is_gfx11(e.mach)) ||
+                          (is_gfx12(r.mach) && is_gfx12(e.mach));
+        require(compatible, "record target architecture mismatch");
+    }
     auto text=e.find(".text"),note=e.find(".note"),sym=e.find(".symtab");
     require(e.sections[text].align==256 && e.sections[text].addr==0,"PAL entry alignment");
     // Exactly one compute entry, no relocations, no secondary functions/data.
