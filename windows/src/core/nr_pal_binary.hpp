@@ -178,9 +178,11 @@ struct Arguments {
     }
 };
 inline bool is_gfx11(uint32_t m) {
-    // gfx11: gfx1100 0x41 (7900), gfx1101 0x47 (7800/7700), gfx1102 0x46 (7600), gfx1103 0x44 (780M)
-    // gfx115x (RDNA 3.5): gfx1150 0x43 (Strix Point / 890M), gfx1151 0x4a (Strix Halo / AI MAX+ 395)
-    return m == 0x41 || m == 0x44 || m == 0x46 || m == 0x47 || m == 0x43 || m == 0x4a;
+    // RDNA3: gfx1100 0x41 (7900), gfx1101 0x46 (7800/7700), gfx1102 0x47 (7600), gfx1103 0x44 (780M)
+    // RDNA 3.5: gfx1150 0x43 (Strix Point / 890M), gfx1151 0x4a (Strix Halo / AI MAX+ 395),
+    //           gfx1152 0x55 (Kraken Point), gfx1153 0x58, gfx1154 0x57, gfx11-generic 0x54
+    return m == 0x41 || m == 0x44 || m == 0x46 || m == 0x47 ||
+           m == 0x43 || m == 0x4a || m == 0x55 || m == 0x58 || m == 0x57 || m == 0x54;
 }
 inline bool is_gfx12(uint32_t m) {
     return m == 0x48 || m == 0x4e;
