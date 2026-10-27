@@ -159,6 +159,16 @@ std::string sha256_hex(const void* data, size_t len) {
     return std::string(buf);
 }
 
+static uint16_t to_fp16(float f) {
+    if (f == 0.0f) return 0;
+    uint32_t x;
+    std::memcpy(&x, &f, 4);
+    uint32_t sign = (x >> 16) & 0x8000;
+    int32_t exp = ((x >> 23) & 0xff) - 127 + 15;
+    uint32_t mant = (x >> 13) & 0x3ff;
+    return uint16_t(sign | ((exp & 0x1f) << 10) | mant);
+}
+
 void print_key_info(const char* label, const VkPipelineBinaryKeyKHR& key) {
     std::printf("%s (keySize: %u): ", label, key.keySize);
     for (uint32_t i = 0; i < key.keySize && i < 32; ++i)
@@ -197,6 +207,7 @@ int main(int argc, char** argv) {
             if (base_name.find("noinput") != std::string::npos) case_name = "noinput";
             else if (base_name.find("const") != std::string::npos) case_name = "const";
             else if (base_name.find("scratch") != std::string::npos) case_name = "scratch";
+            else if (base_name.find("wmma") != std::string::npos) case_name = "wmma";
             else if (base_name.find("ptr") != std::string::npos) case_name = "ptr";
             else if (base_name.find("test") != std::string::npos) case_name = "test";
             else case_name = "ptr"; // default network-shape kernel
@@ -204,6 +215,9 @@ int main(int argc, char** argv) {
         if (case_name == "noinput" && (elements % 64 != 0)) {
             elements = (elements + 63) / 64 * 64;
             std::printf("note: rounded elements to %u (multiple of 64 for noinput)\n", elements);
+        } else if (case_name == "wmma" && (elements % 256 != 0)) {
+            elements = (elements + 255) / 256 * 256;
+            std::printf("note: rounded elements to %u (multiple of 256 for wmma)\n", elements);
         }
 
         std::string spv_sha = sha256_hex(spv.data(), spv.size());
@@ -216,15 +230,31 @@ int main(int argc, char** argv) {
             std::printf("mode: %s\n", aco ? "ACO import (VK_KHR_pipeline_binary)" : "native compile (reference)");
             std::printf("device: %s\ndriver: %s\n", ctx.gpu_name.c_str(), ctx.driver_name.c_str());
 
+            const uint32_t tiles = (elements + 255) / 256;
             const uint32_t mul = 0x2545F491u, add = 0x9E3779B9u, seed = 0x1234567u;
             struct Push { uint32_t w[32]; } push{};
-            push.w[0] = mul; push.w[1] = add; push.w[2] = elements; push.w[3] = seed;
+            push.w[0] = mul; push.w[1] = add; push.w[2] = (case_name == "wmma" ? tiles : elements); push.w[3] = seed;
             for (uint32_t k = 4; k < 32; ++k) push.w[k] = 0x9E3779B1u * k + 0x13572468u;
 
             auto run = [&](auto& ctx2, std::vector<uint32_t>& out) {
                 Buf bin_ = make_buf(ctx, elements * 4), bout = make_buf(ctx, elements * 4);
                 std::vector<uint32_t> in_(elements);
-                for (uint32_t i = 0; i < elements; ++i) in_[i] = i * 2654435761u + 12345u;
+                if (case_name == "wmma") {
+                    uint16_t* in_fp16 = reinterpret_cast<uint16_t*>(in_.data());
+                    for (uint32_t t = 0; t < tiles; ++t) {
+                        uint32_t base = t * 512;
+                        for (uint32_t r = 0; r < 16; ++r) {
+                            for (uint32_t c = 0; c < 16; ++c) {
+                                float a_val = float((r + c + t) % 4 + 1);
+                                float b_val = float((r * 3 + c + t) % 4 + 1);
+                                in_fp16[base + r * 16 + c] = to_fp16(a_val);
+                                in_fp16[base + 256 + r * 16 + c] = to_fp16(b_val);
+                            }
+                        }
+                    }
+                } else {
+                    for (uint32_t i = 0; i < elements; ++i) in_[i] = i * 2654435761u + 12345u;
+                }
                 std::memcpy(bin_.mapped, in_.data(), in_.size() * 4);
 
                 // Stage A: initialize output buffer with non-zero sentinel so lack of execution is detectable
@@ -420,7 +450,11 @@ int main(int argc, char** argv) {
                     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
                                          0, 0, nullptr, 1, &bar, 0, nullptr);
                 } else {
-                    vkCmdDispatch(cb, (elements + 63) / 64, 1, 1);
+                    if (case_name == "wmma") {
+                        vkCmdDispatch(cb, tiles, 1, 1);
+                    } else {
+                        vkCmdDispatch(cb, (elements + 63) / 64, 1, 1);
+                    }
                     VkBufferMemoryBarrier bar{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
                     bar.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
                     bar.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
@@ -485,6 +519,22 @@ int main(int argc, char** argv) {
                     uint32_t res = 0;
                     for (uint32_t i = 0; i < 300; ++i) res ^= v[i];
                     ref[idx] = res;
+                }
+            } else if (case_name == "wmma") {
+                for (uint32_t t = 0; t < tiles; ++t) {
+                    for (uint32_t r = 0; r < 16; ++r) {
+                        for (uint32_t c = 0; c < 16; ++c) {
+                            float sum = 0.0f;
+                            for (uint32_t k = 0; k < 16; ++k) {
+                                float a = float((r + k + t) % 4 + 1);
+                                float b = float((k * 3 + c + t) % 4 + 1);
+                                sum += a * b;
+                            }
+                            uint32_t u;
+                            std::memcpy(&u, &sum, 4);
+                            ref[t * 256 + r * 16 + c] = u;
+                        }
+                    }
                 }
             } else if (case_name == "test") {
                 for (uint32_t i = 0; i < elements; ++i) {
