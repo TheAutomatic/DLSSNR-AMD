@@ -1,6 +1,7 @@
 #include "nr_runtime.hpp"
 #include "nr_native_plan.hpp"
 #include "nr_runtime_dispatch.hpp"
+#include "core/nr_driver_identity.hpp"
 #define NR_NO_MAIN 1
 #include "nr_graph.cpp"
 #include "nr_input_check.hpp"
@@ -1235,12 +1236,39 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     // development tree has build/ and artifacts/ at its root instead.
     const auto data = std::filesystem::is_directory(root / "dlssnr-amd") ? root / "dlssnr-amd" : root;
     const bool installed = data != root;
+
+    int initial_rdna3 = config.rdna3 >= 0 ? config.rdna3 : host.rdna3;
+    if (initial_rdna3 < 0) {
+        VkPhysicalDeviceProperties hp{};
+        vkGetPhysicalDeviceProperties(host.physical, &hp);
+        VkPhysicalDeviceProperties real_hp = hp;
+        VkPhysicalDeviceDriverProperties real_drv{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        if (nr::driver::amd_reported(host.physical, &real_hp, &real_drv)) {
+            hp.vendorID = real_hp.vendorID;
+            hp.deviceID = real_hp.deviceID;
+            std::memcpy(hp.deviceName, real_hp.deviceName, sizeof(hp.deviceName));
+        }
+        uint32_t ne = 0;
+        vkEnumerateDeviceExtensionProperties(host.physical, nullptr, &ne, nullptr);
+        std::vector<VkExtensionProperties> have(ne);
+        vkEnumerateDeviceExtensionProperties(host.physical, nullptr, &ne, have.data());
+        bool have_fp8 = false;
+        for (const auto& h : have)
+            if (std::strcmp(h.extensionName, VK_EXT_SHADER_FLOAT8_EXTENSION_NAME) == 0) have_fp8 = true;
+        initial_rdna3 = nrvk::is_rdna3_device(hp.vendorID, hp.deviceID, have_fp8) ? 1 : 0;
+    }
+    impl_->session.ctx.rdna3 = (initial_rdna3 == 1);
+
     // The ACO network (nr_pipeline_binary.hpp) needs a device created with pipeline binaries; one that
     // was not (a game's device made before we could add them) builds with the driver's compiler.
     if (!nr::binary::directory().empty() && !nr::binary::enabled(host.device))
         nr::binary::disable("the device was created without pipeline binaries");
     const std::string aco = nr::binary::directory();
-    const auto native_shaders = installed ? data / "shaders" : root / "build";
+    const auto native_shaders = installed
+        ? (std::filesystem::is_directory(data / "shaders" / impl_->session.ctx.target_arch_dir())
+               ? data / "shaders" / impl_->session.ctx.target_arch_dir()
+               : data / "shaders")
+        : root / "build";
     const auto network_shaders = !aco.empty() ? std::filesystem::path(aco) / "shaders" : native_shaders;
     // Shaders are read from inside the NR root, or from the ACO bundle when one is in use.
     const auto inside = [&](const std::filesystem::path& p) {
@@ -1835,8 +1863,10 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         // The temporal pre/post blocks are network kernels: the ACO bundle's own SPIR-V when it is in use.
         auto shaders = std::filesystem::canonical(temporal_config.shaders.empty()
             ? (!aco.empty() ? std::filesystem::path(aco) / "shaders/temporal"
-               : installed ? data / "shaders/temporal"
-                           : root / "build/windows" / nrvk::nr_target_arch_dir() / "network/temporal")
+               : installed ? (std::filesystem::is_directory(data / "shaders" / s.ctx.target_arch_dir() / "temporal")
+                                  ? data / "shaders" / s.ctx.target_arch_dir() / "temporal"
+                                  : data / "shaders/temporal")
+                           : root / "build/windows" / s.ctx.target_arch_dir() / "network/temporal")
             : std::filesystem::path(temporal_config.shaders));
 #if NR_INT4
         // The int4 network's temporal pre/post variants are built with its defines (hard-swish, whose scale
@@ -2213,6 +2243,7 @@ uint64_t network_ram_bytes(const RuntimeCore& core) {
 }
 
 static bool adopt_for(nrvk::Context& ctx, const HostDevice& host) {
+    if (host.rdna3 >= 0) ctx.rdna3 = (host.rdna3 == 1);
     std::string why;
     if (!ctx.adopt(host.instance, host.physical, host.device, host.queue, host.queue_family, &why)) {
         nr::logf("[nr] the network's memory cannot be moved: %s", why.c_str());
@@ -2251,12 +2282,10 @@ void release_network(const RuntimeCore& core, std::vector<uint8_t>&& weights) {
     vkDestroyBuffer(a->device, a->wgt.handle, nullptr);
     vkFreeMemory(a->device, a->wgt.memory, nullptr);
     a->wgt = nrvk::Buffer{};
-#if NR_ARCH_RDNA3
     if (a->wgt_e.mapped) vkUnmapMemory(a->device, a->wgt_e.memory);
     if (a->wgt_e.handle) vkDestroyBuffer(a->device, a->wgt_e.handle, nullptr);
     if (a->wgt_e.memory) vkFreeMemory(a->device, a->wgt_e.memory, nullptr);
     a->wgt_e = nrvk::Buffer{};
-#endif
     a->act_want = a->act_need ? a->act_need : a->act ? a->act->cap : a->act_want;
     a->act.reset();
     a->loaded = 0;
@@ -2279,35 +2308,29 @@ bool reload_network(const HostDevice& host, const RuntimeCore& core, const std::
     if (!arena) {
         if (act && act->act && act->act->device == a->device && act->act->cap >= a->act_want) {
             arena = act->act;
-#if NR_ARCH_RDNA3
-            if (arena && !arena->twin.handle && arena->cap) {
+            if (ctx.rdna3 && arena && !arena->twin.handle && arena->cap) {
                 arena->twin = ctx.buffer(VkDeviceSize(arena->cap) * 2);
             }
-#endif
         } else {
             auto g = std::make_shared<GraphAct>();
             g->device = a->device; g->cap = size_t(double(a->act_want) * std::max(1.0, slack) + 255) / 256 * 256;
             g->buf = ctx.buffer(g->cap, false, /*device_address=*/true);   // freed by ~GraphAct if what follows throws
-#if NR_ARCH_RDNA3
-            g->twin = ctx.buffer(VkDeviceSize(g->cap) * 2);
-#endif
+            if (ctx.rdna3) {
+                g->twin = ctx.buffer(VkDeviceSize(g->cap) * 2);
+            }
             arena = std::move(g);
         }
-    }
-#if NR_ARCH_RDNA3
-    else if (!arena->twin.handle && arena->cap) {
+    } else if (ctx.rdna3 && !arena->twin.handle && arena->cap) {
         arena->twin = ctx.buffer(VkDeviceSize(arena->cap) * 2);
     }
-#endif
     nrvk::Buffer w{}, w_e{};
     try {
         w = ctx.buffer(a->wgt_cap);
-#if NR_ARCH_RDNA3
-        w_e = ctx.buffer(VkDeviceSize(a->wgt_cap) * 2);
-#endif
+        if (ctx.rdna3) {
+            w_e = ctx.buffer(VkDeviceSize(a->wgt_cap) * 2);
+        }
         ctx.upload(w, 0, a->host_weights.data(), a->host_weights.size());
-#if NR_ARCH_RDNA3
-        {
+        if (ctx.rdna3) {
             std::array<uint16_t, 256> to_f16{};
             for (int i = 0; i < 256; ++i) to_f16[size_t(i)] = tin::f_to_f16(tin::e4m3_to_f(uint8_t(i)));
             std::vector<uint8_t> f16_buf(a->host_weights.size() * 2);
@@ -2315,18 +2338,13 @@ bool reload_network(const HostDevice& host, const RuntimeCore& core, const std::
             for (size_t i = 0; i < a->host_weights.size(); ++i) out[i] = to_f16[a->host_weights[i]];
             ctx.upload(w_e, 0, f16_buf.data(), f16_buf.size());
         }
-#endif
     } catch (...) {
         if (w.handle) ctx.destroy(w);
-#if NR_ARCH_RDNA3
         if (w_e.handle) ctx.destroy(w_e);
-#endif
         throw;
     }
     a->wgt = w;
-#if NR_ARCH_RDNA3
-    a->wgt_e = w_e;
-#endif
+    if (ctx.rdna3) a->wgt_e = w_e;
     a->act = std::move(arena);
     a->loaded = 0;   // the tail and the noise fields: the first recording (retarget)
     std::vector<uint8_t>().swap(a->host_weights);

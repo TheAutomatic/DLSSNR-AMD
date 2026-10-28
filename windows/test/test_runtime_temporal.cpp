@@ -29,6 +29,14 @@ int main(int argc, char** argv) {
     std::filesystem::path pkg_root = (root_path.filename() == "dlssnr-amd") ? root_path.parent_path() : root_path;
 
     std::string bundle = (data_dir / "aco").string();
+    if (std::filesystem::is_directory(data_dir / "aco/rdna3")) {
+        const char* f = std::getenv("DLSSNR_FORCE_ARCH");
+        if (f && std::strcmp(f, "rdna4") == 0 && std::filesystem::is_directory(data_dir / "aco/rdna4")) {
+            bundle = (data_dir / "aco/rdna4").string();
+        } else {
+            bundle = (data_dir / "aco/rdna3").string();
+        }
+    }
     std::string shells = bundle + "/shells";
     std::string shell_fb = bundle + "/shell";
     std::string shaders = (data_dir / "shaders").string();
@@ -48,7 +56,13 @@ int main(int argc, char** argv) {
     std::printf("[test] Configured ACO bundle from: %s (%zu aliases)\n", bundle.c_str(), aliases.size());
 
     // Configure binary mode BEFORE creating Vulkan Context so pipeline_binary extension is enabled on device
-    nr::binary::configure(bundle, {shells, shell_fb, shaders}, "", std::move(aliases));
+    std::vector<std::string> template_dirs = {shells, shell_fb};
+    if (std::filesystem::is_directory(data_dir / "shaders/rdna4"))
+        template_dirs.push_back((data_dir / "shaders/rdna4").string());
+    if (std::filesystem::is_directory(data_dir / "shaders/rdna3"))
+        template_dirs.push_back((data_dir / "shaders/rdna3").string());
+    template_dirs.push_back(shaders);
+    nr::binary::configure(bundle, template_dirs, "", std::move(aliases));
 
     nrvk::Context ctx;
     try {
@@ -57,7 +71,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "Context create failed: %s\n", e.what());
         return 1;
     }
-    std::printf("Active GPU: %s\n", ctx.gpu_name.c_str());
+    std::printf("Active GPU: %s (%s)\n", ctx.gpu_name.c_str(), ctx.target_name());
 
     nr::HostDevice host{};
     host.instance = ctx.instance;
@@ -66,6 +80,7 @@ int main(int argc, char** argv) {
     host.queue = ctx.queue;
     host.queue_family = ctx.family;
     host.buffer_device_address = true;
+    host.rdna3 = ctx.rdna3 ? 1 : 0;
 
     nr::RuntimeConfig rc{};
     rc.root = pkg_root.string();
@@ -73,6 +88,8 @@ int main(int argc, char** argv) {
     rc.height = 360;
     rc.colour_format = VK_FORMAT_R32G32B32A32_SFLOAT;
     rc.network = 1; // small model
+    rc.max_passes = 1;
+    rc.rdna3 = ctx.rdna3 ? 1 : 0;
 
     nr::TemporalConfig tc{};
     tc.enable = true;

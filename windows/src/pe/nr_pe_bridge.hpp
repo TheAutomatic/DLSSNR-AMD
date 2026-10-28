@@ -65,6 +65,7 @@ class Device {
     // repeated for that adapter.
     static Device* get(const LUID& luid, std::string* why);
     const LUID& luid() const { return luid_; }
+    bool is_rdna3() const { return is_rdna3_; }
 
     DeviceHandles handles() const { return handles_; }
     VkQueue queue() const { return queue_; }
@@ -160,6 +161,7 @@ class Device {
     void drop_locked(Job* job, std::vector<std::function<void()>>& calls);
     bool done(Job* job);   // jobs_mutex_ held: submitted and its fence signalled
     LUID luid_{};
+    bool is_rdna3_ = false;
     struct Buried { IUnknown* d3d; uint64_t mark; };
     std::vector<Buried> buried_;   // under sync_mutex_
     void sweep_buried_locked(uint64_t completed);

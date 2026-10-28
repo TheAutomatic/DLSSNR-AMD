@@ -2144,6 +2144,7 @@ RuntimeConfig Session::Impl::make_config(uint32_t w, uint32_t h, VkFormat f, boo
     // and hands an SDR one over as it is, and only the format reaches us).
     config.preprocess_unknee = want_linear || (native && is_linear_format(f));
     if (native) config.model_scale = 1.0f;   // the DLL has no resample; OptiScaler scales outside
+    config.rdna3 = bdev ? (bdev->is_rdna3() ? 1 : 0) : -1;
     return config;
 }
 
@@ -2156,6 +2157,7 @@ HostDevice Session::Impl::make_host() const {
     host.queue = access.queue; host.queue_family = access.family;
     host.buffer_device_address = vkd3d_device || mode == Mode::Bridge ||
                                  vkdevice::network_features_added(handles.device);
+    host.rdna3 = bdev ? (bdev->is_rdna3() ? 1 : 0) : -1;
     return host;
 }
 

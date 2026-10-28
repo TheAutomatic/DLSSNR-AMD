@@ -105,6 +105,7 @@ void write_log(FILE* f, bool enabled, bool clear);
 // [Network] ACO Mode of dlssnr-amd.ini in `folder`, handed to nr::binary before the first device is made: on
 // (and the bundle dlssnr-amd/aco present) the network runs ACO's machine code. Logs what it decided.
 void configure_network(const std::string& folder);
+void configure_network_for_arch(const std::string& folder, bool is_rdna3);
 // "exposure auto, ExposureBias +0.00 EV, curve none, contrast 1.00, saturation 1.00", for the log.
 std::string describe(const Preprocess& p);
 

@@ -1,5 +1,7 @@
 #include "nr_pe_bridge.hpp"
+#include "nr_pe_config.hpp"
 #include "nr_pipeline_binary.hpp"
+#include "core/nr_driver_identity.hpp"
 #include "nrvk.hpp"
 
 #include "nr_pe_log.hpp"
@@ -216,7 +218,39 @@ bool Device::create(const LUID& luid, std::string* why) {
     vkEnumerateDeviceExtensionProperties(physical_, nullptr, &n, nullptr);
     std::vector<VkExtensionProperties> have(n);
     vkEnumerateDeviceExtensionProperties(physical_, nullptr, &n, have.data());
-    const std::vector<const char*> required_exts = network_extensions();
+
+    bool have_float8_ext = false;
+    for (const auto& h : have) {
+        if (std::strcmp(h.extensionName, VK_EXT_SHADER_FLOAT8_EXTENSION_NAME) == 0)
+            have_float8_ext = true;
+    }
+
+    // Recover real un-spoofed AMD device properties if OptiScaler Vulkan GPU spoofing is active
+    VkPhysicalDeviceProperties real_props = chosen;
+    VkPhysicalDeviceDriverProperties real_drv{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    if (nr::driver::amd_reported(physical_, &real_props, &real_drv)) {
+        if (chosen.vendorID != real_props.vendorID || chosen.deviceID != real_props.deviceID) {
+            log("[nr] bridge: GPU spoofing detected (loader: %04x:%04x, ICD: %04x:%04x \"%s\")",
+                chosen.vendorID, chosen.deviceID, real_props.vendorID, real_props.deviceID, real_props.deviceName);
+        }
+        chosen.vendorID = real_props.vendorID;
+        chosen.deviceID = real_props.deviceID;
+        std::memcpy(chosen.deviceName, real_props.deviceName, sizeof(chosen.deviceName));
+    }
+
+    is_rdna3_ = nrvk::is_rdna3_device(chosen.vendorID, chosen.deviceID, have_float8_ext);
+    log("[nr] bridge: device %s (%04x:%04x) selected %s path",
+        chosen.deviceName, chosen.vendorID, chosen.deviceID,
+        is_rdna3_ ? "RDNA3 (FP16)" : "RDNA4 (FP8)");
+
+    std::vector<const char*> required_exts = {
+        VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME,
+        VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
+        VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
+        VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME
+    };
+    if (!is_rdna3_) required_exts.push_back(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
+
     for (const char* e : required_exts) {
         bool found = false;
         for (const auto& h : have) found = found || std::strcmp(h.extensionName, e) == 0;
@@ -232,6 +266,13 @@ bool Device::create(const LUID& luid, std::string* why) {
         if (std::strcmp(h.extensionName, VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME) == 0) robustness_ext = true;
     }
     if (keyed_mutex_) extensions.push_back(VK_KHR_WIN32_KEYED_MUTEX_EXTENSION_NAME);
+
+    const VkComponentTypeKHR ab_type = is_rdna3_ ? VK_COMPONENT_TYPE_FLOAT16_KHR : VK_COMPONENT_TYPE_FLOAT8_E4M3_EXT;
+    if (!nrvk::Context::has_matrix_config(instance_, physical_, ab_type)) {
+        *why = std::string(chosen.deviceName) + " lacks required 16x16x16 cooperative matrix config for " +
+               (is_rdna3_ ? "RDNA3 (FP16)" : "RDNA4 (FP8)");
+        return false;
+    }
 
     // The network's feature set, as nrvk::Context::create enables it for the measurements, plus
     // timeline semaphores (the shared fences) and buffer device addresses (the Windows network reads
@@ -250,7 +291,7 @@ bool Device::create(const LUID& luid, std::string* why) {
     q.pNext = &coop; coop.pNext = &fp8; fp8.pNext = &f11; f11.pNext = &f12; f12.pNext = &f13; f13.pNext = &wml;
     wml.pNext = &prf;
     vkGetPhysicalDeviceFeatures2(physical_, &q);
-    const bool no_fp8 = !nrvk::nr_target_float8();
+    const bool no_fp8 = is_rdna3_;
     struct { bool have; const char* name; } required[] = {
         {bool(coop.cooperativeMatrix), "cooperativeMatrix"},
         {no_fp8 || bool(fp8.shaderFloat8), "shaderFloat8"},
@@ -275,7 +316,7 @@ bool Device::create(const LUID& luid, std::string* why) {
     fp8 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT};
     // The FP8 features are the rdna4-fp8 target's; rdna3-fp16 leaves the struct zeroed in
     // the chain — explicitly disabled, not silently absent.
-    if (nrvk::nr_target_float8()) fp8.shaderFloat8 = fp8.shaderFloat8CooperativeMatrix = VK_TRUE;
+    if (!is_rdna3_) fp8.shaderFloat8 = fp8.shaderFloat8CooperativeMatrix = VK_TRUE;
     f11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
     f11.storageBuffer16BitAccess = VK_TRUE;
     f12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
@@ -313,6 +354,7 @@ bool Device::create(const LUID& luid, std::string* why) {
     di.queueCreateInfoCount = 1; di.pQueueCreateInfos = &qi;
     di.enabledExtensionCount = uint32_t(extensions.size());
     di.ppEnabledExtensionNames = extensions.data();
+    nr::pe::configure_network_for_arch(nr::pe::module_folder(), is_rdna3_);
     nr::binary::Features binary_features;
     binary_features.prepare(physical_, di, extensions);
     const VkResult r = vkCreateDevice(physical_, &di, nullptr, &device_);

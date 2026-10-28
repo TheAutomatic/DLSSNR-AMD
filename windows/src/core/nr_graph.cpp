@@ -167,15 +167,15 @@ static std::vector<uint8_t> g_tc_nobar;
 static std::vector<uint32_t> g_tc_words;
 static std::vector<size_t> g_tc_err;   // error words, as indices into g_tc_words
 static size_t g_tc_base = 0;
-static bool tchain_active() {
+static bool tchain_active(bool rdna3 = false) {
     if (!NR_TCHAIN_TILES || g_chain_epoch_word == 0xFFFFFFFFu) return false;
     const char* e = std::getenv("NR_TCHAIN");
-#if NR_ARCH_RDNA3
-    // RDNA3 initial default: explicit barriers. Chaining is opt-in via NR_TCHAIN=1.
-    return e && *e && std::atoi(e) != 0;
-#else
-    return !(e && *e && std::atoi(e) == 0);
-#endif
+    if (rdna3) {
+        // RDNA3 initial default: explicit barriers. Chaining is opt-in via NR_TCHAIN=1.
+        return e && *e && std::atoi(e) != 0;
+    } else {
+        return !(e && *e && std::atoi(e) == 0);
+    }
 }
 // Which barriers a tile counter replaces. C=512: attn -> its projection ->
 // ffwd3 -> FFN projection -> attn. ViT: expand -> contraction -> QKV, and
@@ -1339,11 +1339,9 @@ private:
 struct NrSession {
     nrvk::Context ctx;
     nrvk::Buffer act{}, wgt{};
-#if NR_ARCH_RDNA3
     // RDNA3: the arenas' FP16 twins, which hold the e4m3 values as FP16 elements at the
     // same element index (nrvk::Context::fp16_twin; shaders reach them by block name).
     nrvk::Buffer act_e{}, wgt_e{};
-#endif
     nrvk::Context::Image tex_in{}, surf0{}, surf1{};
     std::map<std::string, nrvk::Kernel> kern;
     std::vector<Disp> disp;
@@ -1434,20 +1432,16 @@ struct NrSession {
 struct GraphAct {
     VkDevice device{};
     nrvk::Buffer buf{};
-#if NR_ARCH_RDNA3
     nrvk::Buffer twin{};
-#endif
     size_t cap{};
     uint64_t loaded{};
     ~GraphAct() {
         if (buf.mapped) vkUnmapMemory(device, buf.memory);
         if (buf.handle) vkDestroyBuffer(device, buf.handle, nullptr);
         if (buf.memory) vkFreeMemory(device, buf.memory, nullptr);
-#if NR_ARCH_RDNA3
         if (twin.mapped) vkUnmapMemory(device, twin.memory);
         if (twin.handle) vkDestroyBuffer(device, twin.handle, nullptr);
         if (twin.memory) vkFreeMemory(device, twin.memory, nullptr);
-#endif
     }
 };
 
@@ -1459,9 +1453,7 @@ struct GraphArenas {
     VkDevice device{};
     std::shared_ptr<GraphAct> act;   // possibly another network's too (GraphAct)
     nrvk::Buffer wgt{};
-#if NR_ARCH_RDNA3
     nrvk::Buffer wgt_e{};
-#endif
     size_t wgt_cap{}, weights_end{};
     uint64_t weights_hash{};
     uint64_t loaded{};   // GraphCore::id whose tail and noise fields the weight buffer holds, 0 none
@@ -1486,11 +1478,9 @@ struct GraphArenas {
         if (wgt.mapped) vkUnmapMemory(device, wgt.memory);
         if (wgt.handle) vkDestroyBuffer(device, wgt.handle, nullptr);
         if (wgt.memory) vkFreeMemory(device, wgt.memory, nullptr);
-#if NR_ARCH_RDNA3
         if (wgt_e.mapped) vkUnmapMemory(device, wgt_e.memory);
         if (wgt_e.handle) vkDestroyBuffer(device, wgt_e.handle, nullptr);
         if (wgt_e.memory) vkFreeMemory(device, wgt_e.memory, nullptr);
-#endif
     }
 };
 
@@ -1993,6 +1983,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     for (const auto& kv : vsize) if (kv.second) plain_total += align(kv.second, 256);
     if (reuse) {
         NrSession probe;
+        probe.ctx.rdna3 = ctx.rdna3;
         probe.arena_probe = true;
         const nr::LogSink sink = nr::g_log_sink;
         const uint32_t epoch_word = g_chain_epoch_word;
@@ -2178,7 +2169,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         // accumulators with every k pair swapped in the upper lane half, and the weight tiles they
         // multiply those operands by have to be stored the same way; see the repack below.
         if (!built.count("kswap")) built["kswap"] = 0;
-        if (built.at("kswap") && !NR_ARCH_RDNA3) {
+        if (built.at("kswap") && !ctx.rdna3) {
             std::fprintf(stderr, "kswap shaders need the RDNA3 host\n"); return 1;
         }
         kswap = built.at("kswap");
@@ -4061,9 +4052,9 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                 PushFfwd3 p{};
                 if(pd.push.size()!=sizeof p) throw std::runtime_error("packed FFWD push mismatch");
                 std::memcpy(&p,pd.push.data(),sizeof p);
-                pack_matrix(p.a_off,FF_GROUPS*FF_R,FF_K,NR_ARCH_RDNA3);
-                pack_matrix(p.q0_off,FF_GROUPS*FF_J,FF_R,NR_ARCH_RDNA3);
-                pack_matrix(p.q2_off,FF_GROUPS*FF_OUT,FF_J,NR_ARCH_RDNA3);
+                pack_matrix(p.a_off,FF_GROUPS*FF_R,FF_K,ctx.rdna3);
+                pack_matrix(p.q0_off,FF_GROUPS*FF_J,FF_R,ctx.rdna3);
+                pack_matrix(p.q2_off,FF_GROUPS*FF_OUT,FF_J,ctx.rdna3);
                 continue;
             }
 #if NR_INT4
@@ -4091,7 +4082,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             // operand are stored with their k pairs swapped too. Which tiles those are is a property
             // of each kernel: a tile against an operand loaded from LDS or the arena stays plain.
             // The swap is a permutation of the tile's bytes; the products are the same products.
-            if(NR_ARCH_RDNA3 && pd.kern.rfind("fswin",0)==0) {
+            if(ctx.rdna3 && pd.kern.rfind("fswin",0)==0) {
                 if(!kswap) continue;
                 // diagnostic (wrong picture): NR_KSWAP_DIAG=0 leaves the weights plain, to time the data alone.
                 if(std::getenv("NR_KSWAP_DIAG") && !std::atoi(std::getenv("NR_KSWAP_DIAG"))) continue;
@@ -4177,15 +4168,11 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     // Off for every flag that reasons per step: they dispatch, seed or time
     // individual layers and a merged run has no individual layers left.
     {
-#if NR_ARCH_RDNA3
-        // RDNA3: persistent Swin workgroup loops have spin/barrier deadlock issues at resolutions >= 1080p
-        // causing GPU TDR (display resets). Default to off; opt-in with NR_PERSIST=1.
-        const bool asked_off = !(std::getenv("NR_PERSIST") && *std::getenv("NR_PERSIST") == '1') ||
-                               flag(argc, argv, "--no-persist");
-#else
-        const bool asked_off = flag(argc, argv, "--no-persist") ||
-            (std::getenv("NR_NO_PERSIST") && *std::getenv("NR_NO_PERSIST"));
-#endif
+        // Persistent Swin workgroup loops on RDNA3 have spin/barrier deadlock issues at resolutions >= 1080p
+        // causing GPU TDR (display resets). On RDNA3 default to off (opt-in with NR_PERSIST=1); on RDNA4 default to on.
+        const bool asked_off = ctx.rdna3
+            ? (!(std::getenv("NR_PERSIST") && *std::getenv("NR_PERSIST") == '1') || flag(argc, argv, "--no-persist"))
+            : (flag(argc, argv, "--no-persist") || (std::getenv("NR_NO_PERSIST") && *std::getenv("NR_NO_PERSIST")));
         const char* per_step_flags[] = {"--only", "--seed-dir", "--no-barrier-after",
                                         "--barrier-stride"};
         bool per_step = flag(argc, argv, "--oracle") || flag(argc, argv, "--no-barrier") ||
@@ -4531,7 +4518,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         // read inside such a stretch stays reserved to the stretch's end (the next
         // real barrier); otherwise a later dispatch of the stretch could overwrite
         // what a still-running earlier one reads.
-        if (tchain_active()) {
+        if (tchain_active(ctx.rdna3)) {
             std::vector<int> stretch_end(size_t(nd) + 1);
             for (int f = nd; f >= 0; --f)
                 stretch_end[size_t(f)] = (f + 1 < nd && tchain_pair(disp[size_t(f)].kern, disp[size_t(f) + 1].kern))
@@ -4660,7 +4647,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     g_tc_err.clear();
     tc_expect.clear(); tc_pair.clear(); tc_err.clear(); tc_base = 0; tc_words = 0;
     if (NR_TCHAIN_TILES) {
-        const bool on = tchain_active();
+        const bool on = tchain_active(ctx.rdna3);
         act_total = align(act_total, 256);
         g_tc_base = act_total / 4;
         // The frame counter: ticked by the frame's first fswin32 (a real barrier
@@ -4930,32 +4917,30 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         act_shared = given_act && given_act->device == ctx.device && given_act->cap >= act_bytes;
         if (act_shared) {
             arenas->act = given_act;
-#if NR_ARCH_RDNA3
-            if (!given_act->twin.handle) {
+            if (ctx.rdna3 && !given_act->twin.handle) {
                 given_act->twin = ctx.buffer(VkDeviceSize(given_act->cap) * 2);
             }
-#endif
             nr::logf("activation arena: taken over from another network (%.1f MB, this one needs %.1f MB)",
                      double(given_act->cap) / 1e6, double(act_bytes) / 1e6);
         } else {
             const size_t room = size_t(double(act_bytes) * std::max(1.0, act_slack) + 255) / 256 * 256;
             auto a = std::make_shared<GraphAct>();
             a->device = ctx.device; a->buf = ctx.buffer(room, false, /*device_address=*/true); a->cap = room;
-#if NR_ARCH_RDNA3
-            a->twin = ctx.buffer(VkDeviceSize(room) * 2);
-#endif
+            if (ctx.rdna3) {
+                a->twin = ctx.buffer(VkDeviceSize(room) * 2);
+            }
             arenas->act = std::move(a);
         }
         arenas->act_need = act_bytes;
         act = arenas->act->buf; wgt = ctx.buffer(std::max(wgt_bytes, wblob.size()));
-#if NR_ARCH_RDNA3
-        act_e = arenas->act->twin;
-        arenas->wgt_e = ctx.buffer(VkDeviceSize(std::max(wgt_bytes, wblob.size())) * 2);
-        wgt_e = arenas->wgt_e;
-        ctx.fp16_twin[act.handle] = act_e.handle; ctx.fp16_twin[wgt.handle] = wgt_e.handle;
-        nr::logf("fp16 twins for e4m3 data: activation %.1f MB, weights %.1f MB",
-                 double(act_bytes) * 2 / 1e6, double(wblob.size()) * 2 / 1e6);
-#endif
+        if (ctx.rdna3) {
+            act_e = arenas->act->twin;
+            arenas->wgt_e = ctx.buffer(VkDeviceSize(std::max(wgt_bytes, wblob.size())) * 2);
+            wgt_e = arenas->wgt_e;
+            ctx.fp16_twin[act.handle] = act_e.handle; ctx.fp16_twin[wgt.handle] = wgt_e.handle;
+            nr::logf("fp16 twins for e4m3 data: activation %.1f MB, weights %.1f MB",
+                     double(act_bytes) * 2 / 1e6, double(wblob.size()) * 2 / 1e6);
+        }
         // vit_attn.comp NR_VBDA reads V through a buffer_reference: the arena's address goes into
         // every vitattn push block (PushVAttn::act_lo/act_hi).
         nr::logf("[nr] activation arena through its device address: %s",
@@ -5022,8 +5007,8 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         ctx.upload_with(wgt, 0, wblob.size(), [&](VkDeviceSize off, VkDeviceSize n, uint8_t* dst) {
             wblob.read(size_t(off), dst, size_t(n));
         });
-#if NR_ARCH_RDNA3
-        {   // Every byte read as an e4m3 code. Regions that hold f16/f32/u32 data decode to
+        if (ctx.rdna3) {
+            // Every byte read as an e4m3 code. Regions that hold f16/f32/u32 data decode to
             // garbage here, and nothing reads them through an e4m3 view.
             std::array<uint16_t, 256> to_f16{};
             for (int i = 0; i < 256; ++i) to_f16[size_t(i)] = tin::f_to_f16(tin::e4m3_to_f(uint8_t(i)));
@@ -5035,7 +5020,6 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                 for (size_t i = 0; i < count; ++i) out[i] = to_f16[codes[i]];
             });
         }
-#endif
         // The extent tail is kept for the resize path (GraphCore::tail); the rest of the host copy is not needed
         // again: free it before the runtime allocates.
         keep_tail(wblob);
@@ -5336,9 +5320,9 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     // is exactly zero". Fill now, disarm, and every later submit keeps what the
     // seeder put there.
     runner.zero_buffer = act.handle;
-#if NR_ARCH_RDNA3
-    runner.zero_twin = act_e.handle; runner.zero_twin_bytes = VkDeviceSize(act_total) * 2;
-#endif
+    if (ctx.rdna3) {
+        runner.zero_twin = act_e.handle; runner.zero_twin_bytes = VkDeviceSize(act_total) * 2;
+    }
     runner.zero_bytes = VkDeviceSize(act_total);
     // **What arena reuse has to keep zero** (diagnostics, off unless asked for,
     // one-value-one-slot layout). NR_ARENA_UNWRITTEN=1 fills the values with a
@@ -5402,6 +5386,8 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     if (!act_shared) runner.run_graph({}, 1);
     runner.poison.clear();
     runner.zero_buffer = VK_NULL_HANDLE;
+    runner.zero_twin = VK_NULL_HANDLE;
+    runner.zero_twin_bytes = 0;
     runner.zero_bytes = 0;
     // Diagnostic NR_DUP=k1,k2: run those kernels twice back to back (idempotent
     // layers only), so the second copy shows the kernel with warm caches.
@@ -5501,10 +5487,8 @@ void NrSession::retarget(VkCommandBuffer cmd) {
     // The arena as a build leaves it (zero), the tail as it uploads it, the noise fields as it fills them.
     if (zero) {
         vkCmdFillBuffer(cmd, act.handle, 0, (VkDeviceSize(c.act_total) + 3) / 4 * 4, 0);
-#if NR_ARCH_RDNA3
-        if (act_e.handle)
+        if (ctx.rdna3 && act_e.handle)
             vkCmdFillBuffer(cmd, act_e.handle, 0, ((VkDeviceSize(c.act_total) * 2) + 3) / 4 * 4, 0);
-#endif
     }
     if (tail && c.staging && c.staging->buf.handle) {
         std::vector<VkBufferCopy> r = c.staging->ranges;
@@ -5681,10 +5665,10 @@ int NrSession::build_shared(int argc, char** argv) {
     persist_err = c.persist_err;
     tc_base = c.tc_base; tc_words = c.tc_words; tc_err = c.tc_err; tc_expect = c.tc_expect; tc_pair = c.tc_pair;
     arenas = slot; act = arenas->act->buf; wgt = arenas->wgt;
-#if NR_ARCH_RDNA3
-    act_e = arenas->act->twin; wgt_e = arenas->wgt_e;
-    ctx.fp16_twin[act.handle] = act_e.handle; ctx.fp16_twin[wgt.handle] = wgt_e.handle;
-#endif
+    if (ctx.rdna3) {
+        act_e = arenas->act->twin; wgt_e = arenas->wgt_e;
+        ctx.fp16_twin[act.handle] = act_e.handle; ctx.fp16_twin[wgt.handle] = wgt_e.handle;
+    }
     put_act_address(disp, act.address);   // the slot's arena, which need not be the one the core was built in
     core = share;
     ctx.pin = &arenas->pipelines;

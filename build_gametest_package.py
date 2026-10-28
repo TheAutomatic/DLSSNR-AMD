@@ -115,31 +115,64 @@ else:
     else:
         raise FileNotFoundError("Could not find dlssnr.bin and dlssnr-small.bin in benchmark zip or fallbacks")
 
-print("[5/8] Assembling ACO bundle & native shaders...")
+print("[5/8] Assembling Dual-Architecture ACO bundles & native shaders...")
 aco_dir = dlssnr_amd_dir / "aco"
-(aco_dir / "records").mkdir(parents=True, exist_ok=True)
-(aco_dir / "shaders").mkdir(parents=True, exist_ok=True)
-(aco_dir / "shells").mkdir(parents=True, exist_ok=True)
+aco_rdna3_dir = aco_dir / "rdna3"
+aco_rdna4_dir = aco_dir / "rdna4"
+(aco_rdna3_dir / "records").mkdir(parents=True, exist_ok=True)
+(aco_rdna3_dir / "shaders").mkdir(parents=True, exist_ok=True)
+(aco_rdna3_dir / "shells").mkdir(parents=True, exist_ok=True)
+(aco_rdna3_dir / "shell").mkdir(parents=True, exist_ok=True)
+(aco_rdna4_dir / "records").mkdir(parents=True, exist_ok=True)
 
-# 62 records
+# 1. RDNA3 ACO bundle
+for rec in (ACO_DATA / "records").glob("*.nrp"):
+    shutil.copy2(rec, aco_rdna3_dir / "records" / rec.name)
+
+if TMP_ACO_SHADERS.exists():
+    shutil.copytree(TMP_ACO_SHADERS, aco_rdna3_dir / "shaders", dirs_exist_ok=True)
+else:
+    shutil.copytree(ACO_DATA / "shaders", aco_rdna3_dir / "shaders", dirs_exist_ok=True)
+
+shutil.copytree(ACO_DATA / "shells", aco_rdna3_dir / "shells", dirs_exist_ok=True)
+shutil.copytree(ACO_DATA / "shells", aco_rdna3_dir / "shell", dirs_exist_ok=True)
+shutil.copy2(ACO_DATA / "shell-aliases.txt", aco_rdna3_dir / "shell-aliases.txt")
+
+# 2. RDNA4 ACO bundle
+ACO_RDNA4_DATA = REPO_ROOT / "windows/data/aco/rdna4"
+if not ACO_RDNA4_DATA.exists():
+    ACO_RDNA4_DATA = REPO_ROOT / "windows/data/aco"
+(aco_rdna4_dir / "records").mkdir(parents=True, exist_ok=True)
+for rec in (ACO_RDNA4_DATA / "records").glob("*.nrp"):
+    shutil.copy2(rec, aco_rdna4_dir / "records" / rec.name)
+if (ACO_RDNA4_DATA / "shaders").exists():
+    shutil.copytree(ACO_RDNA4_DATA / "shaders", aco_rdna4_dir / "shaders", dirs_exist_ok=True)
+elif Path("/mnt/c/Users/Kenny/Downloads/DLSSNR-AMD-Vulkan-Windows-0.0.7-preview-x86_64/dlssnr-amd/aco/shaders").exists():
+    shutil.copytree(Path("/mnt/c/Users/Kenny/Downloads/DLSSNR-AMD-Vulkan-Windows-0.0.7-preview-x86_64/dlssnr-amd/aco/shaders"), aco_rdna4_dir / "shaders", dirs_exist_ok=True)
+if (ACO_RDNA4_DATA / "shell-aliases.txt").exists():
+    shutil.copy2(ACO_RDNA4_DATA / "shell-aliases.txt", aco_rdna4_dir / "shell-aliases.txt")
+
+# 3. Flat fallback for backwards compatibility
+(aco_dir / "records").mkdir(parents=True, exist_ok=True)
 for rec in (ACO_DATA / "records").glob("*.nrp"):
     shutil.copy2(rec, aco_dir / "records" / rec.name)
-
-# Shaders from linux network build or aco data fallback
-if TMP_ACO_SHADERS.exists():
-    shutil.copytree(TMP_ACO_SHADERS, aco_dir / "shaders", dirs_exist_ok=True)
-else:
-    shutil.copytree(ACO_DATA / "shaders", aco_dir / "shaders", dirs_exist_ok=True)
-
-# Shells from windows rdna3 shells
-shutil.copytree(ACO_DATA / "shells", aco_dir / "shells", dirs_exist_ok=True)
-shutil.copytree(ACO_DATA / "shells", aco_dir / "shell", dirs_exist_ok=True)
-
-# Shell aliases
+shutil.copytree(aco_rdna3_dir / "shaders", aco_dir / "shaders", dirs_exist_ok=True)
+shutil.copytree(aco_rdna3_dir / "shells", aco_dir / "shells", dirs_exist_ok=True)
+shutil.copytree(aco_rdna3_dir / "shells", aco_dir / "shell", dirs_exist_ok=True)
 shutil.copy2(ACO_DATA / "shell-aliases.txt", aco_dir / "shell-aliases.txt")
 
-# Native shaders for completeness
-shutil.copytree(ACO_DATA / "shaders", dlssnr_amd_dir / "shaders", dirs_exist_ok=True)
+# 4. Native shaders: dual architecture
+shaders_dir = dlssnr_amd_dir / "shaders"
+shaders_rdna3 = shaders_dir / "rdna3"
+shaders_rdna4 = shaders_dir / "rdna4"
+shutil.copytree(aco_rdna3_dir / "shaders", shaders_rdna3, dirs_exist_ok=True)
+
+RDNA4_UPSTREAM_SHADERS = Path("/mnt/c/Users/Kenny/Downloads/DLSSNR-AMD-Vulkan-Windows-0.0.7-preview-x86_64/dlssnr-amd/shaders")
+if RDNA4_UPSTREAM_SHADERS.exists():
+    shutil.copytree(RDNA4_UPSTREAM_SHADERS, shaders_rdna4, dirs_exist_ok=True)
+
+# Default shaders root
+shutil.copytree(aco_rdna3_dir / "shaders", shaders_dir, dirs_exist_ok=True)
 
 print("[6/8] Configuring OptiScaler.ini and dlssnr-amd.ini...")
 # Configure OptiScaler.ini
@@ -227,14 +260,15 @@ pause
 '''
 
 # 2. install_game.ps1 (Rich PowerShell UI with UTF-8 BOM)
-install_game_ps1 = r'''param([string]$Target = '')
+install_game_ps1 = r'''param([string]$Target = '', [switch]$NoPause)
 
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
 
 Write-Host "=======================================================================" -ForegroundColor Cyan
-Write-Host "          DLSS-NR AMD (RDNA3 / RDNA3.5) 游戏整合测试包 v__VERSION__" -ForegroundColor Cyan
-Write-Host "       支持硬件: RX 7000 系列 / 8060S / 890M / 780M 全系" -ForegroundColor Cyan
+Write-Host "       DLSS-NR AMD (RDNA3 / RDNA3.5 / RDNA4) 全架构整合测试包 v__VERSION__" -ForegroundColor Cyan
+Write-Host "  支持硬件: RX 9000 / RX 7000 / 8060S / 890M / 780M / 混合双显卡全系" -ForegroundColor Cyan
+Write-Host "  核心特性: 单 DLL 跨架构运行时动态派发 (LUID 渲染设备精准绑定)" -ForegroundColor Cyan
 Write-Host "=======================================================================" -ForegroundColor Cyan
 Write-Host ""
 
@@ -357,7 +391,14 @@ foreach ($item in $itemsToCopy) {
     $srcPath = Join-Path $here $item
     if (Test-Path -LiteralPath $srcPath) {
         $destPath = Join-Path $gameDir $item
-        Copy-Item -LiteralPath $srcPath -Destination $destPath -Recurse -Force
+        if (Test-Path -LiteralPath $srcPath -PathType Container) {
+            if (-not (Test-Path -LiteralPath $destPath)) {
+                New-Item -ItemType Directory -Path $destPath -Force | Out-Null
+            }
+            Copy-Item -Path (Join-Path $srcPath "*") -Destination $destPath -Recurse -Force
+        } else {
+            Copy-Item -LiteralPath $srcPath -Destination $destPath -Force
+        }
         Write-Host "  -> 已部署: $item" -ForegroundColor Gray
     } else {
         Write-Host "  -> [跳过] 未找到源文件: $item" -ForegroundColor DarkGray
@@ -396,7 +437,7 @@ Write-Host ""
 Write-Host "如需卸载，运行本包内的【一键卸载.bat】即可。"
 Write-Host "======================================================================="
 Write-Host ""
-Read-Host "请按 Enter 键退出..."
+if (-not $NoPause) { Read-Host "请按 Enter 键退出..." }
 '''
 
 # 3. 一键卸载.bat (Pure 7-bit ASCII wrapper)
@@ -582,32 +623,38 @@ Read-Host "按 Enter 键退出..."
 
 # 3. README_使用与实测指南.txt
 readme_txt = r'''===============================================================================
-              DLSS-NR AMD (RDNA3 / RDNA3.5) 游戏实机集成测试包 v__VERSION__
+       DLSS-NR AMD (RDNA3 / RDNA3.5 / RDNA4) 全架构实机集成测试包 v__VERSION__
 ===============================================================================
 
-【适用硬件】
-  - AMD Radeon RX 7000 全系列独立显卡（RX 7900 XTX / 7900 XT / 7800 XT / 7700 XT / 7600 等）
-  - AMD Ryzen AI MAX+ 395 / Ryzen AI MAX 390 (Strix Halo Radeon 8060S / 8050S 40CU/32CU)
-  - AMD Ryzen AI 9 HX 370 / 365 (Strix Point Radeon 890M / 880M)
-  - AMD Ryzen 7 7840U / 8840U / 7840HS / 8840HS / 7940HS (Phoenix / Hawk Point Radeon 780M)
+【适用硬件与架构支持】
+  - AMD Radeon RX 9000 全系列独立显卡（RX 9070 XT / 9070 等，RDNA4 架构）：
+    -> 运行时自动派发至原生 FP8 协作矩阵核心（Wave32 原生指令），零内存与转换开销。
+  - AMD Radeon RX 7000 全系列独立显卡（RX 7900 XTX / XT / 7800 XT / 7700 XT / 7600 等，RDNA3 架构）：
+    -> 运行时自动激活 FP16 WMMA 孪生缓冲转换与 kswap 偶数行转置链路，彻底解决泛绿屏与崩溃。
+  - AMD 移动端 APU / 掌机芯片：
+    - AMD Ryzen AI MAX+ 395 / Ryzen AI MAX 390 (Strix Halo Radeon 8060S / 8050S 40CU/32CU)
+    - AMD Ryzen AI 9 HX 370 / 365 (Strix Point Radeon 890M / 880M)
+    - AMD Ryzen 7 7840U / 8840U / 7840HS / 8840HS / 7940HS (Phoenix / Hawk Point Radeon 780M)
 
-【重大更新与真机优化亮点】
-  0. 【v1.0.3 时域滤波模板查找与稳定性修复】
-     - 修复在 AMD 驱动下因错选 ~445KB 原生 temporal 着色器而导致的驱动编译器内存崩溃（0xC0000005）。
-     - 共享模板解析器优先命中 aco/shells/temporal/ 下约 3KB 的专用 shell，编译时间从超时/闪退降至 2ms。
-     - 增加模板加载详尽审计日志（路径、大小、SPIR-V 哈希与 NRP 记录绑定）。
-     - 在 AMD 780M (RDNA3) 实机通过完整 Runtime 时域链路（冷捕获 -> 导入 -> 连续多帧时序滤波）验证。
-  1. 【ACO 硬件级着色器编译】
-     - 彻底摒弃 AMD 原生 Windows 驱动易崩溃的动态编译，默认强制开启 [ACO Mode = 1]。
-     - 预置 62 个全套 RDNA3 / RDNA3.5 专用 ACO 机器码切片 (*.nrp)，100% 杜绝编译崩溃。
-  2. 【CC_SMALL_FP8 极速模型默认预置】
-     - 默认激活全新 SMALL FP8 矩阵量化网络，模型大小从 141MB 精简至 108MB。
-     - 真机压测显示：在 720p（等效 1080p 平衡档输入）纯神经网络降噪仅需 14.89 ms！
-     - 突破 67 FPS 纯算力上限，实机游戏帧率推测可从原生 25 FPS 翻倍拉升至 38.5~40+ FPS！
-  3. 【防死锁/TDR 机制】
-     - 默认禁用持久化线程（NR_NO_PERSIST=1），彻底消除 1080p+ 高分辨率下的 GPU TDR 挂起。
-  4. 【多显卡自动秒选】
-     - 双显卡或 APU+独显环境自动智能排除不兼容设备，精准绑定 RDNA3/3.5 目标 GPU。
+【重大架构升级：单 DLL 跨架构运行时动态派发】
+  1. 【真正的单 DLL 自动兼容 (Unified Single DLL Architecture)】
+     - 彻底告别分发阶段必须选择 RDNA3 专版或 RDNA4 专版的割裂现状。
+     - 编译层完全消除硬编码宏分支（彻底重构 #if NR_ARCH_RDNA3），统一为一个单 DLL。
+     - 整合包内同时内置 RDNA3 与 RDNA4 两套 ACO 机器码切片 (aco/rdna3/ 与 aco/rdna4/) 以及
+       双架构着色器 (shaders/rdna3/ 与 shaders/rdna4/)。
+  2. 【多显卡 / 混合显卡 (LUID 渲染设备精准绑定)】
+     - 无论用户电脑是“独显+核显”（如 RX 9070 XT + Radeon 780M）、双独显还是笔记本双显卡切换，
+       插件均会在 Direct3D 12/11 初始化时读取游戏正在渲染的 Adapter LUID，并与底层 Vulkan 物理
+       设备严格一一对应匹配。
+     - 游戏在 9070 XT 上渲染，插件自动以 RDNA4 原生 FP8 模式运行；如果游戏在 780M 上渲染，插件
+       自动以 RDNA3 FP16 模式运行，绝不会因系统内存在多张显卡而错配架构或引发崩溃！
+  3. 【绿色屏幕彻底根治】
+     - 完整修复 RDNA3 WMMA 偶数行寄存器跨通道转置 (kswap) 及原地运动向量采样描述符布局，
+       输出画面色彩平衡，无任何偏绿、泛绿与数值溢出异常。
+  4. 【ACO 硬件级着色器编译】
+     - 默认强制开启 [ACO Mode = 1]，预置全套 ACO 机器码切片 (*.nrp)，杜绝 Windows 原生驱动崩溃。
+  5. 【CC_SMALL_FP8 极速模型默认预置】
+     - 默认激活全新 SMALL FP8 矩阵量化网络，模型大小从 141MB 精简至 108MB，大幅提升降噪帧率。
 
 -------------------------------------------------------------------------------
 【安装方法（两种方式任选）】

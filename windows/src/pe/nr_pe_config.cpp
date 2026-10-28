@@ -1130,53 +1130,83 @@ void write_log(FILE* f, bool enabled, bool clear) {
         enabled ? 1 : 0, clear ? 1 : 0);
 }
 
+static void configure_network_internal(const std::string& folder, int arch_choice) {
+    const std::string ini = folder.empty() ? std::string("dlssnr-amd.ini") : folder + "\\dlssnr-amd.ini";
+    bool aco = true;   // no ACO Mode in the file: on (NetworkConfig::aco)
+    if (FILE* file = std::fopen(ini.c_str(), "r")) {
+        std::string name;
+        char line[512];
+        while (std::fgets(line, sizeof line, file)) {
+            std::string text = line;
+            const auto comment = text.find_first_of(";#");
+            if (comment != std::string::npos) text = text.substr(0, comment);
+            text = trim(text);
+            if (text.empty()) continue;
+            if (text.front() == '[') { name = lower(trim(text.substr(1, text.find(']') - 1))); continue; }
+            const auto equals = text.find('=');
+            if (name != "network" || equals == std::string::npos) continue;
+            const std::string key = lower(trim(text.substr(0, equals)));
+            if (key == "aco" || key == "aco mode" || key == "acomode")
+                if (auto b = parse_bool(trim(text.substr(equals + 1)))) aco = *b;
+        }
+        std::fclose(file);
+    }
+    if (!aco) {
+        nr::binary::disable("ACO Mode disabled in dlssnr-amd.ini");
+        return;
+    }
+    const std::string root = folder.empty() ? std::string(".") : folder;
+    const std::string data = root + "\\dlssnr-amd";
+    std::string bundle = data + "\\aco";
+    if (arch_choice == 1) {
+        if (GetFileAttributesA((bundle + "\\rdna3\\records").c_str()) != INVALID_FILE_ATTRIBUTES)
+            bundle += "\\rdna3";
+    } else if (arch_choice == 0) {
+        if (GetFileAttributesA((bundle + "\\rdna4\\records").c_str()) != INVALID_FILE_ATTRIBUTES)
+            bundle += "\\rdna4";
+    }
+    if (GetFileAttributesA((bundle + "\\records").c_str()) == INVALID_FILE_ATTRIBUTES ||
+        GetFileAttributesA((bundle + "\\shaders").c_str()) == INVALID_FILE_ATTRIBUTES) {
+        log("[nr] [Network] ACO Mode = 1, but %s has no complete ACO network (records\\, shaders\\): the driver's compiler is used",
+            bundle.c_str());
+        nr::binary::disable("selected architecture has no complete ACO network");
+        return;
+    }
+    // Templates: the native network shaders, under their own name or the one shell-aliases.txt gives
+    // ("<bundle name> <native name>" per line: a kernel the Windows build names otherwise).
+    std::map<std::string, std::string> aliases;
+    if (FILE* file = std::fopen((bundle + "\\shell-aliases.txt").c_str(), "r")) {
+        char a[128], b[128];
+        while (std::fscanf(file, "%127s %127s", a, b) == 2) aliases[a] = b;
+        std::fclose(file);
+    }
+    // The imported binaries are kept in aco-cache\ (made again when the driver or the files change).
+    const std::string cache = data + "\\aco-cache" + (arch_choice == 1 ? "\\rdna3" : arch_choice == 0 ? "\\rdna4" : "");
+    CreateDirectoryA(data.c_str(), nullptr);
+    CreateDirectoryA((data + "\\aco-cache").c_str(), nullptr);
+    CreateDirectoryA(cache.c_str(), nullptr);
+    std::vector<std::string> template_dirs = {bundle + "\\shells", bundle + "\\shell"};
+    if (arch_choice == 1) {
+        if (GetFileAttributesA((data + "\\shaders\\rdna3").c_str()) != INVALID_FILE_ATTRIBUTES)
+            template_dirs.push_back(data + "\\shaders\\rdna3");
+    } else if (arch_choice == 0) {
+        if (GetFileAttributesA((data + "\\shaders\\rdna4").c_str()) != INVALID_FILE_ATTRIBUTES)
+            template_dirs.push_back(data + "\\shaders\\rdna4");
+    }
+    template_dirs.push_back(data + "\\shaders");
+    nr::binary::configure(bundle, template_dirs, cache, std::move(aliases));
+    log("[nr] [Network] ACO Mode = 1: the network runs ACO's machine code from %s", bundle.c_str());
+}
+
 void configure_network(const std::string& folder) {
     static std::once_flag once;
     std::call_once(once, [&] {
-        const std::string ini = folder.empty() ? std::string("dlssnr-amd.ini") : folder + "\\dlssnr-amd.ini";
-        bool aco = true;   // no ACO Mode in the file: on (NetworkConfig::aco)
-        if (FILE* file = std::fopen(ini.c_str(), "r")) {
-            std::string name;
-            char line[512];
-            while (std::fgets(line, sizeof line, file)) {
-                std::string text = line;
-                const auto comment = text.find_first_of(";#");
-                if (comment != std::string::npos) text = text.substr(0, comment);
-                text = trim(text);
-                if (text.empty()) continue;
-                if (text.front() == '[') { name = lower(trim(text.substr(1, text.find(']') - 1))); continue; }
-                const auto equals = text.find('=');
-                if (name != "network" || equals == std::string::npos) continue;
-                const std::string key = lower(trim(text.substr(0, equals)));
-                if (key == "aco" || key == "aco mode" || key == "acomode")
-                    if (auto b = parse_bool(trim(text.substr(equals + 1)))) aco = *b;
-            }
-            std::fclose(file);
-        }
-        if (!aco) return;
-        const std::string root = folder.empty() ? std::string(".") : folder;
-        const std::string data = root + "\\dlssnr-amd", bundle = data + "\\aco";
-        if (GetFileAttributesA((bundle + "\\records").c_str()) == INVALID_FILE_ATTRIBUTES ||
-            GetFileAttributesA((bundle + "\\shaders").c_str()) == INVALID_FILE_ATTRIBUTES) {
-            log("[nr] [Network] ACO Mode = 1, but %s has no ACO network (records\\, shaders\\): the driver's compiler is used",
-                bundle.c_str());
-            return;
-        }
-        // Templates: the native network shaders, under their own name or the one shell-aliases.txt gives
-        // ("<bundle name> <native name>" per line: a kernel the Windows build names otherwise).
-        std::map<std::string, std::string> aliases;
-        if (FILE* file = std::fopen((bundle + "\\shell-aliases.txt").c_str(), "r")) {
-            char a[128], b[128];
-            while (std::fscanf(file, "%127s %127s", a, b) == 2) aliases[a] = b;
-            std::fclose(file);
-        }
-        // The imported binaries are kept in aco-cache\ (made again when the driver or the files change).
-        const std::string cache = data + "\\aco-cache";
-        CreateDirectoryA(cache.c_str(), nullptr);
-        nr::binary::configure(bundle, {bundle + "\\shells", bundle + "\\shell", data + "\\shaders"}, cache,
-                              std::move(aliases));
-        log("[nr] [Network] ACO Mode = 1: the network runs ACO's machine code from %s", bundle.c_str());
+        configure_network_internal(folder, -1);
     });
+}
+
+void configure_network_for_arch(const std::string& folder, bool is_rdna3) {
+    configure_network_internal(folder, is_rdna3 ? 1 : 0);
 }
 
 bool PreprocessFile::poll(const std::string& path, PreprocessConfig& out) {

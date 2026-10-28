@@ -72,6 +72,34 @@ inline constexpr VkComponentTypeKHR nr_target_matrix_ab() {
 // build/windows/<this>/network; dev-tree fallbacks in the runtime follow it).
 inline constexpr const char* nr_target_arch_dir() { return nr_rdna3 ? "rdna3" : "rdna4"; }
 
+inline bool is_rdna3_device(uint32_t vendor_id, uint32_t device_id, bool have_float8) {
+    if (const char* force = std::getenv("DLSSNR_FORCE_ARCH")) {
+        if (std::strcmp(force, "rdna3") == 0) return true;
+        if (std::strcmp(force, "rdna4") == 0) return false;
+    }
+    if (const char* force3 = std::getenv("NR_FORCE_RDNA3")) {
+        if (*force3 && std::atoi(force3) != 0) return true;
+    }
+    if (const char* force3_mz = std::getenv("MZ_FORCE_RDNA3")) {
+        if (*force3_mz && std::atoi(force3_mz) != 0) return true;
+    }
+    // RDNA4 (RX 9000): 0x75xx
+    if ((device_id & 0xff00) == 0x7500) {
+        return false;
+    }
+    // RDNA3 / 3.5: Navi 3x (0x74xx), Phoenix/Hawk Point (0x1900, 0x15c8), Strix (0x15bf, 0x15c0)
+    if ((device_id & 0xff00) == 0x7400 || device_id == 0x1900 || device_id == 0x15c8 ||
+        device_id == 0x15bf || device_id == 0x15c0) {
+        return true;
+    }
+    // If vendor is not AMD, or if device_id didn't match known families:
+    // RDNA4 requires VK_EXT_shader_float8 hardware matrix instructions.
+    // Devices lacking float8 can only run the RDNA3 FP16 WMMA path.
+    if (!have_float8) return true;
+    if (vendor_id == 0x1002) return false; // AMD device with float8 not matching RDNA3 is RDNA4
+    return false;
+}
+
 struct Buffer {
     VkBuffer handle{};
     VkDeviceMemory memory{};
@@ -104,6 +132,14 @@ struct ImageHeap {
 struct SharedPipeline;   // below; Context::pin
 
 struct Context {
+    bool rdna3 = nr_rdna3;
+    const char* target_name() const { return rdna3 ? "rdna3-fp16" : "rdna4-fp8"; }
+    bool target_float8() const { return !rdna3; }
+    VkComponentTypeKHR target_matrix_ab() const {
+        return rdna3 ? VK_COMPONENT_TYPE_FLOAT16_KHR : VK_COMPONENT_TYPE_FLOAT8_E4M3_EXT;
+    }
+    const char* target_arch_dir() const { return rdna3 ? "rdna3" : "rdna4"; }
+
     // RDNA3: an arena's FP16 twin, which holds its e4m3 values as FP16 elements at the same
     // element index. Empty on RDNA4.
     std::map<VkBuffer, VkBuffer> fp16_twin;
@@ -200,6 +236,15 @@ struct Context {
             return std::string(line);
         };
         std::string seen;
+        bool any_fp8 = false;
+        for (uint32_t i = 0; i < count; ++i) {
+            VkPhysicalDeviceProperties p{};
+            vkGetPhysicalDeviceProperties(devices[i], &p);
+            if (p.vendorID == 0x1002 && has_matrix_config(instance, devices[i], VK_COMPONENT_TYPE_FLOAT8_E4M3_EXT)) {
+                any_fp8 = true; break;
+            }
+        }
+
         for (uint32_t i = 0; i < count; ++i) {
             VkPhysicalDeviceIDProperties idp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
             VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
@@ -210,10 +255,19 @@ struct Context {
             if (forced) want = i == uint32_t(atoi(forced));
             else if (have_id) want = p.deviceID == want_device && (!want_vendor || p.vendorID == want_vendor);
             else if (have_uuid) want = std::memcmp(idp.deviceUUID, want_uuid_bytes, VK_UUID_SIZE) == 0;
-            else if (nr_rdna3) want = p.vendorID == 0x1002 &&
-                                      has_matrix_config(instance, devices[i], VK_COMPONENT_TYPE_FLOAT16_KHR) &&
-                                      !has_matrix_config(instance, devices[i], VK_COMPONENT_TYPE_FLOAT8_E4M3_EXT);
-            else want = p.vendorID == 0x1002 && p.deviceID == 0x7550;
+            else if (const char* force = std::getenv("DLSSNR_FORCE_ARCH")) {
+                if (std::strcmp(force, "rdna3") == 0)
+                    want = p.vendorID == 0x1002 &&
+                           has_matrix_config(instance, devices[i], VK_COMPONENT_TYPE_FLOAT16_KHR) &&
+                           !has_matrix_config(instance, devices[i], VK_COMPONENT_TYPE_FLOAT8_E4M3_EXT);
+                else
+                    want = p.vendorID == 0x1002 &&
+                           (p.deviceID == 0x7550 || has_matrix_config(instance, devices[i], VK_COMPONENT_TYPE_FLOAT8_E4M3_EXT));
+            } else if (rdna3 || !any_fp8) want = p.vendorID == 0x1002 &&
+                                                  has_matrix_config(instance, devices[i], VK_COMPONENT_TYPE_FLOAT16_KHR) &&
+                                                  !has_matrix_config(instance, devices[i], VK_COMPONENT_TYPE_FLOAT8_E4M3_EXT);
+            else want = p.vendorID == 0x1002 &&
+                        (p.deviceID == 0x7550 || has_matrix_config(instance, devices[i], VK_COMPONENT_TYPE_FLOAT8_E4M3_EXT));
             if (!want) continue;
             if (physical)
                 throw std::runtime_error("more than one candidate GPU: " + seen + " and "
@@ -225,8 +279,27 @@ struct Context {
             seen = describe(i, p, idp.deviceUUID);
         }
         if (!physical)
-            throw std::runtime_error("no candidate GPU for " + std::string(nr_target_name())
+            throw std::runtime_error("no candidate GPU for " + std::string(target_name())
                                      + "; set NR_GPU, NR_DEVICE_ID (e.g. 1002:1900) or NR_GPU_UUID");
+
+        uint32_t n_ext = 0;
+        vkEnumerateDeviceExtensionProperties(physical, nullptr, &n_ext, nullptr);
+        std::vector<VkExtensionProperties> dev_exts(n_ext);
+        vkEnumerateDeviceExtensionProperties(physical, nullptr, &n_ext, dev_exts.data());
+        bool have_float8_ext = false;
+        for (const auto& e : dev_exts) {
+            if (std::strcmp(e.extensionName, VK_EXT_SHADER_FLOAT8_EXTENSION_NAME) == 0) have_float8_ext = true;
+        }
+        if (const char* force = std::getenv("DLSSNR_FORCE_ARCH")) {
+            if (std::strcmp(force, "rdna3") == 0) rdna3 = true;
+            else if (std::strcmp(force, "rdna4") == 0) rdna3 = false;
+        } else if (const char* force3 = std::getenv("NR_FORCE_RDNA3")) {
+            if (*force3 && std::atoi(force3) != 0) rdna3 = true;
+        } else if (const char* force3_mz = std::getenv("MZ_FORCE_RDNA3")) {
+            if (*force3_mz && std::atoi(force3_mz) != 0) rdna3 = true;
+        } else {
+            rdna3 = is_rdna3_device(gpu_vendor_id, gpu_device_id, have_float8_ext);
+        }
 
         require_matrix_config();
 
@@ -240,7 +313,7 @@ struct Context {
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
         features.pNext = &coop; coop.pNext = &fp8; fp8.pNext = &f11; f11.pNext = &f12; f12.pNext = &f13;
         vkGetPhysicalDeviceFeatures2(physical, &features);
-        const bool no_fp8 = !nr_target_float8();
+        const bool no_fp8 = !target_float8();
         struct { bool have; const char* name; } required[] = {
             {bool(coop.cooperativeMatrix),            "cooperativeMatrix"},
             {no_fp8 || bool(fp8.shaderFloat8),                  "shaderFloat8"},
@@ -261,7 +334,7 @@ struct Context {
         fp8 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT};
         // The FP8 features are the rdna4-fp8 target's; rdna3-fp16 leaves the struct zeroed in
         // the chain — explicitly disabled, not silently absent.
-        if constexpr (nr_target_float8()) fp8.shaderFloat8 = fp8.shaderFloat8CooperativeMatrix = VK_TRUE;
+        if (target_float8()) fp8.shaderFloat8 = fp8.shaderFloat8CooperativeMatrix = VK_TRUE;
         f11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
         f11.storageBuffer16BitAccess = VK_TRUE;
         f12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
@@ -331,7 +404,7 @@ struct Context {
         wml.workgroupMemoryExplicitLayoutScalarBlockLayout = VK_FALSE;
         if (have_wml) f13.pNext = &wml;
         std::vector<const char*> ext_list{VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME};
-        if constexpr (nr_target_float8()) ext_list.push_back(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
+        if (target_float8()) ext_list.push_back(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
         if (have_wml) ext_list.push_back(VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME);
         VkDeviceCreateInfo di{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
         di.pNext = &coop; di.queueCreateInfoCount = 1; di.pQueueCreateInfos = &qi;
@@ -414,6 +487,27 @@ struct Context {
             if (why) *why = n;
             return false;
         };
+        uint32_t ne = 0;
+        vkEnumerateDeviceExtensionProperties(physical, nullptr, &ne, nullptr);
+        std::vector<VkExtensionProperties> have_exts(ne);
+        vkEnumerateDeviceExtensionProperties(physical, nullptr, &ne, have_exts.data());
+        bool have_float8_ext = false;
+        for (const auto& e : have_exts) {
+            if (std::strcmp(e.extensionName, VK_EXT_SHADER_FLOAT8_EXTENSION_NAME) == 0) have_float8_ext = true;
+        }
+        VkPhysicalDeviceProperties pprops{};
+        vkGetPhysicalDeviceProperties(physical, &pprops);
+        if (const char* force = std::getenv("DLSSNR_FORCE_ARCH")) {
+            if (std::strcmp(force, "rdna3") == 0) rdna3 = true;
+            else if (std::strcmp(force, "rdna4") == 0) rdna3 = false;
+        } else if (const char* force3 = std::getenv("NR_FORCE_RDNA3")) {
+            if (*force3 && std::atoi(force3) != 0) rdna3 = true;
+        } else if (const char* force3_mz = std::getenv("MZ_FORCE_RDNA3")) {
+            if (*force3_mz && std::atoi(force3_mz) != 0) rdna3 = true;
+        } else if (!rdna3) {
+            rdna3 = is_rdna3_device(pprops.vendorID, pprops.deviceID, have_float8_ext);
+        }
+
         VkPhysicalDeviceCooperativeMatrixFeaturesKHR c{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
         VkPhysicalDeviceShaderFloat8FeaturesEXT f8{
@@ -436,8 +530,8 @@ struct Context {
         // compiles a pipeline by its own VkPipelineRobustnessCreateInfo whether or not the device enabled it.
         pipeline_robustness = prf.pipelineRobustness;
         if (!c.cooperativeMatrix)             return no("cooperativeMatrix");
-        if (nr_target_float8() && !f8.shaderFloat8)                 return no("shaderFloat8");
-        if (nr_target_float8() && !f8.shaderFloat8CooperativeMatrix) return no("shaderFloat8CooperativeMatrix");
+        if (target_float8() && !f8.shaderFloat8)                 return no("shaderFloat8");
+        if (target_float8() && !f8.shaderFloat8CooperativeMatrix) return no("shaderFloat8CooperativeMatrix");
         if (!v11.storageBuffer16BitAccess)    return no("storageBuffer16BitAccess");
         if (!v12.storageBuffer8BitAccess)     return no("storageBuffer8BitAccess");
         if (!v12.shaderFloat16)               return no("shaderFloat16");
@@ -543,11 +637,11 @@ struct Context {
     // for `adopt` to succeed. A layer adds these to the application's own
     // create info on the way through; nothing else can. The FP8 extension is
     // the rdna4-fp8 target's.
-    static const char* const* required_device_extensions(uint32_t& n) {
+    const char* const* required_device_extensions(uint32_t& n) const {
         static const char* const with_fp8[] = {VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME,
                                                VK_EXT_SHADER_FLOAT8_EXTENSION_NAME};
         static const char* const without_fp8[] = {VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME};
-        if (nr_target_float8()) { n = 2; return with_fp8; }
+        if (target_float8()) { n = 2; return with_fp8; }
         n = 1;
         return without_fp8;
     }
@@ -576,10 +670,10 @@ struct Context {
     // The configuration the whole port rests on. Asserting it here means a driver that quietly
     // stops reporting it fails at startup with a name, rather than in a kernel with wrong numbers.
     void require_matrix_config() const {
-        if (has_matrix_config(instance, physical, nr_target_matrix_ab())) return;
+        if (has_matrix_config(instance, physical, target_matrix_ab())) return;
         if (!vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR"))
             throw std::runtime_error("vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR absent");
-        throw std::runtime_error(std::string(nr_target_name())
+        throw std::runtime_error(std::string(target_name())
                                  + ": 16x16x16 subgroup matrix configuration not reported");
     }
 

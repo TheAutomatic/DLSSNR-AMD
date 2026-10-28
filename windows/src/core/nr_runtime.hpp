@@ -137,6 +137,8 @@ struct HostDevice {
     // then reads the activation arena through a buffer_reference where that is faster (Windows
     // network only).
     bool buffer_device_address = false;
+    // Target GPU architecture: -1 = auto-detect from physical device, 0 = RDNA4 (FP8), 1 = RDNA3 (FP16).
+    int rdna3 = -1;
 };
 // [Network] Residency offload: a network held by a core alone (no runtime, no frame of it in flight) moves its weights
 // to RAM and releases its device memory (its weight buffer, its hold on the activation arena); reload_network brings
@@ -184,6 +186,8 @@ struct RuntimeConfig {
     // neither: small), 0 = the original model, 1 = the small model. The small model
     // needs an installed tree with dlssnr-small.bin; without it, the original model.
     int network = -1;
+    // Target GPU architecture: -1 = auto-detect, 0 = RDNA4 (FP8), 1 = RDNA3 (FP16).
+    int rdna3 = -1;
 #if NR_INT4
     // The int4 mixed network: -1 = as DLSSNR_INT4 / dlssnr-amd.ini [Int4Mixed] Enabled say (start), 0 = the original
     // network, 1 = int4 mixed when installed and the device has VK_KHR_pipeline_binary ([Int4Mixed] Hotkey switches).

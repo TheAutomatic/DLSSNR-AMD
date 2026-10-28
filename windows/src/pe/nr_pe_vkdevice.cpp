@@ -1,9 +1,11 @@
 #include "nr_pe_vkdevice.hpp"
 
 #include "nr_pe_bridge.hpp"
+#include "nr_pe_config.hpp"
 #include "nr_pe_log.hpp"
 #include "nr_device_features.hpp"
 #include "nr_pipeline_binary.hpp"
+#include "core/nr_driver_identity.hpp"
 #include "nrvk.hpp"
 
 #include <windows.h>
@@ -108,12 +110,41 @@ bool augment(VkPhysicalDevice physical, const VkDeviceCreateInfo* info, Augmente
     std::vector<VkExtensionProperties> have(n);
     if (enumerate_extensions(physical, nullptr, &n, have.data()) != VK_SUCCESS) return false;
     have.resize(n);
+
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(physical, &props);
+    bool have_float8_ext = false;
+    for (const auto& h : have) {
+        if (std::strcmp(h.extensionName, VK_EXT_SHADER_FLOAT8_EXTENSION_NAME) == 0)
+            have_float8_ext = true;
+    }
+
+    // Recover real un-spoofed AMD device properties if OptiScaler Vulkan GPU spoofing is active
+    VkPhysicalDeviceProperties real_props = props;
+    VkPhysicalDeviceDriverProperties real_drv{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    if (nr::driver::amd_reported(physical, &real_props, &real_drv)) {
+        if (props.vendorID != real_props.vendorID || props.deviceID != real_props.deviceID) {
+            log("[nr] vkdevice: GPU spoofing detected (loader: %04x:%04x, ICD: %04x:%04x \"%s\")",
+                props.vendorID, props.deviceID, real_props.vendorID, real_props.deviceID, real_props.deviceName);
+        }
+        props.vendorID = real_props.vendorID;
+        props.deviceID = real_props.deviceID;
+        std::memcpy(props.deviceName, real_props.deviceName, sizeof(props.deviceName));
+    }
+
+    const bool is_rdna3 = nrvk::is_rdna3_device(props.vendorID, props.deviceID, have_float8_ext);
+
     auto listed = [](const char* name, const char* const* list, size_t count) {
         for (size_t i = 0; i < count; ++i)
             if (list[i] && std::strcmp(list[i], name) == 0) return true;
         return false;
     };
-    const std::vector<const char*> network = network_extensions();
+    std::vector<const char*> network = {
+        VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME,
+        VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME
+    };
+    if (!is_rdna3) network.push_back(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
+
     for (const char* e : network) {
         bool found = false;
         for (const auto& h : have) found = found || std::strcmp(h.extensionName, e) == 0;
@@ -127,7 +158,7 @@ bool augment(VkPhysicalDevice physical, const VkDeviceCreateInfo* info, Augmente
     for (const char* e : network)
         if (!listed(e, a->extensions.data(), a->extensions.size())) a->extensions.push_back(e);
     a->features = std::make_unique<nr::DeviceFeatures>(info->pNext);
-    a->features->enable();
+    a->features->enable(is_rdna3);
     auto* w = a->features->get<VkPhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR>(
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_FEATURES_KHR);
     w->workgroupMemoryExplicitLayout = w->workgroupMemoryExplicitLayout8BitAccess =
@@ -136,6 +167,7 @@ bool augment(VkPhysicalDevice physical, const VkDeviceCreateInfo* info, Augmente
     a->info.pNext = a->features->head;
     a->info.enabledExtensionCount = uint32_t(a->extensions.size());
     a->info.ppEnabledExtensionNames = a->extensions.data();
+    nr::pe::configure_network_for_arch(nr::pe::module_folder(), is_rdna3);
     a->binary.prepare(physical, a->info, a->extensions);
     return true;
 }
