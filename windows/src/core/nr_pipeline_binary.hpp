@@ -60,7 +60,13 @@ inline void disable(const std::string& why) {
 inline std::string disabled_why() { auto& s=mode();std::lock_guard<std::mutex> l(s.m);return s.disabled?s.why:""; }
 inline std::vector<std::string> shell_dirs() {
     if(const char* p=std::getenv("NR_ACO_SHELL_DIR")) if(*p) return {p};
-    auto& s=mode();std::lock_guard<std::mutex> l(s.m);return s.shells;
+    auto& s=mode();std::lock_guard<std::mutex> l(s.m);
+    if(!s.shells.empty()) return s.shells;
+    std::string dir;
+    if(const char* p=std::getenv("NR_ACO_DIR")) if(*p) dir=p;
+    if(dir.empty() && s.configured) dir=s.dir;
+    if(!dir.empty()) return {dir + "/shells", dir + "/shell"};
+    return {};
 }
 inline std::mutex devices_mutex;
 inline std::set<VkDevice> enabled_devices;
@@ -263,6 +269,31 @@ inline VkPipeline create(VkDevice device,const VkComputePipelineCreateInfo& ci,c
     if(!cache_file.empty())save_cached(cache_file,key,blob);
     return pipeline;
 }
+// Template SPIR-V resolver: returns the file path of a template SPIR-V matching `path`.
+// Priority rules:
+//   1. Each directory in shell_dirs() is probed in order (NR_ACO_SHELL_DIR wins, else configured roots).
+//   2. For temporal passes (name begins with temporal_ or path contains temporal), the relative
+//      subdirectory "temporal/" under root d is probed first, before the flat root d.
+//   3. For each probed location, the kernel name is tested first, then its alias (shell-aliases.txt).
+inline std::string resolve_template(const std::string& path) {
+    auto name = path.substr(path.find_last_of("/\\") + 1);
+    auto alias = alias_of(name);
+    const bool is_temporal = name.rfind("temporal_", 0) == 0 ||
+                             path.find("/temporal/") != std::string::npos ||
+                             path.find("\\temporal\\") != std::string::npos;
+    for (const auto& d : shell_dirs()) {
+        for (const auto& n : {name, alias}) {
+            if (n.empty()) continue;
+            if (is_temporal) {
+                std::ifstream probe(d + "/temporal/" + n, std::ios::binary);
+                if (probe) return d + "/temporal/" + n;
+            }
+            std::ifstream probe(d + "/" + n, std::ios::binary);
+            if (probe) return d + "/" + n;
+        }
+    }
+    return {};
+}
 inline VkResult create_or_default(VkDevice device,VkPipelineCache cache,const VkComputePipelineCreateInfo& ci,
                                  const std::string& path,const uint32_t* code,size_t bytes,VkPipeline* out,uint32_t push_bytes) {
     auto dir=directory();
@@ -286,46 +317,56 @@ inline VkResult create_or_default(VkDevice device,VkPipelineCache cache,const Vk
     // The PAL container comes from the driver's own compile of a template SPIR-V with the same interface:
     // the first shell directory holding the name (NR_ACO_SHELL_DIR, or the product's aco/shell then the
     // native network shaders), else the Linux SPIR-V itself.
-    std::string shell_path;
-    {
-        auto name=path.substr(path.find_last_of("/\\")+1);
-        // The name itself, else the native shader that serves as its template (the bundle's alias list).
-        for(const auto& n:{name,alias_of(name)}) {
-            if(n.empty() || !shell_path.empty())continue;
-            for(const auto& d:shell_dirs()) {
-                std::ifstream probe(d+"/"+n,std::ios::binary);
-                if(probe) {shell_path=d+"/"+n;break;}
-            }
-        }
-    }
-    if(!shell_path.empty()) {
-        auto name=path.substr(path.find_last_of("/\\")+1);
-        auto shell=pal::load(shell_path);
-        pal::require(shell.size()%4==0,"invalid shell SPIR-V size");
-        std::vector<uint32_t> words(shell.size()/4);std::memcpy(words.data(),shell.data(),shell.size());
-        VkShaderModuleCreateInfo sm{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};sm.codeSize=shell.size();sm.pCode=words.data();
-        VkShaderModule module{};check(vkCreateShaderModule(device,&sm,nullptr,&module),"create shell module");
-        auto shell_ci=ci;shell_ci.stage.module=module;
-        try{
-            if(native_shell(name)) {
-                std::fprintf(stderr,"ACO diagnostic native shell: %s\n",name.c_str());
-                check(vkCreateComputePipelines(device,cache,1,&shell_ci,nullptr,out),"create native shell pipeline");
+    std::string shell_path = resolve_template(path);
+    auto name = path.substr(path.find_last_of("/\\") + 1);
+    if (!shell_path.empty()) {
+        auto shell = pal::load(shell_path);
+        pal::require(shell.size() % 4 == 0, "invalid shell SPIR-V size");
+        nr::logf("[nr] ACO template for %s: %s (%zu bytes, spv_hash %016llx, record %s)",
+                 name.c_str(), shell_path.c_str(), shell.size(),
+                 static_cast<unsigned long long>(pal::hash(shell.data(), shell.size())),
+                 keyname(record.spv_hash).c_str());
+        std::vector<uint32_t> words(shell.size() / 4);
+        std::memcpy(words.data(), shell.data(), shell.size());
+        VkShaderModuleCreateInfo sm{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        sm.codeSize = shell.size();
+        sm.pCode = words.data();
+        VkShaderModule module{};
+        check(vkCreateShaderModule(device, &sm, nullptr, &module), "create shell module");
+        auto shell_ci = ci;
+        shell_ci.stage.module = module;
+        try {
+            if (native_shell(name)) {
+                std::fprintf(stderr, "ACO diagnostic native shell: %s\n", name.c_str());
+                check(vkCreateComputePipelines(device, cache, 1, &shell_ci, nullptr, out), "create native shell pipeline");
             } else {
                 // The cached import is valid for this record, this template, these push/workgroup values
                 // and this GPU + driver.
                 std::string cache_file;
-                const std::string cache=cache_dir();
-                if(!cache.empty()) {
-                    uint64_t k[6]={pal::hash(record_bytes.data(),record_bytes.size()),pal::hash(shell.data(),shell.size()),
-                                   identity(),push_bytes,(uint64_t(workgroup[0])<<32)|workgroup[1],workgroup[2]};
-                    char b[40];std::snprintf(b,sizeof b,"%016llx.nrb",static_cast<unsigned long long>(pal::hash(k,sizeof k)));
-                    cache_file=cache+"/"+b;
+                const std::string cache = cache_dir();
+                if (!cache.empty()) {
+                    uint64_t k[6] = {pal::hash(record_bytes.data(), record_bytes.size()),
+                                     pal::hash(shell.data(), shell.size()),
+                                     identity(),
+                                     push_bytes,
+                                     (uint64_t(workgroup[0]) << 32) | workgroup[1],
+                                     workgroup[2]};
+                    char b[40];
+                    std::snprintf(b, sizeof b, "%016llx.nrb", static_cast<unsigned long long>(pal::hash(k, sizeof k)));
+                    cache_file = cache + "/" + b;
                 }
-                *out=create(device,shell_ci,record,push_bytes,workgroup,cache_file);
+                *out = create(device, shell_ci, record, push_bytes, workgroup, cache_file);
             }
-        }catch(...){vkDestroyShaderModule(device,module,nullptr);throw;}
-        vkDestroyShaderModule(device,module,nullptr);return VK_SUCCESS;
+        } catch (...) {
+            vkDestroyShaderModule(device, module, nullptr);
+            throw;
+        }
+        vkDestroyShaderModule(device, module, nullptr);
+        return VK_SUCCESS;
     }
-    *out=create(device,ci,record,push_bytes,workgroup);return VK_SUCCESS;
+    nr::logf("[nr] ACO template for %s not found; falling back to driver compile on %s (%zu bytes, record %s)",
+             name.c_str(), path.c_str(), bytes, keyname(record.spv_hash).c_str());
+    *out = create(device, ci, record, push_bytes, workgroup);
+    return VK_SUCCESS;
 }
 } // namespace nr::binary

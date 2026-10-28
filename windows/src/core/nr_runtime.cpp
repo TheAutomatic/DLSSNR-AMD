@@ -2233,6 +2233,12 @@ void release_network(const RuntimeCore& core, std::vector<uint8_t>&& weights) {
     vkDestroyBuffer(a->device, a->wgt.handle, nullptr);
     vkFreeMemory(a->device, a->wgt.memory, nullptr);
     a->wgt = nrvk::Buffer{};
+#if NR_ARCH_RDNA3
+    if (a->wgt_e.mapped) vkUnmapMemory(a->device, a->wgt_e.memory);
+    if (a->wgt_e.handle) vkDestroyBuffer(a->device, a->wgt_e.handle, nullptr);
+    if (a->wgt_e.memory) vkFreeMemory(a->device, a->wgt_e.memory, nullptr);
+    a->wgt_e = nrvk::Buffer{};
+#endif
     a->act_want = a->act_need ? a->act_need : a->act ? a->act->cap : a->act_want;
     a->act.reset();
     a->loaded = 0;
@@ -2255,21 +2261,54 @@ bool reload_network(const HostDevice& host, const RuntimeCore& core, const std::
     if (!arena) {
         if (act && act->act && act->act->device == a->device && act->act->cap >= a->act_want) {
             arena = act->act;
+#if NR_ARCH_RDNA3
+            if (arena && !arena->twin.handle && arena->cap) {
+                arena->twin = ctx.buffer(VkDeviceSize(arena->cap) * 2);
+            }
+#endif
         } else {
             auto g = std::make_shared<GraphAct>();
             g->device = a->device; g->cap = size_t(double(a->act_want) * std::max(1.0, slack) + 255) / 256 * 256;
             g->buf = ctx.buffer(g->cap, false, /*device_address=*/true);   // freed by ~GraphAct if what follows throws
+#if NR_ARCH_RDNA3
+            g->twin = ctx.buffer(VkDeviceSize(g->cap) * 2);
+#endif
             arena = std::move(g);
         }
     }
-    nrvk::Buffer w = ctx.buffer(a->wgt_cap);
+#if NR_ARCH_RDNA3
+    else if (!arena->twin.handle && arena->cap) {
+        arena->twin = ctx.buffer(VkDeviceSize(arena->cap) * 2);
+    }
+#endif
+    nrvk::Buffer w{}, w_e{};
     try {
+        w = ctx.buffer(a->wgt_cap);
+#if NR_ARCH_RDNA3
+        w_e = ctx.buffer(VkDeviceSize(a->wgt_cap) * 2);
+#endif
         ctx.upload(w, 0, a->host_weights.data(), a->host_weights.size());
+#if NR_ARCH_RDNA3
+        {
+            std::array<uint16_t, 256> to_f16{};
+            for (int i = 0; i < 256; ++i) to_f16[size_t(i)] = tin::f_to_f16(tin::e4m3_to_f(uint8_t(i)));
+            std::vector<uint8_t> f16_buf(a->host_weights.size() * 2);
+            uint16_t* out = reinterpret_cast<uint16_t*>(f16_buf.data());
+            for (size_t i = 0; i < a->host_weights.size(); ++i) out[i] = to_f16[a->host_weights[i]];
+            ctx.upload(w_e, 0, f16_buf.data(), f16_buf.size());
+        }
+#endif
     } catch (...) {
-        ctx.destroy(w);
+        if (w.handle) ctx.destroy(w);
+#if NR_ARCH_RDNA3
+        if (w_e.handle) ctx.destroy(w_e);
+#endif
         throw;
     }
     a->wgt = w;
+#if NR_ARCH_RDNA3
+    a->wgt_e = w_e;
+#endif
     a->act = std::move(arena);
     a->loaded = 0;   // the tail and the noise fields: the first recording (retarget)
     std::vector<uint8_t>().swap(a->host_weights);

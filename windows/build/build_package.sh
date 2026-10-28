@@ -59,13 +59,15 @@ done
 gpu_arch=${NR_GPU_ARCH:-rdna4}
 [[ -f "windows/build/arch/$gpu_arch.sh" ]] || { echo "unknown NR_GPU_ARCH: $gpu_arch" >&2; exit 2; }
 source "windows/build/arch/$gpu_arch.sh"
+int4_default=1; [[ "$gpu_arch" == rdna3 ]] && int4_default=0   # gfx11 int4 mixed lands as its own change
+export NR_INT4=${NR_INT4:-$int4_default}
 
 # ---- the ReShade add-on -----------------------------------------------------------------------
 stamp=$(bash windows/build/version.sh)
 python3 windows/build/generate_device_chain.py toolchain/Vulkan-Headers "$out/nr_device_chain_sizes.hpp"
 common=(-std=c++17 -O2 -DNDEBUG -DNR_BUILD_STAMP="\"$stamp\"" -Itoolchain/Vulkan-Headers/include -Iwindows/src
         -Iwindows/src/core -Iwindows/src/pe -I"$out")
-[[ "${NR_INT4:-1}" == 1 ]] && common+=(-DNR_INT4=1)
+[[ "$NR_INT4" == 1 ]] && common+=(-DNR_INT4=1)
 [[ "$gpu_arch" == rdna3 ]] && common+=(-DNR_ARCH_RDNA3=1)
 "$cxx" "${common[@]}" "${NR_PRODUCT_DEFINES[@]}" -c windows/src/core/nr_runtime.cpp -o "$out/nr_runtime.o"
 "$cxx" "${common[@]}" -c windows/src/core/nr_native_plan.cpp -o "$out/nr_native_plan.o"
@@ -149,8 +151,11 @@ cp -r -- "$out/aco-shaders" "$aco/shaders"
 ls -- "$aco_data"/records/*.nrp >/dev/null 2>&1 || { echo "no ACO records for $NR_GPU_ARCH in $aco_data/records" >&2; exit 2; }
 cp -- "$aco_data"/records/*.nrp "$aco/records/"
 cp -- "$aco_data/shell-aliases.txt" "$aco/"
-int4_default=1; [[ "$NR_GPU_ARCH" == rdna3 ]] && int4_default=0   # gfx11 int4 mixed lands as its own change
-if [[ "${NR_INT4:-$int4_default}" == 1 ]]; then
+if [[ -d "$aco_data/shells" ]]; then
+    mkdir -p -- "$aco/shells"
+    cp -r -- "$aco_data/shells/"* "$aco/shells/"
+fi
+if [[ "$NR_INT4" == 1 ]]; then
     # int4 mixed as ACO's machine code ($aco_data/int4/records) and the Linux int4 network the records were
     # made from (linux/build/build_network.py --int4)
     rm -rf -- "$out/aco-shaders-int4"

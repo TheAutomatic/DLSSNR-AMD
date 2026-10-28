@@ -1173,7 +1173,7 @@ void configure_network(const std::string& folder) {
         // The imported binaries are kept in aco-cache\ (made again when the driver or the files change).
         const std::string cache = data + "\\aco-cache";
         CreateDirectoryA(cache.c_str(), nullptr);
-        nr::binary::configure(bundle, {bundle + "\\shell", data + "\\shaders", data + "\\shaders\\temporal"}, cache,
+        nr::binary::configure(bundle, {bundle + "\\shells", bundle + "\\shell", data + "\\shaders"}, cache,
                               std::move(aliases));
         log("[nr] [Network] ACO Mode = 1: the network runs ACO's machine code from %s", bundle.c_str());
     });
