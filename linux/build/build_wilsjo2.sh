@@ -9,7 +9,7 @@ glslang=${NR_GLSLANG:-toolchain/glslang/bin/glslang}
 src=linux/shaders/wilsjo2
 mkdir -p -- "$out"
 rm -f -- "$out"/wilsjo2_*.spv   # only this tree's programs (a reused folder may hold another build's)
-log=$(mktemp "${TMPDIR:-/opt/DLSS-NR-on-AMD-project/tmp}/wilsjo2.XXXXXX")
+log=$(mktemp "${TMPDIR:-/tmp}/wilsjo2.XXXXXX")
 trap 'rm -f -- "$log"' EXIT
 for k in encode resolve meter autoexposure finished clamp downsample os spatial inspect light; do
     "$glslang" -V --target-env vulkan1.3 -I"$src" "$src/wilsjo2_$k.comp" -o "$out/wilsjo2_$k.spv" > "$log" ||
