@@ -55,7 +55,7 @@ OPTI_ZIP = REPO_ROOT / "artifacts/ref/downloads/OptiScaler-NR-v0.8.91.zip"
 BENCH_ZIP = Path("/mnt/c/Users/Kenny/Downloads/DLSSNR-AMD-RDNA3-RDNA3.5-Benchmark-v1.1.zip")
 OPTISCALER_BIN = REPO_ROOT / "artifacts/windows/optiscaler"
 ACO_DATA = REPO_ROOT / "windows/data/aco/rdna3"
-TMP_ACO_SHADERS = Path("/tmp/test-aco-shaders")
+TMP_ACO_SHADERS = ACO_DATA / "shaders"
 
 print("[1/8] Cleaning and creating package directory...")
 if PKG_DIR.exists():
@@ -129,10 +129,7 @@ aco_rdna4_dir = aco_dir / "rdna4"
 for rec in (ACO_DATA / "records").glob("*.nrp"):
     shutil.copy2(rec, aco_rdna3_dir / "records" / rec.name)
 
-if TMP_ACO_SHADERS.exists():
-    shutil.copytree(TMP_ACO_SHADERS, aco_rdna3_dir / "shaders", dirs_exist_ok=True)
-else:
-    shutil.copytree(ACO_DATA / "shaders", aco_rdna3_dir / "shaders", dirs_exist_ok=True)
+shutil.copytree(ACO_DATA / "shaders", aco_rdna3_dir / "shaders", dirs_exist_ok=True)
 
 shutil.copytree(ACO_DATA / "shells", aco_rdna3_dir / "shells", dirs_exist_ok=True)
 shutil.copytree(ACO_DATA / "shells", aco_rdna3_dir / "shell", dirs_exist_ok=True)
@@ -242,7 +239,7 @@ if exist "%TARGET_DIR%\" (
 )
 if "%GAME_DIR:~-1%"=="\" set "GAME_DIR=%GAME_DIR:~0,-1%"
 
-if exist "%GAME_DIR%\dxgi.dll" (
+if exist "%GAME_DIR%\dxgi.dll" if not exist "%GAME_DIR%\dlssnr_core.dll" if not exist "%GAME_DIR%\dlssnr_backup\dxgi.dll.bak" (
     if not exist "%GAME_DIR%\dlssnr_backup" mkdir "%GAME_DIR%\dlssnr_backup"
     copy /y "%GAME_DIR%\dxgi.dll" "%GAME_DIR%\dlssnr_backup\dxgi.dll.bak" >nul
 )
@@ -362,7 +359,9 @@ Write-Host ""
 # 3. 备份原有 dxgi.dll
 $dxgiPath = Join-Path $gameDir "dxgi.dll"
 $backupDir = Join-Path $gameDir "dlssnr_backup"
-if (Test-Path -LiteralPath $dxgiPath) {
+if ((Test-Path -LiteralPath $dxgiPath) -and
+    -not (Test-Path -LiteralPath (Join-Path $gameDir "dlssnr_core.dll")) -and
+    -not (Test-Path -LiteralPath (Join-Path $backupDir "dxgi.dll.bak"))) {
     Write-Host "[2/4] 发现原有 dxgi.dll，备份至 dlssnr_backup\dxgi.dll.bak..." -ForegroundColor Yellow
     if (-not (Test-Path -LiteralPath $backupDir)) {
         New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
