@@ -209,7 +209,7 @@ int main(int argc, char** argv) {
         e_sum_r += r; e_sum_g += g; e_sum_b += b; e_sum_a += a;
     }
     std::printf("[test] Frame 4 (Engine direct_source) results: non-zero: %.2f%%, NaNs: %zu\n",
-                (100.0 * e_non_zero) / engine_out.size(), e_has_nan);
+                (100.0 * e_non_zero) / num_pixels, e_has_nan);
     std::printf("       Channels Avg: R=%.4f, G=%.4f, B=%.4f, A=%.4f\n",
                 e_sum_r / num_pixels, e_sum_g / num_pixels, e_sum_b / num_pixels, e_sum_a / num_pixels);
     std::printf("       Sample center pixel: R=%.4f, G=%.4f, B=%.4f, A=%.4f\n",
