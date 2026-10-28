@@ -142,8 +142,23 @@ int main(int argc, char** argv) {
             sum += std::abs(v);
         }
         double avg = sum / out_data.size();
+        double sum_r = 0, sum_g = 0, sum_b = 0, sum_a = 0;
+        const size_t num_pixels = rc.width * rc.height;
+        for (size_t p = 0; p < num_pixels; ++p) {
+            sum_r += out_data[p * 4 + 0];
+            sum_g += out_data[p * 4 + 1];
+            sum_b += out_data[p * 4 + 2];
+            sum_a += out_data[p * 4 + 3];
+        }
         std::printf("[test] Frame %d results: non-zero: %.2f%%, NaNs: %zu, AvgAbs: %.4f\n",
                     frame_idx, (100.0 * non_zero) / out_data.size(), has_nan, avg);
+        std::printf("       Channels Avg: R=%.4f, G=%.4f, B=%.4f, A=%.4f\n",
+                    sum_r / num_pixels, sum_g / num_pixels, sum_b / num_pixels, sum_a / num_pixels);
+        std::printf("       Sample center pixel: R=%.4f, G=%.4f, B=%.4f, A=%.4f\n",
+                    out_data[(rc.height / 2 * rc.width + rc.width / 2) * 4 + 0],
+                    out_data[(rc.height / 2 * rc.width + rc.width / 2) * 4 + 1],
+                    out_data[(rc.height / 2 * rc.width + rc.width / 2) * 4 + 2],
+                    out_data[(rc.height / 2 * rc.width + rc.width / 2) * 4 + 3]);
 
         if (has_nan > 0) {
             std::fprintf(stderr, "[FAIL] Frame %d contains %zu NaNs!\n", frame_idx, has_nan);
@@ -155,6 +170,63 @@ int main(int argc, char** argv) {
         }
     }
 
-    std::printf("\n>>> TEMPORAL RUNTIME VERIFICATION SUCCESSFUL (3 frames evaluated without crash)! <<<\n");
+    std::printf("[test] Setting up Engine Frame (direct_source in-place sampling with motion vectors)...\n");
+    auto motion_img = ctx.image(rc.width, rc.height, VK_FORMAT_R16G16_SFLOAT, true, true);
+    ctx.transition(motion_img, VK_IMAGE_LAYOUT_GENERAL);
+    std::vector<uint16_t> zero_mv(rc.width * rc.height * 2, 0);
+    ctx.upload(motion_img, zero_mv.data(), zero_mv.size() * sizeof(uint16_t));
+
+    nr::EngineFrame ef{};
+    ef.colour = cf;
+    ef.colour.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+    ef.motion.image = motion_img.handle;
+    ef.motion.format = VK_FORMAT_R16G16_SFLOAT;
+    ef.motion.width = rc.width;
+    ef.motion.height = rc.height;
+    ef.motion.before = VK_IMAGE_LAYOUT_GENERAL;
+    ef.motion.after = VK_IMAGE_LAYOUT_GENERAL;
+    ef.motion.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+    ef.feature = 1;
+    ef.reset = false;
+
+    std::printf("[test] Recording and evaluating Frame 4 (Engine direct_source path)...\n");
+    ctx.one_shot([&](VkCommandBuffer cmd) {
+        runtime->record_engine(cmd, ef, controls);
+    });
+
+    std::vector<float> engine_out(rc.width * rc.height * 4);
+    ctx.download(input_img, engine_out.data(), engine_out.size() * sizeof(float));
+
+    size_t e_non_zero = 0, e_has_nan = 0;
+    double e_sum_r = 0, e_sum_g = 0, e_sum_b = 0, e_sum_a = 0;
+    const size_t num_pixels = rc.width * rc.height;
+    for (size_t p = 0; p < num_pixels; ++p) {
+        float r = engine_out[p * 4 + 0], g = engine_out[p * 4 + 1], b = engine_out[p * 4 + 2], a = engine_out[p * 4 + 3];
+        if (std::isnan(r) || std::isnan(g) || std::isnan(b) || std::isnan(a) ||
+            std::isinf(r) || std::isinf(g) || std::isinf(b) || std::isinf(a)) ++e_has_nan;
+        if (r != 0.0f || g != 0.0f || b != 0.0f || a != 0.0f) ++e_non_zero;
+        e_sum_r += r; e_sum_g += g; e_sum_b += b; e_sum_a += a;
+    }
+    std::printf("[test] Frame 4 (Engine direct_source) results: non-zero: %.2f%%, NaNs: %zu\n",
+                (100.0 * e_non_zero) / engine_out.size(), e_has_nan);
+    std::printf("       Channels Avg: R=%.4f, G=%.4f, B=%.4f, A=%.4f\n",
+                e_sum_r / num_pixels, e_sum_g / num_pixels, e_sum_b / num_pixels, e_sum_a / num_pixels);
+    std::printf("       Sample center pixel: R=%.4f, G=%.4f, B=%.4f, A=%.4f\n",
+                engine_out[(rc.height / 2 * rc.width + rc.width / 2) * 4 + 0],
+                engine_out[(rc.height / 2 * rc.width + rc.width / 2) * 4 + 1],
+                engine_out[(rc.height / 2 * rc.width + rc.width / 2) * 4 + 2],
+                engine_out[(rc.height / 2 * rc.width + rc.width / 2) * 4 + 3]);
+
+    if (e_has_nan > 0) {
+        std::fprintf(stderr, "[FAIL] Frame 4 contains %zu NaNs!\n", e_has_nan);
+        return 1;
+    }
+    if (e_non_zero == 0) {
+        std::fprintf(stderr, "[FAIL] Frame 4 is entirely black!\n");
+        return 1;
+    }
+
+    std::printf("\n>>> TEMPORAL & ENGINE RUNTIME VERIFICATION SUCCESSFUL (all frames evaluated without crash)! <<<\n");
     return 0;
 }

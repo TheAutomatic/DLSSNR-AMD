@@ -91,13 +91,29 @@ dlssnr_amd_dir.mkdir(parents=True, exist_ok=True)
 shutil.copy2(OPTISCALER_BIN / "nr_present_probe.exe", dlssnr_amd_dir / "nr_present_probe.exe")
 
 print("[4/8] Extracting model weights...")
-with zipfile.ZipFile(BENCH_ZIP) as z:
-    for name in ["DLSSNR-AMD-RDNA3-Benchmark-v1.0/dlssnr.bin", "DLSSNR-AMD-RDNA3-Benchmark-v1.0/dlssnr-small.bin"]:
-        base = Path(name).name
-        target = dlssnr_amd_dir / base
-        print(f"  Extracting {base}...")
-        with z.open(name) as src, open(target, "wb") as dst:
-            dst.write(src.read())
+if BENCH_ZIP.exists():
+    with zipfile.ZipFile(BENCH_ZIP) as z:
+        for name in ["DLSSNR-AMD-RDNA3-Benchmark-v1.0/dlssnr.bin", "DLSSNR-AMD-RDNA3-Benchmark-v1.0/dlssnr-small.bin"]:
+            base = Path(name).name
+            target = dlssnr_amd_dir / base
+            print(f"  Extracting {base}...")
+            with z.open(name) as src, open(target, "wb") as dst:
+                dst.write(src.read())
+else:
+    # Fallback to existing package or tmp
+    fallback_sources = [
+        REPO_ROOT / "artifacts/windows/RDNA3&3.5-DLSSNR-GameTest-v1.0.3/dlssnr-amd",
+        Path("/mnt/c/tmp/dlssnr-amd"),
+        REPO_ROOT / "artifacts/windows/DLSSNR-AMD-RDNA3-GameTest-v1.0/dlssnr-amd"
+    ]
+    for src_dir in fallback_sources:
+        if (src_dir / "dlssnr-small.bin").exists() and (src_dir / "dlssnr.bin").exists():
+            print(f"  Copying weights from {src_dir}...")
+            shutil.copy2(src_dir / "dlssnr-small.bin", dlssnr_amd_dir / "dlssnr-small.bin")
+            shutil.copy2(src_dir / "dlssnr.bin", dlssnr_amd_dir / "dlssnr.bin")
+            break
+    else:
+        raise FileNotFoundError("Could not find dlssnr.bin and dlssnr-small.bin in benchmark zip or fallbacks")
 
 print("[5/8] Assembling ACO bundle & native shaders...")
 aco_dir = dlssnr_amd_dir / "aco"
