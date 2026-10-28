@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 # DLSSNR-AMD-Vulkan installer (Linux)
 #
-#   bash install.sh <folder with the game's exe> [route] [--model <network>] [--renodx | --no-renodx]
+#   bash install.sh <folder with the game's exe> [route] [--model <network>] [--renodx | --no-renodx | --wilsjo2]
 #                   [--dll <nvngx_dlssnr.dll or .zip>] [--lumenite [<LumeniteFX zip>] | --no-lumenite]
 #
-# Unreal Engine games: the folder is <project>/Binaries/Win64 (the *-Shipping.exe), not the top
-# folder with the launcher exe.
+# Unreal Engine games: the folder is <project>/Binaries/Win64 (the *-Shipping.exe), not the top folder with the launcher exe.
 #
 # Routes:
-#   optiscaler             the game has a DLSS, FSR or XeSS option: OptiScaler, with this project as its DLSS-NR backend (64-bit only)
+#   optiscaler             the game has a DLSS, FSR or XeSS option: OptiScaler + this project's NR plugin (64-bit only)
 #   reshade-feeder         D3D10/11/12 games without a usable upscaler: ReShade + VORT motion vectors
 #   reshade-feeder-vulkan  Vulkan games, or D3D9 games (DXVK turns D3D9 into Vulkan under Proton)
 #   reshade-feeder-dx9     as reshade-feeder-vulkan, plus the depth direction for old D3D9 games
@@ -20,20 +19,29 @@
 # package's dlssnr-amd/, so later installs from this package (into other games too) need no --dll.
 # The 310.9.16 DLL holds two models, the new and the old one; the 310.8.0 DLL only the old one.
 #
-# All three networks are installed and can be switched in game at any time (the drop-down in NR Control or on
+# All four networks are installed and can be switched in game at any time (the drop-down in NR Control or on
 # ReShade's Add-ons page, or Ctrl+F11 to cycle). The choice below only sets the one a game starts with ([Network] Model):
-# --model CC_SMALL_FP8                  the default network of 310.9.16, the fastest (default)
-# --model CC_SILVER_AARDWOLD            the network of 310.8.0 (also preset 1 of 310.9.16)
+# --model CC_SMALL_FP8                  the default network of 310.9.16 (default)
+# --model CC_SMALL_FP8_EXPERIMENTAL     this project's experimental network: CC_SMALL_FP8 made faster;
+#                                       its weights are made from CC_SMALL_FP8's model at install
+# --model CC_SILVER_AARDWOLD            the network of 310.8.0
 # --model CC_SILVER_AARDWOLD_INT4_MIXED CC_SILVER_AARDWOLD with part of the work in int4 and other lower precisions; faster, the picture differs somewhat
 # Without it, the installer asks once; Enter = CC_SMALL_FP8 (not asked when not run in a terminal: CC_SMALL_FP8).
 # The earlier options still work: --new-model = CC_SMALL_FP8, --old-model = CC_SILVER_AARDWOLD, --int4 = CC_SILVER_AARDWOLD_INT4_MIXED;
 # --no-int4 is no longer needed (int4 mixed is always installed) and is ignored.
 # int4 mixed needs its Vulkan layer in the launch options: the installer prints a second launch line with it.
 #
-# --renodx     turn on the RenoDX style: the picture before and after NR is processed the way RenoDX's DLSS5 add-on
-#              does it, and every NR setting moves to [RenoDX] (on the OptiScaler route in the NR Control menu, on the ReShade routes on the Add-ons page).
-# --no-renodx  leave it off. With neither, the installer asks once after the network; Enter = off (not asked when not run in a terminal: off).
-#              Later: [RenoDX] Enabled in dlssnr-amd.ini, applied after a game restart.
+# The processing of the picture before and after NR (the NR network itself is the same):
+# OptiScaler route:
+#   --renodx     the RenoDX style (default): processed the way RenoDX's DLSS5 add-on does it.
+#   --wilsjo2    the wilsjo2 style: the original processing of OptiScaler-NR (wilsjo2), ported. --no-renodx means the same.
+#   With neither, the installer asks once after the network; Enter = the RenoDX style (not asked when not run in a terminal: RenoDX).
+#   Later NR Control (End in game) switches it at any time and can stack several layers.
+# ReShade routes:
+#   --renodx     the RenoDX style (default), settings in [RenoDX] (on the Add-ons page).
+#   --wilsjo2    the wilsjo2 style: OptiScaler-NR's (wilsjo2) settings and names ([DlssNr]), this route's own processing. --no-renodx means the same.
+#   With neither, the installer asks once after the network; Enter = the RenoDX style (not asked when not run in a terminal: RenoDX).
+#   Later the Add-ons page can stack several layers, each with either style; without layers [RenoDX] Enabled, applied after a game restart.
 # The old route name optiscaler-renodx still works and means optiscaler --renodx.
 #
 # --lumenite     (ReShade routes only) motion vectors from LumeniteFX Kernel (by Afzaal (Kaidō),
@@ -48,7 +56,7 @@
 set -euo pipefail
 here=$(cd -- "$(dirname -- "$0")" && pwd)
 # The package's models: bundled, or kept there by the first --dll install. Checked by SHA256.
-# dlssnr.bin = the old model (310.8.0, also preset 1 of 310.9.16), dlssnr-small.bin = the new model (310.9.16's default)
+# dlssnr.bin = CC_SILVER_AARDWOLD (310.8.0, also preset 1 of 310.9.16), dlssnr-small.bin = CC_SMALL_FP8 (310.9.16's default)
 pkg_model=$here/dlssnr-amd/dlssnr.bin
 pkg_small=$here/dlssnr-amd/dlssnr-small.bin
 model_sha256=2b41c888cf4155b8958c665ba64018ab0bd25c85fc71a2b6db86d0d04d1f7fbd
@@ -67,8 +75,9 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --dll) dll=${2:?--dll needs a file path}; shift 2;;
         --model) model=${2:?--model needs a network name}; shift 2
-            case "$model" in CC_SMALL_FP8|CC_SILVER_AARDWOLD|CC_SILVER_AARDWOLD_INT4_MIXED) ;;
-                *) echo "--model takes CC_SMALL_FP8, CC_SILVER_AARDWOLD or CC_SILVER_AARDWOLD_INT4_MIXED" >&2; exit 1;; esac;;
+            case "$model" in CC_SMALL_FP8|CC_SMALL_FP8_EXPERIMENTAL|CC_SILVER_AARDWOLD|CC_SILVER_AARDWOLD_INT4_MIXED) ;;
+                *) echo "--model takes CC_SMALL_FP8, CC_SMALL_FP8_EXPERIMENTAL, CC_SILVER_AARDWOLD or CC_SILVER_AARDWOLD_INT4_MIXED" >&2
+                   exit 1;; esac;;
         --new-model) model=CC_SMALL_FP8; shift;;
         --old-model) model=CC_SILVER_AARDWOLD; shift;;
         --int4) model=CC_SILVER_AARDWOLD_INT4_MIXED; shift;;
@@ -78,13 +87,13 @@ while [[ $# -gt 0 ]]; do
             if [[ $# -gt 1 && "$2" == *.zip ]]; then lumenite_zip=$2; shift; fi
             shift;;
         --no-lumenite) lumenite=0; shift;;
-        --no-renodx) renodx=0; shift;;
-        -h|--help) sed -n '2,48p' "$0"; exit 0;;
+        --no-renodx|--wilsjo2) renodx=0; shift;;
+        -h|--help) sed -n '2,54p' "$0"; exit 0;;
         *) if [[ -z "$game" ]]; then game=$1; elif [[ -z "$route" ]]; then route=$1;
            else echo "unexpected argument: $1" >&2; exit 1; fi; shift;;
     esac
 done
-[[ -n "$game" ]] || { sed -n '2,48p' "$0"; exit 1; }
+[[ -n "$game" ]] || { sed -n '2,54p' "$0"; exit 1; }
 [[ -d "$game" ]] || { echo "no such folder: $game" >&2; exit 1; }
 game=$(cd -- "$game" && pwd)
 manifest="$game/dlssnr-amd-install.txt"
@@ -153,8 +162,7 @@ if [[ "$kind" == optiscaler && ! -d "$here/optiscaler" ]]; then
     echo "The OptiScaler route is only in the 64-bit package." >&2; exit 1
 fi
 model_src="" small_src=""
-# An extracted model is kept in the package; if that fails (package folder not writable?) it is installed directly
-# this time and the next install needs --dll again
+# the extracted model is kept in the package; when it cannot be (package folder not writable?) this install goes on and the next one needs --dll again
 keep() {   # <extracted file> <place in the package>
     if cp -- "$1" "$2.part" && mv -f -- "$2.part" "$2"; then
         chmod 644 -- "$2"; echo "The model is kept in $2; later installs from this package need no --dll."; return 0
@@ -169,7 +177,7 @@ if [[ -n "$dll" ]] && ! { model_ok "$pkg_model" && small_ok "$pkg_small"; }; the
     model_ok "$model_tmp/dlssnr.bin" || { echo "The extracted model has the wrong checksum; nothing was installed." >&2; exit 1; }
     keep "$model_tmp/dlssnr.bin" "$pkg_model" || model_src=$model_tmp/dlssnr.bin
     if [[ -f "$model_tmp/dlssnr-small.bin" ]]; then
-        small_ok "$model_tmp/dlssnr-small.bin" || { echo "The extracted new model has the wrong checksum; nothing was installed." >&2; exit 1; }
+        small_ok "$model_tmp/dlssnr-small.bin" || { echo "The extracted CC_SMALL_FP8 model has the wrong checksum; nothing was installed." >&2; exit 1; }
         keep "$model_tmp/dlssnr-small.bin" "$pkg_small" || small_src=$model_tmp/dlssnr-small.bin
     fi
 elif model_ok "$pkg_model"; then
@@ -191,52 +199,75 @@ if [[ -z "$small_src" ]] && ! small_ok "$pkg_small"; then
     echo "To add it, install again with --dll pointing at the 310.9.16 nvngx_dlssnr.dll or its zip."
 fi
 int4=0; [[ -x "$here/int4/dlssnr-int4-weights" ]] && int4=1   # both the x86_64 and the i686 package have it
-# the network a game starts with: all three are installed, this only sets [Network] Model in dlssnr-amd.ini
+experimental=0; [[ -f "$here/experimental/dlssnr-small-experimental.delta" ]] && experimental=1
+# the network a game starts with: all four are installed, this only sets [Network] Model in dlssnr-amd.ini
 if [[ -z "$model" ]]; then
     model=CC_SMALL_FP8; [[ $have_small == 0 ]] && model=CC_SILVER_AARDWOLD
     if [[ -t 0 ]]; then
         echo
-        echo "All three networks are installed and can be switched in game at any time (the drop-down in NR Control or on ReShade's Add-ons page, or Ctrl+F11 to cycle)."
+        echo "All four networks are installed and can be switched in game at any time (the drop-down in NR Control or on ReShade's Add-ons page, or Ctrl+F11 to cycle)."
         echo "Choose only the one a game starts with:"
         if [[ $have_small == 1 ]]; then
-            echo "  1) CC_SMALL_FP8                    the default network of 310.9.16, the fastest (default)"
+            echo "  1) CC_SMALL_FP8                    the default network of 310.9.16 (default)"
         else
             echo "  1) CC_SMALL_FP8                    not available: needs the 310.9.16 nvngx_dlssnr.dll (install again with --dll)"
         fi
-        echo "  2) CC_SILVER_AARDWOLD              the network of 310.8.0 (also preset 1 of 310.9.16)"
-        if [[ $int4 == 1 ]]; then
-            echo "  3) CC_SILVER_AARDWOLD_INT4_MIXED   2) with part of the work in int4; faster, the picture differs somewhat"
+        if [[ $have_small == 1 && $experimental == 1 ]]; then
+            echo "  2) CC_SMALL_FP8_EXPERIMENTAL       this project's experimental network: 1) made faster"
+        elif [[ $have_small == 1 ]]; then
+            echo "  2) CC_SMALL_FP8_EXPERIMENTAL       not available: this package does not have it"
         else
-            echo "  3) CC_SILVER_AARDWOLD_INT4_MIXED   not available: this package has no int4 mixed"
+            echo "  2) CC_SMALL_FP8_EXPERIMENTAL       not available: needs the 310.9.16 nvngx_dlssnr.dll (install again with --dll)"
+        fi
+        echo "  3) CC_SILVER_AARDWOLD              the network of 310.8.0"
+        if [[ $int4 == 1 ]]; then
+            echo "  4) CC_SILVER_AARDWOLD_INT4_MIXED   3) with part of the work in int4; faster, the picture differs somewhat"
+        else
+            echo "  4) CC_SILVER_AARDWOLD_INT4_MIXED   not available: this package has no int4 mixed"
         fi
         echo "Later: [Network] Model in dlssnr-amd.ini."
-        def=1; [[ $have_small == 0 ]] && def=2
-        read -r -p "Start with which one? [1/2/3, Enter = $def] " pick || pick=""
+        def=1; [[ $have_small == 0 ]] && def=3
+        read -r -p "Start with which one? [1/2/3/4, Enter = $def] " pick || pick=""
         case "${pick:-$def}" in
-            1) model=CC_SMALL_FP8;; 2) model=CC_SILVER_AARDWOLD;; 3) model=CC_SILVER_AARDWOLD_INT4_MIXED;;
+            1) model=CC_SMALL_FP8;; 2) model=CC_SMALL_FP8_EXPERIMENTAL;; 3) model=CC_SILVER_AARDWOLD;;
+            4) model=CC_SILVER_AARDWOLD_INT4_MIXED;;
             *) echo "invalid choice, using $def.";;
         esac
     fi
 fi
-if [[ $model == CC_SMALL_FP8 && $have_small == 0 ]]; then
-    echo "CC_SMALL_FP8 is not available (no model for it); games start with CC_SILVER_AARDWOLD."; model=CC_SILVER_AARDWOLD
+if [[ ($model == CC_SMALL_FP8 || $model == CC_SMALL_FP8_EXPERIMENTAL) && $have_small == 0 ]]; then
+    echo "$model is not available (no CC_SMALL_FP8 model); the game starts with CC_SILVER_AARDWOLD."; model=CC_SILVER_AARDWOLD
 fi
 if [[ $model == CC_SILVER_AARDWOLD_INT4_MIXED && $int4 == 0 ]]; then
     echo "This package has no int4 mixed; games start with CC_SILVER_AARDWOLD."; model=CC_SILVER_AARDWOLD
 fi
-if [[ -z "$renodx" ]]; then
-    renodx=0
+if [[ -z "$renodx" && "$kind" == optiscaler ]]; then
+    renodx=1
     if [[ -t 0 ]]; then
         echo
-        echo "RenoDX style (optional): the picture before and after NR is processed the way RenoDX's DLSS5 add-on does it (the NR network itself is the same)."
-        if [[ "$kind" == optiscaler ]]; then
-            echo "  y: turn it on. Every NR setting is in NR Control (End in game); the OptiScaler menu only handles upscaling and frame generation."
-        else
-            echo "  y: turn it on. Every NR setting is on ReShade's Add-ons page ([RenoDX] in dlssnr-amd.ini)."
-        fi
-        echo "  N: leave it off, as before. To turn it on later, set [RenoDX] Enabled = 1 in dlssnr-amd.ini and restart the game."
-        read -r -p "Turn on the RenoDX style? [y/N] " pick || pick=""
-        [[ "$pick" == y || "$pick" == Y ]] && renodx=1
+        echo "The processing before and after NR (the NR network itself is the same):"
+        echo "  1) RenoDX style: processed the way RenoDX's DLSS5 add-on does it (default)"
+        echo "  2) wilsjo2 style: the original processing of OptiScaler-NR (wilsjo2), ported"
+        echo "In game NR Control (End) switches it at any time and can stack several layers."
+        read -r -p "Which one? [1/2, Enter = 1] " pick || pick=""
+        case "${pick:-1}" in
+            1) renodx=1;; 2) renodx=0;;
+            *) echo "Not a choice; 1.";;
+        esac
+    fi
+elif [[ -z "$renodx" ]]; then
+    renodx=1
+    if [[ -t 0 ]]; then
+        echo
+        echo "The processing before and after NR (the NR network itself is the same):"
+        echo "  1) RenoDX style: processed the way RenoDX's DLSS5 add-on does it (default)"
+        echo "  2) wilsjo2 style: OptiScaler-NR's (wilsjo2) settings and names ([DlssNr]), this route's own processing"
+        echo "In game, ReShade's Add-ons page can stack several layers, each with either style."
+        read -r -p "Which one? [1/2, Enter = 1] " pick || pick=""
+        case "${pick:-1}" in
+            1) renodx=1;; 2) renodx=0;;
+            *) echo "Not a choice; 1.";;
+        esac
     fi
 fi
 if [[ -z "$lumenite" ]]; then
@@ -303,6 +334,27 @@ if [[ $int4 == 1 ]]; then
         echo "Games start with CC_SILVER_AARDWOLD."; model=CC_SILVER_AARDWOLD
     fi
 fi
+exp_weights=0
+if [[ $experimental == 1 && $have_small == 1 ]]; then
+    # CC_SMALL_FP8_EXPERIMENTAL's weights are not in the package: made here from CC_SMALL_FP8's model and the package's difference file,
+    # installed only when their SHA-256 matches. When that fails the other networks are installed as usual and it is greyed out in game (with the reason).
+    echo "Making CC_SMALL_FP8_EXPERIMENTAL's weights ..."
+    exp_tmp=$(mktemp -d)
+    trap 'rm -rf -- "$exp_tmp" ${int4_tmp:+"$int4_tmp"}; [[ -n "${model_tmp:-}" ]] && rm -rf -- "$model_tmp"; rm -f -- "$pkg_model.part" "$pkg_small.part"' EXIT
+    if ! python3 "$here/experimental/experimental_weights.py" apply "${small_src:-$pkg_small}" \
+            "$here/experimental/dlssnr-small-experimental.delta" "$exp_tmp/dlssnr-small-experimental.bin" > "$exp_tmp/log.txt" 2>&1; then
+        cat "$exp_tmp/log.txt" >&2
+        echo "Note: CC_SMALL_FP8_EXPERIMENTAL's weights could not be made; it is not available in game. The other networks are installed as usual." >&2
+    elif [[ "$(sha256sum -- "$exp_tmp/dlssnr-small-experimental.bin" | cut -d' ' -f1)" != \
+            "$(cut -d' ' -f1 "$here/experimental/dlssnr-small-experimental.bin.sha256")" ]]; then
+        echo "Note: CC_SMALL_FP8_EXPERIMENTAL's weights have the wrong checksum (model or package incomplete?); it is not available in game. The other networks are installed as usual." >&2
+    else
+        exp_weights=1
+    fi
+fi
+if [[ $exp_weights == 0 && $model == CC_SMALL_FP8_EXPERIMENTAL ]]; then
+    echo "The game starts with CC_SMALL_FP8 instead."; model=CC_SMALL_FP8
+fi
 if [[ -f "$manifest" ]]; then
     echo "Found a previous installation, removing it first."
     remove_installed
@@ -315,20 +367,22 @@ fi
 put_tree "$here/dlssnr-amd" dlssnr-amd
 [[ -n "$model_src" ]] && cp -- "$model_src" "$game/dlssnr-amd/dlssnr.bin"
 [[ -n "$small_src" ]] && cp -- "$small_src" "$game/dlssnr-amd/dlssnr-small.bin"
+[[ $exp_weights == 1 ]] && mv -- "$exp_tmp/dlssnr-small-experimental.bin" "$game/dlssnr-amd/dlssnr-small-experimental.bin"
 
 case "$kind" in
     optiscaler)
-        tmp=$(mktemp -d)
-        python3 "$here/optiscaler/extract_release.py" "$here"/optiscaler/OptiScaler*.zip "$tmp" > /dev/null
-        rm -f -- "$tmp/!! EXTRACT ALL FILES TO GAME FOLDER !!" "$tmp/setup_windows.bat" "$tmp/setup_linux.sh" \
-                 "$tmp/nvngx.dll_dlssnr.dll"
-        mv -- "$tmp/OptiScaler.dll" "$tmp/dxgi.dll"
-        for f in "$tmp"/*; do
-            name=$(basename -- "$f")
-            if [[ -d "$f" ]]; then put_tree "$f" "$name"; else put_file "$f" "$name"; fi
-        done
-        rm -rf -- "$tmp"
-        for f in nvngx.dll_dlssnr.dll nvngx_dlssnr.dll dlssnr_core.dll; do put_file "$here/optiscaler/$f" "$f"; done
+        # OptiScaler as released (its files unmodified): OptiScaler.dll as dxgi.dll, its ini, its OptiScaler\ folder;
+        # its licences go into that folder (a Licenses folder of the game's own is not touched); its setup scripts are
+        # not needed. Our NR plugin into OptiScaler\plugins; NR Control's probe into dlssnr-amd\ (the wilsjo2 shaders are in it).
+        rel=$here/optiscaler/release
+        put_file "$rel/OptiScaler.dll" dxgi.dll
+        put_file "$rel/OptiScaler.ini" OptiScaler.ini
+        put_tree "$rel/OptiScaler" OptiScaler
+        if [[ -d "$rel/Licenses" ]]; then mkdir -p -- "$game/OptiScaler/Licenses"; cp -r -- "$rel/Licenses"/. "$game/OptiScaler/Licenses/"; fi
+        cp -- "$here/optiscaler/OptiScaler_LICENSE.txt" "$game/OptiScaler/Licenses/OptiScaler_LICENSE.txt"
+        mkdir -p -- "$game/OptiScaler/plugins"
+        cp -- "$here/optiscaler/asi/dlssnr-amd.asi" "$game/OptiScaler/plugins/dlssnr-amd.asi"
+        cp -- "$here/optiscaler/asi/nr_present_probe.exe" "$game/dlssnr-amd/"
         # vulkan-1.dll forwarding to winevulkan.dll, as Proton's own: with Proton's native Vulkan loader (which Steam
         # turns on for some games) OptiScaler's menu would not show (linux/vulkan-loader/vulkan1_forwarder.c). A
         # vulkan-1.dll the game brings itself is left alone.
@@ -337,9 +391,6 @@ case "$kind" in
         else
             put_file "$here/optiscaler/vulkan-1.dll" vulkan-1.dll
         fi
-        # NR Control (the NR menu opened with End, a Linux Vulkan layer): recorded and removed with dlssnr-amd/
-        mkdir -p -- "$game/dlssnr-amd/control"
-        cp -r -- "$here/optiscaler/control/layer" "$game/dlssnr-amd/control/"
         python3 "$here/optiscaler/patch_ini.py" "$game"
         record OptiScaler.log; record dlssnr-amd.log; record dlssnr-amd.ini
         overrides="dxgi=n,b"
@@ -375,13 +426,14 @@ if [[ $lumenite == 1 ]]; then
         { echo "ReShadePreset.ini could not be switched to LumeniteFX ($preset)." >&2; exit 1; }
 fi
 if [[ $int4 == 1 ]]; then
-    # the programs that run all three networks (int4 mixed built in) replace the ones of the same name this route just
-    # installed; dlssnr-amd/int4: network, quantisation, settings, Vulkan layer (the restore tables *.fix.bin, *.mu.bin stay in the package); the made weights go to dlssnr-amd/
-    d=reshade; [[ "$kind" == optiscaler ]] && d=optiscaler
-    for f in "$here/int4/$d"/*; do
-        name=$(basename -- "$f")
-        [[ -e "$game/$name" ]] && cp -- "$f" "$game/$name"
-    done
+    # the programs that run all four networks (int4 mixed built in) replace the ReShade route's files of the same name just installed (the OptiScaler route's NR plugin runs all four as it is);
+    # dlssnr-amd/int4: network, quantisers, settings, Vulkan layer (the recovery tables *.fix.bin, *.mu.bin stay in the package); the weights made go into dlssnr-amd/
+    if [[ "$kind" != optiscaler ]]; then
+        for f in "$here/int4/reshade"/*; do
+            name=$(basename -- "$f")
+            [[ -e "$game/$name" ]] && cp -- "$f" "$game/$name"
+        done
+    fi
     mkdir -p -- "$game/dlssnr-amd/int4"
     (cd -- "$here/int4/dlssnr-amd/int4" && find . -type f ! -name '*.fix.bin' ! -name '*.mu.bin' -print0 |
         while IFS= read -r -d '' f; do mkdir -p -- "$game/dlssnr-amd/int4/$(dirname -- "$f")"; cp -- "$f" "$game/dlssnr-amd/int4/$f"; done)
@@ -406,14 +458,18 @@ sed -i "/^\[Network\]/,/^\[/ s/^Model = .*/Model = $model/" "$game/dlssnr-amd.in
 grep -q "^Model = $model\$" "$game/dlssnr-amd.ini" || { echo "dlssnr-amd.ini: could not set Model = $model." >&2; exit 1; }
 
 echo
-echo "Installed the $route route into: $game$([[ $renodx == 1 ]] && echo " (RenoDX style)")"
-echo "Networks installed: $([[ $have_small == 1 ]] && echo "CC_SMALL_FP8, ")CC_SILVER_AARDWOLD$([[ $int4_weights == 1 ]] && echo ", CC_SILVER_AARDWOLD_INT4_MIXED"); games start with $model."
+if [[ "$kind" == optiscaler ]]; then
+    echo "Installed the $route route into: $game ($([[ $renodx == 1 ]] && echo "RenoDX style" || echo "wilsjo2 style"))"
+else
+    echo "Installed the $route route into: $game$([[ $renodx == 1 ]] && echo " (RenoDX style)")"
+fi
+echo "Networks installed: $([[ $have_small == 1 ]] && echo "CC_SMALL_FP8, ")$([[ $exp_weights == 1 ]] && echo "CC_SMALL_FP8_EXPERIMENTAL, ")CC_SILVER_AARDWOLD$([[ $int4_weights == 1 ]] && echo ", CC_SILVER_AARDWOLD_INT4_MIXED"); the game starts with $model."
 echo "Switch the network in game at any time: the drop-down in $([[ "$kind" == optiscaler ]] && echo "NR Control (End)" || echo "ReShade's Add-ons page"), or Ctrl+F11 to cycle; settings: [Network] in dlssnr-amd.ini."
-# Vulkan layers in the launch options: NR Control's (the OptiScaler route); int4 mixed's in the main line only when games start with it, otherwise in a line of its own
+# the Vulkan layer in the launch options: only int4 mixed on the ReShade routes needs it (in the main launch line only when it is the starting network, else printed as a line of its own);
+# the OptiScaler route needs no layer (the NR plugin draws NR Control itself and adds the device extensions int4 mixed needs)
 launch() {   # <with the int4 layer: 0/1>
     local paths=() names=()
-    [[ $1 == 1 ]] && { paths+=("$game/dlssnr-amd/int4/layer"); names+=(VK_LAYER_DLSSNR_int4); }
-    [[ "$kind" == optiscaler ]] && { paths+=("$game/dlssnr-amd/control/layer"); names+=(VK_LAYER_DLSSNR_control); }
+    [[ $1 == 1 && "$kind" != optiscaler ]] && { paths+=("$game/dlssnr-amd/int4/layer"); names+=(VK_LAYER_DLSSNR_int4); }
     if [[ ${#paths[@]} -gt 0 ]]; then
         echo "VK_ADD_LAYER_PATH=\"$(IFS=:; echo "${paths[*]}")\" VK_INSTANCE_LAYERS=$(IFS=:; echo "${names[*]}") WINEDLLOVERRIDES=\"$overrides\" %command%"
     else
@@ -422,18 +478,14 @@ launch() {   # <with the int4 layer: 0/1>
 }
 main_int4=0; [[ $model == CC_SILVER_AARDWOLD_INT4_MIXED ]] && main_int4=1
 echo "Steam launch options:  $(launch $main_int4)"
-[[ "$kind" == optiscaler ]] && echo "VK_ADD_LAYER_PATH / VK_INSTANCE_LAYERS in the launch options are needed by the NR Control menu$([[ $main_int4 == 1 ]] && echo " and int4 mixed"); copy the whole line."
-if [[ $int4_weights == 1 && $main_int4 == 0 ]]; then
-    echo "To use CC_SILVER_AARDWOLD_INT4_MIXED in game, use this line instead (all three networks can be switched):"
+if [[ $int4_weights == 1 && $main_int4 == 0 && "$kind" != optiscaler ]]; then
+    echo "To use CC_SILVER_AARDWOLD_INT4_MIXED in game, use this line instead (every network can be switched to):"
     echo "                 $(launch 1)"
 fi
 if [[ "$kind" == optiscaler ]]; then
-    if [[ $renodx == 1 ]]; then
-        echo "In the game, turn on DLSS, FSR or XeSS in its settings; Insert opens the OptiScaler menu (with the RenoDX style on, only for upscaling and frame generation)."
-    else
-        echo "In the game, turn on DLSS, FSR or XeSS in its settings; Insert opens the OptiScaler menu, DLSS Neural Rendering has its own page."
-    fi
-    echo "If the NR page keeps showing 'Waiting for the upscaler to run', set [Spoofing] Dxgi=false in OptiScaler.ini and try again."
+    echo "In game, turn on DLSS, FSR or XeSS in the game's settings. End opens NR Control (DirectX 11 / 12 and Vulkan games: every NR setting: processing, network, stacked layers);"
+    echo "Insert opens the OptiScaler menu (upscaling and frame generation only)."
+    echo "If NR Control keeps waiting for the game's upscaler, set [Spoofing] Dxgi=false in OptiScaler.ini and try again."
     echo "If colours turn green or grainy after NR (007 First Light, for example), try [Preprocess] in dlssnr-amd.ini, or press Ctrl+F10 in the game."
 else
     echo "In the game, Home opens ReShade; the settings are on the Add-ons page, or edit dlssnr-amd.ini directly."
@@ -444,10 +496,14 @@ else
     fi
 fi
 [[ "$kind" == optiscaler ]] &&
-    echo "End opens NR Control (this project's NR menu: networks, Preprocess$([[ $renodx == 1 ]] && echo ", and every NR setting of the RenoDX style"))."
-[[ "$kind" == optiscaler && $renodx == 1 ]] &&
-    echo "The RenoDX style is on ([RenoDX] Enabled = 1 in dlssnr-amd.ini). With it on, every NR setting is in NR Control ([RenoDX]); the OptiScaler menu only handles upscaling and frame generation, and its NR page has no effect. Turning the RenoDX style off (Enabled = 0, restart the game) brings back the previous behaviour, with the NR settings in the OptiScaler menu. F5 saves a screenshot (the same frame without and with NR) to NR Screenshots in the game folder."
-[[ "$kind" != optiscaler && $renodx == 1 ]] &&
-    echo "The RenoDX style is on ([RenoDX] Enabled = 1 in dlssnr-amd.ini). With it on, every NR setting is in the RenoDX part of the Add-ons page ([RenoDX]); the NR settings in [DlssNr] have no effect. Turning it off (Enabled = 0, restart the game) brings back the previous behaviour. F5 saves a screenshot (the same frame without and with NR) to NR Screenshots in the game folder."
+    echo "F5 takes screenshots (the same frame without and with NR) into NR Screenshots in the game folder."
+if [[ "$kind" != optiscaler ]]; then
+    if [[ $renodx == 1 ]]; then
+        echo "Processing before and after NR: the RenoDX style ([RenoDX] Enabled = 1 in dlssnr-amd.ini), settings on the Add-ons page (that is [RenoDX])."
+    else
+        echo "Processing before and after NR: the wilsjo2 style ([RenoDX] Enabled = 0), settings on the Add-ons page (that is [DlssNr])."
+    fi
+    echo "The Add-ons page can stack several layers ([LayerN]), each RenoDX or wilsjo2. F5 takes screenshots (the same frame without and with NR) into NR Screenshots in the game folder."
+fi
 echo "Logs: dlssnr-amd.log$([[ "$kind" == optiscaler ]] && echo ", OptiScaler.log" || echo ", ReShade.log")"
 echo "Uninstall:  bash install.sh \"$game\" remove"

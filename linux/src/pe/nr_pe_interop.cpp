@@ -1,5 +1,7 @@
 #include "nr_pe_interop.hpp"
 #include "nr_pe_log.hpp"
+#include "nr_vram_ledger.hpp"
+#include "nr_test_fault.hpp"
 #include <cstdio>
 #include <mutex>
 #include <set>
@@ -12,6 +14,7 @@ extern "C" int nr_vk_missing;
 extern "C" const char* nr_vk_first_missing;
 
 namespace nr::pe {
+void vulkan_entry_points();
 namespace {
 // Once the game's D3D stack has handed over its Vulkan objects, winevulkan.dll is surely in the process: the
 // entry points are taken again there (nr_vk_load), since at DLL load it may not have been yet.
@@ -19,6 +22,7 @@ void entry_points_for_interop() {
     static std::once_flag once;
     std::call_once(once, [] {
         nr_vk_load();
+        nr::vram::install_vulkan();   // our allocations counted for NR Control's VRAM breakdown
         if (nr_vk_missing)
             log("[nr] Vulkan entry points from %s: %d not exported (%s, ...)", nr_vk_source, nr_vk_missing,
                 nr_vk_first_missing);
@@ -26,6 +30,11 @@ void entry_points_for_interop() {
             log("[nr] Vulkan entry points from %s", nr_vk_source);
     });
 }
+}  // namespace
+
+void vulkan_entry_points() { entry_points_for_interop(); }
+
+namespace {
 // vkd3d-proton hands out VkFormat-equivalents through the D3D12 description, so
 // the texture's own D3D12 format is what tells us how to treat the image. Only
 // the formats a colour or motion buffer actually uses are listed; anything else
@@ -76,6 +85,7 @@ VkFormat vulkan_format(DXGI_FORMAT format) {
     case DXGI_FORMAT_R16_FLOAT: return VK_FORMAT_R16_SFLOAT;
     case DXGI_FORMAT_R32G32_FLOAT: return VK_FORMAT_R32G32_SFLOAT;
     case DXGI_FORMAT_R16G16_SNORM: return VK_FORMAT_R16G16_SNORM;
+    case DXGI_FORMAT_R32_UINT: return VK_FORMAT_R32_UINT;   // ours only: HUD FIX's counts (nr_asi_main.cpp present_layers)
     default: return VK_FORMAT_UNDEFINED;
     }
 }
@@ -203,6 +213,28 @@ VkCommandBuffer command_buffer(ID3D12GraphicsCommandList* list) {
     ext->GetVulkanHandle(&cmd);
     ext->Release();
     return cmd;
+}
+
+VkCommandBuffer begin_interop_recording(ID3D12Device* device, ID3D12GraphicsCommandList* list) {
+    if (!device || !list) return VK_NULL_HANDLE;
+    ID3D12DXVKInteropDevice1* interop = nullptr;
+    if (FAILED(device->QueryInterface(__uuidof(ID3D12DXVKInteropDevice1), reinterpret_cast<void**>(&interop))) ||
+        !interop)
+        return VK_NULL_HANDLE;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    if (test_fault("d12_interop") || FAILED(interop->BeginVkCommandBufferInterop(list, &cmd))) cmd = VK_NULL_HANDLE;
+    interop->Release();
+    return cmd;
+}
+
+void end_interop_recording(ID3D12Device* device, ID3D12GraphicsCommandList* list) {
+    if (!device || !list) return;
+    ID3D12DXVKInteropDevice1* interop = nullptr;
+    if (FAILED(device->QueryInterface(__uuidof(ID3D12DXVKInteropDevice1), reinterpret_cast<void**>(&interop))) ||
+        !interop)
+        return;
+    interop->EndVkCommandBufferInterop(list);
+    interop->Release();
 }
 
 ResourceHandle resource_handle(ID3D12Device* device, ID3D12Resource* resource,
@@ -442,6 +474,28 @@ ResourceHandle d3d11_image(IUnknown* texture, IUnknown* device) {
             out.width = info.extent.width;
             out.height = info.extent.height;
             out.usage = info.usage;
+            // A typeless D3D11 texture: DXVK creates it in one representative format of the family (UNORM for
+            // R16G16B16A16 and R16G16, 7 Days To Die's Unity colour and motion vectors) with mutable views,
+            // while the game writes it through typed views - half floats there. Read as UNORM the colour is
+            // bent (green sunlight) and the motion vectors are noise (flicker). Viewed as the format the
+            // game wrote, as DXGI's typeless rule in vulkan_format() gives it (vkd3d-proton's own choice).
+            ID3D11Texture2D* tex = nullptr;
+            D3D11_TEXTURE2D_DESC desc{};
+            if (SUCCEEDED(texture->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&tex))) && tex) {
+                tex->GetDesc(&desc);
+                tex->Release();
+            }
+            out.dxgi = desc.Format;
+            const VkFormat typed = is_typeless(desc.Format) || desc.Format == DXGI_FORMAT_R16G16_TYPELESS ||
+                                           desc.Format == DXGI_FORMAT_R32G32_TYPELESS
+                                       ? vulkan_colour_format_of(desc.Format) : VK_FORMAT_UNDEFINED;
+            // DXVK makes every typeless colour texture mutable with the float format in its view list
+            // (d3d11_texture.cpp: a format family of more than one; dxgi_format.cpp: the families). Its
+            // GetVulkanImageInfo reports flags as 0 whatever the image has, so this is DXVK's rule, not a flag read.
+            if (trace && typed != VK_FORMAT_UNDEFINED)
+                log("[nr] d3d11_image: typeless DXGI %u, DXVK's VkFormat %u, read as VkFormat %u", unsigned(desc.Format),
+                    unsigned(info.format), unsigned(typed));
+            if (typed != VK_FORMAT_UNDEFINED) out.format = typed;
         } else {
             // DXVK creates every D3D11 texture with transfer usage on both
             // sides; the rest comes from the texture's own description.

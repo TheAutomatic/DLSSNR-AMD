@@ -1,10 +1,19 @@
 #include "nr_pe_session.hpp"
+#include "nr_pe_events.hpp"
+#include "nr_gpu_completion.hpp"
+#include "nr_wilsjo2.hpp"
+#include "nr_wilsjo2_flow.hpp"
+#include "nr_vram_tag.hpp"
+#include "nr_vram_ledger.hpp"
 #include "nr_ini_network.hpp"
 #include "nr_pe_config.hpp"   // NetworkSwitch
 #include "nr_pe_log.hpp"
 #include "nr_log.hpp"
 #include "nr_screenshot.hpp"
+#include "nr_test_fault.hpp"
 #include <windows.h>
+#include "nr_pe_watchdog.hpp"
+#include "nr_pe_vkdevice.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -25,6 +34,15 @@ namespace nr::pe {
 namespace {
 
 using nr::pe::log;
+
+// `f` at the end of the scope unless disarmed: a command buffer of ours recorded and then not submitted (any early
+// return, or a failed submit) has its timing discarded (Session::Impl::discard_timing).
+template <class F> struct OnExit {
+    F f;
+    bool armed = true;
+    ~OnExit() { if (armed) f(); }
+};
+template <class F> OnExit<F> on_exit(F f) { return OnExit<F>{std::move(f)}; }
 
 // What the process has left of its own address space.
 //
@@ -68,6 +86,14 @@ std::string address_space_report() {
 
 }  // namespace
 
+// The network a runtime config builds (RuntimeConfig::network / int4_mixed), as nr::NetworkChoice.
+static int config_net(const RuntimeConfig& c) {
+#if NR_INT4
+    if (c.network != 1 && c.int4_mixed == 1) return nr::kSilverAardwoldInt4;
+#endif
+    return c.network == 2 ? nr::kSmallFp8Experimental : c.network == 1 ? nr::kSmallFp8 : nr::kSilverAardwold;
+}
+
 struct Session::Impl {
     std::string root;
     std::string status;
@@ -91,13 +117,9 @@ struct Session::Impl {
         std::unique_ptr<Runtime> runtime;
         uint32_t width{}, height{};
         VkFormat format{VK_FORMAT_UNDEFINED};
-        bool linear{};
-        float scale{1.0f};
-        // The pass ceiling this one was built for: it sizes one history image
-        // per pass, so a network built for four cannot serve a request for six.
-        uint32_t passes{4};
-        bool prep{};   // RuntimeConfig::preprocess
-        bool native{}; // RuntimeConfig::native_compose
+        // The NR-chain layers (set_call_layer) that selected it, and when: a network another layer ran lately is that
+        // layer's (the ReShade route's layers each have their own).
+        std::map<int, std::chrono::steady_clock::time_point> layers;
         int net{};     // the network it runs (nr::NetworkChoice)
         uint64_t used{};   // LRU stamp
         std::chrono::steady_clock::time_point last{};   // when it was last selected
@@ -108,6 +130,20 @@ struct Session::Impl {
     static constexpr std::chrono::milliseconds kStaleHistory{250};
     std::vector<Built> cache;
     uint64_t use_stamp{};
+    // The NR-chain layers (set_call_layer) seen lately, and when. With two or more running, a network a layer ran within
+    // kNetIdle is that layer's: neither the drops of a finished build nor the per-kind limit take it (a slow frame
+    // during a build - 32-bit games - is longer than kIdleDrop); short memory is still the residency's.
+    std::map<int, std::chrono::steady_clock::time_point> layer_seen;
+    bool chain_active(std::chrono::steady_clock::time_point now) const {
+        int n = 0;
+        for (const auto& [layer, at] : layer_seen) n += now - at < kNetIdle;
+        return n >= 2;
+    }
+    bool layer_held(const Built& b, std::chrono::steady_clock::time_point now) const {
+        if (!chain_active(now)) return false;
+        for (const auto& [layer, at] : b.layers) if (now - at < kNetIdle) return true;
+        return false;
+    }
     // Networks of one [Int4Mixed] kind kept at once (see the adoption in ensure_runtime_), and runtimes: those built
     // from another's network (Runtime::share_for, an extent with the same working extent) hold their own images only.
     static constexpr size_t kMaxResident = 2;
@@ -127,7 +163,7 @@ struct Session::Impl {
     // same frame, as NVIDIA's DLL evaluates one feature at any size. A plan is built in the background (~0.15 s) the
     // first time its working extent is asked for.
     struct PlanEntry {
-        VkFormat format{}; bool linear{}; float scale{}; uint32_t passes{}; bool prep{}, native{}; int net{};
+        VkFormat format{}; int net{};
         uint32_t ww{}, wh{}, sh{};   // working extent, tallest frame height
         std::shared_ptr<const RuntimeCore> core;
         uint64_t used{};
@@ -137,39 +173,34 @@ struct Session::Impl {
     bool build_plan{};   // the background build is a plan (RuntimeConfig::plan_only)
     uint64_t inframe_built{}, plans_built{};
     double inframe_ms_max{};
-    bool same_config_but_format(const Built& e, bool want_linear) const { return same_config(e, e.format, want_linear); }
-    bool same_config(const Built& e, VkFormat f, bool want_linear) const {
-        if (e.format != f || e.linear != want_linear || e.scale != model_scale || e.passes != max_passes_want ||
-            e.prep != prep_want || e.native != (native_compose || renodx_native))
-            return false;
-        return e.net == net_want;
-    }
+    bool same_config_but_format(const Built& e) const { return same_config(e, e.format); }
+    bool same_config(const Built& e, VkFormat f) const { return e.format == f && e.net == net_want; }
     // The network a runtime runs (nr::NetworkChoice).
     static int net_of(const Runtime& r) {
 #if NR_INT4
         if (r.int4_mixed()) return nr::kSilverAardwoldInt4;
 #endif
+        if (r.experimental()) return nr::kSmallFp8Experimental;
         return r.network() == NetworkModel::Small ? nr::kSmallFp8 : nr::kSilverAardwold;
     }
-    RuntimeConfig make_config(uint32_t w, uint32_t h, VkFormat f, bool want_linear) const;
+    RuntimeConfig make_config(uint32_t w, uint32_t h, VkFormat f) const;
     HostDevice make_host() const;
     TemporalConfig make_temporal() const {
         TemporalConfig temporal; temporal.enable = true;
         temporal.history_strength = history_strength;
         return temporal;
     }
-    const PlanEntry* plan_for(uint32_t w, uint32_t h, VkFormat f, bool want_linear, NetworkModel model);
+    const PlanEntry* plan_for(uint32_t w, uint32_t h, VkFormat f, NetworkModel model);
     // `tried`: the network it would have run on, when building inside the frame failed (a pipeline not made yet):
     // the background build then makes that runtime.
-    bool inframe(uint32_t w, uint32_t h, VkFormat f, bool want_linear, std::shared_ptr<const RuntimeCore>* tried);
-    bool start_plan(uint32_t w, uint32_t h, VkFormat f, bool want_linear);
+    bool inframe(uint32_t w, uint32_t h, VkFormat f, std::shared_ptr<const RuntimeCore>* tried);
+    bool start_plan(uint32_t w, uint32_t h, VkFormat f);
     // While a game's dynamic resolution moves the frame size (a resize in the last kDrsActive): the plans of the
     // working extents nearest the latest size, one at a time in the background, so a sweep finds them made.
     static constexpr std::chrono::seconds kDrsActive{2};
     std::chrono::steady_clock::time_point last_resize{};
     uint32_t last_w{}, last_h{};
     VkFormat last_format{VK_FORMAT_UNDEFINED};
-    bool last_linear{};
     std::pair<uint32_t, uint32_t> prefetched_around{};   // the size whose neighbourhood is all planned
     bool drs_active() const {
         return last_resize != std::chrono::steady_clock::time_point{} &&
@@ -206,10 +237,17 @@ struct Session::Impl {
     bool heap_busy{}, heap_done{};
     const void* heap_for{};
     std::shared_ptr<ImageHeapRef> heap_made;
+    // The network memory a frame waits for a heap in (inframe, past kOwnImages): asked for by heap_poll whether or not
+    // the frame size moves (a placement or colour format of its own needs a runtime there too, not only DRS).
+    const void* heap_ask{};
     void heap_poll();
     // Runtimes built inside frames with images of their own (no heap yet) kept at most this many.
     static constexpr size_t kOwnImages = 2;
     bool inframe_waiting{};
+    // Since when frames wait for that heap: past kHeapWait the background build serves them instead (frames never
+    // pass through for good waiting for a heap that cannot come).
+    std::chrono::steady_clock::time_point inframe_wait_since{};
+    static constexpr std::chrono::seconds kHeapWait{2};
     static constexpr uint32_t kSettle = 3;
     static constexpr uint64_t kSettleGap = 8;
     std::map<std::pair<uint32_t, uint32_t>, std::pair<uint32_t, uint64_t>> asked;   // extent -> count, last call
@@ -230,8 +268,9 @@ struct Session::Impl {
     std::vector<Retired> retired;
     uint64_t calls{};   // ensure_runtime calls (one per evaluation)
     // Evaluations that ran the network and that passed the frame through (building, freeing, failed): in the log
-    // every kPassLog while any pass through, and for the whole session at its end.
+    // every kPassLog while NR is asked for, and for the whole session at its end.
     uint64_t ran{}, passed{}, ran_total{}, passed_total{};
+    bool totals_logged{};   // Session::log_totals
     std::chrono::steady_clock::time_point pass_logged{};
     static constexpr std::chrono::seconds kPassLog{10};
     static constexpr uint64_t kRetireCalls = 16;
@@ -249,6 +288,8 @@ struct Session::Impl {
     static constexpr std::chrono::milliseconds kResidencyCheck{500};
     static constexpr std::chrono::seconds kFreedQuiet{1};
     std::chrono::steady_clock::time_point last_call{}, residency_checked{}, residency_freed{};
+    std::string residency_why;   // residency()'s last reason to act (NR Control)
+    void publish_residency(int mode, bool nr_off);
     struct Vram { uint64_t heap{}, budget{}, usage{}; };
     bool vram(Vram& v) const;   // the largest device-local heap
     void residency(bool switched, bool nr_off);
@@ -263,7 +304,7 @@ struct Session::Impl {
     // the background (RuntimeConfig::share, ~10 ms) instead of a whole build.
     struct Parked {
         std::shared_ptr<const RuntimeCore> core;
-        VkFormat format{}; bool linear{}; float scale{}; uint32_t passes{}; bool prep{}, native{}; int net{};
+        VkFormat format{}; int net{};
         uint32_t width{}, height{};
         std::chrono::steady_clock::time_point last{};
     };
@@ -298,6 +339,50 @@ struct Session::Impl {
         uint32_t stack{1};   // the model passes its stack last ran: pass k > 0 keeps a history of its own
     };
     std::map<uint64_t, RenoDXEntry> renodx;
+    // ---- wilsjo2 layers of the ReShade route: nr_wilsjo2_flow.hpp, the flow the .asi runs, around the network (which
+    // runs network-only, as for RenoDX). Per feature: the flow's state; the surfaces ours, retired once the GPU is done
+    // with them (or, without a proof, after 64 evaluations and 2 s).
+    struct W2Surface { VkImage image{}; VkDeviceMemory memory{}; VkFormat format{VK_FORMAT_UNDEFINED}; uint32_t w{}, h{}; };
+    struct W2Entry { nr::wilsjo2::FlowState flow; W2Surface* work{}; uint32_t passes{}; };
+    std::map<uint64_t, W2Entry> w2;
+    std::unique_ptr<nr::wilsjo2::Stage> w2_stage;
+    // the wilsjo2 Stage could not be made: when (steady ms; 0 never), tried again 5 s later; said once
+    uint64_t w2_stage_failed_ms{};
+    bool w2_stage_said{};
+    float w2_fast_passes = 0.f;                 // the last wilsjo2 run: Passes (fast), Session::state()
+    bool w2_fast_fallback = false, w2_motion = false;
+    nr::wilsjo2::SpatialLayout w2_spatial{};    // the last wilsjo2 run's peripheral compression (Session::spatial_layout)
+    bool w2_spatial_on = false;
+    struct W2Retired { W2Surface* s; nr::gpu::Uses uses; uint64_t call; std::chrono::steady_clock::time_point at; };
+    std::vector<W2Retired> w2_retired;
+    nr::gpu::Uses w2_uses;
+    VkPhysicalDeviceMemoryProperties w2_mem{};
+    bool w2_mem_known{};
+    void w2_retire(W2Surface*& x) {
+        if (x) w2_retired.push_back({x, w2_uses, calls, std::chrono::steady_clock::now()});
+        x = nullptr;
+    }
+    void w2_destroy(W2Surface* x) {
+        if (!x) return;
+        if (x->image) vkDestroyImage(handles.device, x->image, nullptr);
+        if (x->memory) vkFreeMemory(handles.device, x->memory, nullptr);
+        delete x;
+    }
+    void w2_free_retired() {
+        const auto now = std::chrono::steady_clock::now();
+        for (size_t i = w2_retired.size(); i-- > 0;)
+            if (calls - w2_retired[i].call > 64 && now - w2_retired[i].at > std::chrono::seconds(2) && w2_retired[i].uses.ready()) {
+                w2_destroy(w2_retired[i].s);
+                w2_retired.erase(w2_retired.begin() + std::ptrdiff_t(i));
+            }
+    }
+    W2Surface* w2_make(VkCommandBuffer cmd, VkFormat f, uint32_t w, uint32_t h);
+    void wilsjo2_release(uint64_t feature);
+    bool wilsjo2_runtime(const Controls& controls, uint32_t w, uint32_t h, VkFormat f, Controls* c);
+    bool wilsjo2_prepare(const Session::Wilsjo2Frame& wf, uint64_t feature, uint32_t w, uint32_t h, VkFormat f, bool guides,
+                         const Controls& controls, Controls* net);
+    bool record_wilsjo2(VkCommandBuffer cmd, const ColourFrame& colour, const EngineFrame& engine, const Controls& net,
+                        const Session::Wilsjo2Frame& wf);
     // The history pass k of a feature's stack runs on (pass 0: the feature's own).
     static uint64_t stack_feature(uint64_t feature, uint32_t k) {
         return k == 0 ? feature : (uint64_t(1) << 62) | (feature << 8) | k;
@@ -309,6 +394,10 @@ struct Session::Impl {
     }
     // RenoDX's neutral guides (NRPresentGuides): zero motion vectors at the frame's extent, for a Present-path frame
     // without the game's (Optional) or always (Never). Made and cleared on first use, kept.
+    struct NeutralRetired { VkImage image; VkDeviceMemory memory; nr::gpu::Uses uses; uint64_t call; std::chrono::steady_clock::time_point at; };
+    std::vector<NeutralRetired> neutral_retired;
+    nr::gpu::Uses neutral_uses;
+    uint64_t neutral_calls = 0;
     VkImage neutral_mv{};
     VkDeviceMemory neutral_mv_memory{};
     uint32_t neutral_w{}, neutral_h{};
@@ -329,8 +418,85 @@ struct Session::Impl {
     uint32_t stage_slot{};
     uint32_t stage_slot_passes[kStageSlots]{};
     uint64_t stage_recorded{};
-    float stage_ms_avg{}, stage_net_ms_avg{};
-    bool renodx_timed{};
+    // The averages by NR-chain layer (Session::set_call_layer; 0 outside a chain): every layer's runs apart, and whether
+    // its last run was timed here (else the runtime's own timing is its cost)
+    struct StageAverage {
+        float ms{}, net_ms{};
+        bool renodx_timed{};
+        std::chrono::steady_clock::time_point seen{};   // its last reading
+    };
+    std::map<int, StageAverage> stage_avg;
+    int stage_slot_layer[kStageSlots]{};
+    // reset_layer_timing: each layer's measurement generation, and the one each slot was recorded in
+    std::map<int, uint32_t> layer_gen;
+    uint32_t stage_slot_gen[kStageSlots]{};
+    int call_layer{};
+    // Session::outer_begin / outer_end: their own ring, in the stage's pool after the stage's queries
+    static constexpr uint32_t kOuterSlots = 16;
+    static constexpr uint32_t kOuterPasses = 32;   // network recordings timed inside one run (wilsjo2: up to 30 passes)
+    static constexpr uint32_t kOuterQueries = 2 + 2 * kOuterPasses;
+    VkQueryPool outer_timing{};
+    bool outer_tried{}, outer_open{};
+    uint32_t outer_slot{}, outer_passes{};
+    uint64_t outer_recorded{};
+    int outer_slot_layer[kOuterSlots]{};
+    uint32_t outer_slot_gen[kOuterSlots]{};
+    uint32_t outer_slot_passes[kOuterSlots]{};
+    std::map<int, float> outer_avg, outer_net_avg;
+    // When each layer's outer run was last recorded: an average is the layer's only while its runs go on (a layer that
+    // was wilsjo2 and is RenoDX now, or removed and added again, must not show the old run's time for good)
+    std::map<int, std::chrono::steady_clock::time_point> outer_seen;
+    bool outer_fresh(int layer) const {
+        const auto s = outer_seen.find(layer);
+        return s != outer_seen.end() && std::chrono::steady_clock::now() - s->second < std::chrono::seconds(1);
+    }
+    // A network recording inside an open outer run: its start (begin) or end timestamp
+    void outer_net(VkCommandBuffer cmd, bool begin) {
+        if (!outer_open || outer_passes >= kOuterPasses) return;
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, outer_timing,
+                            outer_slot * kOuterQueries + 2 + 2 * outer_passes + (begin ? 0u : 1u));
+        if (!begin) ++outer_passes;
+    }
+    bool outer_ready() {
+        if (outer_tried) return outer_timing != VK_NULL_HANDLE;
+        outer_tried = true;
+        if (!stage_timing_ready()) return false;   // its timestamp period, and a queue family with timestamps
+        VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qi.queryType = VK_QUERY_TYPE_TIMESTAMP; qi.queryCount = kOuterSlots * kOuterQueries;
+        if (vkCreateQueryPool(handles.device, &qi, nullptr, &outer_timing) != VK_SUCCESS) outer_timing = VK_NULL_HANDLE;
+        return outer_timing != VK_NULL_HANDLE;
+    }
+    void discard_timing() {   // (Session::discard_timing)
+        outer_recorded = 0;
+        stage_recorded = 0;
+        for (Built& b : cache) if (b.runtime) b.runtime->discard_timing();
+        for (Retired& r : retired) if (r.runtime) r.runtime->discard_timing();
+        if (built) built->discard_timing();
+    }
+    void read_outer_timing() {
+        if (outer_recorded <= kOuterSlots) return;
+        const uint32_t n = 2 + 2 * outer_slot_passes[outer_slot];
+        uint64_t stamps[kOuterQueries] = {};
+        if (vkGetQueryPoolResults(handles.device, outer_timing, outer_slot * kOuterQueries, n, n * sizeof(uint64_t), stamps,
+                                  sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS || stamps[1] <= stamps[0])
+            return;
+        if (outer_slot_gen[outer_slot] != layer_gen[outer_slot_layer[outer_slot]]) return;   // of the layer's old setup
+        const float ms = float(double(stamps[1] - stamps[0]) * stage_timestamp_ns / 1e6);
+        float& a = outer_avg[outer_slot_layer[outer_slot]];
+        a = a > 0.0f ? a + (ms - a) * 0.1f : ms;
+        if (!outer_slot_passes[outer_slot]) return;
+        uint64_t net = 0;
+        for (uint32_t p = 0; p < outer_slot_passes[outer_slot]; ++p)
+            if (stamps[3 + 2 * p] > stamps[2 + 2 * p]) net += stamps[3 + 2 * p] - stamps[2 + 2 * p];
+        const float net_ms = float(double(net) * stage_timestamp_ns / 1e6);
+        if (std::getenv("NR_LAYER_TIMING_DIAG"))
+            for (uint32_t p = 0; p < outer_slot_passes[outer_slot]; ++p)
+                log("[nr] timing layer %d pass %u total %llu %llu network %llu %llu ns %.6f",
+                    outer_slot_layer[outer_slot], p, (unsigned long long)stamps[0], (unsigned long long)stamps[1],
+                    (unsigned long long)stamps[2 + 2 * p], (unsigned long long)stamps[3 + 2 * p], stage_timestamp_ns);
+        float& b = outer_net_avg[outer_slot_layer[outer_slot]];
+        b = b > 0.0f ? b + (net_ms - b) * 0.1f : net_ms;
+    }
     void read_stage_timing() {
         if (stage_recorded <= kStageSlots) return;
         const uint32_t n = 2 + 2 * stage_slot_passes[stage_slot];
@@ -338,14 +504,24 @@ struct Session::Impl {
         if (vkGetQueryPoolResults(handles.device, stage_timing, stage_slot * kStageQueries, n, n * sizeof(uint64_t), stamps,
                                   sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS || stamps[1] <= stamps[0])
             return;   // still running: next frame
+        if (stage_slot_gen[stage_slot] != layer_gen[stage_slot_layer[stage_slot]]) return;   // of the layer's old setup
         uint64_t net = 0;
         for (uint32_t p = 0; p < stage_slot_passes[stage_slot]; ++p)
             if (stamps[3 + 2 * p] > stamps[2 + 2 * p]) net += stamps[3 + 2 * p] - stamps[2 + 2 * p];
         const float ms = float(double(stamps[1] - stamps[0]) * stage_timestamp_ns / 1e6);
         const float net_ms = float(double(net) * stage_timestamp_ns / 1e6);
-        const bool first = stage_ms_avg <= 0.0f;
-        stage_ms_avg = first ? ms : stage_ms_avg + (ms - stage_ms_avg) * 0.1f;
-        stage_net_ms_avg = first ? net_ms : stage_net_ms_avg + (net_ms - stage_net_ms_avg) * 0.1f;
+        if (std::getenv("NR_LAYER_TIMING_DIAG"))
+            for (uint32_t p = 0; p < stage_slot_passes[stage_slot]; ++p)
+                log("[nr] timing layer %d pass %u total %llu %llu network %llu %llu ns %.6f",
+                    stage_slot_layer[stage_slot], p, (unsigned long long)stamps[0], (unsigned long long)stamps[1],
+                    (unsigned long long)stamps[2 + 2 * p], (unsigned long long)stamps[3 + 2 * p], stage_timestamp_ns);
+        StageAverage& a = stage_avg[stage_slot_layer[stage_slot]];
+        // a layer timed again after a pause (it ran as another processing, or was removed and added): anew
+        const auto now = std::chrono::steady_clock::now();
+        const bool first = a.ms <= 0.0f || now - a.seen > std::chrono::seconds(1);
+        a.seen = now;
+        a.ms = first ? ms : a.ms + (ms - a.ms) * 0.1f;
+        a.net_ms = first ? net_ms : a.net_ms + (net_ms - a.net_ms) * 0.1f;
     }
     bool stage_timing_ready() {
         if (stage_timing_tried) return stage_timing != VK_NULL_HANDLE;
@@ -382,6 +558,8 @@ struct Session::Impl {
     };
     static constexpr uint32_t kShotSettleFrames = 240;   // RenoDX's kExactSettlePresents
     std::unique_ptr<Shot> shot;                          // recorded, waiting for the GPU
+    std::unique_ptr<Shot> model_shot;
+    std::unique_ptr<Shot> outside_shot;                  // capture_begin's, until capture_end
     std::vector<std::unique_ptr<Shot>> shots_out;        // with the worker, or kept
     void shot_free(Shot& sh) {
         if (sh.mapped) vkUnmapMemory(handles.device, sh.memory);
@@ -391,9 +569,9 @@ struct Session::Impl {
         sh.mapped = nullptr; sh.buffer = VK_NULL_HANDLE; sh.memory = VK_NULL_HANDLE; sh.done = VK_NULL_HANDLE;
     }
     // Readbacks for a w x h pair of `format`, stamped (nr_screenshot.hpp); null when anything fails.
-    std::unique_ptr<Shot> shot_prepare(uint32_t w, uint32_t h, VkFormat format) {
+    std::unique_ptr<Shot> shot_prepare(uint32_t w, uint32_t h, VkFormat format, VkFormat pre = VK_FORMAT_UNDEFINED) {
         auto sh = std::make_unique<Shot>();
-        sh->bytes = uint64_t(w) * h * screenshot::bytes_per_pixel(format);
+        sh->bytes = uint64_t(w) * h * std::max(screenshot::bytes_per_pixel(format), screenshot::bytes_per_pixel(pre));
         VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         bi.size = sh->bytes * 2; bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         VkMemoryRequirements req{};
@@ -427,6 +605,7 @@ struct Session::Impl {
         screenshot::stamp(static_cast<uint8_t*>(sh->mapped) + sh->bytes, sh->bytes);
         sh->pair.width = w; sh->pair.height = h; sh->pair.format = format;
         sh->pair.row_pitch = w * screenshot::bytes_per_pixel(format);
+        sh->pair.pre_format = pre; sh->pair.pre_row_pitch = w * screenshot::bytes_per_pixel(pre);
         sh->pair.bytes = sh->bytes;
         sh->pair.pre = sh->mapped;
         sh->pair.post = static_cast<uint8_t*>(sh->mapped) + sh->bytes;
@@ -488,6 +667,37 @@ struct Session::Impl {
                                 "(buffers kept)");
             shots_out.push_back(std::move(shot));
         }
+    }
+    Controls shot_controls;
+    const Controls& capture_controls(const Controls& source) {
+        shot_poll();
+        Controls& c = shot_controls;
+        c = source;
+        c.feature = current_feature;
+        if (c.history_strength < 0.f) c.history_strength = history_strength;
+        c.network_timestamp = [this](VkCommandBuffer cmd, bool begin) { outer_net(cmd, begin); };
+        if (!source.model_capture_allowed || !screenshot::wants_model() || shot || outside_shot) return c;
+        c.model_capture = [this](VkCommandBuffer cmd, const ColourFrame& in, const ColourFrame& out, bool after) {
+            if (!after) {
+                if (model_shot) shots_out.push_back(std::move(model_shot));
+                if (!screenshot::wants_model()) return;
+                if (!screenshot::readable(in.format) || !screenshot::readable(out.format)) {
+                    screenshot::fail("unsupported_present", "the model's format cannot be read back"); return;
+                }
+                model_shot = shot_prepare(in.width, in.height, out.format, in.format);
+                if (!model_shot) { screenshot::abandon("allocation_failed", "model readback allocation failed"); return; }
+                model_shot->pair.model_diagnostic = true;
+                model_shot->pair.meta = "comparison=model-input-output\nprocessing=wilsjo2\n";
+                shot_copy(cmd, *model_shot, in.image, in.before, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                          VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, 0);
+                screenshot::recorded();
+            } else if (model_shot) {
+                shot_copy(cmd, *model_shot, out.image, out.before, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                          VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, model_shot->bytes);
+                shot_recorded(cmd, std::move(model_shot));
+            }
+        };
+        return c;
     }
     // NR_DIAG_EXPOSURE=1, a diagnostic (off by default): on the RenoDX-style option, texel (0,0) of the game's exposure
     // texture and 64 points (an 8 x 8 grid) of the frame before NR, the network's input and output (pass 1) and the
@@ -715,7 +925,7 @@ struct Session::Impl {
     void free_retired_stages() {
         const auto now = std::chrono::steady_clock::now();
         for (size_t i = renodx_retired.size(); i-- > 0;)
-            if (calls - renodx_retired[i].call > kRetireCalls && now - renodx_retired[i].at > kRetireTime)
+            if (calls - renodx_retired[i].call > kRetireCalls && now - renodx_retired[i].at > kRetireTime && renodx_retired[i].stage->recordings_done())
                 renodx_retired.erase(renodx_retired.begin() + std::ptrdiff_t(i));
     }
     // The entry in `cache` the run paths are using. Raw, because the cache owns
@@ -747,6 +957,12 @@ struct Session::Impl {
     // DXVK's interop device, held for the life of the session: the queue lock
     // closures call into it every frame.
     IDXGIVkInteropDevice* dxvk{};
+    // record_raw_d3d11's ring (its own pool on DXVK's queue family)
+    static constexpr int kRaw11 = 4;
+    VkCommandPool raw11_pool{};
+    VkCommandBuffer raw11_cmd[kRaw11]{};
+    VkFence raw11_fence[kRaw11]{};
+    int raw11_slot = 0;
 
     VkImage vk_output{};
     VkImageView vk_output_view{};
@@ -773,39 +989,73 @@ struct Session::Impl {
     }
     bool ensure_vk_output(uint32_t w, uint32_t h, VkFormat format);
     void release_vk_output();
-    // `linear`: the colour is scene-referred linear light (an upscaler's input
-    // in a float format), so the runtime encodes it; false for every swapchain.
+    // The network for a frame of w x h in `format` (it runs the network only; the composition is the caller's).
     // Builds in the background: returns false, with `status` saying so, until
     // the network is ready, and the caller leaves the frame alone meanwhile.
-    // `controls` asking for a preprocess makes every runtime from then on one
-    // that can run it (prep_want); see RuntimeConfig::preprocess.
-    bool ensure_runtime(const Controls& controls, uint32_t w, uint32_t h, VkFormat format, bool linear);
-    bool ensure_runtime_(const Controls& controls, uint32_t w, uint32_t h, VkFormat format, bool linear);
-    // The preprocess meter in the log every five seconds while it runs, so NR on/off at one spot
-    // can be compared (the feedback loop that made upstream drop frame metering).
-    std::chrono::steady_clock::time_point meter_logged{};
-    static bool is_linear_format(VkFormat f) {
-        return f == VK_FORMAT_R16G16B16A16_SFLOAT || f == VK_FORMAT_B10G11R11_UFLOAT_PACK32 ||
-               f == VK_FORMAT_R32G32B32A32_SFLOAT ||
-               // Taken only through the rest-of-DXGI colour formats
-               // (nr_pe_interop.cpp colour_format_fallback), so no frame that
-               // ran before changes its answer here.
-               f == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 || f == VK_FORMAT_R32G32B32_SFLOAT;
-    }
+    bool ensure_runtime(const Controls& controls, uint32_t w, uint32_t h, VkFormat format);
+    bool ensure_runtime_(const Controls& controls, uint32_t w, uint32_t h, VkFormat format);
     // The background build. Everything the thread needs is copied in; it hands
     // back either a runtime or an error under `build_lock`, and the render
     // thread adopts whichever on its next call.
     std::thread build_thread;
     std::mutex build_lock;
-    bool building{}, build_done{}, build_linear{}, build_prep{}, build_native{};
+    // Background threads whose result is handed over but which may still be ending. The game's thread never waits for
+    // one to end: a thread's end runs every module's thread detach under the loader lock, and waiting for that inside
+    // the game's frame, with the game's and ReShade's locks held, waits on whatever any other thread of the game does
+    // under the loader lock. Each is joined once it has ended (reap_threads, every call), the rest when the session goes.
+    std::vector<std::thread> ending_threads;
+    void let_end(std::thread& t) {
+        if (t.joinable()) ending_threads.push_back(std::move(t));
+    }
+    // A std::thread's Win32 handle under either of mingw's thread models: win32 (the native handle is the HANDLE; the
+    // x86_64 toolchain) or posix (winpthreads: a pthread_t, whose HANDLE pthread_gethandle gives; the i686 toolchain).
+    static HANDLE os_handle(std::thread& t) {
+#ifdef WIN_PTHREADS_H
+        return static_cast<HANDLE>(pthread_gethandle(t.native_handle()));
+#else
+        return reinterpret_cast<HANDLE>(t.native_handle());
+#endif
+    }
+    void reap_threads() {
+        for (size_t i = ending_threads.size(); i-- > 0;) {
+            std::thread& t = ending_threads[i];
+            const HANDLE h = os_handle(t);
+            if (!h || WaitForSingleObject(h, 0) != WAIT_OBJECT_0) continue;   // still running (or not known: kept)
+            t.join();
+            ending_threads.erase(ending_threads.begin() + long(i));
+        }
+    }
+    bool building{}, build_done{};
+    int build_layer{};   // the NR-chain layer whose call started the build
     std::chrono::steady_clock::time_point build_started{};
     // [Network] Model: the network the switch asks for, the one being built, and the one running (Built::net).
     NetworkSwitch net_switch;
     int net_want{}, build_net{}, running_net{-1};
+    int call_net{-1};   // Session::set_call_network
+    // The network this call wants: an NR-chain layer's own (set_call_network) when the run can serve it,
+    // else [Network] Model (the switch, which also takes the hotkey: called on every call either way).
+    int wanted_network() {
+        const int want = wanted_network_(net_switch.frame(root + "\\dlssnr-amd.ini"));
+        net_users[want][call_layer] = std::chrono::steady_clock::now();
+        return want;
+    }
+    // Which NR-chain layers (Session::set_call_layer) ran each network lately: act_for never gives a network the
+    // activation arena of one another layer still runs (every layer's network its own working memory; a
+    // shared one is zero-filled at every turn).
+    std::map<int, std::map<int, std::chrono::steady_clock::time_point>> net_users;
+    int wanted_network_(int model) {
+        const int layer = call_net;
+        if (layer < 0 || layer >= nr::kNetworkChoices || layer == model) return model;
+        if (net_switch.available(layer)) return layer;
+        if (said_unavailable.insert(layer).second)
+            log("[nr] a layer's network %s cannot run here (%s); it runs %s", nr::network_codename(layer),
+                net_switch.reason(layer).c_str(), nr::network_codename(model));
+        return model;
+    }
+    std::set<int> said_unavailable;
     // What can run in this run, checked once the game's device is known (NetworkSwitch::unavailable).
     bool availability_checked{};
     void check_availability();
-    uint32_t build_passes{kMaxPasses};
     uint32_t build_w{}, build_h{};
     VkFormat build_format{VK_FORMAT_UNDEFINED};
     std::unique_ptr<Runtime> built;
@@ -822,37 +1072,25 @@ struct Session::Impl {
     unsigned oom_failures{};
     static constexpr unsigned kOomRetries = 4;
     std::chrono::steady_clock::time_point retry_at{};
-    bool linear{};
-    float white_point{1.0f};
-    // Model Resolution. A change rebuilds the network, like a resolution change.
-    float model_scale{1.0f}, build_scale{1.0f}, built_scale{1.0f};
-    bool native_compose{};   // Session::set_native_compose
     bool motion_point{};     // Session::set_motion_point
-    // The RenoDX-style option on a route without native compose (the ReShade add-on): its frames ask for the
-    // DLL's own composition too, so the network RenoDX's processing wraps is the same on every route.
-    bool renodx_native{};
-    bool running_native{};   // Built::native of `runtime`
-    uint32_t running_passes{};   // Built::passes of `runtime`
-    bool running_prep{};         // Built::prep of `runtime`
-    // Controls::preprocess was asked for once: from then on every runtime is
-    // built able to run it, so the hotkey switches at once after the first
-    // time. Never cleared; until then nothing about the runtime changes.
-    bool prep_want{};
-    // Every runtime is built able to run this many passes; Controls::passes
-    // picks the count per frame.
-    // What a network is built for unless the host asks for something else
-    // (set_max_passes: one pass is built for one, more for at least four). The
-    // ceiling is 16 and raising it costs one model-sized history image per
-    // pass, which is why it is not simply set there.
-    static constexpr uint32_t kMaxPasses = 4;
-    static constexpr uint32_t kPassCeiling = 16;
-    uint32_t max_passes_want{kMaxPasses};
+    bool keep_caller_state{};   // Session::set_keep_caller_state
+    // One raw-Vulkan recording into the caller's list: through vkd3d-proton's interop begin/end when the caller's
+    // state is to be kept (and it can), else the plain command buffer; leave_list then puts vkd3d's view of the list
+    // right for what comes after.
+    struct Recording {
+        ID3D12Device* device = nullptr;
+        ID3D12GraphicsCommandList* list = nullptr;
+        bool interop = false;
+        ~Recording() { if (interop) end_interop_recording(device, list); }
+    };
+    VkCommandBuffer begin_recording(ID3D12Device* device, ID3D12GraphicsCommandList* list, Recording& rec);
+    void leave_list(ID3D12Device* device, ID3D12GraphicsCommandList* list, const Recording& rec);
     bool ensure_own_command_buffer();
     bool ensure_d3d12_device(ID3D12Device* device);
     bool fits_in_memory(uint32_t w, uint32_t h, bool quiet = false);   // quiet: no log, no status
     // Make `entry` the one the run paths use. Returns false when there is no
     // such entry.
-    bool select_runtime(uint32_t w, uint32_t h, VkFormat format, bool want_linear);
+    bool select_runtime(uint32_t w, uint32_t h, VkFormat format);
     // The running network serves while another builds (an [Int4Mixed] or pass-count switch): it is in use.
     void touch_running() {
         for (auto& e : cache)
@@ -866,14 +1104,18 @@ struct Session::Impl {
     // least recently used entry is evicted (one per call) and false is returned:
     // the frame passes through and the build is asked for again later.
     bool make_room(uint32_t w, uint32_t h);
+    bool last_ok{true};    // the last ensure_runtime ran the network (State::passed)
+    bool said_no_room{};   // make_room: a layer's network waits for room (said once until it gets it)
+    // fits_in_memory's refusals, by extent: noted once, then at most every 10 s (it is asked every evaluate while the
+    // card is full: a stress test, 2723 lines in 900 frames)
+    std::map<uint64_t, std::chrono::steady_clock::time_point> vram_said;
     void drop(size_t index, const char* why = "to make room");
     // Feature ids, handed out by Session::create_feature. Monotonic, never
     // reused, so a stale id can only ever miss.
     uint64_t next_feature{1};
-    // NVIDIA's resize semantics (310.9, measured on an RTX 5090): a
-    // feature evaluated at another extent than its last evaluation is a new feature at that extent - the frame is
-    // byte-identical to the first frame of a feature created there; its history is not read. `resized` says so for
-    // this evaluation (the caller ORs it into the frame's Reset) and remembers the extent.
+    // NVIDIA's resize semantics (310.9 on an RTX 5090): in that fixture, evaluating at another extent matched the first
+    // frame of a newly created feature there. We reset history on a size change based on that measurement. `resized`
+    // says so for this evaluation (the caller ORs it into the frame's Reset) and remembers the extent.
     std::map<uint64_t, std::pair<uint32_t, uint32_t>> feature_extent;
     uint64_t resizes{};
     bool resized(uint64_t feature, uint32_t w, uint32_t h) {
@@ -1123,36 +1365,38 @@ bool Session::Impl::fits_in_memory(uint32_t w, uint32_t h, bool quiet) {
                       "network before the upscaler instead, where the extent is smaller.",
                       need_mb, w, h, free_mb);
         status = message;
-        log("[nr] %s", message);
+        const auto now = std::chrono::steady_clock::now();
+        auto& said = vram_said[uint64_t(w) << 32 | h];
+        if (said == std::chrono::steady_clock::time_point{} || now - said >= std::chrono::seconds(10)) {
+            said = now;
+            events::note(events::kResidency, "%s", message);
+        }
         return false;
     }
+    vram_said.erase(uint64_t(w) << 32 | h);   // (a later refusal is noted at once)
     log("[nr] %ux%u needs about %.0f MB, %.0f MB free", w, h, need_mb, free_mb);
     return true;
 }
 
-bool Session::Impl::select_runtime(uint32_t w, uint32_t h, VkFormat format, bool want_linear) {
+bool Session::Impl::select_runtime(uint32_t w, uint32_t h, VkFormat format) {
     for (auto& e : cache) {
         if (e.runtime->stale()) continue;   // its images belong to a later runtime (dropped by trim_cache)
-        if (e.width != w || e.height != h || e.format != format || e.linear != want_linear ||
-            e.scale != model_scale || e.passes != max_passes_want || e.prep != prep_want ||
-            e.native != (native_compose || renodx_native))
-            continue;
+        if (e.width != w || e.height != h || e.format != format) continue;
         if (e.net != net_want) continue;   // [Network] Model: the network the switch asks for
         e.used = ++use_stamp;
         const auto now = std::chrono::steady_clock::now();
         if (runtime != e.runtime.get()) {
             const bool stale = e.last != std::chrono::steady_clock::time_point{} && now - e.last > kStaleHistory;
             if (stale) e.runtime->forget_history();
-            log("[nr] runtime cache hit: %ux%u (model %ux%u, scale %.2f%s), %u built, "
-                "%u live features%s", e.width, e.height, e.runtime->model_width(),
-                e.runtime->model_height(), e.scale, e.linear ? ", linear" : "",
-                unsigned(cache.size()), e.runtime->live_features(), stale ? ", history started afresh" : "");
+            // Said when a runtime comes back, not on every change: the NR chain's layers take turns every frame.
+            if (e.last == std::chrono::steady_clock::time_point{} || now - e.last > std::chrono::seconds(1))
+                log("[nr] runtime cache hit: %ux%u, %u built, %u live features%s", e.width, e.height,
+                    unsigned(cache.size()), e.runtime->live_features(), stale ? ", history started afresh" : "");
         }
         e.last = now;
+        e.layers[call_layer] = now;
         runtime = e.runtime.get();
         width = e.width; height = e.height; this->format = e.format;
-        linear = e.linear; built_scale = e.scale; running_native = e.native;
-        running_passes = e.passes; running_prep = e.prep;
         running_net = e.net;
         return true;
     }
@@ -1161,7 +1405,7 @@ bool Session::Impl::select_runtime(uint32_t w, uint32_t h, VkFormat format, bool
 
 void Session::Impl::drop(size_t index, const char* why) {
     auto& e = cache[index];
-    log("[nr] evicting the %ux%u network %s", e.width, e.height, why);
+    events::note(events::kResidency, "evicting the %ux%u network %s", e.width, e.height, why);
     if (runtime == e.runtime.get()) { runtime = nullptr; width = height = 0; }
     // Nothing of ours may still be reading it. On the paths that submit for
     // themselves this waits on our own fence; on the paths that record into the
@@ -1175,9 +1419,9 @@ void Session::Impl::drop(size_t index, const char* why) {
 void Session::Impl::free_retired() {
     const auto now = std::chrono::steady_clock::now();
     for (size_t i = retired.size(); i-- > 0;) {
-        if (calls - retired[i].call < kRetireCalls || now - retired[i].at < kRetireTime) continue;
+        if (calls - retired[i].call < kRetireCalls || now - retired[i].at < kRetireTime || !retired[i].runtime->recordings_done()) continue;
         retired.erase(retired.begin() + long(i));
-        log("[nr] evicted network freed");
+        events::note(events::kResidency, "evicted network freed");
     }
 }
 
@@ -1188,6 +1432,7 @@ bool Session::Impl::vram(Vram& v) const {
     if (!handles.physical) return false;
     vkGetPhysicalDeviceMemoryProperties2(handles.physical, &props);
     const auto& mem = props.memoryProperties;
+    nr::vram::memory_types(mem);   // which of our allocations are video memory (NR Control's breakdown)
     v = {};
     for (uint32_t i = 0; i < mem.memoryHeapCount; ++i) {
         if (!(mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) || mem.memoryHeaps[i].size <= v.heap) continue;
@@ -1216,10 +1461,9 @@ void Session::Impl::park(size_t index, const char* why) {
             release_image_heap(*core);
             Parked p;
             p.core = std::move(core);
-            p.format = e.format; p.linear = e.linear; p.scale = e.scale; p.passes = e.passes; p.prep = e.prep;
-            p.native = e.native; p.net = e.net; p.width = e.width; p.height = e.height; p.last = e.last;
+            p.format = e.format; p.net = e.net; p.width = e.width; p.height = e.height; p.last = e.last;
             parked.push_back(std::move(p));
-            log("[nr] %s at %ux%u parked: its weights stay, its runtimes and images go %s", nr::network_codename(e.net),
+            events::note(events::kResidency, "%s at %ux%u parked: its weights stay, its runtimes and images go %s", nr::network_codename(e.net),
                 e.width, e.height, why);
         }
     }
@@ -1261,7 +1505,7 @@ bool Session::Impl::start_offload(Parked& p) {
 
 void Session::Impl::poll_offload() {
     if (!offloading || !offload_done) return;
-    if (offload_thread.joinable()) offload_thread.join();
+    let_end(offload_thread);
     if (offload_ok) {
         release_network(*offloading, std::move(offload_weights));
         offload_ok = network_offloaded(*offloading);
@@ -1269,7 +1513,7 @@ void Session::Impl::poll_offload() {
     offload_weights.clear();
     for (const auto& p : parked)
         if (p.core == offloading)
-            log("[nr] %s at %ux%u: %s", nr::network_codename(p.net), p.width, p.height,
+            events::note(events::kResidency, "%s at %ux%u: %s", nr::network_codename(p.net), p.width, p.height,
                 offload_ok ? "its weights moved to RAM, its video memory freed" : "its weights could not be moved to RAM");
     if (!offload_ok)   // not tried again: freed instead
         for (size_t i = parked.size(); i-- > 0;)
@@ -1277,11 +1521,38 @@ void Session::Impl::poll_offload() {
     offloading.reset();
 }
 
+// What residency() decided, for NR Control (nr_pe_events.hpp): every network held, where it is, the budget and why.
+void Session::Impl::publish_residency(int mode, bool nr_off) {
+    events::Residency r;
+    r.mode = mode;
+    if (Vram v; vram(v)) {
+        r.budget = v.budget; r.usage = v.usage; r.heap = v.heap;
+        r.reserve = std::max<uint64_t>(1ull << 30, v.heap / 10);
+    }
+    for (const auto& e : cache)
+        r.nets.push_back({e.net, e.net == running_net && !nr_off ? 1 : 2, e.width, e.height});
+    for (const auto& p : parked)
+        r.nets.push_back({p.net, p.core == offloading ? 3 : network_offloaded(*p.core) ? 4 : 2, p.width, p.height});
+    if (offloading) {
+        for (const auto& p : parked)
+            if (p.core == offloading) r.status = std::string("moving ") + nr::network_codename(p.net) + "'s weights to RAM";
+    } else if (building) {
+        r.status = std::string("building ") + (build_net >= 0 ? nr::network_codename(build_net) : "a network");
+    }
+    r.reason = residency_why;
+    if (width && height) {   // fits_in_memory's estimate at the serving extent
+        r.need_w = width; r.need_h = height;
+        r.need = uint64_t((width + 63) / 64 * 64) * ((height + 63) / 64 * 64) * arena_bytes_per_pixel() + (300ull << 20);
+    }
+    events::publish(std::move(r));
+}
+
 void Session::Impl::residency(bool switched, bool nr_off) {
     const auto now = std::chrono::steady_clock::now();
     residency_checked = now;
     poll_offload();
     const int mode = net_switch.file().residency;   // 0 auto, 1 resident, 2 offload, 3 minimal
+    struct Publish { Impl* m; int mode; bool nr_off; ~Publish() { m->publish_residency(mode, nr_off); } } publish{this, mode, nr_off};
     // Of another kind and not used for a second: right after a switch the left network may still serve a feature whose
     // new network is not built yet (net_only, touch_running).
     auto inactive = [&](const Built& e) { return nr_off || (e.net != running_net && now - e.last > std::chrono::seconds(1)); };
@@ -1290,7 +1561,7 @@ void Session::Impl::residency(bool switched, bool nr_off) {
         for (size_t i = cache.size(); i-- > 0;)
             if (inactive(cache[i]))
                 drop(i, nr_off ? "(NR off; [Network] Residency frees it)" : "(another network runs; [Network] Residency frees it)");
-        if (!parked.empty() && !offloading) { parked.clear(); log("[nr] parked networks freed ([Network] Residency)"); }
+        if (!parked.empty() && !offloading) { parked.clear(); events::note(events::kResidency, "parked networks freed ([Network] Residency)"); }
         return;
     }
     // offload and auto: a network of another kind is parked at once (its runtimes and images are of no use until it runs
@@ -1305,7 +1576,7 @@ void Session::Impl::residency(bool switched, bool nr_off) {
         if (ram_short() && !parked.empty() && !offloading) {
             size_t lru = 0;
             for (size_t i = 1; i < parked.size(); ++i) if (parked[i].last < parked[lru].last) lru = i;
-            log("[nr] parked %s freed (RAM is short)", nr::network_codename(parked[lru].net));
+            events::note(events::kResidency, "parked %s freed (RAM is short)", nr::network_codename(parked[lru].net));
             parked.erase(parked.begin() + long(lru));
         }
         return;
@@ -1317,6 +1588,7 @@ void Session::Impl::residency(bool switched, bool nr_off) {
     const uint64_t free = v.budget > v.usage ? v.budget - v.usage : 0;
     const double pressure = v.budget ? double(v.usage) / double(v.budget) : 0.0;
     const bool short_now = free < (switched ? reserve + reserve / 2 : reserve);
+    residency_why = short_now ? "remaining budget below the reserve" : pressure > 0.7 ? "video memory over 70 % of the budget: idle networks kept for a shorter time" : "";
     // the keep-alive in video memory of what is not running shrinks as the heap fills (the D3D12 Residency Starter
     // Library's grace period): above 70 % of the budget 60 s, down to 1 s at 100 %
     const double keep = pressure > 0.7 ? 60.0 - 59.0 * std::min(1.0, (pressure - 0.7) / 0.3) : 1e30;
@@ -1334,7 +1606,7 @@ void Session::Impl::residency(bool switched, bool nr_off) {
         for (size_t i = 0; i < parked.size(); ++i)
             if (network_offloaded(*parked[i].core) && (lru == parked.size() || parked[i].last < parked[lru].last)) lru = i;
         if (lru < parked.size()) {
-            log("[nr] %s freed from RAM (RAM is short)", nr::network_codename(parked[lru].net));
+            events::note(events::kResidency, "%s freed from RAM (RAM is short)", nr::network_codename(parked[lru].net));
             parked.erase(parked.begin() + long(lru));
         }
     }
@@ -1350,12 +1622,12 @@ void Session::Impl::residency(bool switched, bool nr_off) {
     if (!short_now && !old) return;
     if (ram_short()) {
         log_state();
-        log("[nr] parked %s at %ux%u freed (%s; RAM is short too)", nr::network_codename(parked[lru].net),
+        events::note(events::kResidency, "parked %s at %ux%u freed (%s; RAM is short too)", nr::network_codename(parked[lru].net),
             parked[lru].width, parked[lru].height, short_now ? "video memory is short" : "video memory is getting full");
         parked.erase(parked.begin() + long(lru));
     } else if (start_offload(parked[lru])) {
         log_state();
-        log("[nr] parked %s at %ux%u: moving its weights to RAM (%s)", nr::network_codename(parked[lru].net),
+        events::note(events::kResidency, "parked %s at %ux%u: moving its weights to RAM (%s)", nr::network_codename(parked[lru].net),
             parked[lru].width, parked[lru].height, short_now ? "video memory is short" : "video memory is getting full");
     } else {
         return;   // still in flight: next check
@@ -1372,6 +1644,14 @@ std::shared_ptr<ActArenaRef> Session::Impl::act_for(int net) const {
     std::set<const void*> busy;
     for (const auto& h : held)
         if (h.net == net && h.act) busy.insert(act_arena_id(*h.act));
+    const auto now = std::chrono::steady_clock::now();
+    for (const auto& h : held) {   // another layer's network
+        if (h.net == net || !h.act) continue;
+        const auto users = net_users.find(h.net);
+        if (users == net_users.end()) continue;
+        for (const auto& [layer, at] : users->second)
+            if (layer != call_layer && now - at < std::chrono::seconds(2)) busy.insert(act_arena_id(*h.act));
+    }
     const auto pref = feature_slot.find(current_feature);
     std::shared_ptr<ActArenaRef> best;
     for (const auto& h : held) {
@@ -1399,7 +1679,7 @@ void Session::Impl::trim_cache(const Built* adopting) {
         };
         for (;;) {
             // This kind's runtimes, and its networks with their latest use.
-            struct Use { uint64_t used{}; std::chrono::steady_clock::time_point last{}; };
+            struct Use { uint64_t used{}; std::chrono::steady_clock::time_point last{}; bool held{}; };
             std::map<const void*, Use> nets;
             size_t entries = 0, oldest = cache.size();
             for (size_t i = 0; i < cache.size(); ++i) {
@@ -1407,6 +1687,7 @@ void Session::Impl::trim_cache(const Built* adopting) {
                 ++entries;
                 Use& u = nets[cache[i].runtime->network_id()];
                 u.used = std::max(u.used, cache[i].used); u.last = std::max(u.last, cache[i].last);
+                u.held |= layer_held(cache[i], now);
                 if (oldest == cache.size() || cache[i].used < cache[oldest].used) oldest = i;
             }
             if (adopting && of_kind(*adopting)) {
@@ -1419,7 +1700,7 @@ void Session::Impl::trim_cache(const Built* adopting) {
             if (nets.size() > 1) {
                 const void* idle = nullptr;
                 for (const auto& [id, u] : nets) {
-                    if (!id || (adopting && id == adopting->runtime->network_id())) continue;
+                    if (!id || (adopting && id == adopting->runtime->network_id()) || u.held) continue;
                     bool referenced = false;
                     for (const auto& fs : feature_slot) referenced |= fs.second == id;
                     if (now - u.last > (referenced ? std::chrono::duration_cast<std::chrono::milliseconds>(kNetIdle) : kIdleDrop)) {
@@ -1435,7 +1716,7 @@ void Session::Impl::trim_cache(const Built* adopting) {
             if (nets.size() > kMaxResident) {
                 const void* victim = nullptr;
                 Use v{~uint64_t(0), {}};
-                for (const auto& [id, u] : nets) if (u.used < v.used) { v = u; victim = id; }
+                for (const auto& [id, u] : nets) if (!u.held && u.used < v.used) { v = u; victim = id; }
                 if (!victim || now - v.last < kIdleDrop) break;
                 for (size_t i = cache.size(); i-- > 0;)
                     if (of_kind(cache[i]) && cache[i].runtime->network_id() == victim)
@@ -1453,11 +1734,30 @@ void Session::Impl::trim_cache(const Built* adopting) {
 }
 
 bool Session::Impl::make_room(uint32_t w, uint32_t h) {
-    if (fits_in_memory(w, h)) return true;
+    if (fits_in_memory(w, h, said_no_room)) return true;   // (quiet while a layer already waits for room)
     if (cache.empty()) return false;
-    size_t oldest = 0;
-    for (size_t i = 1; i < cache.size(); ++i)
-        if (cache[i].used < cache[oldest].used) oldest = i;
+    // Never a network another NR-chain layer is running: with two layers on two networks that do not both fit, each
+    // layer's build evicted the other's network every few frames and NR went on and off for good. The layer whose
+    // network does not fit waits (it passes its frame through, said once) until memory frees.
+    const auto now = std::chrono::steady_clock::now();
+    const auto other_layer = [&](const Built& b) {
+        if (!chain_active(now)) return false;
+        for (const auto& [layer, at] : b.layers)
+            if (layer != call_layer && now - at < kNetIdle) return true;
+        return false;
+    };
+    size_t oldest = cache.size();
+    for (size_t i = 0; i < cache.size(); ++i)
+        if (!other_layer(cache[i]) && (oldest == cache.size() || cache[i].used < cache[oldest].used)) oldest = i;
+    if (oldest == cache.size()) {
+        status = "not enough video memory for this layer's network beside the other layers' (it waits for room)";
+        if (!said_no_room) {
+            said_no_room = true;
+            log("[nr] NR-chain layer %d: %s", call_layer, status.c_str());
+        }
+        return false;
+    }
+    said_no_room = false;
     // One at a time: an evicted network keeps its memory until it is freed (see Retired), and the build is asked
     // for again once it has been.
     drop(oldest);
@@ -1465,11 +1765,11 @@ bool Session::Impl::make_room(uint32_t w, uint32_t h) {
     return false;
 }
 
-bool Session::Impl::ensure_runtime(const Controls& controls, uint32_t w, uint32_t h, VkFormat format,
-                                   bool want_linear) {
-    const bool ok = ensure_runtime_(controls, w, h, format, want_linear);
+bool Session::Impl::ensure_runtime(const Controls& controls, uint32_t w, uint32_t h, VkFormat format) {
+    const bool ok = ensure_runtime_(controls, w, h, format);
     ++(ok ? ran : passed);
-    last_w = w; last_h = h; last_format = format; last_linear = want_linear;
+    last_ok = ok;
+    last_w = w; last_h = h; last_format = format;
     if (ok && runtime) {
         runtime->set_style_grade(net_switch.file().style_grade);   // [Network] Style Grade, live
         feature_slot[current_feature] = runtime->network_id();
@@ -1482,7 +1782,9 @@ bool Session::Impl::ensure_runtime(const Controls& controls, uint32_t w, uint32_
         const auto now = std::chrono::steady_clock::now();
         if (pass_logged == std::chrono::steady_clock::time_point{}) pass_logged = now;
         if (now - pass_logged >= kPassLog) {
-            if (passed)
+            // every 10 s with NR asked for: a log that shows NR running as well as not (the OptiScaler route has no
+            // frame line of its own)
+            if (passed || ran)
                 log("[nr] last %.0f s: %llu evaluations ran the network, %llu passed the frame through (%s)",
                     std::chrono::duration<double>(now - pass_logged).count(), (unsigned long long)ran,
                     (unsigned long long)passed, ok ? "running now" : status.c_str());
@@ -1490,45 +1792,32 @@ bool Session::Impl::ensure_runtime(const Controls& controls, uint32_t w, uint32_
             pass_logged = now;
         }
     }
-    if (ok && controls.preprocess.active() && controls.preprocess.exposure == 1) {
-        const auto now = std::chrono::steady_clock::now();
-        const auto m = runtime->preprocess_meter();
-        if (now - meter_logged > std::chrono::seconds(5) && m.first == m.first) {
-            meter_logged = now;
-            const float bias = controls.preprocess.bias_ev;
-            log("[nr] preprocess exposure: auto %+.2f EV (this frame asks %+.2f) + ExposureBias %+.2f = %+.2f EV",
-                m.first, m.second, bias, m.first + bias);
-        }
-    }
     return ok;
 }
 
-bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32_t h, VkFormat format,
-                                    bool want_linear) {
+bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32_t h, VkFormat format) {
     ++calls;
     last_call = std::chrono::steady_clock::now();
+    layer_seen[call_layer] = last_call;
+    if (!ending_threads.empty()) reap_threads();
     if (last_call - residency_checked >= kResidencyCheck) residency(false, false);
     if (!retired.empty()) free_retired();
     if (cache.size() > kMaxResident) trim_cache();
-    if (controls.preprocess.active() && !prep_want) {
-        prep_want = true;
-        log("[nr] preprocess asked for: networks are rebuilt able to run it (once)");
-    }
     if (!availability_checked) check_availability();
-    net_want = net_switch.frame(root + "\\dlssnr-amd.ini");
+    net_want = wanted_network();
     // Adopt a finished background build first.
     {
+        nr::pe::watchdog::Phase phase("adopting a finished network build (build lock)");
         std::lock_guard<std::mutex> guard(build_lock);
         if (build_done) {
-            if (build_thread.joinable()) build_thread.join();
+            let_end(build_thread);
             build_done = false; building = false;
             if (build_plan) {
                 // A plan (RuntimeConfig::plan_only): cached; its runtimes are built inside the frames that ask.
                 build_plan = false;
                 if (built && built->plan()) {
                     PlanEntry pe;
-                    pe.format = build_format; pe.linear = build_linear; pe.scale = build_scale; pe.passes = build_passes;
-                    pe.prep = build_prep; pe.native = build_native;
+                    pe.format = build_format;
                     pe.net = net_of(*built);
                     pe.core = built->plan();
                     plan_extent(*pe.core, &pe.ww, &pe.wh, &pe.sh);
@@ -1551,64 +1840,28 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
             } else if (built) {
                 Built entry;
                 entry.width = build_w; entry.height = build_h; entry.format = build_format;
-                entry.linear = build_linear; entry.scale = build_scale;
-                entry.passes = build_passes; entry.prep = build_prep; entry.native = build_native;
                 // what was built, not what was asked: a network without what it needs is another one (the runtime
                 // says why); the one asked for is not asked again this run
                 entry.net = net_of(*built);
                 if (entry.net != build_net) {
                     net_switch.unavailable(build_net, built->network_note().empty() ? "could not be built (see dlssnr-amd.log)"
                                                                                     : built->network_note());
-                    net_want = net_switch.frame(root + "\\dlssnr-amd.ini");
+                    net_want = wanted_network();
                 }
                 entry.used = ++use_stamp;
                 entry.last = std::chrono::steady_clock::now();
                 entry.runtime = std::move(built);
-                // The pass count went back while this one built, and the running network is the one wanted again:
-                // this one is not wanted; the running one keeps serving.
-                const bool unwanted = entry.passes != max_passes_want && runtime && running_passes == max_passes_want &&
-                                      width == entry.width && height == entry.height && this->format == entry.format;
-                if (unwanted) {
-                    log("[nr] the network built for %u passes is not wanted any more (the pass count changed back)",
-                        entry.passes);
-                    retired.push_back({std::move(entry.runtime), calls, std::chrono::steady_clock::now()});
-                } else {
-                log("[nr] network built at %ux%u (model %ux%u, scale %.2f) on queue family %u in "
-                    "%.1f s%s; %u networks resident",
-                    entry.width, entry.height, entry.runtime->model_width(),
-                    entry.runtime->model_height(), entry.scale, access.family, build_seconds,
-                    entry.linear ? "; the colour is linear light and is encoded for the network" : "",
-                    unsigned(cache.size() + 1));
-                // A network built without the preprocess at this extent is
-                // never selected again; its memory goes now. Its last frame
-                // was before this build started, a second or more ago.
-                for (size_t i = cache.size(); i-- > 0;)
-                    if (entry.prep && !cache[i].prep && cache[i].width == entry.width &&
-                        cache[i].height == entry.height)
-                        drop(i, "built without the preprocess");
-                // A change of pass count: the network built for the other count served until now and keeps no
-                // memory once this one is in.
-                for (size_t i = cache.size(); i-- > 0;)
-                    if (cache[i].passes != entry.passes && cache[i].width == entry.width &&
-                        cache[i].height == entry.height && cache[i].format == entry.format &&
-                        cache[i].linear == entry.linear && cache[i].scale == entry.scale &&
-                        cache[i].prep == entry.prep && cache[i].native == entry.native)
-                        drop(i, "(built for another pass count)");
-                // Model resolution is one value for the whole session: a network built for another one can never
-                // be selected again unless the setting goes back, and kept, every value tried stayed resident
-                // (ReShade route, 1080p, 100% -> 50% in steps: 6 networks, 865 -> 3288 MiB).
-                for (size_t i = cache.size(); i-- > 0;)
-                    if (cache[i].scale != entry.scale) drop(i, "(built for another model resolution)");
+                events::note(events::kNetwork, "network built at %ux%u on queue family %u in %.1f s; %u networks resident", entry.width,
+                    entry.height, access.family, build_seconds, unsigned(cache.size() + 1));
                 trim_cache(&entry);
                 cache.push_back(std::move(entry));
                 auto& adopted = cache.back();
+                adopted.layers[build_layer] = std::chrono::steady_clock::now();
                 // a parked network in use again: its runtime holds it now
                 for (size_t i = parked.size(); i-- > 0;)
                     if (core_network(*parked[i].core) == adopted.runtime->network_id()) parked.erase(parked.begin() + long(i));
                 runtime = adopted.runtime.get();
                 width = adopted.width; height = adopted.height; this->format = adopted.format;
-                linear = adopted.linear; built_scale = adopted.scale; running_native = adopted.native;
-                running_passes = adopted.passes; running_prep = adopted.prep;
                 running_net = adopted.net;
                 // A network switch: what happens to the networks it left ([Network] Residency)
                 residency(true, false);
@@ -1616,7 +1869,6 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
                     log("[nr] %s serving; %zu runtimes, %zu parked; this process's video memory %.0f MiB (budget %.0f MiB)",
                         nr::network_codename(running_net), cache.size(), parked.size(), double(v.usage) / (1 << 20),
                         double(v.budget) / (1 << 20));
-                }
                 oom_failures = 0;
                 retry_at = {};
             } else {
@@ -1625,7 +1877,7 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
                     if (build_share && parked[i].core == build_share) parked.erase(parked.begin() + long(i));
                 build_share.reset();
                 status = build_error;
-                log("[nr] %s", status.c_str());
+                events::note(events::kNetwork, "%s", status.c_str());
                 if (build_oom && oom_failures < kOomRetries) {
                     // 4, 8, 16, 32 seconds. Long enough that the load or the
                     // resolution change that took the address space has
@@ -1634,7 +1886,7 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
                     const unsigned wait = 4u << oom_failures;
                     ++oom_failures;
                     retry_at = std::chrono::steady_clock::now() + std::chrono::seconds(wait);
-                    log("[nr] retrying the build in %u s (attempt %u of %u)", wait, oom_failures,
+                    events::note(events::kNetwork, "retrying the build in %u s (attempt %u of %u)", wait, oom_failures,
                         kOomRetries);
                 } else {
                     failed = true;
@@ -1643,32 +1895,33 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
             }
         }
     }
-    if (select_runtime(w, h, format, want_linear)) return true;
+    if (select_runtime(w, h, format)) return true;
     // The resize path: a new frame size from a resident network or a cached plan, inside this recording.
     std::shared_ptr<const RuntimeCore> tried;
     inframe_waiting = false;
-    if (inframe(w, h, format, want_linear, &tried)) return true;
+    if (inframe(w, h, format, &tried)) { inframe_wait_since = {}; return true; }
     if (inframe_waiting) {
-        status = "making memory for the game's changing frame size; frames pass through until it is ready";
-        return false;
+        const auto now = std::chrono::steady_clock::now();
+        if (inframe_wait_since == std::chrono::steady_clock::time_point{}) inframe_wait_since = now;
+        if (now - inframe_wait_since < kHeapWait) {
+            status = "making memory for the game's changing frame size; frames pass through until it is ready";
+            return false;
+        }
+        static bool said = false;
+        if (!said) {
+            said = true;
+            log("[nr] %ux%u: no image heap for it after %lld s; built in the background instead", w, h,
+                (long long)kHeapWait.count());
+        }
+    } else {
+        inframe_wait_since = {};
     }
     // A network switch: the running network keeps serving its frames while the other one builds, so the
     // comparison has no gap but the build itself (the first int4 build also compiles its pipelines).
     const bool net_only = runtime && running_net >= 0 && running_net != net_want && width == w && height == h &&
-                           this->format == format && linear == want_linear && built_scale == model_scale &&
-                           running_native == (native_compose || renodx_native);
-    // A change of pass count (set_max_passes): the running network serves, at most at the passes it was built for,
-    // while the one for the new count builds.
-    static constexpr const char* kPassesServing =
-        "building the network for the new pass count in the background; the running one serves until it is ready";
-    const bool passes_only = runtime && running_passes != max_passes_want && width == w && height == h &&
-                             this->format == format && linear == want_linear && built_scale == model_scale &&
-                             running_native == (native_compose || renodx_native) && running_prep == prep_want
-                             && running_net == net_want
-        ;
+                           this->format == format;
     if (building) {
         if (net_only) { touch_running(); return true; }
-        if (passes_only) { touch_running(); status = kPassesServing; return true; }
         status = "building the network in the background; frames pass through until it is ready";
         return false;
     }
@@ -1699,7 +1952,7 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
     std::shared_ptr<const RuntimeCore> share = tried;
     for (const auto& e : cache) {
         if (share) break;
-        if (!same_config(e, format, want_linear) || e.runtime->stale()) continue;
+        if (!same_config(e, format) || e.runtime->stale()) continue;
         if ((share = e.runtime->share_for(w, h)))
             log("[nr] %ux%u has the working extent of the %ux%u network: built from it", w, h, e.width, e.height);
     }
@@ -1708,9 +1961,7 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
     poll_offload();
     for (const auto& p : parked) {
         if (share) break;
-        if (p.net != net_want || p.format != format || p.linear != want_linear || p.scale != model_scale ||
-            p.passes != max_passes_want || p.prep != prep_want || p.native != (native_compose || renodx_native) ||
-            !core_runs(*p.core, w, h, model_scale, native_compose || renodx_native))
+        if (p.net != net_want || p.format != format || !core_runs(*p.core, w, h))
             continue;
         if (p.core == offloading) {   // its weights are on their way to RAM: built from them once they are there
             if (net_only) { touch_running(); return true; }
@@ -1722,9 +1973,8 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
     }
     // A frame size of a working extent no plan covers yet, with a resident network of this configuration: the plan in
     // the background (no device memory, ~0.15 s), then its runtimes inside the frames (inframe).
-    if (!share && start_plan(w, h, format, want_linear)) {
+    if (!share && start_plan(w, h, format)) {
         if (net_only) { touch_running(); return true; }
-        if (passes_only) { touch_running(); status = kPassesServing; return true; }
         status = "building the plan for this frame size in the background; frames pass through until it is ready";
         return false;
     }
@@ -1734,23 +1984,21 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
     bool have_network = false;
     const Built* any_net = nullptr;
     for (const auto& e : cache)
-        if (same_config(e, format, want_linear) && !e.runtime->stale()) { have_network = true; any_net = &e; break; }
-    const bool capacity_miss = any_net && plan_for(w, h, format, want_linear, any_net->runtime->network()) != nullptr;
+        if (same_config(e, format) && !e.runtime->stale()) { have_network = true; any_net = &e; break; }
+    const bool capacity_miss = any_net && plan_for(w, h, format, any_net->runtime->network()) != nullptr;
     if (!share && have_network && !capacity_miss && !settled(w, h)) {
         if (net_only) { touch_running(); return true; }
-        if (passes_only) { touch_running(); status = kPassesServing; return true; }
         status = "the frame's size is changing; the network is built once it holds";
         return false;
     }
     if (!share && !retired.empty() && !fits_in_memory(w, h, true)) {
         if (net_only) { touch_running(); return true; }
-        if (passes_only) { touch_running(); status = kPassesServing; return true; }
         status = "freeing the previous network before building another";
         return false;
     }
     // a parked network whose weights are in RAM needs room too (the weights, perhaps an arena)
     if ((!share || network_offloaded(*share)) && !make_room(w, h)) return false;
-    RuntimeConfig config = make_config(w, h, format, want_linear);
+    RuntimeConfig config = make_config(w, h, format);
     config.share = share;
     // the activation arena: a whole build's own or another kind's; a parked network moved to RAM gets one back too
     if (!share || network_offloaded(*share)) { config.act_arena = act_for(net_want); config.act_slack = kActSlack; }
@@ -1762,7 +2010,6 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
         if (size_hint_px > uint64_t(px * 1.02)) config.capacity = std::min(4.0, double(size_hint_px) / px * 1.02);
         else if (capacity_miss || drs_active()) config.capacity = kDrsCapacity;
     }
-    const bool native = config.native_compose;
     const TemporalConfig temporal = make_temporal();
     const HostDevice host = make_host();
     // Off the render thread. Building reads the weights, creates every pipeline
@@ -1774,16 +2021,16 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
     const QueueAccess access_copy = access;
     build_share.reset();
     for (const auto& p : parked) if (p.core == share) build_share = share;
-    building = true; build_w = w; build_h = h; build_format = format; build_linear = want_linear;
+    building = true; build_w = w; build_h = h; build_format = format;
     build_started = std::chrono::steady_clock::now();
     nr::g_build_stage = 1; nr::g_build_pipes_done = 0; nr::g_build_pipes_total = 0;
-    build_scale = model_scale; build_passes = max_passes_want; build_prep = prep_want; build_native = native;
+    build_layer = call_layer;
     build_net = net_want;
     status = "building the network in the background; frames pass through until it is ready";
-    log("[nr] network asked for: %s", nr::network_codename(net_want));
-    log("[nr] building the network at %ux%u (model scale %.2f) in the background%s", w, h, model_scale,
-        want_linear ? " (linear-light colour: encoding with a white point, see dlssnr-amd.ini white_point)" : "");
+    events::note(events::kNetwork, "network asked for: %s", nr::network_codename(net_want));
+    events::note(events::kNetwork, "building the network at %ux%u in the background", w, h);
     build_thread = std::thread([this, host, config, temporal, access_copy] {
+        nr::pe::watchdog::Phase phase("building the network (background)");
         const auto t0 = std::chrono::steady_clock::now();
         std::unique_ptr<Runtime> made;
         std::string error;
@@ -1796,12 +2043,15 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
             // (an 8.4 s frame). **Quiet**: this is not the render thread, and
             // the flush half of the other lock drives DXVK's immediate context,
             // which that thread owns. See QueueAccess::lock_quiet.
+            if (test_fault("net_build")) throw std::runtime_error("NR_TEST_FAULT net_build");
+            if (test_fault("net_oom")) throw std::bad_alloc();   // (the retried kind: 4, 8, 16, 32 s)
             HostDevice locked = host;
             locked.queue_lock = access_copy.lock_quiet;
             locked.queue_unlock = access_copy.unlock_quiet;
             // a parked network whose weights went to RAM (Residency offload): back first
             if (config.share && network_offloaded(*config.share)) {
                 const auto r0 = std::chrono::steady_clock::now();
+                nr::vram::Scope owner(nr::vram::kUnset, config_net(config));
                 if (!reload_network(locked, *config.share, config.act_arena, config.act_slack))
                     throw std::runtime_error("the network's weights could not be brought back from RAM");
                 log("[nr] network weights back from RAM in %.0f ms",
@@ -1810,7 +2060,10 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
 #if NR_INT4
             try {   // an int4 mixed build that fails (its weights file damaged, from other data...) gives the default one
 #endif
-            made = std::make_unique<Runtime>(locked, config, ControlMaskConfig{}, temporal);
+            made = [&] {   // its memory under its network in NR Control's VRAM breakdown
+                nr::vram::Scope owner(nr::vram::kUnset, config_net(config));
+                return std::make_unique<Runtime>(locked, config, ControlMaskConfig{}, temporal);
+            }();
 #if NR_INT4
             } catch (const std::bad_alloc&) {
                 throw;   // host memory: the whole build is retried later, int4 mixed still requested
@@ -1819,7 +2072,10 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
                 log("[nr] int4 mixed network failed: %s; building the default network", e.what());
                 RuntimeConfig fallback = config;
                 fallback.int4_mixed = 0;
-                made = std::make_unique<Runtime>(locked, fallback, ControlMaskConfig{}, temporal);
+                made = [&] {   // its memory under its network in NR Control's VRAM breakdown
+                nr::vram::Scope owner(nr::vram::kUnset, config_net(fallback));
+                return std::make_unique<Runtime>(locked, fallback, ControlMaskConfig{}, temporal);
+            }();
             }
 #endif
         } catch (const std::bad_alloc& e) {
@@ -1841,34 +2097,18 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
         build_oom = oom;
     });
     if (net_only && runtime != nullptr) { touch_running(); return true; }   // a network switch: the running one serves until the new one is in
-    if (passes_only && runtime != nullptr) {   // a change of pass count, the same
-        touch_running();
-        status = kPassesServing;
-        return true;
-    }
     return false;
 }
 
-RuntimeConfig Session::Impl::make_config(uint32_t w, uint32_t h, VkFormat f, bool want_linear) const {
+RuntimeConfig Session::Impl::make_config(uint32_t w, uint32_t h, VkFormat f) const {
     RuntimeConfig config;
     config.root = root; config.width = w; config.height = h; config.colour_format = f;
-    config.linear_input = want_linear; config.white_point = white_point;
-    config.model_scale = model_scale;
-    const bool native = native_compose || renodx_native;
-    config.max_passes = native ? 1u : max_passes_want;
-    config.native_compose = native;
     config.motion_point = motion_point;
-    config.preprocess = prep_want;
-    config.network = net_want == nr::kSmallFp8 ? 1 : 0;   // RuntimeConfig::network: 1 the small model, 0 the 310.8 one
+    // RuntimeConfig::network: 1 the small model, 2 CC_SMALL_FP8_EXPERIMENTAL, 0 the 310.8 one
+    config.network = net_want == nr::kSmallFp8 ? 1 : net_want == nr::kSmallFp8Experimental ? 2 : 0;
 #if NR_INT4
     config.int4_mixed = net_want == nr::kSilverAardwoldInt4 ? 1 : 0;
 #endif
-    // The soft knee to undo: the linear path's own encode, or OptiScaler's
-    // linear-HDR encode, which a float proxy on the OptiScaler route came
-    // through (OptiScaler encodes a float colour flagged IsHDR or AutoExposure
-    // and hands an SDR one over as it is, and only the format reaches us).
-    config.preprocess_unknee = want_linear || (native && is_linear_format(f));
-    if (native) config.model_scale = 1.0f;   // the DLL has no resample; OptiScaler scales outside
     return config;
 }
 
@@ -1883,16 +2123,12 @@ HostDevice Session::Impl::make_host() const {
 }
 
 // The cached plan that runs a frame of w x h: its working extent, tall enough. Null: none yet.
-const Session::Impl::PlanEntry* Session::Impl::plan_for(uint32_t w, uint32_t h, VkFormat f, bool want_linear,
-                                                        NetworkModel model) {
-    const bool native = native_compose || renodx_native;
+const Session::Impl::PlanEntry* Session::Impl::plan_for(uint32_t w, uint32_t h, VkFormat f, NetworkModel model) {
     uint32_t ww = 0, wh = 0;
     bool known = false;
     for (auto& p : plans) {
-        if (p.format != f || p.linear != want_linear || p.scale != model_scale || p.passes != max_passes_want ||
-            p.prep != prep_want || p.native != native || p.net != net_want || h > p.sh)
-            continue;
-        if (!known) { working_extent(model, native ? 1.0f : model_scale, w, h, &ww, &wh); known = true; }
+        if (p.format != f || p.net != net_want || h > p.sh) continue;
+        if (!known) { working_extent(model, 1.0f, w, h, &ww, &wh); known = true; }
         if (p.ww == ww && p.wh == wh) { p.used = ++use_stamp; return &p; }
     }
     return nullptr;
@@ -1902,19 +2138,16 @@ const Session::Impl::PlanEntry* Session::Impl::plan_for(uint32_t w, uint32_t h, 
 // network of its working extent (Runtime::share_for) or from a cached plan in a resident network's memory
 // (Runtime::with_slot_of) - the memory least recently used first, so OptiScaler's NR before and after the upscaler
 // keep a memory each. False: nothing fits; the caller builds in the background.
-bool Session::Impl::inframe(uint32_t w, uint32_t h, VkFormat f, bool want_linear,
-                           std::shared_ptr<const RuntimeCore>* tried) {
-    const bool native = native_compose || renodx_native;
-    if (!native && model_scale != 1.0f) return false;   // Model Resolution below 100% submits at construction
+bool Session::Impl::inframe(uint32_t w, uint32_t h, VkFormat f, std::shared_ptr<const RuntimeCore>* tried) {
     // This configuration's resident networks, least recently used first.
     std::vector<Built*> nets;
     for (auto& e : cache)
-        if (same_config(e, f, want_linear) && !e.runtime->stale()) nets.push_back(&e);
+        if (same_config(e, f) && !e.runtime->stale()) nets.push_back(&e);
     // none for this colour format: a network of another format serves it (the runtime checks it can - the format only
     // sizes its images), as a game switching its colour buffer's format at a camera cut asks
     if (nets.empty())
         for (auto& e : cache)
-            if (e.format != f && same_config_but_format(e, want_linear) && !e.runtime->stale()) nets.push_back(&e);
+            if (e.format != f && same_config_but_format(e) && !e.runtime->stale()) nets.push_back(&e);
     if (nets.empty()) return false;
     // The memory this feature ran in last first, then the least recently used.
     const auto pref = feature_slot.find(current_feature);
@@ -1924,12 +2157,13 @@ bool Session::Impl::inframe(uint32_t w, uint32_t h, VkFormat f, bool want_linear
         return pa != pb ? pa : a->used < b->used;
     });
     std::shared_ptr<const RuntimeCore> core;
+    Built* memory = nullptr;   // the resident network whose memory `core` runs in
     for (Built* e : nets)
-        if ((core = e->runtime->share_for(w, h))) break;
+        if ((core = e->runtime->share_for(w, h))) { memory = e; break; }
     if (!core)
-        if (const PlanEntry* p = plan_for(w, h, f, want_linear, nets.front()->runtime->network()))
+        if (const PlanEntry* p = plan_for(w, h, f, nets.front()->runtime->network()))
             for (Built* e : nets)
-                if ((core = e->runtime->with_slot_of(p->core))) break;
+                if ((core = e->runtime->with_slot_of(p->core))) { memory = e; break; }
     if (!core) return false;
     // No heap in that memory yet: a couple of runtimes may take memory of their own meanwhile; then the frames pass
     // through until the heap is made (heap_poll), rather than each new size holding its images until retired.
@@ -1937,17 +2171,27 @@ bool Session::Impl::inframe(uint32_t w, uint32_t h, VkFormat f, bool want_linear
         size_t own = 0;
         for (const auto& c : cache) own += c.light && c.runtime->owns_image_memory();
         for (const auto& r : retired) own += r.runtime && r.runtime->owns_image_memory();
-        if (own >= kOwnImages) { inframe_waiting = true; return false; }
+        if (own >= kOwnImages) {
+            inframe_waiting = true;
+            heap_ask = memory->runtime->network_id();
+            return false;
+        }
     }
-    RuntimeConfig config = make_config(w, h, f, want_linear);
+    RuntimeConfig config = make_config(w, h, f);
     config.share = core;
     config.deferred = true;
     std::unique_ptr<Runtime> made;
     const auto t0 = std::chrono::steady_clock::now();
     try {
-        made = std::make_unique<Runtime>(make_host(), config, ControlMaskConfig{}, make_temporal());
+        made = [&] {   // its memory under its network in NR Control's VRAM breakdown
+                nr::vram::Scope owner(nr::vram::kUnset, config_net(config));
+                return std::make_unique<Runtime>(make_host(), config, ControlMaskConfig{}, make_temporal());
+            }();
     } catch (const std::exception& e) {
-        log("[nr] %ux%u could not be built inside the frame (%s); building it in the background", w, h, e.what());
+        // once per extent, format and reason: the frames ask again until the background build is there
+        static std::set<std::string> said;
+        if (said.insert(std::to_string(w) + "x" + std::to_string(h) + ":" + std::to_string(int(f)) + ":" + e.what()).second)
+            log("[nr] %ux%u could not be built inside the frame (%s); building it in the background", w, h, e.what());
         *tried = core;
         return false;
     }
@@ -1957,8 +2201,7 @@ bool Session::Impl::inframe(uint32_t w, uint32_t h, VkFormat f, bool want_linear
         log("[nr] %ux%u: runtime built inside the frame in %.2f ms (%llu so far, slowest %.2f ms)%s", w, h, ms,
             (unsigned long long)inframe_built, inframe_ms_max, inframe_built == 8 ? "; logged every 100th from here" : "");
     Built entry;
-    entry.width = w; entry.height = h; entry.format = f; entry.linear = want_linear; entry.scale = model_scale;
-    entry.passes = max_passes_want; entry.prep = prep_want; entry.native = native;
+    entry.width = w; entry.height = h; entry.format = f;
     entry.net = net_of(*made);
     entry.used = ++use_stamp;
     entry.last = std::chrono::steady_clock::now();
@@ -1969,28 +2212,24 @@ bool Session::Impl::inframe(uint32_t w, uint32_t h, VkFormat f, bool want_linear
     auto& adopted = cache.back();
     runtime = adopted.runtime.get();
     width = adopted.width; height = adopted.height; this->format = adopted.format;
-    linear = adopted.linear; built_scale = adopted.scale; running_native = adopted.native;
-    running_passes = adopted.passes; running_prep = adopted.prep;
     running_net = adopted.net;
     return true;
 }
 
-bool Session::Impl::start_plan(uint32_t w, uint32_t h, VkFormat f, bool want_linear) {
-    const bool native = native_compose || renodx_native;
-    if (!native && model_scale != 1.0f) return false;
+bool Session::Impl::start_plan(uint32_t w, uint32_t h, VkFormat f) {
     const Built* net = nullptr;
     for (const auto& e : cache)
-        if (same_config(e, f, want_linear) && !e.runtime->stale()) { net = &e; break; }
+        if (same_config(e, f) && !e.runtime->stale()) { net = &e; break; }
     if (!net) return false;
     const NetworkModel model = net->runtime->network();
-    if (plan_for(w, h, f, want_linear, model)) return false;   // there is one: no memory holds it (a whole build)
-    RuntimeConfig config = make_config(w, h, f, want_linear);
+    if (plan_for(w, h, f, model)) return false;   // there is one: no memory holds it (a whole build)
+    RuntimeConfig config = make_config(w, h, f);
     config.plan_only = true;
     const TemporalConfig temporal = make_temporal();
     const HostDevice host = make_host();
     building = true; build_plan = true;
-    build_w = w; build_h = h; build_format = f; build_linear = want_linear;
-    build_scale = model_scale; build_passes = max_passes_want; build_prep = prep_want; build_native = native;
+    build_w = w; build_h = h; build_format = f;
+    build_layer = call_layer;
     build_net = net_want;
     build_started = std::chrono::steady_clock::now();
     build_thread = std::thread([this, host, config, temporal, model]() mutable {
@@ -1999,9 +2238,11 @@ bool Session::Impl::start_plan(uint32_t w, uint32_t h, VkFormat f, bool want_lin
         std::string error;
         try {
             // lowered at the tallest frame of this working extent: it runs every height of it
-            config.height = plan_height(model, config.native_compose ? 1.0f : config.model_scale, config.width,
-                                        config.height);
-            made = std::make_unique<Runtime>(host, config, ControlMaskConfig{}, temporal);
+            config.height = plan_height(model, 1.0f, config.width, config.height);
+            made = [&] {   // its memory under its network in NR Control's VRAM breakdown
+                nr::vram::Scope owner(nr::vram::kUnset, config_net(config));
+                return std::make_unique<Runtime>(host, config, ControlMaskConfig{}, temporal);
+            }();
         } catch (const std::exception& e) {
             error = e.what();
         }
@@ -2013,32 +2254,29 @@ bool Session::Impl::start_plan(uint32_t w, uint32_t h, VkFormat f, bool want_lin
 }
 
 void Session::Impl::prefetch() {
-    const bool native = native_compose || renodx_native;
-    if (!native && model_scale != 1.0f) return;
     if (prefetched_around == std::make_pair(last_w, last_h)) return;
     const Built* net = nullptr;
     for (const auto& e : cache)
-        if (same_config(e, last_format, last_linear) && !e.runtime->stale()) { net = &e; break; }
+        if (same_config(e, last_format) && !e.runtime->stale()) { net = &e; break; }
     if (!net || plans.size() >= kMaxPlans) return;
     // The working extents planned already for this configuration.
     std::vector<std::pair<uint32_t, uint32_t>> covered;
     for (const auto& p : plans)
-        if (p.format == last_format && p.linear == last_linear && p.scale == model_scale && p.passes == max_passes_want &&
-            p.prep == prep_want && p.native == native && p.net == net_want)
+        if (p.format == last_format && p.net == net_want)
             covered.push_back({p.ww, p.wh});
     for (const auto& e : cache)
-        if (same_config(e, last_format, last_linear)) {
+        if (same_config(e, last_format)) {
             uint32_t ww = 0, wh = 0;
             if (const auto c = e.runtime->plan()) { uint32_t sh = 0; plan_extent(*c, &ww, &wh, &sh); covered.push_back({ww, wh}); }
         }
     const NetworkModel model = net->runtime->network();
-    RuntimeConfig config = make_config(last_w, last_h, last_format, last_linear);
+    RuntimeConfig config = make_config(last_w, last_h, last_format);
     config.plan_only = true;
     const TemporalConfig temporal = make_temporal();
     const HostDevice host = make_host();
     building = true; build_plan = true;
-    build_w = last_w; build_h = last_h; build_format = last_format; build_linear = last_linear;
-    build_scale = model_scale; build_passes = max_passes_want; build_prep = prep_want; build_native = native;
+    build_w = last_w; build_h = last_h; build_format = last_format;
+    build_layer = call_layer;
     build_net = net_want;
     build_started = std::chrono::steady_clock::now();
     const std::pair<uint32_t, uint32_t> around{last_w, last_h};
@@ -2048,7 +2286,7 @@ void Session::Impl::prefetch() {
         std::string error;
         try {
             // The nearest working extent not planned, along the frame's aspect, within half to one and a half its size.
-            const float scale = config.native_compose ? 1.0f : config.model_scale;
+            const float scale = 1.0f;
             const double aspect = double(around.first) / double(around.second);
             for (uint32_t step = 8; step <= around.second / 2 && !made; step += 8)
                 for (int sign : {-1, 1}) {
@@ -2060,7 +2298,10 @@ void Session::Impl::prefetch() {
                     if (std::find(covered.begin(), covered.end(), std::make_pair(ww, wh)) != covered.end()) continue;
                     config.width = cw;
                     config.height = plan_height(model, scale, cw, ch);
-                    made = std::make_unique<Runtime>(host, config, ControlMaskConfig{}, temporal);
+                    made = [&] {   // its memory under its network in NR Control's VRAM breakdown
+                nr::vram::Scope owner(nr::vram::kUnset, config_net(config));
+                return std::make_unique<Runtime>(host, config, ControlMaskConfig{}, temporal);
+            }();
                     break;
                 }
         } catch (const std::exception& e) {
@@ -2080,7 +2321,7 @@ void Session::Impl::heap_poll() {
         std::lock_guard<std::mutex> guard(heap_lock);
         if (heap_done) {
             heap_done = false; heap_busy = false;
-            if (heap_thread.joinable()) heap_thread.join();
+            let_end(heap_thread);
             for (auto& e : cache)
                 if (e.runtime->network_id() == heap_for) { e.runtime->adopt_image_heap(heap_made); break; }
             if (!heap_made) log("[nr] the image heap for the changing frame size could not be made");
@@ -2088,12 +2329,21 @@ void Session::Impl::heap_poll() {
         }
         if (heap_busy) return;
     }
-    if (!runtime || !drs_active()) return;
-    const uint64_t region = runtime->image_heap_wanted();
+    // the memory a waiting frame asked for (inframe), else the running one's while the size moves
+    const Runtime* target = nullptr;
+    if (heap_ask) {
+        for (auto& e : cache)
+            if (e.runtime->network_id() == heap_ask) { target = e.runtime.get(); break; }
+        heap_ask = nullptr;
+    }
+    if (!target && runtime && drs_active()) target = runtime;
+    if (!target) return;
+    const uint64_t region = target->image_heap_wanted();
     if (!region) return;
-    heap_busy = true; heap_for = runtime->network_id();
+    heap_busy = true; heap_for = target->network_id();
     const HostDevice host = make_host();
-    heap_thread = std::thread([this, host, region] {
+    heap_thread = std::thread([this, host, region, net = running_net] {
+        nr::vram::Scope owner(nr::vram::kUnset, net);
         auto made = allocate_image_heap(host, region);
         std::lock_guard<std::mutex> guard(heap_lock);
         heap_made = std::move(made); heap_done = true;
@@ -2142,6 +2392,10 @@ void Session::Impl::check_availability() {
         net_switch.unavailable(nr::kSmallFp8, "needs the model of the 310.9.16 nvngx_dlssnr.dll (install.sh --dll)");
     if (!exists("dlssnr-amd\\dlssnr.bin"))
         net_switch.unavailable(nr::kSilverAardwold, "the model file is missing (run install.sh again)");
+    if (!exists("dlssnr-amd\\experimental\\shaders\\fixed-attention.txt"))
+        net_switch.unavailable(nr::kSmallFp8Experimental, "not installed (run install.sh again)");
+    else if (!exists("dlssnr-amd\\dlssnr-small-experimental.bin"))
+        net_switch.unavailable(nr::kSmallFp8Experimental, "needs the model of the 310.9.16 nvngx_dlssnr.dll (install.sh --dll)");
 #if NR_INT4
     if (!exists("dlssnr-amd\\dlssnr.bin"))
         net_switch.unavailable(nr::kSilverAardwoldInt4, "the model file is missing (run install.sh again)");
@@ -2239,8 +2493,9 @@ bool Session::Impl::ensure_invalidator(ID3D12Device* device) {
 // vkd3d has exactly one mechanism for "something bound its own pipeline behind
 // my back": d3d12_command_list_invalidate_current_pipeline(list, meta_shader=true),
 // which sets `command_buffer_pipeline = VK_NULL_HANDLE` - "just pretend we never
-// bound anything". It is not on any interface; it runs when vkd3d dispatches one
-// of its own meta shaders. ClearUnorderedAccessViewUint takes that path whenever
+// bound anything". It runs when vkd3d dispatches one of its own meta shaders, and
+// (newer vkd3d-proton) in ID3D12DXVKInteropDevice1::BeginVkCommandBufferInterop with
+// all the list's other bindings - the way Session::set_keep_caller_state records. ClearUnorderedAccessViewUint takes that path whenever
 // its fast path cannot serve the clear, and a rect covering PART of the image is
 // refused by the fast path (d3d12_command_list_clear_uav_builtin: "Accept a
 // single full-subresource rect"). So: two texels, clear one.
@@ -2271,7 +2526,8 @@ bool Session::Impl::ensure_output(ID3D12Device* device, uint32_t w, uint32_t h, 
     desc.Format = dxgi; desc.SampleDesc.Count = 1;
     desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+    if (test_fault("d12_resource") ||
+        FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
                                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
                                                __uuidof(ID3D12Resource),
                                                reinterpret_cast<void**>(&output)))) {
@@ -2395,31 +2651,49 @@ Session::Session(std::string root) : impl_(std::make_unique<Impl>()) {
     (void)input_check;
 }
 
-void Session::set_white_point(float v) {
-    impl_->white_point = v;
-    for (auto& e : impl_->cache) e.runtime->set_white_point(v);
-}
-
-void Session::set_native_compose(bool v) { impl_->native_compose = v; }
 void Session::set_motion_point(bool v) { impl_->motion_point = v; }
+void Session::set_keep_caller_state(bool v) { impl_->keep_caller_state = v; }
 
-void Session::set_max_passes(uint32_t v) {
-    // One pass: a network built for exactly one, whose single-pass paths (history
-    // written in turn into two images, motion sampled in place, the input not
-    // kept for later passes) do less work for the same answer. More than one:
-    // never below four, so 2..4 share a network; above it the next frame
-    // rebuilds, like a resolution change. A change of pass count keeps the
-    // running network serving until the new one is built (ensure_runtime_).
-    const uint32_t want = v <= 1 ? 1u
-                        : v < Session::Impl::kMaxPasses ? Session::Impl::kMaxPasses
-                        : (v > Session::Impl::kPassCeiling ? Session::Impl::kPassCeiling : v);
-    impl_->max_passes_want = want;
+VkCommandBuffer Session::Impl::begin_recording(ID3D12Device* device, ID3D12GraphicsCommandList* list,
+                                               Recording& rec) {
+    rec.device = device;
+    rec.list = list;
+    if (keep_caller_state) {
+        if (const VkCommandBuffer cmd = begin_interop_recording(device, list)) {
+            rec.interop = true;
+            return cmd;
+        }
+        static bool said = false;
+        if (!said) {
+            said = true;
+            log("[nr] this vkd3d-proton has no interop begin/end (ID3D12DXVKInteropDevice1): the network's commands "
+                "leave the command list's compute pipeline state and root signature nulled");
+        }
+    }
+    return command_buffer(list);
 }
 
-void Session::set_model_scale(float v) {
-    // Clamped to the range the runtime accepts; the rebuild happens on the
-    // next frame, in the background, like a resolution change.
-    impl_->model_scale = v < 0.25f ? 0.25f : (v > 1.0f ? 1.0f : v);
+void Session::Impl::leave_list(ID3D12Device* device, ID3D12GraphicsCommandList* list, const Recording& rec) {
+    if (rec.interop) return;   // vkd3d-proton re-emits the list's own bindings at its next draw or dispatch
+    list->SetPipelineState(nullptr);
+    list->SetComputeRootSignature(nullptr);
+    forget_bound_pipeline(device, list);
+}
+
+void Session::set_call_network(int network) { impl_->call_net = network; }
+void Session::reset_layer_timing(int layer) {
+    Impl& s = *impl_;
+    ++s.layer_gen[layer];
+    s.stage_avg.erase(layer);
+    s.outer_avg.erase(layer);
+    s.outer_net_avg.erase(layer);
+    s.outer_seen.erase(layer);
+}
+
+void Session::set_call_layer(int layer) {
+    impl_->call_layer = layer;
+    const auto a = impl_->stage_avg.find(layer);   // a run not timed by the RenoDX stage: the runtime's timing
+    if (a != impl_->stage_avg.end()) a->second.renodx_timed = false;
 }
 
 void Session::set_history_strength(float v) {
@@ -2427,18 +2701,25 @@ void Session::set_history_strength(float v) {
     for (auto& e : impl_->cache) e.runtime->set_history_strength(v);
 }
 
+void Session::log_totals() {
+    static_assert(sizeof(impl_->ran_total) == 8, "counters");
+    if (impl_->totals_logged) return;
+    impl_->totals_logged = true;
+    const uint64_t r = impl_->ran_total + impl_->ran, p = impl_->passed_total + impl_->passed;
+    if (r + p)
+        log("[nr] session: %llu evaluations ran the network, %llu passed the frame through", (unsigned long long)r,
+            (unsigned long long)p);
+}
+
 Session::~Session() {
-    {
-        const uint64_t r = impl_->ran_total + impl_->ran, p = impl_->passed_total + impl_->passed;
-        if (r + p)
-            log("[nr] session: %llu evaluations ran the network, %llu passed the frame through", (unsigned long long)r,
-                (unsigned long long)p);
-    }
+    log_totals();
     // A build still running owns nothing the session is about to destroy, but
     // it will hand back a runtime that must be destroyed too: wait for it.
     if (impl_->build_thread.joinable()) impl_->build_thread.join();
     if (impl_->heap_thread.joinable()) impl_->heap_thread.join();
     if (impl_->offload_thread.joinable()) impl_->offload_thread.join();
+    for (std::thread& t : impl_->ending_threads) t.join();
+    impl_->ending_threads.clear();
     impl_->heap_made.reset();
     impl_->built.reset();
     impl_->runtime = nullptr;
@@ -2448,17 +2729,38 @@ Session::~Session() {
     impl_->release_invalidator();
     impl_->release_vk_output();
     if (impl_->stage_timing) vkDestroyQueryPool(impl_->handles.device, impl_->stage_timing, nullptr);
+    if (impl_->outer_timing) vkDestroyQueryPool(impl_->handles.device, impl_->outer_timing, nullptr);
     // Screenshot readbacks: the worker may still be reading one it was handed (it finishes on its own).
     if (impl_->shot) impl_->shot_free(*impl_->shot);
+    if (impl_->outside_shot) impl_->shot_free(*impl_->outside_shot);
+    if (impl_->model_shot) impl_->shot_free(*impl_->model_shot);
     for (auto& d : impl_->diag)   // NR_DIAG_EXPOSURE: a slot still in flight stays allocated
         if (!d.pending || vkGetEventStatus(impl_->handles.device, d.done) == VK_EVENT_SET) impl_->diag_free(d);
     for (auto& sh : impl_->shots_out) {
         for (int i = 0; i < 500 && sh->handed && !sh->read.load(std::memory_order_acquire); ++i) Sleep(10);
         if (!sh->handed || sh->read.load(std::memory_order_acquire)) impl_->shot_free(*sh);
     }
+    for (const auto& r : impl_->neutral_retired) {
+        if (r.image) vkDestroyImage(impl_->handles.device, r.image, nullptr);
+        if (r.memory) vkFreeMemory(impl_->handles.device, r.memory, nullptr);
+    }
+    {   // the wilsjo2 layers' surfaces and programs (the device is idle by now or never ran them)
+        std::vector<uint64_t> features;
+        for (const auto& e : impl_->w2) features.push_back(e.first);
+        for (uint64_t f : features) impl_->wilsjo2_release(f);
+        for (auto& r : impl_->w2_retired) impl_->w2_destroy(r.s);
+        impl_->w2_retired.clear();
+        impl_->w2_stage.reset();
+    }
     if (impl_->neutral_mv) vkDestroyImage(impl_->handles.device, impl_->neutral_mv, nullptr);
     if (impl_->neutral_mv_memory) vkFreeMemory(impl_->handles.device, impl_->neutral_mv_memory, nullptr);
     if (impl_->pool) vkDestroyCommandPool(impl_->handles.device, impl_->pool, nullptr);
+    if (impl_->raw11_pool) {   // nothing freed while the GPU may still run it (not done in 2 s: left as it is)
+        if (vkWaitForFences(impl_->handles.device, Impl::kRaw11, impl_->raw11_fence, VK_TRUE, 2000000000ull) == VK_SUCCESS) {
+            for (VkFence f : impl_->raw11_fence) if (f) vkDestroyFence(impl_->handles.device, f, nullptr);
+            vkDestroyCommandPool(impl_->handles.device, impl_->raw11_pool, nullptr);
+        }
+    }
     if (impl_->owned_queue) impl_->owned_queue->Release();
     if (impl_->dxvk) impl_->dxvk->Release();
     if (impl_->own_fence) {
@@ -2469,9 +2771,13 @@ Session::~Session() {
     impl_->release_slots();
 }
 
-void Session::wait_idle() {
-    impl_->wait_for_own_cmd();
-    for (auto& slot : impl_->slots) impl_->wait_slot(slot);
+bool Session::wait_idle() {
+    nr::pe::watchdog::Phase phase("waiting for NR's GPU work (session wait_idle)");
+    bool done = impl_->wait_for_own_cmd();
+    for (auto& slot : impl_->slots) done = impl_->wait_slot(slot) && done;
+    if (impl_->raw11_pool)   // the D3D10/11 raw recordings (HUD FIX and the compare tools on the ReShade route)
+        done = vkWaitForFences(impl_->handles.device, Impl::kRaw11, impl_->raw11_fence, VK_TRUE, 2000000000ull) == VK_SUCCESS && done;
+    return done;
 }
 
 const std::string& Session::status() const { return impl_->status; }
@@ -2481,13 +2787,113 @@ bool Session::failed() const { return impl_->failed; }
 
 // The runtime that is actually running frames, not the one being built: during a
 // rebuild the old one is still the one paying for the picture on screen.
+bool Session::video_memory(uint64_t* usage, uint64_t* budget, uint64_t* heap) const {
+    Impl::Vram v;
+    if (!impl_->vram(v)) return false;
+    *usage = v.usage; *budget = v.budget; *heap = v.heap;
+    return true;
+}
+
+bool Session::capture_begin(VkCommandBuffer cmd, VkImage image, VkFormat format, uint32_t w, uint32_t h,
+                            VkImageLayout layout, uint8_t hdr_mode, const char* path) {
+    Impl& s = *impl_;
+    s.shot_poll();
+    if (s.outside_shot || s.shot || !cmd || !image || !screenshot::wants_final()) return false;
+    if (!screenshot::readable(format)) {
+        screenshot::fail("unsupported_present", "the frame's format cannot be read back");
+        return false;
+    }
+    s.outside_shot = s.shot_prepare(w, h, format);
+    if (!s.outside_shot) {
+        screenshot::abandon("allocation_failed", "the readback buffers could not be allocated");
+        return false;
+    }
+    Impl::Shot& sh = *s.outside_shot;
+    sh.pair.hdr_mode = hdr_mode;
+    sh.pair.linear_unit_nits = 80.0f;
+    sh.pair.meta = std::string("path=") + (path ? path : "wilsjo2") + "\ncomparison=" +
+                   (path && std::string(path) == "present" ? "final-picture-before-after-nr" : "frame-nr-runs-on-before-after-nr") +
+                   "\nprocessing=wilsjo2\nwidth=" + std::to_string(w) + "\nheight=" + std::to_string(h) +
+                   "\nsource_format=" + std::to_string(int(format)) + "\nhdr_mode=" + std::to_string(hdr_mode) + "\n";
+    Impl::shot_copy(cmd, sh, image, layout, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                    VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, 0);
+    screenshot::recorded();
+    return true;
+}
+
+void Session::capture_abort() {
+    if (!impl_->outside_shot) return;
+    impl_->shots_out.push_back(std::move(impl_->outside_shot));
+    screenshot::abandon("run_failed", "the frame's run could not finish");
+}
+
+void Session::capture_end(VkCommandBuffer cmd, VkImage image, VkImageLayout layout) {
+    Impl& s = *impl_;
+    if (!s.outside_shot || !cmd || !image) return;
+    std::unique_ptr<Impl::Shot> sh = std::move(s.outside_shot);
+    Impl::shot_copy(cmd, *sh, image, layout, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                    VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, sh->bytes);
+    s.shot_recorded(cmd, std::move(sh));
+}
+
+void Session::discard_timing() { impl_->discard_timing(); }
+
+void Session::outer_begin(VkCommandBuffer cmd) {
+    Impl& s = *impl_;
+    if (!s.outer_ready()) return;
+    vkCmdResetQueryPool(cmd, s.outer_timing, s.outer_slot * Impl::kOuterQueries, Impl::kOuterQueries);
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s.outer_timing,
+                        s.outer_slot * Impl::kOuterQueries);   // after the work before it
+    s.outer_open = true;
+    s.outer_passes = 0;
+}
+
+void Session::outer_end(VkCommandBuffer cmd) {
+    Impl& s = *impl_;
+    if (!s.outer_open) return;
+    s.outer_open = false;
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s.outer_timing, s.outer_slot * Impl::kOuterQueries + 1);
+    s.outer_slot_layer[s.outer_slot] = s.call_layer;
+    s.outer_slot_gen[s.outer_slot] = s.layer_gen[s.call_layer];
+    s.outer_slot_passes[s.outer_slot] = s.outer_passes;
+    if (!s.outer_fresh(s.call_layer)) {   // runs again after a pause (or as another processing): its average anew
+        s.outer_avg.erase(s.call_layer);
+        s.outer_net_avg.erase(s.call_layer);
+    }
+    s.outer_seen[s.call_layer] = std::chrono::steady_clock::now();
+    ++s.outer_recorded;
+    s.outer_slot = (s.outer_slot + 1) % Impl::kOuterSlots;
+    s.read_outer_timing();
+}
+
+wilsjo2::SpatialLayout Session::spatial_layout() const { return impl_->w2_spatial; }
+bool Session::spatial_active() const { return impl_->w2_spatial_on; }
 float Session::gpu_ms() const {
-    if (impl_->renodx_timed) return impl_->stage_ms_avg;
+    if (const auto o = impl_->outer_avg.find(impl_->call_layer);
+        o != impl_->outer_avg.end() && o->second > 0.0f && impl_->outer_fresh(impl_->call_layer))
+        return o->second;
+    const auto a = impl_->stage_avg.find(impl_->call_layer);
+    if (a != impl_->stage_avg.end() && a->second.renodx_timed) return a->second.ms;
+    if (impl_->call_layer > 0) return 0.0f;
     return impl_->runtime ? impl_->runtime->average_gpu_ms() : 0.0f;
 }
 
+bool Session::network_ms_whole_run() const {
+    const auto o = impl_->outer_avg.find(impl_->call_layer);
+    return o != impl_->outer_avg.end() && o->second > 0.0f && impl_->outer_fresh(impl_->call_layer) &&
+           impl_->outer_net_avg.count(impl_->call_layer) != 0;
+}
+
 float Session::network_ms() const {
-    if (impl_->renodx_timed) return impl_->stage_net_ms_avg;
+    // a layer timed by an outer run (wilsjo2): the sum of its network recordings in it, while its total is that run's
+    if (const auto o = impl_->outer_avg.find(impl_->call_layer);
+        o != impl_->outer_avg.end() && o->second > 0.0f && impl_->outer_fresh(impl_->call_layer)) {
+        const auto n = impl_->outer_net_avg.find(impl_->call_layer);
+        return n != impl_->outer_net_avg.end() ? n->second : 0.0f;
+    }
+    const auto a = impl_->stage_avg.find(impl_->call_layer);
+    if (a != impl_->stage_avg.end() && a->second.renodx_timed) return a->second.net_ms;
+    if (impl_->call_layer > 0) return 0.0f;
     return impl_->runtime ? impl_->runtime->average_network_ms() : 0.0f;
 }
 
@@ -2502,7 +2908,6 @@ Session::State Session::state() const {
     s.running = m.runtime != nullptr;
     if (m.runtime) {
         s.model_w = m.runtime->model_width(); s.model_h = m.runtime->model_height();
-        s.prep_ev = m.runtime->preprocess_meter().first;
     }
     s.running_net = m.runtime ? m.running_net : -1;
     s.want_net = m.net_want;
@@ -2512,8 +2917,11 @@ Session::State Session::state() const {
     s.carried = m.carried;
     s.renodx_known = m.renodx_facts_known;
     s.renodx = m.renodx_facts;
+    s.wilsjo2_fast_passes = m.w2_fast_passes; s.wilsjo2_fast_fallback = m.w2_fast_fallback; s.wilsjo2_motion = m.w2_motion;
     s.motion_without_depth = m.runtime ? m.runtime->motion_without_depth() : m.net_switch.file().motion_without_depth;
     s.building = m.building && !m.build_plan;   // a plan is no network to wait for
+    s.passed = !m.last_ok;
+    if (s.passed) s.status = m.status;
     if (m.building) {
         s.building_seconds = std::chrono::duration<float>(std::chrono::steady_clock::now() - m.build_started).count();
         s.stage = nr::g_build_stage;
@@ -2529,8 +2937,12 @@ void Session::idle() {
     const auto now = std::chrono::steady_clock::now();
     if (m.last_call == std::chrono::steady_clock::time_point{} || now - m.last_call < Impl::kNrOff) return;
     if (!m.retired.empty()) {
-        m.retired.clear();
-        log("[nr] evicted networks freed (no evaluation for %.0f s)", std::chrono::duration<double>(now - m.last_call).count());
+        const size_t before = m.retired.size();
+        m.retired.erase(std::remove_if(m.retired.begin(), m.retired.end(), [](const Impl::Retired& r) {
+            return r.runtime->recordings_done();
+        }), m.retired.end());
+        if (m.retired.size() != before)
+            events::note(events::kResidency, "evicted networks freed (no evaluation for %.0f s)", std::chrono::duration<double>(now - m.last_call).count());
     }
     if ((!m.cache.empty() || !m.parked.empty()) && now - m.residency_checked >= Impl::kResidencyCheck)
         m.residency(false, true);
@@ -2548,12 +2960,23 @@ void Session::release_feature(uint64_t feature) {
     // history for it. None of them is freed here; see Runtime::release_feature.
     for (auto& e : impl_->cache) e.runtime->release_feature(feature);
     impl_->feature_extent.erase(feature);
+    // what it last ran against: a feature that is gone holds no network (make_room / park count these references)
+    const auto forget = [&](uint64_t f) {
+        impl_->feature_slot.erase(f);
+        impl_->feature_runtime.erase(f);
+        impl_->feature_prev_runtime.erase(f);
+    };
+    forget(feature);
     const auto stage = impl_->renodx.find(feature);
     if (stage != impl_->renodx.end()) {
-        for (uint32_t k = 1; k < stage->second.stack; ++k) impl_->release_everywhere(Impl::stack_feature(feature, k));
+        for (uint32_t k = 1; k < stage->second.stack; ++k) {
+            impl_->release_everywhere(Impl::stack_feature(feature, k));
+            forget(Impl::stack_feature(feature, k));
+        }
         impl_->retire_stage(std::move(stage->second.stage));
         impl_->renodx.erase(stage);
     }
+    impl_->wilsjo2_release(feature);
     log("[nr] feature #%u released", static_cast<unsigned>(feature));
 }
 
@@ -2567,6 +2990,18 @@ static uint64_t guide_pixels(const Session::EngineResources& r) {
         }
     return px;
 }
+
+// A layer of a chain run through here on its own (the ReShade route's wilsjo2 layers): timed around its recording as an
+// outer run (outer_begin / outer_end), so each layer shows its own time - not the runtime's average, which every layer
+// on that runtime shares. Nothing when an outer run is open already (the .asi's wilsjo2 times its whole flow) or no
+// layer is said (call_layer 0: the route's one layer, the runtime's own timing).
+struct OwnOuterRun {
+    Session& s;
+    VkCommandBuffer cmd;
+    bool on;
+    OwnOuterRun(Session& session, VkCommandBuffer c, bool want) : s(session), cmd(c), on(want) { if (on) s.outer_begin(cmd); }
+    ~OwnOuterRun() { if (on) s.outer_end(cmd); }
+};
 
 ID3D12Resource* Session::run(ID3D12Device* device, ID3D12GraphicsCommandList* list,
                              const EngineResources& resources, const Controls& controls) {
@@ -2604,9 +3039,7 @@ ID3D12Resource* Session::run(ID3D12Device* device, ID3D12GraphicsCommandList* li
     // upscaler's quality preset. Rebuild rather than scale: this pass is only
     // cheap because it runs at exactly the size the game rendered.
     s.size_hint_px = guide_pixels(resources);
-    if (!s.ensure_runtime(controls, colour_vk.width, colour_vk.height, colour_vk.format,
-                          !resources.colour_encoded &&
-                              Session::Impl::is_linear_format(colour_vk.format)))
+    if (!s.ensure_runtime(controls, colour_vk.width, colour_vk.height, colour_vk.format))
         return nullptr;
 
     // The game keeps using its own colour buffer, so the network works on our
@@ -2635,6 +3068,7 @@ ID3D12Resource* Session::run(ID3D12Device* device, ID3D12GraphicsCommandList* li
         fill(&engine.depth, resource_handle(device, resources.depth, resources.depth_state)))
         apply_guide_subrect(&engine.depth, resources.depth_subrect, "depth", &engine.depth_x, &engine.depth_y);
 
+    OwnOuterRun timing(*this, cmd, s.call_layer > 0 && !s.outer_open);
     try {
         // Seed our output with the game's colour, then enhance it in place.
         VkImageCopy copy{};
@@ -2668,8 +3102,9 @@ ID3D12Resource* Session::run(ID3D12Device* device, ID3D12GraphicsCommandList* li
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              0, 0, nullptr, 0, nullptr, 1, &out);
 
-        if (motion_vk) s.runtime->record_engine(cmd, engine, controls);
-        else s.runtime->record(cmd, frame, controls, engine.reset);
+        if (motion_vk) s.runtime->record_engine(cmd, engine, s.capture_controls(controls));
+        else s.runtime->record(cmd, frame, s.capture_controls(controls), engine.reset);
+
     } catch (const std::exception& e) {
         s.status = std::string("neural rendering failed: ") + e.what();
         s.failed = true;
@@ -2688,14 +3123,50 @@ bool Session::run_after(ID3D12Device* device, ID3D12GraphicsCommandList* list,
     if (s.failed || !device || !list || !output) return false;
     s.status.clear();
     if (!s.ensure_d3d12_device(device)) return false;
-    const VkCommandBuffer cmd = command_buffer(list);
+    Impl::Recording rec;
+    const VkCommandBuffer cmd = s.begin_recording(device, list, rec);
     if (!cmd) { s.status = "the command list exposes no Vulkan handle"; s.failed = true; return false; }
     const auto target = colour_handle(device, output, output_state);
     if (!target.usable()) { s.status = describe_rejection(target, "output"); return false; }
     s.size_hint_px = guide_pixels(resources);
-    if (!s.ensure_runtime(controls, target.width, target.height, target.format,
-                          !resources.colour_encoded &&
-                              Session::Impl::is_linear_format(target.format))) return false;
+    if (resources.wilsjo2) {   // a wilsjo2 layer (the ReShade route): its flow on the output, in place
+        Controls net{};
+        if (!s.wilsjo2_prepare(*resources.wilsjo2, resources.feature, target.width, target.height, target.format,
+                               resources.motion != nullptr, controls, &net))
+            return false;
+        ColourFrame frame{};
+        frame.image = target.image;
+        frame.format = target.format;
+        frame.width = target.width; frame.height = target.height;
+        frame.before = frame.after = target.layout;
+        frame.usage = target.usage;
+        EngineFrame engine{};
+        engine.colour = frame;
+        engine.feature = resources.feature;
+        engine.reset = resources.reset || s.resized(resources.feature, frame.width, frame.height);
+        engine.motion_scale_x = resources.motion_scale_x;
+        engine.motion_scale_y = resources.motion_scale_y;
+        engine.depth_inverted = resources.depth_inverted;
+        if (resources.motion && fill(&engine.motion, resource_handle(device, resources.motion, resources.motion_state))) {
+            engine.motion_texture_width = engine.motion.width; engine.motion_texture_height = engine.motion.height;
+            apply_guide_subrect(&engine.motion, resources.motion_subrect, "motion-vector", &engine.motion_x, &engine.motion_y);
+        }
+        if (resources.depth && fill(&engine.depth, resource_handle(device, resources.depth, resources.depth_state)))
+            apply_guide_subrect(&engine.depth, resources.depth_subrect, "depth", &engine.depth_x, &engine.depth_y);
+        bool ran = false;
+        try {
+            OwnOuterRun timing(*this, cmd, s.call_layer > 0 && !s.outer_open);
+            ran = s.record_wilsjo2(cmd, frame, engine, net, *resources.wilsjo2);
+        } catch (const std::exception& e) {
+            s.status = std::string("neural rendering failed: ") + e.what();
+            s.failed = true;
+            log("[nr] %s", s.status.c_str());
+            return false;
+        }
+        s.leave_list(device, list, rec);
+        return ran;
+    }
+    if (!s.ensure_runtime(controls, target.width, target.height, target.format)) return false;
 
     // In place: the upscaler already wrote this and nobody is waiting for a
     // different resource, so there is nothing to rebind.
@@ -2756,8 +3227,11 @@ bool Session::run_after(ID3D12Device* device, ID3D12GraphicsCommandList* list,
     };
     everything(VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
     try {
-        if (motion_vk) s.runtime->record_engine(cmd, engine, controls);
-        else s.runtime->record(cmd, frame, controls, engine.reset);
+        OwnOuterRun timing(*this, cmd, s.call_layer > 0 && !s.outer_open);
+
+        if (motion_vk) s.runtime->record_engine(cmd, engine, s.capture_controls(controls));
+        else s.runtime->record(cmd, frame, s.capture_controls(controls), engine.reset);
+
     } catch (const std::exception& e) {
         s.status = std::string("neural rendering failed: ") + e.what();
         s.failed = true;
@@ -2778,12 +3252,11 @@ bool Session::run_after(ID3D12Device* device, ID3D12GraphicsCommandList* list,
     // constants (SetComputeRootSignature -> invalidate_root_parameters). The
     // graphics bind point was not touched by us and is left alone.
     everything(VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
-    list->SetPipelineState(nullptr);
-    list->SetComputeRootSignature(nullptr);
-    // ...and the part those two cannot reach: vkd3d's memory of what is bound in
-    // the Vulkan command buffer itself. Without this, the second neural pass in
-    // one command list leaves every following caller dispatch running our kernel.
-    s.forget_bound_pipeline(device, list);
+    // (leave_list: SetPipelineState(nullptr), SetComputeRootSignature(nullptr), and the part those two cannot
+    // reach: vkd3d's memory of what is bound in the Vulkan command buffer itself. Without that, the second neural
+    // pass in one command list leaves every following caller dispatch running our kernel. Through the interop
+    // begin/end none of it is needed.)
+    s.leave_list(device, list, rec);
     return true;
 }
 
@@ -2799,9 +3272,7 @@ bool Session::Impl::renodx_runtime(const Controls& controls, uint32_t w, uint32_
     // Enabled / Apply model do not apply.
     c->enabled = true;
     c->apply_model = true;
-    renodx_native = true;
-    const bool ok = ensure_runtime(*c, w, h, VK_FORMAT_R16G16B16A16_SFLOAT, false);
-    renodx_native = false;
+    const bool ok = ensure_runtime(*c, w, h, VK_FORMAT_R16G16B16A16_SFLOAT);
     return ok && runtime->takes_target(*c);   // the model not applied: the frame stays as it is
 }
 
@@ -2809,6 +3280,14 @@ bool Session::Impl::renodx_runtime(const Controls& controls, uint32_t w, uint32_
 void Session::Impl::renodx_extent(uint64_t feature, uint32_t w, uint32_t h, uint32_t guide_w, uint32_t guide_h,
                                   const renodx::Settings& settings, uint32_t* nw, uint32_t* nh) {
     auto& e = renodx[feature];
+    // Only changes in the game's input activate nearby-size prefetching. A user scale/follow change is
+    // deliberate, so planning dozens of sizes around it consumes host memory without helping a later frame.
+    const bool input_resize = e.scale == settings.resolution_scale && e.follow == settings.follow_input_res;
+    struct Resize {
+        Impl& s; const RenoDXEntry& e; uint32_t w, h; bool input_resize;
+        ~Resize() { if (input_resize && w && (e.applied_w != w || e.applied_h != h))
+            s.last_resize = std::chrono::steady_clock::now(); }
+    } resize{*this, e, e.applied_w, e.applied_h, input_resize};
     renodx::working_resolution(settings, w, h, guide_w, guide_h, nw, nh);
     const bool settings_changed = e.scale != settings.resolution_scale || e.follow != settings.follow_input_res ||
                                   e.w != w || e.h != h;
@@ -2870,9 +3349,17 @@ renodx::Stage* Session::Impl::renodx_stage(uint64_t feature, uint32_t w, uint32_
 }
 
 bool Session::Impl::neutral_motion(VkCommandBuffer cmd, uint32_t w, uint32_t h, ColourFrame* out) {
+    ++neutral_calls;
+    const auto now = std::chrono::steady_clock::now();
+    for (auto i = neutral_retired.begin(); i != neutral_retired.end();) {
+        if (neutral_calls - i->call < 64 || now - i->at < std::chrono::seconds(2) || !i->uses.ready()) { ++i; continue; }
+        if (i->image) vkDestroyImage(handles.device, i->image, nullptr);
+        if (i->memory) vkFreeMemory(handles.device, i->memory, nullptr);
+        i = neutral_retired.erase(i);
+    }
     if (!neutral_mv || neutral_w != w || neutral_h != h) {
-        if (neutral_mv) { vkDestroyImage(handles.device, neutral_mv, nullptr); neutral_mv = VK_NULL_HANDLE; }
-        if (neutral_mv_memory) { vkFreeMemory(handles.device, neutral_mv_memory, nullptr); neutral_mv_memory = VK_NULL_HANDLE; }
+        if (neutral_mv || neutral_mv_memory) neutral_retired.push_back({neutral_mv, neutral_mv_memory, neutral_uses, neutral_calls, now});
+        neutral_mv = VK_NULL_HANDLE; neutral_mv_memory = VK_NULL_HANDLE; neutral_uses = {};
         VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         ci.imageType = VK_IMAGE_TYPE_2D; ci.format = VK_FORMAT_R16G16_SFLOAT; ci.extent = {w, h, 1};
         ci.mipLevels = ci.arrayLayers = 1; ci.samples = VK_SAMPLE_COUNT_1_BIT; ci.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -2898,6 +3385,7 @@ bool Session::Impl::neutral_motion(VkCommandBuffer cmd, uint32_t w, uint32_t h, 
         }
         neutral_w = w; neutral_h = h; neutral_cleared = false;
     }
+    neutral_uses.touch();
     if (!neutral_cleared) {
         VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; b.newLayout = VK_IMAGE_LAYOUT_GENERAL; b.image = neutral_mv;
@@ -2941,6 +3429,7 @@ bool Session::Impl::record_renodx(VkCommandBuffer cmd, renodx::Stage& stage, con
         look_motion = ColourFrame{};
     }
     renodx::StageFrame sf;
+    sf.fast_motion_available = rf.fast_motion_available;
     sf.colour = colour;
     sf.output = output;
     sf.reset = engine.reset;
@@ -2983,6 +3472,7 @@ bool Session::Impl::record_renodx(VkCommandBuffer cmd, renodx::Stage& stage, con
         Controls ck = c;
         ck.per_pass.clear();
         ck.passes = 1;
+        ck.history_strength = 1.f;
         const bool own = k > 0 && !rs.pass_follow[k - 1];
         ck.intensity = k == 0 ? rs.intensity : rs.pass_intensity[k - 1];
         ck.style = int(own ? rs.pass_style[k - 1] : rs.style);
@@ -2990,6 +3480,7 @@ bool Session::Impl::record_renodx(VkCommandBuffer cmd, renodx::Stage& stage, con
         ck.local_structure = own ? rs.pass_local_structure[k - 1] : rs.local_structure;
         ck.skin_structure = own ? rs.pass_skin_structure[k - 1] : rs.skin_structure;
         ck.automatic_mask = own ? rs.pass_auto_mask[k - 1] : rs.auto_mask;
+        ck.seed_fixed = !rs.noise_every_frame;
         if (rs.skin_independent && ck.automatic_mask) {
             ck.local_structure = std::min(ck.local_structure, 1.0f);
             if (ck.skin_structure < 0.0f) ck.skin_structure = 1.0f;
@@ -3011,7 +3502,7 @@ bool Session::Impl::record_renodx(VkCommandBuffer cmd, renodx::Stage& stage, con
     // ran on it inline). The model's input and output: the last pass's, after it ran.
     shot_poll();
     std::unique_ptr<Shot> capture;
-    const bool final_frame = rf.present != 0 || rf.finished;
+    const bool final_frame = rf.present != 0 || rf.finished || rf.capture_at;
     if (!shot && rs.nr_enabled && screenshot::wants_final() && final_frame && rf.clean) {
         if (!screenshot::readable(colour.format)) {
             screenshot::fail("unsupported_present", "the frame's format cannot be read back");
@@ -3032,8 +3523,20 @@ bool Session::Impl::record_renodx(VkCommandBuffer cmd, renodx::Stage& stage, con
             capture->pair.hdr_mode = rf.present ? (rf.present == 2 ? 2 : rf.present == 3 ? 1 : 0)
                                                 : linear ? 1 : pq && rf.hdr_flag ? 2 : 0;
             capture->pair.linear_unit_nits = 80.0f;
-            capture->pair.meta = std::string("path=") + (rf.present ? "present" : "optiscaler-finished-picture") +
-                                 "\ncomparison=final-picture-before-after-nr\nstack=" + std::to_string(passes) +
+            // A frame inside the game's pipeline (Vulkan / D3D11 games, the frame NR runs on): read as the stage reads
+            // it. Relative linear light (before the game's tone mapping) has no nits: shown with 1.0 = 80 nits.
+            const char* units = "";
+            if (!rf.present && !rf.finished && rf.capture_at) {
+                const renodx::FrameUnits u = renodx::frame_units(rf.settings, colour.format, rf.hdr_flag);
+                capture->pair.hdr_mode = u.mode;
+                if (u.mode == 1 && u.unit_nits > 0.f) capture->pair.linear_unit_nits = u.unit_nits;
+                units = u.mode == 1 ? (u.unit_nits > 0.f ? "\nlinear_units=absolute" : "\nlinear_units=relative-shown-as-80-nits")
+                                    : u.mode == 2 ? "\nlinear_units=pq" : "\nlinear_units=display-codes";
+            }
+            const bool mid = !rf.present && !rf.finished && rf.capture_at;
+            capture->pair.meta = std::string("path=") + (rf.present ? "present" : rf.capture_at ? rf.capture_at : "optiscaler-finished-picture") +
+                                 (mid ? "\ncomparison=frame-nr-runs-on-before-after-nr" : "\ncomparison=final-picture-before-after-nr") +
+                                 units + "\nstack=" + std::to_string(passes) +
                                  "\nwidth=" + std::to_string(colour.width) + "\nheight=" + std::to_string(colour.height) +
                                  "\nsource_format=" + std::to_string(int(colour.format)) +
                                  "\nhdr_mode=" + std::to_string(capture->pair.hdr_mode) + "\n";
@@ -3050,9 +3553,13 @@ bool Session::Impl::record_renodx(VkCommandBuffer cmd, renodx::Stage& stage, con
         e.reset = reset;
         e.feature = pass_feature(k);
         const bool time_net = timed && timed_passes < renodx::kMaxUnlockedPasses;
-        if (time_net) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, stage_timing, base + 2 + 2 * timed_passes);
-        runtime->record_engine(cmd, e, pass_controls(k));
-        if (time_net) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, stage_timing, base + 3 + 2 * timed_passes++);
+        Controls controls = pass_controls(k);
+        if (time_net) controls.network_timestamp = [&](VkCommandBuffer c, bool begin) {
+            vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, stage_timing,
+                                base + 2 + 2 * timed_passes + (begin ? 0u : 1u));
+            if (!begin) ++timed_passes;
+        };
+        runtime->record_engine(cmd, e, controls);
         if (k == 0) {
             diag_copy(cmd, 2, proxy.image, proxy.format, proxy.width, proxy.height, proxy.usage, proxy.after,
                       proxy.after_stage, proxy.after_access);
@@ -3101,11 +3608,13 @@ bool Session::Impl::record_renodx(VkCommandBuffer cmd, renodx::Stage& stage, con
         if (timed) {
             vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, stage_timing, base + 1);
             stage_slot_passes[slot] = timed_passes;
+            stage_slot_layer[slot] = call_layer;
+            stage_slot_gen[slot] = layer_gen[call_layer];
             ++stage_recorded;
             stage_slot = (slot + 1) % kStageSlots;
             read_stage_timing();
         }
-        renodx_timed = timed;
+        stage_avg[call_layer].renodx_timed = timed;
     } catch (const std::exception& x) {
         if (capture) {   // its pre-NR copy may be in the command buffer: kept until the session goes
             screenshot::abandon("failed", "RenoDX-style processing failed during the capture");
@@ -3119,6 +3628,459 @@ bool Session::Impl::record_renodx(VkCommandBuffer cmd, renodx::Stage& stage, con
     return true;
 }
 
+// ---- wilsjo2 layers of the ReShade route (nr_wilsjo2_flow.hpp) ---------------------------------------------------------
+namespace {
+VkFormat w2_storage_twin(VkFormat f) {   // a format the stage can store into: an sRGB one's UNORM twin (same bytes)
+    switch (f) {
+        case VK_FORMAT_R8G8B8A8_SRGB: return VK_FORMAT_R8G8B8A8_UNORM;
+        case VK_FORMAT_B8G8R8A8_SRGB: return VK_FORMAT_B8G8R8A8_UNORM;
+        case VK_FORMAT_A8B8G8R8_SRGB_PACK32: return VK_FORMAT_A8B8G8R8_UNORM_PACK32;
+        default: return f;
+    }
+}
+// The format the stage works a frame of format `f` in: `f` or its sRGB twin when the stage can store into it (sampled +
+// storage); else a wider format holding every value of `f`, copied in and back by blits (`*blit`; 0.0.7's ReShade
+// route went through such an intermediate with a blit, Transfer::DirectBlit) - when `f` can be blitted from and into.
+// UNDEFINED: neither.
+VkFormat w2_work_format(VkPhysicalDevice physical, VkFormat f, bool* blit) {
+    const auto has = [physical](VkFormat x, VkFormatFeatureFlags need) {
+        VkFormatProperties fp{};
+        vkGetPhysicalDeviceFormatProperties(physical, x, &fp);
+        return (fp.optimalTilingFeatures & need) == need;
+    };
+    const VkFormatFeatureFlags work = VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+    *blit = false;
+    const VkFormat twin = w2_storage_twin(f);
+    if (has(twin, work)) return twin;
+    VkFormat wide = VK_FORMAT_R32G32B32A32_SFLOAT;   // any other colour format's values
+    switch (f) {
+        case VK_FORMAT_B10G11R11_UFLOAT_PACK32: case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32: case VK_FORMAT_R16G16B16_SFLOAT:
+            wide = VK_FORMAT_R16G16B16A16_SFLOAT;
+            break;
+        case VK_FORMAT_R5G6B5_UNORM_PACK16: case VK_FORMAT_B5G6R5_UNORM_PACK16: case VK_FORMAT_R5G5B5A1_UNORM_PACK16:
+        case VK_FORMAT_B5G5R5A1_UNORM_PACK16: case VK_FORMAT_A1R5G5B5_UNORM_PACK16: case VK_FORMAT_R4G4B4A4_UNORM_PACK16:
+        case VK_FORMAT_B4G4R4A4_UNORM_PACK16: case VK_FORMAT_A4R4G4B4_UNORM_PACK16: case VK_FORMAT_A4B4G4R4_UNORM_PACK16:
+        case VK_FORMAT_R8G8B8_UNORM: case VK_FORMAT_B8G8R8_UNORM:
+            wide = VK_FORMAT_R8G8B8A8_UNORM;
+            break;
+        case VK_FORMAT_R16G16B16_UNORM:
+            wide = VK_FORMAT_R16G16B16A16_UNORM;
+            break;
+        default:
+            break;
+    }
+    if (!has(f, VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT) ||
+        !has(wide, work | VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT))
+        return VK_FORMAT_UNDEFINED;
+    *blit = true;
+    return wide;
+}
+bool w2_unorm(VkFormat f) {
+    switch (f) {
+        case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_A8B8G8R8_UNORM_PACK32:
+        case VK_FORMAT_A2B10G10R10_UNORM_PACK32: case VK_FORMAT_A2R10G10B10_UNORM_PACK32: case VK_FORMAT_R16G16B16A16_UNORM:
+            return true;
+        default:
+            return false;
+    }
+}
+void w2_layout(VkCommandBuffer cmd, VkImage image, VkImageLayout from, VkImageLayout to) {
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    b.oldLayout = from; b.newLayout = to;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = image;
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0,
+                         nullptr, 1, &b);
+}
+void w2_everything(VkCommandBuffer cmd) {
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr,
+                         0, nullptr);
+}
+}  // namespace
+
+Session::Impl::W2Surface* Session::Impl::w2_make(VkCommandBuffer cmd, VkFormat f, uint32_t w, uint32_t h) {
+    if (!handles.device || !handles.physical || !f || !w || !h) return nullptr;
+    VkFormatProperties fp{};
+    vkGetPhysicalDeviceFormatProperties(handles.physical, f, &fp);
+    const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+    if ((fp.optimalTilingFeatures & need) != need) return nullptr;
+    if (!w2_mem_known) { vkGetPhysicalDeviceMemoryProperties(handles.physical, &w2_mem); w2_mem_known = true; }
+    auto* x = new W2Surface{};
+    VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ii.imageType = VK_IMAGE_TYPE_2D; ii.format = f; ii.extent = {w, h, 1}; ii.mipLevels = 1; ii.arrayLayers = 1;
+    ii.samples = VK_SAMPLE_COUNT_1_BIT; ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ii.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+               VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    if (vkCreateImage(handles.device, &ii, nullptr, &x->image) != VK_SUCCESS) { x->image = VK_NULL_HANDLE; w2_destroy(x); return nullptr; }
+    VkMemoryRequirements req{};
+    vkGetImageMemoryRequirements(handles.device, x->image, &req);
+    uint32_t type = ~0u;
+    for (uint32_t i = 0; i < w2_mem.memoryTypeCount; ++i)
+        if ((req.memoryTypeBits & (1u << i)) && (w2_mem.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+            type = i;
+            break;
+        }
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = req.size; ai.memoryTypeIndex = type;
+    {
+        nr::vram::Scope tag(nr::vram::kWilsjo2);
+        if (type == ~0u || vkAllocateMemory(handles.device, &ai, nullptr, &x->memory) != VK_SUCCESS) {
+            x->memory = VK_NULL_HANDLE;
+            w2_destroy(x);
+            return nullptr;
+        }
+    }
+    if (vkBindImageMemory(handles.device, x->image, x->memory, 0) != VK_SUCCESS) { w2_destroy(x); return nullptr; }
+    x->format = f; x->w = w; x->h = h;
+    w2_layout(cmd, x->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    return x;
+}
+
+namespace {
+// The flow's route inside the session (the ReShade route's wilsjo2 layers): our surfaces GENERAL throughout, the frame
+// moved to GENERAL for the run and back after, the guides read in their layouts, the stage on the session's device and
+// the network through the session's runtime, network-only (Session::Impl::wilsjo2_runtime).
+class SessionW2Io final : public nr::wilsjo2::FlowIo {
+public:
+    using Impl = Session::Impl;
+    SessionW2Io(Impl& s, VkCommandBuffer cmd, const ColourFrame& target, const EngineFrame& engine, const Controls& net,
+                const nr::wilsjo2::Settings& settings, uint64_t feature, bool estimate)
+        : s_(s), cmd_(cmd), target_(target), engine_(engine), net_(net), settings_(settings), feature_(feature),
+          estimate_(estimate) {
+        target_now_ = target.before;
+    }
+    nr::wilsjo2::Surf target() { return {&target_}; }
+    nr::wilsjo2::Surf depth() { return engine_.depth.image ? nr::wilsjo2::Surf{&engine_.depth} : nr::wilsjo2::Surf{}; }
+    nr::wilsjo2::Surf motion() { return engine_.motion.image ? nr::wilsjo2::Surf{&engine_.motion} : nr::wilsjo2::Surf{}; }
+
+    nr::wilsjo2::Surf make(nr::wilsjo2::Fmt format, uint32_t w, uint32_t h, bool) override {
+        VkFormat f = target_.format;
+        switch (format) {
+            case nr::wilsjo2::Fmt::kFrame: break;
+            case nr::wilsjo2::Fmt::kHalf: f = VK_FORMAT_R16G16B16A16_SFLOAT; break;
+            case nr::wilsjo2::Fmt::kR32F: f = VK_FORMAT_R32_SFLOAT; break;
+            case nr::wilsjo2::Fmt::kRG32F: f = VK_FORMAT_R32G32_SFLOAT; break;
+            case nr::wilsjo2::Fmt::kF32: f = VK_FORMAT_R32G32B32A32_SFLOAT; break;
+            case nr::wilsjo2::Fmt::kRG16F: f = VK_FORMAT_R16G16_SFLOAT; break;
+        }
+        return {s_.w2_make(cmd_, f, w, h)};
+    }
+    void retire(nr::wilsjo2::Surf& x) override {
+        auto* p = static_cast<Impl::W2Surface*>(x.h);
+        s_.w2_retire(p);
+        x = {};
+    }
+    void use(nr::wilsjo2::Surf x, nr::wilsjo2::Access) override {
+        if (x.h == &target_ && target_now_ != VK_IMAGE_LAYOUT_GENERAL) {
+            w2_layout(cmd_, target_.image, target_now_, VK_IMAGE_LAYOUT_GENERAL);
+            target_now_ = VK_IMAGE_LAYOUT_GENERAL;
+        }
+    }
+    bool record(const Recorder& fn) override {
+        if (!s_.w2_stage) return false;
+        const ImageOf image_of = [&](nr::wilsjo2::Surf x) {
+            nr::wilsjo2::Image i;
+            if (!x) return i;
+            if (x.h == &target_) {
+                i.image = target_.image; i.format = target_.format; i.width = target_.width; i.height = target_.height;
+                i.layout = target_now_;
+            } else if (x.h == &engine_.depth || x.h == &engine_.motion) {
+                const ColourFrame& g = *static_cast<const ColourFrame*>(x.h);
+                i.image = g.image; i.format = g.format; i.width = g.width; i.height = g.height; i.layout = g.before;
+            } else {
+                const auto* p = static_cast<const Impl::W2Surface*>(x.h);
+                i.image = p->image; i.format = p->format; i.width = p->w; i.height = p->h; i.layout = VK_IMAGE_LAYOUT_GENERAL;
+            }
+            return i;
+        };
+        // one stage recording a call (its descriptor sets and views by recording: a frame with many passes needs more
+        // sets than one recording's pool holds)
+        bool ok = false;
+        try {
+            ok = fn(cmd_, *s_.w2_stage, image_of);
+        } catch (const std::exception& e) {
+            log("[nr] wilsjo2 (ReShade route): %s", e.what());
+            ok = false;
+        }
+        s_.w2_stage->end_recording();
+        return ok;
+    }
+    bool has(nr::wilsjo2::Mode mode) const override { return s_.w2_stage && s_.w2_stage->has(mode); }
+    bool has_fast() const override { return !s_.w2_stage || s_.w2_stage->has_fast(); }
+    bool stage_failed() const override { return !s_.w2_stage; }
+    nr::wilsjo2::PassReady pass(uint32_t, const nr::wilsjo2::PassControls&, uint32_t, uint32_t) override {
+        return nr::wilsjo2::PassReady::kReady;   // the network runtime is made before the recording (wilsjo2_prepare)
+    }
+    void release_passes(size_t from) override {
+        for (uint32_t k = uint32_t(from); k < nr::wilsjo2::kMaxPasses; ++k) s_.release_everywhere(Impl::stack_feature(feature_, k));
+    }
+    int network(const nr::wilsjo2::NetCall& c) override {
+        ColourFrame in = frame_of(c.input), out = frame_of(c.output);
+        EngineFrame e = engine_;
+        e.colour = in;
+        e.target = out;
+        e.reset = c.reset;
+        e.feature = Impl::stack_feature(feature_, c.pass);
+        if (c.depth.h != &engine_.depth) {   // peripheral compression: the packed guides at the model extent
+            e.depth = frame_of(c.depth);
+            e.motion = frame_of(c.motion);
+            e.depth_x = e.depth_y = e.motion_x = e.motion_y = 0;
+            e.motion_texture_width = e.motion.width; e.motion_texture_height = e.motion.height;
+            e.motion_scale_x = c.motion_rect.width ? c.mv_x / float(c.motion_rect.width) : c.mv_x;
+            e.motion_scale_y = c.motion_rect.height ? c.mv_y / float(c.motion_rect.height) : c.mv_y;
+        }
+        // Otherwise the route's own scales (normalized screen units, at any model extent), as this route ran them.
+        Controls k = net_;
+        k.intensity = c.controls.intensity;
+        k.style = int(c.controls.style);
+        k.local_structure = c.controls.local_structure;
+        k.local_tone = c.controls.local_tone;
+        k.skin_structure = c.controls.skin_structure;
+        k.automatic_mask = c.controls.auto_mask;
+        k.noise_every_frame = c.noise_every_frame;
+        k.reversible_mode = int(c.proxy_curve);
+        k.model_capture_allowed = c.last;
+        k.history_strength = settings_.history_strength;
+        try {
+            if (e.motion.image) {
+                s_.runtime->record_engine(cmd_, e, s_.capture_controls(k));
+            } else {
+                if (in.image != out.image) {
+                    w2_everything(cmd_);
+                    VkImageCopy region{};
+                    region.srcSubresource = region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                    region.extent = {in.width, in.height, 1};
+                    vkCmdCopyImage(cmd_, in.image, VK_IMAGE_LAYOUT_GENERAL, out.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+                    w2_everything(cmd_);
+                }
+                if (estimate_) {
+                    TemporalFrame t{c.reset, e.feature};
+                    s_.runtime->record_temporal(cmd_, out, s_.capture_controls(k), t);
+                } else {
+                    s_.runtime->record(cmd_, out, s_.capture_controls(k), c.reset);
+                }
+            }
+        } catch (const std::exception& x) {
+            log("[nr] wilsjo2 (ReShade route): the network: %s", x.what());
+            return 1;
+        }
+        return 0;
+    }
+    void passes_begin(const nr::wilsjo2::FlowFacts& x) override {
+        s_.w2_fast_passes = x.fast_passes;
+        s_.w2_fast_fallback = x.fast_fallback;
+    }
+    void spatial_ran(const nr::wilsjo2::SpatialLayout& layout) override {
+        s_.w2_spatial = layout;
+        s_.w2_spatial_on = true;
+    }
+    void finish() override {
+        if (target_now_ != target_.after) {
+            w2_layout(cmd_, target_.image, target_now_, target_.after);
+            target_now_ = target_.after;
+        }
+    }
+    void say(const char* text) override { log("[nr] wilsjo2 (ReShade route): %s", text); }
+
+private:
+    ColourFrame frame_of(nr::wilsjo2::Surf x) const {
+        ColourFrame f{};
+        if (x.h == &target_) {
+            f = target_;
+            f.before = f.after = target_now_;
+            return f;
+        }
+        if (x.h == &engine_.depth || x.h == &engine_.motion) return *static_cast<const ColourFrame*>(x.h);
+        const auto* p = static_cast<const Impl::W2Surface*>(x.h);
+        f.image = p->image; f.format = p->format; f.width = p->w; f.height = p->h;
+        f.before = f.after = VK_IMAGE_LAYOUT_GENERAL;
+        f.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                  VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        return f;
+    }
+    Impl& s_;
+    VkCommandBuffer cmd_;
+    ColourFrame target_;
+    VkImageLayout target_now_;
+    EngineFrame engine_;
+    Controls net_;
+    const nr::wilsjo2::Settings& settings_;
+    uint64_t feature_;
+    bool estimate_;
+};
+}  // namespace
+
+void Session::Impl::wilsjo2_release(uint64_t feature) {
+    const auto it = w2.find(feature);
+    if (it == w2.end()) return;
+    nr::wilsjo2::FlowState& o = it->second.flow;
+    for (W2Surface** x : {reinterpret_cast<W2Surface**>(&o.proxy.h), reinterpret_cast<W2Surface**>(&o.keep.h),
+                          reinterpret_cast<W2Surface**>(&o.answer.h), reinterpret_cast<W2Surface**>(&o.scratch.h),
+                          reinterpret_cast<W2Surface**>(&o.clamp.h), reinterpret_cast<W2Surface**>(&o.small.h),
+                          reinterpret_cast<W2Surface**>(&o.native.h), reinterpret_cast<W2Surface**>(&o.sp_colour.h),
+                          reinterpret_cast<W2Surface**>(&o.sp_depth.h), reinterpret_cast<W2Surface**>(&o.sp_motion.h),
+                          reinterpret_cast<W2Surface**>(&o.sp_proxy.h), reinterpret_cast<W2Surface**>(&o.sp_answer.h),
+                          reinterpret_cast<W2Surface**>(&o.sp_proxy_native.h),
+                          reinterpret_cast<W2Surface**>(&o.sp_answer_native.h), reinterpret_cast<W2Surface**>(&o.meter.h),
+                          reinterpret_cast<W2Surface**>(&o.exposure.h), reinterpret_cast<W2Surface**>(&o.p_light.h),
+                          reinterpret_cast<W2Surface**>(&o.p_light_m.h), reinterpret_cast<W2Surface**>(&o.p_in.h),
+                          reinterpret_cast<W2Surface**>(&o.p_out.h), reinterpret_cast<W2Surface**>(&o.p_scratch.h),
+                          reinterpret_cast<W2Surface**>(&o.p_clamp.h), reinterpret_cast<W2Surface**>(&o.p_m.h),
+                          reinterpret_cast<W2Surface**>(&o.p_state.h), reinterpret_cast<W2Surface**>(&o.small_raw.h),
+                          reinterpret_cast<W2Surface**>(&o.small_keep.h), reinterpret_cast<W2Surface**>(&o.classic.h),
+                          reinterpret_cast<W2Surface**>(&o.f_in.h), reinterpret_cast<W2Surface**>(&o.f_out.h),
+                          reinterpret_cast<W2Surface**>(&o.f_net.h), reinterpret_cast<W2Surface**>(&o.f_ans.h)})
+        w2_retire(*x);
+    for (nr::wilsjo2::Surf& x : o.fast) w2_retire(*reinterpret_cast<W2Surface**>(&x.h));
+    w2_retire(it->second.work);
+    for (uint32_t k = 1; k < nr::wilsjo2::kMaxPasses; ++k) release_everywhere(stack_feature(feature, k));
+    w2.erase(it);
+}
+
+// The network at the model's extent, network-only (as RenoDX's): the flow shows it the proxy and composes the answer.
+bool Session::Impl::wilsjo2_runtime(const Controls& controls, uint32_t w, uint32_t h, VkFormat f, Controls* c) {
+    *c = controls;
+    c->preprocess = Preprocess{};   // the flow runs [Preprocess] itself, from the frame's light
+    c->passes = 1;
+    c->per_pass.clear();
+    c->enabled = true;
+    c->apply_model = true;
+    c->debug_view = 0;
+    c->show_skin_mask = false;
+    const bool ok = ensure_runtime(*c, w, h, f);
+    return ok && runtime->takes_target(*c);
+}
+
+bool Session::Impl::wilsjo2_prepare(const Session::Wilsjo2Frame& wf, uint64_t feature, uint32_t w, uint32_t h, VkFormat f,
+                                    bool guides, const Controls& controls, Controls* net) {
+    if (!wf.settings) return false;
+    w2_free_retired();
+    const auto& e = w2[feature];
+    uint32_t mw = w, mh = h;
+    bool spatial = false;
+    nr::wilsjo2::flow_model_extent(*wf.settings, w, h, e.flow, guides, &mw, &mh, &spatial);
+    // the network made for the format the flow will show it (its input and answer)
+    namespace w2f = nr::wilsjo2;
+    const bool prep = wf.preprocess.active() && (!w2_stage || w2_stage->has(w2f::kPrepBack));
+    const w2f::Fmt nf = w2f::flow_network_format(*wf.settings, spatial, !w2_stage || w2_stage->has_fast(), prep);
+    const VkFormat vf = nf == w2f::Fmt::kHalf ? VK_FORMAT_R16G16B16A16_SFLOAT
+                      : nf == w2f::Fmt::kF32 ? VK_FORMAT_R32G32B32A32_SFLOAT : [&] {
+                            bool blit = false;
+                            const VkFormat x = w2_work_format(handles.physical, f, &blit);
+                            return x ? x : w2_storage_twin(f);
+                        }();
+    return wilsjo2_runtime(controls, mw, mh, vf, net);
+}
+
+bool Session::Impl::record_wilsjo2(VkCommandBuffer cmd, const ColourFrame& colour, const EngineFrame& engine,
+                                   const Controls& net, const Session::Wilsjo2Frame& wf) {
+    if (!wf.settings || !runtime) return false;
+    const uint64_t now_ms = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         std::chrono::steady_clock::now().time_since_epoch()).count());
+    if (!w2_stage && (!w2_stage_failed_ms || now_ms - w2_stage_failed_ms >= 5000)) {
+        try {
+            w2_stage = std::make_unique<nr::wilsjo2::Stage>(make_host(), root + "\\dlssnr-amd\\shaders\\wilsjo2");
+            if (w2_stage_failed_ms) log("[nr] wilsjo2 (ReShade route) available again");
+            w2_stage_failed_ms = 0;
+        } catch (const std::exception& x) {
+            if (!w2_stage_said) { w2_stage_said = true; log("[nr] wilsjo2 (ReShade route) unavailable: %s (tried again every 5 s)", x.what()); }
+            w2_stage_failed_ms = std::max<uint64_t>(now_ms, 1);
+        }
+    }
+    if (!w2_stage) return false;
+    w2_uses.touch();
+    W2Entry& entry = w2[engine.feature];
+    w2_everything(cmd);
+    // The frame read and written in place when the stage can (sampled + storage, a storable format); else through an
+    // image of ours (an sRGB view's bytes as UNORM), copied in before and back after.
+    // A format the stage cannot store into goes through a wider one by blits (w2_work_format).
+    const VkImageUsageFlags rw = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+    bool blit = false;
+    const VkFormat twin = w2_work_format(handles.physical, colour.format, &blit);
+    if (!twin) {
+        status = "wilsjo2: the stage can neither store into the frame's format nor blit it into one it can";
+        return false;
+    }
+    const bool in_place = twin == colour.format && (colour.usage & rw) == rw;
+    ColourFrame target = colour;
+    const auto copy = [&](VkImage from, VkImageLayout from_layout, VkImage to, VkImageLayout to_layout) {
+        if (blit) {
+            VkImageBlit b{};
+            b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            b.srcOffsets[1] = b.dstOffsets[1] = {int32_t(colour.width), int32_t(colour.height), 1};
+            vkCmdBlitImage(cmd, from, from_layout, to, to_layout, 1, &b, VK_FILTER_NEAREST);
+            return;
+        }
+        VkImageCopy region{};
+        region.srcSubresource = region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.extent = {colour.width, colour.height, 1};
+        vkCmdCopyImage(cmd, from, from_layout, to, to_layout, 1, &region);
+    };
+    if (!in_place) {
+        if (!(colour.usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) || !(colour.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+            status = "the frame cannot be read and written in place or copied (its usage)";
+            return false;
+        }
+        W2Surface*& work = entry.work;
+        if (work && (work->format != twin || work->w != colour.width || work->h != colour.height)) w2_retire(work);
+        if (!work && !(work = w2_make(cmd, twin, colour.width, colour.height))) {
+            status = "wilsjo2: the frame's working copy could not be made";
+            return false;
+        }
+        if (blit) {
+            static bool said = false;
+            if (!said) { said = true; log("[nr] wilsjo2 (ReShade route): the frame's format %d is worked in format %d (blits in and back)", int(colour.format), int(twin)); }
+        }
+        w2_layout(cmd, colour.image, colour.before, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        copy(colour.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, work->image, VK_IMAGE_LAYOUT_GENERAL);
+        w2_layout(cmd, colour.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, colour.before);
+        target.image = work->image; target.format = work->format;
+        target.before = target.after = VK_IMAGE_LAYOUT_GENERAL;
+        target.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                       VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    }
+    SessionW2Io io(*this, cmd, target, engine, net, *wf.settings, engine.feature, wf.estimate_motion);
+    w2_fast_passes = 0.f; w2_fast_fallback = false; w2_spatial_on = false;
+    w2_motion = engine.motion.image != VK_NULL_HANDLE && wf.fast_motion;
+    nr::wilsjo2::FlowFrame ff;
+    ff.target = io.target();
+    ff.width = target.width; ff.height = target.height;
+    ff.unorm = w2_unorm(target.format);
+    ff.direct_ok = true;   // the stage reads and writes it in GENERAL at its extent (SessionW2Io::use)
+    ff.depth = io.depth();
+    ff.motion = io.motion();
+    char g[160];
+    std::snprintf(g, sizeof g, "%d:%ux%u:%d:%ux%u", int(engine.depth.format), engine.depth.width, engine.depth.height,
+                  int(engine.motion.format), engine.motion.width, engine.motion.height);
+    ff.guide_signature = g;
+    ff.depth_rect = {engine.depth_x, engine.depth_y, engine.depth.width, engine.depth.height};
+    ff.motion_rect = {engine.motion_x, engine.motion_y, engine.motion.width, engine.motion.height};
+    ff.flags = engine.depth_inverted ? (1u << 3) : 0u;
+    ff.hdr = wf.hdr;
+    ff.reset = engine.reset;
+    // the flow's MV scale in pixels of the motion region (as an NGX scale is), so that its peripheral compression maps
+    // them to native pixels; the network is given this route's own normalized scale (SessionW2Io::network)
+    ff.mv_x = engine.motion_scale_x * float(std::max(engine.motion.width, 1u));
+    ff.mv_y = engine.motion_scale_y * float(std::max(engine.motion.height, 1u));
+    ff.preprocess = wf.preprocess;
+    ff.at_present = true;
+    ff.fast_motion = wf.fast_motion;
+    const bool ran = nr::wilsjo2::flow_run(io, entry.flow, ff, *wf.settings, uint64_t(target.format));
+    w2_everything(cmd);
+    if (!in_place) {   // the answer (or the frame as it came) back into the frame
+        w2_layout(cmd, colour.image, colour.before, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        copy(entry.work->image, VK_IMAGE_LAYOUT_GENERAL, colour.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        w2_layout(cmd, colour.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, colour.after);
+    }
+    return ran;
+}
+
 bool Session::run_renodx(ID3D12Device* device, ID3D12GraphicsCommandList* list,
                          ID3D12Resource* output, D3D12_RESOURCE_STATES output_state,
                          const EngineResources& resources, const Controls& controls,
@@ -3129,7 +4091,8 @@ bool Session::run_renodx(ID3D12Device* device, ID3D12GraphicsCommandList* list,
     if (!resources.motion && Impl::renodx_needs_motion(rf)) return false;
     s.status.clear();
     if (!s.ensure_d3d12_device(device)) return false;
-    const VkCommandBuffer cmd = command_buffer(list);
+    Impl::Recording rec;
+    const VkCommandBuffer cmd = s.begin_recording(device, list, rec);
     if (!cmd) { s.status = "the command list exposes no Vulkan handle"; s.failed = true; return false; }
     const auto target = colour_handle(device, output, output_state);
     if (!target.usable()) { s.status = describe_rejection(target, "output"); return false; }
@@ -3210,9 +4173,164 @@ bool Session::run_renodx(ID3D12Device* device, ID3D12GraphicsCommandList* list,
     everything(VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
     if (!s.record_renodx(cmd, *stage, colour, out, engine, c, rf, have_exposure ? &exposure : nullptr)) return false;
     everything(VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
-    list->SetPipelineState(nullptr);
-    list->SetComputeRootSignature(nullptr);
-    s.forget_bound_pipeline(device, list);
+    s.leave_list(device, list, rec);
+    return true;
+}
+
+bool Session::record_raw(ID3D12Device* device, ID3D12GraphicsCommandList* list, const RawRecorder& recorder) {
+    auto& s = *impl_;
+    if (!device || !list || !recorder) return false;
+    if (!s.ensure_d3d12_device(device)) return false;
+    Impl::Recording rec;
+    const VkCommandBuffer cmd = s.begin_recording(device, list, rec);
+    if (!cmd) return false;
+    HostDevice host{};
+    host.instance = s.handles.instance; host.physical = s.handles.physical; host.device = s.handles.device;
+    host.queue = s.access.queue; host.queue_family = s.access.family;
+    const RawLookup lookup = [device](ID3D12Resource* r, D3D12_RESOURCE_STATES state, bool colour) {
+        RawImage out{};
+        if (!r) return out;
+        ResourceHandle h = colour ? colour_handle(device, r, state) : resource_handle(device, r, state);
+        if (!colour && h.image && h.format == VK_FORMAT_UNDEFINED) {   // as run_renodx reads an exposure texture
+            switch (h.dxgi) {
+                case DXGI_FORMAT_R32_TYPELESS: h.format = VK_FORMAT_R32_SFLOAT; break;
+                case DXGI_FORMAT_R16_TYPELESS: h.format = VK_FORMAT_R16_SFLOAT; break;
+                case DXGI_FORMAT_R32G32B32A32_TYPELESS: h.format = VK_FORMAT_R32G32B32A32_SFLOAT; break;
+                default: break;
+            }
+        }
+        out.image = h.image; out.format = h.format; out.width = h.width; out.height = h.height; out.layout = h.layout;
+        return out;
+    };
+    const auto everything = [&] {
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             0, 1, &mb, 0, nullptr, 0, nullptr);
+    };
+    everything();
+    bool ok = false;
+    try {
+        ok = recorder(cmd, host, lookup);
+    } catch (const std::exception& e) {
+        log("[nr] %s", e.what());
+        ok = false;
+    }
+    everything();
+    s.leave_list(device, list, rec);
+    return ok;
+}
+
+bool Session::record_raw_vk(VkCommandBuffer cmd, const RawRecorderVk& recorder) {
+    auto& s = *impl_;
+    if (!cmd || !recorder || !s.handles.valid() || !s.access.queue) return false;
+    HostDevice host{};
+    host.instance = s.handles.instance; host.physical = s.handles.physical; host.device = s.handles.device;
+    host.queue = s.access.queue; host.queue_family = s.access.family;
+    const auto everything = [&] {
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             0, 1, &mb, 0, nullptr, 0, nullptr);
+    };
+    everything();
+    bool ok = false;
+    try {
+        ok = recorder(cmd, host);
+    } catch (const std::exception& e) {
+        log("[nr] %s", e.what());
+        ok = false;
+    }
+    everything();
+    return ok;
+}
+
+bool Session::record_raw_d3d11(IUnknown* device, const RawRecorder11& recorder) {
+    auto& s = *impl_;
+    if (!device || !recorder || !s.dxvk || !s.handles.valid() || !s.access.queue) return false;
+    if (!s.raw11_pool) {
+        VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        pci.queueFamilyIndex = s.access.family;
+        if (vkCreateCommandPool(s.handles.device, &pci, nullptr, &s.raw11_pool) != VK_SUCCESS) { s.raw11_pool = {}; return false; }
+        VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        ai.commandPool = s.raw11_pool; ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ai.commandBufferCount = Impl::kRaw11;
+        bool made = vkAllocateCommandBuffers(s.handles.device, &ai, s.raw11_cmd) == VK_SUCCESS;
+        for (int i = 0; made && i < Impl::kRaw11; ++i) {
+            VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+            fi.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+            made = vkCreateFence(s.handles.device, &fi, nullptr, &s.raw11_fence[i]) == VK_SUCCESS;
+        }
+        if (!made) {
+            for (VkFence& f : s.raw11_fence) if (f) { vkDestroyFence(s.handles.device, f, nullptr); f = {}; }
+            vkDestroyCommandPool(s.handles.device, s.raw11_pool, nullptr);
+            s.raw11_pool = {};
+            return false;
+        }
+    }
+    const int slot = s.raw11_slot;
+    if (!s.raw11_fence[slot]) {   // a failed submit's fence that could not be made again (below): made here, or no NR now
+        VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        fi.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+        if (test_fault("raw11_fence") || vkCreateFence(s.handles.device, &fi, nullptr, &s.raw11_fence[slot]) != VK_SUCCESS) {
+            s.raw11_fence[slot] = {};
+            return false;
+        }
+    }
+    if (vkWaitForFences(s.handles.device, 1, &s.raw11_fence[slot], VK_TRUE, 2000000000ull) != VK_SUCCESS) return false;
+    const VkCommandBuffer cmd = s.raw11_cmd[slot];
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkResetCommandBuffer(cmd, 0) != VK_SUCCESS || vkBeginCommandBuffer(cmd, &bi) != VK_SUCCESS) return false;
+    auto unsubmitted = on_exit([&s] { s.discard_timing(); });
+    HostDevice host{};
+    host.instance = s.handles.instance; host.physical = s.handles.physical; host.device = s.handles.device;
+    host.queue = s.access.queue; host.queue_family = s.access.family;
+    const auto everything = [&] {
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
+        mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             0, 1, &mb, 0, nullptr, 0, nullptr);
+    };
+    const RawLookup11 lookup = [&](IUnknown* texture) {
+        RawImage out;
+        const ResourceHandle h = d3d11_image(texture, device);
+        if (!h.image) return out;
+        out.image = h.image; out.format = h.format; out.width = h.width; out.height = h.height; out.layout = h.layout;
+        return out;
+    };
+    everything();
+    bool ok = false;
+    try {
+        ok = recorder(cmd, host, lookup);
+    } catch (const std::exception& e) {
+        log("[nr] %s", e.what());
+        ok = false;
+    }
+    everything();
+    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) return false;
+    if (!ok) return false;   // nothing submitted (the slot's fence stays signalled)
+    if (vkResetFences(s.handles.device, 1, &s.raw11_fence[slot]) != VK_SUCCESS) return false;
+    VkResult r;
+    {
+        QueueAccess::Held held(s.access);   // the game's recorded work goes in front (DXVK's flush in the lock)
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
+        r = test_fault("raw11_submit") ? VK_ERROR_OUT_OF_DEVICE_MEMORY : vkQueueSubmit(s.access.queue, 1, &si, s.raw11_fence[slot]);
+    }
+    if (r != VK_SUCCESS) {   // the fence stays unsignalled: made again signalled so the slot is not waited on for ever
+        vkDestroyFence(s.handles.device, s.raw11_fence[slot], nullptr);
+        VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        fi.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+        if (test_fault("raw11_fence") || vkCreateFence(s.handles.device, &fi, nullptr, &s.raw11_fence[slot]) != VK_SUCCESS)
+            s.raw11_fence[slot] = {};
+        return false;
+    }
+    s.raw11_slot = (slot + 1) % Impl::kRaw11;
+    unsubmitted.armed = false;
     return true;
 }
 
@@ -3220,7 +4338,7 @@ bool Session::run_present(ID3D12Device* device, ID3D12GraphicsCommandList* list,
                           ID3D12Resource* back_buffer, unsigned width, unsigned height,
                           const Controls& controls) {
     auto& s = *impl_;
-    s.current_feature = 0;   // which network memory a new frame size prefers (Impl::inframe)
+    s.current_feature = Impl::kUnnamedStack;   // legacy Present entry, private to this session
     if (s.failed || !device || !list || !back_buffer) return false;
     s.status.clear();
     if (!s.ensure_d3d12_device(device)) return false;
@@ -3228,7 +4346,7 @@ bool Session::run_present(ID3D12Device* device, ID3D12GraphicsCommandList* list,
     if (!cmd) { s.status = "the command list exposes no Vulkan handle"; s.failed = true; return false; }
     const auto target = colour_handle(device, back_buffer, D3D12_RESOURCE_STATE_PRESENT);
     if (!target.usable()) { s.status = describe_rejection(target, "back buffer"); return false; }
-    if (!s.ensure_runtime(controls, target.width, target.height, target.format, false)) return false;
+    if (!s.ensure_runtime(controls, target.width, target.height, target.format)) return false;
 
     // Here the network works on the game's own buffer: there is nothing to hand
     // anyone afterwards, the frame just has to come out enhanced.
@@ -3238,8 +4356,8 @@ bool Session::run_present(ID3D12Device* device, ID3D12GraphicsCommandList* list,
     frame.width = target.width; frame.height = target.height;
     frame.before = frame.after = target.layout;
     try {
-        TemporalFrame temporal{};
-        s.runtime->record_temporal(cmd, frame, controls, temporal);
+        TemporalFrame temporal{false, s.current_feature};
+        s.runtime->record_temporal(cmd, frame, s.capture_controls(controls), temporal);
     } catch (const std::exception& e) {
         s.status = std::string("neural rendering failed: ") + e.what();
         s.failed = true;
@@ -3251,7 +4369,7 @@ bool Session::run_present(ID3D12Device* device, ID3D12GraphicsCommandList* list,
 
 bool Session::run_d3d11(const D3D11Frame& frame, const Controls& controls) {
     auto& s = *impl_;
-    s.current_feature = 0;   // which network memory a new frame size prefers (Impl::inframe)
+    s.current_feature = frame.feature;   // which network memory a new frame size prefers (Impl::inframe)
     if (s.failed || !frame.device || !frame.target) return false;
     s.status.clear();
 
@@ -3303,7 +4421,7 @@ bool Session::run_d3d11(const D3D11Frame& frame, const Controls& controls) {
         s.status = "the game's texture cannot be copied to and from; nothing to run on";
         return false;
     }
-    Controls renodx_controls{};
+    Controls renodx_controls{}, w2_controls{};
     renodx::Stage* renodx_stage = nullptr;
     if (frame.renodx) {
         if (!frame.motion && Impl::renodx_needs_motion(*frame.renodx)) {
@@ -3312,13 +4430,15 @@ bool Session::run_d3d11(const D3D11Frame& frame, const Controls& controls) {
         }
         const auto mv = frame.motion ? d3d11_image(frame.motion, frame.device) : decltype(d3d11_image(frame.motion, frame.device)){};
         uint32_t nw = target.width, nh = target.height;
-        s.renodx_extent(0, target.width, target.height, mv.width, mv.height, frame.renodx->settings, &nw, &nh);
+        s.renodx_extent(frame.feature, target.width, target.height, mv.width, mv.height, frame.renodx->settings, &nw, &nh);
         if (frame.renodx->settings.nr_enabled && !s.renodx_runtime(controls, nw, nh, &renodx_controls)) return false;
-        if (!(renodx_stage = s.renodx_stage(0, target.width, target.height, nw, nh, target.format, *frame.renodx)))
+        if (!(renodx_stage = s.renodx_stage(frame.feature, target.width, target.height, nw, nh, target.format, *frame.renodx)))
             return false;
-    } else if (!s.ensure_runtime(controls, target.width, target.height, target.format,
-                                 (frame.upscaler_input || frame.linear_hdr) && !frame.estimate_motion &&
-                                 Session::Impl::is_linear_format(target.format))) return false;
+    } else if (frame.wilsjo2) {
+        if (!s.wilsjo2_prepare(*frame.wilsjo2, frame.feature, target.width, target.height, target.format,
+                               frame.motion != nullptr, controls, &w2_controls))
+            return false;
+    } else if (!s.ensure_runtime(controls, target.width, target.height, target.format)) return false;
     if (!s.ensure_own_command_buffer()) return false;
     if (!s.wait_for_own_cmd()) return false;
 
@@ -3334,31 +4454,42 @@ bool Session::run_d3d11(const D3D11Frame& frame, const Controls& controls) {
     colour.usage = target.usage;
 
     EngineFrame engine{};
+    engine.feature = frame.feature;
     engine.colour = colour;
-    engine.reset = frame.reset || s.resized(0, colour.width, colour.height);
+    engine.reset = frame.reset || s.resized(frame.feature, colour.width, colour.height);
+    bool w2_ran = true;   // a wilsjo2 layer's flow ran (else the frame was left as it came; its commands still go in)
     engine.motion_scale_x = frame.motion_scale_x;
     engine.motion_scale_y = frame.motion_scale_y;
     engine.depth_inverted = frame.depth_inverted;
     const bool motion = frame.motion && fill(&engine.motion, d3d11_image(frame.motion, frame.device));
     if (frame.depth) fill(&engine.depth, d3d11_image(frame.depth, frame.device));
 
+    auto unsubmitted = on_exit([&s] { s.discard_timing(); });
     try {
         VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkResetCommandBuffer(s.own_cmd, 0);
         vkBeginCommandBuffer(s.own_cmd, &bi);
-        if (renodx_stage) {
+        if (frame.wilsjo2) {
+            OwnOuterRun timing(*this, s.own_cmd, s.call_layer > 0 && !s.outer_open);
+            Wilsjo2Frame wf = *frame.wilsjo2;
+            wf.estimate_motion = wf.estimate_motion || frame.estimate_motion;
+            w2_ran = s.record_wilsjo2(s.own_cmd, colour, engine, w2_controls, wf);
+        } else if (renodx_stage) {
             if (!motion && Impl::renodx_needs_motion(*frame.renodx)) { vkEndCommandBuffer(s.own_cmd); return false; }
             if (!s.record_renodx(s.own_cmd, *renodx_stage, colour, colour, engine, renodx_controls, *frame.renodx)) {
                 vkEndCommandBuffer(s.own_cmd);
                 return false;
             }
-        } else if (motion) s.runtime->record_engine(s.own_cmd, engine, controls);
-        else if (frame.estimate_motion) {
-            TemporalFrame temporal{}; temporal.reset = frame.reset;
-            s.runtime->record_temporal(s.own_cmd, colour, controls, temporal);
         } else {
-            s.runtime->record(s.own_cmd, colour, controls, frame.reset);
+            OwnOuterRun timing(*this, s.own_cmd, s.call_layer > 0 && !s.outer_open);
+
+            if (motion) s.runtime->record_engine(s.own_cmd, engine, s.capture_controls(controls));
+            else if (frame.estimate_motion) {
+                TemporalFrame temporal{engine.reset, frame.feature};
+                s.runtime->record_temporal(s.own_cmd, colour, s.capture_controls(controls), temporal);
+            } else s.runtime->record(s.own_cmd, colour, s.capture_controls(controls), frame.reset);
+
         }
         vkEndCommandBuffer(s.own_cmd);
     } catch (const std::exception& e) {
@@ -3376,14 +4507,15 @@ bool Session::run_d3d11(const D3D11Frame& frame, const Controls& controls) {
         QueueAccess::Held held(s.access);
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         si.commandBufferCount = 1; si.pCommandBuffers = &s.own_cmd;
-        r = vkQueueSubmit(s.access.queue, 1, &si, s.own_fence);
+        r = test_fault("own_submit") ? VK_ERROR_OUT_OF_DEVICE_MEMORY : vkQueueSubmit(s.access.queue, 1, &si, s.own_fence);
         if (r == VK_SUCCESS) s.own_cmd_pending = true;
     }
     if (r != VK_SUCCESS) {
         s.status = "the submit on the game's queue failed";
         return false;
     }
-    return true;
+    unsubmitted.armed = false;
+    return w2_ran;
 }
 
 bool Session::run_present_vulkan(const DeviceHandles& handles, VkQueue queue, uint32_t family,
@@ -3393,7 +4525,7 @@ bool Session::run_present_vulkan(const DeviceHandles& handles, VkQueue queue, ui
                                  VkSemaphore* signalled, bool temporal,
                                  const Controls& controls) {
     auto& s = *impl_;
-    s.current_feature = 0;   // which network memory a new frame size prefers (Impl::inframe)
+    s.current_feature = Impl::kUnnamedStack;   // legacy Present entry, private to this session
     if (s.failed || !image || !queue || !handles.valid() || !signalled) return false;
     s.status.clear();
     s.handles = handles;
@@ -3443,7 +4575,7 @@ bool Session::run_present_vulkan(const DeviceHandles& handles, VkQueue queue, ui
     for (auto& other : s.slots) if (!s.wait_slot(other)) return false;
     // Only after the slot is free: rebuilding the runtime destroys images this
     // slot's command buffer may still be reading.
-    if (!s.ensure_runtime(controls, width, height, format, false)) return false;
+    if (!s.ensure_runtime(controls, width, height, format)) return false;
 
     // A swapchain image at present time is in PRESENT_SRC. The pass transfers in
     // and out of it, and leaves it exactly as it found it: the present that
@@ -3457,16 +4589,17 @@ bool Session::run_present_vulkan(const DeviceHandles& handles, VkQueue queue, ui
     static bool first = true;
     if (first) log("[nr] first fallback frame: %ux%u format %d on queue family %u, image %u of %u",
                    width, height, int(format), family, slot_index, slot_count);
+    auto unsubmitted = on_exit([&s] { s.discard_timing(); });
     try {
         VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkResetCommandBuffer(slot.cmd, 0);
         vkBeginCommandBuffer(slot.cmd, &bi);
         if (temporal) {
-            TemporalFrame frame{};
-            s.runtime->record_temporal(slot.cmd, colour, controls, frame);
+            TemporalFrame frame{false, s.current_feature};
+            s.runtime->record_temporal(slot.cmd, colour, s.capture_controls(controls), frame);
         } else {
-            s.runtime->record(slot.cmd, colour, controls);
+            s.runtime->record(slot.cmd, colour, s.capture_controls(controls));
         }
         vkEndCommandBuffer(slot.cmd);
     } catch (const std::exception& e) {
@@ -3486,11 +4619,12 @@ bool Session::run_present_vulkan(const DeviceHandles& handles, VkQueue queue, ui
     si.pCommandBuffers = &slot.cmd;
     si.signalSemaphoreCount = 1;
     si.pSignalSemaphores = &slot.done;
-    if (vkQueueSubmit(queue, 1, &si, slot.fence) != VK_SUCCESS) {
+    if (test_fault("slot_submit") || vkQueueSubmit(queue, 1, &si, slot.fence) != VK_SUCCESS) {
         s.status = "the submit before present failed";
         return false;
     }
     slot.pending = true;
+    unsubmitted.armed = false;
     *signalled = slot.done;
     if (first) { first = false; log("[nr] first fallback frame submitted"); }
     return true;
@@ -3500,12 +4634,27 @@ void Session::set_vulkan_queue(VkQueue queue, uint32_t family) {
     if (!queue) return;
     impl_->access.queue = queue;
     impl_->access.family = family;
-    // No lock: this queue belongs to the game and nothing else in this process
-    // shares it through an interop layer, so there is no mutex to take. The
-    // caller records into the command buffer the upscaler handed over, which the
-    // game submits itself; only the one-off weight upload submits here.
-    impl_->access.lock = nullptr;
-    impl_->access.unlock = nullptr;
+    // The caller records into the command buffer the upscaler handed over, which the game submits itself; only the
+    // builds submit here (the weight upload, on the background thread), onto the game's own queue. Vulkan wants
+    // every call on one queue serialised: on the .asi route the game's queue calls take the queue's lock
+    // (vkdevice::enable_queue_locks), and ours take it too. Elsewhere (ReShade as a Vulkan layer serialises its own)
+    // there is no lock to take, as before.
+    if (vkdevice::queue_locks_enabled()) {
+        impl_->access.lock = impl_->access.lock_quiet = [queue] { vkdevice::lock_queue(queue); };
+        impl_->access.unlock = impl_->access.unlock_quiet = [queue] { vkdevice::unlock_queue(queue); };
+    } else {
+        impl_->access.lock = nullptr;
+        impl_->access.unlock = nullptr;
+    }
+}
+
+void Session::set_queue_lock(std::function<void()> lock, std::function<void()> unlock) {
+    impl_->access.lock = impl_->access.lock_quiet = lock;
+    impl_->access.unlock = impl_->access.unlock_quiet = unlock;
+}
+
+void Session::set_vulkan_handles(const DeviceHandles& handles) {
+    if (handles.valid()) impl_->handles = handles;
 }
 
 VkImageView Session::vulkan_output_view() const { return impl_->vk_output_view; }
@@ -3521,7 +4670,7 @@ VkImage Session::run_vulkan(const DeviceHandles& handles, VkCommandBuffer cmd,
     // A Vulkan game gives us no D3D12 resource to hand back, so the output is a
     // plain VkImage of our own rather than one borrowed from a D3D12 allocation -
     // unless the caller takes the answer in its own image (VulkanFrame::in_place).
-    Controls renodx_controls{};
+    Controls renodx_controls{}, w2_controls{};
     renodx::Stage* renodx_stage = nullptr;
     if (frame.renodx) {
         if (!frame.motion && Impl::renodx_needs_motion(*frame.renodx)) {
@@ -3538,6 +4687,10 @@ VkImage Session::run_vulkan(const DeviceHandles& handles, VkCommandBuffer cmd,
         if (!(renodx_stage = s.renodx_stage(frame.feature, frame.width, frame.height, nw, nh, frame.colour_format,
                                             *frame.renodx)))
             return VK_NULL_HANDLE;
+    } else if (frame.wilsjo2) {
+        if (!s.wilsjo2_prepare(*frame.wilsjo2, frame.feature, frame.width, frame.height, frame.colour_format,
+                               frame.motion != VK_NULL_HANDLE, controls, &w2_controls))
+            return VK_NULL_HANDLE;
     } else {
     if (!frame.in_place && !s.vk_output_valid(frame.width, frame.height, frame.colour_format)) {
         if (!s.ensure_vk_output(frame.width, frame.height, frame.colour_format))
@@ -3545,9 +4698,7 @@ VkImage Session::run_vulkan(const DeviceHandles& handles, VkCommandBuffer cmd,
     }
     s.size_hint_px = std::max(uint64_t(frame.motion ? frame.motion_width : 0) * (frame.motion ? frame.motion_height : 0),
                               uint64_t(frame.depth ? frame.depth_width : 0) * (frame.depth ? frame.depth_height : 0));
-    if (!s.ensure_runtime(controls, frame.width, frame.height, frame.colour_format,
-                          (frame.upscaler_input || frame.linear_hdr) &&
-                              Session::Impl::is_linear_format(frame.colour_format)))
+    if (!s.ensure_runtime(controls, frame.width, frame.height, frame.colour_format))
         return VK_NULL_HANDLE;
     }
 
@@ -3601,6 +4752,23 @@ VkImage Session::run_vulkan(const DeviceHandles& handles, VkCommandBuffer cmd,
         apply_guide_subrect(&engine.depth, frame.depth_subrect, "depth", &engine.depth_x, &engine.depth_y);
     }
 
+    if (frame.wilsjo2) {   // a wilsjo2 layer (the ReShade route): its flow on `colour`, in place
+        ColourFrame in{};
+        in.image = frame.colour; in.format = frame.colour_format; in.width = frame.width; in.height = frame.height;
+        in.before = in.after = frame.colour_layout; in.usage = frame.colour_usage;
+        engine.colour = in;
+        bool ran = false;
+        try {
+            OwnOuterRun timing(*this, cmd, s.call_layer > 0 && !s.outer_open);
+            ran = s.record_wilsjo2(cmd, in, engine, w2_controls, *frame.wilsjo2);
+        } catch (const std::exception& e) {
+            s.status = std::string("neural rendering failed: ") + e.what();
+            s.failed = true;
+            log("[nr] %s", s.status.c_str());
+            return VK_NULL_HANDLE;
+        }
+        return ran ? frame.colour : VK_NULL_HANDLE;
+    }
     if (renodx_stage) {
         ColourFrame in{}, out{};
         in.image = frame.colour; in.format = frame.colour_format; in.width = frame.width; in.height = frame.height;
@@ -3621,9 +4789,12 @@ VkImage Session::run_vulkan(const DeviceHandles& handles, VkCommandBuffer cmd,
         if (!s.record_renodx(cmd, *renodx_stage, in, out, engine, renodx_controls, *frame.renodx, ex)) return VK_NULL_HANDLE;
         return out.image;
     }
+    OwnOuterRun timing(*this, cmd, s.call_layer > 0 && !s.outer_open);
     if (direct) {
         try {
-            s.runtime->record_engine(cmd, engine, controls);
+
+            s.runtime->record_engine(cmd, engine, s.capture_controls(controls));
+
         } catch (const std::exception& e) {
             s.status = std::string("neural rendering failed: ") + e.what();
             s.failed = true;
@@ -3634,8 +4805,10 @@ VkImage Session::run_vulkan(const DeviceHandles& handles, VkCommandBuffer cmd,
     }
     if (frame.in_place) {
         try {
-            if (frame.motion) s.runtime->record_engine(cmd, engine, controls);
-            else s.runtime->record(cmd, colour, controls, engine.reset);
+
+            if (frame.motion) s.runtime->record_engine(cmd, engine, s.capture_controls(controls));
+            else s.runtime->record(cmd, colour, s.capture_controls(controls), engine.reset);
+
         } catch (const std::exception& e) {
             s.status = std::string("neural rendering failed: ") + e.what();
             s.failed = true;
@@ -3664,8 +4837,10 @@ VkImage Session::run_vulkan(const DeviceHandles& handles, VkCommandBuffer cmd,
         b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                              0, 0, nullptr, 0, nullptr, 1, &b);
-        if (frame.motion) s.runtime->record_engine(cmd, engine, controls);
-        else s.runtime->record(cmd, colour, controls, engine.reset);
+
+        if (frame.motion) s.runtime->record_engine(cmd, engine, s.capture_controls(controls));
+        else s.runtime->record(cmd, colour, s.capture_controls(controls), engine.reset);
+
     } catch (const std::exception& e) {
         s.status = std::string("neural rendering failed: ") + e.what();
         s.failed = true;

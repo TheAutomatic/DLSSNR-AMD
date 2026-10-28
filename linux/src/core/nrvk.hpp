@@ -11,6 +11,7 @@
 // them back without staging; the adapter that owns the game's VkDevice will
 // allocate the same arenas out of device-local memory.
 #pragma once
+#include "nr_gpu_completion.hpp"
 #if NR_INT4
 #include "nr_build_cfg.hpp"
 #include "nr_log.hpp"
@@ -64,7 +65,7 @@ struct Buffer {
 
 // Device memory several runtimes' images take turns in (the resize path): two regions; a runtime built at a new frame
 // size takes its images from the region the size before it did not use, so the memory of the sizes a game's dynamic
-// resolution leaves behind is reused at once instead of waiting for their retirement. A region's previous runtime is
+// resolution leaves behind is reused after its recordings finish and are reset. A region's previous runtime is
 // stale from then on (`gen`) and never recorded again; its images alias the new ones, which the GPU sees in order
 // after a full barrier (the new runtime's first transitions are from UNDEFINED). An image that does not fit takes
 // memory of its own, and `need` says how big the regions should have been.
@@ -75,6 +76,7 @@ struct ImageHeap {
     VkDeviceSize region_cap{};
     VkDeviceSize cursor[2]{};
     uint64_t gen[2]{};
+    nr::gpu::Uses uses[2];   // executable or pending recordings also retain aliased memory regions
     VkDeviceSize need[2]{};   // bytes the region's runtime asked for, fitted or not
     ImageHeap() = default;
     ImageHeap(const ImageHeap&) = delete;

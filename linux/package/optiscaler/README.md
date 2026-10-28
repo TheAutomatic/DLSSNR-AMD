@@ -1,5 +1,9 @@
 # DLSS Neural Rendering on AMD, through OptiScaler
 
+> Since 0.0.8 the Linux packages use the official OptiScaler with this project's NR as an OptiScaler plugin
+> (`dlssnr-amd.asi`, see `docs/ARCHITECTURE.md`); of this folder only `patch_ini.py` is used. What follows describes
+> the NGX-core backend for the OptiScaler-NR fork, which the Windows package still uses (`windows/`).
+
 OptiScaler's DLSS-NR forks already know how to find a game's colour, depth and motion vectors, encode
 a display-referred proxy, run a Neural Rendering model over it and composite the answer back. What
 they do not have is a model that runs on a Radeon: they reach NVIDIA's `nvngx_dlssnr.dll`, and that

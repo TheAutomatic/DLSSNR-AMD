@@ -54,8 +54,10 @@ source linux/build/arch/rdna4.sh
 "$cxx" "${common[@]}" -c linux/src/core/nr_renodx.cpp -o "$out/nr_renodx.o"
 "$cxx" "${common[@]}" -c linux/src/pe/nr_pe_log.cpp -o "$out/log.o"
 "$cxx" "${common[@]}" -c linux/src/pe/nr_pe_interop.cpp -o "$out/interop.o"
+"$cxx" "${common[@]}" -c linux/src/pe/nr_vram_ledger.cpp -o "$out/vram_ledger.o"
 "$cxx" "${common[@]}" -I"$minhook/include" -c linux/src/pe/nr_pe_vkdevice.cpp -o "$out/vkdevice.o"
 "$cxx" "${common[@]}" -c linux/src/pe/nr_pe_session.cpp -o "$out/session.o"
+"$cxx" "${common[@]}" -c linux/src/core/nr_wilsjo2.cpp -o "$out/nr_wilsjo2.o"   # the session's wilsjo2 flow (ReShade layers)
 "$cxx" "${common[@]}" -c linux/src/pe/nr_pe_config.cpp -o "$out/config.o"
 "$cxx" "${common[@]}" -c linux/src/pe/nr_dlssnr_model.cpp -o "$out/model.o"
 "$cxx" "${common[@]}" -c linux/src/pe/nr_pe_renodx_route.cpp -o "$out/renodx_route.o"
@@ -78,13 +80,15 @@ ldflags=(-ld3d12 -ldxgi -lole32 -static -static-libgcc -static-libstdc++)
 # Vulkan is resolved at run time rather than imported, exactly as in build_package.sh: a static
 # import of vulkan-1.dll forces winevulkan up before the game's graphics stack, which has killed a
 # real game. This link is expected to fail; its failure is the input to the next step.
-shared_objs=("$out/model.o" "$out/session.o" "$out/config.o" "$out/interop.o" "$out/log.o" "$out/vkdevice.o"
-             "$out/nr_runtime.o" "$out/nr_native_plan.o" "$out/nr_renodx.o" "$out/renodx_route.o" "$out/control.o" "$out/screenshot.o" "$out"/mh_*.o)
+shared_objs=("$out/model.o" "$out/session.o" "$out/config.o" "$out/interop.o" "$out/vram_ledger.o" "$out/log.o" "$out/vkdevice.o"
+             "$out/nr_runtime.o" "$out/nr_native_plan.o" "$out/nr_renodx.o" "$out/nr_wilsjo2.o" "$out/renodx_route.o" "$out/control.o" "$out/screenshot.o" "$out"/mh_*.o)
 forwarder_objs=("$out/forwarder.o" "${shared_objs[@]}")
 core_objs=("$out/ngx_core.o" "$out/optifix.o" "${shared_objs[@]}")
 # Both links contribute undefined vk* names; the probe link takes every object either DLL uses so one
 # generated thunk file serves both.
-undefined=$({ "$cxx" -shared -o /dev/null "${forwarder_objs[@]}" "$out/ngx_core.o" "$out/optifix.o" "${ldflags[@]}" 2>&1 || true; } |
+extra_vk_objs=()
+[[ ${NR_ASI_VK_OBJECTS:-0} == 1 ]] && extra_vk_objs=("$out/menu.o" "$out/im_imgui_impl_vulkan.o")
+undefined=$({ "$cxx" -shared -o /dev/null "${extra_vk_objs[@]}" "${forwarder_objs[@]}" "$out/ngx_core.o" "$out/optifix.o" "${ldflags[@]}" 2>&1 || true; } |
     grep -o "undefined reference to \`_*vk[A-Za-z0-9_@]*'" | sed "s/.*\`//; s/'//" | sort -u)
 count=$(echo "$undefined" | grep -c . || true)
 plain() { echo "$1" | sed 's/^_//; s/@[0-9]*$//'; }

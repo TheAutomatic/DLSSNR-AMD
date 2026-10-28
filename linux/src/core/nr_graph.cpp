@@ -24,6 +24,7 @@
 #include "nr_shader_manifest.hpp"
 #include "nr_activation_lut.hpp"
 #include "nr_log.hpp"
+#include "nr_vram_tag.hpp"
 #include "nrvk.hpp"
 #include "telemetry.hpp"
 #include "tinlayout.hpp"
@@ -239,6 +240,7 @@ static bool tchain_pair(const std::string& p, const std::string& q) {
 // after their push block as this file declares it (gemm1x1 pipelines therefore
 // all build NR_GEMM_REMAP_PC=1, so their block ends with `remap` like PushGemm).
 static bool tchain_kern(const std::string& k00) {
+    if (k00 == "fswin32nhd") return tchain_kern("fswin32nh");   // the decoder's copy (CC_SMALL_FP8_EXPERIMENTAL)
 #if NR_INT4
     {   // the int4 pipelines and the hard-swish route's "<kern>p" (NR_HS_ROUTE) chain like their base kernels
         std::string k = i4base(k00);
@@ -1602,6 +1604,9 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         }
     }
     const bool swin_bias_f16 = swin_bias_storage == "fp16";
+    // CC_SMALL_FP8_EXPERIMENTAL (build_network.py --experimental): fixed-attention.txt lists the pipelines whose window
+    // attention is a fixed probability table (NR_FIXP); the table follows each one-head C=32 layer's bias.
+    const bool fixed_attention = std::filesystem::exists(spv_dir + "/fixed-attention.txt");
     std::printf("Swin position bias storage: %s; FP32 logit addition\n", swin_bias_storage.c_str());
     const uint32_t repeats = uint32_t(std::atoi(arg(argc, argv, "--repeats", "1")));
     const uint32_t warm = uint32_t(std::atoi(arg(argc, argv, "--warmup", "0")));
@@ -2345,6 +2350,14 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                 g_audit_bias = bias;
                 // Recovered position bias is already FP16. Widen only when
                 // adding it to FP32 logits; no new numerical rounding.
+                if (fixed_attention && !swin_bias_f16 && heads == 1 && C == 32) {
+                    // the fixed probability table right after the bias: [query][key] = e4m3(f16(baked bias)), the
+                    // trained probabilities (attn_pos_bias.bin carries them as bias = (P - 1.30078125) / 0.044921875)
+                    std::vector<uint8_t> blob(bias.size() * 4 + 4096);
+                    std::memcpy(blob.data(), bias.data(), bias.size() * 4);
+                    for (size_t i = 0; i < 4096; ++i) blob[bias.size() * 4 + i] = tin::f_to_e4m3(tin::round_f16(bias[i]));
+                    p.b_off = uint32_t(put(blob, 16) / 4);
+                } else
                 p.b_off = swin_bias_f16 ? uint32_t(put_f16(bias) / 2)
                                        : uint32_t(put_f32(bias) / 4);
                 // NR_BIAS_TABLE (research, SPVs built with it): the 64x64 bias of a
@@ -5132,11 +5145,17 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         } else {
             const size_t room = size_t(double(act_bytes) * std::max(1.0, act_slack) + 255) / 256 * 256;
             auto a = std::make_shared<GraphAct>();
-            a->device = ctx.device; a->buf = ctx.buffer(room); a->cap = room;
+            {
+                nr::vram::Scope kind(nr::vram::kActivations);
+                a->device = ctx.device; a->buf = ctx.buffer(room); a->cap = room;
+            }
             arenas->act = std::move(a);
         }
         arenas->act_need = act_bytes;
-        act = arenas->act->buf; wgt = ctx.buffer(std::max(wgt_bytes, wblob.size()));
+        {
+            nr::vram::Scope kind(nr::vram::kWeights);
+            act = arenas->act->buf; wgt = ctx.buffer(std::max(wgt_bytes, wblob.size()));
+        }
         arenas->device = ctx.device; arenas->wgt = wgt;
         arenas->wgt_cap = std::max(wgt_bytes, wblob.size()); arenas->weights_end = weights_end;
         ctx.pin = &arenas->pipelines;
@@ -5300,6 +5319,15 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                     return f.shift == 0 && f.shift_y == 0 && f.tiles_x == 2u * d.gx && f.tiles_y == 2u * d.gy; }()) &&
                 std::filesystem::exists(spv_dir + "/g_" + d.kern + "nh.spv")) { d.kern += "nh"; ++n; }
         if (n) std::printf("exp upper clamp dead (weights): %d C=32 dispatches\n", n);
+    }
+    // CC_SMALL_FP8_EXPERIMENTAL: the decoder's plain C=32 layers (after the ViT) on their own pipeline when the network
+    // has it, so they can differ from the encoder's layers of the same kernel (fixed attention on the decoder's only).
+    {
+        int n = 0;
+        for (Disp& d : disp)
+            if (d.s && d.s->block >= 22 && d.kern == "fswin32nh" && std::filesystem::exists(spv_dir + "/g_fswin32nhd.spv")) {
+                d.kern = "fswin32nhd"; ++n; }
+        if (n) std::printf("decoder C=32 pipeline: %d dispatches\n", n);
     }
 #if NR_INT4
     // NR_HS_ROUTE=b+b+...: C=32 dispatches of these blocks take the "<kern>p" pipeline (built with the
