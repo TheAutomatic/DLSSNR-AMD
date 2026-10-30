@@ -63,11 +63,11 @@ Measured facts worth knowing before changing kernels:
 
 - The version comes from git tags only (`*/build/version.sh`): tag `v0.0.1` builds as `0.0.1`, later
   commits as `0.0.1-3-g1a2b3c4`. Package names and the DLLs' log lines carry it.
-- Releasing: `git tag v0.0.2 && git push origin v0.0.2`. CI (.github/workflows/packages.yml) builds
-  the Linux packages and the Windows package and publishes a GitHub release. For a Linux-only release,
-  set the repository variable `WINDOWS_PACKAGE` to `off` first (`gh variable set WINDOWS_PACKAGE --body off`).
-  A tag with `-win-` in it (`v0.0.4-win-preview`) is a Windows-only release: CI builds no Linux packages and
-  does not mark the release latest.
+- Releasing: `git tag v0.0.2 && git push origin v0.0.2`. CI (`.gitlab-ci.yml`) builds the Linux packages
+  and the Windows package and publishes a GitLab release (the packages in the project's generic package
+  registry). For a Linux-only release, set the CI/CD variable `WINDOWS_PACKAGE` to `off` first
+  (`glab variable set WINDOWS_PACKAGE off`).
+  A tag with `-win-` in it (`v0.0.4-win-preview`) is a Windows-only release: CI builds no Linux packages.
   A tag with `-linux-` in it (`v0.0.6-linux-preview`) is a Linux-only release: CI builds no Windows package.
 
 ## Style

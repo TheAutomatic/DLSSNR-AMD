@@ -154,7 +154,7 @@ NvngxPath=<game-dir>\dlssnr_core.dll
 - `[DlssNr] WhitePointSource=1` — the white point from the game's own exposure (the 1x1 exposure
   texture and pre-exposure it hands DLSS), as v0.8.4 did by default. v0.8.5 made 0, a fixed paper
   white, the default; a game that supplies its exposure then gets a different picture (upstream
-  issue #96: "NR does nothing" until "game exposure" is chosen). A frame without a valid exposure
+  issue 96: "NR does nothing" until "game exposure" is chosen). A frame without a valid exposure
   texture falls back to the paper white either way. v0.8.4's ini has no such key (1 is its built-in
   default), so the key is optional: rewritten where present, not an error where absent.
 - `[Spoofing]` stays at the release's `auto` values: `StreamlineSpoofing` is true, `Dxgi` is true on

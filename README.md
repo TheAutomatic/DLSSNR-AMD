@@ -34,8 +34,8 @@ graphics cards.
   driver's compiler) and ships in the package, and comes close to Linux (see [Performance](#performance)); see
   [Windows](#windows).
 - **RX 7000 and Radeon 700M / 800M / 8000S graphics (RDNA3), Windows only, experimental:** `CC_SMALL_FP8` and
-  `CC_SILVER_AARDWOLD`, thanks to [TheAutomatic](https://github.com/TheAutomatic)
-  ([#26](https://github.com/mochizuki0323/DLSSNR-AMD/pull/26)) and to [mauri870](https://github.com/mauri870), whose
+  `CC_SILVER_AARDWOLD`, thanks to [TheAutomatic](https://github.com/TheAutomatic) and
+  to [mauri870](https://github.com/mauri870), whose
   [DLSSNR-RDNA3](https://github.com/mauri870/DLSSNR-RDNA3) port it builds on. Tried on few machines; expect more
   problems than on RX 9000, and for now it may not match the stability and performance of DLSSNR-RDNA3 (see
   [Windows](#windows)).
@@ -87,7 +87,7 @@ instructions, and their network runs FP16 in place of FP8. Older cards are not s
 `CC_SMALL_FP8` and `CC_SMALL_FP8_EXPERIMENTAL` (310.9.16), GPU time of the network per frame on an RX 9070 XT
 (network only). Linux **measured in game** (`CC_SMALL_FP8` with v0.0.6-linux-preview, `CC_SMALL_FP8_EXPERIMENTAL`
 with 0.0.8); Windows with the driver's own compiler from
-[#13](https://github.com/mochizuki0323/DLSSNR-AMD/pull/13); Windows with ACO's machine code not measured (it runs the
+an earlier pull request; Windows with ACO's machine code not measured (it runs the
 same machine code as Linux):
 
 | | 1080p | 1440p | 4K |
@@ -416,7 +416,7 @@ quicker.
 
 **RX 7000 and Radeon 700M / 800M / 8000S graphics (RDNA3), experimental.** `CC_SMALL_FP8` and
 `CC_SILVER_AARDWOLD` as ACO's machine code, made and tested by
-[TheAutomatic](https://github.com/TheAutomatic) ([#26](https://github.com/mochizuki0323/DLSSNR-AMD/pull/26)),
+[TheAutomatic](https://github.com/TheAutomatic),
 building on [mauri870](https://github.com/mauri870)'s [DLSSNR-RDNA3](https://github.com/mauri870/DLSSNR-RDNA3).
 Tried on few machines: expect more problems than on RX 9000, and for now it may not match the stability and
 performance of DLSSNR-RDNA3.
