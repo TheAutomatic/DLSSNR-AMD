@@ -84,7 +84,8 @@ windows:
       - artifacts/ref
   script:
     - apt-get update
-    - apt-get install -y --no-install-recommends ca-certificates git curl cmake ninja-build mingw-w64 python3
+    # g++: windows/package/model-tools/build_extract_model.sh builds the native model extractor
+    - apt-get install -y --no-install-recommends ca-certificates git curl cmake ninja-build mingw-w64 g++ python3
       p7zip-full
     - bash fetch_deps.sh --windows
     - bash windows/build/build_package.sh   # builds the Vulkan loader and the OptiScaler DLLs too
