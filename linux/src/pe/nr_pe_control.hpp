@@ -8,6 +8,12 @@
 #include <string>
 #include <vector>
 
+// A text the menus show as it comes and translate there (nr_lang.hpp tr_text): make_lang.py takes the literal into
+// the language file.
+#ifndef NR_N
+#define NR_N(text) text
+#endif
+
 namespace nr::control { struct Shared; }
 
 namespace nr::pe::control {
@@ -30,6 +36,7 @@ struct Status {
     float fast_passes = 0.f;
     bool motion = false, fast_fallback = false;
     bool waiting = false;                  // the run passed its frame through, not building (`waiting_why`)
+    bool ran = false;                      // this run's network ran (a switch builds behind the network before)
     std::string waiting_why;
     bool vram_known = false;               // the process's device-local heap: use, budget, size (Session::video_memory)
     uint64_t vram_usage = 0, vram_budget = 0, vram_heap = 0;

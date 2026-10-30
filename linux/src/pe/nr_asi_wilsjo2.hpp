@@ -30,6 +30,7 @@ struct Wilsjo2Frame {
     float pre_exposure = 1.0f;          // DLSS.Pre.Exposure as given (sanitised by the flow)
     float mv_x = 1.0f, mv_y = 1.0f;     // the game's MV scale (non-finite or 0 -> 1)
     nr::dlssnr::Rect depth_rect, motion_rect;   // the guide regions
+    uint32_t out_w = 0, out_h = 0;      // the upscaler's output, for NR Control (0: the frame's own extent)
 };
 
 // One OptiScaler feature's wilsjo2 state at one placement: the surfaces, the model's feature, the reset latch.
@@ -107,6 +108,7 @@ struct Wilsjo2VkFrame {
     float pre_exposure = 1.0f;
     float mv_x = 1.0f, mv_y = 1.0f;
     nr::dlssnr::Rect depth_rect, motion_rect;
+    uint32_t out_w = 0, out_h = 0;   // as Wilsjo2Frame's
 };
 struct Wilsjo2VkOwner;
 Wilsjo2VkOwner* wilsjo2_vk_owner();

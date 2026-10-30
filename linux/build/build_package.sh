@@ -22,6 +22,8 @@ set -euo pipefail
 model=${NR_MODEL:+$(realpath -- "$NR_MODEL")}
 small=${NR_MODEL_SMALL:+$(realpath -- "$NR_MODEL_SMALL")}
 cd -- "$(dirname -- "$0")/../.."
+bash linux/build/check_paths.sh   # UTF-8 paths only in the Windows code (a game folder with any letters)
+bash linux/build/check_imgui.sh   # ReShade's ImGui is MSVC's: no ImVec2-returning call from the add-on's code
 arch=${NR_ARCH:-x86_64}
 case "$arch" in x86_64|i686) ;; *) echo "NR_ARCH must be x86_64 or i686" >&2; exit 2;; esac
 if [[ "$arch" == i686 ]]; then default_out=artifacts/package-build/nr32; bits=32; else default_out=artifacts/package-build/nr; bits=64; fi
@@ -298,12 +300,12 @@ sed 's/^PreprocessorDefinitions=.*/&,RESHADE_DEPTH_INPUT_IS_REVERSED=0/' "$rs/Re
 # wilsjo2 processing's shaders are in dlssnr-amd\shaders\wilsjo2 for every route, assemble_product_data.sh). The plugin
 # is built with the int4 mixed network (it adds that network's device extensions itself: no Vulkan layer on this route).
 if [[ "$arch" == x86_64 ]]; then
-    opti_7z=${NR_OPTI_ARCHIVE:-artifacts/ref/downloads/OptiScaler_v10.0.0-pre1_20261028.7z}
-    opti_license=${NR_OPTI_LICENSE:-artifacts/ref/optiscaler-nightly-20261028/LICENSE}
+    opti_7z=${NR_OPTI_ARCHIVE:-artifacts/ref/downloads/OptiScaler_v10.0.0-pre1_20261030.7z}
+    opti_license=${NR_OPTI_LICENSE:-artifacts/ref/optiscaler-nightly-20261030/LICENSE}
     [[ -f "$opti_7z" && -f "$opti_license" ]] || { echo "missing $opti_7z or $opti_license" >&2; exit 1; }
     if [[ -z "${NR_OPTI_ARCHIVE:-}" ]]; then   # the archive the package was tested with
-        [[ "$(sha256sum -- "$opti_7z" | cut -d' ' -f1)" == e3a4f533d19a5818a821093f7dcbd9698b96b9b60dcb0e577c569a0b33c94a33 ]] ||
-            { echo "$opti_7z is not the tested OptiScaler nightly-20261028" >&2; exit 1; }
+        [[ "$(sha256sum -- "$opti_7z" | cut -d' ' -f1)" == db4fe2deae7edd9f6657f5cb223edc694ebdec62b52f15a3a59913f8b656c176 ]] ||
+            { echo "$opti_7z is not the tested OptiScaler nightly-20261030" >&2; exit 1; }
     fi
     command -v 7z >/dev/null || { echo "7z is needed to unpack $opti_7z" >&2; exit 1; }
     rm -rf -- "$pkg/optiscaler"
@@ -312,7 +314,8 @@ if [[ "$arch" == x86_64 ]]; then
     [[ -f "$pkg/optiscaler/release/OptiScaler.dll" && -f "$pkg/optiscaler/release/OptiScaler.ini" &&
        -d "$pkg/optiscaler/release/OptiScaler" ]] || { echo "$opti_7z is not laid out as OptiScaler v10" >&2; exit 1; }
     cp -- "$opti_license" "$pkg/optiscaler/OptiScaler_LICENSE.txt"
-    bash linux/build/build_asi.sh artifacts/optiscaler/asi > /dev/null
+    # stamped with the package's version (its log line and NR Control's title), not the bare commit
+    NR_STAMP=$(bash linux/build/version.sh) bash linux/build/build_asi.sh artifacts/optiscaler/asi > /dev/null
     cp -- artifacts/optiscaler/asi/dlssnr-amd.asi artifacts/optiscaler/asi/nr_present_probe.exe "$pkg/optiscaler/asi/"
     # the notices of what dlssnr-amd.asi has compiled in: NR Control's font (Inter, SIL OFL 1.1) and Dear ImGui (MIT)
     cp -- "${NR_MENU_FONT_LICENSE:-toolchain/fonts/inter-4.1/LICENSE.txt}" "$pkg/optiscaler/asi/Inter-LICENSE.txt"

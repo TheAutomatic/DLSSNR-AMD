@@ -29,6 +29,7 @@
 //     the game makes its D3D12 device, so vkd3d-proton's vkCreateDevice can be wrapped where it gets it.
 // Every file stays where the OptiScaler route keeps it: the module folder is OptiScaler's (dlssnr-amd.ini,
 // dlssnr-amd\, dlssnr-amd.log, control.bin for NR Control).
+#include "nr_path_win.hpp"
 #include "MinHook.h"
 #include "nr_asi_wilsjo2.hpp"
 #include "nr_device_features.hpp"
@@ -38,6 +39,8 @@
 #include "nr_ngx_abi.hpp"
 #include "nr_pe_config.hpp"
 #include "nr_pe_control.hpp"
+#include "nr_control_shared.hpp"
+#include "nr_pe_crash.hpp"
 #include "nr_asi_hudcap.hpp"
 #include "nr_pe_interop.hpp"
 #include "nr_pe_vkdevice.hpp"
@@ -59,16 +62,19 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <cstring>
 #include <cwchar>
 #include <cwctype>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -194,11 +200,11 @@ void judge_executable() {
 
 // [Hotfix] *ResourceBarrier in OptiScaler.ini beside OptiScaler (auto / absent: not set).
 void read_ini_barriers() {
-    char ini[MAX_PATH + 32];
+    char ini[MAX_PATH * 4 + 32];
     std::snprintf(ini, sizeof ini, "%s\\OptiScaler.ini", nr::pe::module_folder());
     auto get = [&](const char* key) {
         char v[32] = {};
-        GetPrivateProfileStringA("Hotfix", key, "", v, sizeof v, ini);
+        nr::u8::profile("Hotfix", key, "", v, sizeof v, ini);
         return v[0] >= '0' && v[0] <= '9' ? std::atoi(v) : -1;
     };
     g_ini.color = get("ColorResourceBarrier");
@@ -391,8 +397,10 @@ struct Tracked {
     CreateSizes create;            // its create block's sizes
     std::map<int, LayerState> layers;   // by layer number ([LayerN]; 0 the one layer of a file without any)
     uint64_t chain_version = 0;         // the chain the layers were last matched against
-    ID3D12Resource* copy = nullptr;            // before the upscaler: the colour NR has run on, handed to it
+    ID3D12Resource* copy = nullptr;            // before the upscaler: the colour's region NR runs on
     D3D12_RESOURCE_STATES copy_state = D3D12_RESOURCE_STATE_COMMON;
+    ID3D12Resource* mirror = nullptr;          // before the upscaler: the colour as the game made it, NR's answer in its
+    D3D12_RESOURCE_STATES mirror_state = D3D12_RESOURCE_STATE_COMMON;   // region - handed to the upscaler
     ID3D12Resource* out_copy = nullptr;        // after the upscaler, for an output subrect: its region
     D3D12_RESOURCE_STATES out_copy_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;   // UNORDERED_ACCESS between uses
     // [Inspect]: the output before and after the compared layers (NON_PIXEL_SHADER_RESOURCE between uses)
@@ -460,6 +468,7 @@ void forget(Tracked& t) {
     for (auto& [n, l] : t.layers) release_layer(l);
     t.layers.clear();
     release_resource(t.copy);
+    release_resource(t.mirror);
     release_resource(t.out_copy);
     release_resource(t.inspect_off);
     release_resource(t.inspect_on);
@@ -619,7 +628,7 @@ std::shared_ptr<const Chain> chain_now() {
             nr::dlssnr::layer_changed(row_number(was));
             nr::pe::control::layer_changed(row_number(was));
         }
-    nr::pe::events::note(nr::pe::events::kSettings, "NR chain%s: %s",
+    nr::pe::events::note(nr::pe::events::kSettings, "NR%s: %s",
                          config.layered ? "" : " (one layer, from [RenoDX] / [wilsjo2])", said.empty() ? "no layer enabled" : said.c_str());
     current = next;
     return current;
@@ -676,6 +685,37 @@ bool ensure_texture(ID3D12Device* device, ID3D12Resource*& tex, D3D12_RESOURCE_S
     }
     nr::vram::track_d3d12(device, tex, nr::vram::kCopies);
     state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    return true;
+}
+
+// A texture of `source`'s own description - size, format and flags (with unordered access, without deny-shader-
+// resource), one mip - in COPY_DEST: what the upscaler is handed before it, as the forked OptiScaler of 0.0.7 hands it
+// (DlssNr_Dx12::CreateBufferResource). A texture of another size and flags handed in the colour's place (the region
+// at base 0) ended a game with FSR 4 on Windows at the first frame. False when `source` is not a plain 2D texture or
+// it cannot be made.
+bool ensure_mirror(ID3D12Device* device, ID3D12Resource*& tex, D3D12_RESOURCE_STATES& state, ID3D12Resource* source) {
+    D3D12_RESOURCE_DESC d = source->GetDesc();
+    if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.SampleDesc.Count != 1 || d.DepthOrArraySize != 1)
+        return false;
+    d.MipLevels = 1;
+    d.Alignment = 0;
+    d.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    d.Flags = (d.Flags | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) & ~D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
+    if (tex) {
+        const D3D12_RESOURCE_DESC h = tex->GetDesc();
+        if (h.Width == d.Width && h.Height == d.Height && h.Format == d.Format && h.Flags == d.Flags) return true;
+        release_resource(tex);
+    }
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    if (test_fault("d12_resource") ||
+        FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                               IID_PPV_ARGS(&tex)))) {
+        tex = nullptr;
+        return false;
+    }
+    nr::vram::track_d3d12(device, tex, nr::vram::kCopies);
+    state = D3D12_RESOURCE_STATE_COPY_DEST;
     return true;
 }
 
@@ -1125,6 +1165,18 @@ void late_present(IDXGISwapChain* sc, ID3D12CommandQueue* queue, int encoding) {
 // never does). Frame generation's cadence below; not yet: the composition around the game's HUD (HUD FIX).
 constexpr uint32_t kPresentRing = 8;                 // present_path.hpp kPresentRing
 constexpr DWORD kPresentSlotWaitMs = 100;            // kPresentSlotWaitMs
+// The log's pacing line (pacing_watch below): the game's Presents the layers ran in, the time they took on the CPU,
+// and their waits for a ring slot (a Present of eight ago still on the GPU), in microseconds
+struct PacingStats {
+    std::atomic<uint64_t> top_calls{0}, top_us{0}, top_max_us{0}, waits{0}, wait_us{0};
+};
+PacingStats g_pacing;
+uint64_t pacing_us() {
+    static const double per_us = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return double(f.QuadPart) / 1e6; }();
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return uint64_t(double(c.QuadPart) / per_us);
+}
 constexpr uint32_t kPresentGuideSets = 4;            // kPresentGuideSets
 constexpr uint64_t kPresentGuideMaxAge = 8;          // kPresentGuideMaxAge (presents)
 constexpr ULONGLONG kPresentGuideMaxAgeMs = 250;     // kPresentGuideMaxAgeNs
@@ -1225,29 +1277,45 @@ uint32_t hud_stats_h(uint32_t h) { return 1 + 2 * ((h + 7) / 8); }   // two tile
 // run there). `follows`: the capture follows this API (D3D12, D3D11, Vulkan); `captured` this frame, else `why` not.
 void hud_report(bool layers, bool follows = false, bool captured = false, const std::string& why = std::string(),
                 bool fg_api = false, bool fg = false, const std::string& fg_why = std::string(), const char* fg_source = "",
-                bool broken = false) {
+                bool broken = false, bool fg_offered = false, int capture_ok = -1) {
     const bool d3d12 = follows;
-    // greyed while it cannot run: frame generation's HUD-less frame not handed over for 2 s; the capture's hooks failed
-    static ULONGLONG fg_seen = 0, fg_watched = 0;   // a hand-over last seen; watched since (Auto / Game armed it)
+    // greyed while it cannot run: frame generation's HUD-less frame not handed over for 2 s; the capture's hooks failed.
+    // Hand-overs are followed in every mode (fg_offered while not armed), so the menu shows what can run before a
+    // method is picked - it used to be watched only once Auto / Game armed it, and greyed only after it was chosen.
+    static ULONGLONG fg_seen = 0, fg_watched = 0;   // a hand-over last seen; watched since
     const ULONGLONG now_ms = GetTickCount64();
-    const uint32_t mode_now = chain_now() ? chain_now()->hud.mode : 0;
-    if (!(mode_now == 1 || mode_now == 2)) fg_watched = 0;
-    else if (!fg_watched) fg_watched = now_ms;
-    if (fg) fg_seen = now_ms;
-    // greyed only once it was watched for 2 s and nothing came (off: it is not watched, so not greyed)
+    if (!fg_watched) fg_watched = now_ms;
+    if (fg || fg_offered) fg_seen = now_ms;
+    // greyed once it was watched for 2 s and nothing came
     const bool fg_absent = fg_api && fg_watched && now_ms - fg_watched > 2000 && (!fg_seen || now_ms - fg_seen > 2000);
     const std::shared_ptr<const Chain> c = chain_now();
     const uint32_t mode = c ? c->hud.mode : 0;
-    const char* const no_game = "frame generation's HUD-less frame is read for D3D12 games only";
-    const char* const no_capture = "the capture before the HUD does not follow this game's API";
-    std::string now = mode == 0 ? "off"
-                      : !layers ? "nothing: no layer runs at Present"
-                      : mode == 4 ? "estimated"
-                      : fg && (mode == 1 || mode == 2) ? std::string("frame generation's HUD-less frame (") + fg_source + ")"
-                      : mode == 2 ? (fg_api ? "nothing this frame: " + fg_why : std::string("nothing: ") + no_game)
-                      : captured  ? "captured before the HUD"
-                      : mode == 1 ? (d3d12 ? "estimated (captured: " + why + ")" : std::string("estimated"))
-                      : d3d12     ? "nothing this frame: " + why : std::string("nothing: ") + no_capture;
+    // the capture before the HUD the same way: armed (Auto, Captured) for 2 s with layers running and nothing captured
+    // greys it, until a capture succeeds; the verdict stays while another method is chosen (unarmed, it is not tried)
+    static ULONGLONG cap_seen = 0, cap_watched = 0;
+    static bool cap_absent = false;
+    static std::string cap_why;
+    const bool cap_armed = d3d12 && layers && (mode == 1 || mode == 3);
+    const bool cap_now = capture_ok < 0 ? captured : capture_ok != 0;
+    if (!cap_armed) cap_watched = 0;
+    else {
+        if (!cap_watched) cap_watched = now_ms;
+        if (cap_now) { cap_seen = now_ms; cap_absent = false; }
+        else if (now_ms - cap_watched > 2000 && (!cap_seen || now_ms - cap_seen > 2000)) {
+            cap_absent = true;
+            if (!why.empty()) cap_why = why;
+        }
+    }
+    const char* const no_game = NR_N("frame generation's HUD-less frame is read for D3D12 games only");
+    const char* const no_capture = NR_N("the capture before the HUD does not follow this game's API");
+    std::string now = mode == 0 ? NR_N("off")
+                      : !layers ? NR_N("nothing: no layer runs at Present")
+                      : mode == 4 ? NR_N("estimated")
+                      : fg && (mode == 1 || mode == 2) ? std::string(NR_N("frame generation's HUD-less frame (")) + fg_source + ")"
+                      : mode == 2 ? (fg_api ? NR_N("nothing this frame: ") + fg_why : std::string(NR_N("nothing: ")) + no_game)
+                      : captured  ? NR_N("captured before the HUD")
+                      : mode == 1 ? (d3d12 ? NR_N("estimated (captured: ") + why + ")" : std::string(NR_N("estimated")))
+                      : d3d12     ? NR_N("nothing this frame: ") + why : std::string(NR_N("nothing: ")) + no_capture;
     static std::string said;   // the log: its changes, the first 40
     static int changes = 0;
     if (now != said && changes < 40) {
@@ -1256,9 +1324,11 @@ void hud_report(bool layers, bool follows = false, bool captured = false, const 
         said = now;
     }
     const std::string why_game = !fg_api ? std::string(no_game)
-                                 : fg_absent ? (fg_why.empty() ? std::string("the game hands its frame generation no HUD-less frame") : fg_why)
+                                 : fg_absent ? (fg_why.empty() ? std::string(NR_N("the game hands its frame generation no HUD-less frame")) : fg_why)
                                              : std::string();
-    const std::string why_capture = !d3d12 ? std::string(no_capture) : broken ? why : std::string();
+    const std::string why_capture = !d3d12 ? std::string(no_capture) : broken ? why
+                                    : cap_absent ? (cap_why.empty() ? std::string(NR_N("no frame before the HUD was found in this game")) : cap_why)
+                                                 : std::string();
     nr::pe::control::hud_facts(now.c_str(), why_game.c_str(), why_capture.c_str(), "");
 }
 bool renodx_layer(const Layer& l) { return l.cfg.processing == nr::pe::Processing::kRenoDX; }
@@ -1692,7 +1762,8 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top) {
     const bool hud_captured = hud_fg || (hud_cap.result == nr::asi::hudcap::Result::kCaptured && hud_cap.hudless);
     ID3D12Resource* const hud_hudless = hud_fg ? hud_cap.fg.copy : hud_cap.hudless;
     hud_report(!runs.empty(), true, hud_captured && !hud_fg, hud_cap.why, true, hud_fg, hud_cap.fg.why, hud_cap.fg.source,
-               hud_cap.broken);
+               hud_cap.broken, hud_cap.fg.offered || hud_cap.fg.seen,
+               hud_cap.result == nr::asi::hudcap::Result::kCaptured && hud_cap.hudless);
     if (runs.empty()) return;
     // Frame generation (present_path.hpp RunPresentPath): a matching DLSS-G declaration is authoritative; without one
     // the cadence of presents against fresh captures, over windows (nr_present_cadence.hpp)
@@ -1747,7 +1818,10 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top) {
         ID3D12Resource* const target_was = g_present.target;
         const uint64_t waited_for = g_present.slot_value[slot], submitted_was = g_present.submitted;
         guard.unlock();
+        const uint64_t wait_from = pacing_us();
         const bool completed = WaitForSingleObject(g_present.event, kPresentSlotWaitMs) == WAIT_OBJECT_0;
+        ++g_pacing.waits;
+        g_pacing.wait_us += pacing_us() - wait_from;
         guard.lock();
         // the lock was let go: the ring and the copy may have been made anew meanwhile (another device, a resize), or
         // another Present took the slot: this one leaves the frame alone
@@ -1940,14 +2014,17 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top) {
         pl.processing = layer.cfg.processing;
         g_present.held = true;
         if (!renodx_layer(layer)) {
-            // wilsjo2's finished picture: the newest capture of this or the previous frame (with frame
-            // generation: of the last game frame's presents), of exactly the back buffer's size, each capture once
+            // wilsjo2's finished picture: the newest capture fresh as RenoDX's guides are (the back buffer's aspect, at
+            // most 8 presents or 250 ms old), each capture once. Its guide regions are scaled to the frame as after the
+            // upscaler (nr_wilsjo2_flow.hpp), so an output of another size than the back buffer (a game that scales its
+            // output into the window) serves as RenoDX's does. It used to take only a capture of this or the previous
+            // frame: one whose list ran on another queue is ordered before a Present only once that list finished, by
+            // then two presents old, so in such a game (3 runs in 11 s) the layer waited and the network was freed as
+            // idle again and again.
             GuideSet* g = nullptr;
             for (uint32_t k = 0; k < kPresentGuideSets; ++k) {
                 GuideSet& gs = g_present.sets[k];
-                if (!ordered[k] || gs.serial <= pl.consumed ||
-                    g_present.presents - gs.captured_at > uint64_t(multiplier) ||
-                    gs.out_w != w || gs.out_h != h || (g && gs.serial < g->serial))
+                if (!ordered[k] || gs.serial <= pl.consumed || !fresh(gs) || (g && gs.serial < g->serial))
                     continue;
                 g = &gs;
             }
@@ -1967,7 +2044,7 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top) {
                 if (pl.consumed && g_present.presents - pl.consumed_present <= multiplier + 1u)
                     return;
                 pl.w2_reset = true;
-                layer_note(layer, 2, 3, "waits for a game frame of the back buffer's size");
+                layer_note(layer, 2, 3, "waits for a recent game frame of the back buffer's aspect ratio");
                 return;
             }
             if (g != &held_set) read(g);
@@ -2112,7 +2189,7 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top) {
 // p_NNNNN.raw; a line per Present in dlssnr-amd.log. For comparing what frame generation shows between builds.
 void debug_present_dump(IDXGISwapChain* sc, ID3D12CommandQueue* queue) {
     static const std::string folder = [] {
-        char b[MAX_PATH] = {};
+        char b[MAX_PATH * 4] = {};
         return GetEnvironmentVariableA("NR_DEBUG_PRESENT_DUMP", b, MAX_PATH) ? std::string(b) : std::string();
     }();
     if (folder.empty()) return;
@@ -2132,7 +2209,7 @@ void debug_present_dump(IDXGISwapChain* sc, ID3D12CommandQueue* queue) {
             FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, nullptr, IID_PPV_ARGS(&list))) ||
             FAILED(list->Close()) || FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))))
             return;
-        CreateDirectoryA(folder.c_str(), nullptr);
+        nr::u8::make_dir(folder.c_str(), nullptr);
     }
     IDXGISwapChain3* sc3 = nullptr;
     if (FAILED(sc->QueryInterface(IID_PPV_ARGS(&sc3))) || !sc3) return;
@@ -2178,9 +2255,9 @@ void debug_present_dump(IDXGISwapChain* sc, ID3D12CommandQueue* queue) {
     if (fence->GetCompletedValue() < value) return;   // not done: nothing read (the copy may still be written)
     uint8_t* m = nullptr;
     if (FAILED(readback->Map(0, nullptr, reinterpret_cast<void**>(&m))) || !m) return;
-    char path[MAX_PATH + 32];
+    char path[MAX_PATH * 4 + 32];
     std::snprintf(path, sizeof path, "%s\\p_%05llu.raw", folder.c_str(), static_cast<unsigned long long>(n));
-    if (FILE* f = std::fopen(path, "wb")) {
+    if (FILE* f = nr::u8::fopen(path, "wb")) {
         for (UINT y = 0; y < rows; ++y) std::fwrite(m + fp.Offset + size_t(y) * fp.Footprint.RowPitch, 1, size_t(row_bytes), f);
         std::fclose(f);
     }
@@ -2195,7 +2272,147 @@ void debug_present_dump(IDXGISwapChain* sc, ID3D12CommandQueue* queue) {
 // game's frames (its upscaler's evaluates), over a second; and the game's own DLSS-G when it declares one. A
 // measurement, said as one: a game that presents twice a frame for other reasons reads the same.
 std::atomic<uint64_t> g_fg_frames{0};
+std::atomic<ULONGLONG> g_fg_on_ms{0};   // frame generation last seen on (frame_generation_line), GetTickCount64
+
+// Every 10 s while Present layers run, one line in the log (user 10-30: with frame generation on, the frame rate stayed
+// low after heavy NR changes until frame generation was switched off and on): the game's frames, the presents, the
+// layers' CPU time in the game's Present and their ring waits, the GPU's shader clock (amdgpu's pp_dpm_sclk) and this
+// process's GPU memory in VRAM and in GTT (its DRM clients' fdinfo) - a GPU idling at a low clock, NR's memory moved
+// out of VRAM, or a Present held up by the layers, told apart. Wine only (the Linux files through Z:); on its own
+// thread: the fdinfo scan reads a file per open descriptor.
+std::atomic<uint64_t> g_pacing_presents{0};
+bool read_small(const std::string& path, std::string* out) {
+    FILE* f = nr::u8::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    char buf[4096];
+    out->clear();
+    for (size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0 && out->size() < 65536;) out->append(buf, n);
+    std::fclose(f);
+    return true;
+}
+void pacing_watch() {
+    // the GPU: the card with the most VRAM (a processor's integrated GPU has its own card and a few hundred MB)
+    std::string card;
+    {
+        uint64_t most = 0;
+        for (int c = 0; c < 8; ++c) {
+            const std::string d = "Z:\\sys\\class\\drm\\card" + std::to_string(c) + "\\device\\";
+            std::string t;
+            if (!read_small(d + "mem_info_vram_total", &t)) continue;
+            const uint64_t v = std::strtoull(t.c_str(), nullptr, 10);
+            if (v > most) { most = v; card = d; }
+        }
+    }
+    // its shader clock (pp_dpm_sclk's starred line, MHz) and busy percent, sampled twice a second
+    const auto sample = [&](unsigned* mhz, unsigned* busy) {
+        std::string t;
+        *mhz = *busy = ~0u;
+        if (card.empty()) return;
+        if (read_small(card + "pp_dpm_sclk", &t))
+            for (size_t a = 0; a < t.size();) {
+                size_t e = t.find('\n', a);
+                if (e == std::string::npos) e = t.size();
+                const std::string line = t.substr(a, e - a);
+                if (line.find('*') != std::string::npos && line.find(':') != std::string::npos)
+                    *mhz = unsigned(std::strtoul(line.c_str() + line.find(':') + 1, nullptr, 10));
+                a = e + 1;
+            }
+        if (read_small(card + "gpu_busy_percent", &t)) *busy = unsigned(std::strtoul(t.c_str(), nullptr, 10));
+    };
+    uint64_t frames_at = g_fg_frames.load(), presents_at = g_pacing_presents.load();
+    uint64_t calls_at = 0, us_at = 0, waits_at = 0, wait_us_at = 0;
+    std::string unix_pid;
+    int pid_tries = 0;
+    for (;;) {
+        uint64_t mhz_sum = 0, busy_sum = 0;
+        unsigned mhz_n = 0, busy_n = 0, mhz_min = ~0u, mhz_max = 0;
+        for (int k = 0; k < 20; ++k) {
+            Sleep(500);
+            unsigned mhz = 0, busy = 0;
+            sample(&mhz, &busy);
+            if (mhz != ~0u) { mhz_sum += mhz; ++mhz_n; mhz_min = std::min(mhz_min, mhz); mhz_max = std::max(mhz_max, mhz); }
+            if (busy != ~0u) { busy_sum += busy; ++busy_n; }
+        }
+        const uint64_t frames = g_fg_frames.load(), presents = g_pacing_presents.load();
+        const uint64_t calls = g_pacing.top_calls.load(), us = g_pacing.top_us.load();
+        const uint64_t waits = g_pacing.waits.load(), wait_us = g_pacing.wait_us.load();
+        const uint64_t max_us = g_pacing.top_max_us.exchange(0);
+        const bool active = g_present.wanted.load() || calls != calls_at;
+        if (active) {
+            char clock[96] = "not known";
+            if (mhz_n)
+                std::snprintf(clock, sizeof clock, "%llu MHz (%u..%u), busy %s%%", static_cast<unsigned long long>(mhz_sum / mhz_n),
+                              mhz_min, mhz_max, busy_n ? std::to_string(busy_sum / busy_n).c_str() : "?");
+            std::string t;
+            // this process's GPU memory by placement: every amdgpu DRM client's fdinfo once (by its client id). Under
+            // Wine /proc/self is wineserver's (the server opens the files): this process's Unix pid is found once among
+            // the processes whose command line holds this executable's name, as the one with amdgpu clients
+            uint64_t vram = 0, gtt = 0;
+            const auto memory_of = [&](const std::string& pid, uint64_t* v_kib, uint64_t* g_kib) {
+                std::vector<std::string> clients;
+                bool any = false;
+                const std::string dir = "Z:\\proc\\" + pid + "\\fdinfo\\";
+                nr::u8::list(dir + "*", [&](const std::string& file, DWORD) {
+                    if (file.empty() || file[0] == '.' || !read_small(dir + file, &t)) return;
+                    if (t.find("drm-driver:\tamdgpu") == std::string::npos) return;
+                    const auto value = [&](const char* key) -> std::string {
+                        const size_t k = t.find(key);
+                        if (k == std::string::npos) return {};
+                        const size_t e = t.find('\n', k);
+                        return t.substr(k + std::strlen(key), e == std::string::npos ? std::string::npos : e - k - std::strlen(key));
+                    };
+                    const std::string id = value("drm-client-id:");
+                    if (std::find(clients.begin(), clients.end(), id) != clients.end()) return;
+                    clients.push_back(id);
+                    any = true;
+                    std::string v = value("drm-resident-vram:"), g = value("drm-resident-gtt:");
+                    if (v.empty()) v = value("drm-memory-vram:");
+                    if (g.empty()) g = value("drm-memory-gtt:");
+                    *v_kib += std::strtoull(v.c_str(), nullptr, 10);
+                    *g_kib += std::strtoull(g.c_str(), nullptr, 10);
+                });
+                return any;
+            };
+            if (unix_pid.empty() && pid_tries < 3) {   // (a few tries: the device may come later)
+                ++pid_tries;
+                std::string name = nr::u8::module_file(nullptr);
+                if (const size_t cut = name.find_last_of("\\/"); cut != std::string::npos) name = name.substr(cut + 1);
+                for (char& c : name) c = char(std::tolower(static_cast<unsigned char>(c)));
+                uint64_t best = 0;
+                nr::u8::list("Z:\\proc\\*", [&](const std::string& pid, DWORD) {
+                    if (pid.empty() || pid.find_first_not_of("0123456789") != std::string::npos) return;
+                    if (!read_small("Z:\\proc\\" + pid + "\\cmdline", &t)) return;
+                    for (char& c : t) c = c ? char(std::tolower(static_cast<unsigned char>(c))) : ' ';
+                    if (t.find(name) == std::string::npos) return;
+                    uint64_t v = 0, g = 0;
+                    if (memory_of(pid, &v, &g) && v + g >= best) { best = v + g; unix_pid = pid; }
+                });
+            }
+            if (!unix_pid.empty() && !memory_of(unix_pid, &vram, &gtt)) unix_pid.clear();
+            char memory_text[96] = "not known";
+            if (!unix_pid.empty())
+                std::snprintf(memory_text, sizeof memory_text, "VRAM %llu MiB, GTT %llu MiB",
+                              static_cast<unsigned long long>(vram / 1024), static_cast<unsigned long long>(gtt / 1024));
+            const std::string memory = memory_text;
+            const double sec = 10.0;
+            log("[nr] pacing (10 s): %.1f game frames/s, %.1f presents/s; layers in the game's Present %.2f ms a call "
+                "(max %.2f), ring waits %llu (%.0f ms); GPU %s; this process's GPU memory: %s",
+                double(frames - frames_at) / sec, double(presents - presents_at) / sec,
+                calls > calls_at ? double(us - us_at) / 1000.0 / double(calls - calls_at) : 0.0, double(max_us) / 1000.0,
+                static_cast<unsigned long long>(waits - waits_at), double(wait_us - wait_us_at) / 1000.0, clock,
+                memory.c_str());
+        }
+        frames_at = frames; presents_at = presents; calls_at = calls; us_at = us; waits_at = waits; wait_us_at = wait_us;
+    }
+}
+
 void frame_generation_line() {
+    ++g_pacing_presents;
+    static const bool pacing = [] {
+        if (GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version")) std::thread(pacing_watch).detach();
+        return true;
+    }();
+    (void)pacing;
     static uint64_t presents = 0, frames_at = 0;
     static ULONGLONG since = 0;
     ++presents;
@@ -2205,14 +2422,17 @@ void frame_generation_line() {
     const uint64_t frames = g_fg_frames.load() - frames_at;
     char line[160];
     const auto& decl = g_present.declaration;
+    if ((decl.multiplier > 1 && now - decl.ms < 2000) || (frames && presents >= frames * 13 / 10)) g_fg_on_ms = now;   // (frame generation capped by the display: under 2x)
     if (decl.multiplier > 1 && now - decl.ms < 2000)
-        std::snprintf(line, sizeof line, "Frame generation: the game's DLSS-G, %ux (its own word)", decl.multiplier);
+        std::snprintf(line, sizeof line, NR_N("Frame generation: the game's DLSS-G, %ux (its own word)"), decl.multiplier);
     else if (!frames)
-        std::snprintf(line, sizeof line, "Frame generation: not known (no game frame in the last second)");
+        std::snprintf(line, sizeof line, NR_N("Frame generation: not known (no game frame in the last second)"));
     else {
         const double r = double(presents) / double(frames);
-        std::snprintf(line, sizeof line, "Frame generation: %.2f presents per game frame%s", r,
-                      r >= 1.8 ? " - frame generation is likely on" : r <= 1.2 ? " - none seen" : "");
+        std::snprintf(line, sizeof line,
+                      r >= 1.8   ? NR_N("Frame generation: %.2f presents per game frame - frame generation is likely on")
+                      : r <= 1.2 ? NR_N("Frame generation: %.2f presents per game frame - none seen")
+                                 : NR_N("Frame generation: %.2f presents per game frame"), r);
     }
     nr::pe::control::asi_facts(nullptr, line);
     presents = 0;
@@ -2271,7 +2491,42 @@ int g_detours_used[kDetourKinds] = {};                         // g_sc_lock
 std::unordered_map<void*, int> g_hooked_functions;             // hooked (or not hookable) function -> instance, -1 not
                                                                 // hookable, -2 hooked by NR Control (g_sc_lock)
 
+// FSR frame generation paces its presents by a moving average of the last frames' times (FidelityFX SDK,
+// FrameInterpolationSwapchainDX12.cpp interpolationThread: half the average less its variance), and starts that average
+// afresh only when frame generation is switched on or after a gap of more than 0.1 s between frames. When NR got
+// heavier and then lighter again (Passes 3 back to 1, a layer removed) it went on presenting at the heavy frame time,
+// the GPU idled between frames and lowered its clock, and the frame rate stayed down until frame generation was
+// toggled (user 10-30, DL:TB, every placement). So once the NR settings, the network or NR's switch have stayed put for
+// half a second after a change, with frame generation seen on, the game's Present waits 120 ms once: the gap restarts
+// the average, as toggling frame generation does.
+void fg_pacing_restart() {
+    static uint64_t seen_version = 0;
+    static uint32_t seen_net = 0;
+    static int seen_on = -1;
+    static ULONGLONG changed_ms = 0;
+    static int told = 0;
+    const std::shared_ptr<const Chain> chain = chain_now();
+    const uint64_t version = chain ? chain->version : 0;
+    const nr::control::Shared* s = nr::pe::control::page();
+    const uint32_t net = s ? s->net_running : nr::control::kNoNet;
+    const int on = nr::dlssnr::nr_on_now() ? 1 : 0;
+    const ULONGLONG now = GetTickCount64();
+    if (seen_on < 0 || version != seen_version || net != seen_net || on != seen_on) {
+        if (seen_on >= 0) changed_ms = now;
+        seen_version = version; seen_net = net; seen_on = on;
+        return;
+    }
+    if (!changed_ms || now - changed_ms < 500) return;
+    changed_ms = 0;
+    if (now - g_fg_on_ms.load() > 3000) return;   // frame generation not seen on
+    if (told++ < 20)
+        log("[nr] frame generation: its frame pacing restarted after an NR change (one 120 ms pause; FSR frame generation "
+            "keeps the old frame time otherwise)");
+    Sleep(120);
+}
+
 void game_present_before(IDXGISwapChain* sc) {
+    fg_pacing_restart();
     ID3D12CommandQueue* queue = nullptr;
     ID3D11Device* d11 = nullptr;
     {
@@ -2284,17 +2539,28 @@ void game_present_before(IDXGISwapChain* sc) {
     // NR_PRESENT_UNDER=1 (measurement only): leave the layers to NR Control's Present hook, under OptiScaler (and after
     // its frame generation), for comparing the two places
     static const bool under = [] { char b[8] = {}; return GetEnvironmentVariableA("NR_PRESENT_UNDER", b, 8) && b[0] == '1'; }();
+    // NR Control after the layers, here too (nr_pe_menu.hpp draw_game): as OptiScaler's menu, before frame generation,
+    // once a game frame - drawn below it, on the frames frame generation presents from a thread of its own, it flickered
     if (d11) {
         if (!under && d11_present_due()) {
             d11_present_layers(sc, d11);
             g_d11_top_ms = GetTickCount64();
         }
+        if (!under) nr::pe::menu::draw_game(sc, d11);
         d11->Release();
         return;
     }
-    if (!queue || under || !present_due()) return;
-    present_layers(sc, queue, true);
-    g_present.top_ms = GetTickCount64();
+    if (!queue || under) return;
+    const uint64_t from = pacing_us();
+    if (present_due()) {
+        present_layers(sc, queue, true);
+        g_present.top_ms = GetTickCount64();
+    }
+    nr::pe::menu::draw_game(sc, queue);
+    const uint64_t took = pacing_us() - from;
+    ++g_pacing.top_calls;
+    g_pacing.top_us += took;
+    for (uint64_t m = g_pacing.top_max_us.load(); took > m && !g_pacing.top_max_us.compare_exchange_weak(m, took);) {}
 }
 
 void adopt_swapchain(IUnknown* device, IDXGISwapChain* sc);
@@ -2395,15 +2661,30 @@ bool hook_slot(void* object, int slot, DetourKind kind) {
     std::lock_guard<std::mutex> guard(g_sc_lock);
     if (const auto it = g_hooked_functions.find(fn); it != g_hooked_functions.end()) return it->second != -1;
     if (kind == kDetourPresent || kind == kDetourPresent1) {
-        // A Present outside OptiScaler (no wrapper of its between the game and the system's DXGI) is NR Control's to
-        // hook (nr_pe_menu.cpp, from its own thread: hooking it here too would race it); its hook calls on_present /
-        // on_present11, the same place.
+        // The system's DXGI's Present (no wrapper between the game and it) is NR Control's to hook (nr_pe_menu.cpp, from
+        // its own thread: hooking it here too would race it); its hook calls on_present / on_present11, the same place.
+        // Any other module's is hooked here: OptiScaler's wrapper, or the swap chain of a frame generator the game was
+        // handed - with OptiScaler's FSR frame generation on, amd_fidelityfx_framegeneration_dx12.dll's, whose Present
+        // takes the game's frames and presents them and the generated ones from a thread of its own. Left to the
+        // system's Present, the layers ran there on every present, generated ones too, at twice the cost.
         HMODULE owner = nullptr;
         GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                            static_cast<LPCWSTR>(fn), &owner);
         if (owner != g_opti) {
-            g_hooked_functions[fn] = -2;
-            return true;
+            wchar_t path[MAX_PATH] = {};
+            if (owner) GetModuleFileNameW(owner, path, MAX_PATH);
+            std::wstring name = path;
+            if (const size_t cut = name.find_last_of(L"\\/"); cut != std::wstring::npos) name = name.substr(cut + 1);
+            for (wchar_t& c : name) c = wchar_t(std::towlower(c));
+            const bool system = !owner || name == L"dxgi.dll" || name == L"d3d11.dll" || name == L"d3d12.dll" ||
+                                name == L"d3d12core.dll" || name == L"d3d10core.dll" || name == L"d3d10_1.dll" ||
+                                name == L"d3d10.dll" || name.rfind(L"dxvk", 0) == 0 || name.rfind(L"vkd3d", 0) == 0;
+            if (system) {
+                g_hooked_functions[fn] = -2;
+                return true;
+            }
+            log("[nr] Present layers: the game's swap chain is %s's (frame generation's, or another wrapper's): its "
+                "Present (slot %d) hooked", nr::u8::narrow(name).c_str(), slot);
         }
     }
     if (g_detours_used[kind] >= kDetoursPerKind) {
@@ -2801,18 +3082,37 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_evaluate(ID3D12GraphicsCommandList* cmd, const 
                 nr::pe::renodx_route::CallLayer number(row_number(*l));
                 nr::asi::Wilsjo2Frame wr = wf;
                 wr.reset = wr.reset || hold_released(row_number(*l));
+                wr.out_w = f.out_w; wr.out_h = f.out_h;
                 nr::asi::wilsjo2_run(cmd, device, *ls.w2[1], wr, l->w2, t.copy, rw, rh, true);
             }
             if (inspect && k == ib)
                 inspect_show(cmd, device, chain->inspect, t.inspect_off, t.inspect_off_state, t.inspect_on,
                              t.inspect_on_state, t.copy);
         }
-        transition(cmd, t.copy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, st.color);
-        t.copy_state = st.color;
+        // Handed to the upscaler: the colour's mirror (its own size, format and flags), NR's answer copied into the
+        // region at its own place, the subrect as the game gave it; without one, the region itself at base 0
         ID3D12Resource* copy = t.copy;
+        bool moved = false;
+        if (ensure_mirror(device, t.mirror, t.mirror_state, f.color)) {
+            const D3D12_RESOURCE_DESC cd = f.color->GetDesc();
+            transition(cmd, f.color, st.color, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            transition(cmd, t.mirror, t.mirror_state, D3D12_RESOURCE_STATE_COPY_DEST);
+            copy_region(cmd, t.mirror, 0, 0, f.color, 0, 0, uint32_t(cd.Width), cd.Height);
+            transition(cmd, f.color, D3D12_RESOURCE_STATE_COPY_SOURCE, st.color);
+            transition(cmd, t.copy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            copy_region(cmd, t.mirror, rx, ry, t.copy, 0, 0, rw, rh);
+            transition(cmd, t.copy, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            t.copy_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            transition(cmd, t.mirror, D3D12_RESOURCE_STATE_COPY_DEST, st.color);
+            t.mirror_state = st.color;
+            copy = t.mirror;
+        } else {
+            transition(cmd, t.copy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, st.color);
+            t.copy_state = st.color;
+            moved = rx || ry;
+        }
         guard.unlock();
         if (f.color_as_resource) p->Set(f.color_key, copy); else p->Set(f.color_key, static_cast<void*>(copy));
-        const bool moved = rx || ry;
         if (moved) {
             p->Set("DLSS.Input.Color.Subrect.Base.X", 0u);
             p->Set("DLSS.Input.Color.Subrect.Base.Y", 0u);
@@ -4007,11 +4307,11 @@ uint32_t optiscaler_init_flags(uint32_t flags) {
     const ULONGLONG now = GetTickCount64();
     if (!read || now - read >= 5000) {
         read = now;
-        char path[MAX_PATH + 32];
+        char path[MAX_PATH * 4 + 32];
         std::snprintf(path, sizeof path, "%s\\OptiScaler.ini", nr::pe::module_folder());
         for (int i = 0; i < 4; ++i) {
             char v[16] = {};
-            GetPrivateProfileStringA("InitFlags", kKeys[i].name, "", v, sizeof v, path);
+            nr::u8::profile("InitFlags", kKeys[i].name, "", v, sizeof v, path);
             forced[i] = _stricmp(v, "true") == 0 ? 1 : _stricmp(v, "false") == 0 ? 0 : -1;
         }
     }
@@ -4549,6 +4849,7 @@ void run_before_one(VkCommandBuffer cmd, VkTracked& t, const Layer& layer, const
             target.usage = VkImageUsageFlags(copy.usage);
             nr::asi::Wilsjo2VkFrame wr = wf;
             wr.reset = wr.reset || hold_released(row_number(*l));
+            wr.out_w = f.out_w; wr.out_h = f.out_h;
             nr::asi::wilsjo2_run_vk(cmd, *ls.w2[1], wr, l->w2, target, rw, rh, true);
         }
     }
@@ -4892,8 +5193,7 @@ bool vk_present_run(VkCommandBuffer cmd, VkPresentPath& P, const std::shared_ptr
                 }
                 VkGuideSet* g = nullptr;
                 for (VkGuideSet& gs : P.sets) {
-                    if (!gs.serial || gs.serial <= pl.consumed || P.presents - gs.captured_at > 1u || gs.out_w != w ||
-                        gs.out_h != h || (g && gs.serial < g->serial))
+                    if (!fresh(gs) || gs.serial <= pl.consumed || (g && gs.serial < g->serial))   // as on D3D12
                         continue;
                     g = &gs;
                 }
@@ -4901,7 +5201,7 @@ bool vk_present_run(VkCommandBuffer cmd, VkPresentPath& P, const std::shared_ptr
                 if (!g) {
                     if (pl.consumed && P.presents - pl.consumed_present <= 2u) return;   // one capture, one run
                     pl.w2_reset = true;
-                    layer_note(layer, 2, 3, "waits for a game frame of the back buffer's size");
+                    layer_note(layer, 2, 3, "waits for a recent game frame of the back buffer's aspect ratio");
                     return;
                 }
                 pl.consumed = g->serial;
@@ -5168,7 +5468,8 @@ bool game_caller(void* address) {
             std::lock_guard<std::mutex> g(g_wrapper_lock);
             if (std::find(g_wrappers.begin(), g_wrappers.end(), m) == g_wrappers.end()) g_wrappers.push_back(m);
         }
-        log("[nr] Vulkan presents: every present for 2 s came through %ls; taken as the game's present path", path);
+        log("[nr] Vulkan presents: every present for 2 s came through %s; taken as the game's present path",
+            nr::u8::narrow(path).c_str());
         g_game_present_ms = now;
         return true;
     };
@@ -5530,11 +5831,11 @@ struct VkDump {
     VkDeviceSize size = 0;
     void* mapped = nullptr;
     VkDump() {
-        char b[MAX_PATH] = {};
+        char b[MAX_PATH * 4] = {};
         if (GetEnvironmentVariableA("NR_DEBUG_PRESENT_DUMP", b, MAX_PATH)) folder = b;
         char f[32] = {};
         if (GetEnvironmentVariableA("NR_DEBUG_PRESENT_FROM", f, 32)) from = std::strtoull(f, nullptr, 10);
-        if (!folder.empty()) CreateDirectoryA(folder.c_str(), nullptr);
+        if (!folder.empty()) nr::u8::make_dir(folder.c_str(), nullptr);
     }
     bool wanted() { return !folder.empty() && seen++ >= from && written < 60; }
     bool ensure(VkDevice d, VkDeviceSize bytes) {
@@ -5923,10 +6224,10 @@ const VkPresentInfoKHR* vk_present_one(VkQueue queue, const VkPresentInfoKHR* in
         return nullptr;
     }
     if (dump && vkWaitForFences(R.device, 1, &R.fence[s], VK_TRUE, 5000000000ull) == VK_SUCCESS) {
-        char path[MAX_PATH + 32];
+        char path[MAX_PATH * 4 + 32];
         std::snprintf(path, sizeof path, "%s\\p_%05llu.raw", g_vk_dump.folder.c_str(),
                       static_cast<unsigned long long>(g_vk_dump.written));
-        if (FILE* f = std::fopen(path, "wb")) {
+        if (FILE* f = nr::u8::fopen(path, "wb")) {
             std::fwrite(g_vk_dump.mapped, 1, size_t(w) * h * bpp, f);
             std::fclose(f);
         }
@@ -7109,14 +7410,16 @@ extern "C" __declspec(dllexport) void InitializeASI() {
                        reinterpret_cast<LPCWSTR>(__builtin_return_address(0)), &g_opti);
     if (!g_opti) g_opti = GetModuleHandleW(nullptr);
     nr::pe::set_module(g_opti);   // dlssnr-amd.ini, dlssnr-amd\, the log and control.bin sit beside OptiScaler
+    nr::pe::install_crash_watch();
+    // an exception that leaves one of NR's threads ends the process through std::terminate: said in the log first
+    std::set_terminate([] {
+        log("[nr] std::terminate: an exception left one of NR's threads; the process ends");
+        std::abort();
+    });
     {   // and RenoDX's NR screenshots go to <game>\NR Screenshots, as on the OptiScaler route
-        wchar_t folder[MAX_PATH * 2] = {};
-        MultiByteToWideChar(CP_ACP, 0, nr::pe::module_folder(), -1, folder, MAX_PATH * 2);
-        nr::pe::screenshot::set_folder(std::wstring(folder) + L"\\NR Screenshots");
+        nr::pe::screenshot::set_folder(nr::u8::wide(nr::pe::module_folder()) + L"\\NR Screenshots");
     }
-    char opti[MAX_PATH] = {};
-    GetModuleFileNameA(g_opti, opti, MAX_PATH);
-    log("[nr] dlssnr-amd.asi %s loaded by %s", NR_BUILD_STAMP, opti);
+    log("[nr] dlssnr-amd.asi %s loaded by %s", NR_BUILD_STAMP, nr::u8::module_file(g_opti).c_str());
     nr::pe::control::asi_facts(NR_BUILD_STAMP, nullptr);
     nr::pe::watchdog::start();   // its thread runs once OptiScaler's DllMain has returned
     judge_executable();
@@ -7175,6 +7478,10 @@ BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID reserved) {
         g_self = module;
         DisableThreadLibraryCalls(module);
     } else if (reason == DLL_PROCESS_DETACH && reserved) {
+        // The game's own exit (ExitProcess): no crash to watch for from here. The static destructors that run after this
+        // fault under Proton (libstdc++'s std::ios_base::Init::~Init flushing std::cout, a first-chance access violation
+        // the exit goes on past); the watch would log it and write a minidump on every exit.
+        nr::pe::remove_crash_watch();
         // The process is ending (before this module's static destructors run): the game's other threads are gone,
         // possibly inside vkd3d-proton's / DXVK's locks, and d3d12 / winevulkan were detached before us (loaded after
         // us). Nothing of NR's GPU state is destroyed or waited for now - that could wait for ever and the game would
@@ -7183,6 +7490,8 @@ BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID reserved) {
         nr::asi::wilsjo2_abandon_at_exit();
         nr::asi::wilsjo2_vk_abandon_at_exit();
         nr::pe::menu::abandon_at_exit();
+    } else if (reason == DLL_PROCESS_DETACH) {
+        nr::pe::remove_crash_watch();   // unloaded while the game runs: the handler must not outlive this module's code
     }
     return TRUE;
 }

@@ -1,5 +1,6 @@
 // The wilsjo2 style's GPU half and constant maths: see nr_wilsjo2.hpp. Written from
 // our specification of the style (section numbers below are its; not published).
+#include "nr_path_u8.hpp"
 #include "nr_number.hpp"
 #include "nr_wilsjo2.hpp"
 #include "nr_gpu_completion.hpp"
@@ -58,7 +59,7 @@ bool parse_uint(const std::string& v, uint32_t* out) {
 }
 
 std::vector<uint32_t> read_spirv(const std::string& path) {
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    std::ifstream f(nr::u8::path(path), std::ios::binary | std::ios::ate);
     if (!f) throw std::runtime_error("wilsjo2 stage: cannot open " + path);
     const std::streamoff n = f.tellg();
     std::vector<uint32_t> code(size_t(n) / 4);

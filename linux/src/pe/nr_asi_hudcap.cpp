@@ -715,6 +715,9 @@ struct FgState {
     bool copied = false, until_present = false, substitute = false;
     const char* source = "";
     std::string refused;              // the last one not taken: why
+    // a hand-over seen while not armed (HUD FIX in another mode): its time (GetTickCount64), so NR Control can tell
+    // whether the method could run before it is picked
+    std::atomic<uint64_t> offered_ms{0};
     bool hooked_ffx[3] = {}, hooked_xefg = false, hooked_sl = false;
     uint64_t looked = 0;
 } gf;
@@ -722,7 +725,11 @@ struct FgState {
 // A hand-over of `r` (in `state`; `list`: the game's command list it was made on, null none) by `source`.
 void fg_note(ID3D12Resource* r, D3D12_RESOURCE_STATES state, ID3D12GraphicsCommandList* list, bool until_present,
              bool substitute, const char* source) {
-    if (!r || !gf.armed.load(std::memory_order_relaxed) || t_own) return;
+    if (!r || t_own) return;
+    if (!gf.armed.load(std::memory_order_relaxed)) {   // only seen (not during the Present: OptiScaler's own)
+        if (!gf.in_present.load()) gf.offered_ms.store(GetTickCount64());
+        return;
+    }
     std::lock_guard<std::mutex> lk(gf.m);
     if (gf.in_present.load()) { gf.refused = std::string(source) + "'s is handed over during the Present (OptiScaler's own frame generation): the capture serves it"; return; }
     const D3D12_RESOURCE_DESC d = r->GetDesc();
@@ -925,8 +932,12 @@ Frame d3d12_present(ID3D12Device* device, IDXGISwapChain* sc, ID3D12CommandQueue
             gf.at = ~0ull;
         }
         gf.armed.store(fg_armed && device);
+        const uint64_t offered = gf.offered_ms.load();
+        f.fg.offered = offered && GetTickCount64() - offered <= 2000;
     }
-    if (fg_armed && device) fg_hook_libraries();
+    // followed in every mode: NR Control greys the method from the start where no hand-over comes (cheap: the
+    // libraries' entry points hooked once; while not armed a hand-over only notes its time)
+    if (device) fg_hook_libraries();
     ++g.presents;
     // earlier copies' images (g.retired) are kept: a list the game recorded with one may still run (it is not freed
     // without a proof that none can; each resize retires one or two)

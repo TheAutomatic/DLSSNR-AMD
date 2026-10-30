@@ -5,6 +5,7 @@
 #include <cctype>
 #include <cstdio>
 #include <string>
+#include "nr_path_u8.hpp"
 
 namespace nr {
 // The networks a user picks, by the DLL's own codenames (dlssnr-amd.ini [Network] Model, NR Control, the log).
@@ -42,7 +43,7 @@ inline int network_value(std::string v) {
     return n == kSmallFp8 ? 1 : n == kSmallFp8Experimental ? 2 : n < 0 ? -1 : 0;
 }
 inline int ini_network(const std::string& path) {
-    FILE* f = std::fopen(path.c_str(), "r");
+    FILE* f = nr::u8::fopen(path.c_str(), "r");
     if (!f) return -1;
     auto trim = [](std::string s) {
         while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back();
@@ -68,7 +69,7 @@ inline int ini_network(const std::string& path) {
 }
 // Another [Network] key's value, trimmed ("" when there is none): `key` lower case, as the file's keys are compared.
 inline std::string ini_network_key(const std::string& path, const std::string& key) {
-    FILE* f = std::fopen(path.c_str(), "r");
+    FILE* f = nr::u8::fopen(path.c_str(), "r");
     if (!f) return {};
     auto trim = [](std::string s) {
         while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back();

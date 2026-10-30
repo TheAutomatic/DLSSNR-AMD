@@ -1,3 +1,4 @@
+#include "nr_path_win.hpp"
 #include "nr_pe_session.hpp"
 #include "nr_pe_events.hpp"
 #include "nr_gpu_completion.hpp"
@@ -1356,13 +1357,17 @@ bool Session::Impl::fits_in_memory(uint32_t w, uint32_t h, bool quiet) {
     }
     const double need_mb = double(need) / (1 << 20);
     const double free_mb = double(available) / (1 << 20);
+    if (!net_switch.file().memory_guard) {   // [Network] Memory Guard = 0
+        if (!quiet) log("[nr] %ux%u needs about %.0f MB, %.0f MB free (Memory Guard off: not checked)", w, h, need_mb, free_mb);
+        return true;
+    }
     if (quiet) return !available || need <= available;
     if (available && need > available) {
         char message[256];
         std::snprintf(message, sizeof message,
                       "the network needs about %.0f MB at %ux%u and only %.0f MB is free; "
                       "not building it. At output resolution this is expected - run the "
-                      "network before the upscaler instead, where the extent is smaller.",
+                      "network before the upscaler instead, where the extent is smaller; Memory Guard off builds it anyway.",
                       need_mb, w, h, free_mb);
         status = message;
         const auto now = std::chrono::steady_clock::now();
@@ -2115,6 +2120,7 @@ RuntimeConfig Session::Impl::make_config(uint32_t w, uint32_t h, VkFormat f) con
 HostDevice Session::Impl::make_host() const {
     HostDevice host{};
     host.instance = handles.instance; host.physical = handles.physical; host.device = handles.device;
+    vkdevice::note_gpu(handles.physical);   // NR Control's header: the GPU the network is built on
     // A real queue and its real family. Construction submits the weight upload
     // and waits for it; the game is submitting to the same underlying VkQueue,
     // so each of those submits takes the queue lock (the build thread's).
@@ -2385,7 +2391,7 @@ void Session::Impl::check_availability() {
     if (!handles.device) return;
     availability_checked = true;
     auto exists = [&](const char* rel) {
-        const DWORD a = GetFileAttributesA((root + "\\" + rel).c_str());
+        const DWORD a = nr::u8::attributes((root + "\\" + rel).c_str());
         return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
     };
     if (!exists("dlssnr-amd\\dlssnr-small.bin"))
@@ -2644,7 +2650,7 @@ Session::Session(std::string root) : impl_(std::make_unique<Impl>()) {
         if (GetEnvironmentVariableA("NR_INPUT_CHECK_PICTURES", v, sizeof v) > 0) pictures = std::atoi(v);
         std::string folder = nr::pe::module_folder();
         folder += folder.empty() ? "dlssnr-amd-check" : "\\dlssnr-amd-check";
-        if (!CreateDirectoryA(folder.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) folder.clear();
+        if (!nr::u8::make_dir(folder.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) folder.clear();
         nr::set_input_check(true, folder, pictures);
         return true;
     }();

@@ -138,13 +138,13 @@ get artifacts/ref/downloads/OptiScaler-NR-v0.8.91.zip \
     19a2852bb3f88e09075e3ccc66e0318c52e83a5901d9020a10384ae49d59ff77
 
 # OptiScaler (GPL-3.0), the Linux OptiScaler route's host, shipped as released: the official nightly the Linux packages
-# were tested with (OptiScaler v10.0.0-pre1, nightly-20261028), and its licence from its source tree at that nightly.
-get artifacts/ref/downloads/OptiScaler_v10.0.0-pre1_20261028.7z \
-    https://github.com/optiscaler/OptiScaler-nightly/releases/download/nightly-20261028/OptiScaler_v10.0.0-pre1_20261028.7z \
-    e3a4f533d19a5818a821093f7dcbd9698b96b9b60dcb0e577c569a0b33c94a33
-mkdir -p artifacts/ref/optiscaler-nightly-20261028
-get artifacts/ref/optiscaler-nightly-20261028/LICENSE \
-    https://raw.githubusercontent.com/optiscaler/OptiScaler/b19cfd29134ab9bc75d654b90f55fb05faca91b2/LICENSE \
+# were tested with (OptiScaler v10.0.0-pre1, nightly-20261030), and its licence from its source tree at that nightly.
+get artifacts/ref/downloads/OptiScaler_v10.0.0-pre1_20261030.7z \
+    https://github.com/optiscaler/OptiScaler-nightly/releases/download/nightly-20261030/OptiScaler_v10.0.0-pre1_20261030.7z \
+    db4fe2deae7edd9f6657f5cb223edc694ebdec62b52f15a3a59913f8b656c176
+mkdir -p artifacts/ref/optiscaler-nightly-20261030
+get artifacts/ref/optiscaler-nightly-20261030/LICENSE \
+    https://raw.githubusercontent.com/optiscaler/OptiScaler/e7e3872d410f704479d94d318d68d163b6b58947/LICENSE \
     3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986
 # Inter 4.1 (SIL Open Font License 1.1), NR Control's font on the Linux OptiScaler route (embedded in dlssnr-amd.asi).
 get artifacts/ref/downloads/Inter-4.1.zip https://github.com/rsms/inter/releases/download/v4.1/Inter-4.1.zip \

@@ -14,7 +14,7 @@
 namespace nr::control {
 
 inline constexpr uint32_t kMagic = 0x4C4F5243u;   // "CROL"
-inline constexpr uint32_t kVersion = 13;
+inline constexpr uint32_t kVersion = 14;
 inline constexpr uint32_t kPanelLines = 10;
 inline constexpr uint32_t kMaxLayers = 8;
 // The engine-data line nr_engine_panel.hpp writes when the game gives no exposure and nothing covers it (its start;
@@ -37,7 +37,7 @@ struct LayerStatus {
     uint32_t motion;                // this layer had motion vectors on its last run
     float gpu_ms, network_ms;       // its runtime's average a run: all of it, and the network's part
     uint32_t updated;               // GetTickCount (low 32 bits) of the last update
-    char note[64];                  // why it was skipped, or what it waits for
+    char note[192];                 // why it was skipped, or what it waits for (the longest notes run past 90 characters)
     uint32_t panel_lines;           // the engine-data panel of this layer's runs (as Shared::panel)
     char panel[kPanelLines][192];
     uint32_t panel_at;              // GetTickCount (low 32 bits) of its last write
@@ -106,8 +106,8 @@ struct Shared {
     char frame_gen[160];
     // DLL -> menu (the .asi route): HUD FIX ([HudFix]) - what it does now, and why each method cannot run here (by
     // Mode: 0 frame generation's HUD-less frame, 1 captured before the HUD, 2 estimated; "" it can)
-    char hud_now[128];
-    char hud_why[3][160];
+    char hud_now[256];
+    char hud_why[3][256];
 };
 static_assert(sizeof(Shared) % 4 == 0, "a plain array of words");
 

@@ -1,3 +1,4 @@
+#include "nr_path_win.hpp"
 #include "nr_pe_log.hpp"
 
 #include <windows.h>
@@ -17,8 +18,8 @@ HMODULE self_module = nullptr;
 // used to do and it is right when it works; the executable's own folder last,
 // which is where a drop-in module was copied to anyway.
 std::string folder_of(HMODULE module) {
-    char path[MAX_PATH]{};
-    if (!GetModuleFileNameA(module, path, MAX_PATH)) return {};
+    char path[MAX_PATH * 4]{};
+    if (!nr::u8::module_file(module, path, sizeof path)) return {};
     std::string s = path;
     const auto slash = s.find_last_of("\\/");
     return slash == std::string::npos ? std::string{} : s.substr(0, slash);
@@ -52,7 +53,7 @@ struct LogSettings { bool enabled = true, clear = true; };
 LogSettings read_settings() {
     LogSettings s;
     const std::string folder = resolve_folder();
-    FILE* f = std::fopen((folder.empty() ? std::string("dlssnr-amd.ini") : folder + "\\dlssnr-amd.ini").c_str(), "r");
+    FILE* f = nr::u8::fopen((folder.empty() ? std::string("dlssnr-amd.ini") : folder + "\\dlssnr-amd.ini").c_str(), "r");
     if (!f) return s;
     auto trim = [](std::string t) {
         const auto b = t.find_first_not_of(" \t\r\n"), e = t.find_last_not_of(" \t\r\n");
@@ -89,7 +90,7 @@ FILE* open_log() {
     char seen[4];
     const bool first = GetEnvironmentVariableA("NR_LOG_OPENED", seen, sizeof seen) == 0;
     if (first) SetEnvironmentVariableA("NR_LOG_OPENED", "1");
-    return std::fopen(resolve_path().c_str(), s.clear && first ? "w" : "a");
+    return nr::u8::fopen(resolve_path().c_str(), s.clear && first ? "w" : "a");
 }
 
 FILE* file() {
@@ -249,7 +250,7 @@ struct Modules {
         wchar_t path[MAX_PATH] = {};
         if (g_mapped_name && g_mapped_name(GetCurrentProcess(), reinterpret_cast<void*>(base), path, MAX_PATH)) {
             const wchar_t* slash = std::wcsrchr(path, L'\\');
-            char n[MAX_PATH] = {};
+            char n[MAX_PATH * 4] = {};
             WideCharToMultiByte(CP_UTF8, 0, slash ? slash + 1 : path, -1, n, sizeof n - 1, nullptr, nullptr);
             m.name = n;
         }

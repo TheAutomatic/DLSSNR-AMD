@@ -25,6 +25,8 @@ common=(-std=c++17 -O2 -DNDEBUG -DNR_BUILD_STAMP="\"$stamp\"" -Itoolchain/Vulkan
         -Ilinux/src/layer -Ilinux/src/pe -I"$out")
 [[ "$int4" == 1 ]] && common+=(-DNR_INT4=1)
 "$cxx" "${common[@]}" -I"$minhook/include" -c linux/src/pe/nr_asi_main.cpp -o "$out/asi_main.o"
+# Where a game died: exceptions with their stack in the log, one minidump (nr_pe_crash.hpp)
+"$cxx" "${common[@]}" -c linux/src/pe/nr_pe_crash.cpp -o "$out/crash.o"
 # The wilsjo2 style (nr_asi_wilsjo2.hpp): its flow and its programs; the shaders go to dlssnr-amd\shaders\wilsjo2.
 "$cxx" "${common[@]}" -c linux/src/pe/nr_asi_wilsjo2.cpp -o "$out/asi_wilsjo2.o"
 "$cxx" "${common[@]}" -c linux/src/pe/nr_asi_wilsjo2_vk.cpp -o "$out/asi_wilsjo2_vk.o"
@@ -59,7 +61,7 @@ NR_ARCH=x86_64 NR_INT4=$int4 NR_ASI_VK_OBJECTS=1 bash linux/build/build_optiscal
 shared_objs=("$out/model.o" "$out/session.o" "$out/config.o" "$out/interop.o" "$out/vram_ledger.o" "$out/log.o" "$out/vkdevice.o"
              "$out/nr_runtime.o" "$out/nr_native_plan.o" "$out/nr_renodx.o" "$out/renodx_route.o" "$out/control.o"
              "$out/screenshot.o" "$out"/mh_*.o)
-"$cxx" -shared -o "$out/dlssnr-amd.asi" "$out/asi_main.o" "$out/asi_wilsjo2.o" "$out/asi_wilsjo2_vk.o" "$out/nr_wilsjo2.o" "$out/asi_hudcap.o" "$out/menu.o" "$out"/im_*.o "${shared_objs[@]}" "$out/vulkan_lazy_s.o" \
+"$cxx" -shared -o "$out/dlssnr-amd.asi" "$out/asi_main.o" "$out/crash.o" "$out/asi_wilsjo2.o" "$out/asi_wilsjo2_vk.o" "$out/nr_wilsjo2.o" "$out/asi_hudcap.o" "$out/menu.o" "$out"/im_*.o "${shared_objs[@]}" "$out/vulkan_lazy_s.o" \
     "$out/vulkan_lazy_c.o" -ld3d12 -ldxgi -lole32 -lversion -static -static-libgcc -static-libstdc++
 
 echo "built $out/dlssnr-amd.asi ($(stat -c %s "$out/dlssnr-amd.asi") bytes), $out/nr_present_probe.exe and $out/shaders/wilsjo2"

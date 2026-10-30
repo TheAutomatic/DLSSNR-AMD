@@ -13,6 +13,7 @@
 // The queue matters and is not a detail: building the network uploads its
 // weights, which is a submit. Without a queue the Vulkan paths can record
 // nothing at all.
+#include <string>
 #include "nr_pe_interop.hpp"
 
 namespace nr::pe::vkdevice {
@@ -65,6 +66,14 @@ void note_device(VkInstance instance, VkPhysicalDevice physical, VkDevice device
 
 // The game destroys `device`: its queues and handles are forgotten (a later device may get the same handle).
 void forget_device(VkDevice device);
+// The GPU NR runs on, as its Vulkan driver names it ("AMD Radeon RX 9070 XT (RADV GFX1201)"); empty before NR has seen
+// a device. For NR Control's header.
+std::string gpu_name();
+// The physical device a network is built on (every route: a D3D game's comes through its translator's interop, not a
+// device seen being made)
+void note_gpu(VkPhysicalDevice physical);
+// Its driver as the driver names itself ("Mesa 26.2.5"; VkPhysicalDeviceDriverProperties::driverInfo, else its name)
+std::string driver_name();
 
 // Submits of ours onto a queue the game also submits to, serialised with the game's own: once enabled (the .asi on a
 // Vulkan game, which wraps the game's queue calls with the same per-queue lock), lock_queue / unlock_queue take the

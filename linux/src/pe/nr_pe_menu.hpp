@@ -4,7 +4,8 @@
 // NR Control, the OptiScaler route's own NR menu (End), drawn by our DLL over the game's DXGI swap chain (the .asi route,
 // nr_asi_main.cpp; ported from windows/src/pe/nr_pe_menu.cpp without its native-D3D12 parts): DXGI's
 // Present is hooked in the system's dxgi.dll (below OptiScaler's own swap chain, after its menu and frame
-// generation), and while the menu is open it is drawn with ImGui into an 8-bit image of its own and laid over the
+// generation) - where the .asi hooks the game's own swap chain the menu is drawn at that one's Present instead
+// (draw_game) - and while the menu is open it is drawn with ImGui into an 8-bit image of its own and laid over the
 // back buffer in the swap chain's encoding (SDR, scRGB, HDR10), on D3D11 and D3D12 swap chains. It edits the game's
 // dlssnr-amd.ini - [RenoDX] (every NR setting with the RenoDX-style option on), [Preprocess], [Network] - which
 // the DLL takes at once (nr_pe_config.hpp touch_config), and shows what NR is doing (nr_control_shared.hpp). Vulkan
@@ -20,6 +21,7 @@ struct ID3D12CommandQueue;
 struct IDXGISwapChain;
 struct ID3D12CommandList;
 struct ID3D11Device;
+struct IUnknown;
 
 namespace nr::pe::menu {
 
@@ -43,6 +45,11 @@ void on_d3d11_present(D3D11PresentHook hook);
 // the lists it was handed. The .asi's Present layers learn there where their guide copies were submitted.
 using ExecuteObserver = void (*)(ID3D12CommandQueue* queue, unsigned count, ID3D12CommandList* const* lists);
 void on_execute(ExecuteObserver observer);
+// NR Control at the Present of the game's own swap chain (the .asi's hook of it, after its Present layers), as
+// OptiScaler draws its menu in its own swap chain's Present: once a game frame, before frame generation, on the queue
+// (D3D12) or device (D3D11) the swap chain was made with - frame generation makes its frames from the picture with the
+// menu. While it is drawn there the system's Present only runs the hooks (on_d3d12_present / on_d3d11_present).
+void draw_game(IDXGISwapChain* swap_chain, IUnknown* device);
 // The colour space the game set on `swap_chain` (IDXGISwapChain3::SetColorSpace1, a DXGI_COLOR_SPACE_TYPE); false when
 // it never set one.
 bool colour_space_of(IDXGISwapChain* swap_chain, int* space);

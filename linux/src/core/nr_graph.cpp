@@ -18,6 +18,7 @@
 //
 // Two things this is not, yet: every family - `--report` says which - and the
 // OptiScaler entry point. The arenas are already the shapes that adapter wants.
+#include "nr_path_u8.hpp"
 #if NR_INT4
 #include "nr_build_cfg.hpp"
 #endif
@@ -350,7 +351,7 @@ struct ModelPack {
 };
 ModelPack g_pack;
 bool open_model_pack(const std::string& file, const std::string& root, std::string* why) {
-    std::ifstream f(file, std::ios::binary);
+    std::ifstream f(nr::u8::path(file), std::ios::binary);
     char magic[8];
     uint32_t count = 0, reserved = 0;
     if (!f.read(magic, 8) || std::memcmp(magic, "NRMODEL1", 8) ||
@@ -379,13 +380,13 @@ std::vector<uint8_t> slurp(const std::string& p) {
         for (char& c : name) if (c == '\\') c = '/';
         const auto it = g_pack.index.find(name);
         if (it == g_pack.index.end()) return {};
-        std::ifstream f(g_pack.file, std::ios::binary);
+        std::ifstream f(nr::u8::path(g_pack.file), std::ios::binary);
         std::vector<uint8_t> v(size_t(it->second.second));
         if (!f.seekg(std::streamoff(it->second.first)) ||
             !f.read(reinterpret_cast<char*>(v.data()), std::streamsize(v.size()))) return {};
         return v;
     }
-    std::ifstream f(p, std::ios::binary);
+    std::ifstream f(nr::u8::path(p), std::ios::binary);
     if (!f) return {};
     return std::vector<uint8_t>((std::istreambuf_iterator<char>(f)),
                                 std::istreambuf_iterator<char>());
@@ -440,7 +441,7 @@ static void i4_store_write(const std::string& path, const std::vector<I4Entry>& 
     const uint32_t cnt = uint32_t(es.size());
     const uint64_t ck = i4_fnv(1469598103934665603ull, body.data(), body.size());
     const std::string tmp = path + ".tmp";
-    FILE* f = std::fopen(tmp.c_str(), "wb");
+    FILE* f = nr::u8::fopen(tmp.c_str(), "wb");
     if (!f) throw std::runtime_error("int4 weights: cannot write " + tmp);
     bool ok = std::fwrite(kI4Magic, 1, 8, f) == 8 && std::fwrite(&cnt, 4, 1, f) == 1 && std::fwrite(&ck, 8, 1, f) == 1 &&
               std::fwrite(body.data(), 1, body.size(), f) == body.size();
@@ -460,7 +461,7 @@ static const I4Store* i4_store() {
     if (!path) return nullptr;
     // Checked in one pass with a small buffer, and only each entry's place in the file kept: i4_obtain reads a
     // matrix when the build reaches it, so the file is never in host memory as a whole.
-    std::ifstream f(path, std::ios::binary);
+    std::ifstream f(nr::u8::path(path), std::ios::binary);
     char magic[8] = {};
     uint32_t cnt = 0; uint64_t ck = 0;
     if (!f.read(magic, 8) || std::memcmp(magic, kI4Magic, 8) || !f.read(reinterpret_cast<char*>(&cnt), 4) ||
@@ -519,7 +520,7 @@ static I4Mat i4_obtain(const std::string& prefix, const std::vector<uint8_t>& ws
             throw std::runtime_error("int4 weights: " + std::filesystem::path(prefix).filename().string() + " is not in dlssnr-int4.bin or was made from another model");
         std::vector<uint8_t> nib(size_t(N) * K4 / 2);
         r.sc.resize(size_t(N) * 8);
-        std::ifstream f(st->path, std::ios::binary);
+        std::ifstream f(nr::u8::path(st->path), std::ios::binary);
         if (!f.seekg(std::streamoff(it->second.at)) || !f.read(reinterpret_cast<char*>(nib.data()), std::streamsize(nib.size())) ||
             !f.read(reinterpret_cast<char*>(r.sc.data()), std::streamsize(r.sc.size())))
             throw std::runtime_error("int4 weights: " + st->path + " could not be read again");
@@ -871,7 +872,7 @@ std::vector<Step> parse_plan(std::istream& f) {
 }
 
 std::vector<Step> load_plan(const std::string& path) {
-    std::ifstream f(path);
+    std::ifstream f(nr::u8::path(path));
     if (!f) throw std::runtime_error("cannot open " + path);
     return parse_plan(f);
 }
@@ -1567,7 +1568,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     }
     std::string spv_dir = arg(argc, argv, "--spv-dir", "build");
     if(accumulation=="round-fp16") spv_dir += "/round-fp16";
-    std::ifstream policy_file(spv_dir+"/accumulation.txt");
+    std::ifstream policy_file(nr::u8::path(spv_dir+"/accumulation.txt"));
     std::string built_policy;
     policy_file >> built_policy;
     if(built_policy!=accumulation) {
@@ -1586,7 +1587,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     // is, because a runner and a build that disagree here compute stale data.
     bool coherent_act = false;
     {
-        std::ifstream coh(spv_dir + "/coherent-act.txt");
+        std::ifstream coh(nr::u8::path(spv_dir + "/coherent-act.txt"));
         std::string t;
         coh >> t;
         coherent_act = (t == "1");
@@ -1596,7 +1597,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     std::string swin_bias_storage = "fp32";
     const std::string bias_marker = spv_dir + "/swin-bias-storage.txt";
     if (std::filesystem::exists(bias_marker)) {
-        std::ifstream file(bias_marker);
+        std::ifstream file(nr::u8::path(bias_marker));
         if (!(file >> swin_bias_storage) ||
             (swin_bias_storage != "fp16" && swin_bias_storage != "fp32")) {
             std::fprintf(stderr, "invalid Swin bias storage marker: %s\n", bias_marker.c_str());
@@ -2064,7 +2065,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     math_profile = 0;
     {
         const std::string path = spv_dir + "/shader-constants.txt";
-        std::ifstream f(path);
+        std::ifstream f(nr::u8::path(path));
         if (!f) {
             std::fprintf(stderr, "missing %s; the SPVs and this binary cannot be "
                          "checked against each other. Run linux/build/build_network.py\n",
@@ -2208,7 +2209,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         const Step& s = *ps;
         const Shape sh = shape_of(s);
         Disp d{&s};
-        char base[256];
+        char base[1024];   // (UTF-8 paths: 3 bytes a CJK letter)
         if (sh.fam == F_FSWIN || sh.fam == F_DS || sh.fam == F_UPS) {
             const bool pre = s.type == "CCTinlayoutFusedPreBlockSwin1H";
             const bool post = s.type == "CCTinlayoutFusedPostBlockSwin1H";
@@ -3669,7 +3670,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                 }
             }
             if (s.type == "CCVit1DQKV") {
-                char record_path[256];
+                char record_path[1024];
                 std::snprintf(record_path, sizeof record_path,
                               "%s/inventory/weights/block%d.layer%d.layer.bin",
                               unp.c_str(), s.block, s.layer);
@@ -3985,7 +3986,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             p.o_off=uint32_t(voff[pool_key(s.block)]/2); // FP16 element offset
             d.kern="gemmvqkv";
             std::memcpy(d.push.data(),&p,sizeof p);
-            char record_path[256];
+            char record_path[1024];
             std::snprintf(record_path,sizeof record_path,"%s/inventory/weights/block%d.layer%d.layer.bin",
                           unp.c_str(),s.block,s.layer);
             const auto rec=slurp(record_path);
@@ -5368,7 +5369,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         const std::string hm = spv_dir + "/hs-pipelines.txt";
         if (std::filesystem::exists(hm)) {
             std::set<std::string> hs;
-            { std::ifstream f(hm); std::string k; while (f >> k) hs.insert(k); }
+            { std::ifstream f(nr::u8::path(hm)); std::string k; while (f >> k) hs.insert(k); }
             std::string bad;
             for (const Disp& d : disp) {
                 if (d.kern.rfind("fswin", 0) != 0) continue;
@@ -5971,7 +5972,7 @@ int main(int argc, char** argv) try {
                     100.0 * double(nz) / double(px.size()),
                     std::sqrt(s2 / double(px.size())), lo, hi);
         if (const char* op = arg(argc, argv, "--out-image")) {
-            FILE* f = std::fopen(op, "wb");
+            FILE* f = nr::u8::fopen(op, "wb");
             if (!f) throw std::runtime_error(std::string("cannot open output image: ") + op);
             const size_t written = std::fwrite(px.data(), sizeof(float), px.size(), f);
             const int closed = std::fclose(f);
@@ -5993,7 +5994,7 @@ int main(int argc, char** argv) try {
             for (const Step* r : run)
                 if (r->block == ds_only && shape_of(*r).fam == F_DS) dss = r;
             if (!dss) { std::fprintf(stderr, "block %d is not a _ds layer\n", ds_only); return 1; }
-            char cap[256];
+            char cap[1024];
             std::snprintf(cap, sizeof cap, host_boundary ? "%s/b%03dl%d_o1.bin" : "%s/b%03dl%d_skip.bin",
                           score_dir, dss->block, dss->layer);
             const std::vector<uint8_t> sk = slurp(cap);
@@ -6195,7 +6196,7 @@ int main(int argc, char** argv) try {
                 const Step& s2 = *d.s;
                 if (d.kern.rfind("imgin", 0) == 0 || d.kern.rfind("pool", 0) == 0 || d.kern.rfind("upsblend", 0) == 0 ||
                 d.kern == "upsview" || d.kern == "decups" || d.kern == "repack" || d.kern == "qkvnorm" || d.kern == "gemmds" || d.kern == "gemmups" || d.kern == "gemmups16") continue;
-                char cap[256];
+                char cap[1024];
                 std::snprintf(cap, sizeof cap, "%s/b%03dl%d.bin", seed_dir, s2.block, s2.layer);
                 const std::vector<uint8_t> ref = slurp(cap);
                 if (ref.empty()) {
@@ -6214,7 +6215,7 @@ int main(int argc, char** argv) try {
                 }
                 if (host_boundary && (s2.type == "CCSplitSwin16HProjPool" ||
                                       (s2.block == vit_first && s2.layer == 0))) {
-                    char sidepath[256];
+                    char sidepath[1024];
                     std::snprintf(sidepath, sizeof sidepath, "%s/b%03dl%d_o1.bin",
                                   seed_dir, s2.block, s2.layer);
                     const auto side = slurp(sidepath);
@@ -6792,7 +6793,7 @@ int main(int argc, char** argv) try {
                         std::memcpy(canon.data() + (t*C+c)*elem_bytes,
                                     got.data() + src*elem_bytes, elem_bytes);
                     }
-                FILE* f = std::fopen(dump_to, "wb");
+                FILE* f = nr::u8::fopen(dump_to, "wb");
                 if (f) {
                     std::fwrite(canon.data(), 1, canon.size(), f);
                     std::fclose(f);
@@ -6820,7 +6821,7 @@ int main(int argc, char** argv) try {
                 d.kern == "upsview" || d.kern == "decups" || d.kern == "repack" || d.kern == "qkvnorm" || d.kern == "gemmds" || d.kern == "gemmups" || d.kern == "gemmups16") continue;
             if (!oracle && (only_b >= 0 ? !(s2.block == only_b && s2.layer == only_l)
                                         : s2.block < seed_step->block)) continue;
-            char cap[256];
+            char cap[1024];
             std::snprintf(cap, sizeof cap, "%s/b%03dl%d.bin",
                           score_dir, s2.block, s2.layer);
             const std::vector<uint8_t> ref = slurp(cap);
@@ -7206,12 +7207,12 @@ int main(int argc, char** argv) try {
         runner.run_graph(steps, pf);
         ctx.download(act, VkDeviceSize(prof_off) * 4, pz.data(), pz.size() * 4);
         const char* po = std::getenv("NR_PROF_OUT") ? std::getenv("NR_PROF_OUT") : "prof.bin";
-        FILE* f = std::fopen(po, "wb");
+        FILE* f = nr::u8::fopen(po, "wb");
         if (f) { std::fwrite(pz.data(), 4, pz.size(), f); std::fclose(f); }
         std::printf("NR_PROF: %u records -> %s\n", pz[0], po);
     }
     if (const char* path=arg(argc,argv,"--telemetry-csv")) {
-        std::ofstream trace(path);
+        std::ofstream trace(nr::u8::path(path));
         if(!trace)throw std::runtime_error("cannot open telemetry CSV");
         trace << "elapsed_ms,phase,gfx_mhz,power_w,edge_c\n";
         for(size_t i=0;i<tel.elapsed.size();++i)

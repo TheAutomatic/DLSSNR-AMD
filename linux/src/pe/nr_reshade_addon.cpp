@@ -23,6 +23,7 @@
 // Layout: this file sits next to ReShade's own DLL in the game directory, with
 // build/ and artifacts/ beside it, exactly like the standalone module. dlssnr-amd.ini
 // is shared with it.
+#include "nr_path_win.hpp"
 #include "nr_screenshot.hpp"
 #include "nr_gpu_completion.hpp"
 #include "nr_pe_config.hpp"
@@ -158,6 +159,8 @@ Ret call(const C* self, Ret (C::*pmf)(A...) const, B&&... b) {
 namespace {
 
 using namespace reshade::api;
+using nr::lang::tr;
+using nr::lang::tr_text;
 
 // NR's own resources made through reshade::api (the frame copies: HUD FIX's, the PQ conversion's, the motion copies,
 // Inspect's), in NR Control's video memory (nr_vram_ledger.hpp, "Frame copies"): D3D12 by its allocation size, D3D11 /
@@ -287,7 +290,7 @@ void chain_poll() {
         said += one;
         layers_now.push_back(std::move(a));
     }
-    if (layered) nr::pe::events::note(nr::pe::events::kSettings, "NR chain: %s", said.empty() ? "no layer enabled" : said.c_str());
+    if (layered) nr::pe::events::note(nr::pe::events::kSettings, "NR: %s", said.empty() ? "no layer enabled" : said.c_str());
     if (layered) {   // the page's rows follow the file at once (a chain with no layer on runs no frame to do it)
         std::vector<int> numbers;
         for (const AddonLayer& l : layers_now) numbers.push_back(l.number);
@@ -390,12 +393,12 @@ LPTOP_LEVEL_EXCEPTION_FILTER previous_filter = nullptr;
 LONG WINAPI crash_filter(EXCEPTION_POINTERS* e) {
     const auto* rec = e ? e->ExceptionRecord : nullptr;
     void* at = rec ? rec->ExceptionAddress : nullptr;
-    char module[MAX_PATH] = "?";
+    char module[MAX_PATH * 4] = "?";
     HMODULE m = nullptr;
     if (at && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                                  GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                                  static_cast<LPCSTR>(at), &m) && m)
-        GetModuleFileNameA(m, module, MAX_PATH);
+        nr::u8::module_file(m, module, sizeof module);
     log("[nr] CRASH: exception 0x%08lX at %p in %s (module base %p)",
         rec ? rec->ExceptionCode : 0ul, at, module, static_cast<void*>(m));
     return previous_filter ? previous_filter(e) : EXCEPTION_CONTINUE_SEARCH;
@@ -688,7 +691,7 @@ void dump_write(device* dev, resource staging, const char* which) {
     char name[64];
     std::snprintf(name, sizeof name, "nr-reshade-e%u-%s.ppm", (unsigned)dump_state.seen, which);
     path += name;
-    FILE* fp = std::fopen(path.c_str(), "wb");
+    FILE* fp = nr::u8::fopen(path.c_str(), "wb");
     double sum[3] = {0, 0, 0};
     if (fp) std::fprintf(fp, "P6\n%u %u\n255\n", dump_state.w, dump_state.h);
     std::vector<uint8_t> row((size_t)dump_state.w * 3);
@@ -1011,6 +1014,11 @@ struct HudFixState {
     std::string said;     // the last reason it did not run, logged once each
     std::mutex now_m;
     std::string now;      // what it did the last frame (the page's line)
+    // Captured greyed on the page (why_captured, under now_m) as on the .asi: the API cannot be followed, or armed
+    // (Auto, Captured) for 2 s with nothing captured - until a capture succeeds
+    std::string why_captured;
+    ULONGLONG cap_watched = 0, cap_seen = 0;
+    std::string cap_why;
 };
 HudFixState hudfix{};
 
@@ -1550,8 +1558,23 @@ HudPlan hudfix_plan(device* dev, command_list* cl, uint64_t colour) {
     CapVerdict v = CapVerdict::kMissed;
     if (armed_before && cap.armed.load()) v = cap_verdict(colour, why);
     else {
-        why = "it starts with the next frame";
+        why = NR_N("it starts with the next frame");
         if (armed_before) (void)cap_verdict(colour, why);   // switched off: its writes go
+    }
+    {   // Captured greyed or not (the page)
+        const ULONGLONG now_ms = GetTickCount64();
+        std::string grey;
+        if (!can_capture) grey = NR_N("the capture before the HUD does not follow this game's API");
+        else if (!cap.armed.load()) hudfix.cap_watched = 0;
+        else {
+            if (!hudfix.cap_watched) hudfix.cap_watched = now_ms;
+            if (v == CapVerdict::kCaptured) { hudfix.cap_seen = now_ms; hudfix.cap_why.clear(); }
+            else if (now_ms - hudfix.cap_watched > 2000 && (!hudfix.cap_seen || now_ms - hudfix.cap_seen > 2000))
+                hudfix.cap_why = why.empty() ? std::string(NR_N("no frame before the HUD was found in this game")) : why;
+        }
+        if (grey.empty()) grey = hudfix.cap_why;
+        std::lock_guard<std::mutex> g(hudfix.now_m);
+        hudfix.why_captured = grey;
     }
     switch (mode) {
     case 1:   // Auto
@@ -2169,7 +2192,7 @@ MotionSource motion{};
 bool lumenite_on_disk() {
     const std::string folder = nr::pe::module_folder();
     if (folder.empty()) return false;
-    const DWORD a = GetFileAttributesA((folder + "\\reshade-shaders\\Shaders\\lumenite_Kernel.fx").c_str());
+    const DWORD a = nr::u8::attributes((folder + "\\reshade-shaders\\Shaders\\lumenite_Kernel.fx").c_str());
     return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
 }
 
@@ -2721,7 +2744,7 @@ const char* run_note(int one) {
     if (one != 0) return last_status.c_str();
     // passed through: why, when the session says (waiting for video memory for this layer's network, ...)
     const nr::pe::Session::State st = session ? session->state() : nr::pe::Session::State{};
-    run_note_text = st.passed && !st.status.empty() ? st.status : "not run this frame";
+    run_note_text = st.passed && !st.status.empty() ? st.status : NR_N("not run this frame");
     return run_note_text.c_str();
 }
 // A layer's row after its run on this frame, or after it was left out (state 3, `note` why), as the .asi's layers
@@ -2748,10 +2771,10 @@ void note_layer(int number, bool wilsjo2, uint32_t state, const char* note, unsi
         r->gpu_ms = session->gpu_ms(); r->network_ms = session->network_ms();
         if (!wilsjo2 && st.renodx_known) {
             r->fast_passes = st.renodx.fast_passes; r->motion = st.renodx.motion;
-            if (st.renodx.fast_fallback) std::snprintf(r->note, sizeof r->note, "Extrapolation: no motion vectors");
+            if (st.renodx.fast_fallback) std::snprintf(r->note, sizeof r->note, "%s", NR_N("Extrapolation: no motion vectors"));
         } else if (wilsjo2) {
             r->fast_passes = st.wilsjo2_fast_passes; r->motion = st.wilsjo2_motion ? 1u : 0u;
-            if (st.wilsjo2_fast_fallback) std::snprintf(r->note, sizeof r->note, "Extrapolation: no motion vectors");
+            if (st.wilsjo2_fast_fallback) std::snprintf(r->note, sizeof r->note, "%s", NR_N("Extrapolation: no motion vectors"));
         }
         r->state = state;
         r->net = st.running_net < 0 ? nr::control::kNoNet : uint32_t(st.running_net);
@@ -2867,7 +2890,7 @@ bool run_layers(effect_runtime* rt, nr::pe::Session& s, const nr::pe::Session::R
             f.settings.nr_enabled = true;
             f.present = present_encoding(f.settings, format);
             if (!f.present) {
-                report("NR chain layer " + std::to_string(l.number) + ": the RenoDX processing cannot serve this swap chain "
+                report("Layer " + std::to_string(l.number) + ": the RenoDX processing cannot serve this swap chain "
                        "(colour space " + std::string(space_name(back_buffer_space)) + ", format " +
                        std::to_string(unsigned(format)) + "); it is left out");
                 note_layer(l.number, false, 3, "RenoDX cannot serve this swap chain", w, h, 0, 1.f);
@@ -2885,7 +2908,7 @@ bool run_layers(effect_runtime* rt, nr::pe::Session& s, const nr::pe::Session::R
             note_layer(l.number, false, run_state(one), run_note(one), w, h, nr::renodx::stack_passes(f.settings), 1.f);
         } else {
             if (back_buffer_space == color_space::hdr10_hlg) {
-                report("NR chain layer " + std::to_string(l.number) + ": the swapchain is HLG, which the wilsjo2 "
+                report("Layer " + std::to_string(l.number) + ": the swapchain is HLG, which the wilsjo2 "
                        "processing has no decode for; it is left out");
                 note_layer(l.number, true, 3, "HLG swap chain: wilsjo2 has no decode for it", w, h, 0, l.cfg.white_point);
                 continue;
@@ -3013,6 +3036,7 @@ void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
     {   // NeuralUplift as NRToggleKey left it
         static nr::pe::NrToggle toggle;
         renodx_frame.settings.nr_enabled = toggle.frame(config.renodx);
+        nr::pe::layer_keys_frame();   // [LayerN] ToggleKey
     }
     {   // RenoDX's NR screenshot (nr_screenshot.hpp), taken by a RenoDX layer: this route's final picture is the presented frame
         static nr::pe::KeyPress screenshot_key;
@@ -3462,17 +3486,17 @@ const nr::control_ui::ChainRoute kReShadeChain = [] {
     r.placement_default = "present";
     r.added_processing = "RenoDX";
     r.added_placement = "present";
-    r.chain_help = "Each layer is an NR run of its own on the frame, in layer order: its processing (RenoDX, or wilsjo2 - "
+    r.chain_help = NR_N("Each layer is an NR run of its own on the frame, in layer order: its processing (RenoDX, or wilsjo2 - "
                    "this route's own composition under OptiScaler DLSS-NR's settings), its network ([Network] Model, or one "
                    "of its own) and its own settings below. On this route every layer runs at Present, on the picture "
                    "ReShade hands over. Each layer costs a network run, and a layer with another network or size its own "
-                   "memory. Removing every layer goes back to [DlssNr] / [RenoDX].";
-    r.wilsjo2_about = "This route's own composition around the network, under OptiScaler DLSS-NR's settings and names.";
+                   "memory. Removing every layer goes back to [DlssNr] / [RenoDX].");
+    r.wilsjo2_about = NR_N("This route's own composition around the network, under OptiScaler DLSS-NR's settings and names.");
     r.wilsjo2_table = nr::reshade_layer_keys::kKeys;
     r.wilsjo2_count = nr::reshade_layer_keys::kCount;
-    r.mask_label = "Auto skin mask";
-    r.passes_help = "Passes. Model passes a frame, 1-3 (up to 30 with Unlock passes); each costs one more network run.";
-    r.pass_same_help = "On: pass 1's settings, with the local tone at 0. Off: this pass's own settings below.";
+    r.mask_label = NR_N("Auto skin mask");
+    r.passes_help = NR_N("Passes. Model passes a frame, 1-3 (up to 30 with Unlock passes); each costs one more network run.");
+    r.pass_same_help = NR_N("On: pass 1's settings, with the local tone at 0. Off: this pass's own settings below.");
     r.legacy_row = [](const nr::ini_edit::Ini& ini) {
         nr::control_ui::ChainRow row;
         row.number = 1;
@@ -3552,6 +3576,36 @@ void fill_view() {
     }
 }
 
+// The page's parts, in a sidebar as NR Control's (nr_pe_menu.cpp). NR_ADDON_PAGE=<name> (tests) opens one;
+// NR_ADDON_PAGES=<name,name,...> with NR_ADDON_PAGE_SHOTS: shot i shows the i-th.
+enum AddonPage { kPgChain, kPgLayer, kPgNetwork, kPgPreprocess, kPgHudFix, kPgMotion, kPgHotkeys, kPgScreenshot, kPgCompare,
+                 kPgDiagnostics, kPgLanguage, kPgStatus, kAddonPages };
+int addon_page_named(const char* name) {
+    static const char* const names[] = {"chain", "layer", "network", "preprocess", "hudfix", "motion", "hotkeys",
+                                        "screenshot", "compare", "diagnostics", "language", "status"};
+    for (int i = 0; name && i < kAddonPages; ++i) if (!std::strcmp(name, names[i])) return i;
+    return -1;
+}
+// The menus' language files (nr_lang.hpp) and [NRControl] Language - from the page's copy of the file, else read from
+// the file once a second (the OSD before the page was opened)
+std::string lang_folder() { return std::string(nr::pe::module_folder()) + "\\dlssnr-amd\\lang"; }
+std::string addon_language() {
+    if (page_ini) return page_ini->get("NRControl", "Language", "");
+    static std::string v;
+    static uint64_t at = 0;
+    if (const uint64_t now = GetTickCount64(); !at || now - at >= 1000) {
+        at = now;
+        char b[128] = {};
+        if (!config_path.empty()) nr::u8::profile("NRControl", "Language", "", b, sizeof b, config_path.c_str());
+        v = b;
+    }
+    return v;
+}
+int addon_page = [] {
+    char v[32] = {};
+    const int n = GetEnvironmentVariableA("NR_ADDON_PAGE", v, sizeof v) ? addon_page_named(v) : -1;
+    return n >= 0 ? n : int(kPgChain);
+}();
 void draw_page();
 void draw_overlay(effect_runtime*) {
     nr::pe::watchdog::Phase phase("the add-on's page (ReShade overlay)");
@@ -3570,7 +3624,7 @@ void page_trace(const char* step) {
 void draw_page() {
     page_trace("begin");
     if (config_path.empty()) {
-        ImGui::TextDisabled("dlssnr-amd.ini was not found next to the add-on.");
+        ImGui::TextDisabled(tr("dlssnr-amd.ini was not found next to the add-on."));
         return;
     }
     if (!page_ini) {
@@ -3579,135 +3633,245 @@ void draw_page() {
     }
     if (page_ini->refresh() || page_loaded < 0) { page_renodx.load(*page_ini); page_loaded = page_loaded < 0 ? 1 : page_loaded + 1; }
     fill_view();
+    nr::lang::sync(lang_folder(), addon_language());
+    // [NRControl] TextScale: this page's text alone (ReShade's own menu keeps its size); popped at the page's end
+    float text_scale = nr::parse_float(page_ini->get("NRControl", "TextScale", "1"), 1.0f);
+    if (!(text_scale >= 0.75f && text_scale <= 2.f)) text_scale = 1.f;
+    ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * text_scale);
+    nr::control_ui::check_letters();   // a language whose letters ReShade's font lacks: English
     page_trace("view");
 
-    // What runs: NR on or off, the frame, the layers as they last ran and what they cost, a build, the video memory
-    ImGui::Text("Neural Rendering: %s", view.nr_on ? "on" : "off");
-    if (view.width)
-        ImGui::Text("Frame: %ux%u, %s, %s", view.width, view.height, panel_facts.format.c_str(), space_name(back_buffer_space));
+    // The layout of the OptiScaler route's NR Control (nr_pe_menu.cpp): a bar of facts, the NR switch, the pages in a
+    // sidebar and the chosen one beside it, NR's cost below. Inside ReShade's Add-ons tab, so no window, style or size
+    // of its own.
+    {
+        std::string api;
+        if (bound) switch (bound->get_device()->get_api()) {
+            case device_api::d3d9: api = "D3D9"; break;
+            case device_api::d3d10: api = "D3D10"; break;
+            case device_api::d3d11: api = "D3D11"; break;
+            case device_api::d3d12: api = "D3D12"; break;
+            case device_api::vulkan: api = "Vulkan"; break;
+            case device_api::opengl: api = "OpenGL"; break;
+        }
+        nr::control_ui::info_bar(nr::control_ui::info_line(api, nr::pe::vkdevice::gpu_name(), nr::pe::vkdevice::driver_name()));
+    }
+    {   // NR on / off for this run: the same as NRToggleKey ([RenoDX] NeuralUplift: on or off at the start)
+        bool on = view.nr_on != 0;
+        if (ImGui::Checkbox(tr("Neural Rendering"), &on)) nr::pe::request_nr_toggle();
+        ImGui::SameLine();
+        const std::string key = page_ini->get("RenoDX", "NRToggleKey", "F6");
+        ImGui::TextDisabled(tr("on / off for this run%s%s%s"), key.empty() ? "" : " (", key.c_str(), key.empty() ? "" : ")");
+        nr::control_ui::help("Every layer off or on again, for this run only (never written to the file). Its key is on "
+                             "the Hotkeys page; whether NR is on when the game starts: the Screenshot page's "
+                             "\"Neural Rendering\" ([RenoDX] NeuralUplift).");
+    }
     page_trace("lines");
+    const float u = ImGui::GetFontSize() / 17.f;
+    const float foot = ImGui::GetFrameHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y;
+    // the Add-ons tab scrolls: the pages get at least a menu's height (room(): ReShade's table returns an ImVec2 the
+    // MSVC way)
+    const float body = std::max(nr::control_ui::room().y - foot, 520 * u);
+    {   // the sidebar
+        ImGui::BeginChild("##nav", ImVec2(176 * u, body), ImGuiChildFlags_Borders);
+        // every layer of the chain by its number and processing, each opening its own page
+        const std::vector<nr::control_ui::ChainRow> layer_rows = chain_editor->legacy() ? std::vector<nr::control_ui::ChainRow>{chain_editor->legacy_row()}
+                                                                                        : chain_editor->layers();
+        const char* const labels[kAddonPages] = {NR_N("NR chain"), NR_N("Layer settings"), NR_N("Network"), NR_N("Preprocess"),
+                                                 NR_N("HUD FIX"), NR_N("Motion vectors"), NR_N("Hotkeys"),
+                                                 NR_N("Screenshot"), NR_N("Compare"), NR_N("Diagnostics"), NR_N("Language"),
+                                                 NR_N("Status")};
+        // [NRControl] Layers off: no NR chain page; the one layer's page is "NR settings" (its choices and settings)
+        const bool many = chain_editor->many();
+        if (addon_page == kPgChain && !many) addon_page = kPgLayer;
+        for (int i = 0; i < kAddonPages; ++i) {
+            if (i == kPgChain && !many) continue;
+            if (i == kPgNetwork || i == kPgHotkeys || i == kPgStatus) ImGui::Separator();
+            if (i == kPgLayer && !layer_rows.empty()) {
+                for (size_t k = 0; k < layer_rows.size(); ++k) {
+                    const auto& r = layer_rows[k];
+                    const bool chosen = addon_page == kPgLayer && (r.number == chain_editor->layer || (chain_editor->layer <= 0 && k == 0));
+                    char label[112];
+                    if (many) std::snprintf(label, sizeof label, tr("Layer %d (%s)"), r.number, r.processing.c_str());
+                    else std::snprintf(label, sizeof label, "%s", tr("NR settings"));
+                    ImGui::PushID(int(k));
+                    if (ImGui::Selectable(label, chosen)) { chain_editor->layer = r.number; addon_page = kPgLayer; }
+                    ImGui::PopID();
+                }
+                continue;
+            }
+            if (ImGui::Selectable(tr(labels[i]), addon_page == i)) addon_page = i;
+        }
+        // what runs, at the sidebar's foot: NR's layers, the motion vectors' effect, the networks
+        std::vector<nr::control_ui::FootRow> rows;
+        int layers_on = 0;
+        for (const auto& l : view.layers) if (l.number && l.state && l.state != 3) ++layers_on;
+        char t[32];
+        std::snprintf(t, sizeof t, tr(layers_on == 1 ? "%d layer" : "%d layers"), layers_on);
+        rows.push_back({NR_N("NR"), view.nr_on ? t : tr("Off"), view.nr_on != 0});
+        rows.push_back({NR_N("MV"), motion.lumenite_active ? "LumeniteFX" : mv_var.handle ? "VORT" : tr("missing"), false});
+        nr::control_ui::nav_foot(rows, nr::control_ui::ran_networks(&view, view.net_running));
+        ImGui::EndChild();
+    }
+    ImGui::SameLine();
+    ImGui::BeginChild("##page", ImVec2(0, body), ImGuiChildFlags_Borders, ImGuiWindowFlags_HorizontalScrollbar);
+    nr::control_ui::paged() = true;
     static const int skip = [] { char v[8] = {}; return GetEnvironmentVariableA("NR_ADDON_PAGE_SKIP", v, 8) ? std::atoi(v) : 0; }();
-    if (!(skip & 1)) {
-        nr::control_ui::draw_layer_status(&view);
-        nr::control_ui::draw_flapping();
-        nr::control_ui::draw_missing_data(view.layers, nr::control::kMaxLayers, page_ini.get());
-    }
-    page_trace("layer status");
-    if (session) {
-        const nr::pe::Session::State st = session->state();
-        if (st.building) {
-            char phase[128];
-            const float f = build_fraction(st, phase, sizeof phase);
-            ImGui::Text("Building %s", st.building_net >= 0 ? network_name(st.building_net) : "the network");
-            ImGui::ProgressBar(f, ImVec2(-1.0f, 0.0f), phase);
+    switch (addon_page) {
+        case kPgStatus:   // what runs: the frame, the layers as they last ran and what they cost, a build, the video memory
+            if (view.width)
+                ImGui::Text(tr("Frame: %ux%u, %s, %s"), view.width, view.height, panel_facts.format.c_str(), space_name(back_buffer_space));
+            if (!(skip & 1)) {
+                nr::control_ui::draw_layer_status(&view);
+                nr::control_ui::draw_flapping();
+                nr::control_ui::draw_missing_data(view.layers, nr::control::kMaxLayers, page_ini.get());
+            }
+            page_trace("layer status");
+            if (session) {
+                const nr::pe::Session::State st = session->state();
+                if (st.building) {
+                    char phase[128];
+                    const float f = build_fraction(st, phase, sizeof phase);
+                    ImGui::Text(tr("Building %s"), st.building_net >= 0 ? network_name(st.building_net) : tr("the network"));
+                    ImGui::ProgressBar(f, ImVec2(-1.0f, 0.0f), phase);
+                }
+            }
+            if (!last_status.empty()) ImGui::TextWrapped("%s", tr_text(last_status.c_str()));
+            nr::control_ui::text_dim_wrapped("DLSS5_Feed: %s; motion %s, depth %s. Frames: %u with NR, %u without",
+                                             technique.handle ? "found" : "MISSING", mv_var.handle ? "found" : "missing",
+                                             depth_var.handle ? "found" : "missing", frames_run, frames_declined);
+            page_trace("feed line");
+            if (!(skip & 2)) {
+                nr::control_ui::draw_vram(&view);
+                nr::control_ui::draw_residency();
+            }
+            page_trace("vram");
+            break;
+        case kPgChain:
+            chain_editor->nr_on = view.nr_on != 0;
+            chain_editor->flipped = [](int n) { return nr::pe::layer_flipped(n); };
+            if (!(skip & 4)) chain_editor->draw_chain();
+            if (chain_editor->picked) { chain_editor->picked = false; addon_page = kPgLayer; }   // a layer's name: its page
+            page_trace("chain");
+            break;
+        case kPgLayer:
+            chain_editor->nr_on = view.nr_on != 0;
+            chain_editor->draw_layer_page(&view, page_loaded, ImGui::GetStyleColorVec4(ImGuiCol_CheckMark));
+            page_trace("layer page");
+            break;
+        case kPgPreprocess:
+            nr::control_ui::draw_preprocess(*page_ini);
+            page_trace("Preprocess");
+            break;
+        case kPgHudFix: {   // this route has no frame generation's frames; Captured follows D3D10/11/12's draws
+            nr::control_ui::HudFixMenu hm;
+            hm.default_mode = 0;
+            hm.why[2] = tr("this route sees the game's frames only, not frame generation's");
+            {
+                std::lock_guard<std::mutex> g(hudfix.now_m);
+                hm.now = hudfix.now;
+                hm.why[3] = hudfix.why_captured;   // (translated where it is shown: tr_text)
+            }
+            nr::control_ui::draw_hudfix(*page_ini, hm);
+            page_trace("HUD FIX");
+            break;
         }
-    }
-    if (!last_status.empty()) ImGui::TextWrapped("%s", last_status.c_str());
-    ImGui::TextDisabled("DLSS5_Feed: %s; motion %s, depth %s. Frames: %u with NR, %u without",
-                        technique.handle ? "found" : "MISSING", mv_var.handle ? "found" : "missing",
-                        depth_var.handle ? "found" : "missing", frames_run, frames_declined);
-    page_trace("feed line");
-    if (!(skip & 2)) {
-        nr::control_ui::draw_vram(&view);
-        nr::control_ui::draw_residency();
-    }
-    page_trace("vram");
-    ImGui::Separator();
-
-    if (skip & 8) {   // tests: a table of the page's shape, nothing else
-        if (ImGui::BeginTable("probe", 2, ImGuiTableFlags_SizingFixedFit)) {
-            ImGui::TableNextRow();
-            ImGui::TableNextColumn();
-            ImGui::TextUnformatted("probe");
-            ImGui::EndTable();
+        case kPgNetwork: {
+            nr::control_ui::NetworkOptions net;
+            net.resize_help = NR_N("[Network] Resize History. When the size of NR's frame changes (on this route: the game's resolution):\n"
+                              "Off (default): NR's previous result is dropped and NR starts again at the new size, as NVIDIA's DLL does.\n"
+                              "On: the previous result is scaled to the new size and kept.\n"
+                              "It matters for dynamic resolution with NR before the upscaler (OptiScaler route); here sizes change rarely.");
+            nr::control_ui::draw_network_options(*page_ini, &view, net);
+            ImGui::Separator();
+            nr::control_ui::draw_layers_switch(*page_ini);   // the page's foot
+            page_trace("network");
+            break;
         }
-        page_trace("probe table");
+        case kPgMotion:   // the ReShade effect that makes the motion vectors ([DlssNr] MotionVectors), applied at the next present
+            if (nr::control_ui::section("Motion vectors")) {
+                static const char* const sources[] = {"VORT", "LumeniteFX Kernel"};
+                static const char* const words[] = {"vort", "lumenite"};
+                const bool installed = lumenite_on_disk();
+                int chosen = -1;
+                if (ImGui::BeginCombo(tr("Source##motion"), sources[std::clamp(config.motion_vectors, 0, 1)])) {
+                    if (ImGui::Selectable(sources[0], config.motion_vectors == 0)) chosen = 0;
+                    ImGui::BeginDisabled(!installed);
+                    if (ImGui::Selectable(sources[1], config.motion_vectors == 1)) chosen = 1;
+                    ImGui::EndDisabled();
+                    if (!installed && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                        nr::control_ui::tooltip("LumeniteFX is not installed. install.sh --lumenite installs it from its author's GitHub.");
+                    ImGui::EndCombo();
+                }
+                nr::control_ui::help("[DlssNr] MotionVectors. The ReShade effect that estimates the motion NR's history follows. "
+                                     "VORT comes with this package. LumeniteFX Kernel (by Afzaal) is installed separately, "
+                                     "with install.sh --lumenite, from its author's GitHub. Switching makes ReShade compile "
+                                     "its effects again (NR pauses until they are ready) and restarts NR's history.");
+                if (!installed)
+                    nr::control_ui::text_dim_wrapped("LumeniteFX is not installed (install.sh --lumenite).");
+                if (chosen >= 0) {   // choosing LumeniteFX again after it was not used retries it
+                    page_ini->set("DlssNr", "MotionVectors", words[chosen]);
+                    page_ini->save();
+                    config.motion_vectors = chosen;
+                    motion_choice_changed();
+                    log("[nr] motion vectors: %s chosen in the add-on page", sources[chosen]);
+                }
+                if (config.motion_vectors == 1 && motion.fell_back)
+                    ImGui::TextWrapped(tr("LumeniteFX is not used this session: %s. VORT runs instead; choose LumeniteFX "
+                                       "again to retry."), motion.reason.c_str());
+                else if (motion.lumenite_active)
+                    ImGui::TextDisabled(tr("LumeniteFX Kernel%s"), motion.verified ? tr(": its vectors follow the picture") : "");
+            }
+            page_trace("motion");
+            break;
+        case kPgLanguage:
+            if (nr::control_ui::section("Language")) {
+                nr::control_ui::draw_language(*page_ini, lang_folder(), true);
+                nr::control_ui::draw_text_size(*page_ini);
+            }
+            break;
+        case kPgScreenshot:
+            nr::control_ui::draw_nr_switch(*page_ini, page_renodx, [] { nr::pe::screenshot::request(); }, nr::pe::screenshot::status());
+            page_trace("screenshot");
+            break;
+        case kPgHotkeys:
+            nr::control_ui::draw_hotkeys(*page_ini, page_renodx,
+                                         nr::control_ui::HotkeysMenu{false, {{"Home", tr("ReShade's overlay (its default key)")}}});
+            page_trace("hotkeys");
+            break;
+        case kPgCompare:
+            nr::control_ui::draw_inspect(*page_ini, NR_N("What is compared. The final picture: every layer (all run at Present on "
+                                                    "this route), all off against all on. A layer: its own input and output."));
+            page_trace("Compare");
+            break;
+        case kPgDiagnostics:
+            if (nr::control_ui::section("Diagnostics")) {
+                nr::control_ui::draw_events();
+                if (ImGui::Button(tr("Copy a report"))) {
+                    const std::string folder = nr::pe::module_folder();
+                    report_said = nr::control_ui::copy_report(
+                        nr::control_ui::report_text(&view, "dlssnr_amd.addon", config_path, nr::pe::log_path()),
+                        folder + "\\dlssnr-amd\\nr-report.txt");
+                }
+                nr::control_ui::help("For a bug report: the layers as they run, their engine data, the video memory and its "
+                                     "residency, the events above, dlssnr-amd.ini and the last lines of dlssnr-amd.log, as text. "
+                                     "Copied to the clipboard and saved as dlssnr-amd\\nr-report.txt next to the game. Nothing "
+                                     "is sent anywhere.");
+                if (!report_said.empty()) { ImGui::SameLine(); ImGui::TextDisabled("%s", tr(report_said.c_str())); }
+            }
+            nr::control_ui::draw_log(*page_ini);
+            page_trace("Diagnostics");
+            break;
+        default: break;
     }
-    if (!(skip & 4)) chain_editor->draw_chain();
-    page_trace("chain");
-    chain_editor->draw_layer_page(&view, page_loaded, ImGui::GetStyleColorVec4(ImGuiCol_CheckMark));
-    page_trace("layer page");
-
-    ImGui::Spacing();
-    ImGui::SeparatorText("Global");
-    nr::control_ui::draw_preprocess(*page_ini);
-    page_trace("Preprocess");
-    {   // HUD FIX: this route has no frame generation's frames; Captured follows D3D10/11/12's draws
-        nr::control_ui::HudFixMenu hm;
-        hm.default_mode = 0;
-        hm.why[2] = "this route sees the game's frames only, not frame generation's";
-        {
-            std::lock_guard<std::mutex> g(hudfix.now_m);
-            hm.now = hudfix.now;
-        }
-        nr::control_ui::draw_hudfix(*page_ini, hm);
-        page_trace("HUD FIX");
-    }
-    nr::control_ui::NetworkOptions net;
-    net.resize_help = "[Network] Resize History. When the size of NR's frame changes (on this route: the game's resolution):\n"
-                      "Off (default): NR's previous result is dropped and NR starts again at the new size, as NVIDIA's DLL does.\n"
-                      "On: the previous result is scaled to the new size and kept.\n"
-                      "It matters for dynamic resolution with NR before the upscaler (OptiScaler route); here sizes change rarely.";
-    nr::control_ui::draw_network_options(*page_ini, &view, net);
-    page_trace("network");
-    // The ReShade effect that makes the motion vectors ([DlssNr] MotionVectors), applied at the next present
-    if (ImGui::CollapsingHeader("Motion vectors", ImGuiTreeNodeFlags_DefaultOpen)) {
-        static const char* const sources[] = {"VORT", "LumeniteFX Kernel"};
-        static const char* const words[] = {"vort", "lumenite"};
-        const bool installed = lumenite_on_disk();
-        int chosen = -1;
-        if (ImGui::BeginCombo("Source##motion", sources[std::clamp(config.motion_vectors, 0, 1)])) {
-            if (ImGui::Selectable(sources[0], config.motion_vectors == 0)) chosen = 0;
-            ImGui::BeginDisabled(!installed);
-            if (ImGui::Selectable(sources[1], config.motion_vectors == 1)) chosen = 1;
-            ImGui::EndDisabled();
-            if (!installed && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                ImGui::SetTooltip("LumeniteFX is not installed. install.sh --lumenite installs it from its author's GitHub.");
-            ImGui::EndCombo();
-        }
-        nr::control_ui::help("[DlssNr] MotionVectors. The ReShade effect that estimates the motion NR's history follows.\n"
-                             "VORT comes with this package. LumeniteFX Kernel (by Afzaal) is installed separately,\n"
-                             "with install.sh --lumenite, from its author's GitHub.\n"
-                             "Switching makes ReShade compile its effects again (NR pauses until they are ready)\n"
-                             "and restarts NR's history.");
-        if (chosen >= 0) {   // choosing LumeniteFX again after it was not used retries it
-            page_ini->set("DlssNr", "MotionVectors", words[chosen]);
-            page_ini->save();
-            config.motion_vectors = chosen;
-            motion_choice_changed();
-            log("[nr] motion vectors: %s chosen in the add-on page", sources[chosen]);
-        }
-        if (config.motion_vectors == 1 && motion.fell_back)
-            ImGui::TextWrapped("LumeniteFX is not used this session: %s. VORT runs instead; choose LumeniteFX "
-                               "again to retry.", motion.reason.c_str());
-        else if (motion.lumenite_active)
-            ImGui::TextDisabled("LumeniteFX Kernel%s", motion.verified ? ": its vectors follow the picture" : "");
-    }
-    page_trace("motion");
-    nr::control_ui::draw_nr_switch(*page_ini, page_renodx, [] { nr::pe::screenshot::request(); }, nr::pe::screenshot::status());
-    page_trace("NR on / off and screenshot");
-    if (ImGui::CollapsingHeader("Diagnostics")) {
-        nr::control_ui::draw_events();
-        if (ImGui::Button("Copy a report")) {
-            const std::string folder = nr::pe::module_folder();
-            report_said = nr::control_ui::copy_report(
-                nr::control_ui::report_text(&view, "dlssnr_amd.addon", config_path, nr::pe::log_path()),
-                folder + "\\dlssnr-amd\\nr-report.txt");
-        }
-        nr::control_ui::help("For a bug report: the layers as they run, their engine data, the video memory and its "
-                             "residency, the events above, dlssnr-amd.ini and the last lines of dlssnr-amd.log, as text. "
-                             "Copied to the clipboard and saved as dlssnr-amd\\nr-report.txt next to the game. Nothing "
-                             "is sent anywhere.");
-        if (!report_said.empty()) { ImGui::SameLine(); ImGui::TextDisabled("%s", report_said.c_str()); }
-    }
-    page_trace("Diagnostics");
-    nr::control_ui::draw_inspect(*page_ini, "What is compared. The final picture: every layer (all run at Present on "
-                                            "this route), all off against all on. A layer: its own input and output.");
-    page_trace("Compare");
-    nr::control_ui::draw_log(*page_ini);
-    page_trace("Log");
-    ImGui::Separator();
-    ImGui::TextDisabled("Changes are saved to dlssnr-amd.ini at once.");
+    nr::control_ui::paged() = false;
+    ImGui::EndChild();
+    if (nr::control_ui::capturing_key()) nr::pe::pause_hotkeys();   // the key being set acts as nothing else
+    // the footer: NR's GPU time a frame in its parts, and the frame NR works on
+    char frame[64] = "";
+    if (view.width) std::snprintf(frame, sizeof frame, tr("    Frame %ux%u"), view.width, view.height);
+    ImGui::TextDisabled("%s%s", nr::control_ui::cost_text(&view).c_str(), frame);
+    ImGui::PopFont();
     page_ini->save();
     page_trace("end");
 }
@@ -3745,7 +3909,19 @@ void page_window() {
     page_trace("window");
     if (ImGui::Begin("DLSSNR-AMD page (test)", nullptr,
                      ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse)) {
-        ImGui::SetScrollY(float(page_test.scroll) * d.y * 0.85f);
+        // the pages named in NR_ADDON_PAGES, one a shot; without it the page scrolled down by most of a window a shot
+        static const std::vector<int> pages = [] {
+            std::vector<int> v;
+            char list[256] = {};
+            if (GetEnvironmentVariableA("NR_ADDON_PAGES", list, sizeof list)) {
+                std::stringstream ss(list);
+                std::string item;
+                while (std::getline(ss, item, ',')) if (addon_page_named(item.c_str()) >= 0) v.push_back(addon_page_named(item.c_str()));
+            }
+            return v;
+        }();
+        if (!pages.empty()) addon_page = pages[std::min(size_t(page_test.scroll), pages.size() - 1)];
+        else ImGui::SetScrollY(float(page_test.scroll) * d.y * 0.85f);
         draw_page();
     }
     ImGui::End();
@@ -3813,6 +3989,8 @@ void on_reshade_present(effect_runtime* rt) {
 
 void on_reshade_overlay(effect_runtime*) {
     std::lock_guard<std::mutex> guard(lock);
+    nr::lang::sync(lang_folder(), addon_language());   // the OSD's texts
+    nr::control_ui::check_letters();
     for (auto& r : view.layers)
         if (r.number && r.state == 1 && (!layer_at.count(int(r.number)) || layer_at[int(r.number)] != presents)) {
             r.state = 3; r.gpu_ms = r.network_ms = 0.f;
@@ -3843,6 +4021,7 @@ void on_reshade_overlay(effect_runtime*) {
     // [Network] OSD, as NR Control's (nr_control_pages.hpp draw_osd_lines): after a network switch (hotkey, menu or
     // ini) the build's progress, then the running network(s) for 3 s (switch, the default); always (always); always with
     // each layer's GPU time (cost); nothing (off). A layer that only started or went is no switch.
+    nr::control_ui::osd_height(0) = 0.f;   // (the Preprocess notice sits above the network OSD only while that shows)
     if (session && config.network.osd != 0) {
         static uint32_t seen_want = ~0u, seen_running = ~0u;
         static std::chrono::steady_clock::time_point show_until{};
@@ -3866,23 +4045,11 @@ void on_reshade_overlay(effect_runtime*) {
         }
         // a build shows its bar from the first one on (the game's first start: no network has run yet)
         if (nr::control_ui::osd_switching(&view) || (running && (now < show_until || config.network.osd >= 2))) {
-            ImGui::SetNextWindowPos(ImVec2(24.0f, 64.0f));
-            ImGui::SetNextWindowBgAlpha(0.65f);
-            ImGui::Begin("##nr-osd", nullptr,
-                         ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_AlwaysAutoResize |
-                             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
-            nr::control_ui::draw_osd_lines(&view, config.network.osd);
-            ImGui::End();
+            nr::control_ui::osd_window("##nr-osd", 0, [&] { nr::control_ui::draw_osd_lines(&view, config.network.osd); });
         }
     }
     if (prep_switch.since_switch() > 2.0) return;
-    ImGui::SetNextWindowPos(ImVec2(24.0f, 24.0f));
-    ImGui::SetNextWindowBgAlpha(0.65f);
-    ImGui::Begin("##nr-preprocess", nullptr,
-                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_AlwaysAutoResize |
-                     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
-    ImGui::Text("NR Preprocess: %s", prep_switch.on() ? "ON" : "OFF");
-    ImGui::End();
+    nr::control_ui::osd_window("##nr-preprocess", 1, [] { ImGui::Text(tr("NR Preprocess: %s"), prep_switch.on() ? "ON" : "OFF"); });
 }
 
 void on_render_technique(effect_runtime* rt, effect_technique t, command_list* cl,
@@ -3955,6 +4122,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         const std::string folder = nr::pe::module_folder();
         if (!folder.empty()) {
             config_path = folder + "\\dlssnr-amd.ini";
+            nr::pe::restore_ini(folder);   // a deleted dlssnr-amd.ini: the installed one, before it is read
             config.load(config_path);
             log("[nr] settings file %s: enabled=%d intensity=%.2f history=%.2f", config_path.c_str(),
                 int(config.controls.enabled), config.controls.intensity, config.history);

@@ -44,6 +44,7 @@ struct NetworkConfig {
     bool resize_history = false;
     int osd = 1;   // OSD: 0 off, 1 after a switch, 2 always, 3 always with each layer's cost
     bool style_grade = true;   // Style Grade: Natural / Cinematic graded as NVIDIA's DLL (false: the older picture)
+    bool memory_guard = true;  // Memory Guard: a network only where its video memory is free (false: no such check)
 };
 void write_network(FILE* f, const NetworkConfig& n);
 const char* residency_name(int r);   // auto, resident, offload, minimal
@@ -82,7 +83,16 @@ class NrToggle {
     std::string key_text_;
     int vk_ = 0, mods_ = 0;
     bool down_ = false, have_override_ = false, override_ = false, file_on_ = true, logged_ = false, last_ = true;
+    uint64_t requests_ = ~0ull;   // request_nr_toggle()'s count as last taken (~0: not yet looked at)
 };
+// NR Control's NR switch (its top line, or the Add-ons page's): as a press of NRToggleKey, taken at the next frame.
+void request_nr_toggle();
+// A key as the files write it ("End", "Ctrl+F11", "Alt+M"): its virtual key and MOD_CONTROL / MOD_SHIFT / MOD_ALT bits;
+// false when it names no key.
+bool parse_key(const std::string& text, int* vk, int* mods);
+// While NR Control takes a key for a hotkey (its Hotkeys section): no hotkey of NR's acts for `ms` (each frame of the
+// capture renews it).
+void pause_hotkeys(uint32_t ms = 300);
 // NRScreenshotKey: true on the frame the key goes down (the game's window in front).
 class KeyPress {
   public:
@@ -115,10 +125,17 @@ struct LayerConfig {
     Processing processing = Processing::kRenoDX;
     Placement placement = Placement::kPresent;   // the default placement
     std::string network;                // a network's codename; empty: [Network] Model
+    std::string toggle_key;             // ToggleKey: turns the layer off / on for this run (layer_keys_frame); empty: none
+    bool flipped = false;               // `enabled` is the file's turned round by ToggleKey for this run
     RenoDXConfig renodx;                // the RenoDX processing's keys
     // every key of the section other than the four above, as written (the wilsjo2 processing parses them)
     std::vector<std::pair<std::string, std::string>> keys;
 };
+// [LayerN] ToggleKey, once a frame (each route's frame keys): a press turns layer N off or on for this run, never
+// written to the file. read_chain applies it, and ChainFile reads the chain again at once after a press.
+void layer_keys_frame();
+bool layer_flipped(int number);
+uint64_t layer_flips();   // counts the presses
 // [Inspect]: NR Control's comparison and debug tools for the whole NR chain, every route. All off by default.
 struct InspectConfig {
     uint32_t compare = 0;        // Compare: 0 off, 1 side by side, 2 wipe
@@ -140,7 +157,7 @@ struct InspectConfig {
 // [HudFix]: NR's change kept off the game's HUD at Present (the layers placed there), every processing's.
 enum class HudSource : uint32_t { kOff = 0, kAuto = 1, kGame = 2, kCaptured = 3, kEstimated = 4 };
 struct HudFixConfig {
-    uint32_t mode = 1;   // Mode: 0 off, 1 Auto (the default), 2 frame generation's HUD-less frame (DLSS-G,
+    uint32_t mode = 0;   // Mode: 0 off (the default, both routes), 1 Auto, 2 frame generation's HUD-less frame (DLSS-G,
                          // FSR FG, XeSS FG), 3 captured before the HUD is drawn, 4 estimated (screen-fixed pixels while
                          // the picture moves)
     bool show_mask = false;   // ShowMask: the HUD's alpha shown (white = HUD, kept as the game drew it)
@@ -163,7 +180,7 @@ class ChainFile {
     // False when nothing changed since the last call.
     bool poll(const std::string& path, ChainConfig& out);
   private:
-    uint64_t stamp_ = 0, checked_ms_ = 0, epoch_ = 0;
+    uint64_t stamp_ = 0, checked_ms_ = 0, epoch_ = 0, flips_ = 0;
 };
 // NR Control drawn by our DLL (nr_pe_menu.cpp) has just saved dlssnr-amd.ini: the next look of each poll here
 // (RenoDXFile, NetworkSwitch, the model's [Preprocess]) is at once rather than up to a second later. config_epoch()
@@ -172,6 +189,12 @@ void touch_config();
 uint64_t config_epoch();
 // [Log], with its comments (read by nr_pe_log.cpp; every route's file carries it).
 void write_log(FILE* f, bool enabled, bool clear);
+// [NRControl] (NR Control, the OptiScaler route's menu: its key), with its comments.
+void write_nrcontrol(FILE* f);
+// dlssnr-amd.ini missing in `folder`: the copy install.sh keeps (dlssnr-amd/dlssnr-amd.default.ini, the file as
+// installed, with the choices made there) put back in its place, and logged. False when the file is there or there is
+// no copy (the caller writes the built-in defaults). Called at start, and when the file goes while the game runs.
+bool restore_ini(const std::string& folder);
 // [Inspect] (NR Control's comparison and debug tools), with its comments: what the installer writes (every tool off).
 void write_inspect(FILE* f, const InspectConfig& i);
 void write_hudfix(FILE* f, const HudFixConfig& h);
@@ -279,7 +302,9 @@ struct Config {
     // Read the file, creating it with defaults when absent and rewriting it in
     // the current format when it still holds the old keys.
     void load(const std::string& path);
-    void save(const std::string& path);
+    // `whole`: also [Inspect] and [HudFix] at their defaults (HUD FIX off, as the ReShade route's installed file has
+    // it) - a file written anew, as install.sh's; a legacy file rewritten keeps whatever else it holds out of them.
+    void save(const std::string& path, bool whole = false);
     // Re-read if the file changed since the last load/save/reload.
     bool reload(const std::string& path);
 

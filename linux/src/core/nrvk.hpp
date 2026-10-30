@@ -11,6 +11,7 @@
 // them back without staging; the adapter that owns the game's VkDevice will
 // allocate the same arenas out of device-local memory.
 #pragma once
+#include "nr_path_u8.hpp"
 #include "nr_gpu_completion.hpp"
 #if NR_INT4
 #include "nr_build_cfg.hpp"
@@ -388,7 +389,7 @@ struct Context {
         pipeline_cache_path = path;
         std::vector<char> blob;
         {
-            std::ifstream f(path, std::ios::binary | std::ios::ate);
+            std::ifstream f(nr::u8::path(path), std::ios::binary | std::ios::ate);
             if (f) {
                 const std::streamoff n = f.tellg();
                 // 32 bytes is the header every implementation writes; anything
@@ -422,14 +423,14 @@ struct Context {
         // not leave a half-written file behind for the next one to read.
         const std::string tmp = pipeline_cache_path + ".tmp";
         {
-            std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+            std::ofstream f(nr::u8::path(tmp), std::ios::binary | std::ios::trunc);
             if (!f) return 0;
             f.write(blob.data(), std::streamsize(bytes));
             if (!f) return 0;
         }
-        std::remove(pipeline_cache_path.c_str());
-        if (std::rename(tmp.c_str(), pipeline_cache_path.c_str()) != 0) {
-            std::remove(tmp.c_str());
+        nr::u8::remove(pipeline_cache_path);
+        if (nr::u8::rename(tmp, pipeline_cache_path) != 0) {
+            nr::u8::remove(tmp);
             return 0;
         }
         return bytes;
@@ -852,7 +853,7 @@ struct Context {
 };
 
 inline std::vector<uint32_t> read_spirv(const std::string& path) {
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    std::ifstream f(nr::u8::path(path), std::ios::binary | std::ios::ate);
     if (!f) throw std::runtime_error("cannot open " + path);
     const std::streamoff n = f.tellg();
     if (n <= 0 || n % 4) throw std::runtime_error("not a SPIR-V module: " + path);
@@ -1024,7 +1025,7 @@ struct Kernel {
         // hold int4 pairs). Its binary is captured, every v_wmma_i32_16x16x16_iu8 (dword hi16 0xcc44)
         // becomes v_wmma_i32_16x16x32_iu4 (0xcc4a; the second dword is identical), and the copy is
         // imported under a fresh key. Only this pipeline changes; the file holds the expected count.
-        std::ifstream iu4(spirv_path + ".iu4");
+        std::ifstream iu4(nr::u8::path(spirv_path + ".iu4"));
         if (iu4) {
             int want = -1; iu4 >> want;
             if (!ctx.pipeline_binary) throw std::runtime_error("int4 pipeline needs VK_KHR_pipeline_binary: " + spirv_path);
@@ -1058,7 +1059,7 @@ struct Kernel {
             char hx[24]; std::snprintf(hx, sizeof hx, "%016llx", (unsigned long long)h);
             const size_t sl = path.find_last_of("/\\");
             cfile = std::string(cd) + "/" + (sl == std::string::npos ? path : path.substr(sl + 1)) + "." + hx + ".bin";
-            std::ifstream f(cfile, std::ios::binary);
+            std::ifstream f(nr::u8::path(cfile), std::ios::binary);
             if (f) try {
                 std::vector<uint8_t> blob((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
                 size_t o = 0; auto rd = [&](void* d, size_t n) { if (o + n > blob.size()) throw std::runtime_error("short"); std::memcpy(d, blob.data() + o, n); o += n; };
@@ -1135,7 +1136,7 @@ struct Kernel {
         nr::logf("[nr] int4 pipeline %s: %d WMMA rewrites", path.c_str(), n);
         if (!cfile.empty()) {
             const std::string tmpf = cfile + ".tmp";
-            if (FILE* f = std::fopen(tmpf.c_str(), "wb")) {
+            if (FILE* f = nr::u8::fopen(tmpf.c_str(), "wb")) {
                 const uint32_t hdr[3] = {0x43344955u, uint32_t(data.size()), uint32_t(n)};
                 bool ok = std::fwrite(hdr, 4, 3, f) == 3;
                 for (size_t i = 0; i < data.size() && ok; ++i) {
@@ -1144,7 +1145,7 @@ struct Kernel {
                          std::fwrite(&sz, 8, 1, f) == 1 && std::fwrite(data[i].data(), 1, data[i].size(), f) == data[i].size();
                 }
                 ok = std::fclose(f) == 0 && ok;
-                if (ok) { std::remove(cfile.c_str()); std::rename(tmpf.c_str(), cfile.c_str()); } else std::remove(tmpf.c_str());
+                if (ok) { nr::u8::remove(cfile); nr::u8::rename(tmpf, cfile); } else nr::u8::remove(tmpf);
             }
         }
 #endif

@@ -44,6 +44,7 @@ struct Fg {
     bool substitute = false;       // NR's answer may be written back into `game` (frame generation reads it at the present)
     const char* source = "";
     std::string why;               // not seen: why
+    bool offered = false;          // not armed: a hand-over came in the last 2 s (the method could run)
 };
 struct Frame {
     Result result = Result::kOff;

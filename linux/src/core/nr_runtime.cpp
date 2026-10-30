@@ -1,3 +1,4 @@
+#include "nr_path_u8.hpp"
 #include "nr_runtime.hpp"
 #include "nr_gpu_completion.hpp"
 #include "nr_native_plan.hpp"
@@ -1112,7 +1113,7 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
             }
             return result;
         };
-        std::ifstream provided(path); std::istringstream expected(native.text);
+        std::ifstream provided(nr::u8::path(path)); std::istringstream expected(native.text);
         if (!provided || tokens(provided) != tokens(expected))
             throw std::invalid_argument("explicit plan does not match native source-sized descriptor plan");
         plan_name = path.string();
@@ -1367,7 +1368,7 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     // the control mask, or a graph without the fused post block).
     impl_->alpha.create(s.ctx, (adapters / "runtime_alpha.spv").string(), {}, 12, {&s.surf0, &s.tex_in});
     auto require_variant_profile = [&](const std::filesystem::path& directory) {
-        std::ifstream manifest(directory / "shader-constants.txt");
+        std::ifstream manifest(nr::u8::path(directory / "shader-constants.txt"));
         uint32_t profile = 0;
         if (manifest) {
             const auto values = nr::detail::read_shader_manifest(manifest);

@@ -29,9 +29,12 @@
 //   HUD_COMPOSE  u0 = the composition. HudMode 0: a = t3.r (a UI alpha), 1: a = t3.a (a UI colour's alpha), 2: the
 //                difference mask (Back == Hudless within Epsilon: scene, else HUD), with prefg_compose's limits - above
 //                HudLimit HUD pixels the mask is no HUD (Residual 1 and the grain-sized count within it: NR's change on
-//                Back where the difference is grain, else Back kept; else Enhanced whole); 3: the estimate, a = the
+//                Back where the difference is grain, else Back kept; else Back kept whole); 3: the estimate, a = the
 //                largest t3.r of the 5 x 5 around the pixel (the HUD's antialiased edges with it), and 1 for a pixel
 //                that did not change in a panel's inside (bit 6); Hudless = Back.
+//                (prefg_compose takes Enhanced whole in the last case, but only for the frames until its add-on's
+//                two-pass path runs NR on Back. Nothing takes over here, and Enhanced whole is the scene without what
+//                was drawn after the copy: a menu over most of the screen vanished, the scene before it shown.)
 //   HUD_ESTIMATE with the game's motion vectors (t2, MotionOn): where the scene under a pixel moves a pixel or more,
 //                the pixel is HUD when it stayed the same yet differs from the frame before where its scene came from
 //                (below); elsewhere the frame-wide test above.
@@ -197,7 +200,7 @@ void main() {
             if (cb.Residual != 0u && imageLoad(u1, ivec2(1, 0)).x <= cb.HudLimit)
                 result = coarse ? back : vec4(back.rgb + (enhanced.rgb - hudless.rgb), back.a);
             else
-                result = vec4(enhanced.rgb, back.a);
+                result = back;
         } else {
             result = hud ? back : vec4(enhanced.rgb, back.a);
         }

@@ -134,28 +134,36 @@ Use
 ---
 optiscaler: turn on DLSS, FSR or XeSS in the game; Insert opens the OptiScaler menu (upscaling and
             frame generation only).
-            End opens NR Control, this project's NR menu, which holds every NR setting:
-            - At the top, what NR is doing: one line a layer (processing, where it runs, network, size,
-              passes, cost - split into the network itself and the processing around it; the column
-              headers explain on hover), then the sums; video memory (this project's by network and
-              use, and what the whole process uses); Video memory, in detail opens the breakdown.
-            - NR chain: NR is one or more layers, each with its own processing (the RenoDX or the
-              wilsjo2 style, see below), network ([Network] Model or one of its own) and place (after
-              the upscaler, before it, Present); the layers' settings are independent. Layers at one
-              place run in layer order; the places run before the upscaler, after it, then at Present.
-              Every layer runs the network once more.
-            - Each layer's page: all its settings, and Engine data (what the layer gets, see below).
-            - Global: first Preprocess (open by default, see Preprocess below; coloured text hints at it
-              when layers run before or after the upscaler or the game hands over no exposure), then the
-              NR switch (F6), screenshots (F5), menu size and colours; Copy a report under Diagnostics
-              copies the layers' state, video memory, dlssnr-amd.ini and the log's last lines to the
-              clipboard and saves them as dlssnr-amd\nr-report.txt (nothing is sent anywhere).
+            End opens NR Control, this project's NR menu, which holds every NR setting (another key: the
+            Hotkeys page, [NRControl] MenuKey in dlssnr-amd.ini):
+            - The sidebar's pages: NR settings - the processing (the RenoDX or the wilsjo2 style, see below),
+              the network ([Network] Model or one of its own), the place (Present, after the upscaler,
+              before it), all its settings and Engine data (what NR gets, see below); Network - the
+              networks and their options (see below), and at its foot the Layers switch ([NRControl]
+              Layers, off by default); Preprocess (see below); HUD FIX; Hotkeys (every key NR reads: click
+              a key, then press the new one); Screenshot (F5); Compare; Diagnostics; NR Control (menu size,
+              text size, colours, language); Status.
+            - The header: API, graphics card, driver and the Neural Rendering switch (F6: NR off or on for
+              this run, not saved). The footer: NR's cost and the upscaling.
+            - Status: what NR is doing - one line a layer (processing, where it runs, network, size,
+              passes, cost split into the network itself and the processing around it; the column headers
+              explain on hover), then the sums; video memory (this project's by network and use, and what
+              the whole process uses), with Video memory, in detail for the breakdown.
+            - Layers (only for special cases; for ordinary stacking use Passes): with the switch on, NR
+              can be several layers on the NR chain page, each with its own processing, network, place and
+              settings and its own page. Layers at one place run in layer order; the places run before
+              the upscaler, after it, then at Present. Every layer runs the network once more.
+            - Diagnostics: Copy a report copies the layers' state, video memory, dlssnr-amd.ini and the
+              log's last lines to the clipboard and saves them as dlssnr-amd\nr-report.txt (nothing is
+              sent anywhere); the residency and an event timeline.
             - Compare ([Inspect] in dlssnr-amd.ini): NR off against NR on, on the screen - side by side
               or with a split line (sides can be swapped, NR off / NR on tags), on the final picture or
               one layer; with Apply NR off the layers run as usual but their result is not shown. For a
               chosen layer also: the network's input, its output, its change x20 (Debug view), the skin
               weight (wilsjo2 layers), a held frame (the layer keeps processing one frame, for tuning),
               the spatial compression's work area and centre band (wilsjo2 layers).
+            - Language: the menus' texts come from a language file in dlssnr-amd\lang (see the
+              README.txt there); English.txt is made from the program.
             Changes are written to dlssnr-amd.ini at once and apply in the game within about a second
             (except those marked as applied after a game restart). While the menu is open it takes the
             keyboard and mouse; End or Esc closes it. Not yet tested on Wayland
@@ -170,24 +178,20 @@ optiscaler: turn on DLSS, FSR or XeSS in the game; Insert opens the OptiScaler m
             Present, never moved before or after the upscaler; when Present cannot serve it (for example
             a screen colour format it does not support), the layer does not run and its line in the menu
             says why.
-reshade-feeder routes: Home opens ReShade; the NR settings are on the Add-ons page, laid out as in NR
+reshade-feeder routes: Home opens ReShade; the NR settings are on the Add-ons page, laid out as NR
             Control:
-            - At the top, what NR is doing: one line a layer (processing, network, size, passes, cost -
-              split into the network itself and the processing around it; the column headers explain on
-              hover), then the sums; whether DLSS5_Feed and its motion vectors and depth were found;
-              video memory, with Video memory, in detail for the breakdown.
-            - NR chain: NR is one or more layers, each with its own processing (the wilsjo2 style = these
-              routes' original processing, or the RenoDX style, see below), network ([Network] Model or
-              one of its own) and settings, run on the picture in layer order (on these routes every
-              layer runs at Present); the format is that of the optiscaler route's NR chain. Every layer
-              runs the network once more; layers with different settings each take their own network
-              memory.
-            - Each layer's page: all its settings, and Engine data (what the layer gets, see below).
-            - Global: Preprocess (first, open by default), the NR switch (F6), screenshots (F5, taken by
-              the RenoDX style's layers), Diagnostics (Copy a report, as in NR Control), the network and
-              other settings, Motion vectors (VORT or LumeniteFX Kernel), Log.
-            - Compare: as NR Control's Compare (side by side can be zoomed; Debug view works on layers
-              of both styles, Skin mask on wilsjo2 layers).
+            - The same pages as NR Control (NR settings, Network with the Layers switch, Preprocess, HUD FIX,
+              Hotkeys, Screenshot, Compare, Diagnostics, Status), plus Motion vectors (VORT or LumeniteFX
+              Kernel) and Language (with Text size); the menu's size and font are ReShade's own settings.
+            - NR settings: the processing (the wilsjo2 style = these routes' original processing, or the
+              RenoDX style, see below), the network and all its settings; on these routes NR always runs
+              at Present.
+            - Status: one line a layer, then the sums; whether DLSS5_Feed and its motion vectors and depth
+              were found; video memory, with Video memory, in detail for the breakdown.
+            - Layers (switch on): several layers, run on the picture in layer order; every layer runs the
+              network once more, and layers with different settings each take their own network memory.
+            - Compare and Diagnostics: as in NR Control (screenshots, F5, are taken by the RenoDX style's
+              layers).
             Changes are written to dlssnr-amd.ini in the game folder at once and apply (except those
             marked as applied after a game restart). A dlssnr-amd.ini without [LayerN] sections (as the
             installer writes it) has one layer: the RenoDX style with [RenoDX] Enabled = 1 (the [RenoDX]
@@ -254,13 +258,17 @@ Network model and options):
     of the pixel and its four diagonal neighbours is nearest the camera. Only the edges of moving
     objects change; applied after a game restart.
   - Hotkey, Sound: the hotkey that cycles the networks (default Ctrl+F11) and its sound.
+  - Memory Guard (default 1): a network is built only while the video memory it needs is free. 0 = no
+    such check: NR builds in whatever video memory is left (a game left short of video memory may
+    stutter or fail to load its own data). Applied at once.
   - [Log]: whether dlssnr-amd.log is written and whether it is cleared at every start; applied after a
     game restart.
 Dynamic resolution: with NR before the upscaler and a render size that keeps changing, every new
 size is prepared in the frame it appears in (except the first range of sizes seen), so NR is no
 longer skipped for stretches of frames; its video memory is bounded.
-Engine data (each layer's page in NR Control and the Add-ons page): what the network actually gets,
-for troubleshooting - the colour format and HDR, the encoding the network sees, the exposure (who
+Engine data (on the NR settings page in NR Control and on the Add-ons page; with layers on, each layer's
+page): what the network actually gets, for troubleshooting -
+the colour format and HDR, the encoding the network sees, the exposure (who
 computes it, the white point or divisor), the motion vectors (size, sampling, scale), size changes,
 resets. What the game does not hand over but something else covers says who covers it; with no
 exposure from anywhere, a hint says to try Preprocess with Exposure = auto if the picture looks wrong.
@@ -280,8 +288,8 @@ RenoDX style: the processing around NR (how the picture is handed to NR and how 
 back into the picture) follows RenoDX's DLSS5 add-on v8.5.0-rc10, with RenoDX's own shaders (MIT,
 licence in dlssnr-amd/shaders/renodx/RenoDX-LICENSE.txt). The NR network itself is the same.
   - optiscaler route: the default processing (the installer can choose the wilsjo2 style instead,
-    --wilsjo2); every layer of the NR chain can choose it. Its settings are on the layer's page in NR
-    Control. A dlssnr-amd.ini without [LayerN] sections (as the installer writes it) has one layer,
+    --wilsjo2); the NR settings page chooses it (with layers on, each layer). Its settings are on that
+    page in NR Control. A dlssnr-amd.ini without [LayerN] sections (as the installer writes it) has one layer,
     with the [RenoDX] settings (Enabled = 1: the RenoDX style; 0: the wilsjo2 style); the first change
     of the chain in NR Control turns it into a [Layer1] section.
   - reshade-feeder routes: the default processing too (the installer can choose the wilsjo2 style,
@@ -326,7 +334,7 @@ manual, automatic metering), the HDR curve (ReversibleMode), detail and colour s
 guard, skin and environment protection, passes and each pass's own settings, the model resolution
 (WorkingScale, 0.25..2, above 1 is supersampling, ScalingDownscaler chooses the filter) and the
 enlargement (Transfer), spatial compression (Spatial*).
-  - optiscaler route: on the layer's page in NR Control (without [LayerN] sections, the [wilsjo2]
+  - optiscaler route: on the NR settings page in NR Control (without [LayerN] sections, the [wilsjo2]
     section of dlssnr-amd.ini). On this project's test pictures its output was compared with
     OptiScaler-NR v0.8.91's, case by case; the differences are within the last rounding step.
   - reshade-feeder routes: these routes' original settings ([DlssNr], or wilsjo2 layers of the NR

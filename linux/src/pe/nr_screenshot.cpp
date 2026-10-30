@@ -2,6 +2,7 @@
 // screenshot.hpp (MIT, Copyright (C) 2026, PEQHUB/RenoDX-DLSS5-Generic), ported with their logic unchanged: the
 // readback decoding takes Vulkan formats instead of DXGI ones, WIC is created here instead of RenoDX's utils/png.hpp,
 // and the log is ours. The arming, the GPU proof and the readbacks are our session's (nr_pe_session.cpp).
+#include "nr_path_u8.hpp"
 #include "nr_screenshot.hpp"
 
 #include "nr_pe_log.hpp"
@@ -618,7 +619,7 @@ std::vector<uint8_t> EncodePng(IWICImagingFactory* factory, const CodedImage& im
 }
 
 bool WriteBytes(const std::filesystem::path& path, const std::vector<uint8_t>& bytes) {
-    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    std::ofstream file(nr::u8::path(path), std::ios::binary | std::ios::trunc);
     if (!file) return false;
     file.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
     return file.good();
@@ -835,7 +836,7 @@ void ProcessJob(Job work) noexcept {
                 if (!meta.empty()) {
                     std::filesystem::path meta_path = base;
                     meta_path += L".meta.txt";
-                    std::ofstream meta_out(meta_path, std::ios::trunc);
+                    std::ofstream meta_out(nr::u8::path(meta_path), std::ios::trunc);
                     if (meta_out.good()) meta_out << meta;
                 }
             } else {

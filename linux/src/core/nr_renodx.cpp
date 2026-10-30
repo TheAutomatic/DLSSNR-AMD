@@ -8,6 +8,7 @@
 // MakeConstants / RecordCompose / RecordUpsample, ChainActive, and the dispatch order of its D3D12 after path
 // (ProcessInline: the stack loop, RunLookStage, the write-back). codec_gain.hpp is
 // included as it is. The shaders are RenoDX's, compiled for Vulkan as RenoDX compiles them.
+#include "nr_path_u8.hpp"
 #include "nr_renodx.hpp"
 #include "nr_gpu_completion.hpp"
 #include "nr_log.hpp"
@@ -463,7 +464,7 @@ struct Program {
 };
 
 std::vector<uint32_t> read_spirv(const std::string& path) {
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    std::ifstream f(nr::u8::path(path), std::ios::binary | std::ios::ate);
     if (!f) throw std::runtime_error("RenoDX stage: cannot open " + path);
     const std::streamoff n = f.tellg();
     std::vector<uint32_t> code(size_t(n) / 4);

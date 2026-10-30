@@ -22,6 +22,7 @@
 #include <windows.h>
 #include <d3d12.h>
 
+#include "nr_path_win.hpp"
 #include "nr_dlssnr_model.hpp"
 #include "nr_pe_config.hpp"
 #include "nr_pe_interop.hpp"
@@ -183,6 +184,7 @@ bool frame_keys() {
     static nr::pe::KeyPress screenshot_key;
     const nr::pe::RenoDXConfig cfg = renodx_now();
     g_nr_on = toggle.frame(cfg);
+    nr::pe::layer_keys_frame();   // [LayerN] ToggleKey
     // RenoDX's NR screenshot: NRScreenshotKey (the menu's button comes through control.bin, nr_pe_control.cpp)
     nr::pe::screenshot::configure({cfg.screenshot_source, cfg.screenshot_format, cfg.screenshot_layout,
                                    cfg.screenshot_jpeg_quality, cfg.screenshot_max_mb});
@@ -222,10 +224,10 @@ int optiscaler_white_point_source() {
     const ULONGLONG now = GetTickCount64();
     if (read && now - read < 5000) return value;
     read = now;
-    char path[MAX_PATH + 32];
+    char path[MAX_PATH * 4 + 32];
     std::snprintf(path, sizeof path, "%s\\OptiScaler.ini", nr::pe::module_folder());
     char v[16] = {};
-    GetPrivateProfileStringA("DlssNr", "WhitePointSource", "", v, sizeof v, path);
+    nr::u8::profile("DlssNr", "WhitePointSource", "", v, sizeof v, path);
     value = v[0] >= '0' && v[0] <= '9' ? std::atoi(v) : -1;
     return value;
 }
@@ -271,7 +273,6 @@ void report_control(nr::pe::Session& session, const Feature* f, uint32_t route, 
     st.renodx = rs != nullptr;
     st.nr_on = rs ? rs->nr_enabled : true;
     st.preprocess = f->controls.preprocess.active() || f->prep_by_layer;
-    st.building = session.building() && !ran;
     st.gpu_ms = session.gpu_ms();
     st.network_ms = session.network_ms();
     st.width = w; st.height = h;
@@ -360,8 +361,11 @@ void report_control(nr::pe::Session& session, const Feature* f, uint32_t route, 
         st.panel = nr::pe::panel::lines(pf);
     }
     st.net_running = ss.running_net; st.net_want = ss.want_net;
+    // a network being built (a plan is none) while this layer still runs the one before: a switch, the OSD's bar
+    st.building = ss.building;
+    st.ran = ran;
     st.waiting = !ran && !ss.building;
-    if (st.waiting) st.waiting_why = ss.status.empty() ? "this frame passed through" : ss.status;
+    if (st.waiting) st.waiting_why = ss.status.empty() ? NR_N("this frame passed through") : ss.status;
     // a frame passed through ran nothing: no time on its row (the session's averages are an earlier run's - another
     // placement's, feature's or configuration's)
     if (!ran) st.gpu_ms = st.network_ms = 0.f;
@@ -974,7 +978,7 @@ void dump_ppm(const DebugReadback& rb, const uint8_t* base, uint64_t feature_id,
     std::snprintf(name, sizeof name, "dlssnr-amd-f%u-e%u-%s.ppm", static_cast<unsigned>(feature_id),
                   static_cast<unsigned>(rb.pending_n), which);
     path += name;
-    FILE* fp = std::fopen(path.c_str(), "wb");
+    FILE* fp = nr::u8::fopen(path.c_str(), "wb");
     if (!fp) { log("[nr] dump: cannot write %s", path.c_str()); return; }
     const UINT w = rb.fp.Footprint.Width, h = rb.fp.Footprint.Height;
     const size_t pitch = rb.fp.Footprint.RowPitch;

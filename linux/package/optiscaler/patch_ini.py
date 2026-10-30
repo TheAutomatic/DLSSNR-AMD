@@ -2,7 +2,7 @@
 """Rewrite the keys our install needs in OptiScaler's own OptiScaler.ini.
 
 Key names and sections were read from the bundled OptiScaler's OptiScaler.ini and Config.cpp (nightly-20261020,
-artifacts/ref/optiscaler-nightly-20261020; nightly-20261028's OptiScaler.ini has the same [Plugins] LoadAsiPlugins). Nothing is added that is not already in the file: every key here ships as
+artifacts/ref/optiscaler-nightly-20261020; nightly-20261030's OptiScaler.ini has the same [Plugins] LoadAsiPlugins). Nothing is added that is not already in the file: every key here ships as
 `<key>=auto` and is rewritten in place, so a key renamed upstream shows up as an error rather than as a silently
 ignored line.
 """
@@ -17,6 +17,9 @@ def wanted_keys(game: str) -> dict:
         # OptiScaler loads the .asi plugins in its plugins folder (OptiScaler\plugins) only when asked to; ours is the
         # whole of NR on this route.
         ("Plugins", "LoadAsiPlugins"): "true",
+        # OptiScaler's frame generation on / off key: End by default, NR Control's key too (one press would open the
+        # menu and switch frame generation). No key: frame generation is switched in OptiScaler's menu (Insert).
+        ("Menu", "FGShortcutKey"): "-1",
         # [Spoofing] is left at the release's own `auto` values (Dxgi: true on AMD/Intel; the reported GPU: an NVIDIA
         # card, so the game offers DLSS). Dxgi is a per-game, per-system setting: if NR Control keeps waiting for the
         # game's upscaler, Dxgi=false is the thing to try (install.sh and the package README say so).

@@ -17,11 +17,15 @@
 #include <string>
 #include <vector>
 
+#ifndef NR_N
+#define NR_N(text) text   // a text for the menus' language file (nr_lang.hpp)
+#endif
+
 namespace nr::pe::events {
 
 enum Category : uint8_t { kNetwork, kResidency, kRun, kSettings, kCategories };
 inline const char* category_name(Category c) {
-    static const char* const names[] = {"network", "memory", "run", "settings"};
+    static const char* const names[] = {NR_N("network"), NR_N("memory"), NR_N("run"), NR_N("settings")};   // (translated where shown)
     return c < kCategories ? names[c] : "other";
 }
 

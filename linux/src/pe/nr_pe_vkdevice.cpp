@@ -181,6 +181,41 @@ void note_device(VkInstance instance, VkPhysicalDevice physical, VkDevice device
     requested_families = families;
 }
 
+namespace {
+VkPhysicalDevice g_gpu = VK_NULL_HANDLE;   // note_gpu's (guarded by `lock`)
+}
+void note_gpu(VkPhysicalDevice physical) {
+    std::lock_guard<std::mutex> guard(lock);
+    if (physical) g_gpu = physical;
+}
+std::string driver_name() {
+    static std::string name;
+    static VkPhysicalDevice named = VK_NULL_HANDLE;
+    std::lock_guard<std::mutex> guard(lock);
+    const VkPhysicalDevice p = g_gpu ? g_gpu : seen.physical;
+    if (p && p != named) {
+        VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &driver};
+        vkGetPhysicalDeviceProperties2(p, &props);
+        name = driver.driverInfo[0] ? driver.driverInfo : driver.driverName;
+        named = p;
+    }
+    return name;
+}
+std::string gpu_name() {
+    static std::string name;
+    static VkPhysicalDevice named = VK_NULL_HANDLE;
+    std::lock_guard<std::mutex> guard(lock);
+    const VkPhysicalDevice p = g_gpu ? g_gpu : seen.physical;
+    if (p && p != named) {
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(p, &props);
+        name = props.deviceName;
+        named = p;
+    }
+    return name;
+}
+
 void forget_device(VkDevice device) {
     if (!device) return;
     std::lock_guard<std::mutex> guard(lock);

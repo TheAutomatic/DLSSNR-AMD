@@ -36,12 +36,12 @@
 #   --renodx     the RenoDX style (default): processed the way RenoDX's DLSS5 add-on does it.
 #   --wilsjo2    the wilsjo2 style: the original processing of OptiScaler-NR (wilsjo2), ported. --no-renodx means the same.
 #   With neither, the installer asks once after the network; Enter = the RenoDX style (not asked when not run in a terminal: RenoDX).
-#   Later NR Control (End in game) switches it at any time and can stack several layers.
+#   Later NR Control (End in game) switches it at any time. For stacking use Passes.
 # ReShade routes:
 #   --renodx     the RenoDX style (default), settings in [RenoDX] (on the Add-ons page).
 #   --wilsjo2    the wilsjo2 style: OptiScaler-NR's (wilsjo2) settings and names ([DlssNr]), this route's own processing. --no-renodx means the same.
 #   With neither, the installer asks once after the network; Enter = the RenoDX style (not asked when not run in a terminal: RenoDX).
-#   Later the Add-ons page can stack several layers, each with either style; without layers [RenoDX] Enabled, applied after a game restart.
+#   Later the Add-ons page switches it ([RenoDX] Enabled, applied after a game restart). For stacking use Passes.
 # The old route name optiscaler-renodx still works and means optiscaler --renodx.
 #
 # --lumenite     (ReShade routes only) motion vectors from LumeniteFX Kernel (by Afzaal (Kaidō),
@@ -248,7 +248,7 @@ if [[ -z "$renodx" && "$kind" == optiscaler ]]; then
         echo "The processing before and after NR (the NR network itself is the same):"
         echo "  1) RenoDX style: processed the way RenoDX's DLSS5 add-on does it (default)"
         echo "  2) wilsjo2 style: the original processing of OptiScaler-NR (wilsjo2), ported"
-        echo "In game NR Control (End) switches it at any time and can stack several layers."
+        echo "In game NR Control (End) switches it at any time."
         read -r -p "Which one? [1/2, Enter = 1] " pick || pick=""
         case "${pick:-1}" in
             1) renodx=1;; 2) renodx=0;;
@@ -262,7 +262,7 @@ elif [[ -z "$renodx" ]]; then
         echo "The processing before and after NR (the NR network itself is the same):"
         echo "  1) RenoDX style: processed the way RenoDX's DLSS5 add-on does it (default)"
         echo "  2) wilsjo2 style: OptiScaler-NR's (wilsjo2) settings and names ([DlssNr]), this route's own processing"
-        echo "In game, ReShade's Add-ons page can stack several layers, each with either style."
+        echo "In game, ReShade's Add-ons page switches it (after a game restart)."
         read -r -p "Which one? [1/2, Enter = 1] " pick || pick=""
         case "${pick:-1}" in
             1) renodx=1;; 2) renodx=0;;
@@ -456,6 +456,9 @@ fi
 # the network a game starts with
 sed -i "/^\[Network\]/,/^\[/ s/^Model = .*/Model = $model/" "$game/dlssnr-amd.ini"
 grep -q "^Model = $model\$" "$game/dlssnr-amd.ini" || { echo "dlssnr-amd.ini: could not set Model = $model." >&2; exit 1; }
+# The installed dlssnr-amd.ini kept: NR puts it back from there (with the choices made here) when the file is
+# deleted; in dlssnr-amd/, removed with it
+cp -- "$game/dlssnr-amd.ini" "$game/dlssnr-amd/dlssnr-amd.default.ini"
 
 echo
 if [[ "$kind" == optiscaler ]]; then
@@ -483,7 +486,7 @@ if [[ $int4_weights == 1 && $main_int4 == 0 && "$kind" != optiscaler ]]; then
     echo "                 $(launch 1)"
 fi
 if [[ "$kind" == optiscaler ]]; then
-    echo "In game, turn on DLSS, FSR or XeSS in the game's settings. End opens NR Control (DirectX 11 / 12 and Vulkan games: every NR setting: processing, network, stacked layers);"
+    echo "In game, turn on DLSS, FSR or XeSS in the game's settings. End opens NR Control (DirectX 11 / 12 and Vulkan games: every NR setting: processing, network, Passes);"
     echo "Insert opens the OptiScaler menu (upscaling and frame generation only)."
     echo "If NR Control keeps waiting for the game's upscaler, set [Spoofing] Dxgi=false in OptiScaler.ini and try again."
     echo "If colours turn green or grainy after NR (007 First Light, for example), try [Preprocess] in dlssnr-amd.ini, or press Ctrl+F10 in the game."
@@ -503,7 +506,7 @@ if [[ "$kind" != optiscaler ]]; then
     else
         echo "Processing before and after NR: the wilsjo2 style ([RenoDX] Enabled = 0), settings on the Add-ons page (that is [DlssNr])."
     fi
-    echo "The Add-ons page can stack several layers ([LayerN]), each RenoDX or wilsjo2. F5 takes screenshots (the same frame without and with NR) into NR Screenshots in the game folder."
+    echo "For stacking use Passes on the Add-ons page. F5 takes screenshots (the same frame without and with NR) into NR Screenshots in the game folder."
 fi
 echo "Logs: dlssnr-amd.log$([[ "$kind" == optiscaler ]] && echo ", OptiScaler.log" || echo ", ReShade.log")"
 echo "Uninstall:  bash install.sh \"$game\" remove"

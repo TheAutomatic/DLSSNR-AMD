@@ -10,6 +10,8 @@
 #   dlssnr-amd/shaders/wilsjo2/       the wilsjo2 stage's (HUD FIX on the ReShade routes too; the .asi brings its own)
 #   dlssnr-amd/experimental/shaders/  CC_SMALL_FP8_EXPERIMENTAL's network and temporal variants (its weights are made
 #                                     at install, linux/build/experimental_weights.py)
+#   dlssnr-amd/lang/                  the menus' texts: English.txt from the code (linux/build/make_lang.py) and
+#                                     README.txt, how to make another language
 #
 #   assemble_product_data.sh <parent dir> [--model dlssnr.bin [--small-model dlssnr-small.bin]]
 set -euo pipefail
@@ -38,6 +40,15 @@ for f in accumulation.txt swin-bias-storage.txt coherent-act.txt shader-constant
     cp -- "$NR_PRODUCT_SPV-experimental/$f" "$xs/"
 done
 cp -- "$NR_PRODUCT_SPV-experimental"/temporal/* "$xs/temporal/"
+mkdir -p -- "$dst/lang"
+python3 linux/build/make_lang.py "$dst/lang/English.txt" linux/src/pe/nr_pe_menu.cpp linux/src/ui/nr_control_ui.hpp \
+    linux/src/ui/nr_control_pages.hpp linux/src/core/nr_renodx_keys.hpp linux/src/ui/nr_wilsjo2_shared_keys.hpp \
+    linux/src/ui/nr_wilsjo2_keys.hpp linux/src/ui/nr_reshade_layer_keys.hpp linux/src/pe/nr_pe_events.hpp \
+    linux/src/pe/nr_reshade_addon.cpp \
+    --producers linux/src/pe/nr_asi_main.cpp linux/src/pe/nr_asi_hudcap.cpp linux/src/pe/nr_pe_control.cpp \
+    linux/src/pe/nr_dlssnr_model.cpp linux/src/pe/nr_pe_session.cpp linux/src/pe/nr_engine_panel.hpp \
+    linux/src/pe/nr_reshade_addon.cpp > /dev/null
+cp -- linux/package/lang/README.txt "$dst/lang/README.txt"
 cp -- linux/shaders/renodx/LICENSE "$dst/shaders/renodx/RenoDX-LICENSE.txt"
 
 # The weights are NVIDIA's and are never part of this repository: --model takes a dlssnr.bin and

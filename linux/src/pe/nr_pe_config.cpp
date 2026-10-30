@@ -1,6 +1,7 @@
 // dlssnr-amd.ini: the ReShade add-on's settings, and [Preprocess] for every
 // route. Re-read while the game runs.
 #include <atomic>
+#include "nr_path_win.hpp"
 #include "nr_number.hpp"
 #include "nr_pe_config.hpp"
 #include "nr_pe_events.hpp"
@@ -18,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <set>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -63,7 +65,7 @@ float number(const std::string& v, float lo, float hi, float def) {
 
 uint64_t stamp_of(const std::string& path) {
     WIN32_FILE_ATTRIBUTE_DATA data{};
-    if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &data)) return 0;
+    if (!nr::u8::attributes_ex(path.c_str(), &data)) return 0;
     return (uint64_t(data.ftLastWriteTime.dwHighDateTime) << 32) | data.ftLastWriteTime.dwLowDateTime;
 }
 
@@ -167,7 +169,7 @@ void play_note(float hz) {
     std::thread([] {
         using PlaySoundFn = BOOL(WINAPI*)(LPCSTR, HMODULE, DWORD);
         static const PlaySoundFn play = [] {
-            const HMODULE winmm = LoadLibraryA("winmm.dll");
+            const HMODULE winmm = LoadLibraryW(L"winmm.dll");
             return winmm ? reinterpret_cast<PlaySoundFn>(GetProcAddress(winmm, "PlaySoundA")) : nullptr;
         }();
         if (play) play(wav.data(), nullptr, 0x0004 | 0x0002);   // SND_MEMORY | SND_NODEFAULT, synchronous
@@ -179,7 +181,7 @@ void play_cue(bool on) {
     std::thread([on] {
         using PlaySoundFn = BOOL(WINAPI*)(LPCSTR, HMODULE, DWORD);
         static const PlaySoundFn play = [] {
-            const HMODULE winmm = LoadLibraryA("winmm.dll");
+            const HMODULE winmm = LoadLibraryW(L"winmm.dll");
             return winmm ? reinterpret_cast<PlaySoundFn>(GetProcAddress(winmm, "PlaySoundA")) : nullptr;
         }();
         const DWORD kMemory = 0x0004, kNoDefault = 0x0002;   // SND_MEMORY | SND_NODEFAULT, synchronous
@@ -188,7 +190,11 @@ void play_cue(bool on) {
 }
 
 // Only while one of this process's windows has the focus.
+std::atomic<uint64_t> g_hotkeys_paused_until{0};
+std::atomic<uint64_t> g_nr_toggle_requests{0};
+
 bool focused() {
+    if (GetTickCount64() < g_hotkeys_paused_until.load()) return false;   // NR Control takes a key (pause_hotkeys)
     DWORD pid = 0;
     const HWND w = GetForegroundWindow();
     return w && GetWindowThreadProcessId(w, &pid) && pid == GetCurrentProcessId();
@@ -322,7 +328,7 @@ void finish(Config& c, int passes) {
 // Parse one file into `c`. Returns false if it could not be opened. `legacy`
 // is set when the file uses the old lowercase keys (before 2026-09-23).
 bool parse(const std::string& path, Config& c, bool& legacy) {
-    FILE* file = std::fopen(path.c_str(), "r");
+    FILE* file = nr::u8::fopen(path.c_str(), "r");
     if (!file) return false;
     int passes = c.controls.passes;
     bool section = false;
@@ -370,6 +376,7 @@ bool parse(const std::string& path, Config& c, bool& legacy) {
             else if (key == "motion without depth") { if (auto b = parse_bool(value)) n.motion_without_depth = *b; }
             else if (key == "resize history") { if (auto b = parse_bool(value)) n.resize_history = *b; }
             else if (key == "style grade") { if (auto b = parse_bool(value)) n.style_grade = *b; }
+            else if (key == "memory guard") { if (auto b = parse_bool(value)) n.memory_guard = *b; }
             else if (key == "osd") {
                 const std::string v = lower(value);
                 for (int o = 0; o < 4; ++o) if (v == osd_name(o)) n.osd = o;
@@ -412,7 +419,7 @@ uint32_t renodx_enum(const std::string& v, uint32_t def, uint32_t lo, uint32_t h
 
 // The [Preprocess] section of `path` alone into `p`. False if it could not be opened.
 bool parse_preprocess_file(const std::string& path, PreprocessConfig& p) {
-    FILE* file = std::fopen(path.c_str(), "r");
+    FILE* file = nr::u8::fopen(path.c_str(), "r");
     if (!file) return false;
     std::string name;
     char line[512];
@@ -1201,6 +1208,16 @@ bool NrToggle::frame(const RenoDXConfig& file) {
         }
         down_ = down;
     }
+    // NR Control's switch: a press of the key, wherever the focus is (the click was in the game's window)
+    const uint64_t requests = g_nr_toggle_requests.load();
+    if (requests_ == ~0ull) requests_ = requests;
+    if (requests != requests_) {
+        if ((requests - requests_) % 2) {
+            override_ = !(have_override_ ? override_ : file_on_);
+            have_override_ = true;
+        }
+        requests_ = requests;
+    }
     const bool on = have_override_ ? override_ : file_on_;
     if (logged_ && on != last_)
         nr::pe::events::note(nr::pe::events::kSettings, "RenoDX-style option: NR %s%s", on ? "on" : "off",
@@ -1211,7 +1228,7 @@ bool NrToggle::frame(const RenoDXConfig& file) {
 }
 
 bool read_renodx(const std::string& path, RenoDXConfig& out) {
-    FILE* file = std::fopen(path.c_str(), "r");
+    FILE* file = nr::u8::fopen(path.c_str(), "r");
     if (!file) return false;
     RenoDXConfig r{};
     std::string name;
@@ -1241,11 +1258,18 @@ const char* placement_name(Placement p) {
     return p == Placement::kBefore ? "before" : p == Placement::kPresent ? "present" : "after";
 }
 
-namespace { uint32_t g_hudfix_default = 1; }
+namespace {
+uint32_t g_hudfix_default = 0;
+// [LayerN] ToggleKey (layer_keys_frame): the keys as the chain was last read, the layers turned round for this run
+std::mutex g_layer_keys_lock;
+std::map<int, std::string> g_layer_key_text;
+std::map<int, bool> g_layer_flipped;
+std::atomic<uint64_t> g_layer_flips{0};
+}  // namespace
 void set_hudfix_default(uint32_t mode) { g_hudfix_default = mode; }
 
 bool read_chain(const std::string& path, ChainConfig& out) {
-    FILE* file = std::fopen(path.c_str(), "r");
+    FILE* file = nr::u8::fopen(path.c_str(), "r");
     if (!file) return false;
     // Every section's keys, as written, in file order.
     std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>> sections;
@@ -1334,6 +1358,8 @@ bool read_chain(const std::string& path, ChainConfig& out) {
                 else log("[nr] dlssnr-amd.ini [Layer%d] Placement = %s not known; after", n, value.c_str());
             } else if (k == "network") {
                 l.network = value;
+            } else if (k == "togglekey") {
+                l.toggle_key = value;
             } else {
                 parse_renodx_key(l.renodx, k, value);
                 l.keys.push_back({key, value});
@@ -1348,7 +1374,24 @@ bool read_chain(const std::string& path, ChainConfig& out) {
     // [Layer3] twice: the later one is the layer (as a key written twice in one section)
     for (size_t i = 0; i + 1 < c.layers.size();)
         if (c.layers[i].number == c.layers[i + 1].number) c.layers.erase(c.layers.begin() + long(i)); else ++i;
+    // [NRControl] Layers (off by default: layers were taken for Passes): off, the first [LayerN] alone; the others stay
+    // in the file and do not run
+    bool many = false;
+    if (const auto* r = section("nrcontrol"))
+        for (const auto& [key, value] : *r)
+            if (lower(key) == "layers")
+                if (auto b = parse_bool(value)) many = *b;
+    if (!many && c.layers.size() > 1) c.layers.erase(c.layers.begin() + 1, c.layers.end());
     c.layered = !c.layers.empty();
+    {   // ToggleKey: the keys for layer_keys_frame, and this run's turns applied
+        std::lock_guard<std::mutex> hold(g_layer_keys_lock);
+        g_layer_key_text.clear();
+        for (LayerConfig& l : c.layers) {
+            if (!l.toggle_key.empty()) g_layer_key_text[l.number] = l.toggle_key;
+            const auto f = g_layer_flipped.find(l.number);
+            if (f != g_layer_flipped.end() && f->second) { l.enabled = !l.enabled; l.flipped = true; }
+        }
+    }
     if (!c.layered) {
         LayerConfig l;
         if (const auto* r = section("renodx"))
@@ -1389,6 +1432,8 @@ Config layer_config(const LayerConfig& l) {
 
 bool ChainFile::poll(const std::string& path, ChainConfig& out) {
     if (const uint64_t e = config_epoch(); e != epoch_) { epoch_ = e; checked_ms_ = 0; }
+    const uint64_t flips = layer_flips();   // a layer's ToggleKey: the chain again at once
+    if (flips != flips_) { flips_ = flips; checked_ms_ = 0; stamp_ = 0; }
     const uint64_t now = GetTickCount64();
     if (stamp_ && now - checked_ms_ < 1000) return false;
     checked_ms_ = now;
@@ -1405,6 +1450,53 @@ namespace {
 std::atomic<uint64_t> g_config_epoch{0};
 }  // namespace
 void touch_config() { g_config_epoch.fetch_add(1); }
+
+void request_nr_toggle() { g_nr_toggle_requests.fetch_add(1); }
+bool parse_key(const std::string& text, int* vk, int* mods) { return parse_hotkey(text, *vk, *mods); }
+void pause_hotkeys(uint32_t ms) { g_hotkeys_paused_until.store(GetTickCount64() + ms); }
+
+void layer_keys_frame() {
+    struct State { std::string text; int vk = 0, mods = 0; bool down = false; };
+    static std::map<int, State> keys;   // by layer number (one frame-keys caller a route)
+    std::map<int, std::string> now;
+    {
+        std::lock_guard<std::mutex> hold(g_layer_keys_lock);
+        now = g_layer_key_text;
+    }
+    for (auto it = keys.begin(); it != keys.end();) it = now.count(it->first) ? std::next(it) : keys.erase(it);
+    for (const auto& [n, text] : now) {
+        State& k = keys[n];
+        if (k.text != text) {
+            k.text = text;
+            k.vk = 0;
+            if (!parse_hotkey(text, k.vk, k.mods)) {
+                log("[nr] dlssnr-amd.ini [Layer%d] ToggleKey \"%s\" not understood; no hotkey", n, text.c_str());
+                k.vk = 0;
+            }
+            k.down = true;   // held while it was set: not a press
+        }
+        if (!k.vk) continue;
+        const bool down = key_down(k.vk) && ((k.mods & MOD_CONTROL) != 0) == key_down(VK_CONTROL) &&
+                          ((k.mods & MOD_SHIFT) != 0) == key_down(VK_SHIFT) && ((k.mods & MOD_ALT) != 0) == key_down(VK_MENU);
+        if (down && !k.down && focused()) {
+            bool turned;
+            {
+                std::lock_guard<std::mutex> hold(g_layer_keys_lock);
+                turned = g_layer_flipped[n] = !g_layer_flipped[n];
+            }
+            g_layer_flips.fetch_add(1);
+            nr::pe::events::note(nr::pe::events::kSettings, "Layer %d %s (its ToggleKey)", n,
+                                 turned ? "on / off the other way for this run" : "back as dlssnr-amd.ini has it");
+        }
+        k.down = down;
+    }
+}
+bool layer_flipped(int number) {
+    std::lock_guard<std::mutex> hold(g_layer_keys_lock);
+    const auto f = g_layer_flipped.find(number);
+    return f != g_layer_flipped.end() && f->second;
+}
+uint64_t layer_flips() { return g_layer_flips.load(); }
 uint64_t config_epoch() { return g_config_epoch.load(); }
 
 bool RenoDXFile::poll(const std::string& path, RenoDXConfig& out) {
@@ -1500,8 +1592,14 @@ void write_network(FILE* f, const NetworkConfig& n) {
         "; always = all the time\n"
         "; cost   = all the time, with each layer's GPU time split into the network and its processing, and the sums\n"
         "; off    = never\n"
+        "\n"
+        "Memory Guard = %d\n"
+        "; 1 = a network is built only while the video memory it needs is free (default)\n"
+        "; 0 = no such check: NR builds in whatever video memory is left. A game left short of video memory may\n"
+        ";     stutter or fail to load its own data. Applied at once\n"
         "\n", nr::network_codename(n.model), n.hotkey.c_str(), n.sound ? 1 : 0, residency_name(n.residency),
-        n.motion_without_depth ? 1 : 0, n.resize_history ? 1 : 0, n.style_grade ? 1 : 0, osd_name(n.osd));
+        n.motion_without_depth ? 1 : 0, n.resize_history ? 1 : 0, n.style_grade ? 1 : 0, osd_name(n.osd),
+        n.memory_guard ? 1 : 0);
 }
 
 void write_preprocess(FILE* f, const PreprocessConfig& p) {
@@ -1611,7 +1709,7 @@ void write_hudfix(FILE* f, const HudFixConfig& h) {
         "; HUD FIX: layers at Present leave the game's HUD (crosshair, health bars, subtitles, menus) as it is. Applies when saved.\n"
         "\n"
         "Mode = %s\n"
-        "; auto = the best of the ones below that can be used (the OptiScaler route's default); off = off (the ReShade route's default);\n"
+        "; off = off (the default); auto = the best of the ones below that can be used;\n"
         "; game = the HUD-less picture the game hands to frame generation (FSR 3.1, XeSS frame generation, DLSS-G through Streamline or NGX; D3D12 games):\n"
         ";        NR runs on the HUD-less picture, the HUD is put back as it was, frame generation gets NR's picture; only when the game runs frame\n"
         ";        generation and hands over a HUD-less picture. OptiScaler's own frame generation gets no such picture; captured serves those games;\n"
@@ -1623,6 +1721,37 @@ void write_hudfix(FILE* f, const HudFixConfig& h) {
         "; true = shows the HUD's area (white = HUD, kept as the game drew it), for debugging\n",
         h.mode == 1 ? "auto" : h.mode == 2 ? "game" : h.mode == 3 ? "captured" : h.mode == 4 ? "estimated" : "off",
         h.show_mask ? "true" : "false");
+}
+
+void write_nrcontrol(FILE* f) {
+    std::fprintf(f,
+        "\n[NRControl]\n"
+        "; NR Control, this project's menu (the OptiScaler route).\n"
+        "\n"
+        "MenuKey = End\n"
+        "; The key that opens and closes NR Control (Esc closes it too): one key, with Ctrl, Shift or Alt if wanted,\n"
+        "; e.g. End, F7, Ctrl+M, Alt+Home. Empty = no key: NR Control cannot be opened until a key is set here again.\n"
+        "; A text that names no key leaves End. Applied at once\n"
+        "\n"
+        "Language =\n"
+        "; The menus' language (NR Control and the ReShade Add-ons page): the name of a file in the lang folder of\n"
+        "; dlssnr-amd, without .txt; empty = English. The README.txt there says how to make one. Applied at once\n"
+        "\n"
+        "Layers = 0\n"
+        "; 0 = one layer (default): only the first [LayerN] runs (without any [LayerN]: the one layer of [RenoDX] /\n"
+        "; [wilsjo2]); other [LayerN] sections stay in the file and do not run. 1 = several layers (Add a layer on the\n"
+        "; NR chain page), each a whole NR run with its own processing, network, place and settings. For ordinary\n"
+        "; stacking use the layer's Passes, not layers. Applied at once\n");
+}
+
+bool restore_ini(const std::string& folder) {
+    const std::string base = folder.empty() ? std::string(".") : folder;
+    const std::string ini = base + "\\dlssnr-amd.ini", copy = base + "\\dlssnr-amd\\dlssnr-amd.default.ini";
+    if (nr::u8::attributes(ini.c_str()) != INVALID_FILE_ATTRIBUTES) return false;
+    if (nr::u8::attributes(copy.c_str()) == INVALID_FILE_ATTRIBUTES || !nr::u8::copy_file(copy.c_str(), ini.c_str(), TRUE))
+        return false;
+    log("[nr] dlssnr-amd.ini was missing: put back from dlssnr-amd\\dlssnr-amd.default.ini (the settings as installed)");
+    return true;
 }
 
 void write_log(FILE* f, bool enabled, bool clear) {
@@ -1641,18 +1770,32 @@ void write_log(FILE* f, bool enabled, bool clear) {
 }
 
 bool PreprocessFile::poll(const std::string& path, PreprocessConfig& out) {
-    const uint64_t stamp = stamp_of(path);
+    uint64_t stamp = stamp_of(path);
+    if (!stamp && !tried_) {   // the installed copy first (restore_ini)
+        const size_t cut = path.find_last_of("\\/");
+        if (restore_ini(cut == std::string::npos ? std::string() : path.substr(0, cut))) stamp = stamp_of(path);
+    }
     if (!stamp) {
         if (tried_) return false;
         tried_ = true;
-        // No file: write one with the defaults, off, so there is something to edit.
-        if (FILE* f = std::fopen(path.c_str(), "w")) {
-            write_network(f, NetworkConfig{});
-            write_preprocess(f, PreprocessConfig{});
-            write_renodx(f, RenoDXConfig{});
+        // No file and no installed copy: the OptiScaler route's file as install.sh writes it without the RenoDX style
+        // (make_ini.py dlssnr-amd-optiscaler.ini: every section, the same functions, the same defaults, the same order),
+        // so everything can be edited and NR Control's settings have their places. (It used to hold [Network],
+        // [Preprocess], [RenoDX], [wilsjo2] and [Log] only, the install's choices lost.)
+        if (FILE* f = nr::u8::fopen(path.c_str(), "w")) {
+            const Config d{};
+            RenoDXConfig renodx = d.renodx;
+            renodx.enabled = false;
+            write_network(f, d.network);
+            write_preprocess(f, d.preprocess);
+            write_renodx(f, renodx);
             write_wilsjo2(f);
-            write_log(f, true, true);
+            write_inspect(f, InspectConfig{});
+            write_hudfix(f, HudFixConfig{});
+            write_nrcontrol(f);
+            write_log(f, d.log_enabled, d.log_clear);
             std::fclose(f);
+            log("[nr] dlssnr-amd.ini was missing (and dlssnr-amd\\dlssnr-amd.default.ini too): written with the defaults");
             stamp_ = stamp_of(path);
         }
         out = PreprocessConfig{};
@@ -1662,7 +1805,7 @@ bool PreprocessFile::poll(const std::string& path, PreprocessConfig& out) {
     PreprocessConfig next{};
     if (!parse_preprocess_file(path, next)) return false;
     stamp_ = stamp;
-    tried_ = true;
+    tried_ = false;   // deleted later (the game running): put back again
     out = next;
     return true;
 }
@@ -1746,7 +1889,7 @@ void NetworkSwitch::unavailable(int n, const std::string& why) {
 void NetworkSwitch::write(int n) {
     if (ini_.empty()) return;
     std::string text;
-    if (FILE* f = std::fopen(ini_.c_str(), "rb")) {
+    if (FILE* f = nr::u8::fopen(ini_.c_str(), "rb")) {
         char buf[4096]; size_t got;
         while ((got = std::fread(buf, 1, sizeof buf, f)) > 0) text.append(buf, got);
         std::fclose(f);
@@ -1775,7 +1918,7 @@ void NetworkSwitch::write(int n) {
         out += line;
     }
     if (!done) out += (lower(section) == "network" ? "" : "\n[Network]\n") + std::string("Model = ") + value + "\n";
-    if (FILE* f = std::fopen(ini_.c_str(), "wb")) {
+    if (FILE* f = nr::u8::fopen(ini_.c_str(), "wb")) {
         std::fwrite(out.data(), 1, out.size(), f);
         std::fclose(f);
     }
@@ -1878,7 +2021,7 @@ void Config::load(const std::string& path) {
     if (!parse(path, next, legacy)) {
         *this = Config{};
         resolve();
-        save(path);
+        save(path, true);   // the installed file (make_ini.py dlssnr-amd-addon.ini) as it comes
         return;
     }
     *this = next;
@@ -1899,8 +2042,8 @@ bool Config::reload(const std::string& path) {
 
 static const char* const kClassicScalers[] = {"bilinear", "catmullrom", "lanczos3", "fsr1"};
 
-void Config::save(const std::string& path) {
-    FILE* f = std::fopen(path.c_str(), "w");
+void Config::save(const std::string& path, bool whole) {
+    FILE* f = nr::u8::fopen(path.c_str(), "w");
     if (!f) return;
     auto flag = [](bool b) { return b ? "true" : "false"; };
     const auto& k = controls;
@@ -2003,6 +2146,12 @@ void Config::save(const std::string& path) {
     write_network(f, network);
     write_preprocess(f, preprocess);
     write_renodx(f, renodx);
+    if (whole) {
+        write_inspect(f, InspectConfig{});
+        HudFixConfig hud{};
+        hud.mode = 0;   // HUD FIX off on the ReShade route
+        write_hudfix(f, hud);
+    }
     write_log(f, log_enabled, log_clear);
     std::fclose(f);
     stamp_ = stamp_of(path);

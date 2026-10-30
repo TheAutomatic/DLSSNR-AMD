@@ -1,4 +1,5 @@
 // See nr_pe_control.hpp.
+#include "nr_path_win.hpp"
 #include "nr_pe_control.hpp"
 #include "nr_pe_events.hpp"
 #include "nr_control_shared.hpp"
@@ -26,7 +27,7 @@ std::atomic<bool> g_tried{false};
 nr::control::Shared* shared() {
     if (g_shared || g_tried.exchange(true)) return g_shared;
     const std::string path = std::string(module_folder()) + "\\dlssnr-amd\\control.bin";
-    HANDLE file = CreateFileA(path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    HANDLE file = nr::u8::create_file(path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                               nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) return nullptr;
     HANDLE map = CreateFileMappingA(file, nullptr, PAGE_READWRITE, 0, sizeof(nr::control::Shared), nullptr);
@@ -401,8 +402,8 @@ void report(const Status& st) {
         if (std::find(g_frame_layers.begin(),g_frame_layers.end(),st.layer)==g_frame_layers.end()) g_frame_layers.push_back(st.layer);
     }
     if (nr::control::LayerStatus* r = row_of(s, st.layer, true)) {   // a layer's row: every run
-        r->state = !st.nr_on ? 3u : st.building && st.gpu_ms <= 0.f ? 2u : st.waiting ? 3u : 1u;
-        if (!st.nr_on) std::snprintf(r->note, sizeof r->note, "NR is off (toggle key)");
+        r->state = !st.nr_on ? 3u : st.building && !st.ran ? 2u : st.waiting ? 3u : 1u;
+        if (!st.nr_on) std::snprintf(r->note, sizeof r->note, "%s", NR_N("NR is off (toggle key)"));
         else if (st.waiting) std::snprintf(r->note, sizeof r->note, "%s", st.waiting_why.c_str());
         else r->note[0] = 0;
         r->net = st.net_running < 0 ? nr::control::kNoNet : uint32_t(st.net_running);
@@ -411,7 +412,7 @@ void report(const Status& st) {
         r->passes = st.passes;
         r->fast_passes = st.fast_passes; r->motion = st.motion;
         if (r->state == 1u && st.fast_fallback)
-            std::snprintf(r->note, sizeof r->note, "Extrapolation: no motion vectors");
+            std::snprintf(r->note, sizeof r->note, "%s", NR_N("Extrapolation: no motion vectors"));
         r->gpu_ms = st.gpu_ms; r->network_ms = st.network_ms;
         r->updated = uint32_t(now);
         nr::pe::events::layer_state(st.layer, r->state, r->note);
@@ -452,9 +453,7 @@ void report(const Status& st) {
         using UnixName = char*(__cdecl*)(const wchar_t*);
         const auto unix_name = reinterpret_cast<UnixName>(reinterpret_cast<void*>(
             GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "wine_get_unix_file_name")));
-        wchar_t wide[1024];
-        char* mapped = nullptr;
-        if (unix_name && MultiByteToWideChar(CP_ACP, 0, game.c_str(), -1, wide, 1024) > 0) mapped = unix_name(wide);
+        char* mapped = unix_name ? unix_name(nr::u8::wide(game).c_str()) : nullptr;
         if (mapped) {
             game = mapped;
             HeapFree(GetProcessHeap(), 0, mapped);

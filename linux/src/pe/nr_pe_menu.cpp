@@ -1,4 +1,5 @@
 // See nr_pe_menu.hpp.
+#include "nr_path_win.hpp"
 #include "nr_vk_receipts.hpp"
 #include "nr_number.hpp"
 #include "nr_pe_menu.hpp"
@@ -11,6 +12,7 @@
 #include "nr_wilsjo2_keys.hpp"
 #include "nr_menu_font.hpp"   // Inter, embedded by linux/build/build_asi.sh (embed_font.py)
 #include "nr_pe_config.hpp"
+#include "nr_dlssnr_model.hpp"
 #include "nr_asi_wilsjo2.hpp"
 #include "nr_wilsjo2.hpp"
 #include "nr_pe_control.hpp"
@@ -85,6 +87,8 @@ HMODULE dllModule = nullptr;
 
 namespace nr::pe::menu {
 namespace {
+using nr::lang::tr;
+using nr::lang::tr_text;
 
 void say(const std::string& s) { log("[nr] NR Control: %s", s.c_str()); }
 
@@ -96,6 +100,8 @@ template <class T> void release(T*& p) {
 nr::control::Shared* shared() { return nr::pe::control::page(); }
 
 std::filesystem::path game_dir() { return std::filesystem::path(nr::pe::module_folder()); }
+// The menus' language files (nr_lang.hpp)
+std::string lang_folder() { return std::string(nr::pe::module_folder()) + "\\dlssnr-amd\\lang"; }
 
 // dlssnr-amd.ini edited in place, a key table's values by section, the chain's global keys: nr_ini_edit.hpp (shared with
 // the ReShade add-on's layer page)
@@ -131,6 +137,7 @@ bool open_at_start() {
 // ---- input: the game window's keyboard and mouse as the DLL reads them (nr_pe_control.cpp) ----
 struct Input {
     bool open = open_at_start();
+    int open_vk = 0x23, open_mods = 0;   // the key that opens and closes NR Control ([NRControl] MenuKey, End)
     uint32_t keys_before[8]{};
     int32_t wheel_seen = 0;
     uint32_t chars_seen = 0;
@@ -138,7 +145,9 @@ struct Input {
     static ImGuiKey key_of(unsigned vk) {
         if (vk >= 'A' && vk <= 'Z') return ImGuiKey(ImGuiKey_A + int(vk - 'A'));
         if (vk >= '0' && vk <= '9') return ImGuiKey(ImGuiKey_0 + int(vk - '0'));
+        if (vk >= 0x70 && vk <= 0x87) return ImGuiKey(ImGuiKey_F1 + int(vk - 0x70));   // F1-F24 (a hotkey taking its key)
         switch (vk) {
+            case 0x13: return ImGuiKey_Pause; case 0x91: return ImGuiKey_ScrollLock;
             case 0x08: return ImGuiKey_Backspace; case 0x09: return ImGuiKey_Tab; case 0x0D: return ImGuiKey_Enter;
             case 0x1B: return ImGuiKey_Escape; case 0x20: return ImGuiKey_Space; case 0x21: return ImGuiKey_PageUp;
             case 0x22: return ImGuiKey_PageDown; case 0x23: return ImGuiKey_End; case 0x24: return ImGuiKey_Home;
@@ -150,7 +159,8 @@ struct Input {
             default: return ImGuiKey_None;
         }
     }
-    // End opens and closes, Esc closes; the rest goes to ImGui while open. `width` x `height`: the back buffer.
+    // MenuKey (End) opens and closes, Esc closes; the rest goes to ImGui while open - every key while a hotkey takes
+    // its key (nr_control_pages.hpp key_capture). `width` x `height`: the back buffer.
     void update(ImGuiIO& io, uint32_t width, uint32_t height) {
         auto* s = shared();
         s->wayland = 1;
@@ -162,8 +172,17 @@ struct Input {
             chars_seen = s->chars_written;
             primed = true;
         }
-        if (down(0x23) && !was(0x23)) open = !open;   // End
-        if (open && down(0x1B) && !was(0x1B) && !io.WantTextInput) open = false;   // Esc
+        // the menu's key with its modifiers held (not while a field takes typing: a letter key would close the menu)
+        const bool taking = open && nr::control_ui::capturing_key();
+        const bool mods_held = (!(open_mods & MOD_CONTROL) || down(0x11)) && (!(open_mods & MOD_SHIFT) || down(0x10)) &&
+                               (!(open_mods & MOD_ALT) || down(0x12));
+        bool toggled = false;
+        if (open_vk && down(unsigned(open_vk)) && !was(unsigned(open_vk)) && mods_held && !(open && io.WantTextInput) &&
+            !taking) {
+            open = !open;
+            toggled = true;
+        }
+        if (open && down(0x1B) && !was(0x1B) && !io.WantTextInput && !taking) open = false;   // Esc
         s->menu_open = open ? 1 : 0;
         // the game hid its cursor (mouse look): the menu draws one
         io.MouseDrawCursor = open && !s->cursor_shown;
@@ -174,8 +193,9 @@ struct Input {
             for (int b = 0; b < 3; ++b) io.AddMouseButtonEvent(b, (s->buttons >> b) & 1u);
             const int32_t wheel = s->wheel;
             if (wheel != wheel_seen) io.AddMouseWheelEvent(0.f, float(wheel - wheel_seen) / 120.f);
+            // The press that opened the menu is not ImGui's: End is its keyboard navigation's "scroll to the bottom"
             for (unsigned vk = 8; vk < 256; ++vk)
-                if (down(vk) != was(vk))
+                if (down(vk) != was(vk) && !(toggled && vk == unsigned(open_vk)))
                     if (ImGuiKey k = key_of(vk); k != ImGuiKey_None) io.AddKeyEvent(k, down(vk) != 0);
             io.AddKeyEvent(ImGuiMod_Ctrl, down(0x11) != 0);
             io.AddKeyEvent(ImGuiMod_Shift, down(0x10) != 0);
@@ -192,6 +212,7 @@ struct Input {
     }
 };
 Input g_input;   // one menu for the process, whichever swap chain shows it
+std::string g_api_name;   // the API of the swap chain the menu was last drawn on (its header line; under the draw lock)
 
 // ---- the NR chain on this route (nr_control_pages.hpp ChainEditor): layers before or after the upscaler or at Present;
 // a file without [LayerN] is one layer, as the .asi reads it: wilsjo2 with [RenoDX] Enabled = 0 given, else RenoDX
@@ -200,17 +221,17 @@ using nr::control_ui::draw_layer_status;
 using nr::control_ui::draw_vram;
 const nr::control_ui::ChainRoute kAsiChain = [] {
     nr::control_ui::ChainRoute r;
-    r.chain_help = "Each layer is an NR pass of its own: its processing (RenoDX or wilsjo2), its network ([Network] "
-                   "Model, or one of its own), where it runs, and its own settings below. Layers at one place run "
+    r.chain_help = NR_N("Each layer is an NR pass of its own: its processing (RenoDX or wilsjo2), its network ([Network] "
+                   "Model, or one of its own), where it runs, and its own settings (click its name: its page). Layers at one place run "
                    "in layer order; before the upscaler, then after it, then at Present. Each layer costs a network "
-                   "run, and a layer with another network or size its own memory.";
-    r.wilsjo2_about = "The OptiScaler-NR fork's processing around the network, ported.";
+                   "run, and a layer with another network or size its own memory.");
+    r.wilsjo2_about = NR_N("The OptiScaler-NR fork's processing around the network, ported.");
     r.wilsjo2_table = nr::wilsjo2_keys::kKeys;
     r.wilsjo2_count = nr::wilsjo2_keys::kCount;
-    r.passes_help = "Passes. Model passes a frame, 1-3 (up to 30 with Unlock passes); each costs one more network "
-                    "run. Only the last pass's answer is composed onto the frame.";
-    r.pass_same_help = "On: pass 1's settings, with the local tone at 0 (the fork's rule for later passes). Off: "
-                       "this pass's own settings below.";
+    r.passes_help = NR_N("Passes. Model passes a frame, 1-3 (up to 30 with Unlock passes); each costs one more network "
+                    "run. Only the last pass's answer is composed onto the frame.");
+    r.pass_same_help = NR_N("On: pass 1's settings, with the local tone at 0 (the fork's rule for later passes). Off: "
+                       "this pass's own settings below.");
     r.legacy_row = [](const Ini& ini) {
         nr::control_ui::ChainRow r;
         r.number = 1;
@@ -277,76 +298,125 @@ struct Menu {
     static ImVec4 rgb(uint32_t hex, float a = 1.f) {
         return {float((hex >> 16) & 255) / 255.f, float((hex >> 8) & 255) / 255.f, float(hex & 255) / 255.f, a};
     }
+    // NR Control's colour presets ([NRControl] Theme): the accent everything else is mixed from
+    static constexpr int kThemes = 6;
+    static constexpr const char* kThemeNames[kThemes] = {NR_N("Blue"), NR_N("Teal"), NR_N("Violet"), NR_N("Amber"), NR_N("Crimson"),
+                                                         NR_N("Graphite")};
+    static ImVec4 theme_accent(int theme) {
+        static const ImVec4 accents[kThemes] = {
+            {0.00f, 0.40f, 0.77f, 1.f},   // blue (OptiScaler's)
+            {0.08f, 0.62f, 0.58f, 1.f},   // teal
+            {0.52f, 0.36f, 0.86f, 1.f},   // violet
+            {0.86f, 0.56f, 0.10f, 1.f},   // amber
+            {0.80f, 0.20f, 0.26f, 1.f},   // crimson
+            {0.50f, 0.54f, 0.60f, 1.f}};  // graphite
+        return accents[std::clamp(theme, 0, kThemes - 1)];
+    }
     static void apply_style(float scale, int theme = 0) {
-        struct Palette { uint32_t bg, panel, frame, frame_hover, header, header_hover, accent, accent_soft, text, dim, border; };
-        static const Palette palettes[3] = {
-            {0x14171D, 0x1B1F27, 0x232833, 0x2C3341, 0x222A38, 0x2D3A50, 0x5B9EFA, 0x34507A, 0xE8EBF0, 0x8B93A1, 0x2B313C},
-            {0x111416, 0x181D20, 0x20272B, 0x293338, 0x1D2629, 0x24363A, 0x2EC4B6, 0x1F5C57, 0xE6EDEC, 0x86939A, 0x263034},
-            {0x15131B, 0x1C1924, 0x26212F, 0x30293C, 0x252033, 0x33294A, 0xA78BFA, 0x4B3C78, 0xEDE9F5, 0x948CA6, 0x2F2A3A}};
-        const Palette& p = palettes[std::clamp(theme, 0, 2)];
+        // Built the way OptiScaler's menu builds its dark theme (menu_common.cpp: near-black panels, one accent mixed in at
+        // fixed strengths, 2 px rounding, 1 px borders, compact spacing. The accent: [NRControl] Theme, one of
+        // kThemeNames (0: OptiScaler's blue).
+        const ImVec4 accent = theme_accent(theme);
+        const auto mix = [](const ImVec4& a, const ImVec4& b, float t, float alpha = 1.f) {
+            return ImVec4(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t, alpha);
+        };
+        const ImVec4 bg_dark(0.09f, 0.09f, 0.10f, 1.f), bg_mid(0.11f, 0.11f, 0.12f, 1.f), bg_light(0.14f, 0.14f, 0.15f, 1.f);
+        const ImVec4 black(0.f, 0.f, 0.f, 1.f), text(0.90f, 0.93f, 0.95f, 1.f), dim(0.54f, 0.58f, 0.62f, 1.f);
+        const ImVec4 border(0.24f, 0.24f, 0.26f, 1.f);
+        const auto tint = [&](const ImVec4& base, float strength = 1.f, float alpha = 1.f) {
+            return mix(base, black, 0.12f * strength, alpha);
+        };
+        const auto soft = [&](float a = 1.f) { return mix(bg_dark, accent, 0.32f, a); };
+        const auto med = [&](float a = 1.f) { return mix(bg_dark, accent, 0.55f, a); };
+        const auto strong = [&](float a = 1.f) { return ImVec4(accent.x, accent.y, accent.z, a); };
+        const ImVec4 readable = mix(accent, ImVec4(1.f, 1.f, 1.f, 1.f), 0.25f);
         ImGuiStyle st;
         ImGui::StyleColorsDark(&st);
-        st.WindowRounding = 10; st.ChildRounding = 8; st.FrameRounding = 6; st.PopupRounding = 8;
-        st.GrabRounding = 6; st.ScrollbarRounding = 8; st.TabRounding = 6;
-        st.WindowPadding = {16, 14}; st.FramePadding = {10, 6}; st.ItemSpacing = {10, 8}; st.ItemInnerSpacing = {8, 6};
-        st.IndentSpacing = 20; st.ScrollbarSize = 12; st.GrabMinSize = 12; st.SeparatorTextBorderSize = 2;
-        st.WindowBorderSize = 1; st.ChildBorderSize = 1; st.FrameBorderSize = 0; st.WindowTitleAlign = {0.02f, 0.5f};
+        st.WindowRounding = 2; st.ChildRounding = 2; st.FrameRounding = 2; st.PopupRounding = 2;
+        st.ScrollbarRounding = 2; st.GrabRounding = 2; st.TabRounding = 2;
+        st.WindowBorderSize = 1; st.ChildBorderSize = 1; st.PopupBorderSize = 1; st.FrameBorderSize = 0;
+        st.ScrollbarSize = 10; st.GrabMinSize = 10; st.SeparatorTextBorderSize = 1;
+        st.WindowPadding = {8, 8}; st.FramePadding = {6, 3}; st.ItemSpacing = {8, 5}; st.ItemInnerSpacing = {6, 4};
+        st.WindowTitleAlign = {0.0f, 0.5f};
         ImVec4* c = st.Colors;
-        c[ImGuiCol_Text] = rgb(p.text);
-        c[ImGuiCol_TextDisabled] = rgb(p.dim);
-        c[ImGuiCol_WindowBg] = rgb(p.bg, 0.97f);
-        c[ImGuiCol_ChildBg] = rgb(p.panel, 1.f);
-        c[ImGuiCol_PopupBg] = rgb(p.panel, 0.99f);
-        c[ImGuiCol_Border] = rgb(p.border);
-        c[ImGuiCol_FrameBg] = rgb(p.frame);
-        c[ImGuiCol_FrameBgHovered] = rgb(p.frame_hover);
-        c[ImGuiCol_FrameBgActive] = rgb(p.accent_soft);
-        c[ImGuiCol_TitleBg] = rgb(p.bg);
-        c[ImGuiCol_TitleBgActive] = rgb(p.header);
-        c[ImGuiCol_TitleBgCollapsed] = rgb(p.bg);
-        c[ImGuiCol_Header] = rgb(p.header);
-        c[ImGuiCol_HeaderHovered] = rgb(p.header_hover);
-        c[ImGuiCol_HeaderActive] = rgb(p.accent_soft);
-        c[ImGuiCol_Button] = rgb(p.header);
-        c[ImGuiCol_ButtonHovered] = rgb(p.header_hover);
-        c[ImGuiCol_ButtonActive] = rgb(p.accent_soft);
-        c[ImGuiCol_CheckMark] = rgb(p.accent);
-        c[ImGuiCol_SliderGrab] = rgb(p.accent, 0.85f);
-        c[ImGuiCol_SliderGrabActive] = rgb(p.accent);
-        c[ImGuiCol_Separator] = rgb(p.border);
-        c[ImGuiCol_SeparatorHovered] = rgb(p.accent_soft);
-        c[ImGuiCol_ScrollbarBg] = rgb(p.bg, 0.f);
-        c[ImGuiCol_ScrollbarGrab] = rgb(p.frame_hover);
-        c[ImGuiCol_ScrollbarGrabHovered] = rgb(p.accent_soft);
+        c[ImGuiCol_Text] = text;
+        c[ImGuiCol_TextDisabled] = dim;
+        c[ImGuiCol_WindowBg] = tint(bg_dark, 1.f, 0.93f);
+        c[ImGuiCol_ChildBg] = tint(bg_mid, 1.1f, 0.35f);
+        c[ImGuiCol_PopupBg] = tint(bg_dark, 1.f, 0.98f);
+        c[ImGuiCol_Border] = border;
+        c[ImGuiCol_BorderShadow] = {0, 0, 0, 0};
+        c[ImGuiCol_FrameBg] = tint(bg_light, 0.5f, 0.6f);
+        c[ImGuiCol_FrameBgHovered] = mix(bg_light, accent, 0.18f);
+        c[ImGuiCol_FrameBgActive] = mix(bg_light, accent, 0.28f);
+        c[ImGuiCol_TitleBg] = soft(0.85f);
+        c[ImGuiCol_TitleBgActive] = mix(soft(), accent, 0.16f);
+        c[ImGuiCol_TitleBgCollapsed] = soft(0.75f);
+        c[ImGuiCol_ScrollbarBg] = tint(bg_dark, 0.6f, 0.4f);
+        c[ImGuiCol_ScrollbarGrab] = soft();
+        c[ImGuiCol_ScrollbarGrabHovered] = med();
+        c[ImGuiCol_ScrollbarGrabActive] = strong();
+        c[ImGuiCol_CheckMark] = readable;
+        c[ImGuiCol_SliderGrab] = med();
+        c[ImGuiCol_SliderGrabActive] = readable;
+        c[ImGuiCol_Button] = soft();
+        c[ImGuiCol_ButtonHovered] = med();
+        c[ImGuiCol_ButtonActive] = strong();
+        c[ImGuiCol_Header] = soft(0.9f);
+        c[ImGuiCol_HeaderHovered] = med(0.95f);
+        c[ImGuiCol_HeaderActive] = strong();
+        c[ImGuiCol_Separator] = border;
+        c[ImGuiCol_SeparatorHovered] = med(0.85f);
+        c[ImGuiCol_SeparatorActive] = strong();
+        c[ImGuiCol_ResizeGrip] = soft(0.3f);
+        c[ImGuiCol_ResizeGripHovered] = strong(0.7f);
+        c[ImGuiCol_ResizeGripActive] = strong(0.95f);
+        c[ImGuiCol_Tab] = tint(bg_dark, 0.6f);
+        c[ImGuiCol_TabHovered] = med(0.85f);
+        c[ImGuiCol_TabSelected] = med();
+        c[ImGuiCol_TableHeaderBg] = tint(bg_mid, 0.8f, 0.6f);
+        c[ImGuiCol_TableBorderStrong] = border;
+        c[ImGuiCol_TableBorderLight] = soft();
         c[ImGuiCol_TableRowBg] = {0, 0, 0, 0};
         c[ImGuiCol_TableRowBgAlt] = {1, 1, 1, 0.03f};
-        c[ImGuiCol_ResizeGrip] = rgb(p.accent, 0.2f);
-        c[ImGuiCol_Tab] = rgb(p.frame);
-        c[ImGuiCol_TabHovered] = rgb(p.header_hover);
-        c[ImGuiCol_TabSelected] = rgb(p.accent_soft);
+        c[ImGuiCol_TextSelectedBg] = med(0.38f);
+        c[ImGuiCol_NavCursor] = readable;
+        c[ImGuiCol_PlotHistogram] = mix(accent, ImVec4(1, 1, 1, 1), 0.35f, 0.85f);
         st.ScaleAllSizes(scale);
         ImGui::GetStyle() = st;
     }
     static ImVec4 accent_of(int theme) {
-        static const uint32_t accents[3] = {0x5B9EFA, 0x2EC4B6, 0xA78BFA};
-        return rgb(accents[std::clamp(theme, 0, 2)]);
+        const ImVec4 a = theme_accent(theme);   // made readable on the dark panels
+        return ImVec4(a.x + (1.f - a.x) * 0.25f, a.y + (1.f - a.y) * 0.25f, a.z + (1.f - a.z) * 0.25f, 1.f);
     }
     int theme() const {
         if (const char* e = std::getenv("NR_CONTROL_THEME")) return std::clamp(std::atoi(e), 0, 2);   // tests
-        return std::clamp(nr::parse_integer<int>(ini.get("NRControl", "Theme", "0"), 0), 0, 2);
+        return std::clamp(nr::parse_integer<int>(ini.get("NRControl", "Theme", "0"), 0), 0, kThemes - 1);
     }
 
     // NR Control's size: the font by the screen's height (17 px at 1080 lines) times [NRControl] MenuScale, every
     // spacing with it. True when the font was made again: the backend makes its font texture again at its next frame.
     float font_px = 0.f;
+    float style_scale = 1.f;   // Menu size alone (the spacing; the text has TextScale on top)
+    float window_scale = 0.f;  // the Menu size the window was last sized for
+    ImVec2 window_size{};      // the window's size at the last frame
     int theme_now = -1;
+    std::string font_key;   // the language's font and letters the font was last made with
     bool fonts_for(uint32_t height) {
-        if (const int t = theme(); t != theme_now && font_px > 0.f) { theme_now = t; apply_style(font_px / 17.f, t); }
+        if (const int t = theme(); t != theme_now && font_px > 0.f) { theme_now = t; apply_style(style_scale, t); }
         float scale = nr::parse_float(ini.get("NRControl", "MenuScale", "1"), 1.0f);
         if (!(scale >= 0.5f && scale <= 3.f)) scale = 1.f;
-        const float px = std::clamp(std::round(float(height) / 1080.f * 17.f * scale), 12.f, 72.f);
-        if (px == font_px) return false;
+        // [NRControl] TextScale: the text alone on top of that (the spacing stays the menu's)
+        float text = nr::parse_float(ini.get("NRControl", "TextScale", "1"), 1.0f);
+        if (!(text >= 0.75f && text <= 2.f)) text = 1.f;
+        const float menu_px = std::clamp(std::round(float(height) / 1080.f * 17.f * scale), 12.f, 72.f);
+        const float px = std::clamp(std::round(menu_px * text), 9.f, 144.f);
+        const nr::lang::Table& lt = nr::lang::table();
+        const std::string key = (lt.font.empty() ? std::string() : lt.name + "|" + lt.font + "|" + std::to_string(lt.letters.size())) +
+                                "|" + std::to_string(menu_px);
+        if (px == font_px && key == font_key) return false;
         font_px = px;
+        font_key = key;
         auto& io = ImGui::GetIO();
         io.Fonts->Clear();
         ImFontConfig cfg;
@@ -354,9 +424,40 @@ struct Menu {
         cfg.OversampleH = 2;
         cfg.OversampleV = 1;
         io.Fonts->AddFontFromMemoryTTF(const_cast<unsigned char*>(kMenuFont), int(kMenuFontSize), px, &cfg);
+        if (!lt.font.empty()) add_language_font(px);
         theme_now = theme();
-        apply_style(px / 17.f, theme_now);
+        style_scale = menu_px / 17.f;
+        apply_style(style_scale, theme_now);
         return true;
+    }
+    // The language file's @font merged into NR Control's for the letters of its translations (Inter has Latin, Greek and
+    // Cyrillic only): the glyphs those texts use, so a CJK font adds only what the menu shows.
+    std::vector<char> lang_font;
+    ImVector<ImWchar> lang_ranges;
+    void add_language_font(float px) {
+        const nr::lang::Table& lt = nr::lang::table();
+        std::string path = lt.font;
+        if (path.size() < 2 || (path[1] != ':' && path[0] != '\\' && path[0] != '/')) path = lang_folder() + "\\" + path;
+        lang_font.clear();
+        if (FILE* f = nr::u8::fopen(path.c_str(), "rb")) {
+            char buf[65536];
+            for (size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) lang_font.insert(lang_font.end(), buf, buf + n);
+            std::fclose(f);
+        }
+        if (lang_font.empty()) {
+            log("[nr] NR Control: the language's font %s could not be read; its letters may not show", path.c_str());
+            return;
+        }
+        ImFontGlyphRangesBuilder b;
+        b.AddText(lt.letters.c_str());
+        lang_ranges.clear();
+        b.BuildRanges(&lang_ranges);
+        ImFontConfig cfg;
+        cfg.MergeMode = true;
+        cfg.FontDataOwnedByAtlas = false;   // lang_font stays ours
+        cfg.GlyphRanges = lang_ranges.Data;
+        ImGui::GetIO().Fonts->AddFontFromMemoryTTF(lang_font.data(), int(lang_font.size()), px, &cfg);
+        log("[nr] NR Control: language %s with the font %s", lt.name.c_str(), path.c_str());
     }
     ~Menu() { if (context) ImGui::DestroyContext(context); }
 
@@ -370,8 +471,10 @@ struct Menu {
         io.DeltaTime = std::clamp(std::chrono::duration<float>(now - previous).count(), .001f, .1f);
         previous = now;
         io.DisplaySize = {float(width), float(height)};
+        menu_key();
         g_input.update(io, width, height);
         const bool osd = osd_due(now);   // also re-reads the file once a second (the marks with it)
+        nr::lang::sync(lang_folder(), ini.get("NRControl", "Language", ""));   // (fonts_for makes the font for its letters)
         nr::pe::control::present_layers();
         nr::asi::wilsjo2_present_spatial();
         read_marks(width, height);
@@ -456,14 +559,9 @@ struct Menu {
     }
     static bool switching(const nr::control::Shared* s) { return nr::control_ui::osd_switching(s); }
     void draw_osd() {
+        nr::control_ui::check_letters();   // (the OSD is drawn with the menu closed too)
         const nr::control::Shared* s = shared();
-        ImGui::SetNextWindowPos({24, 24});
-        ImGui::SetNextWindowBgAlpha(0.65f);
-        ImGui::Begin("##nr-osd", nullptr,
-                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_AlwaysAutoResize |
-                         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
-        nr::control_ui::draw_osd_lines(s, osd_mode);
-        ImGui::End();
+        nr::control_ui::osd_window("##nr-osd", 0, [&] { nr::control_ui::draw_osd_lines(s, osd_mode); });
     }
 
     // The menu's draw data (or the OSD's alone), after the backend's NewFrame.
@@ -515,12 +613,30 @@ struct Menu {
             say("NR_CONTROL_SHOT: the screenshot button pressed at menu frame " + std::to_string(g_drawn));
         }
         ImGui::NewFrame();
-        const float u = font_px > 0.f ? font_px / 17.f : 1.f;
+        // The window by Menu size alone, resized with it (Text size makes the text larger in the same window: lines
+        // wrap, a table its columns no longer fit scrolls sideways in its page)
+        const float u = style_scale;
+        const ImVec2 ds = ImGui::GetIO().DisplaySize;
         ImGui::SetNextWindowPos({24 * u, 24 * u}, ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize({900 * u, std::min(float(height) - 48.f * u, 900.f * u)}, ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize({std::min(1080.f * u, ds.x - 48.f), std::min(float(height) - 48.f, 760.f * u)},
+                                 ImGuiCond_FirstUseEver);
+        if (window_scale > 0.f && window_scale != u && window_size.x > 0.f) {
+            const float r = u / window_scale;
+            ImGui::SetNextWindowSize({std::min(window_size.x * r, ds.x - 48.f), std::min(window_size.y * r, ds.y - 48.f)},
+                                     ImGuiCond_Always);
+        }
+        window_scale = u;
         bool open = true;
-        if (ImGui::Begin("NR Control", &open)) draw();
+        char title[160];
+        const nr::control::Shared* sh = shared();
+        std::snprintf(title, sizeof title, "NR Control  -  dlssnr-amd.asi %.*s###NR Control",
+                      sh ? int(strnlen(sh->asi_build, sizeof sh->asi_build)) : 0, sh ? sh->asi_build : "");
+        if (ImGui::Begin(title, &open, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
+            draw();
+            window_size = ImGui::GetWindowSize();   // (not while collapsed: the title bar's)
+        }
         ImGui::End();
+        if (osd_shown) draw_osd();   // the OSD stays while the menu is open (it used to go with it)
         nr::control_ui::draw_inspect_marks(marks);
         ImGui::Render();
         if (!open) g_input.close();
@@ -528,6 +644,62 @@ struct Menu {
     }
 
     // NR on / off and the screenshot keys, NR Control's for every layer ([RenoDX], as the OptiScaler route keeps them)
+    // [NRControl] MenuKey: the key that opens NR Control (End); empty: none (as the other keys); one that names no key
+    // keeps End. Read from the file once a second while the menu is closed (it may be edited there), from the menu's
+    // own copy while open (the Hotkeys section); said once a change.
+    std::string menu_key_seen = "\x01";
+    ULONGLONG menu_key_read = 0;
+    void menu_key() {
+        std::string text;
+        if (g_input.open) {
+            text = ini.get("NRControl", "MenuKey", "End");
+        } else {
+            const ULONGLONG now = GetTickCount64();
+            if (menu_key_read && now - menu_key_read < 1000) return;
+            menu_key_read = now;
+            char v[64] = {};
+            const std::string path = std::string(nr::pe::module_folder()) + "\\dlssnr-amd.ini";
+            nr::u8::profile("NRControl", "MenuKey", "End", v, sizeof v, path.c_str());
+            text = v;
+        }
+        if (text == menu_key_seen) return;
+        menu_key_seen = text;
+        int vk = 0, mods = 0;
+        if (text.find_first_not_of(" \t") == std::string::npos) {
+            log("[nr] NR Control: [NRControl] MenuKey is empty: no key opens the menu");
+        } else if (!nr::pe::parse_key(text, &vk, &mods)) {
+            vk = 0x23; mods = 0;
+            log("[nr] NR Control: [NRControl] MenuKey '%s' names no key; End opens the menu", text.c_str());
+        } else if (text != "End") {
+            log("[nr] NR Control: %s opens the menu ([NRControl] MenuKey)", text.c_str());
+        }
+        g_input.open_vk = vk; g_input.open_mods = mods;
+    }
+
+    // The Hotkeys section: NR Control's own key, and OptiScaler's menu key as its OptiScaler.ini sets it ([Menu]
+    // ShortcutKey, Insert), read once a second. Its frame-generation key (FGShortcutKey, End by default) is set to none
+    // at install, so it is not listed.
+    nr::control_ui::HotkeysMenu hotkeys;
+    ULONGLONG hotkeys_read = 0;
+    const nr::control_ui::HotkeysMenu& hotkeys_menu() {
+        const ULONGLONG now = GetTickCount64();
+        if (hotkeys_read && now - hotkeys_read < 1000) return hotkeys;
+        hotkeys_read = now;
+        hotkeys.menu_key = true;
+        hotkeys.taken.clear();
+        const std::string path = std::string(nr::pe::module_folder()) + "\\OptiScaler.ini";
+        const auto opti_key = [&](const char* key, int def, const char* what) {
+            char v[32] = {};
+            nr::u8::profile("Menu", key, "auto", v, sizeof v, path.c_str());
+            const std::string t = v;
+            const int vk = t.empty() || t == "auto" ? def : int(std::strtol(t.c_str(), nullptr, 0));
+            const std::string word = vk > 0 ? nr::control_ui::vk_word(vk) : std::string();
+            if (!word.empty()) hotkeys.taken.push_back({word, what});
+        };
+        opti_key("ShortcutKey", 0x2D, tr("OptiScaler's menu"));
+        return hotkeys;
+    }
+
     void draw_globals(const nr::control::Shared* s) {
         nr::control_ui::draw_nr_switch(ini, renodx, [s] { if (s) ++const_cast<nr::control::Shared*>(s)->screenshot_request; },
                                        s && s->screenshot[0] ? std::string(s->screenshot) : std::string());
@@ -546,116 +718,243 @@ struct Menu {
     void draw_diagnostics(const nr::control::Shared* s) {
         static const bool diag_test = [] { const char* e = std::getenv("NR_CONTROL_DIAG_OPEN"); return e && e[0] == '1'; }();
         if (diag_test) { ImGui::SetNextItemOpen(true); ImGui::SetScrollHereY(0.f); }   // tests: open, in view
-        if (!ImGui::CollapsingHeader("Diagnostics")) return;
+        if (!nr::control_ui::section("Diagnostics")) return;
         nr::control_ui::draw_events();
         if (nr::control_ui::draw_key(renodx, nr::control_ui::key_index("NROutputRect"))) {
             renodx.store(ini); ini.save();
         }
 
         if (s && s->asi_build[0]) ImGui::TextDisabled("dlssnr-amd.asi %.*s", int(sizeof s->asi_build), s->asi_build);
-        if (s && s->frame_gen[0]) ImGui::Text("%.*s", int(strnlen(s->frame_gen, sizeof s->frame_gen)), s->frame_gen);   // ImGui takes a "%.*s" length as it is (no stop at the NUL)
-        if (ImGui::Button("Copy a report")) copy_report(s);
+        if (s && s->frame_gen[0]) ImGui::TextUnformatted(tr_text(std::string(s->frame_gen, strnlen(s->frame_gen, sizeof s->frame_gen))).c_str());   // ImGui takes a "%.*s" length as it is (no stop at the NUL)
+        if (ImGui::Button(tr("Copy a report"))) copy_report(s);
         nr::control_ui::help("For a bug report: the layers as they run, their engine data, the video memory and its "
                              "residency, the events above, dlssnr-amd.ini and the last lines of dlssnr-amd.log, as text. "
                              "Copied to the clipboard and saved as dlssnr-amd\\nr-report.txt next to the game. Nothing "
                              "is sent anywhere.");
-        if (!report_said.empty()) { ImGui::SameLine(); ImGui::TextDisabled("%s", report_said.c_str()); }
+        if (!report_said.empty()) nr::control_ui::text_dim_wrapped("%s", report_said.c_str());
     }
 
     void draw_menu_settings() {
-        if (!ImGui::CollapsingHeader("NR Control")) return;
+        if (!nr::control_ui::section("NR Control")) return;
         static float pending = -1.f;
         float v = pending > 0.f ? pending : nr::parse_float(ini.get("NRControl", "MenuScale", "1"), 1.0f);
         if (!(v >= 0.5f && v <= 3.f)) v = 1.f;
-        if (ImGui::SliderFloat("Menu size", &v, 0.75f, 2.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp)) pending = v;
+        if (ImGui::SliderFloat(tr("Menu size"), &v, 0.75f, 2.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp)) pending = v;
         if (ImGui::IsItemDeactivatedAfterEdit() && pending > 0.f) {
             char t[16];
             std::snprintf(t, sizeof t, "%.2f", double(pending));
             ini.set("NRControl", "MenuScale", t);
             pending = -1.f;
         }
-        nr::control_ui::help("[NRControl] MenuScale. The menu's text and controls, on top of the size the screen gives "
-                             "them (17 px text at 1080 lines). Taken when the slider is let go.");
-        static const char* const themes[] = {"Midnight (blue)", "Graphite (teal)", "Plum (violet)"};
-        int t = std::clamp(nr::parse_integer<int>(ini.get("NRControl", "Theme", "0"), 0), 0, 2);
-        if (ImGui::Combo("Colours", &t, themes, 3)) ini.set("NRControl", "Theme", std::to_string(t));
+        nr::control_ui::help("[NRControl] MenuScale. The whole menu: its window, controls and text, on top of the size the "
+                             "screen gives them (17 px text at 1080 lines). Taken when the slider is let go.");
+        nr::control_ui::draw_text_size(ini);
+        int t = std::clamp(nr::parse_integer<int>(ini.get("NRControl", "Theme", "0"), 0), 0, kThemes - 1);
+        const char* themes[kThemes];
+        for (int i = 0; i < kThemes; ++i) themes[i] = tr(kThemeNames[i]);
+        if (ImGui::Combo(tr("Colours"), &t, themes, kThemes)) ini.set("NRControl", "Theme", std::to_string(t));
+        nr::control_ui::draw_language(ini, lang_folder());
     }
 
     // The .asi's NR chain as it runs, the video memory: nr_control_pages.hpp
 
+    // The pages of the sidebar (OptiScaler's menu's layout): the status, the chain and the selected layer, the settings
+    // for every layer, the tools. NR_CONTROL_PAGE=<name> (tests) opens one.
+    enum Page { kChain, kLayer, kNetwork, kPreprocess, kHudFix, kHotkeys, kScreenshot, kCompare, kDiagnostics, kMenu,
+                kStatus, kPages };
+    int page = [] {
+        static const char* const names[] = {"chain", "layer", "network", "preprocess", "hudfix", "hotkeys", "screenshot",
+                                            "compare", "diagnostics", "menu", "status"};
+        const char* e = std::getenv("NR_CONTROL_PAGE");
+        if (std::getenv("NR_CONTROL_HOTKEYS_OPEN")) return int(kHotkeys);
+        for (int i = 0; e && i < kPages; ++i) if (!std::strcmp(e, names[i])) return i;
+        return int(kChain);
+    }();
+
+    // What runs, as it ran last (the DLL's status)
+    void draw_status_page(const nr::control::Shared* s) {
+        if (!s || !s->route) {
+            ImGui::TextWrapped(tr("Waiting for the game's upscaler: DLSS, FSR or XeSS in the game's settings (OptiScaler's "
+                               "own menu, for the upscaler and frame generation: Insert)."));
+            return;
+        }
+        if (s->width) {
+            const bool before = s->placement == 2 ||
+                                (s->placement == 0 && s->render_width == s->width && s->render_height == s->height);
+            const uint32_t ow = s->output_width ? s->output_width : before ? 0u : s->width;
+            const uint32_t oh = s->output_width ? s->output_height : before ? 0u : s->height;
+            (void)ow; (void)oh;   // (the sizes: on the NR switch's row)
+            if (!chain_rows(s)) {
+                const char* where = s->placement == 1 ? tr(" (after the upscaler)") : s->placement == 2 ? tr(" (before the upscaler)") : "";
+                ImGui::Text(tr("NR on %ux%u%s, network %ux%u, %u pass%s"), s->width, s->height, where, s->nr_width,
+                            s->nr_height, s->passes, s->passes == 1 ? "" : "es");
+            }
+        }
+        if (chain_rows(s)) {
+            draw_layer_status(s);
+            nr::control_ui::draw_flapping();
+            nr::control_ui::draw_missing_data(s->layers, nr::control::kMaxLayers, &ini);
+        }
+        else ImGui::TextDisabled(tr(chain.many() ? "No layer is on (the NR chain page): NR does not run."
+                                                 : "NR is off (Enabled on the NR settings page): NR does not run."));
+        if (s->net_running < nr::control::kNoNet && !chain_rows(s)) ImGui::Text(tr("Network: %s"), nr::network_codename(int(s->net_running)));
+        if (s->building) {   // the build's progress, as the OSD and the ReShade route's page show it
+            ImGui::Text(tr("Building %s"), s->building_net < nr::control::kNoNet ? nr::network_codename(int(s->building_net)) : tr("the network"));
+            char phase[sizeof s->build_phase + 1] = {};
+            std::memcpy(phase, s->build_phase, sizeof s->build_phase);   // (the page may not end it)
+            ImGui::ProgressBar(std::clamp(s->build_progress, 0.f, 1.f), ImVec2(-1.0f, 0.0f), phase);
+        }
+        if (s->state[0]) ImGui::TextWrapped("%s", tr_text(std::string(s->state, strnlen(s->state, sizeof s->state))).c_str());
+        if (s->frame_gen[0]) ImGui::TextWrapped("%s", tr_text(std::string(s->frame_gen, strnlen(s->frame_gen, sizeof s->frame_gen))).c_str());   // ImGui takes a "%.*s" length as it is (no stop at the NUL)
+        draw_vram(s);
+        nr::control_ui::draw_residency();
+    }
+
+    // The line under the title (OptiScaler's menu's layout): the API the game presents with, the GPU NR runs on, its
+    // driver; NR's switch below it
+    void draw_header(const nr::control::Shared* s) {
+        nr::control_ui::info_bar(nr::control_ui::info_line(g_api_name, nr::pe::vkdevice::gpu_name(), nr::pe::vkdevice::driver_name()));
+        // NR on / off for this run: the same as NRToggleKey ([RenoDX] NeuralUplift: on or off at the start)
+        bool on = !s || !s->route || nr::dlssnr::nr_on_now();
+        if (ImGui::Checkbox(tr("Neural Rendering"), &on)) nr::pe::request_nr_toggle();
+        ImGui::SameLine();
+        const std::string key = ini.get("RenoDX", "NRToggleKey", "F6");
+        ImGui::TextDisabled(tr("on / off for this run%s%s%s"), key.empty() ? "" : " (", key.c_str(), key.empty() ? "" : ")");
+        nr::control_ui::help("Every layer off or on again, for this run only (never written to the file). Its key is on "
+                             "the Hotkeys page; whether NR is on when the game starts: the Screenshot page's "
+                             "\"Neural Rendering\" ([RenoDX] NeuralUplift).");
+    }
+    // The render size and the upscaler's output as NR last saw them (0: not known)
+    static void upscaling(const nr::control::Shared* s, uint32_t* rw, uint32_t* rh, uint32_t* ow, uint32_t* oh) {
+        *rw = *rh = *ow = *oh = 0;
+        if (!s || !s->route || !s->width) return;
+        const bool before = s->placement == 2 ||
+                            (s->placement == 0 && s->render_width == s->width && s->render_height == s->height);
+        *rw = s->render_width; *rh = s->render_height;
+        *ow = s->output_width ? s->output_width : before ? 0u : s->width;
+        *oh = s->output_width ? s->output_height : before ? 0u : s->height;
+    }
+
+    // The sidebar: the pages, and below them what runs in a few words
+    void draw_nav(const nr::control::Shared* s, float height) {
+        const float u = ImGui::GetFontSize() / 17.f;
+        ImGui::BeginChild("##nav", ImVec2(176 * u, height), ImGuiChildFlags_Borders);
+        // every layer of the chain by its number and processing ("Layer 1 (RenoDX)"; a file without [LayerN]: its one
+        // layer), each opening its own page
+        const std::vector<nr::control_ui::ChainRow> layer_rows = chain.legacy() ? std::vector<nr::control_ui::ChainRow>{chain.legacy_row()}
+                                                                                : chain.layers();
+        const char* const labels[kPages] = {NR_N("NR chain"), NR_N("Layer settings"), NR_N("Network"), NR_N("Preprocess"),
+                                            NR_N("HUD FIX"), NR_N("Hotkeys"), NR_N("Screenshot"), NR_N("Compare"),
+                                            NR_N("Diagnostics"), NR_N("NR Control"), NR_N("Status")};
+        // [NRControl] Layers off: no NR chain page; the one layer's page is "NR settings" (its choices and settings)
+        const bool many = chain.many();
+        for (int i = 0; i < kPages; ++i) {
+            if (i == kChain && !many) continue;
+            if (i == kNetwork || i == kHotkeys || i == kMenu || i == kStatus) ImGui::Separator();
+            if (i == kLayer && !layer_rows.empty()) {
+                for (size_t k = 0; k < layer_rows.size(); ++k) {
+                    const auto& r = layer_rows[k];
+                    const bool chosen = page == kLayer && (r.number == chain.layer || (chain.layer <= 0 && k == 0));
+                    char label[112];
+                    if (many) std::snprintf(label, sizeof label, tr("Layer %d (%s)"), r.number, r.processing.c_str());
+                    else std::snprintf(label, sizeof label, "%s", tr("NR settings"));
+                    ImGui::PushID(int(k));
+                    if (ImGui::Selectable(label, chosen)) { chain.layer = r.number; page = kLayer; }
+                    ImGui::PopID();
+                }
+                continue;
+            }
+            if (ImGui::Selectable(tr(labels[i]), page == i)) page = i;
+        }
+        // what runs, at the sidebar's foot: the upscaling factor, frame generation's multiplier (presents a game frame,
+        // measured), NR's layers and networks
+        uint32_t rw = 0, rh = 0, ow = 0, oh = 0;
+        upscaling(s, &rw, &rh, &ow, &oh);
+        std::vector<nr::control_ui::FootRow> rows;
+        char t[32] = "-";
+        if (rw && ow && (rw != ow || rh != oh)) std::snprintf(t, sizeof t, "%.2fx", double(oh) / double(std::max(rh, 1u)));
+        else if (rw && ow) std::snprintf(t, sizeof t, "%s", tr("none"));
+        rows.push_back({NR_N("SR"), t, rw && ow && (rw != ow || rh != oh)});
+        double ratio = 0.0;
+        if (s)
+            if (const char* f = std::strstr(s->frame_gen, "Frame generation: "))
+                std::sscanf(f + 18, "%lf presents per game frame", &ratio);
+        std::snprintf(t, sizeof t, "%.0fx", ratio);
+        rows.push_back({NR_N("FG"), ratio >= 1.8 ? t : tr("Off"), ratio >= 1.8});
+        const bool on = s && s->route && nr::dlssnr::nr_on_now();
+        int layers_on = 0;
+        if (s) for (const auto& l : s->layers) if (l.number && l.state && l.state != 3) ++layers_on;
+        std::snprintf(t, sizeof t, tr(layers_on == 1 ? "%d layer" : "%d layers"), layers_on);
+        rows.push_back({NR_N("NR"), on ? t : tr("Off"), on});
+        nr::control_ui::nav_foot(rows, nr::control_ui::ran_networks(s, s ? s->net_running : nr::control::kNoNet));
+        ImGui::EndChild();
+    }
+
     void draw() {
         const nr::control::Shared* s = shared();
-        if (s && s->route) {
-            ImGui::Text("Neural Rendering: %s", s->nr_on ? "on" : "off");
-            if (s->width) {
-                const bool before = s->placement == 2 ||
-                                    (s->placement == 0 && s->render_width == s->width && s->render_height == s->height);
-                const uint32_t ow = s->output_width ? s->output_width : before ? 0u : s->width;
-                const uint32_t oh = s->output_width ? s->output_height : before ? 0u : s->height;
-                if (s->render_width && ow && (s->render_width != ow || s->render_height != oh))
-                    ImGui::Text("Upscaling: %ux%u -> %ux%u (%.2fx)", s->render_width, s->render_height, ow, oh,
-                                double(oh) / double(std::max(s->render_height, 1u)));
-                else if (s->render_width && ow)
-                    ImGui::Text("No upscaling: %ux%u", ow, oh);
-                else if (s->render_width)
-                    ImGui::Text("Render: %ux%u", s->render_width, s->render_height);
-                if (!chain_rows(s)) {
-                    const char* where = s->placement == 1 ? " (after the upscaler)" : s->placement == 2 ? " (before the upscaler)" : "";
-                    ImGui::Text("NR on %ux%u%s, network %ux%u, %u pass%s", s->width, s->height, where, s->nr_width,
-                                s->nr_height, s->passes, s->passes == 1 ? "" : "es");
+        nr::control_ui::check_letters();   // a language whose letters the font lacks: English
+        draw_header(s);
+        const float foot = ImGui::GetFrameHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y;
+        const float body = std::max(ImGui::GetContentRegionAvail().y - foot, 100.f);
+        if (page == kChain && !chain.many()) page = kLayer;   // Layers off: no NR chain page
+        draw_nav(s, body);
+        ImGui::SameLine();
+        ImGui::BeginChild("##page", ImVec2(0, body), ImGuiChildFlags_Borders, ImGuiWindowFlags_HorizontalScrollbar);
+        nr::control_ui::paged() = true;
+        switch (page) {
+            case kStatus: draw_status_page(s); break;
+            case kChain:
+                chain.nr_on = !s || !s->route || nr::dlssnr::nr_on_now();
+                chain.flipped = [](int n) { return nr::pe::layer_flipped(n); };
+                chain.draw_chain(s);
+                if (chain.picked) { chain.picked = false; page = kLayer; }   // a layer's name: its page
+                break;
+            case kLayer:
+                chain.nr_on = !s || !s->route || nr::dlssnr::nr_on_now();
+                chain.draw_layer_page(s, loaded, accent_of(theme_now));
+                break;
+            case kPreprocess: nr::control_ui::draw_preprocess(ini); break;
+            case kHudFix: {   // what it does now and why a method cannot run (the DLL's lines)
+                nr::control_ui::HudFixMenu hm;
+                if (s) {
+                    for (int i = 0; i < 3; ++i) hm.why[2 + i] = std::string(s->hud_why[i], strnlen(s->hud_why[i], sizeof s->hud_why[i]));
+                    hm.now = std::string(s->hud_now, strnlen(s->hud_now, sizeof s->hud_now));
                 }
+                nr::control_ui::draw_hudfix(ini, hm);
+                break;
             }
-            if (chain_rows(s)) {
-                draw_layer_status(s);
-                nr::control_ui::draw_flapping();
-                nr::control_ui::draw_missing_data(s->layers, nr::control::kMaxLayers, &ini);
-            }
-            else ImGui::TextDisabled("No layer is on (the NR chain below): NR does not run.");
-            if (s->net_running < nr::control::kNoNet && !chain_rows(s)) ImGui::Text("Network: %s", nr::network_codename(int(s->net_running)));
-            if (s->building) ImGui::TextDisabled("Building a network...");
-            if (s->state[0]) ImGui::TextWrapped("%s", s->state);
-            if (s->frame_gen[0]) ImGui::Text("%.*s", int(strnlen(s->frame_gen, sizeof s->frame_gen)), s->frame_gen);   // ImGui takes a "%.*s" length as it is (no stop at the NUL)
-            draw_vram(s);
-            nr::control_ui::draw_residency();
-        } else {
-            ImGui::TextDisabled("Waiting for the game's upscaler: DLSS, FSR or XeSS in the game's settings (OptiScaler's "
-                                "own menu, for the upscaler and frame generation: Insert).");
+            case kNetwork:
+                nr::control_ui::draw_network_options(ini, s, nr::control_ui::NetworkOptions{});
+                // What the game hands NR, and who covers what it does not (the DLL's lines, nr_engine_panel.hpp)
+                if (s && s->route && s->panel_lines && !chain_rows(s) && nr::control_ui::section("Engine data")) {
+                    nr::control_ui::engine_legend();
+                    for (uint32_t i = 0; i < std::min(s->panel_lines, nr::control::kPanelLines); ++i) {
+                        char line[sizeof s->panel[0] + 1];
+                        std::snprintf(line, sizeof line, "%s", s->panel[i]);
+                        nr::control_ui::engine_line(line);
+                    }
+                }
+                ImGui::Separator();
+                nr::control_ui::draw_layers_switch(ini);   // the page's foot
+                break;
+            case kScreenshot: draw_globals(s); break;
+            case kHotkeys:
+                nr::control_ui::draw_hotkeys(ini, renodx, hotkeys_menu());
+                break;
+            case kCompare:
+                nr::control_ui::draw_inspect(ini, NR_N("What is compared. The final picture: the layers of the last place that "
+                                                  "runs (Present, else after the upscaler), all off against all on. A layer: "
+                                                  "its own input and output, where it runs (before the upscaler: the "
+                                                  "comparison is upscaled too)."));
+                break;
+            case kDiagnostics: draw_diagnostics(s); nr::control_ui::draw_log(ini); break;
+            case kMenu: draw_menu_settings(); break;
+            default: break;
         }
-        ImGui::Separator();
-        chain.draw_chain(s);
-        chain.draw_layer_page(s, loaded, accent_of(theme_now));
-        // tests (NR_CONTROL_ENGINE_OPEN=1): the window scrolled to the layer page's end, its engine data in view
-        static const bool engine_test = [] { const char* e = std::getenv("NR_CONTROL_ENGINE_OPEN"); return e && e[0] == '1'; }();
-        if (engine_test) ImGui::SetScrollHereY(1.0f);
+        nr::control_ui::paged() = false;
         if (const char* y = std::getenv("NR_CONTROL_SCROLL")) ImGui::SetScrollY(std::max(0.f, float(std::atof(y))));   // tests
-        ImGui::Spacing();
-        ImGui::SeparatorText("Global");
-        if (std::getenv("NR_CONTROL_GLOBAL_OPEN")) ImGui::SetScrollHereY(0.f);   // tests
-        nr::control_ui::draw_preprocess(ini);
-        {   // HUD FIX: what it does now and why a method cannot run (the DLL's lines)
-            nr::control_ui::HudFixMenu hm;
-            if (s) {
-                for (int i = 0; i < 3; ++i) hm.why[2 + i] = std::string(s->hud_why[i], strnlen(s->hud_why[i], sizeof s->hud_why[i]));
-                hm.now = std::string(s->hud_now, strnlen(s->hud_now, sizeof s->hud_now));
-            }
-            nr::control_ui::draw_hudfix(ini, hm);
-        }
-        nr::control_ui::draw_network_options(ini, s, nr::control_ui::NetworkOptions{});
-        // What the game hands NR, and who covers what it does not (the DLL's lines, nr_engine_panel.hpp)
-        if (s && s->route && s->panel_lines && !chain_rows(s)) {
-            if (const char* e = std::getenv("NR_CONTROL_GLOBAL_OPEN")) ImGui::SetNextItemOpen(e[0] != '0');   // tests
-            if (ImGui::CollapsingHeader("Engine data")) {
-                nr::control_ui::engine_legend();
-                for (uint32_t i = 0; i < std::min(s->panel_lines, nr::control::kPanelLines); ++i) {
-                    char line[sizeof s->panel[0] + 1];
-                    std::snprintf(line, sizeof line, "%s", s->panel[i]);
-                    nr::control_ui::engine_line(line);
-                }
-            }
-        }
-        draw_globals(s);
-        draw_menu_settings();
-        draw_diagnostics(s);
+        ImGui::EndChild();
+        if (nr::control_ui::capturing_key()) nr::pe::pause_hotkeys();   // the key being set acts as nothing else
         // tests (NR_CONTROL_REPORT_AT=<draws>): the report made once, as its button would
         static int report_at = [] { const char* e = std::getenv("NR_CONTROL_REPORT_AT"); return e ? std::atoi(e) : 0; }();
         if (report_at > 0 && --report_at == 0) copy_report(s);
@@ -666,18 +965,23 @@ struct Menu {
             const std::string text = nr::control_ui::report_text(s, "dlssnr-amd.asi",
                                                                  std::string(nr::pe::module_folder()) + "\\dlssnr-amd.ini",
                                                                  nr::pe::log_path());
-            if (FILE* f = std::fopen((std::string(nr::pe::module_folder()) + "\\nr-report-series.txt").c_str(), "ab")) {
+            if (FILE* f = nr::u8::fopen((std::string(nr::pe::module_folder()) + "\\nr-report-series.txt").c_str(), "ab")) {
                 std::fprintf(f, "--- draw %d\n%s\n", draws, text.c_str());
                 std::fclose(f);
             }
         }
-        nr::control_ui::draw_inspect(ini, "What is compared. The final picture: the layers of the last place that runs "
-                                          "(Present, else after the upscaler), all off against all on. A layer: its own "
-                                          "input and output, where it runs (before the upscaler: the comparison is "
-                                          "upscaled too).");
-        nr::control_ui::draw_log(ini);
-        ImGui::Separator();
-        ImGui::TextDisabled("End: close. Changes are saved to dlssnr-amd.ini at once.");
+        // the footer: NR's GPU time a frame in its parts, the game's render size and the upscaler's output, and a close
+        // button (changes are written at once: no save button)
+        uint32_t rw = 0, rh = 0, ow = 0, oh = 0;
+        upscaling(s, &rw, &rh, &ow, &oh);
+        char sizes[96] = "";
+        if (rw && ow && (rw != ow || rh != oh)) std::snprintf(sizes, sizeof sizes, tr("    Upscaling %ux%u -> %ux%u"), rw, rh, ow, oh);
+        else if (rw && ow) std::snprintf(sizes, sizeof sizes, tr("    No upscaling: %ux%u"), ow, oh);
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextDisabled("%s%s", nr::control_ui::cost_text(s).c_str(), sizes);
+        const float bw = ImGui::CalcTextSize(tr("Close")).x + 2 * ImGui::GetStyle().FramePadding.x;
+        ImGui::SameLine(std::max(0.f, ImGui::GetWindowWidth() - bw - ImGui::GetStyle().WindowPadding.x));
+        if (ImGui::Button(tr("Close"))) g_input.close();
     }
 };
 
@@ -725,6 +1029,9 @@ struct Encoding { uint32_t mode; float scale; const char* name; };
 
 std::mutex g_spaces_mutex;
 std::unordered_map<IDXGISwapChain*, DXGI_COLOR_SPACE_TYPE> g_spaces;   // what the game set (SetColorSpace1)
+// The last one set on any swap chain: the game's own swap chain (OptiScaler's wrapper, or frame generation's) passes
+// SetColorSpace1 to the one below, where it is seen - the menu drawn at the game's Present (draw_game) takes it
+int g_last_space = -1;
 
 // The swap chain's encoding: the colour space the game set if we saw it, else what its format and the display say
 // (a float swap chain is scRGB; a 10-bit one on an HDR display taken as HDR10).
@@ -736,6 +1043,7 @@ Encoding encoding_of(IDXGISwapChain* sc, DXGI_FORMAT format) {
         std::lock_guard<std::mutex> lock(g_spaces_mutex);
         const auto it = g_spaces.find(sc);
         if (it != g_spaces.end()) { space = it->second; known = true; }
+        else if (g_last_space >= 0) { space = DXGI_COLOR_SPACE_TYPE(g_last_space); known = true; }
     }
     if (!known) {
         if (format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
@@ -829,7 +1137,7 @@ void dump_pixel(const uint8_t* px, DXGI_FORMAT format, uint32_t mode, uint8_t rg
 }
 void dump_write(const uint8_t* data, uint32_t pitch, uint32_t w, uint32_t h, DXGI_FORMAT format, uint32_t mode) {
     g_dump.done = true;
-    FILE* f = std::fopen(g_dump.path.c_str(), "wb");
+    FILE* f = nr::u8::fopen(g_dump.path.c_str(), "wb");
     if (!f) { say("NR_CONTROL_DUMP: cannot write " + g_dump.path); return; }
     std::fprintf(f, "P6\n%u %u\n255\n", w, h);
     const size_t step = format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8 : 4;
@@ -1351,21 +1659,25 @@ template <class T> void let_go_idle(std::map<void*, Kept<T>>& m, std::chrono::st
 #include "nr_pe_menu_vk.inl"
 
 // The menu over this swap chain's back buffer, before its Present. Never throws.
-void draw_on(IDXGISwapChain* sc, UINT flags) {
-    ++g_presents;
+std::atomic<ULONGLONG> g_game_drawn_ms{0};   // NR Control drawn at the game's own Present then (draw_game)
+// `known`: the game's own swap chain's queue (D3D12) or device (D3D11), given by draw_game - the menu drawn there, no
+// hooks run; null: the system's Present - the hooks run, and the menu is drawn unless draw_game drew it in the last second.
+void draw_on(IDXGISwapChain* sc, UINT flags, IUnknown* known = nullptr) {
+    if (!known) ++g_presents;
     if (t_inside || (flags & DXGI_PRESENT_TEST)) return;
     t_inside = true;
     std::lock_guard<std::mutex> lock(g_mutex);
     const auto now = std::chrono::steady_clock::now();
+    const bool menu_here = known || GetTickCount64() - g_game_drawn_ms.load() >= 1000;
     // Refresh the presenting device before reaping idle overlays. A slow first frame or a pause must not
     // destroy its ImGui context on the very Present that is using it again.
     struct Reap { std::chrono::steady_clock::time_point now; ~Reap() {
         let_go_idle(g_d3d11, now); let_go_idle(g_d3d12, now);
     } } reap{now};
-    const auto said = [sc](const char* api) {
+    const auto said = [sc, known](const char* api) {
         DXGI_SWAP_CHAIN_DESC desc{};
         sc->GetDesc(&desc);
-        say(std::string("drawn over a ") + api + " swap chain, " + std::to_string(desc.BufferDesc.Width) + "x" +
+        say(std::string("drawn over ") + (known ? "the game's own " : "a ") + api + " swap chain, " + std::to_string(desc.BufferDesc.Width) + "x" +
             std::to_string(desc.BufferDesc.Height) + ", DXGI format " + std::to_string(int(desc.BufferDesc.Format)) +
             ": " + encoding_of(sc, desc.BufferDesc.Format).name);
     };
@@ -1375,7 +1687,14 @@ void draw_on(IDXGISwapChain* sc, UINT flags) {
         ID3D12Device* d12dev = nullptr;
         // A D3D12 swap chain's device is the queue it presents on where DXGI hands that out; else (DXVK's DXGI) the
         // D3D12 device, and the queue is the direct queue this thread has just executed the frame on (watch_queues).
-        if (FAILED(sc->GetDevice(IID_PPV_ARGS(&d11))) || !d11) {
+        // At the game's own Present (draw_game) the queue or device it was made with.
+        if (known) {
+            if (FAILED(known->QueryInterface(IID_PPV_ARGS(&d11))) || !d11) {
+                release(d11);
+                if (FAILED(known->QueryInterface(IID_PPV_ARGS(&q12)))) q12 = nullptr;
+            }
+            if (!d11 && !q12) { t_inside = false; return; }
+        } else if (FAILED(sc->GetDevice(IID_PPV_ARGS(&d11))) || !d11) {
             release(d11);
             if ((FAILED(sc->GetDevice(IID_PPV_ARGS(&q12))) || !q12) && SUCCEEDED(sc->GetDevice(IID_PPV_ARGS(&d12dev))) &&
                 d12dev) {
@@ -1386,10 +1705,29 @@ void draw_on(IDXGISwapChain* sc, UINT flags) {
                     release(owner);
                 }
                 release(d12dev);
-                if (!q12) { t_inside = false; return; }   // no frame executed on this thread yet: next Present
+                if (!q12) {   // no frame executed on this thread yet: next Present
+                    // said (the first three, then every 1000th): a Present thread of frame generation's that never
+                    // executes a list would leave the menu off its frames - it would flicker
+                    static std::atomic<uint64_t> skipped{0};
+                    const uint64_t n = ++skipped;
+                    if (n <= 3 || n % 1000 == 0)
+                        say("a Present on thread " + std::to_string(GetCurrentThreadId()) + " has no D3D12 queue to draw on; "
+                            "the menu is not on that frame (" + std::to_string(n) + " so far)");
+                    t_inside = false;
+                    return;
+                }
             }
         }
-        if (d11) {
+        if (d11 && !menu_here) {   // drawn at the game's own Present: the hook only
+            if (const D3D11PresentHook hook = g_d3d11_hook.load()) hook(sc, d11);
+            d11->Release();
+        } else if (q12 && !menu_here) {
+            if (const D3D12PresentHook hook = g_d3d12_hook.load()) {
+                DXGI_SWAP_CHAIN_DESC d{};
+                if (SUCCEEDED(sc->GetDesc(&d))) hook(sc, q12, int(encoding_of(sc, d.BufferDesc.Format).mode));
+            }
+            q12->Release();
+        } else if (d11) {
             auto& k = g_d3d11[d11];
             k.used = now;
             if (!k.overlay) {
@@ -1402,9 +1740,11 @@ void draw_on(IDXGISwapChain* sc, UINT flags) {
                 }
                 said("D3D11");
             }
-            if (const D3D11PresentHook hook = g_d3d11_hook.load()) hook(sc, d11);
+            if (const D3D11PresentHook hook = known ? nullptr : g_d3d11_hook.load()) hook(sc, d11);
             d11->Release();
+            g_api_name = "D3D11";
             k.overlay->present(sc);
+            if (known) g_game_drawn_ms = GetTickCount64();
         } else if (q12) {
             auto& k = g_d3d12[q12];
             k.used = now;
@@ -1424,11 +1764,13 @@ void draw_on(IDXGISwapChain* sc, UINT flags) {
                 said("D3D12");
             }
             q12->Release();
-            if (const D3D12PresentHook hook = g_d3d12_hook.load()) {
+            if (const D3D12PresentHook hook = known ? nullptr : g_d3d12_hook.load()) {
                 DXGI_SWAP_CHAIN_DESC d{};
                 if (SUCCEEDED(sc->GetDesc(&d))) hook(sc, q12, int(encoding_of(sc, d.BufferDesc.Format).mode));
             }
+            g_api_name = "D3D12";
             k.overlay->present(sc);
+            if (known) g_game_drawn_ms = GetTickCount64();
         } else if (g_failed_for != sc) {
             g_failed_for = sc;
             IUnknown* u = nullptr;
@@ -1473,6 +1815,7 @@ template <int N> HRESULT STDMETHODCALLTYPE colour_space_hook(IDXGISwapChain3* sc
     if (SUCCEEDED(hr)) {
         std::lock_guard<std::mutex> lock(g_spaces_mutex);
         g_spaces[sc] = space;
+        g_last_space = int(space);
     }
     return hr;
 }
@@ -1482,9 +1825,7 @@ void install_now() {
     const std::string folder = nr::pe::module_folder();
     std::wstring probe, out;
     {
-        wchar_t w[MAX_PATH * 2] = {};
-        MultiByteToWideChar(CP_ACP, 0, (folder + "\\dlssnr-amd\\nr_present_probe.exe").c_str(), -1, w, MAX_PATH * 2);
-        probe = w;
+        probe = nr::u8::wide(folder + "\\dlssnr-amd\\nr_present_probe.exe");
         wchar_t tmp[MAX_PATH] = {};
         GetTempPathW(MAX_PATH, tmp);
         out = std::wstring(tmp) + L"dlssnr-amd-present-" + std::to_wstring(GetCurrentProcessId()) + L".txt";
@@ -1666,6 +2007,9 @@ void watch_queues(ID3D12Device* device) {
 }
 
 void on_d3d12_present(D3D12PresentHook hook) { g_d3d12_hook.store(hook); }
+void draw_game(IDXGISwapChain* swap_chain, IUnknown* device) {
+    if (swap_chain && device) draw_on(swap_chain, 0, device);
+}
 void on_d3d11_present(D3D11PresentHook hook) { g_d3d11_hook.store(hook); }
 void on_execute(ExecuteObserver observer) { g_execute_observer.store(observer); }
 bool colour_space_of(IDXGISwapChain* swap_chain, int* space) {

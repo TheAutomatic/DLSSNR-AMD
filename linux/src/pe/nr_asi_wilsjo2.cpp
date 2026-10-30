@@ -308,7 +308,10 @@ public:
         facts_.prep_outside = x.prep_outside; facts_.prep_missing = x.prep_missing;
         facts_.fast_passes = x.fast_passes; facts_.fast_fallback = x.fast_fallback;
         told_.emplace(&facts_);
-        route::note_pass(f_->flags, 1.0f, f_->depth_rect.width, f_->depth_rect.height, w_, h_);
+        // the output NR Control shows: before the upscaler the upscaler's (the frame is the render's; "No upscaling" was
+        // shown), else the frame
+        route::note_pass(f_->flags, 1.0f, f_->depth_rect.width, f_->depth_rect.height, f_->out_w ? f_->out_w : w_,
+                         f_->out_h ? f_->out_h : h_);
         rf_.before_upscale = before_;
         rf_.pre_exposure = f_->pre_exposure;
         rf_.exposure = f_->exposure;

@@ -2,6 +2,7 @@
 // dlssnr-amd.ini edited in place (a value's line keeps its key and spacing, comments stay), a key table's values read
 // from and written to one section, and which [RenoDX] keys belong to the whole NR chain: NR Control's layer pages on
 // the .asi route (nr_pe_menu.cpp) and the ReShade add-on's (nr_reshade_addon.cpp).
+#include "nr_path_u8.hpp"
 #include "nr_number.hpp"
 #include "nr_pe_config.hpp"
 #include "nr_pe_log.hpp"
@@ -32,7 +33,7 @@ class Ini {
         if (ec) return false;
         const int64_t stamp = int64_t(t.time_since_epoch().count());
         if (stamp == stamp_ && !lines_.empty()) return false;
-        std::ifstream f(path_);
+        std::ifstream f(nr::u8::path(path_));
         if (!f) return false;
         lines_.clear();
         std::string l;

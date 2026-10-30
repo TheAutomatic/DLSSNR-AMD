@@ -339,7 +339,8 @@ public:
         facts_.prep_outside = x.prep_outside; facts_.prep_missing = x.prep_missing;
         facts_.fast_passes = x.fast_passes; facts_.fast_fallback = x.fast_fallback;
         told_.emplace(&facts_);
-        route::note_pass(f_->flags, 1.0f, f_->depth_rect.width, f_->depth_rect.height, w_, h_);
+        route::note_pass(f_->flags, 1.0f, f_->depth_rect.width, f_->depth_rect.height, f_->out_w ? f_->out_w : w_,
+                         f_->out_h ? f_->out_h : h_);   // as on D3D12
         rf_.before_upscale = before_;
         rf_.pre_exposure = f_->pre_exposure;
         if (f_->exposure.image) {
