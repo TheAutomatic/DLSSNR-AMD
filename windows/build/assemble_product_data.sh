@@ -6,7 +6,10 @@
 #   dlssnr-amd/shaders/               the network (windows/build/arch/rdna4.sh)
 #   dlssnr-amd/shaders/runtime/       the passes around it
 #   dlssnr-amd/shaders/temporal/      the temporal variants and motion estimator
-#   dlssnr-amd/shaders/renodx/        the RenoDX-style option's shaders (RenoDX's own, MIT)
+#   dlssnr-amd/shaders/renodx/        the RenoDX style's shaders (RenoDX's own, MIT), Passes (fast) and Preprocess
+#   dlssnr-amd/shaders/wilsjo2/       the wilsjo2 style and HUD FIX
+#   dlssnr-amd/lang/                  the menus' texts: English.txt from the code (windows/build/make_lang.py) and
+#                                     README.txt, how to make another language
 #
 #   assemble_product_data.sh <parent dir> [--model dlssnr.bin [--small-model dlssnr-small.bin]]
 set -euo pipefail
@@ -24,8 +27,20 @@ for f in accumulation.txt swin-bias-storage.txt coherent-act.txt shader-constant
 done
 cp -- "$NR_PRODUCT_SPV"/runtime/* "$dst/shaders/runtime/"
 cp -- "$NR_PRODUCT_SPV"/temporal/* "$dst/shaders/temporal/"
-bash windows/build/build_renodx.sh "$dst/shaders/renodx" > /dev/null   # the RenoDX-style option
+bash windows/build/build_renodx.sh "$dst/shaders/renodx" > /dev/null   # the RenoDX style
 cp -- windows/shaders/renodx/LICENSE "$dst/shaders/renodx/RenoDX-LICENSE.txt"
+bash windows/build/build_wilsjo2.sh "$dst/shaders/wilsjo2" > /dev/null   # the wilsjo2 style, HUD FIX on every route
+# wilsjo2_classic.spv carries AMD FidelityFX Super Resolution 1 (MIT): its notice goes with it
+cp -- windows/shaders/passes/include/fsr1/LICENSE.txt "$dst/shaders/wilsjo2/FidelityFX-FSR1-LICENSE.txt"
+mkdir -p -- "$dst/lang"
+python3 windows/build/make_lang.py "$dst/lang/English.txt" windows/src/pe/nr_pe_menu.cpp windows/src/ui/nr_control_ui.hpp \
+    windows/src/ui/nr_control_pages.hpp windows/src/core/nr_renodx_keys.hpp windows/src/ui/nr_wilsjo2_shared_keys.hpp \
+    windows/src/ui/nr_wilsjo2_keys.hpp windows/src/ui/nr_reshade_layer_keys.hpp windows/src/pe/nr_pe_events.hpp \
+    windows/src/pe/nr_reshade_addon.cpp \
+    --producers windows/src/pe/nr_asi_main.cpp windows/src/pe/nr_asi_hudcap.cpp windows/src/pe/nr_pe_control.cpp \
+    windows/src/pe/nr_dlssnr_model.cpp windows/src/pe/nr_pe_session.cpp windows/src/pe/nr_engine_panel.hpp \
+    windows/src/pe/nr_reshade_addon.cpp windows/src/pe/nr_pe_bridge.cpp windows/src/pe/nr_pe_d3d12split.cpp > /dev/null
+cp -- windows/package/lang/README.txt "$dst/lang/README.txt"
 
 # The weights are NVIDIA's and are never part of this repository: --model takes a dlssnr.bin made
 # from your own nvngx_dlssnr.dll by linux/package/model-tools/extract_model.sh, --small-model a

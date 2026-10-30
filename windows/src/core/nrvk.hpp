@@ -11,6 +11,13 @@
 // them back without staging; the adapter that owns the game's VkDevice will
 // allocate the same arenas out of device-local memory.
 #pragma once
+#include "nr_path_u8.hpp"
+#include "nr_gpu_arch.hpp"
+#include "nr_gpu_completion.hpp"
+#if NR_INT4
+#include "nr_build_cfg.hpp"
+#include "nr_log.hpp"
+#endif
 #include <vulkan/vulkan.h>
 #include "nr_pipeline_binary.hpp"
 
@@ -48,9 +55,13 @@ inline void check(VkResult r, const char* what) {
     if (r == VK_SUCCESS) return;
     std::string text = std::string(what) + ": VkResult=" + std::to_string(r);
     if (r == VK_ERROR_OUT_OF_HOST_MEMORY || r == VK_ERROR_MEMORY_MAP_FAILED) throw HostMemoryError(std::move(text));
-    throw std::runtime_error(text);
+    throw nr::binary::VkFailure(text, r);   // with its result: a build tells video memory running short from the rest
 }
 #define NRVK_CHECK(expr) ::nrvk::check((expr), #expr)
+// The network the device's architecture runs (nr_gpu_arch.hpp): RDNA4's e4m3 operands go to the FP8 matrix
+// instructions, RDNA3's (gfx11 has none) travel as FP16 through the FP16 ones with FP32 accumulation
+// (windows/shaders/rdna3/include/coopmm.glsl). Context::rdna3 says which; the host lowering (weight packing, the FP16
+// twins) follows it at run time, so one program serves both.
 
 struct Buffer {
     VkBuffer handle{};
@@ -63,7 +74,7 @@ struct Buffer {
 
 // Device memory several runtimes' images take turns in (the resize path): two regions; a runtime built at a new frame
 // size takes its images from the region the size before it did not use, so the memory of the sizes a game's dynamic
-// resolution leaves behind is reused at once instead of waiting for their retirement. A region's previous runtime is
+// resolution leaves behind is reused after its recordings finish and are reset. A region's previous runtime is
 // stale from then on (`gen`) and never recorded again; its images alias the new ones, which the GPU sees in order
 // after a full barrier (the new runtime's first transitions are from UNDEFINED). An image that does not fit takes
 // memory of its own, and `need` says how big the regions should have been.
@@ -74,6 +85,7 @@ struct ImageHeap {
     VkDeviceSize region_cap{};
     VkDeviceSize cursor[2]{};
     uint64_t gen[2]{};
+    nr::gpu::Uses uses[2];   // executable or pending recordings also retain aliased memory regions
     VkDeviceSize need[2]{};   // bytes the region's runtime asked for, fitted or not
     ImageHeap() = default;
     ImageHeap(const ImageHeap&) = delete;
@@ -84,6 +96,17 @@ struct ImageHeap {
 struct SharedPipeline;   // below; Context::pin
 
 struct Context {
+    // The RDNA3 network (set before create / adopt from the device's architecture, nr_gpu_arch.hpp).
+    bool rdna3 = false;
+    const char* target_name() const { return rdna3 ? "RDNA3 (FP16 matrices)" : "RDNA4 (FP8 matrices)"; }
+    bool target_float8() const { return !rdna3; }
+    VkComponentTypeKHR target_matrix_ab() const {
+        return rdna3 ? VK_COMPONENT_TYPE_FLOAT16_KHR : VK_COMPONENT_TYPE_FLOAT8_E4M3_EXT;
+    }
+
+    // RDNA3: an arena's FP16 twin, which holds its e4m3 values as FP16 elements at the same
+    // element index. Empty on RDNA4.
+    std::map<VkBuffer, VkBuffer> fp16_twin;
     VkInstance instance{};
     VkPhysicalDevice physical{};
     VkDevice device{};
@@ -96,6 +119,7 @@ struct Context {
     // an adopted device says so through HostDevice::buffer_device_address.
     bool buffer_device_address = false;
     std::string gpu_name, driver_name;
+    uint32_t gpu_vendor_id = 0, gpu_device_id = 0;   // telemetry and logs look the device up by ID
     bool device_local_host_visible = false;
     // A queue borrowed from a host API (vkd3d-proton, DXVK) is externally
     // synchronised by that API's own lock. When set, the lock is taken around
@@ -114,9 +138,8 @@ struct Context {
     bool pipeline_stats = false;
 #endif
 
-    // The RX 9070 XT. NR_GPU overrides with a physical-device index, which is
-    // the only reason to run on anything else: the iGPU at 1002:13c0 shares
-    // /dev/dri and would otherwise be a silent wrong answer.
+    // Which device the network runs on (the standalone tools'): NR_GPU picks by enumeration index; without it the
+    // one AMD GPU whose architecture has a network (nr_gpu_arch.hpp) - more than one is an error that names them.
     void create() {
         VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
         app.pApplicationName = "DLSS-NR-on-AMD";
@@ -130,17 +153,22 @@ struct Context {
         std::vector<VkPhysicalDevice> devices(count);
         NRVK_CHECK(vkEnumeratePhysicalDevices(instance, &count, devices.data()));
         const char* forced = getenv("NR_GPU");
+        std::string seen;
         for (uint32_t i = 0; i < count; ++i) {
-            VkPhysicalDeviceProperties p;
+            VkPhysicalDeviceProperties p{};
             vkGetPhysicalDeviceProperties(devices[i], &p);
-            const bool want = forced ? (i == uint32_t(atoi(forced)))
-                                     : (p.vendorID == 0x1002 && p.deviceID == 0x7550);
+            const nr::arch::GpuArch a = forced || p.vendorID != 0x1002 ? nr::arch::GpuArch::unknown : nr::arch::of(devices[i]);
+            const bool want = forced ? i == uint32_t(atoi(forced)) : a != nr::arch::GpuArch::unknown;
             if (!want) continue;
-            if (physical) throw std::runtime_error("more than one candidate GPU; set NR_GPU");
+            if (physical)
+                throw std::runtime_error("more than one candidate GPU: " + seen + " and " + p.deviceName + "; set NR_GPU");
             physical = devices[i];
             gpu_name = p.deviceName;
+            gpu_vendor_id = p.vendorID; gpu_device_id = p.deviceID;
+            seen = p.deviceName;
         }
-        if (!physical) throw std::runtime_error("RX 9070 XT (1002:7550) not found; set NR_GPU");
+        if (!physical) throw std::runtime_error("no RDNA4 or RDNA3 GPU found; set NR_GPU");
+        rdna3 = nr::arch::of(physical) == nr::arch::GpuArch::rdna3;
 
         require_matrix_config();
 
@@ -154,10 +182,11 @@ struct Context {
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
         features.pNext = &coop; coop.pNext = &fp8; fp8.pNext = &f11; f11.pNext = &f12; f12.pNext = &f13;
         vkGetPhysicalDeviceFeatures2(physical, &features);
+        const bool no_fp8 = !target_float8();
         struct { bool have; const char* name; } required[] = {
             {bool(coop.cooperativeMatrix),            "cooperativeMatrix"},
-            {bool(fp8.shaderFloat8),                  "shaderFloat8"},
-            {bool(fp8.shaderFloat8CooperativeMatrix), "shaderFloat8CooperativeMatrix"},
+            {no_fp8 || bool(fp8.shaderFloat8),                  "shaderFloat8"},
+            {no_fp8 || bool(fp8.shaderFloat8CooperativeMatrix), "shaderFloat8CooperativeMatrix"},
             {bool(f12.storageBuffer8BitAccess),       "storageBuffer8BitAccess"},
             {bool(f12.shaderFloat16),                 "shaderFloat16"},
             {bool(f12.shaderInt8),                    "shaderInt8"},
@@ -172,7 +201,9 @@ struct Context {
         coop = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
         coop.cooperativeMatrix = VK_TRUE;
         fp8 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT};
-        fp8.shaderFloat8 = VK_TRUE; fp8.shaderFloat8CooperativeMatrix = VK_TRUE;
+        // The FP8 features are the rdna4-fp8 target's; rdna3-fp16 leaves the struct zeroed in
+        // the chain — explicitly disabled, not silently absent.
+        if (target_float8()) fp8.shaderFloat8 = fp8.shaderFloat8CooperativeMatrix = VK_TRUE;
         f11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
         f11.storageBuffer16BitAccess = VK_TRUE;
         f12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
@@ -241,12 +272,11 @@ struct Context {
         wml.pNext = nullptr;
         wml.workgroupMemoryExplicitLayoutScalarBlockLayout = VK_FALSE;
         if (have_wml) f13.pNext = &wml;
-        const char* exts[] = {VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME,
-                              VK_EXT_SHADER_FLOAT8_EXTENSION_NAME,
-                              VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME};
+        std::vector<const char*> ext_list{VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME};
+        if (target_float8()) ext_list.push_back(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
+        if (have_wml) ext_list.push_back(VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME);
         VkDeviceCreateInfo di{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
         di.pNext = &coop; di.queueCreateInfoCount = 1; di.pQueueCreateInfos = &qi;
-        std::vector<const char*> ext_list(exts, exts + (have_wml ? 3 : 2));
         // Our pipelines ask for no robust buffer / image access (Kernel::create); the feature that allows it.
         VkPhysicalDevicePipelineRobustnessFeaturesEXT prf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT};
         {
@@ -348,8 +378,8 @@ struct Context {
         // compiles a pipeline by its own VkPipelineRobustnessCreateInfo whether or not the device enabled it.
         pipeline_robustness = prf.pipelineRobustness;
         if (!c.cooperativeMatrix)             return no("cooperativeMatrix");
-        if (!f8.shaderFloat8)                 return no("shaderFloat8");
-        if (!f8.shaderFloat8CooperativeMatrix) return no("shaderFloat8CooperativeMatrix");
+        if (target_float8() && !f8.shaderFloat8)                 return no("shaderFloat8");
+        if (target_float8() && !f8.shaderFloat8CooperativeMatrix) return no("shaderFloat8CooperativeMatrix");
         if (!v11.storageBuffer16BitAccess)    return no("storageBuffer16BitAccess");
         if (!v12.storageBuffer8BitAccess)     return no("storageBuffer8BitAccess");
         if (!v12.shaderFloat16)               return no("shaderFloat16");
@@ -367,6 +397,7 @@ struct Context {
         vkGetPhysicalDeviceProperties2(physical, &props);
         driver_name = std::string(drv.driverName) + " / " + drv.driverInfo;
         timestamp_period = props.properties.limits.timestampPeriod;
+        gpu_vendor_id = props.properties.vendorID; gpu_device_id = props.properties.deviceID;
         // The same requirement `create` makes, and for the same reason: the
         // coopmat properties are reported per subgroup size and every fragment
         // size in this port is a wave32 one.
@@ -403,7 +434,7 @@ struct Context {
         pipeline_cache_path = path;
         std::vector<char> blob;
         {
-            std::ifstream f(path, std::ios::binary | std::ios::ate);
+            std::ifstream f(nr::u8::path(path), std::ios::binary | std::ios::ate);
             if (f) {
                 const std::streamoff n = f.tellg();
                 // 32 bytes is the header every implementation writes; anything
@@ -437,14 +468,14 @@ struct Context {
         // not leave a half-written file behind for the next one to read.
         const std::string tmp = pipeline_cache_path + ".tmp";
         {
-            std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+            std::ofstream f(nr::u8::path(tmp), std::ios::binary | std::ios::trunc);
             if (!f) return 0;
             f.write(blob.data(), std::streamsize(bytes));
             if (!f) return 0;
         }
-        std::remove(pipeline_cache_path.c_str());
-        if (std::rename(tmp.c_str(), pipeline_cache_path.c_str()) != 0) {
-            std::remove(tmp.c_str());
+        nr::u8::remove(pipeline_cache_path);
+        if (nr::u8::rename(tmp, pipeline_cache_path) != 0) {
+            nr::u8::remove(tmp);
             return 0;
         }
         return bytes;
@@ -452,35 +483,46 @@ struct Context {
 
     // The extensions and features a host `vkCreateDevice` has to have enabled
     // for `adopt` to succeed. A layer adds these to the application's own
-    // create info on the way through; nothing else can.
-    static const char* const* required_device_extensions(uint32_t& n) {
-        static const char* const e[] = {VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME,
-                                        VK_EXT_SHADER_FLOAT8_EXTENSION_NAME};
-        n = 2;
-        return e;
+    // create info on the way through; nothing else can. The FP8 extension is
+    // the rdna4-fp8 target's.
+    const char* const* required_device_extensions(uint32_t& n) const {
+        static const char* const with_fp8[] = {VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME,
+                                               VK_EXT_SHADER_FLOAT8_EXTENSION_NAME};
+        static const char* const without_fp8[] = {VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME};
+        if (target_float8()) { n = 2; return with_fp8; }
+        n = 1;
+        return without_fp8;
     }
 
-    // The FP8 configuration the whole port rests on. Asserting it here means a
-    // driver that quietly stops reporting it fails at startup with a name,
-    // rather than in a kernel with wrong numbers.
-    void require_matrix_config() const {
+    // The 16x16x16 subgroup configuration with FP32 accumulation the target multiplies in;
+    // the operand type comes from the target (e4m3 on gfx12, f16 on gfx11). Shared by
+    // require_matrix_config and the rdna3 default device pick.
+    static bool has_matrix_config(VkInstance inst, VkPhysicalDevice pd, VkComponentTypeKHR ab) {
         auto query = reinterpret_cast<PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR>(
-            vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR"));
-        if (!query) throw std::runtime_error("vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR absent");
+            vkGetInstanceProcAddr(inst, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR"));
+        if (!query) return false;
         uint32_t n = 0;
-        NRVK_CHECK(query(physical, &n, nullptr));
+        if (query(pd, &n, nullptr) != VK_SUCCESS || !n) return false;
         std::vector<VkCooperativeMatrixPropertiesKHR> p(
             n, {VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR});
-        NRVK_CHECK(query(physical, &n, p.data()));
+        if (query(pd, &n, p.data()) != VK_SUCCESS) return false;
         for (const auto& m : p)
             if (m.MSize == 16 && m.NSize == 16 && m.KSize == 16 &&
-                m.scope == VK_SCOPE_SUBGROUP_KHR &&
-                m.AType == VK_COMPONENT_TYPE_FLOAT8_E4M3_EXT &&
-                m.BType == VK_COMPONENT_TYPE_FLOAT8_E4M3_EXT &&
+                m.scope == VK_SCOPE_SUBGROUP_KHR && m.AType == ab && m.BType == ab &&
                 m.CType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
                 m.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR && !m.saturatingAccumulation)
-                return;
-        throw std::runtime_error("e4m3 x e4m3 -> fp32 16x16x16 subgroup config not reported");
+                return true;
+        return false;
+    }
+
+    // The configuration the whole port rests on. Asserting it here means a driver that quietly
+    // stops reporting it fails at startup with a name, rather than in a kernel with wrong numbers.
+    void require_matrix_config() const {
+        if (has_matrix_config(instance, physical, target_matrix_ab())) return;
+        if (!vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR"))
+            throw std::runtime_error("vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR absent");
+        throw std::runtime_error(std::string(target_name())
+                                 + ": 16x16x16 subgroup matrix configuration not reported");
     }
 
     // Arenas are plain DEVICE_LOCAL, never host-visible, and the host reaches
@@ -877,7 +919,7 @@ struct Context {
 };
 
 inline std::vector<uint32_t> read_spirv(const std::string& path) {
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    std::ifstream f(nr::u8::path(path), std::ios::binary | std::ios::ate);
     if (!f) throw std::runtime_error("cannot open " + path);
     const std::streamoff n = f.tellg();
     if (n <= 0 || n % 4) throw std::runtime_error("not a SPIR-V module: " + path);
@@ -886,6 +928,41 @@ inline std::vector<uint32_t> read_spirv(const std::string& path) {
     f.read(reinterpret_cast<char*>(code.data()), n);
     if (!f || code[0] != 0x07230203u) throw std::runtime_error("bad SPIR-V magic: " + path);
     return code;
+}
+
+// The storage-buffer bindings of a module that hold e4m3 data, by the name of their
+// block: `*E4M3*`, `*Pair4`, and the small kernels' `Act` / `Act4`. On RDNA3 the e4m3
+// values live in FP16 twins of the arenas (`Context::fp16_twin`), indexed exactly like
+// the byte arenas they shadow, and these are the bindings that read the twin.
+inline std::set<uint32_t> e4m3_view_bindings(const std::vector<uint32_t>& code,
+                                             std::set<uint32_t>* all_bindings = nullptr) {
+    std::map<uint32_t, std::string> names;
+    std::map<uint32_t, uint32_t> pointee, var_type, binding;
+    for (size_t i = 5; i < code.size();) {
+        const uint32_t op = code[i] & 0xFFFFu, wc = code[i] >> 16;
+        if (!wc || i + wc > code.size()) break;
+        if (op == 5 && wc >= 3)                                     // OpName
+            names[code[i + 1]] = reinterpret_cast<const char*>(&code[i + 2]);
+        else if (op == 32 && wc == 4 && code[i + 2] == 12)          // OpTypePointer StorageBuffer
+            pointee[code[i + 1]] = code[i + 3];
+        else if (op == 59 && wc >= 4 && code[i + 3] == 12)          // OpVariable StorageBuffer
+            var_type[code[i + 2]] = code[i + 1];
+        else if (op == 71 && wc >= 4 && code[i + 2] == 33)          // OpDecorate Binding
+            binding[code[i + 1]] = code[i + 3];
+        i += wc;
+    }
+    std::set<uint32_t> out;
+    for (const auto& v : var_type) {
+        const auto b = binding.find(v.first);
+        const auto p = pointee.find(v.second);
+        if (b == binding.end() || p == pointee.end()) continue;
+        const std::string& n = names[p->second];
+        if (all_bindings) all_bindings->insert(b->second);
+        if (n.find("E4M3") != std::string::npos || n.find("Pair4") != std::string::npos ||
+            n == "Act" || n == "Act4")
+            out.insert(b->second);
+    }
+    return out;
 }
 
 // One compute pipeline over N storage-buffer bindings in set 0 plus a push
@@ -928,6 +1005,11 @@ struct Kernel {
     VkDescriptorSet set{};
     uint32_t push_range{};   // the layout's push constant bytes
     uint32_t aco_push_gap{}; // ACO INT4 uses Linux's push layout, omitting Windows's arena address.
+    // RDNA3: which bindings read the FP16 twin of their arena and which are raw alias views, and the
+    // context's twin map. A second descriptor set over this layout (nr_runtime.cpp kernel_set) has to
+    // bind the same way `create` does, or the kernel reads and writes an arena in the wrong format.
+    std::vector<uint32_t> twin_bindings, alias_bindings;
+    const std::map<VkBuffer, VkBuffer>* twin_map{};
     void push_constants(VkCommandBuffer cmd, uint32_t bytes, const void* data) const {
         if (!bytes) return;
         if (!aco_push_gap) {
@@ -953,6 +1035,7 @@ struct Kernel {
     // A sampled image is `VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER` and a
     // storage image is `VK_DESCRIPTOR_TYPE_STORAGE_IMAGE`; which one a given
     // binding is comes from whether the `Image` carries a sampler.
+    static constexpr uint32_t kAliasBase = 16;
     void create(Context& ctx, const std::string& spirv_path,
                 const std::vector<VkBuffer>& bindings, uint32_t push_bytes,
                 const std::vector<Context::Image*>& images = {}) {
@@ -965,9 +1048,28 @@ struct Kernel {
                 aco_push_gap=name.rfind("g_gemm",0)==0 && push_bytes>=88 ? 80u : name=="g_vitattn.spv" ? 20u : 0u;
         }
 #endif
+        const std::vector<uint32_t> code = read_spirv(spirv_path);
+        std::vector<VkBuffer> bound(bindings);
+        std::set<uint32_t> declared;
+        const std::set<uint32_t> e4m3 = e4m3_view_bindings(code, &declared);
+        twin_map = &ctx.fp16_twin;
+        twin_bindings.assign(e4m3.begin(), e4m3.end());
+        if (!ctx.fp16_twin.empty())
+            for (uint32_t b : e4m3) {
+                const auto twin = b < bound.size() ? ctx.fp16_twin.find(bound[b]) : ctx.fp16_twin.end();
+                if (twin != ctx.fp16_twin.end()) bound[b] = twin->second;
+            }
+        // Alias bindings (kAliasBase + k) are raw-word views of the buffer at binding k and
+        // always get that buffer itself, never its FP16 twin.
+        std::vector<std::pair<uint32_t, VkBuffer>> aliases;
+        for (uint32_t b : declared)
+            if (b >= kAliasBase && b - kAliasBase < bindings.size())
+                aliases.push_back({b, bindings[b - kAliasBase]});
+        for (const auto& alias : aliases) alias_bindings.push_back(alias.first);
         const uint32_t nb = uint32_t(bindings.size());
         const uint32_t ni = uint32_t(images.size());
-        const uint32_t n = nb + ni;
+        const uint32_t na = uint32_t(aliases.size());
+        const uint32_t n = nb + ni + na;
         std::vector<VkDescriptorSetLayoutBinding> lb(n);
         for (uint32_t i = 0; i < nb; ++i)
             lb[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
@@ -975,6 +1077,8 @@ struct Kernel {
             lb[nb + i] = {nb + i, images[i]->sampler ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
                                                      : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                           1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        for (uint32_t i = 0; i < na; ++i)
+            lb[nb + ni + i] = {aliases[i].first, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
         // The shared part: found by device, file, binding types, push range and robustness, or made here.
         std::string key = std::to_string(reinterpret_cast<uintptr_t>(device)) + "|" + spirv_path + "|" +
                           std::to_string(push_bytes) + "|" + (ctx.pipeline_robustness ? "r" : "-") + "|";
@@ -1001,7 +1105,7 @@ struct Kernel {
         }
 
         std::vector<VkDescriptorPoolSize> ps;
-        if (nb) ps.push_back({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nb});
+        if (nb + na) ps.push_back({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nb + na});
         for (uint32_t i = 0; i < ni; ++i)
             ps.push_back({images[i]->sampler ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
                                              : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1});
@@ -1011,11 +1115,11 @@ struct Kernel {
         VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
         dai.descriptorPool = pool; dai.descriptorSetCount = 1; dai.pSetLayouts = &dsl;
         NRVK_CHECK(vkAllocateDescriptorSets(device, &dai, &set));
-        std::vector<VkDescriptorBufferInfo> bi(nb);
+        std::vector<VkDescriptorBufferInfo> bi(nb + na);
         std::vector<VkDescriptorImageInfo> ii(ni);
         std::vector<VkWriteDescriptorSet> w(n);
         for (uint32_t i = 0; i < nb; ++i) {
-            bi[i] = {bindings[i], 0, VK_WHOLE_SIZE};
+            bi[i] = {bound[i], 0, VK_WHOLE_SIZE};
             w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
             w[i].dstSet = set; w[i].dstBinding = i; w[i].descriptorCount = 1;
             w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[i].pBufferInfo = &bi[i];
@@ -1028,6 +1132,12 @@ struct Kernel {
                 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
                 : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
             w[nb + i].pImageInfo = &ii[i];
+        }
+        for (uint32_t i = 0; i < na; ++i) {
+            bi[nb + i] = {aliases[i].second, 0, VK_WHOLE_SIZE};
+            w[nb + ni + i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            w[nb + ni + i].dstSet = set; w[nb + ni + i].dstBinding = aliases[i].first; w[nb + ni + i].descriptorCount = 1;
+            w[nb + ni + i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[nb + ni + i].pBufferInfo = &bi[nb + i];
         }
         vkUpdateDescriptorSets(device, n, w.data(), 0, nullptr);
     }
@@ -1109,7 +1219,7 @@ struct Kernel {
                             irs(device, &ei, &nr, r.data());
                             for (uint32_t i = 0; i < nr; ++i) {
                                 std::string fn = std::string(dump_ir) + "/" + base + "." + std::to_string(e) + "." + std::to_string(i) + ".txt";
-                                std::ofstream f(fn, std::ios::binary);
+                                std::ofstream f(nr::u8::path(fn), std::ios::binary);
                                 f << "# " << r[i].name << " : " << r[i].description << "\n";
                                 f.write(buf[i].data(), std::streamsize(r[i].dataSize));
                             }
@@ -1314,6 +1424,8 @@ struct Runner {
     // one of them destroys a whole accumulator tile of the next MMA. Every layer
     // whose producer has no kernel yet reads such a slot.
     VkBuffer zero_buffer{};
+    VkBuffer zero_twin{};              // RDNA3: the FP16 twin of zero_buffer, zeroed with it
+    VkDeviceSize zero_twin_bytes{};
     // Arena-reuse diagnostics (nr_graph.cpp, NR_ARENA_UNWRITTEN): ranges filled
     // after the zero fill, and with what.
     uint32_t zero_value = 0;
@@ -1398,6 +1510,7 @@ struct Runner {
             }
             if (zero_buffer && zero_bytes) {
                 vkCmdFillBuffer(cmd, zero_buffer, 0, zero_bytes, zero_value);
+                if (zero_twin && zero_twin_bytes) vkCmdFillBuffer(cmd, zero_twin, 0, zero_twin_bytes, zero_value);
                 for (const auto& pr : poison)
                     vkCmdFillBuffer(cmd, zero_buffer, pr.first, pr.second, poison_value);
                 VkMemoryBarrier zb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};

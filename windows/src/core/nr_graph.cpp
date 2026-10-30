@@ -19,11 +19,13 @@
 // Two things this is not, yet: every family - `--report` says which - and the
 // OptiScaler entry point. The arenas are already the shapes that adapter wants.
 #if NR_INT4
+#include "nr_path_u8.hpp"
 #include "nr_build_cfg.hpp"
 #endif
 #include "nr_shader_manifest.hpp"
 #include "nr_activation_lut.hpp"
 #include "nr_log.hpp"
+#include "nr_vram_tag.hpp"
 #include "nrvk.hpp"
 #include "telemetry.hpp"
 #include "tinlayout.hpp"
@@ -167,9 +169,15 @@ static std::vector<uint8_t> g_tc_nobar;
 static std::vector<uint32_t> g_tc_words;
 static std::vector<size_t> g_tc_err;   // error words, as indices into g_tc_words
 static size_t g_tc_base = 0;
-static bool tchain_active() {
+static bool tchain_active(bool rdna3 = false) {
+    if (!NR_TCHAIN_TILES || g_chain_epoch_word == 0xFFFFFFFFu) return false;
     const char* e = std::getenv("NR_TCHAIN");
-    return NR_TCHAIN_TILES && !(e && *e && std::atoi(e) == 0) && g_chain_epoch_word != 0xFFFFFFFFu;
+    if (rdna3) {
+        // RDNA3 initial default: explicit barriers. Chaining is opt-in via NR_TCHAIN=1.
+        return e && *e && std::atoi(e) != 0;
+    } else {
+        return !(e && *e && std::atoi(e) == 0);
+    }
 }
 // Which barriers a tile counter replaces. C=512: attn -> its projection ->
 // ffwd3 -> FFN projection -> attn. ViT: expand -> contraction -> QKV, and
@@ -227,6 +235,7 @@ static bool tchain_pair(const std::string& p, const std::string& q) {
 // after their push block as this file declares it (gemm1x1 pipelines therefore
 // all build NR_GEMM_REMAP_PC=1, so their block ends with `remap` like PushGemm).
 static bool tchain_kern(const std::string& k00) {
+    if (k00 == "fswin32nhd") return tchain_kern("fswin32nh");   // the decoder's copy (CC_SMALL_FP8_EXPERIMENTAL)
 #if NR_INT4
     {   // the int4 pipelines and the hard-swish route's "<kern>p" (NR_HS_ROUTE) chain like their base kernels
         std::string k = i4base(k00);
@@ -312,6 +321,14 @@ bool flag(int c, char** v, const char* k) {
     for (int i = 1; i < c; ++i) if (!std::strcmp(v[i], k)) return true;
     return false;
 }
+// The network's SPIR-V: --spv-dir; with ACO Mode on, the bundle's (int4 mixed: its int4 folder, nr::binary::directory),
+// unless --spv-dir-aco says --spv-dir is ACO SPIR-V itself (CC_SMALL_FP8_EXPERIMENTAL's experimental/shaders, its records
+// among the bundle's). Without that the experimental network ran the small network's programs on its own weights.
+std::string network_spv_dir(int c, char** v) {
+    std::string d = arg(c, v, "--spv-dir", "build");
+    if (!nr::binary::directory().empty() && !flag(c, v, "--spv-dir-aco")) d = nr::binary::directory() + "/shaders";
+    return d;
+}
 // The per-layer and scoring tools read values by slot after the frame; they
 // keep the one-value-one-slot layout (no arena reuse) and the plain repacks.
 bool slot_reading_diagnostic(int c, char** v) {
@@ -331,7 +348,7 @@ struct ModelPack {
 };
 ModelPack g_pack;
 bool open_model_pack(const std::string& file, const std::string& root, std::string* why) {
-    std::ifstream f(file, std::ios::binary);
+    std::ifstream f(nr::u8::path(file), std::ios::binary);
     char magic[8];
     uint32_t count = 0, reserved = 0;
     if (!f.read(magic, 8) || std::memcmp(magic, "NRMODEL1", 8) ||
@@ -360,13 +377,13 @@ std::vector<uint8_t> slurp(const std::string& p) {
         for (char& c : name) if (c == '\\') c = '/';
         const auto it = g_pack.index.find(name);
         if (it == g_pack.index.end()) return {};
-        std::ifstream f(g_pack.file, std::ios::binary);
+        std::ifstream f(nr::u8::path(g_pack.file), std::ios::binary);
         std::vector<uint8_t> v(size_t(it->second.second));
         if (!f.seekg(std::streamoff(it->second.first)) ||
             !f.read(reinterpret_cast<char*>(v.data()), std::streamsize(v.size()))) return {};
         return v;
     }
-    std::ifstream f(p, std::ios::binary);
+    std::ifstream f(nr::u8::path(p), std::ios::binary);
     if (!f) return {};
     return std::vector<uint8_t>((std::istreambuf_iterator<char>(f)),
                                 std::istreambuf_iterator<char>());
@@ -421,7 +438,7 @@ static void i4_store_write(const std::string& path, const std::vector<I4Entry>& 
     const uint32_t cnt = uint32_t(es.size());
     const uint64_t ck = i4_fnv(1469598103934665603ull, body.data(), body.size());
     const std::string tmp = path + ".tmp";
-    FILE* f = std::fopen(tmp.c_str(), "wb");
+    FILE* f = nr::u8::fopen(tmp.c_str(), "wb");
     if (!f) throw std::runtime_error("int4 weights: cannot write " + tmp);
     bool ok = std::fwrite(kI4Magic, 1, 8, f) == 8 && std::fwrite(&cnt, 4, 1, f) == 1 && std::fwrite(&ck, 8, 1, f) == 1 &&
               std::fwrite(body.data(), 1, body.size(), f) == body.size();
@@ -441,7 +458,7 @@ static const I4Store* i4_store() {
     if (!path) return nullptr;
     // Checked in one pass with a small buffer, and only each entry's place in the file kept: i4_obtain reads a
     // matrix when the build reaches it, so the file is never in host memory as a whole.
-    std::ifstream f(path, std::ios::binary);
+    std::ifstream f(nr::u8::path(path), std::ios::binary);
     char magic[8] = {};
     uint32_t cnt = 0; uint64_t ck = 0;
     if (!f.read(magic, 8) || std::memcmp(magic, kI4Magic, 8) || !f.read(reinterpret_cast<char*>(&cnt), 4) ||
@@ -500,7 +517,7 @@ static I4Mat i4_obtain(const std::string& prefix, const std::vector<uint8_t>& ws
             throw std::runtime_error("int4 weights: " + std::filesystem::path(prefix).filename().string() + " is not in dlssnr-int4.bin or was made from another model");
         std::vector<uint8_t> nib(size_t(N) * K4 / 2);
         r.sc.resize(size_t(N) * 8);
-        std::ifstream f(st->path, std::ios::binary);
+        std::ifstream f(nr::u8::path(st->path), std::ios::binary);
         if (!f.seekg(std::streamoff(it->second.at)) || !f.read(reinterpret_cast<char*>(nib.data()), std::streamsize(nib.size())) ||
             !f.read(reinterpret_cast<char*>(r.sc.data()), std::streamsize(r.sc.size())))
             throw std::runtime_error("int4 weights: " + st->path + " could not be read again");
@@ -857,7 +874,7 @@ std::vector<Step> parse_plan(std::istream& f) {
 }
 
 std::vector<Step> load_plan(const std::string& path) {
-    std::ifstream f(path);
+    std::ifstream f(nr::u8::path(path));
     if (!f) throw std::runtime_error("cannot open " + path);
     return parse_plan(f);
 }
@@ -1333,6 +1350,9 @@ private:
 struct NrSession {
     nrvk::Context ctx;
     nrvk::Buffer act{}, wgt{};
+    // RDNA3: the arenas' FP16 twins, which hold the e4m3 values as FP16 elements at the
+    // same element index (nrvk::Context::fp16_twin; shaders reach them by block name).
+    nrvk::Buffer act_e{}, wgt_e{};
     nrvk::Context::Image tex_in{}, surf0{}, surf1{};
     std::map<std::string, nrvk::Kernel> kern;
     std::vector<Disp> disp;
@@ -1423,12 +1443,16 @@ struct NrSession {
 struct GraphAct {
     VkDevice device{};
     nrvk::Buffer buf{};
+    nrvk::Buffer twin{};
     size_t cap{};
     uint64_t loaded{};
     ~GraphAct() {
         if (buf.mapped) vkUnmapMemory(device, buf.memory);
         if (buf.handle) vkDestroyBuffer(device, buf.handle, nullptr);
         if (buf.memory) vkFreeMemory(device, buf.memory, nullptr);
+        if (twin.mapped) vkUnmapMemory(device, twin.memory);
+        if (twin.handle) vkDestroyBuffer(device, twin.handle, nullptr);
+        if (twin.memory) vkFreeMemory(device, twin.memory, nullptr);
     }
 };
 
@@ -1440,6 +1464,7 @@ struct GraphArenas {
     VkDevice device{};
     std::shared_ptr<GraphAct> act;   // possibly another network's too (GraphAct)
     nrvk::Buffer wgt{};
+    nrvk::Buffer wgt_e{};
     size_t wgt_cap{}, weights_end{};
     uint64_t weights_hash{};
     uint64_t loaded{};   // GraphCore::id whose tail and noise fields the weight buffer holds, 0 none
@@ -1464,6 +1489,9 @@ struct GraphArenas {
         if (wgt.mapped) vkUnmapMemory(device, wgt.memory);
         if (wgt.handle) vkDestroyBuffer(device, wgt.handle, nullptr);
         if (wgt.memory) vkFreeMemory(device, wgt.memory, nullptr);
+        if (wgt_e.mapped) vkUnmapMemory(device, wgt_e.memory);
+        if (wgt_e.handle) vkDestroyBuffer(device, wgt_e.handle, nullptr);
+        if (wgt_e.memory) vkFreeMemory(device, wgt_e.memory, nullptr);
     }
 };
 
@@ -1565,10 +1593,9 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     if (accumulation!="fp32" && accumulation!="round-fp16") {
         std::fprintf(stderr,"--accumulation must be fp32 or round-fp16\n");return 1;
     }
-    std::string spv_dir = arg(argc, argv, "--spv-dir", "build");
-    if (!nr::binary::directory().empty()) spv_dir = nr::binary::directory() + "/shaders";
+    std::string spv_dir = network_spv_dir(argc, argv);
     if(accumulation=="round-fp16") spv_dir += "/round-fp16";
-    std::ifstream policy_file(spv_dir+"/accumulation.txt");
+    std::ifstream policy_file(nr::u8::path(spv_dir+"/accumulation.txt"));
     std::string built_policy;
     policy_file >> built_policy;
     if(built_policy!=accumulation) {
@@ -1587,7 +1614,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     // is, because a runner and a build that disagree here compute stale data.
     bool coherent_act = false;
     {
-        std::ifstream coh(spv_dir + "/coherent-act.txt");
+        std::ifstream coh(nr::u8::path(spv_dir + "/coherent-act.txt"));
         std::string t;
         coh >> t;
         coherent_act = (t == "1");
@@ -1597,7 +1624,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     std::string swin_bias_storage = "fp32";
     const std::string bias_marker = spv_dir + "/swin-bias-storage.txt";
     if (std::filesystem::exists(bias_marker)) {
-        std::ifstream file(bias_marker);
+        std::ifstream file(nr::u8::path(bias_marker));
         if (!(file >> swin_bias_storage) ||
             (swin_bias_storage != "fp16" && swin_bias_storage != "fp32")) {
             std::fprintf(stderr, "invalid Swin bias storage marker: %s\n", bias_marker.c_str());
@@ -1605,6 +1632,9 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         }
     }
     const bool swin_bias_f16 = swin_bias_storage == "fp16";
+    // CC_SMALL_FP8_EXPERIMENTAL (build_network.py --experimental): fixed-attention.txt lists the pipelines whose window
+    // attention is a fixed probability table (NR_FIXP); the table follows each one-head C=32 layer's bias.
+    const bool fixed_attention = std::filesystem::exists(spv_dir + "/fixed-attention.txt");
     std::printf("Swin position bias storage: %s; FP32 logit addition\n", swin_bias_storage.c_str());
     const uint32_t repeats = uint32_t(std::atoi(arg(argc, argv, "--repeats", "1")));
     const uint32_t warm = uint32_t(std::atoi(arg(argc, argv, "--warmup", "0")));
@@ -1966,6 +1996,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     for (const auto& kv : vsize) if (kv.second) plain_total += align(kv.second, 256);
     if (reuse) {
         NrSession probe;
+        probe.ctx.rdna3 = ctx.rdna3;
         probe.arena_probe = true;
         const nr::LogSink sink = nr::g_log_sink;
         const uint32_t epoch_word = g_chain_epoch_word;
@@ -2060,11 +2091,11 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     // `windows/build/build_network.py` from the same table that produces the
     // `-D`s, and a directory without it is refused rather than guessed at.
     uint32_t qkv_fused_norm = 0, ups_fused_mode = 0, wide_ups_fused_mode = 0;
-    uint32_t weight_layout = 0;
+    uint32_t weight_layout = 0, kswap = 0;
     math_profile = 0;
     {
         const std::string path = spv_dir + "/shader-constants.txt";
-        std::ifstream f(path);
+        std::ifstream f(nr::u8::path(path));
         if (!f) {
             std::fprintf(stderr, "missing %s; the SPVs and this binary cannot be "
                          "checked against each other. Run windows/build/build_network.py\n",
@@ -2147,6 +2178,14 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         if (!built.count("ffwd_fm2_min")) built["ffwd_fm2_min"] = 0;
         if (!built.count("post_alpha")) built["post_alpha"] = 0;
         if (!built.count("tchain")) built["tchain"] = 0;
+        // `kswap` (RDNA3, NR_OP_KSWAP in fswin_t.comp): the fused Swin kernels build operands from
+        // accumulators with every k pair swapped in the upper lane half, and the weight tiles they
+        // multiply those operands by have to be stored the same way; see the repack below.
+        if (!built.count("kswap")) built["kswap"] = 0;
+        if (built.at("kswap") && !ctx.rdna3) {
+            std::fprintf(stderr, "kswap shaders need the RDNA3 host\n"); return 1;
+        }
+        kswap = built.at("kswap");
         if (!built.count("ffwd_gmajor")) built["ffwd_gmajor"] = 0;
         if (!built.count("gemm_remap")) built["gemm_remap"] = 0;
         for (const auto& [name, mine] : want) {
@@ -2208,7 +2247,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         const Step& s = *ps;
         const Shape sh = shape_of(s);
         Disp d{&s};
-        char base[256];
+        char base[1024];   // (UTF-8 paths: 3 bytes a CJK letter)
         if (sh.fam == F_FSWIN || sh.fam == F_DS || sh.fam == F_UPS) {
             const bool pre = s.type == "CCTinlayoutFusedPreBlockSwin1H";
             const bool post = s.type == "CCTinlayoutFusedPostBlockSwin1H";
@@ -2350,6 +2389,14 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                 g_audit_bias = (math_profile == 2 || math_profile == 3) ? bias : std::vector<float>();
                 // Recovered position bias is already FP16. Widen only when
                 // adding it to FP32 logits; no new numerical rounding.
+                if (fixed_attention && !swin_bias_f16 && heads == 1 && C == 32) {
+                    // the fixed probability table right after the bias: [query][key] = e4m3(f16(baked bias)), the
+                    // trained probabilities (attn_pos_bias.bin carries them as bias = (P - 1.30078125) / 0.044921875)
+                    std::vector<uint8_t> blob(bias.size() * 4 + 4096);
+                    std::memcpy(blob.data(), bias.data(), bias.size() * 4);
+                    for (size_t i = 0; i < 4096; ++i) blob[bias.size() * 4 + i] = tin::f_to_e4m3(tin::round_f16(bias[i]));
+                    p.b_off = uint32_t(put(blob, 16) / 4);
+                } else
                 p.b_off = swin_bias_f16 ? uint32_t(put_f16(bias) / 2)
                                        : uint32_t(put_f32(bias) / 4);
             }
@@ -3560,7 +3607,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                 }
             }
             if (s.type == "CCVit1DQKV") {
-                char record_path[256];
+                char record_path[1024];
                 std::snprintf(record_path, sizeof record_path,
                               "%s/inventory/weights/block%d.layer%d.layer.bin",
                               unp.c_str(), s.block, s.layer);
@@ -3867,7 +3914,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             p.o_off=uint32_t(voff[pool_key(s.block)]/2); // FP16 element offset
             d.kern="gemmvqkv";
             std::memcpy(d.push.data(),&p,sizeof p);
-            char record_path[256];
+            char record_path[1024];
             std::snprintf(record_path,sizeof record_path,"%s/inventory/weights/block%d.layer%d.layer.bin",
                           unp.c_str(),s.block,s.layer);
             const auto rec=slurp(record_path);
@@ -3991,7 +4038,8 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     if (weight_layout != 0) {
         size_t packed_count=0;
         std::set<uint32_t> binary_packed_attn;
-        auto pack_matrix=[&](uint32_t offset,size_t N,size_t K) {
+        std::set<uint32_t> kswapped; size_t kswap_count=0;
+        auto pack_matrix=[&](uint32_t offset,size_t N,size_t K,bool plain_tiles=false) {
             const size_t bytes=N*K;
             if(N%32 || K%16 || size_t(offset)+bytes>wblob.size())
                 throw std::runtime_error("packed weight matrix bounds");
@@ -4000,7 +4048,9 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             for(size_t n=0;n<N/16;n+=2) for(size_t k=0;k<K/16;++k)
                 for(size_t lane=0;lane<32;++lane) for(size_t j=0;j<2;++j) for(size_t c=0;c<8;++c) {
                     const size_t src=((n+j)*(K/16)+k)*256+(lane%16)*16+(lane/16)*8+c;
-                    const size_t dst=((n/2)*(K/16)+k)*512+lane*16+j*8+c;
+                    const size_t dst=plain_tiles
+                        ? ((n/2)*(K/16)+k)*512+j*256+(lane%16)*16+(lane/16)*8+c
+                        : ((n/2)*(K/16)+k)*512+lane*16+j*8+c;
                     packed[dst]=orig[src];
                 }
             wblob.write(offset, packed.data(), bytes); ++packed_count;
@@ -4023,9 +4073,9 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                 PushFfwd3 p{};
                 if(pd.push.size()!=sizeof p) throw std::runtime_error("packed FFWD push mismatch");
                 std::memcpy(&p,pd.push.data(),sizeof p);
-                pack_matrix(p.a_off,FF_GROUPS*FF_R,FF_K);
-                pack_matrix(p.q0_off,FF_GROUPS*FF_J,FF_R);
-                pack_matrix(p.q2_off,FF_GROUPS*FF_OUT,FF_J);
+                pack_matrix(p.a_off,FF_GROUPS*FF_R,FF_K,ctx.rdna3);
+                pack_matrix(p.q0_off,FF_GROUPS*FF_J,FF_R,ctx.rdna3);
+                pack_matrix(p.q2_off,FF_GROUPS*FF_OUT,FF_J,ctx.rdna3);
                 continue;
             }
 #if NR_INT4
@@ -4046,6 +4096,51 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                 continue;
             }
             uint32_t C=0;
+            // RDNA3: the fused Swin kernels read plain tile-blocked [row][k] tiles. With `kswap`
+            // (NR_OP_KSWAP in fswin_t.comp, measured in linux/test/wmma_half_probe) the WMMA computes
+            // the odd rows of a 16x16 tile from the upper lane half, whose register-built operands
+            // hold every k pair swapped, so the odd rows of the weight tiles that multiply such an
+            // operand are stored with their k pairs swapped too. Which tiles those are is a property
+            // of each kernel: a tile against an operand loaded from LDS or the arena stays plain.
+            // The swap is a permutation of the tile's bytes; the products are the same products.
+            if(ctx.rdna3 && pd.kern.rfind("fswin",0)==0) {
+                if(!kswap) continue;
+                PushFSwin p{};
+                if(pd.push.size()<sizeof p) throw std::runtime_error("kswap: Swin push mismatch");
+                std::memcpy(&p,pd.push.data(),sizeof p);
+                auto swap_odd_rows=[&](uint32_t offset,size_t rows,size_t K) {
+                    if(!kswapped.insert(offset).second) return;   // the same tile from two dispatches
+                    const size_t bytes=rows*K;
+                    if(rows%16 || K%16 || size_t(offset)+bytes>wblob.size())
+                        throw std::runtime_error("kswap: weight matrix bounds");
+                    std::vector<uint8_t> t(bytes);
+                    wblob.read(offset, t.data(), bytes);
+                    for(size_t tile=0;tile<bytes/256;++tile)
+                        for(size_t r=1;r<16;r+=2) for(size_t k=0;k<16;k+=2)
+                            std::swap(t[tile*256+r*16+k],t[tile*256+r*16+k+1]);
+                    wblob.write(offset, t.data(), bytes);
+                    ++kswap_count;
+                };
+                const std::string& k=pd.kern;
+                if(k.size()>=2 && k.compare(k.size()-2,2,"32")==0) {
+                    if(k=="fswinimagepreds32" || k=="fswinimagepost32" || k=="fswinfusedup32")
+                        swap_odd_rows(p.e_off,128,32);
+                    else if(k!="fswin32" && k!="fswinds32" && k!="fswindsp32")
+                        throw std::runtime_error("kswap: unknown C=32 Swin kernel "+k);
+                    swap_odd_rows(p.ct_off,32,128);
+                    swap_odd_rows(p.qkv_off,64,32);
+                    swap_odd_rows(p.op_off,32,32);
+                } else {
+                    for(uint32_t c:{64u,128u,256u}) {
+                        const std::string suffix=std::to_string(c);
+                        if(k.size()>=suffix.size() && k.compare(k.size()-suffix.size(),suffix.size(),suffix)==0) C=c;
+                    }
+                    if(!C) throw std::runtime_error("kswap: unknown Swin kernel "+k);
+                    swap_odd_rows(p.mid_off,C,128);
+                    C=0;
+                }
+                continue;
+            }
             if((weight_layout==3 || weight_layout==5) && pd.kern.rfind("fswin",0)==0 &&
                pd.kern.size()>=2 && pd.kern.substr(pd.kern.size()-2)=="32") {
                 PushFSwin p{};
@@ -4075,6 +4170,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             pack_matrix(p.op_off,C,C);
         }
         std::printf("N-pair FP8 weight layout: %zu matrices\n",packed_count);
+        if(kswap) nr::logf("k-pair swap (kswap): odd rows of %zu Swin weight matrices",kswap_count);   // (in the log: RDNA3 reports)
     }
 
     //
@@ -4091,8 +4187,11 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     // Off for every flag that reasons per step: they dispatch, seed or time
     // individual layers and a merged run has no individual layers left.
     {
-        const bool asked_off = flag(argc, argv, "--no-persist") ||
-            (std::getenv("NR_NO_PERSIST") && *std::getenv("NR_NO_PERSIST"));
+        // Persistent Swin workgroup loops on RDNA3 have spin/barrier deadlock issues at resolutions >= 1080p
+        // causing GPU TDR (display resets). On RDNA3 default to off (opt-in with NR_PERSIST=1); on RDNA4 default to on.
+        const bool asked_off = ctx.rdna3
+            ? (!(std::getenv("NR_PERSIST") && *std::getenv("NR_PERSIST") == '1') || flag(argc, argv, "--no-persist"))
+            : (flag(argc, argv, "--no-persist") || (std::getenv("NR_NO_PERSIST") && *std::getenv("NR_NO_PERSIST")));
         const char* per_step_flags[] = {"--only", "--seed-dir", "--no-barrier-after",
                                         "--barrier-stride"};
         bool per_step = flag(argc, argv, "--oracle") || flag(argc, argv, "--no-barrier") ||
@@ -4438,7 +4537,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         // read inside such a stretch stays reserved to the stretch's end (the next
         // real barrier); otherwise a later dispatch of the stretch could overwrite
         // what a still-running earlier one reads.
-        if (tchain_active()) {
+        if (tchain_active(ctx.rdna3)) {
             std::vector<int> stretch_end(size_t(nd) + 1);
             for (int f = nd; f >= 0; --f)
                 stretch_end[size_t(f)] = (f + 1 < nd && tchain_pair(disp[size_t(f)].kern, disp[size_t(f) + 1].kern))
@@ -4567,7 +4666,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     g_tc_err.clear();
     tc_expect.clear(); tc_pair.clear(); tc_err.clear(); tc_base = 0; tc_words = 0;
     if (NR_TCHAIN_TILES) {
-        const bool on = tchain_active();
+        const bool on = tchain_active(ctx.rdna3);
         act_total = align(act_total, 256);
         g_tc_base = act_total / 4;
         // The frame counter: ticked by the frame's first fswin32 (a real barrier
@@ -4837,16 +4936,34 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         act_shared = given_act && given_act->device == ctx.device && given_act->cap >= act_bytes;
         if (act_shared) {
             arenas->act = given_act;
+            if (ctx.rdna3 && !given_act->twin.handle) {
+                given_act->twin = ctx.buffer(VkDeviceSize(given_act->cap) * 2);
+            }
             nr::logf("activation arena: taken over from another network (%.1f MB, this one needs %.1f MB)",
                      double(given_act->cap) / 1e6, double(act_bytes) / 1e6);
         } else {
             const size_t room = size_t(double(act_bytes) * std::max(1.0, act_slack) + 255) / 256 * 256;
             auto a = std::make_shared<GraphAct>();
-            a->device = ctx.device; a->buf = ctx.buffer(room, false, /*device_address=*/true); a->cap = room;
+            {
+                nr::vram::Scope kind(nr::vram::kActivations);
+                a->device = ctx.device; a->buf = ctx.buffer(room, false, /*device_address=*/true); a->cap = room;
+                if (ctx.rdna3) a->twin = ctx.buffer(VkDeviceSize(room) * 2);
+            }
             arenas->act = std::move(a);
         }
         arenas->act_need = act_bytes;
-        act = arenas->act->buf; wgt = ctx.buffer(std::max(wgt_bytes, wblob.size()));
+        {
+            nr::vram::Scope kind(nr::vram::kWeights);
+            act = arenas->act->buf; wgt = ctx.buffer(std::max(wgt_bytes, wblob.size()));
+            if (ctx.rdna3) {
+                act_e = arenas->act->twin;
+                arenas->wgt_e = ctx.buffer(VkDeviceSize(std::max(wgt_bytes, wblob.size())) * 2);
+                wgt_e = arenas->wgt_e;
+                ctx.fp16_twin[act.handle] = act_e.handle; ctx.fp16_twin[wgt.handle] = wgt_e.handle;
+                nr::logf("fp16 twins for e4m3 data: activation %.1f MB, weights %.1f MB",
+                         double(act_bytes) * 2 / 1e6, double(wblob.size()) * 2 / 1e6);
+            }
+        }
         // vit_attn.comp NR_VBDA reads V through a buffer_reference: the arena's address goes into
         // every vitattn push block (PushVAttn::act_lo/act_hi).
         nr::logf("[nr] activation arena through its device address: %s",
@@ -4913,6 +5030,19 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         ctx.upload_with(wgt, 0, wblob.size(), [&](VkDeviceSize off, VkDeviceSize n, uint8_t* dst) {
             wblob.read(size_t(off), dst, size_t(n));
         });
+        if (ctx.rdna3) {
+            // Every byte read as an e4m3 code. Regions that hold f16/f32/u32 data decode to
+            // garbage here, and nothing reads them through an e4m3 view.
+            std::array<uint16_t, 256> to_f16{};
+            for (int i = 0; i < 256; ++i) to_f16[size_t(i)] = tin::f_to_f16(tin::e4m3_to_f(uint8_t(i)));
+            std::vector<uint8_t> codes(size_t(nrvk::Context::kStageBytes / 2));
+            ctx.upload_with(wgt_e, 0, VkDeviceSize(wblob.size()) * 2, [&](VkDeviceSize off, VkDeviceSize n, uint8_t* dst) {
+                const size_t count = size_t(n / 2);
+                wblob.read(size_t(off / 2), codes.data(), count);
+                uint16_t* out = reinterpret_cast<uint16_t*>(dst);
+                for (size_t i = 0; i < count; ++i) out[i] = to_f16[codes[i]];
+            });
+        }
         // The extent tail is kept for the resize path (GraphCore::tail); the rest of the host copy is not needed
         // again: free it before the runtime allocates.
         keep_tail(wblob);
@@ -5021,6 +5151,15 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             }
         if (n) std::printf("exp upper clamp dead (weights): %d C=32 dispatches\n", n);
     }
+    // CC_SMALL_FP8_EXPERIMENTAL: the decoder's plain C=32 layers (after the ViT) on their own pipeline when the network
+    // has it, so they can differ from the encoder's layers of the same kernel (fixed attention on the decoder's only).
+    {
+        int n = 0;
+        for (Disp& d : disp)
+            if (d.s && d.s->block >= 22 && d.kern == "fswin32nh" && std::filesystem::exists(spv_dir + "/g_fswin32nhd.spv")) {
+                d.kern = "fswin32nhd"; ++n; }
+        if (n) std::printf("decoder C=32 pipeline: %d dispatches\n", n);
+    }
 #if NR_INT4
     // NR_HS_ROUTE=b+b+...: C=32 dispatches of these blocks take the "<kern>p" pipeline (built with the
     // hard-swish) when it exists, so encoder and decoder layers that share a kernel can differ.
@@ -5042,7 +5181,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         const std::string hm = spv_dir + "/hs-pipelines.txt";
         if (std::filesystem::exists(hm)) {
             std::set<std::string> hs;
-            { std::ifstream f(hm); std::string k; while (f >> k) hs.insert(k); }
+            { std::ifstream f(nr::u8::path(hm)); std::string k; while (f >> k) hs.insert(k); }
             std::string bad;
             for (const Disp& d : disp) {
                 if (d.kern.rfind("fswin", 0) != 0) continue;
@@ -5213,6 +5352,9 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     // is exactly zero". Fill now, disarm, and every later submit keeps what the
     // seeder put there.
     runner.zero_buffer = act.handle;
+    if (ctx.rdna3) {
+        runner.zero_twin = act_e.handle; runner.zero_twin_bytes = VkDeviceSize(act_total) * 2;
+    }
     runner.zero_bytes = VkDeviceSize(act_total);
     // **What arena reuse has to keep zero** (diagnostics, off unless asked for,
     // one-value-one-slot layout). NR_ARENA_UNWRITTEN=1 fills the values with a
@@ -5276,6 +5418,8 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     if (!act_shared) runner.run_graph({}, 1);
     runner.poison.clear();
     runner.zero_buffer = VK_NULL_HANDLE;
+    runner.zero_twin = VK_NULL_HANDLE;
+    runner.zero_twin_bytes = 0;
     runner.zero_bytes = 0;
     // Diagnostic NR_DUP=k1,k2: run those kernels twice back to back (idempotent
     // layers only), so the second copy shows the kernel with warm caches.
@@ -5373,7 +5517,11 @@ void NrSession::retarget(VkCommandBuffer cmd) {
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr,
                          0, nullptr);
     // The arena as a build leaves it (zero), the tail as it uploads it, the noise fields as it fills them.
-    if (zero) vkCmdFillBuffer(cmd, act.handle, 0, (VkDeviceSize(c.act_total) + 3) / 4 * 4, 0);
+    if (zero) {
+        vkCmdFillBuffer(cmd, act.handle, 0, (VkDeviceSize(c.act_total) + 3) / 4 * 4, 0);
+        if (ctx.rdna3 && act_e.handle)
+            vkCmdFillBuffer(cmd, act_e.handle, 0, ((VkDeviceSize(c.act_total) * 2) + 3) / 4 * 4, 0);
+    }
     if (tail && c.staging && c.staging->buf.handle) {
         std::vector<VkBufferCopy> r = c.staging->ranges;
         for (VkBufferCopy& x : r) { std::swap(x.srcOffset, x.dstOffset); x.dstOffset += c.weights_end; }
@@ -5457,7 +5605,7 @@ void NrSession::create_kernels(const std::string& spv_dir, const std::set<std::s
         // storage-buffer build of the same kernel, g_<name>nobda.spv.
         if (!act.address) {
             const std::string plain = spv_dir + "/g_" + d.kern + "nobda.spv";
-            if (std::ifstream(plain).good()) p = plain;
+            if (std::ifstream(nr::u8::path(plain)).good()) p = plain;
         }
         if (d.kern.rfind("fswindsp",0)==0)
             kern[d.kern].create(ctx,p,{act.handle,act.handle,wgt.handle,wgt.handle,wgt.handle,act.handle},
@@ -5531,8 +5679,7 @@ int NrSession::build_shared(int argc, char** argv) {
     const uint32_t sw = uint32_t(std::atoi(arg(argc, argv, "--source-width", "0")));
     const uint32_t sh = uint32_t(std::atoi(arg(argc, argv, "--source-height", "0")));
     // The directory build() reads: ACO Mode's bundle when it is on, the round-fp16 builds below it.
-    std::string spv_dir = arg(argc, argv, "--spv-dir", "build");
-    if (!nr::binary::directory().empty()) spv_dir = nr::binary::directory() + "/shaders";
+    std::string spv_dir = network_spv_dir(argc, argv);
     if (std::string(arg(argc, argv, "--accumulation", "fp32")) == "round-fp16") spv_dir += "/round-fp16";
     if (!sw || !sh || sh > c.source_h || spv_dir != c.spv_dir)
         throw std::runtime_error("shared network: not this source extent's");
@@ -5549,6 +5696,10 @@ int NrSession::build_shared(int argc, char** argv) {
     persist_err = c.persist_err;
     tc_base = c.tc_base; tc_words = c.tc_words; tc_err = c.tc_err; tc_expect = c.tc_expect; tc_pair = c.tc_pair;
     arenas = slot; act = arenas->act->buf; wgt = arenas->wgt;
+    if (ctx.rdna3) {
+        act_e = arenas->act->twin; wgt_e = arenas->wgt_e;
+        ctx.fp16_twin[act.handle] = act_e.handle; ctx.fp16_twin[wgt.handle] = wgt_e.handle;
+    }
     put_act_address(disp, act.address);   // the slot's arena, which need not be the one the core was built in
     core = share;
     ctx.pin = &arenas->pipelines;
@@ -5646,7 +5797,7 @@ int main(int argc, char** argv) try {
                     100.0 * double(nz) / double(px.size()),
                     std::sqrt(s2 / double(px.size())), lo, hi);
         if (const char* op = arg(argc, argv, "--out-image")) {
-            FILE* f = std::fopen(op, "wb");
+            FILE* f = nr::u8::fopen(op, "wb");
             if (!f) throw std::runtime_error(std::string("cannot open output image: ") + op);
             const size_t written = std::fwrite(px.data(), sizeof(float), px.size(), f);
             const int closed = std::fclose(f);
@@ -5669,7 +5820,7 @@ int main(int argc, char** argv) try {
         std::vector<uint8_t> bytes(end - it->second);
         ctx.download(act, VkDeviceSize(it->second), bytes.data(), bytes.size());
         const char* to = arg(argc, argv, "--dump-layer-to", "layer.bin");
-        FILE* f = std::fopen(to, "wb");
+        FILE* f = nr::u8::fopen(to, "wb");
         if (!f || std::fwrite(bytes.data(), 1, bytes.size(), f) != bytes.size())
             throw std::runtime_error(std::string("cannot write ") + to);
         std::fclose(f);
@@ -5687,7 +5838,7 @@ int main(int argc, char** argv) try {
             std::snprintf(l, sizeof l, "b%03dl%d %s", s.block, s.layer, s.type.c_str());
             label[key_of(s.block, s.layer)] = l;
         }
-        FILE* index = std::fopen((std::string(dir) + "/index.txt").c_str(), "w");
+        FILE* index = nr::u8::fopen((std::string(dir) + "/index.txt").c_str(), "w");
         size_t total = 0;
         for (size_t i = 0; i < order.size(); ++i) {
             if (index) std::fprintf(index, "%03zu-k%d %s\n", i, order[i].second,
@@ -5698,7 +5849,7 @@ int main(int argc, char** argv) try {
             ctx.download(act, VkDeviceSize(order[i].first), bytes.data(), bytes.size());
             char name[64];
             std::snprintf(name, sizeof name, "/%03zu-k%d.bin", i, order[i].second);
-            FILE* f = std::fopen((std::string(dir) + name).c_str(), "wb");
+            FILE* f = nr::u8::fopen((std::string(dir) + name).c_str(), "wb");
             if (!f || std::fwrite(bytes.data(), 1, bytes.size(), f) != bytes.size())
                 throw std::runtime_error(std::string("cannot write ") + dir + name);
             std::fclose(f);
@@ -5720,7 +5871,7 @@ int main(int argc, char** argv) try {
             for (const Step* r : run)
                 if (r->block == ds_only && shape_of(*r).fam == F_DS) dss = r;
             if (!dss) { std::fprintf(stderr, "block %d is not a _ds layer\n", ds_only); return 1; }
-            char cap[256];
+            char cap[1024];
             std::snprintf(cap, sizeof cap, host_boundary ? "%s/b%03dl%d_o1.bin" : "%s/b%03dl%d_skip.bin",
                           score_dir, dss->block, dss->layer);
             const std::vector<uint8_t> sk = slurp(cap);
@@ -5922,7 +6073,7 @@ int main(int argc, char** argv) try {
                 const Step& s2 = *d.s;
                 if (d.kern.rfind("imgin", 0) == 0 || d.kern.rfind("pool", 0) == 0 || d.kern.rfind("upsblend", 0) == 0 ||
                 d.kern == "upsview" || d.kern == "decups" || d.kern == "repack" || d.kern == "qkvnorm" || d.kern == "gemmds" || d.kern == "gemmups" || d.kern == "gemmups16") continue;
-                char cap[256];
+                char cap[1024];
                 std::snprintf(cap, sizeof cap, "%s/b%03dl%d.bin", seed_dir, s2.block, s2.layer);
                 const std::vector<uint8_t> ref = slurp(cap);
                 if (ref.empty()) {
@@ -5941,7 +6092,7 @@ int main(int argc, char** argv) try {
                 }
                 if (host_boundary && (s2.type == "CCSplitSwin16HProjPool" ||
                                       (s2.block == vit_first && s2.layer == 0))) {
-                    char sidepath[256];
+                    char sidepath[1024];
                     std::snprintf(sidepath, sizeof sidepath, "%s/b%03dl%d_o1.bin",
                                   seed_dir, s2.block, s2.layer);
                     const auto side = slurp(sidepath);
@@ -6519,7 +6670,7 @@ int main(int argc, char** argv) try {
                         std::memcpy(canon.data() + (t*C+c)*elem_bytes,
                                     got.data() + src*elem_bytes, elem_bytes);
                     }
-                FILE* f = std::fopen(dump_to, "wb");
+                FILE* f = nr::u8::fopen(dump_to, "wb");
                 if (f) {
                     std::fwrite(canon.data(), 1, canon.size(), f);
                     std::fclose(f);
@@ -6547,7 +6698,7 @@ int main(int argc, char** argv) try {
                 d.kern == "upsview" || d.kern == "decups" || d.kern == "repack" || d.kern == "qkvnorm" || d.kern == "gemmds" || d.kern == "gemmups" || d.kern == "gemmups16") continue;
             if (!oracle && (only_b >= 0 ? !(s2.block == only_b && s2.layer == only_l)
                                         : s2.block < seed_step->block)) continue;
-            char cap[256];
+            char cap[1024];
             std::snprintf(cap, sizeof cap, "%s/b%03dl%d.bin",
                           score_dir, s2.block, s2.layer);
             const std::vector<uint8_t> ref = slurp(cap);
@@ -6907,7 +7058,7 @@ int main(int argc, char** argv) try {
         return 0;
     }
     nrvk::Telemetry tel;
-    tel.dir = nrvk::Telemetry::find(0x1002, 0x7550);
+    tel.dir = nrvk::Telemetry::find(ctx.gpu_vendor_id, ctx.gpu_device_id);
     // `--per-layer` times every dispatch inside the real frame, rather than
     // modelling the frame as "each family's kernel, run alone, times its layer
     // count" the way a per-family frame model does. The two disagree wherever the
@@ -6933,12 +7084,12 @@ int main(int argc, char** argv) try {
         runner.run_graph(steps, pf);
         ctx.download(act, VkDeviceSize(prof_off) * 4, pz.data(), pz.size() * 4);
         const char* po = std::getenv("NR_PROF_OUT") ? std::getenv("NR_PROF_OUT") : "prof.bin";
-        FILE* f = std::fopen(po, "wb");
+        FILE* f = nr::u8::fopen(po, "wb");
         if (f) { std::fwrite(pz.data(), 4, pz.size(), f); std::fclose(f); }
         std::printf("NR_PROF: %u records -> %s\n", pz[0], po);
     }
     if (const char* path=arg(argc,argv,"--telemetry-csv")) {
-        std::ofstream trace(path);
+        std::ofstream trace(nr::u8::path(path));
         if(!trace)throw std::runtime_error("cannot open telemetry CSV");
         trace << "elapsed_ms,phase,gfx_mhz,power_w,edge_c\n";
         for(size_t i=0;i<tel.elapsed.size();++i)

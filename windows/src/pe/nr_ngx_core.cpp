@@ -42,6 +42,7 @@
 #include <windows.h>
 #include <d3d12.h>
 
+#include "nr_path_win.hpp"
 #include "nr_dlssnr_model.hpp"
 #include "nr_ngx_abi.hpp"
 #include "nr_pe_config.hpp"
@@ -1159,8 +1160,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
 #define NR_BUILD_STAMP "unstamped"
 #endif
         // Under its own file name: the packages ship it as dlssnr_core.dll (never NVIDIA's _nvngx.dll).
-        char path[MAX_PATH] = {};
-        const DWORD n = GetModuleFileNameA(module, path, MAX_PATH);
+        char path[MAX_PATH * 4] = {};
+        const DWORD n = nr::u8::module_file(module, path, sizeof path);
         const char* name = n ? path : "NGX core";
         for (const char* c = path; n && *c; ++c)
             if (*c == '\\' || *c == '/') name = c + 1;

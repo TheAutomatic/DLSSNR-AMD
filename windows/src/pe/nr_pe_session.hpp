@@ -18,6 +18,7 @@
 #include "nr_pe_interop.hpp"
 #include "nr_runtime.hpp"
 #include "nr_renodx.hpp"
+#include "nr_wilsjo2.hpp"
 #include "nr_ini_network.hpp"
 #include <cmath>
 #include <cstdio>
@@ -33,25 +34,31 @@ class Session {
     // to be configured through the environment.
     explicit Session(std::string root);
     ~Session();
+    // The run's "session: N evaluations ran the network, M passed the frame through" line (once; the destructor
+    // writes it otherwise). For a session left undestroyed at process exit.
+    void log_totals();
 
     // The post block's history strength, 0..1; see Config::history. Applies to
     // the running network at once and to any network built later.
     void set_history_strength(float);
-    // The white point for linear-light colour buffers; see Config::white_point.
-    void set_white_point(float);
-    // Model Resolution, 0.25..1: the network's extent as a fraction of the
-    // frame's. Changing it rebuilds the network in the background.
-    // The pass ceiling a network is built for. Below what shipped is ignored,
-    // so 1..4 never rebuilds; above it the next frame rebuilds.
-    void set_max_passes(uint32_t);
-    void set_model_scale(float);
-    // The DLL's own composition only (RuntimeConfig::native_compose): the host
-    // does its resolve after us. Set before the first frame; the OptiScaler
-    // route sets it, the legacy module does not.
-    void set_native_compose(bool);
+    // The .asi's NR chain: the network the next calls want (nr::NetworkChoice; -1: [Network] Model, the default), for a
+    // layer with a Network of its own. One this run cannot serve falls back to [Network] Model (logged once).
+    void set_call_network(int network);
+    // The NR-chain layer this call runs (0 outside a chain): its cost (gpu_ms, network_ms) is averaged apart from other
+    // layers'.
+    void set_call_layer(int layer);
+    // A layer whose processing, placement or network changed (or that was taken out): its cost averages start anew, and
+    // a timestamp still in flight from before is not counted (a measurement generation per layer).
+    void reset_layer_timing(int layer);
     // RuntimeConfig::motion_point: the game's motion vectors point-sampled as NVIDIA's DLL does. Set before the first
     // frame; the NGX (OptiScaler) route sets it.
     void set_motion_point(bool);
+    // The caller's D3D12 command-list state kept across our recording (the .asi route, nr_asi_main.cpp): the
+    // network goes in through vkd3d-proton's interop begin/end (begin_interop_recording), after which vkd3d
+    // re-emits the list's own bindings, instead of the nulled compute pipeline state and root signature and the
+    // invalidating clear the other routes leave behind - those are state the game and OptiScaler's root-signature
+    // restore see. Set before the first frame; where vkd3d-proton cannot, the old way (said once in the log).
+    void set_keep_caller_state(bool);
 
     // Run the network on `colour` and return the resource to hand the upscaler
     // in its place. Returns null when the pass could not run, in which case the
@@ -67,6 +74,19 @@ class Session {
     // A rectangle of a guide texture that actually holds this frame's data.
     struct Subrect {
         uint32_t x{}, y{}, width{}, height{};
+    };
+
+    // A wilsjo2 layer of the ReShade route: the flow the .asi runs (nr_wilsjo2_flow.hpp) around the network, which runs
+    // network-only here (as for RenoDX). `hdr`: the frame is linear light (scRGB, a decoded HDR10 frame); the white point
+    // is the layer's WhitePointScale (this route has no game exposure). `estimate_motion`: without vectors, the
+    // estimator's (the D3D11 Present fallback).
+    struct Wilsjo2Frame {
+        const nr::wilsjo2::Settings* settings{};
+        bool hdr{};
+        Preprocess preprocess{};
+        bool estimate_motion{};
+        // the motion vectors come from a provider that runs (a bound texture whose provider is off is not one)
+        bool fast_motion = true;
     };
 
     struct EngineResources {
@@ -102,6 +122,8 @@ class Session {
         // ever reaches a model, so its path sets this; other callers leave it
         // false and keep judging by format alone.
         bool colour_encoded{};
+        // A wilsjo2 layer (run_after on the ReShade route): its flow on the output, in place.
+        const Wilsjo2Frame* wilsjo2{};
     };
 
     ID3D12Resource* run(ID3D12Device* device, ID3D12GraphicsCommandList* list,
@@ -129,6 +151,7 @@ class Session {
     // builds or when the frame cannot be taken (the caller then copies the input over, which OptiScaler
     // outputs as it is).
     struct RenoDXFrame {
+        bool fast_motion_available = true;
         bool hdr_flag = false;        // the game's colour is HDR (OptiScaler's own judgement)
         bool after_upscale = true;    // NR runs on the upscaler's output
         renodx::Settings settings{};
@@ -151,6 +174,9 @@ class Session {
         // whether this frame carries no NR from an inline evaluate - the final picture a screenshot may take.
         bool finished = false;
         bool clean = true;
+        // A route with no Present capture of its own (the .asi's Vulkan and D3D11 games): the NR screenshot's final
+        // picture is the frame where NR runs, named by this (else null).
+        const char* capture_at = nullptr;
     };
     bool run_renodx(ID3D12Device* device, ID3D12GraphicsCommandList* list,
                     ID3D12Resource* output, D3D12_RESOURCE_STATES output_state,
@@ -182,8 +208,86 @@ class Session {
         bool linear_hdr{};   // as D3D11Frame::linear_hdr
         // [RenoDX] Enabled at start (D3D11Frame::renodx).
         const RenoDXFrame* renodx{};
+        const Wilsjo2Frame* wilsjo2{};   // as D3D11Frame::wilsjo2
+        uint64_t feature{};              // as D3D11Frame::feature
     };
     bool run_d3d12_queue(const D3D12QueueFrame& frame, const Controls& controls);
+
+    // Raw Vulkan commands of a caller's own (the .asi's wilsjo2 style, nr_asi_wilsjo2.cpp) recorded into the game's
+    // command list as the network's are: through the same recording (set_keep_caller_state), between full memory
+    // barriers, the list left as the network leaves it. `lookup` gives a D3D12 resource's Vulkan image in a state
+    // (`colour`: by colour_handle, the frame formats; else resource_handle, a typeless single-channel or RGBA family
+    // read as its float format); an image it cannot give comes back with format VK_FORMAT_UNDEFINED. The recorder's
+    // answer is returned; false without recording anything when the game's Vulkan device or command buffer cannot be
+    // had. Nothing of the network is touched.
+    struct RawImage {
+        VkImage image{};
+        VkFormat format{VK_FORMAT_UNDEFINED};
+        uint32_t width{}, height{};
+        VkImageLayout layout{VK_IMAGE_LAYOUT_UNDEFINED};
+        VkImageUsageFlags usage{};   // where known (bridge12_twin)
+    };
+    using RawLookup = std::function<RawImage(ID3D12Resource*, D3D12_RESOURCE_STATES, bool colour)>;
+    using RawRecorder = std::function<bool(VkCommandBuffer, const HostDevice&, const RawLookup&)>;
+    bool record_raw(ID3D12Device* device, ID3D12GraphicsCommandList* list, const RawRecorder& recorder);
+    // The same on a Vulkan game's own command buffer (the .asi's wilsjo2 style on Vulkan games): `cmd` is the game's,
+    // recording; the caller has its images (no lookup). Between full memory barriers; false without recording anything
+    // before the session has the game's device (set_vulkan_queue).
+    using RawRecorderVk = std::function<bool(VkCommandBuffer, const HostDevice&)>;
+    bool record_raw_vk(VkCommandBuffer cmd, const RawRecorderVk& recorder);
+    // The same for a D3D11 / D3D10 game through DXVK (the ReShade route's HUD FIX): a command buffer of a ring of ours,
+    // submitted on DXVK's queue after what the game's context has recorded so far (as run_d3d11, without waiting for
+    // the last one); `lookup` gives a D3D11 texture's Vulkan image in the layout DXVK keeps it in. False without
+    // recording anything before run_d3d11 has the device (or when the ring's slot is still on the GPU after 2 s).
+    using RawLookup11 = std::function<RawImage(IUnknown* texture)>;
+    using RawRecorder11 = std::function<bool(VkCommandBuffer, const HostDevice&, const RawLookup11&)>;
+    bool record_raw_d3d11(IUnknown* device, const RawRecorder11& recorder);
+    // The bridge's D3D11 / D3D10 recordings for a caller with Vulkan work of its own on this session's device (the
+    // .asi's D3D11 route on the native runtime, whose Vulkan session runs on the bridge's device): bridge11_begin gives
+    // the recording's command buffer (null: not now, status() says why), bridge11_image a texture's twin in it (copied
+    // in right before the work runs, after everything the immediate context was given until then; copied back after
+    // the work when `write`), bridge11_submit runs it (false: it did not run, the textures are as they were; `done`
+    // answers once the work has finished or will never run), bridge11_abandon gives it up.
+    VkCommandBuffer bridge11_begin(IUnknown* device);
+    // A texture's twin as it will be used (made now if needed; its content only in a recording that uses it).
+    RawImage bridge11_twin(IUnknown* device, IUnknown* texture);
+    RawImage bridge11_image(IUnknown* texture, bool write);
+    bool bridge11_submit(std::function<bool()>* done);
+    void bridge11_abandon();
+    // The same on a D3D12 command list (the .asi's wilsjo2 style on the native runtime: its whole flow and its model
+    // calls in one recording, as on D3D11, instead of a cut and a copy of every image at each of its steps):
+    // bridge12_begin gives the recording's command buffer (null: not now, status() says why), bridge12_twin a
+    // resource's twin (copied in now, before the cut; copied back after the work when `state` is a write state),
+    // bridge12_end cuts the list there, bridge12_abandon leaves the list as it was. Between them the caller records on
+    // the command buffer through record_raw_vk and run_vulkan with vulkan_handles().
+    VkCommandBuffer bridge12_begin(ID3D12Device* device, ID3D12GraphicsCommandList* list);
+    RawImage bridge12_twin(ID3D12Resource* resource, D3D12_RESOURCE_STATES state, bool colour);
+    void bridge12_end();
+    void bridge12_abandon();
+    DeviceHandles vulkan_handles() const;
+    // The NR screenshot (nr_screenshot.hpp) of a run outside the RenoDX stage (the .asi's wilsjo2 layers): capture_begin
+    // before the run copies the frame before NR (`image`, in `layout`, w x h) into a readback - only while a capture of
+    // the final picture is armed, else nothing; capture_end after it copies the frame after NR and hands the pair on
+    // once the GPU ran it (as the RenoDX stage's captures). `hdr_mode` 0 SDR codes, 1 scRGB, 2 PQ; `path` the place.
+    bool capture_begin(VkCommandBuffer cmd, VkImage image, VkFormat format, uint32_t w, uint32_t h, VkImageLayout layout,
+                       uint8_t hdr_mode, const char* path);
+    void capture_abort();
+    void capture_end(VkCommandBuffer cmd, VkImage image, VkImageLayout layout);
+    // A command buffer this session recorded into was not submitted (its submit failed): the timing rings it wrote
+    // (the layers' totals, RenoDX's stage, each network's) are not read until they have gone round again - their
+    // queries were never reset on the GPU (a stress test: the validation layer's vkGetQueryPoolResults-None-09401).
+    void discard_timing();
+    // A run timed around more than the network's own recording (the .asi's wilsjo2 layers): a timestamp pair recorded
+    // inside its first and last record_raw, read back a ring of runs later, averaged by the call's layer
+    // (set_call_layer); while a layer has one, gpu_ms() is it. The network's own recordings inside it (every pass) are
+    // timed in the same ring: network_ms() is their sum for that layer.
+    void outer_begin(VkCommandBuffer cmd);
+    // The device-local heap NR's device has: this process's use of it, its budget and its size (false: not known).
+    bool video_memory(uint64_t* usage, uint64_t* budget, uint64_t* heap) const;
+    void outer_end(VkCommandBuffer cmd);
+    // The call's layer has an outer run whose network recordings were timed: network_ms() is the whole run's (every
+    // pass), not one recording's.
+    bool network_ms_whole_run() const;
 
     // D3D11, through DXVK. There is no command list to record into, so this one
     // owns a command buffer, records into it, and submits it on DXVK's own queue
@@ -197,6 +301,7 @@ class Session {
     // milliseconds, and be read by nobody. In place is what makes this path real.
     // The game keeps its handle; the pixels behind it change.
     struct D3D11Frame {
+        uint64_t feature{};   // as EngineResources::feature (the ReShade route's layers: one each)
         IUnknown* device{};
         IUnknown* target{};   // read and written; the upscaler's input, or its output
         IUnknown* motion{};   // engine motion vectors; null runs the spatial pass
@@ -220,6 +325,7 @@ class Session {
         bool linear_hdr{};
         // The RenoDX-style option: RenoDX's processing around the network instead (needs `motion`).
         const RenoDXFrame* renodx{};
+        const Wilsjo2Frame* wilsjo2{};   // a wilsjo2 layer: its flow around the network, on `target` in place
     };
     bool run_d3d11(const D3D11Frame& frame, const Controls& controls);
     // The same for a D3D10 game on the native runtime (`device` an ID3D10Device), through the bridge
@@ -273,12 +379,18 @@ class Session {
         // The RenoDX-style option (needs `motion`): RenoDX's processing around the network, from `colour` into
         // `output` (or back into `colour` when there is no output or in_place is set).
         const RenoDXFrame* renodx{};
+        const Wilsjo2Frame* wilsjo2{};   // a wilsjo2 layer: its flow around the network, on `colour` in place
     };
     // A Vulkan game's own queue. The two D3D runtimes have an interop object to
     // ask for one; a Vulkan game has nothing of the sort, so the queue is learned
     // by watching the game create it. Without this the network cannot upload its
     // weights and the Vulkan path declines with that reason.
     void set_vulkan_queue(VkQueue queue, uint32_t family);
+    // The game's Vulkan device, known before the first run_vulkan (record_raw_vk records before it on the .asi route).
+    void set_vulkan_handles(const DeviceHandles& handles);
+    // The lock around every submit of ours on that queue (the builds' too), in place of the one set_vulkan_queue chose:
+    // a D3D11 game's DXVK submission-queue lock (no flush: never the immediate context), as run_d3d11 takes it.
+    void set_queue_lock(std::function<void()> lock, std::function<void()> unlock);
 
     // Returns the image to hand the upscaler in place of the game's colour, or
     // null when the pass could not run. With VulkanFrame::output set it is that
@@ -340,7 +452,8 @@ class Session {
     // Wait for any work this session has in flight. Called before anything it
     // may still be reading is destroyed - a retiring swapchain above all, whose
     // images go away while our last submit can still be referencing them.
-    void wait_idle();
+    // False when some of it did not finish in time (what it uses must then not be freed).
+    bool wait_idle();
 
     // Why the last run declined, for the log and the overlay. Empty while the
     // pass is running normally.
@@ -351,6 +464,8 @@ class Session {
     // around the work, not a clock around the call. Smoothed; zero until the
     // first result is back, and zero on a queue with no timestamp support.
     // With the RenoDX-style option: its whole stage a frame (every pass and its own work).
+    bool spatial_active() const;
+    wilsjo2::SpatialLayout spatial_layout() const;
     float gpu_ms() const;
     // The network's part of gpu_ms (every pass); gpu_ms - network_ms is the route's own work.
     float network_ms() const;
@@ -374,8 +489,26 @@ class Session {
         uint64_t resizes = 0, carried = 0;
         bool renodx_known = false;
         renodx::Stage::Facts renodx{};
+        // the last wilsjo2 run of this session (the ReShade route's layers): Passes (fast) and the motion vectors
+        float wilsjo2_fast_passes = 0.f;
+        bool wilsjo2_fast_fallback = false, wilsjo2_motion = false;
         bool motion_without_depth = true;
         float prep_ev = NAN;   // the running network's Preprocess auto exposure (smoothed EV), NaN not metered
+        // The last evaluation passed its frame through (not building: waiting for video memory, a size that moves...)
+        // and why (the session's status)
+        bool passed = false;
+        std::string status;
+        // ACO Mode in this run (nr_pipeline_binary.hpp): 0 not known yet (no device), 1 on, 2 off (no reason given),
+        // 3 off: it cannot be used (`aco_why`), 4 off for this device (`aco_why`). `aco_rdna3`: the machine code is
+        // RDNA3's.
+        int aco = 0;
+        std::string aco_why;
+        bool aco_rdna3 = false;
+        // The device the network runs on: 0 not known yet, 1 the bridge (a Vulkan device of NR's own beside the game's
+        // D3D10/11/12, the frame through shared textures and fences), 2 the game's own Vulkan device (a Vulkan game, D3D9
+        // through DXVK, D3D through vkd3d-proton / DXVK under Wine), 3 the game's D3D12 device itself (not made yet: kept
+        // for a network run in D3D12 pipelines, whatever brings ACO's machine code into them).
+        int device_path = 0;
     };
     State state() const;
     // [Network] Model from the host's UI, as the hotkey does (the switch writes Model to the ini).
@@ -390,9 +523,9 @@ class Session {
     // the periodic log line: the Windows driver refuses allocations at the budget
     // instead of spilling, and the game is the one that crashes when it does.
     std::string vram_line() const;
+    struct Impl;   // nr_pe_session.cpp (named here for the file's own helpers; opaque to every caller)
 
   private:
-    struct Impl;
     std::unique_ptr<Impl> impl_;
 };
 

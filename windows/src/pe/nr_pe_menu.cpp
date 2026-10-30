@@ -1,17 +1,32 @@
 // See nr_pe_menu.hpp.
+#include "nr_path_win.hpp"
+#include "nr_vk_receipts.hpp"
+#include "nr_number.hpp"
 #include "nr_pe_menu.hpp"
 #include "mingw_d3d12_compat.h"
 #include "nr_control_shared.hpp"
 #include "nr_ini_network.hpp"
+#include "nr_control_pages.hpp"
 #include "nr_control_ui.hpp"
+#include "nr_ini_edit.hpp"
+#include "nr_wilsjo2_keys.hpp"
+#include "nr_menu_font.hpp"   // Inter, embedded by linux/build/build_asi.sh (embed_font.py)
+#include "nr_pe_config.hpp"
+#include "nr_dlssnr_model.hpp"
+#include "nr_asi_wilsjo2.hpp"
+#include "nr_wilsjo2.hpp"
 #include "nr_pe_control.hpp"
-#include "nr_pe_d3d12split.hpp"
 #include "nr_pe_log.hpp"
+#include "nr_vram_ledger.hpp"
 
 #include "MinHook.h"
 #include "imgui.h"
 #include "imgui_impl_dx11.h"
 #include "imgui_impl_dx12.h"
+#include "imgui_impl_vulkan.h"
+#include "menu_compose_vert.h"
+#include "menu_compose_frag.h"
+#include "nr_pe_vkdevice.hpp"
 
 #include <windows.h>
 #include <d3d11_1.h>
@@ -23,6 +38,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cwchar>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -50,11 +66,29 @@ extern "C" HRESULT WINAPI D3DCompile(LPCVOID data, SIZE_T size, LPCSTR name, con
     if (!fn) return E_NOTIMPL;
     return fn(data, size, name, defines, include, entry, target, flags1, flags2, code, errors);
 }
+// The D3D12 and DXGI entry points the menu (and ImGui's D3D12 backend, in its multi-viewport code, not used) name,
+// taken from the modules already in the process when called: imported, they would load d3d12.dll from OptiScaler's
+// DllMain (this module is loaded there) and bind dxgi.dll to OptiScaler itself (it is the game's dxgi.dll).
+extern "C" HRESULT WINAPI D3D12SerializeRootSignature(const D3D12_ROOT_SIGNATURE_DESC* desc, D3D_ROOT_SIGNATURE_VERSION version,
+                                                      ID3DBlob** blob, ID3DBlob** errors) {
+    using Fn = HRESULT(WINAPI*)(const D3D12_ROOT_SIGNATURE_DESC*, D3D_ROOT_SIGNATURE_VERSION, ID3DBlob**, ID3DBlob**);
+    HMODULE m = GetModuleHandleW(L"d3d12.dll");
+    const Fn fn = m ? reinterpret_cast<Fn>(reinterpret_cast<void*>(GetProcAddress(m, "D3D12SerializeRootSignature"))) : nullptr;
+    return fn ? fn(desc, version, blob, errors) : E_NOTIMPL;
+}
+extern "C" HRESULT WINAPI CreateDXGIFactory1(REFIID riid, void** factory) {
+    using Fn = HRESULT(WINAPI*)(REFIID, void**);
+    HMODULE m = GetModuleHandleW(L"dxgi.dll");
+    const Fn fn = m ? reinterpret_cast<Fn>(reinterpret_cast<void*>(GetProcAddress(m, "CreateDXGIFactory1"))) : nullptr;
+    return fn ? fn(riid, factory) : E_NOTIMPL;
+}
 // The vendored Win32 backend's module handle (mingw_d3d12_compat.h); that backend is not linked here.
 HMODULE dllModule = nullptr;
 
 namespace nr::pe::menu {
 namespace {
+using nr::lang::tr;
+using nr::lang::tr_text;
 
 void say(const std::string& s) { log("[nr] NR Control: %s", s.c_str()); }
 
@@ -66,147 +100,14 @@ template <class T> void release(T*& p) {
 nr::control::Shared* shared() { return nr::pe::control::page(); }
 
 std::filesystem::path game_dir() { return std::filesystem::path(nr::pe::module_folder()); }
+// The menus' language files (nr_lang.hpp)
+std::string lang_folder() { return std::string(nr::pe::module_folder()) + "\\dlssnr-amd\\lang"; }
 
-// ---- dlssnr-amd.ini, edited in place: a value's line keeps its key and spacing, comments stay ----
-class Ini {
-  public:
-    explicit Ini(std::filesystem::path p) : path_(std::move(p)) {}
-    // Re-read when the file changed (the user's editor, the DLL writing defaults). True when it did.
-    bool refresh() {
-        std::error_code ec;
-        const auto t = std::filesystem::last_write_time(path_, ec);
-        if (ec) return false;
-        const int64_t stamp = int64_t(t.time_since_epoch().count());
-        if (stamp == stamp_ && !lines_.empty()) return false;
-        std::ifstream f(path_);
-        if (!f) return false;
-        lines_.clear();
-        std::string l;
-        while (std::getline(f, l)) {
-            if (!l.empty() && l.back() == '\r') l.pop_back();
-            lines_.push_back(l);
-        }
-        stamp_ = stamp;
-        return true;
-    }
-    bool has_section(const std::string& sec) const { return find_section(sec) >= 0; }
-    std::string get(const std::string& sec, const std::string& key, const std::string& def) const {
-        const int at = find_key(sec, key);
-        if (at < 0) return def;
-        const std::string& l = lines_[size_t(at)];
-        std::string v = l.substr(l.find('=') + 1);
-        const auto c = v.find_first_of(";#");
-        if (c != std::string::npos) v = v.substr(0, c);
-        return trim(v);
-    }
-    void set(const std::string& sec, const std::string& key, const std::string& value) {
-        const int at = find_key(sec, key);
-        if (at >= 0) {
-            std::string& l = lines_[size_t(at)];
-            const auto eq = l.find('=');
-            const bool spaced = eq + 1 < l.size() && l[eq + 1] == ' ';
-            l = l.substr(0, eq + 1) + (spaced ? " " : "") + value;
-        } else {
-            int s = find_section(sec);
-            if (s < 0) {
-                lines_.push_back("");
-                lines_.push_back("[" + sec + "]");
-                s = int(lines_.size()) - 1;
-            }
-            size_t end = size_t(s) + 1;
-            while (end < lines_.size() && !(trim(lines_[end]).rfind("[", 0) == 0)) ++end;
-            lines_.insert(lines_.begin() + std::ptrdiff_t(end), key + " = " + value);
-        }
-        dirty_ = true;
-    }
-    // Written whole through a temporary and a replacing move: the DLL never reads half a file.
-    void save() {
-        if (!dirty_) return;
-        const auto tmp = path_.wstring() + L".nrcontrol";
-        {
-            std::ofstream f(std::filesystem::path(tmp), std::ios::trunc | std::ios::binary);
-            for (const auto& l : lines_) f << l << "\r\n";
-        }
-        if (!MoveFileExW(tmp.c_str(), path_.wstring().c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
-            say("could not save dlssnr-amd.ini (error " + std::to_string(GetLastError()) + ")");
-        dirty_ = false;
-        std::error_code ec;
-        const auto t = std::filesystem::last_write_time(path_, ec);
-        if (!ec) stamp_ = int64_t(t.time_since_epoch().count());
-    }
-
-  private:
-    static std::string trim(std::string s) {
-        const auto a = s.find_first_not_of(" \t\r\n");
-        const auto b = s.find_last_not_of(" \t\r\n");
-        return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
-    }
-    static std::string lower(std::string s) {
-        for (char& c : s) c = char(std::tolower(static_cast<unsigned char>(c)));
-        return s;
-    }
-    int find_section(const std::string& sec) const {
-        for (size_t i = 0; i < lines_.size(); ++i)
-            if (lower(trim(lines_[i])) == "[" + lower(sec) + "]") return int(i);
-        return -1;
-    }
-    int find_key(const std::string& sec, const std::string& key) const {
-        const int s = find_section(sec);
-        if (s < 0) return -1;
-        for (size_t i = size_t(s) + 1; i < lines_.size(); ++i) {
-            const std::string t = trim(lines_[i]);
-            if (t.rfind("[", 0) == 0) break;
-            if (t.empty() || t[0] == ';' || t[0] == '#') continue;
-            const auto eq = t.find('=');
-            if (eq != std::string::npos && lower(trim(t.substr(0, eq))) == lower(key)) return int(i);
-        }
-        return -1;
-    }
-    std::filesystem::path path_;
-    std::vector<std::string> lines_;
-    int64_t stamp_ = -1;
-    bool dirty_ = false;
-};
-
-// [RenoDX]'s values for nr_control_ui.hpp, read from and written to the ini by the table's names.
-struct RenoDXValues {
-    std::vector<uint8_t> bools;
-    std::vector<uint32_t> uints;
-    std::vector<float> floats;
-    std::vector<std::string> texts;
-    bool& b(int i) { return reinterpret_cast<bool&>(bools[size_t(i)]); }
-    uint32_t& u(int i) { return uints[size_t(i)]; }
-    float& f(int i) { return floats[size_t(i)]; }
-    std::string& s(int i) { return texts[size_t(i)]; }
-    void load(const Ini& ini) {
-        using namespace nr::renodx_keys;
-        bools.assign(kCount, 0); uints.assign(kCount, 0); floats.assign(kCount, 0.f); texts.assign(kCount, {});
-        for (int i = 0; i < kCount; ++i) {
-            const Key& k = kKeys[i];
-            const std::string v = ini.get("RenoDX", k.name, "");
-            switch (k.kind) {
-                case kBool: bools[size_t(i)] = v.empty() ? k.def != 0.f : (v == "1" || v == "true"); break;
-                case kUint: uints[size_t(i)] = v.empty() ? uint32_t(k.def) : uint32_t(std::strtoul(v.c_str(), nullptr, 10)); break;
-                case kFloat: floats[size_t(i)] = v.empty() ? k.def : std::strtof(v.c_str(), nullptr); break;
-                case kText: texts[size_t(i)] = std::string(v); break;
-            }
-        }
-    }
-    void store(Ini& ini) const {
-        using namespace nr::renodx_keys;
-        for (int i = 0; i < kCount; ++i) {
-            const Key& k = kKeys[i];
-            char v[64];
-            switch (k.kind) {
-                case kBool: std::snprintf(v, sizeof v, "%d", bools[size_t(i)] ? 1 : 0); break;
-                case kUint: std::snprintf(v, sizeof v, "%u", uints[size_t(i)]); break;
-                case kFloat: std::snprintf(v, sizeof v, "%.*f", int(k.decimals), double(floats[size_t(i)])); break;
-                case kText: std::snprintf(v, sizeof v, "%s", texts[size_t(i)].c_str()); break;
-            }
-            if (ini.get("RenoDX", k.name, "\x01") != v) ini.set("RenoDX", k.name, v);
-        }
-    }
-};
+// dlssnr-amd.ini edited in place, a key table's values by section, the chain's global keys: nr_ini_edit.hpp (shared with
+// the ReShade add-on's layer page)
+using nr::ini_edit::Ini;
+using nr::ini_edit::KeyValues;
+using nr::ini_edit::chain_global;
 
 // NR_CONTROL_AT=<n>: NR_CONTROL_SET, NR_CONTROL_SHOT and NR_CONTROL_DUMP wait until the menu has been drawn n times.
 uint64_t control_at() {
@@ -214,6 +115,19 @@ uint64_t control_at() {
     return e ? std::strtoull(e, nullptr, 10) : 0;
 }
 uint64_t g_drawn = 0;   // frames the menu was drawn in
+// NR_CONTROL_TRACE=1 (tests): every Present's menu outcome in the log - drawn (ImGui's vertex and list counts) or why not
+void trace(const char* what, int vertices = -1, int lists = -1) {
+    static const bool on = [] { const char* e = std::getenv("NR_CONTROL_TRACE"); return e && e[0] == '1'; }();
+    if (!on) return;
+    char t[160];
+    std::snprintf(t, sizeof t, "menu trace: drawn %llu %s vertices %d lists %d", static_cast<unsigned long long>(g_drawn),
+                  what, vertices, lists);
+    say(t);
+}
+void trace_drawn() {
+    const ImDrawData* d = ImGui::GetDrawData();
+    trace("drawn", d ? d->TotalVtxCount : -1, d ? d->CmdListsCount : -1);
+}
 
 bool open_at_start() {
     const char* e = std::getenv("NR_CONTROL_OPEN");
@@ -223,6 +137,7 @@ bool open_at_start() {
 // ---- input: the game window's keyboard and mouse as the DLL reads them (nr_pe_control.cpp) ----
 struct Input {
     bool open = open_at_start();
+    int open_vk = 0x23, open_mods = 0;   // the key that opens and closes NR Control ([NRControl] MenuKey, End)
     uint32_t keys_before[8]{};
     int32_t wheel_seen = 0;
     uint32_t chars_seen = 0;
@@ -230,7 +145,9 @@ struct Input {
     static ImGuiKey key_of(unsigned vk) {
         if (vk >= 'A' && vk <= 'Z') return ImGuiKey(ImGuiKey_A + int(vk - 'A'));
         if (vk >= '0' && vk <= '9') return ImGuiKey(ImGuiKey_0 + int(vk - '0'));
+        if (vk >= 0x70 && vk <= 0x87) return ImGuiKey(ImGuiKey_F1 + int(vk - 0x70));   // F1-F24 (a hotkey taking its key)
         switch (vk) {
+            case 0x13: return ImGuiKey_Pause; case 0x91: return ImGuiKey_ScrollLock;
             case 0x08: return ImGuiKey_Backspace; case 0x09: return ImGuiKey_Tab; case 0x0D: return ImGuiKey_Enter;
             case 0x1B: return ImGuiKey_Escape; case 0x20: return ImGuiKey_Space; case 0x21: return ImGuiKey_PageUp;
             case 0x22: return ImGuiKey_PageDown; case 0x23: return ImGuiKey_End; case 0x24: return ImGuiKey_Home;
@@ -242,7 +159,8 @@ struct Input {
             default: return ImGuiKey_None;
         }
     }
-    // End opens and closes, Esc closes; the rest goes to ImGui while open. `width` x `height`: the back buffer.
+    // MenuKey (End) opens and closes, Esc closes; the rest goes to ImGui while open - every key while a hotkey takes
+    // its key (nr_control_pages.hpp key_capture). `width` x `height`: the back buffer.
     void update(ImGuiIO& io, uint32_t width, uint32_t height) {
         auto* s = shared();
         s->wayland = 1;
@@ -254,8 +172,17 @@ struct Input {
             chars_seen = s->chars_written;
             primed = true;
         }
-        if (down(0x23) && !was(0x23)) open = !open;   // End
-        if (open && down(0x1B) && !was(0x1B) && !io.WantTextInput) open = false;   // Esc
+        // the menu's key with its modifiers held (not while a field takes typing: a letter key would close the menu)
+        const bool taking = open && nr::control_ui::capturing_key();
+        const bool mods_held = (!(open_mods & MOD_CONTROL) || down(0x11)) && (!(open_mods & MOD_SHIFT) || down(0x10)) &&
+                               (!(open_mods & MOD_ALT) || down(0x12));
+        bool toggled = false;
+        if (open_vk && down(unsigned(open_vk)) && !was(unsigned(open_vk)) && mods_held && !(open && io.WantTextInput) &&
+            !taking) {
+            open = !open;
+            toggled = true;
+        }
+        if (open && down(0x1B) && !was(0x1B) && !io.WantTextInput && !taking) open = false;   // Esc
         s->menu_open = open ? 1 : 0;
         // the game hid its cursor (mouse look): the menu draws one
         io.MouseDrawCursor = open && !s->cursor_shown;
@@ -266,8 +193,9 @@ struct Input {
             for (int b = 0; b < 3; ++b) io.AddMouseButtonEvent(b, (s->buttons >> b) & 1u);
             const int32_t wheel = s->wheel;
             if (wheel != wheel_seen) io.AddMouseWheelEvent(0.f, float(wheel - wheel_seen) / 120.f);
+            // The press that opened the menu is not ImGui's: End is its keyboard navigation's "scroll to the bottom"
             for (unsigned vk = 8; vk < 256; ++vk)
-                if (down(vk) != was(vk))
+                if (down(vk) != was(vk) && !(toggled && vk == unsigned(open_vk)))
                     if (ImGuiKey k = key_of(vk); k != ImGuiKey_None) io.AddKeyEvent(k, down(vk) != 0);
             io.AddKeyEvent(ImGuiMod_Ctrl, down(0x11) != 0);
             io.AddKeyEvent(ImGuiMod_Shift, down(0x10) != 0);
@@ -284,13 +212,74 @@ struct Input {
     }
 };
 Input g_input;   // one menu for the process, whichever swap chain shows it
+std::string g_api_name;   // the API of the swap chain the menu was last drawn on (its header line; under the draw lock)
+
+// ---- the NR chain on this route (nr_control_pages.hpp ChainEditor): layers before or after the upscaler or at Present;
+// a file without [LayerN] is one layer, as the .asi reads it: wilsjo2 with [RenoDX] Enabled = 0 given, else RenoDX
+using nr::control_ui::chain_rows;
+using nr::control_ui::draw_layer_status;
+using nr::control_ui::draw_vram;
+const nr::control_ui::ChainRoute kAsiChain = [] {
+    nr::control_ui::ChainRoute r;
+    r.chain_help = NR_N("Each layer is an NR pass of its own: its processing (RenoDX or wilsjo2), its network ([Network] "
+                   "Model, or one of its own), where it runs, and its own settings (click its name: its page). Layers at one place run "
+                   "in layer order; before the upscaler, then after it, then at Present. Each layer costs a network "
+                   "run, and a layer with another network or size its own memory.");
+    r.wilsjo2_about = NR_N("The OptiScaler-NR fork's processing around the network, ported.");
+    r.wilsjo2_table = nr::wilsjo2_keys::kKeys;
+    r.wilsjo2_count = nr::wilsjo2_keys::kCount;
+    r.passes_help = NR_N("Passes. Model passes a frame, 1-3 (up to 30 with Unlock passes); each costs one more network "
+                    "run. Only the last pass's answer is composed onto the frame.");
+    r.pass_same_help = NR_N("On: pass 1's settings, with the local tone at 0 (the fork's rule for later passes). Off: "
+                       "this pass's own settings below.");
+    r.legacy_row = [](const Ini& ini) {
+        nr::control_ui::ChainRow r;
+        r.number = 1;
+        const bool wilsjo2 = ini.get("RenoDX", "Enabled", "") == "0";
+        r.processing = wilsjo2 ? "wilsjo2" : "RenoDX";
+        const std::string hp = ini.get("RenoDX", "NRHookPoint", "2");
+        const std::string rb = ini.get("wilsjo2", "RunBeforeSR", "auto");
+        r.placement = wilsjo2 ? (rb == "1" || rb == "true" ? "before" : rb == "0" || rb == "false" ? "after" : "present")
+                              : hp == "1" ? "before" : hp == "0" ? "after" : "present";
+        return r;
+    };
+    r.legacy_source = [](const Ini& ini, const nr::control_ui::ChainRow& row) {
+        return std::make_pair(&ini, std::string(row.processing == "wilsjo2" ? "wilsjo2" : "RenoDX"));
+    };
+    // The first change of a file without [LayerN] writes its one layer as [Layer1], its settings copied over
+    r.materialize = [legacy_row = r.legacy_row](Ini& ini) {
+        const nr::control_ui::ChainRow r = legacy_row(ini);
+        const std::string sec = "Layer1";
+        ini.set(sec, "Enabled", "1");
+        ini.set(sec, "Processing", r.processing);
+        ini.set(sec, "Placement", r.placement);
+        if (r.processing == "RenoDX") {
+            for (const auto& [k, v] : ini.keys("RenoDX"))
+                if (!chain_global(k)) ini.set(sec, k, v);
+        } else {
+            for (const auto& [k, v] : ini.keys("wilsjo2")) {
+                std::string lk = k;
+                for (char& c : lk) c = char(std::tolower(static_cast<unsigned char>(c)));
+                if (lk != "runbeforesr") ini.set(sec, k, v);
+            }
+        }
+        say("the one layer of [RenoDX] / [wilsjo2] written as [Layer1]");
+    };
+    r.renodx_route = [](const std::string& placement) {
+        return placement == "present" ? nr::control_ui::Route::kOptiScalerPresent : nr::control_ui::Route::kOptiScaler;
+    };
+    return r;
+}();
 
 // ---- the menu's content: the same as the Linux layer's ----
 struct Menu {
     ImGuiContext* context{};
     std::chrono::steady_clock::time_point previous = std::chrono::steady_clock::now();
     Ini ini{game_dir() / "dlssnr-amd.ini"};
-    RenoDXValues renodx;
+    KeyValues renodx;            // [RenoDX]: NR on / off and the screenshot keys (all layers)
+    // the NR chain's list and the selected layer's page (nr_control_pages.hpp); the selected layer's number at start:
+    // NR_CONTROL_LAYER=<n>, for tests
+    nr::control_ui::ChainEditor chain{ini, kAsiChain, [] { const char* e = std::getenv("NR_CONTROL_LAYER"); return e ? std::atoi(e) : 0; }()};
     int64_t loaded = -1;
 
     Menu() {
@@ -301,11 +290,174 @@ struct Menu {
         io.LogFilename = nullptr;
         io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
         io.ConfigDebugHighlightIdConflicts = false;   // a developer aid, not a player's message
-        ImGui::StyleColorsDark();
-        auto& style = ImGui::GetStyle();
-        style.WindowRounding = 5;
-        style.FrameRounding = 3;
-        style.Colors[ImGuiCol_WindowBg] = {.07f, .08f, .10f, .96f};
+        apply_style(1.f);
+    }
+
+    // NR Control's look ([NRControl] Theme): 0 Midnight (blue), 1 Graphite (teal), 2 Plum (violet); roomy spacing; every
+    // size times `scale`.
+    static ImVec4 rgb(uint32_t hex, float a = 1.f) {
+        return {float((hex >> 16) & 255) / 255.f, float((hex >> 8) & 255) / 255.f, float(hex & 255) / 255.f, a};
+    }
+    // NR Control's colour presets ([NRControl] Theme): the accent everything else is mixed from
+    static constexpr int kThemes = 6;
+    static constexpr const char* kThemeNames[kThemes] = {NR_N("Blue"), NR_N("Teal"), NR_N("Violet"), NR_N("Amber"), NR_N("Crimson"),
+                                                         NR_N("Graphite")};
+    static ImVec4 theme_accent(int theme) {
+        static const ImVec4 accents[kThemes] = {
+            {0.00f, 0.40f, 0.77f, 1.f},   // blue (OptiScaler's)
+            {0.08f, 0.62f, 0.58f, 1.f},   // teal
+            {0.52f, 0.36f, 0.86f, 1.f},   // violet
+            {0.86f, 0.56f, 0.10f, 1.f},   // amber
+            {0.80f, 0.20f, 0.26f, 1.f},   // crimson
+            {0.50f, 0.54f, 0.60f, 1.f}};  // graphite
+        return accents[std::clamp(theme, 0, kThemes - 1)];
+    }
+    static void apply_style(float scale, int theme = 0) {
+        // Built the way OptiScaler's menu builds its dark theme (menu_common.cpp: near-black panels, one accent mixed in at
+        // fixed strengths, 2 px rounding, 1 px borders, compact spacing. The accent: [NRControl] Theme, one of
+        // kThemeNames (0: OptiScaler's blue).
+        const ImVec4 accent = theme_accent(theme);
+        const auto mix = [](const ImVec4& a, const ImVec4& b, float t, float alpha = 1.f) {
+            return ImVec4(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t, alpha);
+        };
+        const ImVec4 bg_dark(0.09f, 0.09f, 0.10f, 1.f), bg_mid(0.11f, 0.11f, 0.12f, 1.f), bg_light(0.14f, 0.14f, 0.15f, 1.f);
+        const ImVec4 black(0.f, 0.f, 0.f, 1.f), text(0.90f, 0.93f, 0.95f, 1.f), dim(0.54f, 0.58f, 0.62f, 1.f);
+        const ImVec4 border(0.24f, 0.24f, 0.26f, 1.f);
+        const auto tint = [&](const ImVec4& base, float strength = 1.f, float alpha = 1.f) {
+            return mix(base, black, 0.12f * strength, alpha);
+        };
+        const auto soft = [&](float a = 1.f) { return mix(bg_dark, accent, 0.32f, a); };
+        const auto med = [&](float a = 1.f) { return mix(bg_dark, accent, 0.55f, a); };
+        const auto strong = [&](float a = 1.f) { return ImVec4(accent.x, accent.y, accent.z, a); };
+        const ImVec4 readable = mix(accent, ImVec4(1.f, 1.f, 1.f, 1.f), 0.25f);
+        ImGuiStyle st;
+        ImGui::StyleColorsDark(&st);
+        st.WindowRounding = 2; st.ChildRounding = 2; st.FrameRounding = 2; st.PopupRounding = 2;
+        st.ScrollbarRounding = 2; st.GrabRounding = 2; st.TabRounding = 2;
+        st.WindowBorderSize = 1; st.ChildBorderSize = 1; st.PopupBorderSize = 1; st.FrameBorderSize = 0;
+        st.ScrollbarSize = 10; st.GrabMinSize = 10; st.SeparatorTextBorderSize = 1;
+        st.WindowPadding = {8, 8}; st.FramePadding = {6, 3}; st.ItemSpacing = {8, 5}; st.ItemInnerSpacing = {6, 4};
+        st.WindowTitleAlign = {0.0f, 0.5f};
+        ImVec4* c = st.Colors;
+        c[ImGuiCol_Text] = text;
+        c[ImGuiCol_TextDisabled] = dim;
+        c[ImGuiCol_WindowBg] = tint(bg_dark, 1.f, 0.93f);
+        c[ImGuiCol_ChildBg] = tint(bg_mid, 1.1f, 0.35f);
+        c[ImGuiCol_PopupBg] = tint(bg_dark, 1.f, 0.98f);
+        c[ImGuiCol_Border] = border;
+        c[ImGuiCol_BorderShadow] = {0, 0, 0, 0};
+        c[ImGuiCol_FrameBg] = tint(bg_light, 0.5f, 0.6f);
+        c[ImGuiCol_FrameBgHovered] = mix(bg_light, accent, 0.18f);
+        c[ImGuiCol_FrameBgActive] = mix(bg_light, accent, 0.28f);
+        c[ImGuiCol_TitleBg] = soft(0.85f);
+        c[ImGuiCol_TitleBgActive] = mix(soft(), accent, 0.16f);
+        c[ImGuiCol_TitleBgCollapsed] = soft(0.75f);
+        c[ImGuiCol_ScrollbarBg] = tint(bg_dark, 0.6f, 0.4f);
+        c[ImGuiCol_ScrollbarGrab] = soft();
+        c[ImGuiCol_ScrollbarGrabHovered] = med();
+        c[ImGuiCol_ScrollbarGrabActive] = strong();
+        c[ImGuiCol_CheckMark] = readable;
+        c[ImGuiCol_SliderGrab] = med();
+        c[ImGuiCol_SliderGrabActive] = readable;
+        c[ImGuiCol_Button] = soft();
+        c[ImGuiCol_ButtonHovered] = med();
+        c[ImGuiCol_ButtonActive] = strong();
+        c[ImGuiCol_Header] = soft(0.9f);
+        c[ImGuiCol_HeaderHovered] = med(0.95f);
+        c[ImGuiCol_HeaderActive] = strong();
+        c[ImGuiCol_Separator] = border;
+        c[ImGuiCol_SeparatorHovered] = med(0.85f);
+        c[ImGuiCol_SeparatorActive] = strong();
+        c[ImGuiCol_ResizeGrip] = soft(0.3f);
+        c[ImGuiCol_ResizeGripHovered] = strong(0.7f);
+        c[ImGuiCol_ResizeGripActive] = strong(0.95f);
+        c[ImGuiCol_Tab] = tint(bg_dark, 0.6f);
+        c[ImGuiCol_TabHovered] = med(0.85f);
+        c[ImGuiCol_TabSelected] = med();
+        c[ImGuiCol_TableHeaderBg] = tint(bg_mid, 0.8f, 0.6f);
+        c[ImGuiCol_TableBorderStrong] = border;
+        c[ImGuiCol_TableBorderLight] = soft();
+        c[ImGuiCol_TableRowBg] = {0, 0, 0, 0};
+        c[ImGuiCol_TableRowBgAlt] = {1, 1, 1, 0.03f};
+        c[ImGuiCol_TextSelectedBg] = med(0.38f);
+        c[ImGuiCol_NavCursor] = readable;
+        c[ImGuiCol_PlotHistogram] = mix(accent, ImVec4(1, 1, 1, 1), 0.35f, 0.85f);
+        st.ScaleAllSizes(scale);
+        ImGui::GetStyle() = st;
+    }
+    static ImVec4 accent_of(int theme) {
+        const ImVec4 a = theme_accent(theme);   // made readable on the dark panels
+        return ImVec4(a.x + (1.f - a.x) * 0.25f, a.y + (1.f - a.y) * 0.25f, a.z + (1.f - a.z) * 0.25f, 1.f);
+    }
+    int theme() const {
+        if (const char* e = std::getenv("NR_CONTROL_THEME")) return std::clamp(std::atoi(e), 0, 2);   // tests
+        return std::clamp(nr::parse_integer<int>(ini.get("NRControl", "Theme", "0"), 0), 0, kThemes - 1);
+    }
+
+    // NR Control's size: the font by the screen's height (17 px at 1080 lines) times [NRControl] MenuScale, every
+    // spacing with it. True when the font was made again: the backend makes its font texture again at its next frame.
+    float font_px = 0.f;
+    float style_scale = 1.f;   // Menu size alone (the spacing; the text has TextScale on top)
+    float window_scale = 0.f;  // the Menu size the window was last sized for
+    ImVec2 window_size{};      // the window's size at the last frame
+    int theme_now = -1;
+    std::string font_key;   // the language's font and letters the font was last made with
+    bool fonts_for(uint32_t height) {
+        if (const int t = theme(); t != theme_now && font_px > 0.f) { theme_now = t; apply_style(style_scale, t); }
+        float scale = nr::parse_float(ini.get("NRControl", "MenuScale", "1"), 1.0f);
+        if (!(scale >= 0.5f && scale <= 3.f)) scale = 1.f;
+        // [NRControl] TextScale: the text alone on top of that (the spacing stays the menu's)
+        float text = nr::parse_float(ini.get("NRControl", "TextScale", "1"), 1.0f);
+        if (!(text >= 0.75f && text <= 2.f)) text = 1.f;
+        const float menu_px = std::clamp(std::round(float(height) / 1080.f * 17.f * scale), 12.f, 72.f);
+        const float px = std::clamp(std::round(menu_px * text), 9.f, 144.f);
+        const nr::lang::Table& lt = nr::lang::table();
+        const std::string key = (lt.font.empty() ? std::string() : lt.name + "|" + lt.font + "|" + std::to_string(lt.letters.size())) +
+                                "|" + std::to_string(menu_px);
+        if (px == font_px && key == font_key) return false;
+        font_px = px;
+        font_key = key;
+        auto& io = ImGui::GetIO();
+        io.Fonts->Clear();
+        ImFontConfig cfg;
+        cfg.FontDataOwnedByAtlas = false;   // the embedded font stays ours
+        cfg.OversampleH = 2;
+        cfg.OversampleV = 1;
+        io.Fonts->AddFontFromMemoryTTF(const_cast<unsigned char*>(kMenuFont), int(kMenuFontSize), px, &cfg);
+        if (!lt.font.empty()) add_language_font(px);
+        theme_now = theme();
+        style_scale = menu_px / 17.f;
+        apply_style(style_scale, theme_now);
+        return true;
+    }
+    // The language file's @font merged into NR Control's for the letters of its translations (Inter has Latin, Greek and
+    // Cyrillic only): the glyphs those texts use, so a CJK font adds only what the menu shows.
+    std::vector<char> lang_font;
+    ImVector<ImWchar> lang_ranges;
+    void add_language_font(float px) {
+        const nr::lang::Table& lt = nr::lang::table();
+        std::string path = lt.font;
+        if (path.size() < 2 || (path[1] != ':' && path[0] != '\\' && path[0] != '/')) path = lang_folder() + "\\" + path;
+        lang_font.clear();
+        if (FILE* f = nr::u8::fopen(path.c_str(), "rb")) {
+            char buf[65536];
+            for (size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) lang_font.insert(lang_font.end(), buf, buf + n);
+            std::fclose(f);
+        }
+        if (lang_font.empty()) {
+            log("[nr] NR Control: the language's font %s could not be read; its letters may not show", path.c_str());
+            return;
+        }
+        ImFontGlyphRangesBuilder b;
+        b.AddText(lt.letters.c_str());
+        lang_ranges.clear();
+        b.BuildRanges(&lang_ranges);
+        ImFontConfig cfg;
+        cfg.MergeMode = true;
+        cfg.FontDataOwnedByAtlas = false;   // lang_font stays ours
+        cfg.GlyphRanges = lang_ranges.Data;
+        ImGui::GetIO().Fonts->AddFontFromMemoryTTF(lang_font.data(), int(lang_font.size()), px, &cfg);
+        log("[nr] NR Control: language %s with the font %s", lt.name.c_str(), path.c_str());
     }
     ~Menu() { if (context) ImGui::DestroyContext(context); }
 
@@ -313,21 +465,53 @@ struct Menu {
     // The caller has made `context` current.
     bool input(uint32_t width, uint32_t height) {
         ++shared()->menu_seq;
+        ++shared()->dll_menu;   // the Vulkan layer's menu steps aside
         auto& io = ImGui::GetIO();
         const auto now = std::chrono::steady_clock::now();
         io.DeltaTime = std::clamp(std::chrono::duration<float>(now - previous).count(), .001f, .1f);
         previous = now;
         io.DisplaySize = {float(width), float(height)};
+        menu_key();
         g_input.update(io, width, height);
-        osd_only = !g_input.open && osd_due(now);
+        const bool osd = osd_due(now);   // also re-reads the file once a second (the marks with it)
+        nr::lang::sync(lang_folder(), ini.get("NRControl", "Language", ""));   // (fonts_for makes the font for its letters)
+        nr::pe::control::present_layers();
+        nr::asi::wilsjo2_present_spatial();
+        read_marks(width, height);
+        if (std::getenv("NR_SPATIAL_TRACE")) {
+            static int previous = -1;
+            if (previous != int(marks.outlines)) {
+                previous = int(marks.outlines);
+                nr::pe::log("[nr] spatial outlines: %s at presentation %u", previous ? "drawn" : "absent", shared()->menu_seq);
+            }
+        }
+        osd_shown = osd;
+        osd_only = !g_input.open && (osd || marks.any());
         return g_input.open || osd_only;
     }
 
     // [Network] OSD with the menu closed: while a switch builds, its progress, then the network now running for 3 s
     // (switch, the default); the running network all the time (always); nothing (off). The mode is read from the file
     // once a second.
-    bool osd_only = false;
+    bool osd_only = false, osd_shown = false;
     int osd_mode = 1;
+    // [Inspect]'s marks (nr_control_pages.hpp draw_inspect_marks), from the file with the OSD's mode
+    nr::control_ui::InspectMarks marks;
+    nr::pe::ChainFile marks_chain_file;
+    nr::pe::ChainConfig marks_chain;
+    void read_marks(uint32_t width, uint32_t height) {
+        marks = nr::control_ui::inspect_marks(ini);
+        const std::string v = ini.get("Inspect", "SpatialOutlines", "0");
+        if (v != "1" && v != "true") return;
+        marks_chain_file.poll(std::string(nr::pe::module_folder()) + "\\dlssnr-amd.ini", marks_chain);
+        const int chosen = std::max(1, marks_chain.inspect.layer);   // the final picture: the first layer's
+        for (const nr::pe::LayerConfig& l : marks_chain.layers) {
+            if (!l.enabled || std::max(l.number, 1) != chosen || l.processing != nr::pe::Processing::kWilsjo2) continue;
+            // The layout recorded for this presented frame, including fallback and resize decisions.
+            marks.outlines = nr::control_ui::spatial_rects(nr::asi::wilsjo2_spatial_layout(chosen), marks.centre, marks.work);
+            break;
+        }
+    }
     uint32_t osd_want = ~0u, osd_running = ~0u;
     std::chrono::steady_clock::time_point osd_until{}, osd_read{};
     bool osd_due(std::chrono::steady_clock::time_point now) {
@@ -335,54 +519,49 @@ struct Menu {
             osd_read = now;
             if (ini.refresh()) loaded = -1;   // the menu loads the rest when it opens
             const std::string m = ini.get("Network", "OSD", "switch");
-            osd_mode = m == "off" ? 0 : m == "always" ? 2 : 1;
+            osd_mode = m == "off" ? 0 : m == "always" ? 2 : m == "cost" ? 3 : 1;
+
         }
         const nr::control::Shared* s = shared();
         if (!s || !s->route || !s->net_known) return false;
-        if (s->net_want != osd_want || (s->net_running < 3 && s->net_running != osd_running)) {
-            if (osd_want != ~0u && osd_running != ~0u) osd_until = now + std::chrono::seconds(3);
+        // The .asi's chain: the networks its layers run, together (the page's net_running is the last layer's)
+        const uint32_t running = chain_rows(s) ? layer_networks(s) : s->net_running < nr::control::kNoNet ? s->net_running + 1u : ~0u;
+        if (s->net_want != osd_want || (running != ~0u && running != osd_running)) {
+            if (osd_want != ~0u && osd_running != ~0u && (s->net_want != osd_want || switched(osd_running, running)))
+                osd_until = now + std::chrono::seconds(3);
             osd_want = s->net_want;
-            if (s->net_running < 3) osd_running = s->net_running;
+            if (running != ~0u) osd_running = running;
         }
-        if (osd_mode == 0 || s->net_running >= 3) return false;
-        return osd_mode == 2 || switching(s) || now < osd_until;
+        if (osd_mode != 0 && switching(s)) return true;   // a build's bar, the first one too (nothing has run yet)
+        if (osd_mode == 0 || running == ~0u) return false;
+        return osd_mode >= 2 || switching(s) || now < osd_until;
     }
-    static bool switching(const nr::control::Shared* s) {
-        return s->building && s->building_net < 3 && s->building_net != s->net_running;
+    // The layers' running networks as one number (4 bits a layer by row; ~0u: none has run yet).
+    static uint32_t layer_networks(const nr::control::Shared* s) {
+        uint32_t v = 0;
+        bool any = false;
+        for (uint32_t i = 0; i < nr::control::kMaxLayers; ++i) {
+            const auto& r = s->layers[i];
+            if (!r.number || r.net >= nr::control::kNoNet) continue;
+            v |= (r.net + 1u) << (4 * i);
+            any = true;
+        }
+        return any ? v : ~0u;
     }
+    // A network that changed under a layer (or the one instance); a layer that only started or went is no switch.
+    static bool switched(uint32_t before, uint32_t after) {
+        if (before == ~0u || after == ~0u) return false;
+        for (int i = 0; i < 8; ++i) {
+            const uint32_t a = (before >> (4 * i)) & 15u, b = (after >> (4 * i)) & 15u;
+            if (a && b && a != b) return true;
+        }
+        return false;
+    }
+    static bool switching(const nr::control::Shared* s) { return nr::control_ui::osd_switching(s); }
     void draw_osd() {
+        nr::control_ui::check_letters();   // (the OSD is drawn with the menu closed too)
         const nr::control::Shared* s = shared();
-        ImGui::SetNextWindowPos({24, 24});
-        ImGui::SetNextWindowBgAlpha(0.65f);
-        ImGui::Begin("##nr-osd", nullptr,
-                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_AlwaysAutoResize |
-                         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
-        if (switching(s))
-            ImGui::Text("NR: switching to %s ... %.0f%%", nr::network_codename(int(s->building_net)),
-                        double(s->build_progress) * 100.0);
-        else
-            ImGui::Text("NR: %s", s->nr_on ? nr::network_codename(int(s->net_running)) : "off");
-        ImGui::End();
-    }
-
-    // A 0/1 key as a checkbox, written at once.
-    void flag(const char* label, const char* section, const char* key, const char* def, const char* help) {
-        bool on = ini.get(section, key, def) == "1";
-        if (ImGui::Checkbox(label, &on)) ini.set(section, key, on ? "1" : "0");
-        nr::control_ui::help(help);
-    }
-
-    // A hotkey as text, written when the field is let go (the DLL reads the file again and takes it at once).
-    void hotkey_text(const char* label, const char* section, const char* help) {
-        static std::unordered_map<std::string, std::string> editing;
-        auto it = editing.find(label);
-        std::string& t = it != editing.end() ? it->second : (editing[label] = ini.get(section, "Hotkey", ""));
-        char buf[64];
-        std::snprintf(buf, sizeof buf, "%s", t.c_str());
-        if (ImGui::InputText(label, buf, sizeof buf)) t = buf;
-        if (ImGui::IsItemDeactivatedAfterEdit()) { ini.set(section, "Hotkey", t); editing.erase(label); }
-        else if (!ImGui::IsItemActive()) editing.erase(label);
-        nr::control_ui::help(help);
+        nr::control_ui::osd_window("##nr-osd", 0, [&] { nr::control_ui::draw_osd_lines(s, osd_mode); });
     }
 
     // The menu's draw data (or the OSD's alone), after the backend's NewFrame.
@@ -392,25 +571,40 @@ struct Menu {
             const bool cursor = io.MouseDrawCursor;
             io.MouseDrawCursor = false;
             ImGui::NewFrame();
-            draw_osd();
+            if (osd_shown) draw_osd();
+            nr::control_ui::draw_inspect_marks(marks);
             ImGui::Render();
             io.MouseDrawCursor = cursor;
             return;
         }
-        if (ini.refresh() || loaded < 0) { renodx.load(ini); loaded = 1; }
-        static bool set_done = false;
-        if (const char* e = std::getenv("NR_CONTROL_SET"); e && !set_done && g_drawn >= control_at()) {
-            set_done = true;
-            std::stringstream ss(e);
-            std::string item;
-            while (std::getline(ss, item, ',')) {
-                const auto dot = item.find('.'), eq = item.find('=');
-                if (dot != std::string::npos && eq != std::string::npos && dot < eq)
-                    ini.set(item.substr(0, dot), item.substr(dot + 1, eq - dot - 1), item.substr(eq + 1));
+        if (ini.refresh() || loaded < 0) { renodx.load(ini); loaded = loaded < 0 ? 1 : loaded + 1; }   // layer page reloads too
+        // tests: NR_CONTROL_SET=<section.key=value,...> once at NR_CONTROL_AT; or a schedule of such groups,
+        // "<draw>@<section.key=value,...>;<draw>@..." (each written once the menu has been drawn that often)
+        static size_t set_next = 0;
+        if (const char* e = std::getenv("NR_CONTROL_SET")) {
+            std::vector<std::pair<uint64_t, std::string>> groups;
+            {
+                std::stringstream all(e);
+                std::string g;
+                while (std::getline(all, g, ';')) {
+                    const auto at = g.find('@');
+                    if (at == std::string::npos) groups.push_back({control_at(), g});
+                    else groups.push_back({std::strtoull(g.substr(0, at).c_str(), nullptr, 10), g.substr(at + 1)});
+                }
             }
-            ini.save();
-            renodx.load(ini);
-            say("NR_CONTROL_SET written at menu frame " + std::to_string(g_drawn) + ": " + e);
+            if (set_next < groups.size() && g_drawn >= groups[set_next].first) {
+                const std::string& items = groups[set_next++].second;
+                std::stringstream ss(items);
+                std::string item;
+                while (std::getline(ss, item, ',')) {
+                    const auto dot = item.find('.'), eq = item.find('=');
+                    if (dot != std::string::npos && eq != std::string::npos && dot < eq)
+                        ini.set(item.substr(0, dot), item.substr(dot + 1, eq - dot - 1), item.substr(eq + 1));
+                }
+                ini.save();
+                renodx.load(ini);
+                say("NR_CONTROL_SET written at menu frame " + std::to_string(g_drawn) + ": " + items);
+            }
         }
         static bool shot_done = false;
         if (const char* e = std::getenv("NR_CONTROL_SHOT"); e && e[0] == '1' && !shot_done && g_drawn >= control_at()) {
@@ -419,184 +613,377 @@ struct Menu {
             say("NR_CONTROL_SHOT: the screenshot button pressed at menu frame " + std::to_string(g_drawn));
         }
         ImGui::NewFrame();
-        ImGui::SetNextWindowPos({24, 24}, ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize({560, std::min(float(height) - 48.f, 820.f)}, ImGuiCond_FirstUseEver);
+        // The window by Menu size alone, resized with it (Text size makes the text larger in the same window: lines
+        // wrap, a table its columns no longer fit scrolls sideways in its page)
+        const float u = style_scale;
+        const ImVec2 ds = ImGui::GetIO().DisplaySize;
+        ImGui::SetNextWindowPos({24 * u, 24 * u}, ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize({std::min(1080.f * u, ds.x - 48.f), std::min(float(height) - 48.f, 760.f * u)},
+                                 ImGuiCond_FirstUseEver);
+        if (window_scale > 0.f && window_scale != u && window_size.x > 0.f) {
+            const float r = u / window_scale;
+            ImGui::SetNextWindowSize({std::min(window_size.x * r, ds.x - 48.f), std::min(window_size.y * r, ds.y - 48.f)},
+                                     ImGuiCond_Always);
+        }
+        window_scale = u;
         bool open = true;
-        if (ImGui::Begin("NR Control", &open)) draw();
+        char title[160];
+        const nr::control::Shared* sh = shared();
+        std::snprintf(title, sizeof title, "NR Control  -  dlssnr-amd.asi %.*s###NR Control",
+                      sh ? int(strnlen(sh->asi_build, sizeof sh->asi_build)) : 0, sh ? sh->asi_build : "");
+        if (ImGui::Begin(title, &open, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
+            draw();
+            window_size = ImGui::GetWindowSize();   // (not while collapsed: the title bar's)
+        }
         ImGui::End();
+        if (osd_shown) draw_osd();   // the OSD stays while the menu is open (it used to go with it)
+        nr::control_ui::draw_inspect_marks(marks);
         ImGui::Render();
         if (!open) g_input.close();
         ini.save();
     }
 
-    void draw() {
-        const nr::control::Shared* s = shared();
-        const bool renodx_running = s && s->renodx;
-        if (s && s->route) {
-            ImGui::Text("Neural Rendering: %s%s", s->nr_on ? "on" : "off", renodx_running ? " (RenoDX style)" : "");
-            if (s->width) {
-                const bool before = s->placement == 2 ||
-                                    (s->placement == 0 && s->render_width == s->width && s->render_height == s->height);
-                const uint32_t ow = s->output_width ? s->output_width : before ? 0u : s->width;
-                const uint32_t oh = s->output_width ? s->output_height : before ? 0u : s->height;
-                if (s->render_width && ow && (s->render_width != ow || s->render_height != oh))
-                    ImGui::Text("Upscaling: %ux%u -> %ux%u (%.2fx)", s->render_width, s->render_height, ow, oh,
-                                double(oh) / double(std::max(s->render_height, 1u)));
-                else if (s->render_width && ow)
-                    ImGui::Text("No upscaling: %ux%u", ow, oh);
-                else if (s->render_width)
-                    ImGui::Text("Render: %ux%u", s->render_width, s->render_height);
-                const char* where = s->placement == 1 ? " (after the upscaler)" : s->placement == 2 ? " (before the upscaler)" : "";
-                ImGui::Text("NR on %ux%u%s, network %ux%u, %u pass%s", s->width, s->height, where, s->nr_width,
+    // NR on / off and the screenshot keys, NR Control's for every layer ([RenoDX], as the OptiScaler route keeps them)
+    // [NRControl] MenuKey: the key that opens NR Control (End); empty: none (as the other keys); one that names no key
+    // keeps End. Read from the file once a second while the menu is closed (it may be edited there), from the menu's
+    // own copy while open (the Hotkeys section); said once a change.
+    std::string menu_key_seen = "\x01";
+    ULONGLONG menu_key_read = 0;
+    void menu_key() {
+        std::string text;
+        if (g_input.open) {
+            text = ini.get("NRControl", "MenuKey", "End");
+        } else {
+            const ULONGLONG now = GetTickCount64();
+            if (menu_key_read && now - menu_key_read < 1000) return;
+            menu_key_read = now;
+            char v[64] = {};
+            const std::string path = std::string(nr::pe::module_folder()) + "\\dlssnr-amd.ini";
+            nr::u8::profile("NRControl", "MenuKey", "End", v, sizeof v, path.c_str());
+            text = v;
+        }
+        if (text == menu_key_seen) return;
+        menu_key_seen = text;
+        int vk = 0, mods = 0;
+        if (text.find_first_not_of(" \t") == std::string::npos) {
+            log("[nr] NR Control: [NRControl] MenuKey is empty: no key opens the menu");
+        } else if (!nr::pe::parse_key(text, &vk, &mods)) {
+            vk = 0x23; mods = 0;
+            log("[nr] NR Control: [NRControl] MenuKey '%s' names no key; End opens the menu", text.c_str());
+        } else if (text != "End") {
+            log("[nr] NR Control: %s opens the menu ([NRControl] MenuKey)", text.c_str());
+        }
+        g_input.open_vk = vk; g_input.open_mods = mods;
+    }
+
+    // The Hotkeys section: NR Control's own key, and OptiScaler's menu key as its OptiScaler.ini sets it ([Menu]
+    // ShortcutKey, Insert), read once a second. Its frame-generation key (FGShortcutKey, End by default) is set to none
+    // at install, so it is not listed.
+    nr::control_ui::HotkeysMenu hotkeys;
+    ULONGLONG hotkeys_read = 0;
+    const nr::control_ui::HotkeysMenu& hotkeys_menu() {
+        const ULONGLONG now = GetTickCount64();
+        if (hotkeys_read && now - hotkeys_read < 1000) return hotkeys;
+        hotkeys_read = now;
+        hotkeys.menu_key = true;
+        hotkeys.taken.clear();
+        const std::string path = std::string(nr::pe::module_folder()) + "\\OptiScaler.ini";
+        const auto opti_key = [&](const char* key, int def, const char* what) {
+            char v[32] = {};
+            nr::u8::profile("Menu", key, "auto", v, sizeof v, path.c_str());
+            const std::string t = v;
+            const int vk = t.empty() || t == "auto" ? def : int(std::strtol(t.c_str(), nullptr, 0));
+            const std::string word = vk > 0 ? nr::control_ui::vk_word(vk) : std::string();
+            if (!word.empty()) hotkeys.taken.push_back({word, what});
+        };
+        opti_key("ShortcutKey", 0x2D, tr("OptiScaler's menu"));
+        return hotkeys;
+    }
+
+    void draw_globals(const nr::control::Shared* s) {
+        nr::control_ui::draw_nr_switch(ini, renodx, [s] { if (s) ++const_cast<nr::control::Shared*>(s)->screenshot_request; },
+                                       s && s->screenshot[0] ? std::string(s->screenshot) : std::string());
+    }
+
+    // NR Control itself: its size ([NRControl] MenuScale)
+    // ---- Diagnostics: what NR did (its events, the last stop) and what it runs, in one text for a bug report
+    // (nr_control_pages.hpp) ----
+    std::string report_said;
+    void copy_report(const nr::control::Shared* s) {
+        const std::string text = nr::control_ui::report_text(s, "dlssnr-amd.asi",
+                                                             std::string(nr::pe::module_folder()) + "\\dlssnr-amd.ini",
+                                                             nr::pe::log_path());
+        report_said = nr::control_ui::copy_report(text, std::string(nr::pe::module_folder()) + "\\dlssnr-amd\\nr-report.txt");
+    }
+    void draw_diagnostics(const nr::control::Shared* s) {
+        static const bool diag_test = [] { const char* e = std::getenv("NR_CONTROL_DIAG_OPEN"); return e && e[0] == '1'; }();
+        if (diag_test) { ImGui::SetNextItemOpen(true); ImGui::SetScrollHereY(0.f); }   // tests: open, in view
+        if (!nr::control_ui::section("Diagnostics")) return;
+        nr::control_ui::draw_events();
+        if (nr::control_ui::draw_key(renodx, nr::control_ui::key_index("NROutputRect"))) {
+            renodx.store(ini); ini.save();
+        }
+
+        if (s && s->asi_build[0]) ImGui::TextDisabled("dlssnr-amd.asi %.*s", int(sizeof s->asi_build), s->asi_build);
+        if (s && s->frame_gen[0]) ImGui::TextUnformatted(tr_text(std::string(s->frame_gen, strnlen(s->frame_gen, sizeof s->frame_gen))).c_str());   // ImGui takes a "%.*s" length as it is (no stop at the NUL)
+        if (ImGui::Button(tr("Copy a report"))) copy_report(s);
+        nr::control_ui::help("For a bug report: the layers as they run, their engine data, the video memory and its "
+                             "residency, the events above, dlssnr-amd.ini and the last lines of dlssnr-amd.log, as text. "
+                             "Copied to the clipboard and saved as dlssnr-amd\\nr-report.txt next to the game. Nothing "
+                             "is sent anywhere.");
+        if (!report_said.empty()) nr::control_ui::text_dim_wrapped("%s", report_said.c_str());
+    }
+
+    void draw_menu_settings() {
+        if (!nr::control_ui::section("NR Control")) return;
+        static float pending = -1.f;
+        float v = pending > 0.f ? pending : nr::parse_float(ini.get("NRControl", "MenuScale", "1"), 1.0f);
+        if (!(v >= 0.5f && v <= 3.f)) v = 1.f;
+        if (ImGui::SliderFloat(tr("Menu size"), &v, 0.75f, 2.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp)) pending = v;
+        if (ImGui::IsItemDeactivatedAfterEdit() && pending > 0.f) {
+            char t[16];
+            std::snprintf(t, sizeof t, "%.2f", double(pending));
+            ini.set("NRControl", "MenuScale", t);
+            pending = -1.f;
+        }
+        nr::control_ui::help("[NRControl] MenuScale. The whole menu: its window, controls and text, on top of the size the "
+                             "screen gives them (17 px text at 1080 lines). Taken when the slider is let go.");
+        nr::control_ui::draw_text_size(ini);
+        int t = std::clamp(nr::parse_integer<int>(ini.get("NRControl", "Theme", "0"), 0), 0, kThemes - 1);
+        const char* themes[kThemes];
+        for (int i = 0; i < kThemes; ++i) themes[i] = tr(kThemeNames[i]);
+        if (ImGui::Combo(tr("Colours"), &t, themes, kThemes)) ini.set("NRControl", "Theme", std::to_string(t));
+        nr::control_ui::draw_language(ini, lang_folder());
+    }
+
+    // The .asi's NR chain as it runs, the video memory: nr_control_pages.hpp
+
+    // The pages of the sidebar (OptiScaler's menu's layout): the status, the chain and the selected layer, the settings
+    // for every layer, the tools. NR_CONTROL_PAGE=<name> (tests) opens one.
+    enum Page { kChain, kLayer, kNetwork, kPreprocess, kHudFix, kHotkeys, kScreenshot, kCompare, kDiagnostics, kMenu,
+                kStatus, kPages };
+    int page = [] {
+        static const char* const names[] = {"chain", "layer", "network", "preprocess", "hudfix", "hotkeys", "screenshot",
+                                            "compare", "diagnostics", "menu", "status"};
+        const char* e = std::getenv("NR_CONTROL_PAGE");
+        if (std::getenv("NR_CONTROL_HOTKEYS_OPEN")) return int(kHotkeys);
+        for (int i = 0; e && i < kPages; ++i) if (!std::strcmp(e, names[i])) return i;
+        return int(kChain);
+    }();
+
+    // What runs, as it ran last (the DLL's status)
+    void draw_status_page(const nr::control::Shared* s) {
+        if (!s || !s->route) {
+            ImGui::TextWrapped(tr("Waiting for the game's upscaler: DLSS, FSR or XeSS in the game's settings (OptiScaler's "
+                               "own menu, for the upscaler and frame generation: Insert)."));
+            return;
+        }
+        if (s->width) {
+            const bool before = s->placement == 2 ||
+                                (s->placement == 0 && s->render_width == s->width && s->render_height == s->height);
+            const uint32_t ow = s->output_width ? s->output_width : before ? 0u : s->width;
+            const uint32_t oh = s->output_width ? s->output_height : before ? 0u : s->height;
+            (void)ow; (void)oh;   // (the sizes: on the NR switch's row)
+            if (!chain_rows(s)) {
+                const char* where = s->placement == 1 ? tr(" (after the upscaler)") : s->placement == 2 ? tr(" (before the upscaler)") : "";
+                ImGui::Text(tr("NR on %ux%u%s, network %ux%u, %u pass%s"), s->width, s->height, where, s->nr_width,
                             s->nr_height, s->passes, s->passes == 1 ? "" : "es");
             }
-            if (s->gpu_ms > 0.f && s->network_ms > 0.f) {
-                ImGui::Text("NR cost: %.2f ms/frame", double(s->network_ms));
-                ImGui::Text("%s: %.2f ms/frame   (total %.2f ms)", renodx_running ? "RenoDX processing" : "OptiScaler route",
-                            double(std::max(s->gpu_ms - s->network_ms, 0.f)), double(s->gpu_ms));
-            } else if (s->gpu_ms > 0.f) {
-                ImGui::Text("NR cost: %.2f ms/frame", double(s->gpu_ms));
-            } else {
-                ImGui::TextUnformatted("NR cost: --");
-            }
-            if (s->net_running < 3) ImGui::Text("Network: %s", nr::network_codename(int(s->net_running)));
-            if (s->building) ImGui::TextDisabled("Building a network...");
-            if (s->state[0]) ImGui::TextWrapped("%s", s->state);
-        } else {
-            ImGui::TextDisabled("Waiting for NR to run (DLSS in the game's settings, OptiScaler's menu: Insert).");
         }
-        const bool renodx_route = s && s->route ? renodx_running : ini.get("RenoDX", "Enabled", "0") == "1";
-        if (!renodx_route) ImGui::TextDisabled("NR's other settings: OptiScaler's menu (Insert).");
-        ImGui::Separator();
-        if (renodx_route && nr::control_ui::draw_renodx(renodx, nr::control_ui::Route::kOptiScaler, renodx_route, [s] {
-                if (ImGui::Button("Take a screenshot now") && s) ++const_cast<nr::control::Shared*>(s)->screenshot_request;
-                if (s && s->screenshot[0]) ImGui::TextWrapped("Screenshot: %s", s->screenshot);
-            }))
-            renodx.store(ini);
-        // [Network]: which network runs (the three by the DLL's codenames); one that cannot run in this run is
-        // greyed out with the reason the DLL found (net_why), and the DLL skips it
-        // (not "Network": the RenoDX table has a group of that name, and the same label is the same header)
-        if (ImGui::CollapsingHeader("Network model and options", ImGuiTreeNodeFlags_DefaultOpen)) {
-            const int file_model = std::max(0, nr::network_choice(ini.get("Network", "Model", "CC_SMALL_FP8")));
-            const int shown = s && s->net_known && s->net_want < 3 ? int(s->net_want) : file_model;
-            if (ImGui::BeginCombo("Network##model", nr::network_codename(shown))) {
-                for (int n = 0; n < nr::kNetworkChoices; ++n) {
-                    const char* why = s && s->net_known ? s->net_why[n] : "";
-                    const bool ok = !why[0];
-                    if (ImGui::Selectable(nr::network_codename(n), n == shown, ok ? 0 : ImGuiSelectableFlags_Disabled))
-                        ini.set("Network", "Model", nr::network_codename(n));
-                    if (!ok) { ImGui::SameLine(); ImGui::TextDisabled("- %s", why); }
+        if (chain_rows(s)) {
+            draw_layer_status(s);
+            nr::control_ui::draw_flapping();
+            nr::control_ui::draw_missing_data(s->layers, nr::control::kMaxLayers, &ini);
+        }
+        else ImGui::TextDisabled(tr(chain.many() ? "No layer is on (the NR chain page): NR does not run."
+                                                 : "NR is off (Enabled on the NR settings page): NR does not run."));
+        if (s->net_running < nr::control::kNoNet && !chain_rows(s)) ImGui::Text(tr("Network: %s"), nr::network_codename(int(s->net_running)));
+        if (s->building) {   // the build's progress, as the OSD and the ReShade route's page show it
+            ImGui::Text(tr("Building %s"), s->building_net < nr::control::kNoNet ? nr::network_codename(int(s->building_net)) : tr("the network"));
+            char phase[sizeof s->build_phase + 1] = {};
+            std::memcpy(phase, s->build_phase, sizeof s->build_phase);   // (the page may not end it)
+            ImGui::ProgressBar(std::clamp(s->build_progress, 0.f, 1.f), ImVec2(-1.0f, 0.0f), phase);
+        }
+        if (s->state[0]) ImGui::TextWrapped("%s", tr_text(std::string(s->state, strnlen(s->state, sizeof s->state))).c_str());
+        if (s->frame_gen[0]) ImGui::TextWrapped("%s", tr_text(std::string(s->frame_gen, strnlen(s->frame_gen, sizeof s->frame_gen))).c_str());   // ImGui takes a "%.*s" length as it is (no stop at the NUL)
+        draw_vram(s);
+        nr::control_ui::draw_residency();
+    }
+
+    // The line under the title (OptiScaler's menu's layout): the API the game presents with, the GPU NR runs on, its
+    // driver; NR's switch below it
+    void draw_header(const nr::control::Shared* s) {
+        nr::control_ui::info_bar(nr::control_ui::info_line(g_api_name, nr::pe::vkdevice::gpu_name(), nr::pe::vkdevice::driver_name()));
+        // NR on / off for this run: the same as NRToggleKey ([RenoDX] NeuralUplift: on or off at the start)
+        bool on = !s || !s->route || nr::dlssnr::nr_on_now();
+        if (ImGui::Checkbox(tr("Neural Rendering"), &on)) nr::pe::request_nr_toggle();
+        ImGui::SameLine();
+        const std::string key = ini.get("RenoDX", "NRToggleKey", "F6");
+        ImGui::TextDisabled(tr("on / off for this run%s%s%s"), key.empty() ? "" : " (", key.c_str(), key.empty() ? "" : ")");
+        nr::control_ui::help("Every layer off or on again, for this run only (never written to the file). Its key is on "
+                             "the Hotkeys page; whether NR is on when the game starts: the Screenshot page's "
+                             "\"Neural Rendering\" ([RenoDX] NeuralUplift).");
+    }
+    // The render size and the upscaler's output as NR last saw them (0: not known)
+    static void upscaling(const nr::control::Shared* s, uint32_t* rw, uint32_t* rh, uint32_t* ow, uint32_t* oh) {
+        *rw = *rh = *ow = *oh = 0;
+        if (!s || !s->route || !s->width) return;
+        const bool before = s->placement == 2 ||
+                            (s->placement == 0 && s->render_width == s->width && s->render_height == s->height);
+        *rw = s->render_width; *rh = s->render_height;
+        *ow = s->output_width ? s->output_width : before ? 0u : s->width;
+        *oh = s->output_width ? s->output_height : before ? 0u : s->height;
+    }
+
+    // The sidebar: the pages, and below them what runs in a few words
+    void draw_nav(const nr::control::Shared* s, float height) {
+        const float u = ImGui::GetFontSize() / 17.f;
+        ImGui::BeginChild("##nav", ImVec2(176 * u, height), ImGuiChildFlags_Borders);
+        // every layer of the chain by its number and processing ("Layer 1 (RenoDX)"; a file without [LayerN]: its one
+        // layer), each opening its own page
+        const std::vector<nr::control_ui::ChainRow> layer_rows = chain.legacy() ? std::vector<nr::control_ui::ChainRow>{chain.legacy_row()}
+                                                                                : chain.layers();
+        const char* const labels[kPages] = {NR_N("NR chain"), NR_N("Layer settings"), NR_N("Network"), NR_N("Preprocess"),
+                                            NR_N("HUD FIX"), NR_N("Hotkeys"), NR_N("Screenshot"), NR_N("Compare"),
+                                            NR_N("Diagnostics"), NR_N("NR Control"), NR_N("Status")};
+        // [NRControl] Layers off: no NR chain page; the one layer's page is "NR settings" (its choices and settings)
+        const bool many = chain.many();
+        for (int i = 0; i < kPages; ++i) {
+            if (i == kChain && !many) continue;
+            if (i == kNetwork || i == kHotkeys || i == kMenu || i == kStatus) ImGui::Separator();
+            if (i == kLayer && !layer_rows.empty()) {
+                for (size_t k = 0; k < layer_rows.size(); ++k) {
+                    const auto& r = layer_rows[k];
+                    const bool chosen = page == kLayer && (r.number == chain.layer || (chain.layer <= 0 && k == 0));
+                    char label[112];
+                    if (many) std::snprintf(label, sizeof label, tr("Layer %d (%s)"), r.number, r.processing.c_str());
+                    else std::snprintf(label, sizeof label, "%s", tr("NR settings"));
+                    ImGui::PushID(int(k));
+                    if (ImGui::Selectable(label, chosen)) { chain.layer = r.number; page = kLayer; }
+                    ImGui::PopID();
                 }
-                ImGui::EndCombo();
+                continue;
             }
-            nr::control_ui::help("[Network] Model. CC_SMALL_FP8: 310.9.16's default network, the fastest. CC_SILVER_AARDWOLD: "
-                                 "310.8.0's network (310.9.16's preset 1). CC_SILVER_AARDWOLD_INT4_MIXED: that network with part "
-                                 "of its arithmetic in int4, faster, a slightly different picture; needs ACO Mode. Switching "
-                                 "builds the new network in the background; the running one serves until it is ready.");
-            for (int n = 0; n < nr::kNetworkChoices; ++n)
-                if (s && s->net_known && s->net_why[n][0]) ImGui::TextDisabled("%s: %s", nr::network_codename(n), s->net_why[n]);
-            hotkey_text("Hotkey##net", "Network", "[Network] Hotkey: cycles through the networks that can run. Ctrl, Shift, "
-                        "Alt and one key, e.g. Ctrl+F11 or Alt+F9; empty: no hotkey.");
-            bool sound = ini.get("Network", "Sound", "1") == "1";
-            if (ImGui::Checkbox("Sound##net", &sound)) ini.set("Network", "Sound", sound ? "1" : "0");
-            nr::control_ui::help("[Network] Sound. A cue on every switch: one note CC_SMALL_FP8, two going down "
-                                 "CC_SILVER_AARDWOLD, two going up CC_SILVER_AARDWOLD_INT4_MIXED.");
-            static const char* const residencies[] = {"auto", "resident", "offload", "minimal"};
-            const std::string r = ini.get("Network", "Residency", "auto");
-            int ri = 0;
-            for (int k = 0; k < 4; ++k) if (r == residencies[k]) ri = k;
-            if (ImGui::Combo("Residency", &ri, residencies, 4)) ini.set("Network", "Residency", residencies[ri]);
-            nr::control_ui::help("[Network] Residency: what is kept of a network not in use. The networks share one "
-                                 "activation memory, so mostly their weights. auto (default): the weights stay in video "
-                                 "memory, switching back is quick; moved to RAM when video memory runs short, freed when RAM "
-                                 "does too. resident: kept whole, switching back is instant, the most video memory. offload: "
-                                 "the weights in RAM, all video memory freed. minimal: everything freed, switching back builds "
-                                 "anew. While the other network gets ready, the running one keeps serving. NR off for 10 s: "
-                                 "offload and minimal do the same to the running network, auto only when video memory is short.");
-            static const char* const osds[] = {"off", "switch", "always"};
-            const std::string o = ini.get("Network", "OSD", "switch");
-            int oi = 1;
-            for (int k = 0; k < 3; ++k) if (o == osds[k]) oi = k;
-            if (ImGui::Combo("OSD", &oi, osds, 3)) ini.set("Network", "OSD", osds[oi]);
-            nr::control_ui::help("[Network] OSD: the running network in the corner of the picture. switch (default): while "
-                                 "a switch builds, its progress; then the new network for 3 s. always: all the time. off: never.");
-            flag("Style grade (Natural / Cinematic)", "Network", "Style Grade", "1",
-                 "[Network] Style Grade. On (default): Natural and Cinematic are graded after the network as NVIDIA's DLL "
-                 "does. Off: the picture these styles had up to 0.0.6, without that grade. Standard is not affected. "
-                 "Takes effect at once.");
-            flag("Motion without depth", "Network", "Motion Without Depth", "1",
-                 "[Network] Motion Without Depth. Where the network's previous-frame lookup reads its motion vector.\n"
-                 "On (default): the pixel's own vector, depth not used, as NVIDIA's DLL does.\n"
-                 "Off: with depth, the vector of the nearest of the pixel and its four diagonal neighbours.\n"
-                 "Only moving edges between frames with motion vectors and depth differ. Takes effect after a restart.");
-            flag("Resize history", "Network", "Resize History", "0",
-                 "[Network] Resize History. Only when NR runs before the upscaler and the game changes its render size\n"
-                 "(dynamic resolution):\n"
-                 "Off (default): NR's previous result is dropped and NR starts again at the new size, as NVIDIA's DLL does.\n"
-                 "On: the previous result is scaled to the new size and kept. Steadier on our tests when the size changes\n"
-                 "often, but not what NVIDIA's DLL does. Games with jittered input (most DLSS games) hide most of the\n"
-                 "restart, so the default is off.");
-            flag("ACO Mode", "Network", "ACO Mode", "1",
-                 "[Network] ACO Mode. On (default): the network's machine code made in advance by the ACO compiler, loaded by "
-                 "the AMD driver; when it cannot be used, the driver's compiler is used and dlssnr-amd.log says why. Off: the "
-                 "AMD driver's own compiler. CC_SILVER_AARDWOLD_INT4_MIXED needs it on. Takes effect after a restart.");
+            if (ImGui::Selectable(tr(labels[i]), page == i)) page = i;
         }
-        // What the game hands NR, and who covers what it does not (the DLL's lines, nr_engine_panel.hpp)
-        if (s && s->route && s->panel_lines && ImGui::CollapsingHeader("Engine data")) {
-            nr::control_ui::engine_legend();
-            for (uint32_t i = 0; i < std::min(s->panel_lines, nr::control::kPanelLines); ++i) {
-                char line[sizeof s->panel[0] + 1];
-                std::snprintf(line, sizeof line, "%s", s->panel[i]);
-                nr::control_ui::engine_line(line);
-            }
-        }
-        if (ImGui::CollapsingHeader("Preprocess")) {
-            bool on = ini.get("Preprocess", "Enabled", "0") == "1";
-            if (ImGui::Checkbox("Preprocess##on", &on)) ini.set("Preprocess", "Enabled", on ? "1" : "0");
-            nr::control_ui::help("[Preprocess] Enabled. Changes the picture the network is shown.");
-            static const char* const exposures[] = {"off", "auto", "fixed"};
-            static const char* const curves[] = {"none", "neutral", "reinhard", "filmic", "gt", "aces", "agx"};
-            auto combo = [&](const char* label, const char* key, const char* const* items, int n, const char* help) {
-                const std::string v = ini.get("Preprocess", key, items[0]);
-                int i = 0;
-                for (int k = 0; k < n; ++k) if (v == items[k]) i = k;
-                if (ImGui::Combo(label, &i, items, n)) ini.set("Preprocess", key, items[i]);
-                nr::control_ui::help(help);
-            };
-            auto slider = [&](const char* label, const char* key, float lo, float hi, float def, const char* help) {
-                static std::unordered_map<std::string, float> pending;
-                const auto it = pending.find(key);
-                float v = it != pending.end() ? it->second : std::strtof(ini.get("Preprocess", key, "").c_str(), nullptr);
-                if (it == pending.end() && ini.get("Preprocess", key, "").empty()) v = def;
-                if (ImGui::SliderFloat(label, &v, lo, hi, "%.2f", ImGuiSliderFlags_AlwaysClamp)) pending[key] = v;
-                if (ImGui::IsItemDeactivatedAfterEdit() && pending.count(key)) {
-                    char t[32];
-                    std::snprintf(t, sizeof t, "%.2f", double(pending[key]));
-                    ini.set("Preprocess", key, t);
-                    pending.erase(key);
+        // what runs, at the sidebar's foot: the upscaling factor, frame generation's multiplier (presents a game frame,
+        // measured), NR's layers, ACO Mode, the network's device (Path) and the networks
+        uint32_t rw = 0, rh = 0, ow = 0, oh = 0;
+        upscaling(s, &rw, &rh, &ow, &oh);
+        std::vector<nr::control_ui::FootRow> rows;
+        char t[32] = "-";
+        if (rw && ow && (rw != ow || rh != oh)) std::snprintf(t, sizeof t, "%.2fx", double(oh) / double(std::max(rh, 1u)));
+        else if (rw && ow) std::snprintf(t, sizeof t, "%s", tr("none"));
+        rows.push_back({NR_N("SR"), t, rw && ow && (rw != ow || rh != oh)});
+        double ratio = 0.0;
+        if (s)
+            if (const char* f = std::strstr(s->frame_gen, "Frame generation: "))
+                std::sscanf(f + 18, "%lf presents per game frame", &ratio);
+        std::snprintf(t, sizeof t, "%.0fx", ratio);
+        rows.push_back({NR_N("FG"), ratio >= 1.8 ? t : tr("Off"), ratio >= 1.8});
+        const bool on = s && s->route && nr::dlssnr::nr_on_now();
+        int layers_on = 0;
+        if (s) for (const auto& l : s->layers) if (l.number && l.state && l.state != 3) ++layers_on;
+        std::snprintf(t, sizeof t, tr(layers_on == 1 ? "%d layer" : "%d layers"), layers_on);
+        rows.push_back({NR_N("NR"), on ? t : tr("Off"), on});
+        rows.push_back(nr::control_ui::aco_row(s));
+        rows.push_back(nr::control_ui::path_row(s));
+        nr::control_ui::nav_foot(rows, nr::control_ui::ran_networks(s, s ? s->net_running : nr::control::kNoNet));
+        ImGui::EndChild();
+    }
+
+    void draw() {
+        const nr::control::Shared* s = shared();
+        nr::control_ui::check_letters();   // a language whose letters the font lacks: English
+        draw_header(s);
+        const float foot = ImGui::GetFrameHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y;
+        const float body = std::max(ImGui::GetContentRegionAvail().y - foot, 100.f);
+        if (page == kChain && !chain.many()) page = kLayer;   // Layers off: no NR chain page
+        draw_nav(s, body);
+        ImGui::SameLine();
+        ImGui::BeginChild("##page", ImVec2(0, body), ImGuiChildFlags_Borders, ImGuiWindowFlags_HorizontalScrollbar);
+        nr::control_ui::paged() = true;
+        switch (page) {
+            case kStatus: draw_status_page(s); break;
+            case kChain:
+                chain.nr_on = !s || !s->route || nr::dlssnr::nr_on_now();
+                chain.flipped = [](int n) { return nr::pe::layer_flipped(n); };
+                chain.draw_chain(s);
+                if (chain.picked) { chain.picked = false; page = kLayer; }   // a layer's name: its page
+                break;
+            case kLayer:
+                chain.nr_on = !s || !s->route || nr::dlssnr::nr_on_now();
+                chain.draw_layer_page(s, loaded, accent_of(theme_now));
+                break;
+            case kPreprocess: nr::control_ui::draw_preprocess(ini); break;
+            case kHudFix: {   // what it does now and why a method cannot run (the DLL's lines)
+                nr::control_ui::HudFixMenu hm;
+                if (s) {
+                    for (int i = 0; i < 3; ++i) hm.why[2 + i] = std::string(s->hud_why[i], strnlen(s->hud_why[i], sizeof s->hud_why[i]));
+                    hm.now = std::string(s->hud_now, strnlen(s->hud_now, sizeof s->hud_now));
                 }
-                nr::control_ui::help(help);
-            };
-            combo("Exposure", "Exposure", exposures, 3, "[Preprocess] Exposure. auto: Unreal-style auto exposure; fixed: Exposure bias only.");
-            slider("Exposure bias (EV)", "ExposureBias", -8.f, 8.f, 0.f, "[Preprocess] ExposureBias.");
-            combo("Curve", "Curve", curves, 7, "[Preprocess] Curve. The display curve of the picture NR is shown.");
-            slider("Contrast", "Contrast", 0.5f, 2.f, 1.f, "[Preprocess] Contrast.");
-            slider("Saturation", "Saturation", 0.05f, 2.f, 1.f, "[Preprocess] Saturation.");
-            hotkey_text("Hotkey##prep", "Preprocess", "[Preprocess] Hotkey: switches the whole preprocess on or off for "
-                        "this run (not written to the file). Ctrl, Shift, Alt and one key; empty: no hotkey.");
-            flag("Sound##prep", "Preprocess", "Sound", "1",
-                 "[Preprocess] Sound. A cue when it switches: two notes going up = on, going down = off.");
+                nr::control_ui::draw_hudfix(ini, hm);
+                break;
+            }
+            case kNetwork:
+                nr::control_ui::draw_network_options(ini, s, nr::control_ui::NetworkOptions{});
+                // What the game hands NR, and who covers what it does not (the DLL's lines, nr_engine_panel.hpp)
+                if (s && s->route && s->panel_lines && !chain_rows(s) && nr::control_ui::section("Engine data")) {
+                    nr::control_ui::engine_legend();
+                    for (uint32_t i = 0; i < std::min(s->panel_lines, nr::control::kPanelLines); ++i) {
+                        char line[sizeof s->panel[0] + 1];
+                        std::snprintf(line, sizeof line, "%s", s->panel[i]);
+                        nr::control_ui::engine_line(line);
+                    }
+                }
+                ImGui::Separator();
+                nr::control_ui::draw_layers_switch(ini);   // the page's foot
+                break;
+            case kScreenshot: draw_globals(s); break;
+            case kHotkeys:
+                nr::control_ui::draw_hotkeys(ini, renodx, hotkeys_menu());
+                break;
+            case kCompare:
+                nr::control_ui::draw_inspect(ini, NR_N("What is compared. The final picture: the layers of the last place that "
+                                                  "runs (Present, else after the upscaler), all off against all on. A layer: "
+                                                  "its own input and output, where it runs (before the upscaler: the "
+                                                  "comparison is upscaled too)."));
+                break;
+            case kDiagnostics: draw_diagnostics(s); nr::control_ui::draw_log(ini); break;
+            case kMenu: draw_menu_settings(); break;
+            default: break;
         }
-        // [Log]: read once when the game starts
-        if (ImGui::CollapsingHeader("Log")) {
-            flag("Write the log", "Log", "Enabled", "1",
-                 "[Log] Enabled. dlssnr-amd.log in the game's folder. Takes effect after a restart.");
-            flag("Clear on start", "Log", "ClearOnStart", "1",
-                 "[Log] ClearOnStart. On: each start of the game begins a new log; off: appends to the last one. "
-                 "Takes effect after a restart.");
+        nr::control_ui::paged() = false;
+        if (const char* y = std::getenv("NR_CONTROL_SCROLL")) ImGui::SetScrollY(std::max(0.f, float(std::atof(y))));   // tests
+        ImGui::EndChild();
+        if (nr::control_ui::capturing_key()) nr::pe::pause_hotkeys();   // the key being set acts as nothing else
+        // tests (NR_CONTROL_REPORT_AT=<draws>): the report made once, as its button would
+        static int report_at = [] { const char* e = std::getenv("NR_CONTROL_REPORT_AT"); return e ? std::atoi(e) : 0; }();
+        if (report_at > 0 && --report_at == 0) copy_report(s);
+        // tests (NR_CONTROL_REPORT_EVERY=<draws>): the report appended to nr-report-series.txt beside dlssnr-amd.ini that often
+        static const int report_every = [] { const char* e = std::getenv("NR_CONTROL_REPORT_EVERY"); return e ? std::atoi(e) : 0; }();
+        static int draws = 0;
+        if (report_every > 0 && ++draws % report_every == 0) {
+            const std::string text = nr::control_ui::report_text(s, "dlssnr-amd.asi",
+                                                                 std::string(nr::pe::module_folder()) + "\\dlssnr-amd.ini",
+                                                                 nr::pe::log_path());
+            if (FILE* f = nr::u8::fopen((std::string(nr::pe::module_folder()) + "\\nr-report-series.txt").c_str(), "ab")) {
+                std::fprintf(f, "--- draw %d\n%s\n", draws, text.c_str());
+                std::fclose(f);
+            }
         }
-        ImGui::Separator();
-        ImGui::TextDisabled("End: close. Changes are saved to dlssnr-amd.ini at once.");
+        // the footer: NR's GPU time a frame in its parts, the game's render size and the upscaler's output, and a close
+        // button (changes are written at once: no save button)
+        uint32_t rw = 0, rh = 0, ow = 0, oh = 0;
+        upscaling(s, &rw, &rh, &ow, &oh);
+        char sizes[96] = "";
+        if (rw && ow && (rw != ow || rh != oh)) std::snprintf(sizes, sizeof sizes, tr("    Upscaling %ux%u -> %ux%u"), rw, rh, ow, oh);
+        else if (rw && ow) std::snprintf(sizes, sizeof sizes, tr("    No upscaling: %ux%u"), ow, oh);
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextDisabled("%s%s", nr::control_ui::cost_text(s).c_str(), sizes);
+        const float bw = ImGui::CalcTextSize(tr("Close")).x + 2 * ImGui::GetStyle().FramePadding.x;
+        ImGui::SameLine(std::max(0.f, ImGui::GetWindowWidth() - bw - ImGui::GetStyle().WindowPadding.x));
+        if (ImGui::Button(tr("Close"))) g_input.close();
     }
 };
 
@@ -644,6 +1031,9 @@ struct Encoding { uint32_t mode; float scale; const char* name; };
 
 std::mutex g_spaces_mutex;
 std::unordered_map<IDXGISwapChain*, DXGI_COLOR_SPACE_TYPE> g_spaces;   // what the game set (SetColorSpace1)
+// The last one set on any swap chain: the game's own swap chain (OptiScaler's wrapper, or frame generation's) passes
+// SetColorSpace1 to the one below, where it is seen - the menu drawn at the game's Present (draw_game) takes it
+int g_last_space = -1;
 
 // The swap chain's encoding: the colour space the game set if we saw it, else what its format and the display say
 // (a float swap chain is scRGB; a 10-bit one on an HDR display taken as HDR10).
@@ -655,6 +1045,7 @@ Encoding encoding_of(IDXGISwapChain* sc, DXGI_FORMAT format) {
         std::lock_guard<std::mutex> lock(g_spaces_mutex);
         const auto it = g_spaces.find(sc);
         if (it != g_spaces.end()) { space = it->second; known = true; }
+        else if (g_last_space >= 0) { space = DXGI_COLOR_SPACE_TYPE(g_last_space); known = true; }
     }
     if (!known) {
         if (format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
@@ -748,7 +1139,7 @@ void dump_pixel(const uint8_t* px, DXGI_FORMAT format, uint32_t mode, uint8_t rg
 }
 void dump_write(const uint8_t* data, uint32_t pitch, uint32_t w, uint32_t h, DXGI_FORMAT format, uint32_t mode) {
     g_dump.done = true;
-    FILE* f = std::fopen(g_dump.path.c_str(), "wb");
+    FILE* f = nr::u8::fopen(g_dump.path.c_str(), "wb");
     if (!f) { say("NR_CONTROL_DUMP: cannot write " + g_dump.path); return; }
     std::fprintf(f, "P6\n%u %u\n255\n", w, h);
     const size_t step = format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8 : 4;
@@ -848,7 +1239,7 @@ struct D3D11Overlay {
         const uint32_t w = desc.BufferDesc.Width, h = desc.BufferDesc.Height;
         if (!w || !h) return;
         ImGui::SetCurrentContext(menu_ui.context);
-        if (!menu_ui.input(w, h)) return;
+        if (!menu_ui.input(w, h)) { trace("closed"); return; }
         ID3D11Texture2D* back = nullptr;
         check(sc->GetBuffer(0, IID_PPV_ARGS(&back)), "GetBuffer");
         ID3DDeviceContextState* game = nullptr;
@@ -856,6 +1247,7 @@ struct D3D11Overlay {
         ID3D11RenderTargetView* rtv = nullptr;
         try {
             ensure_menu(w, h);
+            if (menu_ui.fonts_for(h)) ImGui_ImplDX11_InvalidateDeviceObjects();
             ImGui_ImplDX11_NewFrame();
             menu_ui.build(h);
             const float clear[4] = {0, 0, 0, 0};
@@ -884,6 +1276,7 @@ struct D3D11Overlay {
             ID3D11ShaderResourceView* none = nullptr;
             context->PSSetShaderResources(0, 1, &none);
             ++g_drawn;
+            trace_drawn();
             if (dump_wanted()) dump(back, desc.BufferDesc.Format, enc.mode);
         } catch (...) {
             context->OMSetRenderTargets(0, nullptr, nullptr);
@@ -1016,7 +1409,10 @@ struct D3D12Overlay {
         if (!backend) throw std::runtime_error("ImGui's D3D12 backend did not start");
     }
     ~D3D12Overlay() {
-        wait_all();
+        if (!wait_all()) {   // the GPU may still run our last list: its objects are left as they are (kept, not freed)
+            say("the menu's last list did not finish in 2 s; its objects are kept, not freed");
+            return;
+        }
         ImGui::SetCurrentContext(menu_ui.context);
         if (backend) ImGui_ImplDX12_Shutdown();
         for (auto& p : pipelines) p.second->Release();
@@ -1041,14 +1437,22 @@ struct D3D12Overlay {
         h.ptr += SIZE_T(i) * rtv_step;
         return h;
     }
-    void wait(uint64_t value) {
-        if (!value || fence->GetCompletedValue() >= value) return;
+    // Whether the GPU is past `value` (waited for up to 2 s): what it still runs is not reset or released when not.
+    bool wait(uint64_t value) {
+        if (!value || fence->GetCompletedValue() >= value) return true;
         if (SUCCEEDED(fence->SetEventOnCompletion(value, event))) WaitForSingleObject(event, 2000);
+        if (fence->GetCompletedValue() >= value) return true;
+        static bool said = false;
+        if (!said) {
+            said = true;
+            log("[nr] NR Control: its last drawing is still on the GPU after 2 s; the menu skips Presents until it is done");
+        }
+        return false;
     }
-    void wait_all() { if (fence) wait(fence_value); }
-    void ensure_menu(uint32_t w, uint32_t h) {
-        if (menu && w == width && h == height) return;
-        wait_all();
+    bool wait_all() { return !fence || wait(fence_value); }
+    bool ensure_menu(uint32_t w, uint32_t h) {
+        if (menu && w == width && h == height) return true;
+        if (!wait_all()) return false;
         release(menu);
         D3D12_HEAP_PROPERTIES heap{};
         heap.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -1060,9 +1464,11 @@ struct D3D12Overlay {
         clear.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         check(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
                                               &clear, IID_PPV_ARGS(&menu)), "the menu image");
+        nr::vram::track_d3d12(device, menu, nr::vram::kMenu);
         device->CreateRenderTargetView(menu, nullptr, rtv(0));
         device->CreateShaderResourceView(menu, nullptr, srv_cpu(0));
         width = w; height = h;
+        return true;
     }
     ID3D12PipelineState* pipeline(DXGI_FORMAT format) {
         const auto it = pipelines.find(format);
@@ -1107,7 +1513,7 @@ struct D3D12Overlay {
         const uint32_t w = desc.BufferDesc.Width, h = desc.BufferDesc.Height;
         if (!w || !h) return;
         ImGui::SetCurrentContext(menu_ui.context);
-        if (!menu_ui.input(w, h)) return;
+        if (!menu_ui.input(w, h)) { trace("closed"); return; }
         IDXGISwapChain3* sc3 = nullptr;
         check(sc->QueryInterface(IID_PPV_ARGS(&sc3)), "IDXGISwapChain3");
         const UINT index = sc3->GetCurrentBackBufferIndex();
@@ -1115,12 +1521,16 @@ struct D3D12Overlay {
         ID3D12Resource* back = nullptr;
         check(sc->GetBuffer(index, IID_PPV_ARGS(&back)), "GetBuffer");
         struct Hold { ID3D12Resource*& r; ~Hold() { release(r); } } hold{back};
-        ensure_menu(w, h);
+        if (!ensure_menu(w, h)) { trace("skipped: the menu image"); return; }
         const Encoding enc = encoding_of(sc, desc.BufferDesc.Format);
         ID3D12PipelineState* compose = pipeline(desc.BufferDesc.Format);
+        if (!wait(done_at[frame])) { trace("skipped: the slot on the GPU"); return; }   // this slot's list is still on the GPU: no menu on this Present
+        if (menu_ui.fonts_for(h)) {   // the old font texture may still be read by a frame on the GPU
+            if (!wait_all()) { trace("skipped: the font"); return; }
+            ImGui_ImplDX12_InvalidateDeviceObjects();
+        }
         ImGui_ImplDX12_NewFrame();
         menu_ui.build(h);
-        wait(done_at[frame]);
         check(allocators[frame]->Reset(), "the command allocator's reset");
         check(list->Reset(allocators[frame], nullptr), "the command list's reset");
         // ImGui into the menu image, from transparent black
@@ -1152,6 +1562,7 @@ struct D3D12Overlay {
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         list->DrawInstanced(3, 1, 0, 0);
         ++g_drawn;
+        trace_drawn();
         // NR_CONTROL_DUMP: the drawn back buffer into a readback buffer
         ID3D12Resource* readback = nullptr;
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout{};
@@ -1183,11 +1594,17 @@ struct D3D12Overlay {
         check(list->Close(), "the command list's close");
         ID3D12CommandList* lists[] = {list};
         queue->ExecuteCommandLists(1, lists);
+        // the slot's completion value set before the signal: if the signal fails, the fence never reaches it and the
+        // slot's allocator is not reused (wait() times out) rather than reset under the list just executed
+        done_at[frame] = fence_value + 1;
         check(queue->Signal(fence, ++fence_value), "the fence signal");
-        done_at[frame] = fence_value;
         frame = (frame + 1) % kFrames;
         if (readback) {
-            wait(fence_value);
+            if (!wait(fence_value)) {   // a test's dump only: not read, and the buffer left to the GPU (kept)
+                say("NR_CONTROL_DUMP: the copy did not finish in 2 s; no dump");
+                g_dump.done = true;
+                return;
+            }
             void* p = nullptr;
             const D3D12_RANGE range{0, SIZE_T(layout.Footprint.RowPitch) * h};
             if (SUCCEEDED(readback->Map(0, &range, &p))) {
@@ -1201,6 +1618,27 @@ struct D3D12Overlay {
         }
     }
 };
+
+// ---- the queue a D3D12 swap chain presents on ----
+// Under Proton DXVK's DXGI gives a D3D12 swap chain's device, not its queue: the queue is the direct queue this thread
+// last executed command lists on (the frame's). ID3D12CommandQueue::ExecuteCommandLists of the game's queue class is
+// hooked to know it (watch_queues).
+using ExecuteFn = void(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
+ExecuteFn g_execute = nullptr;
+std::atomic<ExecuteObserver> g_execute_observer{nullptr};   // on_execute
+thread_local ID3D12CommandQueue* t_last_direct = nullptr;
+thread_local ID3D12CommandQueue* t_last_seen = nullptr;
+void STDMETHODCALLTYPE execute_hook(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists) {
+    if (q != t_last_seen) {   // asked once per change of queue on this thread
+        t_last_seen = q;
+        if (q->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT) t_last_direct = q;
+    }
+    g_execute(q, n, lists);
+    if (const ExecuteObserver observer = g_execute_observer.load()) observer(q, n, lists);
+}
+ID3D12CommandQueue* last_direct_queue() { return t_last_direct; }
+std::atomic<D3D12PresentHook> g_d3d12_hook{nullptr};   // on_d3d12_present
+std::atomic<D3D11PresentHook> g_d3d11_hook{nullptr};   // on_d3d11_present
 
 // ---- the hooks ----
 std::mutex g_mutex;   // one Present at a time draws the menu
@@ -1220,19 +1658,28 @@ template <class T> void let_go_idle(std::map<void*, Kept<T>>& m, std::chrono::st
         else ++it;
 }
 
+#include "nr_pe_menu_vk.inl"
+
 // The menu over this swap chain's back buffer, before its Present. Never throws.
-void draw_on(IDXGISwapChain* sc, UINT flags) {
-    ++g_presents;
+std::atomic<ULONGLONG> g_game_drawn_ms{0};   // NR Control drawn at the game's own Present then (draw_game)
+// `known`: the game's own swap chain's queue (D3D12) or device (D3D11), given by draw_game - the menu drawn there, no
+// hooks run; null: the system's Present - the hooks run, and the menu is drawn unless draw_game drew it in the last second.
+void draw_on(IDXGISwapChain* sc, UINT flags, IUnknown* known = nullptr) {
+    if (!known) ++g_presents;
     if (t_inside || (flags & DXGI_PRESENT_TEST)) return;
     t_inside = true;
     std::lock_guard<std::mutex> lock(g_mutex);
     const auto now = std::chrono::steady_clock::now();
-    let_go_idle(g_d3d11, now);
-    let_go_idle(g_d3d12, now);
-    const auto said = [sc](const char* api) {
+    const bool menu_here = known || GetTickCount64() - g_game_drawn_ms.load() >= 1000;
+    // Refresh the presenting device before reaping idle overlays. A slow first frame or a pause must not
+    // destroy its ImGui context on the very Present that is using it again.
+    struct Reap { std::chrono::steady_clock::time_point now; ~Reap() {
+        let_go_idle(g_d3d11, now); let_go_idle(g_d3d12, now);
+    } } reap{now};
+    const auto said = [sc, known](const char* api) {
         DXGI_SWAP_CHAIN_DESC desc{};
         sc->GetDesc(&desc);
-        say(std::string("drawn over a ") + api + " swap chain, " + std::to_string(desc.BufferDesc.Width) + "x" +
+        say(std::string("drawn over ") + (known ? "the game's own " : "a ") + api + " swap chain, " + std::to_string(desc.BufferDesc.Width) + "x" +
             std::to_string(desc.BufferDesc.Height) + ", DXGI format " + std::to_string(int(desc.BufferDesc.Format)) +
             ": " + encoding_of(sc, desc.BufferDesc.Format).name);
     };
@@ -1240,24 +1687,49 @@ void draw_on(IDXGISwapChain* sc, UINT flags) {
         ID3D11Device* d11 = nullptr;
         ID3D12CommandQueue* q12 = nullptr;
         ID3D12Device* d12dev = nullptr;
-        // A D3D12 swap chain's device is the queue it presents on where DXGI hands that out; else (DXVK's DXGI,
-        // and the runtime's here) the D3D12 device, and the queue is the direct queue this thread has just executed
-        // the frame on (nr_pe_d3d12split.hpp).
-        if (FAILED(sc->GetDevice(IID_PPV_ARGS(&d11))) || !d11) {
+        // A D3D12 swap chain's device is the queue it presents on where DXGI hands that out; else (DXVK's DXGI) the
+        // D3D12 device, and the queue is the direct queue this thread has just executed the frame on (watch_queues).
+        // At the game's own Present (draw_game) the queue or device it was made with.
+        if (known) {
+            if (FAILED(known->QueryInterface(IID_PPV_ARGS(&d11))) || !d11) {
+                release(d11);
+                if (FAILED(known->QueryInterface(IID_PPV_ARGS(&q12)))) q12 = nullptr;
+            }
+            if (!d11 && !q12) { t_inside = false; return; }
+        } else if (FAILED(sc->GetDevice(IID_PPV_ARGS(&d11))) || !d11) {
             release(d11);
             if ((FAILED(sc->GetDevice(IID_PPV_ARGS(&q12))) || !q12) && SUCCEEDED(sc->GetDevice(IID_PPV_ARGS(&d12dev))) &&
                 d12dev) {
                 release(q12);
-                if (ID3D12CommandQueue* last = nr::pe::split::last_direct_queue()) {
+                if (ID3D12CommandQueue* last = last_direct_queue()) {
                     ID3D12Device* owner = nullptr;
                     if (SUCCEEDED(last->GetDevice(IID_PPV_ARGS(&owner))) && owner == d12dev) { q12 = last; q12->AddRef(); }
                     release(owner);
                 }
                 release(d12dev);
-                if (!q12) { t_inside = false; return; }   // no frame executed on this thread yet: next Present
+                if (!q12) {   // no frame executed on this thread yet: next Present
+                    // said (the first three, then every 1000th): a Present thread of frame generation's that never
+                    // executes a list would leave the menu off its frames - it would flicker
+                    static std::atomic<uint64_t> skipped{0};
+                    const uint64_t n = ++skipped;
+                    if (n <= 3 || n % 1000 == 0)
+                        say("a Present on thread " + std::to_string(GetCurrentThreadId()) + " has no D3D12 queue to draw on; "
+                            "the menu is not on that frame (" + std::to_string(n) + " so far)");
+                    t_inside = false;
+                    return;
+                }
             }
         }
-        if (d11) {
+        if (d11 && !menu_here) {   // drawn at the game's own Present: the hook only
+            if (const D3D11PresentHook hook = g_d3d11_hook.load()) hook(sc, d11);
+            d11->Release();
+        } else if (q12 && !menu_here) {
+            if (const D3D12PresentHook hook = g_d3d12_hook.load()) {
+                DXGI_SWAP_CHAIN_DESC d{};
+                if (SUCCEEDED(sc->GetDesc(&d))) hook(sc, q12, int(encoding_of(sc, d.BufferDesc.Format).mode));
+            }
+            q12->Release();
+        } else if (d11) {
             auto& k = g_d3d11[d11];
             k.used = now;
             if (!k.overlay) {
@@ -1270,8 +1742,11 @@ void draw_on(IDXGISwapChain* sc, UINT flags) {
                 }
                 said("D3D11");
             }
+            if (const D3D11PresentHook hook = known ? nullptr : g_d3d11_hook.load()) hook(sc, d11);
             d11->Release();
+            g_api_name = "D3D11";
             k.overlay->present(sc);
+            if (known) g_game_drawn_ms = GetTickCount64();
         } else if (q12) {
             auto& k = g_d3d12[q12];
             k.used = now;
@@ -1290,8 +1765,26 @@ void draw_on(IDXGISwapChain* sc, UINT flags) {
                 d12->Release();
                 said("D3D12");
             }
+            {   // a removed device (the game may end itself on it, with nothing else to see): said once, with the reason
+                static bool removed_said = false;
+                ID3D12Device* d12 = nullptr;
+                if (!removed_said && SUCCEEDED(q12->GetDevice(IID_PPV_ARGS(&d12))) && d12) {
+                    const HRESULT why = d12->GetDeviceRemovedReason();
+                    if (why != S_OK) {
+                        removed_said = true;
+                        log("[nr] the game's D3D12 device was removed (reason 0x%08lX)", static_cast<unsigned long>(why));
+                    }
+                }
+                release(d12);
+            }
             q12->Release();
+            if (const D3D12PresentHook hook = known ? nullptr : g_d3d12_hook.load()) {
+                DXGI_SWAP_CHAIN_DESC d{};
+                if (SUCCEEDED(sc->GetDesc(&d))) hook(sc, q12, int(encoding_of(sc, d.BufferDesc.Format).mode));
+            }
+            g_api_name = "D3D12";
             k.overlay->present(sc);
+            if (known) g_game_drawn_ms = GetTickCount64();
         } else if (g_failed_for != sc) {
             g_failed_for = sc;
             IUnknown* u = nullptr;
@@ -1322,20 +1815,32 @@ PresentFn g_present[2]{};
 Present1Fn g_present1[2]{};
 SetColorSpace1Fn g_colour_space[2]{};
 
+// After the first evaluates (trace_arm): each Present step by step
 template <int N> HRESULT STDMETHODCALLTYPE present_hook(IDXGISwapChain* sc, UINT interval, UINT flags) {
+    const int tr = nr::pe::trace_present();
+    if (tr) log("[nr] trace p%d: Present in (swap chain %p, thread %lu)", tr, static_cast<void*>(sc), GetCurrentThreadId());
     draw_on(sc, flags);
-    return g_present[N](sc, interval, flags);
+    if (tr) log("[nr] trace p%d: NR Control's part done; the Present itself next", tr);
+    const HRESULT hr = g_present[N](sc, interval, flags);
+    if (tr) log("[nr] trace p%d: Present out (0x%08lX)", tr, static_cast<unsigned long>(hr));
+    return hr;
 }
 template <int N> HRESULT STDMETHODCALLTYPE present1_hook(IDXGISwapChain1* sc, UINT interval, UINT flags,
                                                          const DXGI_PRESENT_PARAMETERS* p) {
+    const int tr = nr::pe::trace_present();
+    if (tr) log("[nr] trace p%d: Present1 in (swap chain %p, thread %lu)", tr, static_cast<void*>(sc), GetCurrentThreadId());
     draw_on(sc, flags);
-    return g_present1[N](sc, interval, flags, p);
+    if (tr) log("[nr] trace p%d: NR Control's part done; the Present itself next", tr);
+    const HRESULT hr = g_present1[N](sc, interval, flags, p);
+    if (tr) log("[nr] trace p%d: Present1 out (0x%08lX)", tr, static_cast<unsigned long>(hr));
+    return hr;
 }
 template <int N> HRESULT STDMETHODCALLTYPE colour_space_hook(IDXGISwapChain3* sc, DXGI_COLOR_SPACE_TYPE space) {
     const HRESULT hr = g_colour_space[N](sc, space);
     if (SUCCEEDED(hr)) {
         std::lock_guard<std::mutex> lock(g_spaces_mutex);
         g_spaces[sc] = space;
+        g_last_space = int(space);
     }
     return hr;
 }
@@ -1345,9 +1850,7 @@ void install_now() {
     const std::string folder = nr::pe::module_folder();
     std::wstring probe, out;
     {
-        wchar_t w[MAX_PATH * 2] = {};
-        MultiByteToWideChar(CP_ACP, 0, (folder + "\\dlssnr-amd\\nr_present_probe.exe").c_str(), -1, w, MAX_PATH * 2);
-        probe = w;
+        probe = nr::u8::wide(folder + "\\dlssnr-amd\\nr_present_probe.exe");
         wchar_t tmp[MAX_PATH] = {};
         GetTempPathW(MAX_PATH, tmp);
         out = std::wstring(tmp) + L"dlssnr-amd-present-" + std::to_wstring(GetCurrentProcessId()) + L".txt";
@@ -1420,10 +1923,135 @@ void install_now() {
     std::string list;
     for (const auto& a : apis) list += (list.empty() ? "" : ", ") + a;
     if (!targets[0].used) { say("Present was not hooked; no menu"); return; }
-    say("End opens the menu (DXGI's Present hooked; probed with " + list + " swap chains)");
+    say("its key ([NRControl] MenuKey, End by default) opens the menu (DXGI's Present hooked; probed with " + list +
+        " swap chains)");
+    nr::pe::control::start_input();   // its keys from now on, not from NR's first evaluate
 }
 
 }  // namespace
+
+void abandon_at_exit() {
+    for (auto& [k, v] : g_vulkan) (void)v.release();
+    for (auto& [k, v] : g_d3d11) (void)v.overlay.release();
+    for (auto& [k, v] : g_d3d12) (void)v.overlay.release();
+}
+
+
+const VkPresentInfoKHR* vulkan_present(VkInstance instance, VkPhysicalDevice physical, VkDevice device,
+        VkQueue queue, uint32_t family, VkSwapchainKHR sc, VkFormat format, VkColorSpaceKHR space,
+        VkExtent2D extent, const std::vector<VkImage>& images, const VkPresentInfoKHR* info) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    static thread_local VkPresentInfoKHR result;
+    if (!info || info->swapchainCount != 1 || !info->pImageIndices || info->pImageIndices[0] >= images.size()) return nullptr;
+    auto& o = g_vulkan[sc];
+    bool submitted_frame = false;
+    try {
+        nr::pe::control::start_input();
+        if (!o) {
+            o = std::make_unique<VulkanOverlay>();
+            o->init(instance,physical,device,queue,family,format,space,extent,images);
+            say("drawn over a Vulkan swap chain, " + std::to_string(extent.width) + "x" + std::to_string(extent.height) +
+                ": " + o->encoding.name);
+        }
+        if (o->failed || !o->input()) return nullptr;
+        // A shared menu image and ImGui upload buffers: finish our prior draw before changing either.
+        if (o->last && vkWaitForFences(device,1,&o->last,VK_TRUE,2000000000ull)!=VK_SUCCESS) return nullptr;
+        const uint32_t index=info->pImageIndices[0];
+        auto& f=o->submits[index];
+        if (vkWaitForFences(device,1,&f.fence,VK_TRUE,2000000000ull)!=VK_SUCCESS) return nullptr;
+        vk_check(vkResetCommandBuffer(f.cmd,0),"menu reset");
+        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};bi.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vk_check(vkBeginCommandBuffer(f.cmd,&bi),"menu begin");
+        o->record(f.cmd,index);
+        ++g_drawn;
+        const bool dump=vk_dump_record(*o,f.cmd,index);
+        vk_check(vkEndCommandBuffer(f.cmd),"menu end");
+        std::vector<VkPipelineStageFlags> waits(info->waitSemaphoreCount,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};si.waitSemaphoreCount=info->waitSemaphoreCount;
+        si.pWaitSemaphores=info->pWaitSemaphores;si.pWaitDstStageMask=waits.data();si.commandBufferCount=1;si.pCommandBuffers=&f.cmd;
+        si.signalSemaphoreCount=1;si.pSignalSemaphores=&f.done;
+        vk_check(vkResetFences(device,1,&f.fence),"menu fence reset");
+        const bool held=nr::pe::vkdevice::lock_queue_held(queue);
+        const VkResult submitted=vkQueueSubmit(queue,1,&si,f.fence);
+        nr::pe::vkdevice::unlock_queue_held(queue,held);
+        vk_check(submitted,"menu submit");
+        o->last=f.fence;
+        result=*info;result.waitSemaphoreCount=1;result.pWaitSemaphores=&f.done;
+        submitted_frame = true;
+        if (dump && vkWaitForFences(device,1,&f.fence,VK_TRUE,2000000000ull)==VK_SUCCESS) {
+            const uint32_t bpp=format==VK_FORMAT_R16G16B16A16_SFLOAT?8:4;
+            dump_write(static_cast<const uint8_t*>(o->mapped),extent.width*bpp,extent.width,extent.height,
+                       dump_format(format),o->encoding.mode);
+            g_dump.done=true;
+        }
+        return &result;
+    } catch (const std::exception& e) {
+        if(o)o->failed=true;
+        say(std::string("Vulkan menu: ")+e.what());
+        return submitted_frame ? &result : nullptr;
+    }
+}
+
+void vulkan_forget(VkDevice device, VkSwapchainKHR sc) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    for(auto it=g_vulkan.begin();it!=g_vulkan.end();) {
+        auto& o=it->second;
+        if(!o || (o->device==device && (!sc || it->first==sc))) {
+            // Finish the menu commands before releasing their images and views.
+            if(o) {
+                const bool held=nr::pe::vkdevice::lock_queue_held(o->queue);
+                const VkResult idle=vkQueueWaitIdle(o->queue);
+                nr::pe::vkdevice::unlock_queue_held(o->queue,held);
+                if(idle!=VK_SUCCESS) (void)o.release();
+            }
+            it=g_vulkan.erase(it);
+        } else ++it;
+    }
+    nr::pe::receipts::collect();
+}
+
+void watch_queues(ID3D12Device* device) {
+    static std::once_flag once;
+    std::call_once(once, [device] {
+        D3D12_COMMAND_QUEUE_DESC qd{};
+        qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        ID3D12CommandQueue* q = nullptr;
+        if (!device || FAILED(device->CreateCommandQueue(&qd, IID_PPV_ARGS(&q))) || !q) {
+            say("no queue to learn the swap chains' queue from; no menu over D3D12 swap chains");
+            return;
+        }
+        // IUnknown 3, ID3D12Object 4, ID3D12DeviceChild 1, ID3D12CommandQueue: UpdateTileMappings, CopyTileMappings,
+        // ExecuteCommandLists
+        void* fn = (*reinterpret_cast<void***>(q))[10];
+        q->Release();
+        const MH_STATUS init = MH_Initialize();
+        if ((init != MH_OK && init != MH_ERROR_ALREADY_INITIALIZED) ||
+            MH_CreateHook(fn, reinterpret_cast<void*>(&execute_hook), reinterpret_cast<void**>(&g_execute)) != MH_OK ||
+            MH_EnableHook(fn) != MH_OK)
+            say("ExecuteCommandLists could not be hooked; no menu over D3D12 swap chains");
+    });
+}
+
+void on_d3d12_present(D3D12PresentHook hook) { g_d3d12_hook.store(hook); }
+void draw_game(IDXGISwapChain* swap_chain, IUnknown* device) {
+    if (swap_chain && device) draw_on(swap_chain, 0, device);
+}
+void on_d3d11_present(D3D11PresentHook hook) { g_d3d11_hook.store(hook); }
+void on_execute(ExecuteObserver observer) { g_execute_observer.store(observer); }
+bool colour_space_of(IDXGISwapChain* swap_chain, int* space) {
+    std::lock_guard<std::mutex> lock(g_spaces_mutex);
+    const auto it = g_spaces.find(swap_chain);
+    if (it == g_spaces.end()) {
+        // NR_TEST_COLOUR_SPACE=<DXGI_COLOR_SPACE_TYPE> (tests): a swap chain the game set no colour space on is taken
+        // as in that one (a test display whose surface refuses HDR colour spaces)
+        static const int forced = [] { const char* e = std::getenv("NR_TEST_COLOUR_SPACE"); return e ? std::atoi(e) : -1; }();
+        if (forced < 0) return false;
+        *space = forced;
+        return true;
+    }
+    *space = int(it->second);
+    return true;
+}
 
 void install() {
     static std::once_flag once;

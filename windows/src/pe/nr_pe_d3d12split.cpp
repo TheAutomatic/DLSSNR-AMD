@@ -1,9 +1,11 @@
+#include "nr_path_win.hpp"
 #include "nr_pe_d3d12split.hpp"
 
 #include "nr_pe_log.hpp"
 
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -1005,10 +1007,21 @@ QueueFence* completion_fence(ID3D12CommandQueue* q) {
 thread_local ID3D12CommandQueue* t_last_direct = nullptr;
 thread_local ID3D12CommandQueue* t_last_seen = nullptr;
 
+void execute_cut(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists, PFN_Execute execute);
+
 void STDMETHODCALLTYPE hk_Execute(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists) {
     // Patching is under g_mutex; the class table only grows, so a lookup outside it is safe once the
     // hook it led here through exists.
     const PFN_Execute execute = execute_of(q);
+    // After the first evaluates, every execution step by step (trace_arm)
+    const int tr = trace_execute();
+    if (tr) log("[nr] trace x%d: ExecuteCommandLists in (queue %p, %u lists, thread %lu)", tr, static_cast<void*>(q), n,
+                GetCurrentThreadId());
+    execute_cut(q, n, lists, execute);
+    if (tr) log("[nr] trace x%d: ExecuteCommandLists out", tr);
+}
+
+void execute_cut(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists, PFN_Execute execute) {
     if (q != t_last_seen) {   // last_direct_queue(): asked once per change of queue on this thread
         t_last_seen = q;
         if (q->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT) t_last_direct = q;
@@ -1035,6 +1048,14 @@ void STDMETHODCALLTYPE hk_Execute(ID3D12CommandQueue* q, UINT n, ID3D12CommandLi
         }
     }
     if (work.empty()) return execute(q, n, lists);
+    // The first executions of cut lists, step by step (PBZ: the game ended right after the first frame with a layer
+    // before the upscaler, with nothing logged)
+    static std::atomic<int> traced{0};
+    const int tr = traced.load() < 12 ? ++traced : 0;
+    size_t segments = 0;
+    for (const auto& w : work) segments += w.cut.segments.size();
+    if (tr) log("[nr] trace: lists with %zu cut(s) executed on queue %p (%u lists), thread %lu", segments,
+                static_cast<void*>(q), n, GetCurrentThreadId());
     static bool said_again = false;
     std::vector<ID3D12CommandList*> batch;
     std::vector<Cont*> ran;
@@ -1057,6 +1078,7 @@ void STDMETHODCALLTYPE hk_Execute(ID3D12CommandQueue* q, UINT n, ID3D12CommandLi
         for (Cont* c : w.again) { batch.push_back(c->list); ran.push_back(c); }
     }
     if (!batch.empty()) execute(q, UINT(batch.size()), batch.data());
+    if (tr) log("[nr] trace: those lists and the network's hand-overs executed");
     std::lock_guard<std::recursive_mutex> guard(g_mutex);
     QueueFence* f = completion_fence(q);
     const bool signalled = f && SUCCEEDED(q->Signal(f->fence, f->value + 1));
@@ -1090,9 +1112,9 @@ bool write_vtable(void** vt, unsigned slot, void* fn) {
 // Where an address lives, for the log: a module's file name, or private memory (a heap).
 std::string where_is(const void* p) {
     HMODULE m = nullptr;
-    char path[MAX_PATH] = {};
+    char path[MAX_PATH * 4] = {};
     if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           static_cast<const char*>(p), &m) && m && GetModuleFileNameA(m, path, sizeof path)) {
+                           static_cast<const char*>(p), &m) && m && nr::u8::module_file(m, path, sizeof path)) {
         const char* base = std::strrchr(path, '\\');
         return base ? base + 1 : path;
     }

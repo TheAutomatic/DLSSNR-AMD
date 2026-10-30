@@ -1,3 +1,4 @@
+#include "nr_path_win.hpp"
 #include "nr_pe_crash.hpp"
 
 #include "nr_pe_log.hpp"
@@ -8,6 +9,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <string>
 
 namespace nr::pe {
@@ -32,15 +34,15 @@ bool fatal(DWORD code) {
 // "module+0xoffset", or the bare address when it is in no module.
 std::string where(DWORD64 at) {
     HMODULE m = nullptr;
-    char path[MAX_PATH] = {};
+    char path[MAX_PATH * 4] = {};
     if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                            reinterpret_cast<LPCSTR>(at), &m) || !m || !GetModuleFileNameA(m, path, MAX_PATH)) {
+                            reinterpret_cast<LPCSTR>(at), &m) || !m || !nr::u8::module_file(m, path, sizeof path)) {
         char b[32];
         std::snprintf(b, sizeof b, "0x%llx", static_cast<unsigned long long>(at));
         return b;
     }
     const char* name = std::strrchr(path, '\\');
-    char b[MAX_PATH + 32];
+    char b[MAX_PATH * 4 + 32];
     std::snprintf(b, sizeof b, "%s+0x%llx", name ? name + 1 : path,
                   static_cast<unsigned long long>(at - reinterpret_cast<DWORD64>(m)));
     return b;
@@ -52,10 +54,12 @@ void write_dump(EXCEPTION_POINTERS* ep) {
                              PMINIDUMP_USER_STREAM_INFORMATION, PMINIDUMP_CALLBACK_INFORMATION);
     auto fn = reinterpret_cast<Fn>(GetProcAddress(dbghelp, "MiniDumpWriteDump"));
     if (!fn) return;
-    char path[MAX_PATH] = {};
-    GetModuleFileNameA(nullptr, path, MAX_PATH);
-    if (char* s = std::strrchr(path, '\\')) std::strcpy(s + 1, "dlssnr-amd-crash.dmp");
-    HANDLE f = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    // (the wide path on the stack: no heap use here, the heap may be what broke)
+    wchar_t path[MAX_PATH * 2] = {};
+    const DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH * 2);
+    if (!n || n >= MAX_PATH * 2 - 24) return;
+    if (wchar_t* s = std::wcsrchr(path, L'\\')) std::wcscpy(s + 1, L"dlssnr-amd-crash.dmp");
+    HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) return;
     MINIDUMP_EXCEPTION_INFORMATION info{GetCurrentThreadId(), ep, FALSE};
     const BOOL ok = fn(GetCurrentProcess(), GetCurrentProcessId(), f,
@@ -68,7 +72,19 @@ void write_dump(EXCEPTION_POINTERS* ep) {
 
 LONG CALLBACK on_exception(EXCEPTION_POINTERS* ep) {
     const EXCEPTION_RECORD* rec = ep ? ep->ExceptionRecord : nullptr;
-    if (!rec || !fatal(rec->ExceptionCode)) return EXCEPTION_CONTINUE_SEARCH;
+    if (rec && !fatal(rec->ExceptionCode)) {
+        // After the first evaluate (trace_arm): the first exceptions of any kind but the usual notices (thread names,
+        // debug output, breakpoints), first-chance - a C++ exception nobody catches ends the game in abort's fast fail,
+        // which no handler sees (PBZ: a game that ended with nothing logged)
+        const DWORD code = rec->ExceptionCode;
+        if (code != 0x406D1388 && code != 0x40010006 && code != 0x4001000A && code != 0x80000003) {
+            if (const int n = trace_exception())
+                log("[nr] trace e%d: exception 0x%08lX (first chance) at %s, thread %lu", n, code,
+                    where(reinterpret_cast<DWORD64>(rec->ExceptionAddress)).c_str(), GetCurrentThreadId());
+        }
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    if (!rec) return EXCEPTION_CONTINUE_SEARCH;
     if (reports.fetch_add(1) >= 3) return EXCEPTION_CONTINUE_SEARCH;
     const DWORD64 at = reinterpret_cast<DWORD64>(rec->ExceptionAddress);
     if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && rec->NumberParameters >= 2)
@@ -104,11 +120,15 @@ LONG CALLBACK on_exception(EXCEPTION_POINTERS* ep) {
 
 }  // namespace
 
+std::string where_address(const void* at) { return where(reinterpret_cast<DWORD64>(at)); }
+
 void install_crash_watch() {
     if (handler) return;
     // Loaded now: nothing may be loaded from inside the handler.
     dbghelp = LoadLibraryW(L"dbghelp.dll");
-    handler = AddVectoredExceptionHandler(0, &on_exception);
+    // First in line: a game's or another hook's own handler may end the process before a later one is asked (PBZ:
+    // games ended with nothing logged)
+    handler = AddVectoredExceptionHandler(1, &on_exception);
 }
 
 void remove_crash_watch() {

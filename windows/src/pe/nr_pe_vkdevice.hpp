@@ -13,6 +13,7 @@
 // The queue matters and is not a detail: building the network uploads its
 // weights, which is a submit. Without a queue the Vulkan paths can record
 // nothing at all.
+#include <string>
 #include "nr_pe_interop.hpp"
 
 namespace nr::pe::vkdevice {
@@ -62,5 +63,38 @@ void note_handles(VkInstance instance, VkPhysicalDevice physical, VkDevice devic
 // The watch added the network's features (nr::DeviceFeatures::enable, bufferDeviceAddress among
 // them) to this device's vkCreateDevice and the device was created with them.
 bool network_features_added(VkDevice device);
+// That device was made for RDNA3's network (nr_gpu_arch.hpp).
+bool runs_rdna3(VkDevice device);
+// A game's vkCreateDevice seen by someone other than the watcher (the .asi's wrap of the loader's vkCreateDevice): made
+// with the network's extensions and features, and ACO Mode's pipeline binaries, as the watcher makes it; made again as
+// the game asked when that fails. `added` says which it was.
+VkResult create_with_network(PFN_vkCreateDevice create, VkPhysicalDevice physical, const VkDeviceCreateInfo* info,
+                             const VkAllocationCallbacks* allocator, VkDevice* out, bool* added);
+// A device the game made, seen by someone other than the watcher (the .asi's vkCreateDevice wrap): its handles and
+// the queue families it asked for, so queue_for() can find a queue of one of them.
+void note_device(VkInstance instance, VkPhysicalDevice physical, VkDevice device, const std::vector<uint32_t>& families);
+
+// The game destroys `device`: its queues and handles are forgotten (a later device may get the same handle).
+void forget_device(VkDevice device);
+// The GPU NR runs on, as its Vulkan driver names it ("AMD Radeon RX 9070 XT (RADV GFX1201)"); empty before NR has seen
+// a device. For NR Control's header.
+std::string gpu_name();
+// The physical device a network is built on (every route: a D3D game's comes through its translator's interop, not a
+// device seen being made)
+void note_gpu(VkPhysicalDevice physical);
+// Its driver as the driver names itself ("Mesa 26.2.5"; VkPhysicalDeviceDriverProperties::driverInfo, else its name)
+std::string driver_name();
+
+// Submits of ours onto a queue the game also submits to, serialised with the game's own: once enabled (the .asi on a
+// Vulkan game, which wraps the game's queue calls with the same per-queue lock), lock_queue / unlock_queue take the
+// queue's recursive lock; before that they do nothing (the ReShade routes: ReShade serialises its own queues).
+void enable_queue_locks();
+bool queue_locks_enabled();
+void lock_queue(VkQueue queue);
+void unlock_queue(VkQueue queue);
+// The same for a call that may begin before enable_queue_locks and end after it (a hook installed earlier): the lock
+// is released only if it was taken.
+bool lock_queue_held(VkQueue queue);
+void unlock_queue_held(VkQueue queue, bool held);
 
 }  // namespace nr::pe::vkdevice

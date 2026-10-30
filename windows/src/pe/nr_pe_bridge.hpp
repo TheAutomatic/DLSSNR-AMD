@@ -64,7 +64,14 @@ class Device {
     // Null with `why` set when the GPU or driver cannot carry the bridge; that answer is kept and
     // repeated for that adapter.
     static Device* get(const LUID& luid, std::string* why);
+    // The process is ending (DllMain's DLL_PROCESS_DETACH with `reserved`): the devices are left as they are, not
+    // destroyed by the static destructors - an implicit layer in front of them (Steam's overlay) has finished by then,
+    // and destroying through it crashed every game exit (SteamOverlayVulkanLayer64.dll, PBZ). The process's end frees
+    // them.
+    static void abandon_at_exit();
     const LUID& luid() const { return luid_; }
+    // The GPU runs RDNA3's network (nr_gpu_arch.hpp), as ACO's machine code from the bundle's rdna3 folder.
+    bool rdna3() const { return rdna3_; }
 
     DeviceHandles handles() const { return handles_; }
     VkQueue queue() const { return queue_; }
@@ -102,6 +109,8 @@ class Device {
     // later run_between/discard that holds an old pointer that the job has been handed out again since.
     Job* begin(std::string* why, const void* owner);
     VkCommandBuffer command_buffer(Job* job) const;
+    // What the recording turned out to use (begin may not know yet): busy(owner) answers for it from now on.
+    void set_owner(Job* job, const void* owner);
     uint64_t generation(const Job* job) const;
     // Called (once, on whatever thread) when a recorded job is never run as recorded: discarded,
     // refused, submitted out of recording order. The owner's history then cannot be trusted.
@@ -160,10 +169,18 @@ class Device {
     void drop_locked(Job* job, std::vector<std::function<void()>>& calls);
     bool done(Job* job);   // jobs_mutex_ held: submitted and its fence signalled
     LUID luid_{};
-    struct Buried { IUnknown* d3d; uint64_t mark; };
+    bool rdna3_{};
+    struct Buried { IUnknown* d3d; uint64_t mark; IUnknown* queue; };   // `mark` on `queue`'s shared fence
     std::vector<Buried> buried_;   // under sync_mutex_
-    void sweep_buried_locked(uint64_t completed);
-    IUnknown* hand_over_queue_{};   // the one D3D12 queue (or D3D11 context) the hand-overs run on
+    void sweep_buried_locked();
+    IUnknown* hand_over_queue_{};   // the one D3D12 queue (or D3D11 context) the hand-overs run on now
+    // Every hand-over queue so far, one an epoch (the top 16 bits of hand_over_mark), and the queue frames have been
+    // arriving on instead (run_between moves the hand-over there after enough of them in a row).
+    std::vector<IUnknown*> epochs_;
+    IUnknown* moving_to_{};
+    uint32_t moving_count_{};
+    void bind_hand_over_locked(IUnknown* queue);
+    uint64_t completed_locked(IUnknown* queue, bool* known);   // its shared fence's completed value (UINT64_MAX: gone)
     bool lost_{};
     bool import_image(HANDLE handle, VkExternalMemoryHandleTypeFlagBits type, uint32_t width, uint32_t height,
                       VkFormat format, bool storage, Image* out, std::string* why);
@@ -191,6 +208,9 @@ class Device {
     // caller's recording, and by anything else that allocates from the pool.
     std::mutex record_mutex_;
     VkCommandPool pool_{};
+    // initial_layout's own pool: a recording creates the twins it looks up while it holds record_mutex_.
+    std::mutex layout_mutex_;
+    VkCommandPool layout_pool_{};
     std::vector<std::unique_ptr<Job>> jobs_;
 
     // One shared fence per D3D queue (or D3D11 context), imported once. Values only grow: every signal

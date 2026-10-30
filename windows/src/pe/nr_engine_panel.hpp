@@ -5,6 +5,8 @@
 // draw the same lines (split). Every line starts with its state, the colour of its label: '+' from the game or not
 // needed, '~' covered by something else (a meter, Preprocess, a ReShade effect, a setting), '-' missing with nothing
 // covering it, '=' information; '!' is the hint line (the game gives no exposure and nothing covers it), all in colour.
+#include "nr_control_shared.hpp"
+
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -50,6 +52,13 @@ struct Facts {
     bool motion_without_depth = true;
     // Sizes and resets
     uint64_t resizes = 0, carried = 0, resets = 0;
+    // The .asi's wilsjo2 processing (renodx_route::Wilsjo2Facts)
+    bool wilsjo2 = false;
+    bool wilsjo2_hdr = false;
+    int wilsjo2_exposure = 0;        // 0 manual white point, 1 the game's exposure texture, 3 metered
+    uint32_t wilsjo2_asked = 0;      // WhitePointSource
+    float wilsjo2_white = 1.0f;      // WhitePointScale
+    uint32_t wilsjo2_mode = 0;       // ReversibleMode
 };
 
 inline std::string ev(float gain) {   // a gain as EV, "+1.25 EV"
@@ -67,6 +76,18 @@ inline std::string exposure_line(const Facts& f, bool* hint) {
             return b;
         }
         return "+Exposure: not needed - NR works on the finished picture (the game's exposure and tone mapping are in it)";
+    }
+    if (f.wilsjo2) {
+        if (!f.wilsjo2_hdr) return "+Exposure: not needed - an SDR picture is already exposed by the game";
+        if (f.wilsjo2_exposure == 1) return "+Exposure: the wilsjo2 encode's white point, from the game's exposure texture";
+        if (f.wilsjo2_exposure == 3)
+            return "~Exposure: the wilsjo2 automatic exposure, metered from the frame (WhitePointSource = 3)";
+        std::snprintf(b, sizeof b, "a manual white point %.3g (WhitePointScale)", double(f.wilsjo2_white));
+        if (f.wilsjo2_asked == 1) {
+            *hint = true;
+            return std::string("-Exposure: ") + b + " - WhitePointSource = 1, but the game gives no exposure texture";
+        }
+        return std::string("~Exposure: ") + b;
     }
     std::string prep;
     if (f.preprocess_exposure == 1)
@@ -129,14 +150,22 @@ inline std::vector<std::string> lines(const Facts& f) {
                       f.hdr_why.empty() ? "" : " (", f.hdr_why.c_str(), f.hdr_why.empty() ? "" : ")");
         out.push_back(b);
         std::string shown;
-        if (f.renodx && f.renodx_known) {
+        static const char* const kModes[] = {"soft knee", "Neutwo", "Neutwo, replace", "Hybrid", "Hybrid, replace"};
+        if (f.wilsjo2) {
+            shown = f.wilsjo2_hdr ? std::string("linear light through the wilsjo2 encode's ") + kModes[f.wilsjo2_mode % 5] +
+                                        " curve"
+                                  : "the picture as it is (SDR), the wilsjo2 encode";
+        } else if (f.renodx && f.renodx_known) {
             shown = f.renodx_hdr == 0 ? "the picture as it is (SDR), through RenoDX style's legacy codec"
                     : f.renodx_hdr == 2 ? "PQ decoded to linear light, RenoDX style's v6 encode"
                     : f.renodx_absolute ? "linear light in absolute units, RenoDX style's v6 encode"
                     : "linear light divided as below, RenoDX style's v6 encode";
         } else if (f.reshade) {
             shown = f.hdr == 3 && f.white_point > 0.f ? "linear light, encoded by this add-on (WhitePoint " +
-                    std::to_string(f.white_point).substr(0, 5) + ")" : "the picture as it is";
+                    std::to_string(f.white_point).substr(0, 5) + ")"
+                    : f.hdr == 2 && f.white_point > 0.f ? "HDR10 (PQ) decoded to linear light, encoded by this add-on "
+                                                          "(WhitePoint " + std::to_string(f.white_point).substr(0, 5) + ")"
+                    : "the picture as it is";
         } else if (f.encode == 1) {
             shown = "linear light encoded by OptiScaler's DLSS-NR encode";
         } else if (f.encode == 0) {
@@ -183,7 +212,12 @@ inline std::vector<std::string> lines(const Facts& f) {
         std::snprintf(b, sizeof b, "=Resets from the game: %llu", static_cast<unsigned long long>(f.resets));
         out.push_back(b);
     }
-    if (hint) out.push_back("!The game gives no exposure. If the picture looks wrong, try Preprocess with Exposure = auto");
+    if (hint && f.wilsjo2)
+        out.push_back(std::string(nr::control::kNoExposureHint) +
+                      " If the picture looks wrong, try White point source = Automatic");
+    else if (hint)
+        out.push_back(std::string(nr::control::kNoExposureHint) +
+                      " If the picture looks wrong, try Preprocess with Exposure = auto");
     return out;
 }
 

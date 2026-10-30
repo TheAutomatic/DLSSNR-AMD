@@ -28,10 +28,9 @@ import sys
 from pathlib import Path
 
 R = Path(__file__).resolve().parents[2]
-RUNTIME = ['runtime_alpha', 'runtime_encode', 'runtime_transfer', 'runtime_upscale', 'runtime_prep', 'runtime_depth', 'cascade_lograt', 'cascade_blur', 'cascade_feed',
-           'runtime_downscale', 'runtime_taps']
-# runtime passes built from another pass's source with defines: name -> (source, defines)
-RUNTIME_VARIANTS = {'runtime_transfer_store': ('runtime_transfer', ['NR_STORE_NATIVE'])}
+# the runtime's own passes around the network (it runs the network only: the composition is RenoDX's stage's and the
+# wilsjo2 flow's): the alpha restore and the depth guide's copy
+RUNTIME = ['runtime_alpha', 'runtime_depth']
 MOTION = ['motion_luma', 'motion_estimate']
 
 
@@ -113,13 +112,9 @@ def main():
     shutil.copy2(out / 'shader-constants.txt', out / 'temporal' / 'shader-constants.txt')
     for k in RUNTIME:
         glslang(a.arch, R / 'windows/shaders/passes' / f'{k}.comp', [], out / 'runtime' / f'{k}.spv')
-    for k, (src, defines) in RUNTIME_VARIANTS.items():
-        glslang(a.arch, R / 'windows/shaders/passes' / f'{src}.comp', defines, out / 'runtime' / f'{k}.spv')
-    # runtime_upscale.spv carries AMD FidelityFX Super Resolution 1 (MIT): its notice goes with it
-    shutil.copy2(R / 'windows/shaders/passes/include/fsr1/LICENSE.txt', out / 'runtime' / 'FidelityFX-FSR1-LICENSE.txt')
     print(f'{out}: {len(pipelines) + len(grade["pipelines"])} network pipelines, '
           f'{len(table["variants"]) + len(grade["variants"]) + len(MOTION)} temporal, '
-          f'{len(RUNTIME) + len(RUNTIME_VARIANTS)} runtime')
+          f'{len(RUNTIME)} runtime')
 
     if a.check:
         bad = [p.name for p in sorted(out.iterdir()) if p.is_file()

@@ -1,13 +1,16 @@
 #include "nr_pe_bridge.hpp"
 #include "nr_pipeline_binary.hpp"
+#include "nr_gpu_arch.hpp"
 
 #include "nr_pe_log.hpp"
+#include "nr_vram_ledger.hpp"
 
 #include <d3d11_4.h>
 #include <d3dcompiler.h>
 #include <dxgi1_2.h>
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <iterator>
@@ -44,12 +47,15 @@ uint64_t g_begins{};
 // A recorded job older than this many recordings is not run: the runtime recycles its per-recording
 // views and descriptor sets after 66 recordings and a released feature's history after 64.
 constexpr uint64_t kStaleAfter = 48;
+// Frames in a row on another D3D12 queue, none on the hand-over queue meanwhile, before the hand-over moves there.
+constexpr uint32_t kMoveAfter = 8;
+constexpr uint64_t kMarkValue = (uint64_t(1) << 48) - 1;   // hand_over_mark: the fence value below the epoch
 thread_local bool tl_creating = false;
 std::atomic<VkDevice> g_own_device{VK_NULL_HANDLE};
 
+// RDNA3's network has no FP8 (nr_gpu_arch.hpp): VK_EXT_shader_float8 is RDNA4's alone.
 const char* const kRequiredExtensions[] = {
     VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME,
-    VK_EXT_SHADER_FLOAT8_EXTENSION_NAME,
     VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
     VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
     VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME,
@@ -139,6 +145,11 @@ DXGI_FORMAT depth_view_format(DXGI_FORMAT format) {
 bool creating_device() { return tl_creating; }
 bool is_own_device(VkDevice device) { return device && device == g_own_device.load(); }
 
+void Device::abandon_at_exit() {
+    std::lock_guard<std::mutex> guard(g_device_mutex);
+    for (auto& a : g_adapters) (void)a.device.release();
+}
+
 Device* Device::get(const LUID& luid, std::string* why) {
     std::lock_guard<std::mutex> guard(g_device_mutex);
     for (auto& a : g_adapters) {
@@ -169,6 +180,7 @@ Device* Device::get(const LUID& luid, std::string* why) {
 bool Device::create(const LUID& luid, std::string* why) {
     luid_ = luid;
     nr_vk_load();
+    nr::vram::install_vulkan();   // our allocations counted for NR Control's VRAM breakdown (as on the interop path)
     uint32_t api = 0;
     if (vkEnumerateInstanceVersion(&api) != VK_SUCCESS || api < VK_API_VERSION_1_3) {
         *why = "the Vulkan loader is older than 1.3";
@@ -208,11 +220,30 @@ bool Device::create(const LUID& luid, std::string* why) {
         return false;
     }
 
+    // The network this GPU runs, by its architecture (asked of AMD's driver, not of the loader OptiScaler may spoof).
+    std::string how;
+    const nr::arch::GpuArch arch = nr::arch::of(physical_, &how);
+    if (arch == nr::arch::GpuArch::unknown) {
+        *why = std::string(chosen.deviceName) + " is not an RDNA4 or RDNA3 GPU (" + how + ")";
+        return false;
+    }
+    rdna3_ = arch == nr::arch::GpuArch::rdna3;
+    log("[nr] bridge: %s is %s (%s)", chosen.deviceName, nr::arch::name(arch), how.c_str());
+    if (rdna3_) {
+        std::string aco;
+        if (!nr::binary::use_rdna3(&aco)) {
+            *why = "RDNA3 GPUs run NR as ACO's machine code only, and " + aco;
+            return false;
+        }
+    }
+
     uint32_t n = 0;
     vkEnumerateDeviceExtensionProperties(physical_, nullptr, &n, nullptr);
     std::vector<VkExtensionProperties> have(n);
     vkEnumerateDeviceExtensionProperties(physical_, nullptr, &n, have.data());
-    for (const char* e : kRequiredExtensions) {
+    std::vector<const char*> extensions(std::begin(kRequiredExtensions), std::end(kRequiredExtensions));
+    if (!rdna3_) extensions.push_back(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
+    for (const char* e : extensions) {
         bool found = false;
         for (const auto& h : have) found = found || std::strcmp(h.extensionName, e) == 0;
         if (!found) {
@@ -220,7 +251,6 @@ bool Device::create(const LUID& luid, std::string* why) {
             return false;
         }
     }
-    std::vector<const char*> extensions(std::begin(kRequiredExtensions), std::end(kRequiredExtensions));
     bool robustness_ext = false;
     for (const auto& h : have) {
         if (std::strcmp(h.extensionName, VK_KHR_WIN32_KEYED_MUTEX_EXTENSION_NAME) == 0) keyed_mutex_ = true;
@@ -247,8 +277,8 @@ bool Device::create(const LUID& luid, std::string* why) {
     vkGetPhysicalDeviceFeatures2(physical_, &q);
     struct { bool have; const char* name; } required[] = {
         {bool(coop.cooperativeMatrix), "cooperativeMatrix"},
-        {bool(fp8.shaderFloat8), "shaderFloat8"},
-        {bool(fp8.shaderFloat8CooperativeMatrix), "shaderFloat8CooperativeMatrix"},
+        {rdna3_ || bool(fp8.shaderFloat8), "shaderFloat8"},
+        {rdna3_ || bool(fp8.shaderFloat8CooperativeMatrix), "shaderFloat8CooperativeMatrix"},
         {bool(f11.storageBuffer16BitAccess), "storageBuffer16BitAccess"},
         {bool(f12.storageBuffer8BitAccess), "storageBuffer8BitAccess"},
         {bool(f12.shaderFloat16), "shaderFloat16"},
@@ -280,6 +310,7 @@ bool Device::create(const LUID& luid, std::string* why) {
     wml.workgroupMemoryExplicitLayout = wml.workgroupMemoryExplicitLayout8BitAccess =
         wml.workgroupMemoryExplicitLayout16BitAccess = VK_TRUE;
     coop.pNext = &fp8; fp8.pNext = &f11; f11.pNext = &f12; f12.pNext = &f13; f13.pNext = &wml;
+    if (rdna3_) coop.pNext = &f11;   // no FP8 extension, so no FP8 features in the chain
     const bool robustness = robustness_ext && prf.pipelineRobustness;
     prf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT};
     if (robustness) {
@@ -326,7 +357,8 @@ bool Device::create(const LUID& luid, std::string* why) {
     VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pi.queueFamilyIndex = family_;
     pi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    if (vkCreateCommandPool(device_, &pi, nullptr, &pool_) != VK_SUCCESS) {
+    if (vkCreateCommandPool(device_, &pi, nullptr, &pool_) != VK_SUCCESS ||
+        vkCreateCommandPool(device_, &pi, nullptr, &layout_pool_) != VK_SUCCESS) {
         *why = "could not create the bridge's command pool";
         return false;
     }
@@ -344,6 +376,7 @@ Device::~Device() {
         vkDeviceWaitIdle(device_);
         for (auto& j : jobs_) if (j->fence) vkDestroyFence(device_, j->fence, nullptr);
         if (pool_) vkDestroyCommandPool(device_, pool_, nullptr);
+        if (layout_pool_) vkDestroyCommandPool(device_, layout_pool_, nullptr);
         for (auto& t : timelines_) {
             if (t.semaphore) vkDestroySemaphore(device_, t.semaphore, nullptr);
             if (t.fence) t.fence->Release();
@@ -377,8 +410,8 @@ bool Device::initial_layout(VkImage image, std::string* why) {
     // Once per image, before the D3D side has written anything: the only moment UNDEFINED is true.
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    ai.commandPool = pool_; ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ai.commandBufferCount = 1;
-    std::lock_guard<std::mutex> pool(record_mutex_);
+    ai.commandPool = layout_pool_; ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ai.commandBufferCount = 1;
+    std::lock_guard<std::mutex> pool(layout_mutex_);
     VkResult r = vkAllocateCommandBuffers(device_, &ai, &cmd);
     if (r != VK_SUCCESS) { *why = "no command buffer for the shared image's layout (" + std::to_string(int(r)) + ")"; return false; }
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -405,7 +438,7 @@ bool Device::initial_layout(VkImage image, std::string* why) {
         if (submitted) r = vkQueueWaitIdle(queue_);
     }
     // A buffer that may still be pending is left allocated (the pool frees it with the device).
-    if (!submitted || r == VK_SUCCESS) vkFreeCommandBuffers(device_, pool_, 1, &cmd);
+    if (!submitted || r == VK_SUCCESS) vkFreeCommandBuffers(device_, layout_pool_, 1, &cmd);
     if (r != VK_SUCCESS) {
         *why = "the shared image's layout could not be set (" + std::to_string(int(r)) + ")";
         return false;
@@ -708,17 +741,45 @@ void Device::bury(Image& image) {
         std::lock_guard<std::mutex> guard(sync_mutex_);
         uint64_t mark = 0;
         for (auto& t : timelines_) if (t.owner == hand_over_queue_ && t.semaphore) mark = t.value;
-        buried_.push_back({image.d3d, mark});
+        buried_.push_back({image.d3d, mark, hand_over_queue_});
     }
     image = Image{};
 }
 
-void Device::sweep_buried_locked(uint64_t completed) {
-    for (size_t i = buried_.size(); i-- > 0;)
-        if (completed == UINT64_MAX || completed > buried_[i].mark) {
+void Device::sweep_buried_locked() {
+    for (size_t i = buried_.size(); i-- > 0;) {
+        // each on the queue whose frames it was copied in (the hand-over may have moved since)
+        bool known = false;
+        const uint64_t completed = completed_locked(buried_[i].queue ? buried_[i].queue : hand_over_queue_, &known);
+        if (known && (completed == UINT64_MAX || completed > buried_[i].mark)) {
             buried_[i].d3d->Release();
             buried_.erase(buried_.begin() + long(i));
         }
+    }
+}
+
+void Device::bind_hand_over_locked(IUnknown* queue) {
+    if (hand_over_queue_) hand_over_queue_->Release();
+    hand_over_queue_ = queue;
+    queue->AddRef();
+    epochs_.push_back(queue);
+    moving_to_ = nullptr;
+    moving_count_ = 0;
+}
+
+uint64_t Device::completed_locked(IUnknown* queue, bool* known) {
+    *known = false;
+    for (auto& t : timelines_) {
+        if (t.owner != queue || !t.semaphore) continue;
+        uint64_t completed = 0;
+        ID3D12Fence* f12 = nullptr;
+        ID3D11Fence* f11 = nullptr;
+        if (SUCCEEDED(t.fence->QueryInterface(IID_PPV_ARGS(&f12))) && f12) { completed = f12->GetCompletedValue(); f12->Release(); }
+        else if (SUCCEEDED(t.fence->QueryInterface(IID_PPV_ARGS(&f11))) && f11) { completed = f11->GetCompletedValue(); f11->Release(); }
+        *known = true;
+        return completed;
+    }
+    return 0;
 }
 
 void Device::destroy(Image& image) {
@@ -840,10 +901,21 @@ void ownership(VkCommandBuffer cmd, const std::vector<VkImage>& images, uint32_t
 }
 }  // namespace
 
+void Device::set_owner(Job* job, const void* owner) {
+    std::lock_guard<std::mutex> guard(jobs_mutex_);
+    job->owner = owner;
+}
+
 void Device::acquire(Job* job, const std::vector<const Image*>& images) {
+    // Only the images new to the job: one acquired earlier in the recording may have been written since, and a second
+    // acquire from EXTERNAL without a release in between is not a valid transfer.
+    std::vector<VkImage> fresh;
     for (const Image* i : images)
-        if (i && i->image) job->images.push_back(i->image);
-    ownership(job->cmd, job->images, family_, true);
+        if (i && i->image && std::find(job->images.begin(), job->images.end(), i->image) == job->images.end()) {
+            job->images.push_back(i->image);
+            fresh.push_back(i->image);
+        }
+    ownership(job->cmd, fresh, family_, true);
 }
 
 bool Device::end(Job* job, std::string* why) {
@@ -1086,35 +1158,46 @@ void Device::forget_hand_over_queue() {
 
 uint64_t Device::hand_over_mark() {
     std::lock_guard<std::mutex> guard(sync_mutex_);
-    for (auto& t : timelines_) if (t.owner == hand_over_queue_ && t.semaphore) return t.value;
-    return 0;
+    // the epoch (which hand-over queue) above the value: a mark stays the queue's it was taken on
+    const uint64_t epoch = epochs_.empty() ? 0 : uint64_t(epochs_.size() - 1);
+    for (auto& t : timelines_) if (t.owner == hand_over_queue_ && t.semaphore) return (epoch << 48) | (t.value & kMarkValue);
+    return epoch << 48;
 }
 
 bool Device::hand_over_passed(uint64_t mark) {
     std::lock_guard<std::mutex> guard(sync_mutex_);
-    for (auto& t : timelines_) {
-        if (t.owner != hand_over_queue_ || !t.semaphore) continue;
-        // `mark` is a frame's `done`; the next frame's `ready` is signalled by the D3D side after that
-        // frame's copy out. Nothing later yet: not passed.
-        uint64_t completed = 0;
-        ID3D12Fence* f12 = nullptr;
-        ID3D11Fence* f11 = nullptr;
-        if (SUCCEEDED(t.fence->QueryInterface(IID_PPV_ARGS(&f12))) && f12) { completed = f12->GetCompletedValue(); f12->Release(); }
-        else if (SUCCEEDED(t.fence->QueryInterface(IID_PPV_ARGS(&f11))) && f11) { completed = f11->GetCompletedValue(); f11->Release(); }
-        if (completed == UINT64_MAX) return true;   // the device is gone: nothing of it is running
-        return completed > mark;
-    }
-    return mark == 0;
+    const uint64_t epoch = mark >> 48, value = mark & kMarkValue;
+    IUnknown* queue = epoch < epochs_.size() ? epochs_[size_t(epoch)] : hand_over_queue_;
+    // `value` is a frame's `done`; the next frame's `ready` is signalled by the D3D side after that frame's copy out.
+    // Nothing later yet: not passed.
+    bool known = false;
+    const uint64_t completed = completed_locked(queue, &known);
+    if (!known) return value == 0;
+    if (completed == UINT64_MAX) return true;   // the device is gone: nothing of it is running
+    return completed > value;
 }
 
 bool Device::run_between(ID3D12CommandQueue* queue, Job* job, uint64_t generation) {
     std::lock_guard<std::mutex> guard(sync_mutex_);
-    if (!hand_over_queue_) { hand_over_queue_ = queue; queue->AddRef(); }
+    if (!hand_over_queue_) bind_hand_over_locked(queue);
     if (queue != hand_over_queue_) {
-        static bool said = false;
-        if (!said) { said = true; log("[nr] bridge: a frame on a second D3D12 queue passes through (one queue carries the network)"); }
-        discard(job, generation);
-        return false;
+        // Frames moved to another queue (PBZ: a Present layer first, on the swap chain's queue, then a layer at the
+        // upscaler, on the game's): after kMoveAfter in a row, none on the hand-over queue meanwhile, the hand-over
+        // moves there. Before, every frame there passed through for good, its history dropped each time - NR as good
+        // as off. Frames on both queues at once still do: our queue runs the hand-overs in order, and two D3D12 queues
+        // waiting on each other through it could stall.
+        if (queue == moving_to_) ++moving_count_;
+        else { moving_to_ = queue; moving_count_ = 1; }
+        if (moving_count_ < kMoveAfter) {
+            static bool said = false;
+            if (!said) { said = true; log("[nr] bridge: a frame on a second D3D12 queue passes through (one queue carries the network)"); }
+            discard(job, generation);
+            return false;
+        }
+        log("[nr] bridge: the frames moved to another D3D12 queue; the network is handed over there now");
+        bind_hand_over_locked(queue);
+    } else {
+        moving_count_ = 0;
     }
     Timeline* t = timeline_d3d12(queue);
     if (!t) { discard(job, generation); return false; }
@@ -1128,8 +1211,13 @@ bool Device::run_between(ID3D12CommandQueue* queue, Job* job, uint64_t generatio
         return false;
     }
     t->value = done;
-    if (!buried_.empty()) sweep_buried_locked(fence->GetCompletedValue());
+    const int tr = trace_bridge();   // the first hand-overs after the first evaluates, step by step
+    if (tr) log("[nr] trace b%d: hand-over on queue %p: signal %llu given, the network's submission next", tr,
+                static_cast<void*>(queue), static_cast<unsigned long long>(ready));
+    if (!buried_.empty()) sweep_buried_locked();
     const bool ok = submit(job, generation, t->semaphore, ready, t->semaphore, done);
+    if (tr) log("[nr] trace b%d: the network %s; the queue's wait for %llu next", tr, ok ? "submitted" : "NOT submitted",
+                static_cast<unsigned long long>(done));
     if (!ok) {
         // Nothing of ours will signal `done`: the D3D12 side does, so its wait below is met.
         hr = queue->Signal(fence, done);
@@ -1139,6 +1227,7 @@ bool Device::run_between(ID3D12CommandQueue* queue, Job* job, uint64_t generatio
         }
     }
     hr = queue->Wait(fence, done);
+    if (tr) log("[nr] trace b%d: the queue's wait given (0x%08lX)", tr, static_cast<unsigned long>(hr));
     if (FAILED(hr)) {
         // The rest of the queue would not wait for the network: what it reads may be unfinished.
         log("[nr] bridge: the D3D12 queue refused to wait for the network (0x%08lX)", (unsigned long)hr);
@@ -1151,7 +1240,7 @@ bool Device::run_between(ID3D11DeviceContext* context, Job* job, uint64_t genera
     std::lock_guard<std::mutex> guard(sync_mutex_);
     ID3D11DeviceContext4* c4 = nullptr;
     if (FAILED(context->QueryInterface(IID_PPV_ARGS(&c4))) || !c4) { discard(job, generation); return false; }
-    if (!hand_over_queue_) { hand_over_queue_ = context; context->AddRef(); }
+    if (!hand_over_queue_) bind_hand_over_locked(context);
     if (context != hand_over_queue_) {
         c4->Release();
         discard(job, generation);

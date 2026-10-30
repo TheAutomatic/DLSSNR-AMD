@@ -11,8 +11,8 @@ graphics cards.
   (see [The model](#the-model)). Since 0.0.7 the networks carry the names in NVIDIA's DLL -
   `CC_SMALL_FP8`, `CC_SILVER_AARDWOLD` and `CC_SILVER_AARDWOLD_INT4_MIXED` ([int4 mixed](#int4-mixed-optional)) -
   and all of them can be switched in game.
-  Since 0.0.8 (Linux) `CC_SMALL_FP8_EXPERIMENTAL` can be chosen as well
-  ([CC_SMALL_FP8_EXPERIMENTAL](#cc_small_fp8_experimental-linux-optional)).
+  Since 0.0.8 (Linux) and 0.0.8.1 (Windows) `CC_SMALL_FP8_EXPERIMENTAL` can be chosen as well
+  ([CC_SMALL_FP8_EXPERIMENTAL](#cc_small_fp8_experimental-optional)).
 - The Linux build with `CC_SMALL_FP8`, on an RX 9070 XT, checked against NVIDIA's own `nvngx_dlssnr.dll`
   310.9.16 run on an RTX 5090 through NGX, the same way as below. Single frames: PSNR 49.15 dB at 1080p,
   49.40 dB at 1440p and 50.59 dB at 4K, SSIM 0.997. Moving sequences: PSNR 50.6-52.3 dB at 1080p,
@@ -29,13 +29,16 @@ graphics cards.
   SSIM 0.997-0.998, and the output changes from frame to frame by about as much as NVIDIA's. Method,
   pictures and data: [docs/ngx-verification/310.8.0](docs/ngx-verification/310.8.0/NGX-VERIFICATION.md).
 - **Tested only on an RX 9070 XT.**
-- **Windows:** with [ACO Mode](#windows) (on by default since 0.0.7) the Windows version loads machine code that
-  was made in advance with Mesa's ACO compiler (the Linux driver's compiler) and ships in the package, and comes
-  close to Linux (see [Performance](#performance));
-  with the AMD driver's own compiler the network is slower. ACO Mode has been tested on one driver version only
-  (AMD Software 26.9.2); see [Windows](#windows). Since 0.0.5-win-preview it has
-  [int4 mixed](#int4-mixed-optional), the [RenoDX style](#renodx-style) and
-  [NR Control](#nr-control-optiscaler-route) as well.
+- **Windows:** since 0.0.8.1 the Windows version is the Linux version (the same routes, NR Control and
+  settings). It loads the network as machine code that was made in advance with Mesa's ACO compiler (the Linux
+  driver's compiler) and ships in the package, and comes close to Linux (see [Performance](#performance)); see
+  [Windows](#windows).
+- **RX 7000 and Radeon 700M / 800M / 8000S graphics (RDNA3), Windows only, experimental:** `CC_SMALL_FP8` and
+  `CC_SILVER_AARDWOLD`, thanks to [TheAutomatic](https://github.com/TheAutomatic)
+  ([#26](https://github.com/mochizuki0323/DLSSNR-AMD/pull/26)) and to [mauri870](https://github.com/mauri870), whose
+  [DLSSNR-RDNA3](https://github.com/mauri870/DLSSNR-RDNA3) port it builds on. Tried on few machines; expect more
+  problems than on RX 9000, and for now it may not match the stability and performance of DLSSNR-RDNA3 (see
+  [Windows](#windows)).
 - **Also worth a try:** [TheAutomatic/dlss-5-amd-project](https://github.com/TheAutomatic/dlss-5-amd-project)
   (OptScaler(NR)), an OptiScaler-based project with several NR backends.
 
@@ -73,25 +76,27 @@ these logs:
 | Platform | Needs | State |
 | --- | --- | --- |
 | **Linux** (Steam / Proton) | Mesa 26.2 or newer, a recent Proton | The main version, used in games. |
-| **Windows** | AMD Software 26.9.2 (tested) | Close to Linux with ACO Mode (the default), slower with the driver's own compiler. |
+| **Windows** | AMD Software 26.9 or newer | The same features as Linux; close to Linux in speed with ACO's machine code. |
 
-Both need an RX 9000 series (RDNA4) card; older cards (RX 7000 and earlier) lack the FP8 matrix
-instructions the network needs.
+Both need an RX 9000 series (RDNA4) card for every network. On Windows RX 7000 and Radeon 700M / 800M / 8000S
+graphics (RDNA3) run `CC_SMALL_FP8` and `CC_SILVER_AARDWOLD` (experimental); they lack the FP8 matrix
+instructions, and their network runs FP16 in place of FP8. Older cards are not supported.
 
 ## Performance
 
 `CC_SMALL_FP8` and `CC_SMALL_FP8_EXPERIMENTAL` (310.9.16), GPU time of the network per frame on an RX 9070 XT
 (network only). Linux **measured in game** (`CC_SMALL_FP8` with v0.0.6-linux-preview, `CC_SMALL_FP8_EXPERIMENTAL`
 with 0.0.8); Windows with the driver's own compiler from
-[#13](https://github.com/mochizuki0323/DLSSNR-AMD/pull/13); Windows with ACO Mode not measured (it runs the same
-machine code as Linux):
+[#13](https://github.com/mochizuki0323/DLSSNR-AMD/pull/13); Windows with ACO's machine code not measured (it runs the
+same machine code as Linux):
 
 | | 1080p | 1440p | 4K |
 | --- | --- | --- | --- |
 | Linux, `CC_SMALL_FP8` | 3.27 ms | 5.53 ms | 12.67 ms |
-| Linux, [`CC_SMALL_FP8_EXPERIMENTAL`](#cc_small_fp8_experimental-linux-optional) | 2.90 ms | 4.84 ms | 11.09 ms |
-| Windows, `CC_SMALL_FP8` | 4.673 ms | 7.982 ms | 16.940 ms |
-| Windows, `CC_SMALL_FP8`, [ACO Mode](#windows-experimental-preview) On | about the same as Linux | about the same as Linux | about the same as Linux |
+| Linux, [`CC_SMALL_FP8_EXPERIMENTAL`](#cc_small_fp8_experimental-optional) | 2.90 ms | 4.84 ms | 11.09 ms |
+| Windows, `CC_SMALL_FP8`, the driver's own compiler | 4.673 ms | 7.982 ms | 16.940 ms |
+| Windows, `CC_SMALL_FP8`, [ACO's machine code](#windows) (the default) | about the same as Linux | about the same as Linux | about the same as Linux |
+| Windows, [`CC_SMALL_FP8_EXPERIMENTAL`](#cc_small_fp8_experimental-optional), [ACO's machine code](#windows) | about the same as Linux | about the same as Linux | about the same as Linux |
 
 `CC_SILVER_AARDWOLD` (310.8.0), GPU time of the network per frame on an RX 9070 XT, **offline benchmark** (network
 only), measured with v0.0.3 (the `CC_SILVER_AARDWOLD_INT4_MIXED` row with v0.0.4, the Windows ACO Mode row with v0.0.4-win-preview
@@ -102,17 +107,14 @@ benchmark:
 | --- | --- | --- | --- |
 | Linux | 5.60 ms | 9.70 ms | 21.89 ms |
 | Linux, [`CC_SILVER_AARDWOLD_INT4_MIXED`](#int4-mixed-optional) | 4.99 ms | 8.69 ms | 19.64 ms |
-| Windows | 7.21 ms | 12.59 ms | 27.32 ms |
-| Windows, [ACO Mode](#windows-experimental-preview) On | 5.70 ms | 9.96 ms | 22.49 ms |
-| Windows, [ACO Mode](#windows-experimental-preview) On, [`CC_SILVER_AARDWOLD_INT4_MIXED`](#int4-mixed-optional) | about the same as Linux | about the same as Linux | about the same as Linux |
+| Windows, the driver's own compiler | 7.21 ms | 12.59 ms | 27.32 ms |
+| Windows, [ACO's machine code](#windows) (the default) | 5.70 ms | 9.96 ms | 22.49 ms |
+| Windows, [ACO's machine code](#windows), [`CC_SILVER_AARDWOLD_INT4_MIXED`](#int4-mixed-optional) | about the same as Linux | about the same as Linux | about the same as Linux |
 
-Running the model below the output resolution about doubles the frame rate. On Linux since 0.0.8 that is a
-layer's resolution setting (model resolution in the [wilsjo2 style](#wilsjo2-style), the network's resolution in
-the [RenoDX style](#renodx-style)) on any route, or on the OptiScaler route a layer placed before the upscaler,
-which runs the model on the game's render-resolution frame. On Windows, in the ReShade routes that is the
-**Model resolution** setting; in the OptiScaler route it is mainly OptiScaler-NR's **"Generate model before
-upscaler"** option, which runs the model on the game's render-resolution frame before FSR4 upscales it;
-OptiScaler-NR has a **Model resolution** setting as well.
+Running the model below the output resolution about doubles the frame rate: the resolution setting (model
+resolution in the [wilsjo2 style](#wilsjo2-style), the network's resolution in the [RenoDX style](#renodx-style))
+on any route, or on the OptiScaler route NR placed before the upscaler, which runs the model on the game's
+render-resolution frame.
 
 ## Supported games
 
@@ -123,15 +125,15 @@ Linux and Windows have the same routes:
 | **DirectX 12 / 11** | `optiscaler` if the game has a DLSS, FSR or XeSS option, otherwise `reshade-feeder` |
 | **DirectX 10** | `reshade-feeder` |
 | **DirectX 9** | `reshade-feeder-dx9` |
-| **Vulkan** | `optiscaler` (Linux) if the game has a DLSS, FSR or XeSS option, otherwise `reshade-feeder-vulkan` |
+| **Vulkan** | `optiscaler` if the game has a DLSS, FSR or XeSS option, otherwise `reshade-feeder-vulkan` |
 | OpenGL | not supported |
 
 - **`optiscaler`**: for games with a DLSS, FSR or XeSS option, with the game's own motion vectors. 64-bit games
-  only. On Linux since 0.0.8: the original [OptiScaler](https://github.com/optiscaler/OptiScaler) (shipped
-  unchanged) does the upscaling and frame generation, and this project's NR runs as an OptiScaler
-  plugin (`dlssnr-amd.asi`) on DirectX 12, DirectX 11 and Vulkan games. On Windows:
-  [OptiScaler-NR](https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass) with this project as its
-  DLSS-NR backend.
+  only. The original [OptiScaler](https://github.com/optiscaler/OptiScaler) (shipped unchanged) does the
+  upscaling and frame generation, and this project's NR runs as an OptiScaler plugin (`dlssnr-amd.asi`) on
+  DirectX 12, DirectX 11 and Vulkan games (since 0.0.8 on Linux, 0.0.8.1 on Windows; up to 0.0.7 this route
+  was [OptiScaler-NR](https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass) with this project as its
+  DLSS-NR backend).
 - **`reshade-feeder`**: for other DirectX 10/11/12 games. Runs through ReShade; motion is estimated from
   the picture by a ReShade shader.
 - **`reshade-feeder-vulkan` / `reshade-feeder-dx9`**: for Vulkan and DirectX 9 games. DirectX 9 games
@@ -146,41 +148,49 @@ on Windows. Any route can also use the [RenoDX style](#renodx-style).
 
 ## NR Control (OptiScaler route)
 
-End opens NR Control, this project's NR menu, drawn over the game's swap chain (Linux: DirectX 11, DirectX 12 and
-Vulkan games; Windows: DirectX 11 and 12). Nothing to set up. Changes apply in game within about a second and are
-kept in `dlssnr-amd.ini`.
+End opens NR Control, this project's NR menu, drawn over the game's DirectX 11, DirectX 12 or Vulkan swap chain
+(another key: `[NRControl] MenuKey`). Nothing to set up. Changes apply in game within about a second and are kept in
+`dlssnr-amd.ini`. It holds every NR setting; OptiScaler's own menu (Insert) only drives upscaling and frame
+generation. The ReShade routes have the same pages on ReShade's Add-ons page (plus Motion vectors and Language).
 
-On Linux (since 0.0.8) it holds every NR setting; OptiScaler's own menu (Insert) only drives upscaling and frame
-generation. The ReShade routes have the same on ReShade's Add-ons page.
+- **NR settings**: the processing ([RenoDX style](#renodx-style) or [wilsjo2 style](#wilsjo2-style)), the network,
+  the place (at Present, the default, or before or after the upscaler; on the ReShade routes always Present) and
+  its settings, and Engine data (what the game hands NR).
+- **Network**: the networks and their options (model, hotkey, residency, Memory Guard, OSD). At its foot the
+  **Layers** switch, off by default: on, NR can be several layers, each a complete NR run with its own processing,
+  network, place and settings (the NR chain page). For ordinary stacking use Passes, not layers.
+- **Preprocess**, **HUD FIX** (keeps the game's HUD as it is at Present; off by default), **Hotkeys** (every key NR
+  reads, press a key to assign it), **Screenshot** (F5: the same frame without and with NR).
+- **Compare**: NR off against NR on, side by side or with a split line, with a zoom and debug views.
+- **Diagnostics**: cost, video memory, residency, an event timeline, and Copy a report (to the clipboard and
+  `dlssnr-amd\nr-report.txt`; nothing is sent anywhere).
+- **Status**: what NR does and costs (the network and its processing apart); video memory by network and use.
+- The header has the **Neural Rendering** switch (F6: NR off or on for this run); the footer NR's GPU time and the
+  upscaling.
 
-- **Status**: each layer's place, network, size, passes and cost (the network and its processing apart); video
-  memory by network and use.
-- **NR chain**: one or more layers, each with its own processing ([RenoDX style](#renodx-style) or
-  [wilsjo2 style](#wilsjo2-style)), network, place (before or after the upscaler, or at Present; Present only
-  on the ReShade routes) and settings, and its Engine data (what the game hands NR).
-- **Global**: Preprocess, HUD FIX, the networks and their options (model, hotkey, residency, OSD with each layer's
-  cost), NR on / off (F6), screenshots (F5: the same frame without and with NR), the menu's size and colours, and:
-  - **Diagnostics**: residency, an event timeline, and Copy a report (to the clipboard and
-    `dlssnr-amd\nr-report.txt`; nothing is sent anywhere).
-  - **Compare**: NR off against NR on, side by side or with a split line, with debug views.
+## Languages
 
-On Windows it has the network selection, Preprocess, the `[Network]` settings with ACO Mode and the Engine data
-panel; the other NR settings are in NR Control with the RenoDX style on, else on the DLSS Neural Rendering page
-of the OptiScaler menu (Insert).
+NR Control (OptiScaler route) and the Add-ons page (ReShade routes) take their texts from a language file in
+`dlssnr-amd\lang` in the game folder, chosen on NR Control's NR Control page or on the Add-ons page's Language
+page. Any language can be added: copy `English.txt` there (every text of the menus, made from the program), name
+the copy after the language and translate the text after each `msgstr`. On the OptiScaler route a font that has the
+language's letters can be named in the file (`@font`); the ReShade routes use ReShade's own font (ReShade's
+settings, Font). The file is read again each time it is saved, so the translation can be checked in the game;
+`README.txt` in that folder explains it step by step.
 
 ## RenoDX style
 
 The processing around NR - how the picture is handed to the network and how its result is put back - as
 [RenoDX's DLSS5 add-on](https://github.com/PEQHUB/RenoDX-DLSS5-Generic) v8.5.0-rc10 does it, with RenoDX's own
-shaders. The NR network itself is the same. On Linux it is a layer's default processing; on Windows it is an
-install option (a question or `-RenoDX on` in the installer, or `[RenoDX] Enabled = 1` in `dlssnr-amd.ini`, applied
-after a game restart). Its settings keep RenoDX's names, defaults and ranges:
+shaders. The NR network itself is the same. It is the default processing on every route (the installer asks;
+`--wilsjo2` on Linux or `-RenoDX off` on Windows chooses the other), and NR Control switches it in game. Its
+settings keep RenoDX's names, defaults and ranges:
 
 - **Network**: Intensity, Style, Local tone, Local structure, Skin structure, automatic mask, new noise every frame.
 - **Passes**: legacy (up to 4, or 30 unlocked; passes 2 and later with their own strengths and network settings) or
-  fast (Linux).
+  fast (the network runs once and its change is strengthened).
 - **Composition**: colour and transfer strength, chroma clamp, transfer mode, highlight guard, Detail stability (Off
-  by default on Linux since 0.0.8, Auto on Windows), black restore and pedestal, codec.
+  by default), black restore and pedestal, codec.
 - **Resolution**: the network's resolution, following the render resolution, upsampling.
 - **Adjust NR's look**: brightening, darkening, colour, hue, shadows / midtones / highlights, large-scale tone and
   fine detail, halos, temporal smoothing.
@@ -191,9 +201,9 @@ after a game restart). Its settings keep RenoDX's names, defaults and ranges:
 
 The processing around NR of [OptiScaler-NR](https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass)
 (wilsjo2's OptiScaler fork, which the OptiScaler route used up to 0.0.7), ported to this project. The NR network
-itself is the same. Linux only: a layer's other processing (`--wilsjo2` at install);
-on the ReShade routes it is these routes' own processing (`[DlssNr]`). Its settings keep OptiScaler-NR's `[DlssNr]`
-names, defaults and ranges:
+itself is the same. It is the other processing on every route (`--wilsjo2` on Linux, `-RenoDX off` on Windows at
+install, or NR Control in game); on the ReShade routes it is these routes' own processing (`[DlssNr]`). Its settings
+keep OptiScaler-NR's `[DlssNr]` names, defaults and ranges:
 
 - **Network**: Style, Intensity, Local structure, Local tone, Skin structure, Character mask, new noise without
   motion vectors.
@@ -213,8 +223,7 @@ names, defaults and ranges:
 `[Preprocess]` in `dlssnr-amd.ini` in the game folder changes the picture the NR network is shown (exposure,
 display curve, contrast, saturation), and so how NR edits the picture. It has two uses: a personal look in any
 game, and fixing games that do not hand their exposure to the upscaler (below). The installer writes the
-file; the ReShade routes also show the settings on the Add-ons page, and NR Control on the OptiScaler route
-switches it on and off.
+file; NR Control and ReShade's Add-ons page show the settings on their Preprocess page.
 
 - **Enabled**: off by default; when off, none of it runs. Turned on, it starts from auto exposure and the
   filmic curve.
@@ -251,9 +260,9 @@ than the original network uses, so its picture differs somewhat from `CC_SILVER_
 `CC_SILVER_AARDWOLD` only. Both Linux packages and the Windows package have it, and
 since 0.0.7 it is always installed as the network `CC_SILVER_AARDWOLD_INT4_MIXED`.
 
-On Windows it runs with [ACO Mode](#windows) only (the default): the AMD driver's own
-compiler makes slow code for the int4 kernels, so this version does not offer int4 mixed without ACO Mode
-(it is greyed out then). It needs no layer or launch options on Windows. The rest of this section is about
+On Windows it runs as [ACO's machine code](#windows) only, on RX 9000: the AMD driver's own
+compiler makes slow code for the int4 kernels, so when ACO's machine code cannot be used it is greyed out. It
+needs no layer or launch options on Windows. The rest of this section is about
 Linux; choosing it, the weights and their check work the same way on Windows (`-Model
 CC_SILVER_AARDWOLD_INT4_MIXED` in the Windows installer).
 
@@ -270,9 +279,12 @@ CC_SILVER_AARDWOLD_INT4_MIXED` in the Windows installer).
   1,112 game frames and darkened copies of some of them. int4 mixed is the network these tables define;
   another calibration would give a different network.
 
-## CC_SMALL_FP8_EXPERIMENTAL (Linux, optional)
+<a id="cc_small_fp8_experimental-linux-optional"></a>
 
-`CC_SMALL_FP8` made faster by this project (see Performance), Linux only for now. Its Swin blocks (all but the first)
+## CC_SMALL_FP8_EXPERIMENTAL (optional)
+
+`CC_SMALL_FP8` made faster by this project (see Performance). On Windows it runs as ACO's machine code only, on
+RX 9000. Its Swin blocks (all but the first)
 use ReLU as the MLP activation, and some window-attention layers in the decoder use one fixed attention table per layer (no QK^T,
 no softmax) with the V and output projections merged. The weights of the changed layers were fitted to the original
 network's outputs. Its picture differs somewhat from
@@ -309,7 +321,7 @@ bash install.sh "/path/to/steamapps/common/<game folder>" --dll /path/to/nvngx_d
 
 The folder is the one holding the game's exe. The installer lists the routes, asks which network a game
 starts with (Enter = `CC_SMALL_FP8`; all four are installed and can be switched
-in game), which processing the first layer uses (Enter = the [RenoDX style](#renodx-style); or the
+in game), which processing NR uses (Enter = the [RenoDX style](#renodx-style); or the
 wilsjo2 style) and, on the ReShade routes,
 whether to use [LumeniteFX](https://github.com/umar-afzaal/LumeniteFX) Kernel (by Afzaal) for the motion
 vectors instead of VORT (downloaded from its author's GitHub and installed unchanged; it is not part of this
@@ -320,11 +332,11 @@ the extracted model is kept and reused for every later one. Needs `bash` and `py
 ## Install (Windows)
 
 Download `DLSSNR-AMD-Vulkan-Windows-*-preview-x86_64.zip` from the releases, unpack it and double-click
-`install.bat`. Pick the game's exe (the one that actually runs, not a launcher), then the route, whether to
-use the [RenoDX style](#renodx-style), on the ReShade routes whether to use
+`install.bat`. Pick the game's exe (the one that actually runs, not a launcher), then the route, the processing
+(Enter = the [RenoDX style](#renodx-style); or the wilsjo2 style), on the ReShade routes whether to use
 [LumeniteFX](https://github.com/umar-afzaal/LumeniteFX) Kernel (by Afzaal) for the motion vectors instead of
 VORT (downloaded from its author's GitHub and installed unchanged; it is not part of this project), and which
-network a game starts with (Enter = `CC_SMALL_FP8`; all three are installed and can be switched in game). The
+network a game starts with (Enter = `CC_SMALL_FP8`; all four are installed and can be switched in game). The
 first install asks for `nvngx_dlssnr.dll` (310.9.16 or 310.8.0) or a zip that contains it and extracts the
 models (below); later installs from the same package do not ask again. Read
 [windows/package/README.txt](windows/package/README.txt) and [Windows](#windows)
@@ -353,7 +365,7 @@ model, so with it both models are extracted and installed; 310.8.0 gives `CC_SIL
   without `--dll` (`-Dll` on Windows) check their SHA256 and install them from there, so the extraction runs only once per
   package. With a new package, use `--dll` once more or copy those files over.
 - Every model the package has is installed. Which network runs is `[Network] Model` in `dlssnr-amd.ini`:
-  `CC_SMALL_FP8`, `CC_SMALL_FP8_EXPERIMENTAL` (Linux), `CC_SILVER_AARDWOLD` or
+  `CC_SMALL_FP8`, `CC_SMALL_FP8_EXPERIMENTAL`, `CC_SILVER_AARDWOLD` or
   `CC_SILVER_AARDWOLD_INT4_MIXED`, set at install (`--model` on Linux, `-Model` on Windows, or the installer's
   question) and switchable in game; a network without its model (`CC_SMALL_FP8` from a 310.8.0 DLL) is greyed
   out in the menus with the reason.
@@ -385,31 +397,37 @@ It takes the DLL itself (unpack it from the zip first) and writes `dlssnr.bin`, 
 
 ## Windows
 
-It is built from the same code as the Linux version
-and changed only where the AMD Windows driver needs it. It is updated less often than the Linux
-version, and some releases may be Linux only.
+It is built from the same code as the Linux version and changed only where the AMD Windows driver needs it.
+Since 0.0.8.1 it has everything the Linux version has. Some releases may be Linux only.
 
 DirectX 10/11/12 games keep the system's own D3D. NR runs on a Vulkan device of its own on the same
 card, and each frame is handed between the two through shared textures and a shared fence, on the
-GPU. DirectX 9 games run on Vulkan through DXVK, because D3D9 cannot share a frame with another API.
+GPU. Vulkan games: NR runs on the game's own device. DirectX 9 games run on Vulkan through DXVK, because D3D9
+cannot share a frame with another API.
 
-**ACO Mode.** `[Network] ACO Mode` in `dlssnr-amd.ini` chooses where the network's machine code comes
-from. On (`ACO Mode = 1`, the default since 0.0.7): the package carries the network as machine code made in
-advance with Mesa's ACO compiler (the Linux driver's compiler), and the AMD driver loads that code instead of
-compiling the network. Off (`ACO Mode = 0`): the AMD driver compiles the network. ACO's machine code for this
-network runs faster than the AMD driver's (see Performance). It is in NR Control too and takes effect when the
-game restarts.
-**ACO Mode has been tested on one driver version only (AMD Software 26.9.2, RX 9070 XT). With other
-drivers it may fail: game crashes, wrong pictures or driver resets. If that happens, turn it off.**
-When ACO Mode cannot be used at all, NR runs as with it off and `dlssnr-amd.log` says why.
-[int4 mixed](#int4-mixed-optional) needs ACO Mode On.
+**ACO's machine code (ACO Mode).** The package carries the network as machine code made in advance with Mesa's
+ACO compiler (the Linux driver's compiler), and the AMD driver loads that code instead of compiling the network;
+it runs faster than the AMD driver's own compile (see Performance). Since 0.0.8.1 this is not a setting: it is
+always tried first. When the driver cannot take it, NR Control and `dlssnr-amd.log` say why, and an RX 9000 runs
+the network compiled by the AMD driver instead (without `CC_SMALL_FP8_EXPERIMENTAL` and
+[`CC_SILVER_AARDWOLD_INT4_MIXED`](#int4-mixed-optional)); RX 7000 and Radeon 700M / 800M / 8000S graphics have no
+NR then. The imported machine code is kept in `dlssnr-amd\aco-cache` in the game's folder, so later starts are
+quicker.
+
+**RX 7000 and Radeon 700M / 800M / 8000S graphics (RDNA3), experimental.** `CC_SMALL_FP8` and
+`CC_SILVER_AARDWOLD` as ACO's machine code, made and tested by
+[TheAutomatic](https://github.com/TheAutomatic) ([#26](https://github.com/mochizuki0323/DLSSNR-AMD/pull/26)),
+building on [mauri870](https://github.com/mauri870)'s [DLSSNR-RDNA3](https://github.com/mauri870/DLSSNR-RDNA3).
+Tried on few machines: expect more problems than on RX 9000, and for now it may not match the stability and
+performance of DLSSNR-RDNA3.
 
 Known issues:
 
-- With ACO Mode off (the AMD driver's own compiler) it is slower than the Linux version (see Performance).
-- The first time NR runs in a game, the network compiles for about a minute before it takes effect
-  (on Linux about 10-20 seconds; ACO Mode too has the driver compile a template of each shader, which can take
-  as long); this happens once for each game.
+- When ACO's machine code cannot be used (the AMD driver's own compiler) it is slower than the Linux version (see
+  Performance).
+- The first time NR runs in a game, the network takes a while to build before it takes effect (the driver
+  compiles a template of each shader even for ACO's machine code); the OSD shows its progress. Later starts in
+  that game are quicker.
   Until then the picture looks as without NR, which does not mean the mod is not working: give it a
   minute.
 - DirectX 9 games run entirely on DXVK, which changes their performance and behaviour; overlays such
@@ -420,7 +438,7 @@ Known issues:
 - Games whose FSR runs in their own shaders never hand it to OptiScaler: pick the game's DLSS option
   instead, which OptiScaler offers.
 - The network pauses itself when video or system memory runs short.
-- With ACO Mode off the network is built by the AMD Windows driver's shader compiler, which rounds
+- Without ACO's machine code the network is built by the AMD Windows driver's shader compiler, which rounds
   differently from the Linux version in places; on a 1080p test frame the two outputs are 48.5 dB
   PSNR apart.
 

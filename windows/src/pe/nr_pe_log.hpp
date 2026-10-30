@@ -36,4 +36,13 @@ void log(const char* format, ...);
 // Where the log went, for anyone who needs to say it out loud.
 const char* log_path();
 
+// Step-by-step lines around the first evaluates (PBZ: the game ended right after the first frame with a layer before
+// the upscaler, with nothing logged): an evaluate arms them; each kind then gives the number of its next traced step,
+// 0 when it is not traced.
+void trace_arm();
+int trace_execute();
+int trace_present();
+int trace_bridge();
+int trace_exception();
+
 }  // namespace nr::pe
