@@ -1,0 +1,146 @@
+# Builds the packages on every push to main, every merge request and every v* tag, and makes a GitLab
+# release of them when a v* tag is pushed. The version in the package names comes from the tags
+# (*/build/version.sh). No package contains a model: the installers extract it from the user's own
+# nvngx_dlssnr.dll.
+#
+# Windows switch: the Windows package is built unless the CI/CD variable WINDOWS_PACKAGE is "off"
+# (for a Linux-only release):
+#   glab variable set WINDOWS_PACKAGE off     # Linux only
+#   glab variable set WINDOWS_PACKAGE on      # Linux and Windows
+# A tag with "-win-" in it (v0.0.4-win-preview) is a Windows-only release: no Linux packages. A tag
+# with "-linux-" in it is a Linux-only release.
+#
+# The release job puts the packages into the project's generic package registry
+# (packages/generic/dlssnr-amd/<version>/) and links them from the release.
+
+stages: [build, release]
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_TAG =~ /^v/
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "web"
+
+variables:
+  GIT_DEPTH: 0              # the tags, for the version
+  DEBIAN_FRONTEND: noninteractive
+
+default:
+  image: ubuntu:24.04
+  timeout: 3h
+
+linux:
+  stage: build
+  rules:
+    - if: $CI_COMMIT_TAG =~ /-win-/
+      when: never
+    - when: on_success
+  cache:
+    key:
+      prefix: deps-linux
+      files: [fetch_deps.sh]
+    paths:
+      - toolchain
+      - artifacts/ref
+  script:
+    - apt-get update
+    - apt-get install -y --no-install-recommends ca-certificates git curl cmake ninja-build mingw-w64 g++-multilib
+      python3 p7zip-full
+    - bash fetch_deps.sh
+    - bash linux/build/build_vulkan_loader.sh
+    - NR_ARCH=x86_64 bash linux/build/build_package.sh
+    - NR_ARCH=i686 bash linux/build/build_package.sh
+    # no model was packaged
+    - |
+      for f in linux/package/*.tar.gz; do
+        if tar -tzf "$f" | grep -q 'dlssnr\(-small\)\?\.bin$'; then echo "model found in $f" >&2; exit 1; fi
+      done
+  artifacts:
+    name: linux-packages
+    paths:
+      - linux/package/*.tar.gz
+    expire_in: 30 days
+
+windows:
+  stage: build
+  rules:
+    - if: $WINDOWS_PACKAGE == "off"
+      when: never
+    - if: $CI_COMMIT_TAG =~ /-linux-/
+      when: never
+    - when: on_success
+  # GE-Proton's tarball is cached (artifacts/ref/downloads), its unpacked copy (1.6 GB, toolchain/) is not.
+  cache:
+    key:
+      prefix: deps-windows
+      files: [fetch_deps.sh]
+    paths:
+      - toolchain/Vulkan-Headers
+      - toolchain/glslang
+      - toolchain/slang-2026.19
+      - toolchain/imgui-nr
+      - toolchain/fonts
+      - artifacts/ref
+  script:
+    - apt-get update
+    - apt-get install -y --no-install-recommends ca-certificates git curl cmake ninja-build mingw-w64 python3
+      p7zip-full
+    - bash fetch_deps.sh --windows
+    - bash windows/build/build_package.sh   # builds the Vulkan loader and the OptiScaler DLLs too
+    # no model was packaged
+    - |
+      python3 - windows/package/*.zip <<'PY'
+      import sys, zipfile
+      for f in sys.argv[1:]:
+          if any(n.endswith(('dlssnr.bin', 'dlssnr-small.bin')) for n in zipfile.ZipFile(f).namelist()):
+              sys.exit(f'model found in {f}')
+      PY
+  artifacts:
+    name: windows-package
+    paths:
+      - windows/package/*.zip
+    expire_in: 30 days
+
+release:
+  stage: release
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v/
+  needs:
+    - job: linux
+      optional: true
+    - job: windows
+      optional: true
+  cache: []
+  script:
+    - apt-get update
+    - apt-get install -y --no-install-recommends ca-certificates curl python3
+    - |
+      set -euo pipefail
+      version=${CI_COMMIT_TAG#v}
+      registry="$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/dlssnr-amd/$version"
+      files=(linux/package/*.tar.gz windows/package/*.zip)
+      links=()
+      for f in "${files[@]}"; do
+        [[ -f "$f" ]] || continue
+        name=$(basename -- "$f")
+        curl -fsS --retry 3 -H "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$f" "$registry/$name" > /dev/null
+        echo "uploaded $name"
+        links+=("$name")
+      done
+      (( ${#links[@]} )) || { echo "no packages" >&2; exit 1; }
+      python3 - "$registry" "${links[@]}" > release.json <<'PY'
+      import json, os, sys
+      registry, names = sys.argv[1], sys.argv[2:]
+      tag = os.environ["CI_COMMIT_TAG"]
+      print(json.dumps({
+          "tag_name": tag,
+          "name": tag,
+          "description": tag,
+          "assets": {"links": [{"name": n, "url": f"{registry}/{n}", "direct_asset_path": f"/{n}",
+                                "link_type": "package"} for n in names]},
+      }))
+      PY
+      curl -fsS --retry 3 -H "JOB-TOKEN: $CI_JOB_TOKEN" -H "Content-Type: application/json" \
+        --data @release.json "$CI_API_V4_URL/projects/$CI_PROJECT_ID/releases" > /dev/null
+      echo "release $CI_COMMIT_TAG created"
