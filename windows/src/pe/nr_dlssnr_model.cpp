@@ -262,9 +262,43 @@ PanelGuides panel_guides_d3d12(ID3D12Resource* color, ID3D12Resource* motion, ID
     return g;
 }
 
+// v2.2: the evaluations by route (note_route), their own lock (the wilsjo2 style counts outside the evaluate's).
+struct RouteCounts {
+    std::mutex m;
+    uint64_t sec[kRouteKinds] = {}, total[kRouteKinds] = {};
+    ULONGLONG sec_start = 0, logged = 0;
+    int mix = -1;          // the last second's kinds, a bit each
+    int detail_left = 0;   // seconds still logged one by one after a change of the mix
+    bool both_warned = false;
+};
+RouteCounts g_routes;
+std::atomic<float> g_native_ms{0.f};
+std::atomic<ULONGLONG> g_asd_at{0};   // the last ASD-recorded evaluate (GetTickCount64)
+
+const char* const kRouteNames[kRouteKinds] = {"ASD network (ACO, D3D12)", "Vulkan bridge ran its network",
+                                              "Vulkan bridge passed the frame through", "wilsjo2 D3D12 route ran",
+                                              "wilsjo2 D3D12 route passed the frame through", "wilsjo2 sent to the bridge"};
+
+std::string route_counts_text(const uint64_t* c) {
+    std::string t;
+    for (int k = 0; k < kRouteKinds; ++k) {
+        if (!t.empty()) t += ", ";
+        t += std::to_string(c[k]) + " " + kRouteNames[k];
+    }
+    return t;
+}
+
+void log_route_totals() {
+    std::lock_guard<std::mutex> l(g_routes.m);
+    uint64_t c[kRouteKinds];
+    bool any = false;
+    for (int k = 0; k < kRouteKinds; ++k) { c[k] = g_routes.total[k] + g_routes.sec[k]; any = any || c[k]; }
+    if (any) log("[nr] session (all routes): %s", route_counts_text(c).c_str());
+}
+
 void report_control(nr::pe::Session& session, const Feature* f, uint32_t route, unsigned int w, unsigned int h,
                     const nr::renodx::Settings* rs, size_t live, uint32_t render_w, uint32_t render_h,
-                    const PanelGuides& guides, bool ran) {
+                    const PanelGuides& guides, bool ran, bool asd = false) {
     nr::pe::control::Status st;
     st.layer = nr::pe::renodx_route::call_layer();
     static uint64_t vram_at = 0;   // the heap's use, four times a second (a driver query)
@@ -380,6 +414,23 @@ void report_control(nr::pe::Session& session, const Feature* f, uint32_t route, 
         st.building_net = ss.building_net;
         st.build_progress = nr::pe::build_progress(ss, phase, sizeof phase);
         st.build_phase = phase;
+    }
+    if (asd) {   // v2.2: the native ASD backend recorded this frame - the network runs as ACO through ASD on the game's
+                 // D3D12 device; the Vulkan session's own build (started by the bridge's first evaluates) is not NR's state
+        st.ran = true;
+        st.waiting = false;
+        st.waiting_why.clear();
+        st.building = false;
+        st.building_net = -1;
+        st.build_progress = 0.f;
+        st.build_phase.clear();
+        if (st.net_running < 0 || (ss.want_net >= 0 && st.net_running != ss.want_net)) st.net_running = ss.want_net;
+        if (st.net_running < 0) st.net_running = st.net_want;
+        st.gpu_ms = g_native_ms.load();
+        st.network_ms = 0.f;   // (the [asd] timing lines have the network's share)
+        st.aco = 1;
+        st.aco_rdna3 = false;
+        st.aco_why = "via ASD, active: the network runs as ACO (public ASD + PSDB) on the game's D3D12 device";
     }
     nr::pe::control::report(st);
 }
@@ -1288,6 +1339,22 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
         frame.renodx_route = nr::pe::renodx_route::installed() ? 1 : 0;
         frame.preprocess = preprocess_now().active() ? 1 : 0;
         if (backend(frame)) {
+            note_route(kRouteAsd);
+            {   // v2.2: NR Control's state from this frame (it used to keep the bridge's last one: "building ... 20%")
+                static ULONGLONG reported = 0;
+                const ULONGLONG now = GetTickCount64();
+                if (now - reported >= 100) {   // the shared page takes four a second; the layer's row every report
+                    reported = now;
+                    uint32_t render_w = depth_rect.width, render_h = depth_rect.height;
+                    if ((!render_w || !render_h) && depth) {
+                        const D3D12_RESOURCE_DESC dd = depth->GetDesc();
+                        render_w = uint32_t(dd.Width); render_h = dd.Height;
+                    }
+                    report_control(d3d12_session(), f, 1, width, height, nullptr, g_live_d3d12.size(), render_w, render_h,
+                                   panel_guides_d3d12(color, motion, depth, motion_rect, reset != 0, mv_scale_x, mv_scale_y),
+                                   true, true);
+                }
+            }
             device->Release();
             return static_cast<int>(NVSDK_NGX_Result_Success);
         }
@@ -1453,6 +1520,7 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
                      : "declined", session.gpu_ms(), session.network_ms());
         report_control(session, f, 1, width, height, &rf.settings, g_live_d3d12.size(), render_w, render_h,
                        panel_guides_d3d12(color, motion, depth, motion_rect, resources.reset, mv_scale_x, mv_scale_y), ran);
+        note_route(ran ? kRouteBridgeRan : kRouteBridgePassed);
         device->Release();
         if (!ran && session.failed()) return static_cast<int>(NVSDK_NGX_Result_FAIL_UnableToInitializeFeature);
         return static_cast<int>(NVSDK_NGX_Result_Success);
@@ -1499,6 +1567,7 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
                  static_cast<const void*>(output), resources.reset, ran, why, session.gpu_ms(), session.network_ms());
     report_control(session, f, 1, width, height, nullptr, g_live_d3d12.size(), render_w, render_h,
                    panel_guides_d3d12(color, motion, depth, motion_rect, resources.reset, mv_scale_x, mv_scale_y), ran);
+    note_route(ran ? kRouteBridgeRan : kRouteBridgePassed);
     if (readback && f->debug) readback_log(f, *f->debug);
     // The Vulkan identities behind the D3D12 pointers, for the multipass question: does pass k's
     // colour really alias the buffer pass k-1 wrote, or the untouched model input? Same rate limit.
@@ -1608,6 +1677,7 @@ void vk_queue_lock(const std::function<void()>& lock, const std::function<void()
 }
 
 void abandon_at_exit() {
+    log_route_totals();
     for (std::unique_ptr<nr::pe::Session>* s : {&g_d3d12_session, &g_vk_session})
         if (*s) {
             (*s)->log_totals();
@@ -2044,5 +2114,42 @@ void layer_changed(int layer) {
 }
 
 void set_d3d12_backend(D3d12Backend backend) { g_d3d12_backend = backend; }
+
+void note_native_ms(float ms) {
+    const float old = g_native_ms.load();
+    g_native_ms = old > 0.f ? old * 0.9f + ms * 0.1f : ms;   // smoothed for NR Control's line
+}
+
+void note_route(int kind) {
+    if (kind < 0 || kind >= kRouteKinds) return;
+    const ULONGLONG now = GetTickCount64();
+    if (kind == kRouteAsd) g_asd_at = now;
+    std::lock_guard<std::mutex> l(g_routes.m);
+    if (!g_routes.sec_start) g_routes.sec_start = now;
+    if (now - g_routes.sec_start >= 1000) {   // a second (or more, a pause) done: its mix
+        uint64_t* c = g_routes.sec;
+        int mix = 0;
+        for (int k = 0; k < kRouteKinds; ++k) if (c[k]) mix |= 1 << k;
+        const double secs = double(now - g_routes.sec_start) / 1000.0;
+        if (mix != g_routes.mix) {
+            g_routes.detail_left = 10;
+            log("[nr] routes: the mix changed (%s)", g_routes.mix < 0 ? "first second" : "see the next lines");
+            g_routes.mix = mix;
+        }
+        if (g_routes.detail_left > 0 || now - g_routes.logged >= 30000) {
+            if (g_routes.detail_left > 0) --g_routes.detail_left;
+            g_routes.logged = now;
+            log("[nr] routes, last %.1f s: %s", secs, route_counts_text(c).c_str());
+        }
+        if (c[kRouteAsd] && c[kRouteBridgeRan] && !g_routes.both_warned) {
+            g_routes.both_warned = true;
+            log("[nr] routes: WARNING - the ASD network and the Vulkan bridge's network both ran in one second: two "
+                "networks with their own histories on alternating frames would flicker");
+        }
+        for (int k = 0; k < kRouteKinds; ++k) { g_routes.total[k] += c[k]; c[k] = 0; }
+        g_routes.sec_start = now;
+    }
+    ++g_routes.sec[kind];
+}
 
 }  // namespace nr::dlssnr

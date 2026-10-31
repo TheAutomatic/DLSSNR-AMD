@@ -218,5 +218,15 @@ void discard_vk_timing();
 // A layer of the .asi's chain changed (processing, placement, network) or went: Session::reset_layer_timing on every
 // session there is (none is made for it).
 void layer_changed(int layer);
+// v2.2: the evaluations by route, for the log ("[nr] routes" lines: a second's mix when it changes, then every 30 s;
+// the session's totals at exit) and NR Control's line. kinds: kRouteAsd the native ASD backend recorded the frame;
+// kRouteBridgeRan / kRouteBridgePassed the Vulkan bridge (the 0.0.8.1 route) ran its network / passed the frame through;
+// kRouteNativeRan / kRouteNativePassed / kRouteNativeBridged the .asi's wilsjo2 style on D3D12 (its flow on the D3D12
+// route ran / passed the frame through / went to the bridge).
+enum RouteKind { kRouteAsd, kRouteBridgeRan, kRouteBridgePassed, kRouteNativeRan, kRouteNativePassed, kRouteNativeBridged,
+                 kRouteKinds };
+void note_route(int kind);
+// The wilsjo2 native route's GPU time of one run (its programs + the ASD network), for NR Control's line.
+void note_native_ms(float ms);
 
 }  // namespace nr::dlssnr

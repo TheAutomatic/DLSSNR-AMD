@@ -800,6 +800,9 @@ struct Menu {
         else ImGui::TextDisabled(tr(chain.many() ? "No layer is on (the NR chain page): NR does not run."
                                                  : "NR is off (Enabled on the NR settings page): NR does not run."));
         if (s->net_running < nr::control::kNoNet && !chain_rows(s)) ImGui::Text(tr("Network: %s"), nr::network_codename(int(s->net_running)));
+        if (nr::control_ui::osd_via_asd(s))   // v2.2
+            ImGui::Text(tr("NR: ACO via ASD, active (%s%s)"), nr::network_codename(int(s->net_running)),
+                        s->gpu_ms > 0.f ? nr::control_ui::osd_cost(s->gpu_ms, 0.f).c_str() : "");
         if (s->building) {   // the build's progress, as the OSD and the ReShade route's page show it
             ImGui::Text(tr("Building %s"), s->building_net < nr::control::kNoNet ? nr::network_codename(int(s->building_net)) : tr("the network"));
             char phase[sizeof s->build_phase + 1] = {};

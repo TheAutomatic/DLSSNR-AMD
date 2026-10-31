@@ -1831,6 +1831,38 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top) {
     }
     // The presents a game frame has HERE: one at the game's own Present (generated frames never pass it)
     const uint32_t multiplier = top ? 1u : std::max(g_present.multiplier, 1u);
+    {   // v2.2 (the flicker at Present with frame generation): what frame generation makes its frames from, said once per
+        // change. With HUD FIX off, frame generation that is handed the game's HUD-less picture (ffxConfigure,
+        // Streamline's or XeSS-FG's tag) interpolates from that picture, which NR does not touch: the real frames carry
+        // NR, the generated ones do not, and they alternate.
+        static std::string said;
+        static int lines_left = 20;   // (a state that keeps changing is not logged a frame at a time)
+        const bool fg_on = g_present.multiplier > 1;
+        const bool handed = hud_cap.fg.seen || hud_cap.fg.offered;
+        char line[512];
+        std::snprintf(line, sizeof line,
+                      "[nr] Present layers + frame generation: %s%ux; HUD FIX %s; the game hands frame generation a HUD-less "
+                      "picture: %s%s%s%s",
+                      fg_on ? "on, " : "off, ", std::max(g_present.multiplier, 1u),
+                      hud_mode == 0 ? "off" : hud_mode == 1 ? "auto" : hud_mode == 2 ? "game" : hud_mode == 3 ? "captured" : "estimated",
+                      handed ? "yes" : "not seen", handed && hud_cap.fg.source[0] ? " (" : "", handed ? hud_cap.fg.source : "",
+                      handed && hud_cap.fg.source[0] ? ")" : "");
+        std::string key(line);
+        if (fg_on && key != said && lines_left > 0) {
+            said = key;
+            --lines_left;
+            nr::pe::log("%s", line);
+            if (handed && hud_mode != 1 && hud_mode != 2)
+                nr::pe::log("[nr] Present layers: WARNING - frame generation makes its generated frames from the game's "
+                            "HUD-less picture, which NR does not process with HUD FIX %s: the real frames carry NR and the "
+                            "generated ones do not, and they alternate (flicker). HUD FIX Mode = Game (NR Control) hands "
+                            "frame generation NR's picture; or turn frame generation off.",
+                            hud_mode == 0 ? "off" : "in this mode");
+            else if (!handed && hud_mode == 0)
+                nr::pe::log("[nr] Present layers: frame generation runs and no HUD-less hand-over was seen; it then makes its "
+                            "frames from the presented (NR) picture");
+        }
+    }
     {   // Frame generation's presents as they come (PBZ: flicker at Present with DLSS-G): 32 lines after the first
         // detection and after each change of the multiplier, four times at most
         static uint32_t trace_left = 0, traces = 0, traced_multiplier = 1;
