@@ -1,5 +1,6 @@
 #include "nr_path_u8.hpp"
 #include "nr_runtime.hpp"
+#include "nr_d3d12_net_plan.hpp"
 #include "nr_gpu_completion.hpp"
 #include "nr_native_plan.hpp"
 #include "nr_runtime_dispatch.hpp"
@@ -253,6 +254,58 @@ constexpr float kPostBlendScaleSmall = 0.76708984375f;
 constexpr uint32_t kPrePushBytes = sizeof(PushFSwin) + sizeof(PushPreImage);
 constexpr uint32_t kPreSeedAt = sizeof(PushFSwin) + offsetof(PushPreImage, seed);
 constexpr uint32_t kPreNoiseFieldAt = sizeof(PushFSwin) + offsetof(PushPreImage, noise_off);
+
+// The pass's model controls into one dispatch's push block (Runtime::Impl::patch_push; the D3D12 ASD backend through
+// d3d12_net_controls). post_alpha / round_u8: the post block restores the alpha (and the 8-bit rounding) itself; grade:
+// the Style grade pipelines exist and are on.
+void patch_push_controls(std::vector<uint8_t>& blob, const std::string& kern, int style, float intensity, float tone,
+                         float structure, float skin_in, bool mask, bool post_alpha, bool round_u8, bool grade) {
+    struct { int style; float intensity, tone, structure, skin_in; bool mask; } r{style, intensity, tone, structure, skin_in, mask};
+    const float skin = r.mask ? (r.skin_in < 0 ? r.structure : r.skin_in) : -1.0f;
+    const float background = r.mask ? r.structure : -1.0f;
+    if (kern.rfind("fswinimagepreds32", 0) == 0) {
+        PushPreImage p{};
+        std::memcpy(&p, blob.data() + sizeof(PushFSwin), sizeof p);
+        p.style = float(r.style) / 128; p.tone = r.tone;
+        p.structure = r.mask ? 1 : r.structure;
+        p.skin = skin; p.other = background;
+        std::memcpy(blob.data() + sizeof(PushFSwin), &p, sizeof p);
+    } else if (kern.rfind("imgin", 0) == 0) {
+        PushImgIn p{}; std::memcpy(&p, blob.data(), sizeof p);
+        p.s434 = float(r.style) / 128; p.aux0 = r.tone;
+        p.aux1 = r.mask ? 1 : r.structure;
+        p.gate0 = skin; p.gate1 = background;
+        std::memcpy(blob.data(), &p, sizeof p);
+    } else if (kern == "fswinimagepost32") {
+        constexpr size_t offset = sizeof(PushFSwin) + sizeof(PushUps);
+        PushImageTail p{}; std::memcpy(&p, blob.data() + offset, sizeof p);
+        // Native compose (the OptiScaler and ReShade routes): the fused
+        // tail's own blend IS the DLL's post-block Intensity. **Not clamped
+        // to 1**: that clamp came from one post variant's `sat(Intensity)`
+        // in the PTX, which governs that variant's lerp and not the
+        // control - the DLL copies Intensity out of its settings
+        // unsaturated (18001cf07) and the Toolkit documents 0..2. The tail
+        // takes 0..1 as the lerp and past it as a luminance-ratio power;
+        // see windows/shaders/rdna4/fswin_t.comp.
+        // Every route, every pass: each pass carries its own Intensity
+        // into this blend, as each OptiScaler DLSS-NR pass is its own DLL
+        // feature with its own Intensity.
+        p.intensity = std::clamp(r.intensity, 0.0f, 2.0f);
+        // Bits 28-29: the Style. For Natural and Cinematic the DLL grades the composed answer after the post
+        // block (cg2r_post_process_kernel); the *_grade post pipelines do the same
+        // (windows/shaders/rdna4/include/nr_style_grade.glsl). Non-zero bits select that pipeline at dispatch;
+        // they stay 0 without it. Controls are checked to 0..2 before they get here; the DLL clamps to its
+        // style count, 3.
+        p.w_off = (p.w_off & 0x0FFFFFFFu) |
+                  (post_alpha ? 0x80000000u | (round_u8 ? 0x40000000u : 0u) : 0u) |
+                  (grade ? uint32_t(std::clamp(r.style, 0, 2)) << 28 : 0u);
+        std::memcpy(blob.data() + offset, &p, sizeof p);
+    } else if (kern.rfind("imgout", 0) == 0) {
+        PushImgOut p{}; std::memcpy(&p, blob.data(), sizeof p);
+        p.nr_intensity = std::clamp(r.intensity, 0.0f, 2.0f);
+        std::memcpy(blob.data(), &p, sizeof p);
+    }
+}
 
 // The model extent. At scale 1 it is the frame's own, unaligned, as every
 // game has run so far; below 1 it is rounded to a multiple of 8 (the
@@ -965,50 +1018,8 @@ struct Runtime::Impl {
     struct Resolved { int style; float intensity, tone, structure, skin_in; bool mask; };
 
     void patch_push(std::vector<uint8_t>& blob, const std::string& kern, const Resolved& r) const {
-        const float skin = r.mask ? (r.skin_in < 0 ? r.structure : r.skin_in) : -1.0f;
-        const float background = r.mask ? r.structure : -1.0f;
-        if (kern.rfind("fswinimagepreds32", 0) == 0) {
-            PushPreImage p{};
-            std::memcpy(&p, blob.data() + sizeof(PushFSwin), sizeof p);
-            p.style = float(r.style) / 128; p.tone = r.tone;
-            p.structure = r.mask ? 1 : r.structure;
-            p.skin = skin; p.other = background;
-            std::memcpy(blob.data() + sizeof(PushFSwin), &p, sizeof p);
-        } else if (kern.rfind("imgin", 0) == 0) {
-            PushImgIn p{}; std::memcpy(&p, blob.data(), sizeof p);
-            p.s434 = float(r.style) / 128; p.aux0 = r.tone;
-            p.aux1 = r.mask ? 1 : r.structure;
-            p.gate0 = skin; p.gate1 = background;
-            std::memcpy(blob.data(), &p, sizeof p);
-        } else if (kern == "fswinimagepost32") {
-            constexpr size_t offset = sizeof(PushFSwin) + sizeof(PushUps);
-            PushImageTail p{}; std::memcpy(&p, blob.data() + offset, sizeof p);
-            // Native compose (the OptiScaler and ReShade routes): the fused
-            // tail's own blend IS the DLL's post-block Intensity. **Not clamped
-            // to 1**: that clamp came from one post variant's `sat(Intensity)`
-            // in the PTX, which governs that variant's lerp and not the
-            // control - the DLL copies Intensity out of its settings
-            // unsaturated (18001cf07) and the Toolkit documents 0..2. The tail
-            // takes 0..1 as the lerp and past it as a luminance-ratio power;
-            // see windows/shaders/rdna4/fswin_t.comp.
-            // Every route, every pass: each pass carries its own Intensity
-            // into this blend, as each OptiScaler DLSS-NR pass is its own DLL
-            // feature with its own Intensity.
-            p.intensity = std::clamp(r.intensity, 0.0f, 2.0f);
-            // Bits 28-29: the Style. For Natural and Cinematic the DLL grades the composed answer after the post
-            // block (cg2r_post_process_kernel); the *_grade post pipelines do the same
-            // (windows/shaders/rdna4/include/nr_style_grade.glsl). Non-zero bits select that pipeline at dispatch;
-            // they stay 0 without it. Controls are checked to 0..2 before they get here; the DLL clamps to its
-            // style count, 3.
-            p.w_off = (p.w_off & 0x0FFFFFFFu) |
-                      (post_alpha ? 0x80000000u | (round_u8 ? 0x40000000u : 0u) : 0u) |
-                      (style_grade && style_grade_on ? uint32_t(std::clamp(r.style, 0, 2)) << 28 : 0u);
-            std::memcpy(blob.data() + offset, &p, sizeof p);
-        } else if (kern.rfind("imgout", 0) == 0) {
-            PushImgOut p{}; std::memcpy(&p, blob.data(), sizeof p);
-            p.nr_intensity = std::clamp(r.intensity, 0.0f, 2.0f);
-            std::memcpy(blob.data(), &p, sizeof p);
-        }
+        patch_push_controls(blob, kern, r.style, r.intensity, r.tone, r.structure, r.skin_in, r.mask, post_alpha, round_u8,
+                            style_grade && style_grade_on);
     }
 
     void controls(const Controls& c) {
@@ -2863,6 +2874,173 @@ float Runtime::last_gpu_ms() const { return impl_->gpu_ms; }
 float Runtime::average_gpu_ms() const { return impl_->gpu_ms_avg; }
 float Runtime::average_network_ms() const { return impl_->split_timing ? impl_->net_ms_avg : 0.0f; }
 void Runtime::discard_timing() { impl_->timings_recorded = 0; }
+// ---- the native D3D12 ASD backend's network (nr_d3d12_net_plan.hpp) ---------------------------------------------------
+//
+// Runtime::Runtime's model choice and build arguments, and NrSession::build with plan_only (the lowering; no device, no
+// pipelines), for a caller that runs the dispatches itself. Divergences from the constructor, all of them about the
+// Vulkan host this has not got: no device checks or adopt, no pipeline binaries check (ACO Mode is the configured
+// directory alone), no --tex-in-format / --out0-format (the D3D12 side hands the network RGBA32F), no int4 network.
+bool plan_d3d12_network(const std::string& root_in, uint32_t mw, uint32_t mh, bool allow_experimental, D3d12NetPlan* out,
+                        std::string* why) {
+    try {
+        *out = D3d12NetPlan{};
+        const auto root = std::filesystem::canonical(nr::u8::path(root_in));
+        const auto data = std::filesystem::is_directory(root / "dlssnr-amd") ? root / "dlssnr-amd" : root;
+        const bool installed = data != root;
+        if (!installed) { *why = "no dlssnr-amd folder in " + root.string(); return false; }
+        const std::string aco = nr::binary::directory();
+        if (aco.empty()) {
+            *why = "ACO Mode is off" + (nr::binary::disabled_why().empty() ? std::string()
+                                                                           : " (" + nr::binary::disabled_why() + ")");
+            return false;
+        }
+        const auto network_shaders = std::filesystem::path(aco) / "shaders";
+        // The model, as the constructor picks it: DLSSNR_MODEL over dlssnr-amd.ini [Network] Model; none: the small one.
+        NetworkModel network = NetworkModel::Small;
+        bool experimental = false;
+        const std::filesystem::path xroot = data / "experimental";
+        std::string from;
+        {
+            std::string env;
+#ifdef _WIN32
+            { char b[16] = {}; const unsigned long n = GetEnvironmentVariableA("DLSSNR_MODEL", b, sizeof b); if (n && n < sizeof b) env = b; }
+#endif
+            if (env.empty()) if (const char* e = std::getenv("DLSSNR_MODEL")) env = e;
+            const int ev = env.empty() ? -1 : nr::network_value(env);
+            const int iv = ev >= 0 ? -1 : nr::ini_network((data.parent_path() / "dlssnr-amd.ini").string());
+            from = ev >= 0 ? "DLSSNR_MODEL" : iv >= 0 ? "dlssnr-amd.ini" : "default";
+            const int v = ev >= 0 ? ev : iv;
+            if (v == 0) network = NetworkModel::Original;
+            std::error_code ec;
+            if (v == 2) {
+                const char* missing = !allow_experimental ? "its kernels are not in the PSDB"
+                    : !std::filesystem::is_regular_file(xroot / "shaders" / "fixed-attention.txt", ec) ||
+                              !std::filesystem::is_directory(xroot / "shaders" / "temporal", ec) ? "dlssnr-amd/experimental/ is incomplete"
+                    : !std::filesystem::is_regular_file(data / "dlssnr-small-experimental.bin", ec)
+                              ? "dlssnr-amd/dlssnr-small-experimental.bin is missing"
+                    : nullptr;
+                if (missing) out->note = std::string("CC_SMALL_FP8_EXPERIMENTAL, but ") + missing + ": CC_SMALL_FP8";
+                else experimental = true;
+            }
+            if (network == NetworkModel::Small && !experimental &&
+                !std::filesystem::is_regular_file(data / "dlssnr-small.bin", ec)) {
+                out->note = "dlssnr-amd/dlssnr-small.bin is missing: the original model";
+                network = NetworkModel::Original;
+            }
+        }
+        out->model = network == NetworkModel::Small ? experimental ? "CC_SMALL_FP8_EXPERIMENTAL" : "CC_SMALL_FP8" : "original";
+        out->model += " (" + from + ")";
+        {
+            std::string v = nr::ini_network_key((data.parent_path() / "dlssnr-amd.ini").string(), "style grade");
+            for (auto& ch : v) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+            out->style_grade = !(v == "0" || v == "false" || v == "off" || v == "no");
+        }
+        const auto native = make_native_plan(mw, mh, network);
+        std::istringstream plan_stream(native.text);
+        const auto prepared_plan = parse_plan(plan_stream);
+        auto arena_reuse = [] {
+            const char* e = std::getenv("NR_ARENA_REUSE");
+            return e && *e ? std::atoi(e) != 0 : kArenaReuseDefault;
+        };
+        std::vector<std::string> arguments = {"nr_runtime", "--plan", "compiled native descriptor",
+            "--unpacked", (data / "model").string(),
+            "--spv-dir", network_shaders.string(),
+            "--host-boundary", arena_reuse() ? "--reuse" : "--no-reuse", "--source-width", std::to_string(mw),
+            "--source-height", std::to_string(mh), "--accumulation", "fp32",
+            "--pipeline-cache", (data / "pipeline.cache").string()};
+        if (experimental) {
+            for (size_t i = 0; i + 1 < arguments.size(); ++i) {
+                if (arguments[i] == "--spv-dir") arguments[i + 1] = (xroot / "shaders").string();
+                if (arguments[i] == "--pipeline-cache") arguments[i + 1] = (xroot / "pipeline.cache").string();
+            }
+            arguments.push_back("--spv-dir-aco");
+        }
+        {
+            const auto pack = data / (experimental ? "dlssnr-small-experimental.bin"
+                                      : network == NetworkModel::Small ? "dlssnr-small.bin" : "dlssnr.bin");
+            if (!std::filesystem::is_regular_file(pack)) { *why = "missing " + pack.string(); return false; }
+            arguments.push_back("--model-pack"); arguments.push_back(pack.string());
+        }
+        std::vector<char*> argv;
+        for (auto& a : arguments) argv.push_back(a.data());
+        std::lock_guard<std::mutex> lock(build_mutex);
+#if NR_INT4
+        std::map<std::string, std::string> int4_cfg;   // empty: the default network, nothing from the environment
+        const nr::BuildCfgScope cfg_scope(&int4_cfg);
+#endif
+        NrSession s;
+        s.ctx.rdna3 = false;
+        s.plan_only = true;
+        s.weights_out = &out->weights;
+        const int built = s.build(int(argv.size()), argv.data(), &prepared_plan);
+        if (built != 4 || !s.missing.empty() || !s.core) {
+            *why = "the graph's lowering failed (" + std::to_string(built) + (s.missing.empty() ? "" : ", missing files") + ")";
+            return false;
+        }
+        const GraphCore& c = *s.core;
+        out->disp.reserve(c.disp.size());
+        for (const Disp& d : c.disp) {
+            D3d12NetPlan::Dispatch x;
+            x.kern = d.kern; x.gx = d.gx; x.gy = d.gy; x.gz = d.gz; x.push = d.push;
+            // put_act_address: the arena's address at act_lo (PushVAttn for vitattn, PushGemm for the GEMMs)
+            if (d.kern == "vitattn" && d.push.size() >= sizeof(PushVAttn)) x.act_at = int(offsetof(PushVAttn, act_lo));
+            else if (gemm_push_kern(d.kern) && d.push.size() >= sizeof(PushGemm)) x.act_at = int(offsetof(PushGemm, act_lo));
+            out->disp.push_back(std::move(x));
+        }
+        // The temporal path, as Runtime::Runtime sets it up (temporal_config.enable; the D3D12 session's make_temporal):
+        // the ACO bundle's shaders/temporal (experimental: its own), the no-upper-clamp pre when the graph's pre is
+        // fswinimagepreds32nh and the package has it, the post's Style-grade twin when it exists (else no grading).
+        {
+            auto& t = out->temporal;
+            const bool pre_nh = std::any_of(c.disp.begin(), c.disp.end(), [](const Disp& d) { return d.kern == "fswinimagepreds32nh"; });
+            const std::string pre_name = pre_nh ? "fswinimagepreds32nh" : "fswinimagepreds32";
+            for (size_t i = 0; i < c.disp.size(); ++i) {
+                if (c.disp[i].kern == pre_name && t.pre < 0) t.pre = int(i);
+                if (c.disp[i].kern == "fswinimagepost32") t.post = int(i);
+            }
+            if (t.pre < 0 || t.post < 0) { *why = "the temporal path requires the fused FP32 image kernels"; return false; }
+            if (c.disp[size_t(t.pre)].push.size() != kPrePushBytes) { *why = "temporal pre block: unexpected push size"; return false; }
+            const auto shaders = experimental ? xroot / "shaders" / "temporal" : network_shaders / "temporal";
+            std::error_code ec;
+            const bool tp_nh = pre_nh && std::filesystem::exists(shaders / "temporal_pre_fp32nh.spv", ec);
+            t.pre_spv = (shaders / (tp_nh ? "temporal_pre_fp32nh.spv" : "temporal_pre_fp32.spv")).string();
+            t.post_spv = (shaders / "temporal_post_fp32.spv").string();
+            if (!std::filesystem::is_regular_file(t.pre_spv, ec) || !std::filesystem::is_regular_file(t.post_spv, ec)) {
+                *why = "the temporal shaders are missing in " + shaders.string(); return false;
+            }
+            if (out->style_grade && std::filesystem::exists(shaders / "temporal_post_fp32_grade.spv", ec))
+                t.post_grade_spv = (shaders / "temporal_post_fp32_grade.spv").string();
+            else out->style_grade = false;
+            t.pre_push_bytes = kPrePushBytes;
+            t.seed_at = kPreSeedAt;
+            t.noise_field_at = kPreNoiseFieldAt;
+            t.blend_scale = network == NetworkModel::Small ? kPostBlendScaleSmall : kPostBlendScale;
+            std::string v = nr::ini_network_key((data.parent_path() / "dlssnr-amd.ini").string(), "motion without depth");
+            for (auto& ch : v) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+            t.motion_without_depth = !(v == "0" || v == "false" || v == "off" || v == "no");
+        }
+        for (const NoiseJob& j : c.noise) out->noise.push_back({j.off, j.width, j.height, j.seed, j.noise});
+        out->weights_end = c.weights_end;
+        out->act_total = c.act_total;
+        out->spv_dir = c.spv_dir;
+        out->width = mw; out->height = mh;
+        out->work_w = native.width; out->work_h = native.height;
+        // The tail (noise field, records) at weights_end, as retarget puts it into the network memory.
+        if (out->weights.size() < c.weights_end + c.tail.size()) out->weights.resize(c.weights_end + c.tail.size(), 0);
+        if (!c.tail.empty()) std::memcpy(out->weights.data() + c.weights_end, c.tail.data(), c.tail.size());
+        return true;
+    } catch (const std::exception& e) {
+        *why = e.what();
+        return false;
+    }
+}
+
+void d3d12_net_controls(D3d12NetPlan::Dispatch& d, const D3d12NetControls& c, bool grade) {
+    // NR_POST_ALPHA is 0 in the product: the alpha pass, not the post block, restores the alpha (and the rounding).
+    patch_push_controls(d.push, d.kern, c.style, c.intensity, c.local_tone, c.local_structure, c.skin_structure,
+                        c.automatic_mask, false, false, grade);
+}
+
 }  // namespace nr
 
 namespace nr { bool Runtime::recordings_done() const { return impl_->gpu_uses.ready(); } }

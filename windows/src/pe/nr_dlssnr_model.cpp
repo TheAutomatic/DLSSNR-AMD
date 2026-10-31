@@ -1260,6 +1260,33 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
         frame.output_state = int(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         frame.width = width;
         frame.height = height;
+        {
+            const nr::Controls c = controls_from(controls);
+            frame.style = c.style;
+            frame.intensity = c.intensity;
+            frame.local_tone = c.local_tone;
+            frame.local_structure = c.local_structure;
+            frame.skin_structure = c.skin_structure;
+            frame.automatic_mask = c.automatic_mask ? 1 : 0;
+            frame.reversible_mode = c.reversible_mode;
+        }
+        // The temporal inputs, as the session's resources below take them.
+        frame.motion = motion;
+        frame.motion_x = motion_rect.x; frame.motion_y = motion_rect.y;
+        frame.motion_w = motion_rect.width; frame.motion_h = motion_rect.height;
+        {
+            const D3D12_RESOURCE_DESC md = motion ? motion->GetDesc() : D3D12_RESOURCE_DESC{};
+            const unsigned int mw = motion_rect.width ? motion_rect.width : motion ? unsigned(md.Width) : width;
+            const unsigned int mh = motion_rect.height ? motion_rect.height : motion ? unsigned(md.Height) : height;
+            frame.motion_scale_x = normalized_mv_scale(mv_scale_x, mw);
+            frame.motion_scale_y = normalized_mv_scale(mv_scale_y, mh);
+        }
+        frame.reset = reset != 0 ? 1 : 0;
+        frame.feature = static_cast<unsigned long long>(f->id);
+        frame.history_strength = -1.0f;
+        if (const auto* w2 = nr::pe::renodx_route::call_wilsjo2()) frame.history_strength = w2->history;
+        frame.renodx_route = nr::pe::renodx_route::installed() ? 1 : 0;
+        frame.preprocess = preprocess_now().active() ? 1 : 0;
         if (backend(frame)) {
             device->Release();
             return static_cast<int>(NVSDK_NGX_Result_Success);
