@@ -3700,6 +3700,51 @@ void Session::idle() {
         m.residency(false, true);
 }
 
+size_t Session::release_idle_networks(const char* why, double* freed_mib) {
+    auto& m = *impl_;
+    if (freed_mib) *freed_mib = 0.0;
+    const auto now = std::chrono::steady_clock::now();
+    static constexpr std::chrono::seconds kIdleRelease{2};
+    if (m.last_call != std::chrono::steady_clock::time_point{} && now - m.last_call < kIdleRelease) return 0;
+    Impl::Vram before{};
+    const bool measured = m.vram(before);
+    size_t n = 0;
+    {
+        std::lock_guard<std::mutex> guard(m.build_lock);
+        if (m.build_done) {   // finished, never adopted: no frame of ours ever recorded with it
+            m.let_end(m.build_thread);
+            m.build_done = false; m.building = false; m.build_plan = false;
+            if (m.built) { m.built.reset(); ++n; }
+            m.build_share.reset();
+        }
+    }
+    if (!m.parked.empty() && !m.offloading) { n += m.parked.size(); m.parked.clear(); }
+    for (size_t i = m.cache.size(); i-- > 0;) { m.drop(i, why); ++n; }
+    // the retired ones (these and earlier): once nothing recorded uses them and kRetireTime has passed (no evaluation
+    // moves `calls` any more, so free_retired's call count would keep them for good)
+    for (size_t i = m.retired.size(); i-- > 0;) {
+        auto& r = m.retired[i];
+        if (now - r.at < Impl::kRetireTime || !r.runtime->recordings_done()) continue;
+        if (m.bdev && m.bdev->busy(r.runtime.get())) continue;
+        { std::lock_guard<std::mutex> guard(m.drops->m); m.drops->runtimes.erase(r.runtime.get()); }
+        m.retired.erase(m.retired.begin() + long(i));
+        ++n;
+    }
+    if (n) {
+        Impl::Vram after{};
+        const bool measured_after = measured && m.vram(after);
+        const double freed = measured_after && before.usage > after.usage ? double(before.usage - after.usage) / (1 << 20) : 0.0;
+        if (freed_mib) *freed_mib = freed;
+        if (measured_after)
+            log("[nr] Vulkan session: %zu network(s)/runtime(s) released %s; this process's video memory %.0f -> %.0f MiB "
+                "(budget %.0f MiB)", n, why, double(before.usage) / (1 << 20), double(after.usage) / (1 << 20),
+                double(after.budget) / (1 << 20));
+        else
+            log("[nr] Vulkan session: %zu network(s)/runtime(s) released %s", n, why);
+    }
+    return n;
+}
+
 std::string Session::vram_line() const {
     const MemoryState m = read_memory(impl_->handles.physical);
     char line[128];

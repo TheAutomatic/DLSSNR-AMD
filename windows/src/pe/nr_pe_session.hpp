@@ -523,6 +523,13 @@ class Session {
     // the periodic log line: the Windows driver refuses allocations at the budget
     // instead of spilling, and the game is the one that crashes when it does.
     std::string vram_line() const;
+    // v2.5: the frames are served by another backend (the D3D12 route's ASD network): when nothing has evaluated on this
+    // session for a while (kIdleRelease), its networks go - the resident ones (retired, freed once nothing recorded uses
+    // them), the parked ones, and a finished background build nobody adopted (the bridge's build started for the frames
+    // before the ASD network was ready: it finishes after, and no evaluation adopts it, so it held its memory for the
+    // rest of the session). A build still running is left to finish; a later call takes it. The video memory freed, in
+    // MiB as the driver's budget counts this process (before - after), goes to *freed_mib. Returns how many went.
+    size_t release_idle_networks(const char* why, double* freed_mib = nullptr);
     struct Impl;   // nr_pe_session.cpp (named here for the file's own helpers; opaque to every caller)
 
   private:

@@ -812,6 +812,18 @@ bool wilsjo2_run(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, Wilsjo2Ow
         wilsjo2_vk_release(o.vk);
         o.vk = nullptr;
     }
+    if (ran) {   // v2.5: the Vulkan session's networks nothing evaluates on any more (the bridge's build for the frames
+        // before the ASD network was ready, finished after it and never adopted: ~2.3 GB at 3840x2160) go, checked once
+        // a second; one a bridge layer still evaluates on stays (Session::release_idle_networks)
+        static ULONGLONG next_ms = 0;
+        const ULONGLONG now_ms = GetTickCount64();
+        if (now_ms >= next_ms) {
+            next_ms = now_ms + 1000;
+            nr::dlssnr::with_d3d12_session([](nr::pe::Session& session) {
+                session.release_idle_networks("(the D3D12 route's ASD network serves; none evaluated on them for 2 s)");
+            });
+        }
+    }
     if (!ran)
         native::say_route(io.made() ? "a run on the D3D12 route made its feature (the flow runs it from the next frame); "
                                       "this frame passes through"
