@@ -146,6 +146,8 @@ void keep_caller_state();
 // The .asi's wilsjo2 style (nr_asi_wilsjo2.cpp): its own passes around the model's evaluate are recorded through the
 // D3D12 session (Session::record_raw), under the lock every evaluate holds.
 void with_d3d12_session(const std::function<void(nr::pe::Session&)>& fn);
+// The wanted network (stepped by evaluate_d3d12 from dlssnr-amd.ini and the hotkey; -1 before the first evaluate).
+int frame_network();
 // [Preprocess] as this frame has it (dlssnr-amd.ini, re-read at most once a second, and its hotkey) - for a wilsjo2
 // layer that runs it itself (it then sets Wilsjo2Facts::prep_outside, and the network's runtime does not run it).
 nr::Preprocess preprocess_settings();

@@ -7805,10 +7805,11 @@ extern "C" __declspec(dllexport) void InitializeASI() {
     if (nr::pe::asd::enabled()) {
         // The real network (nr_d3d12_asd_net.hpp): lowered as the Vulkan runtime lowers it, for this installation.
         nr::pe::asd::set_net_planner(
-            [](uint32_t w, uint32_t h, bool experimental, nr::D3d12NetPlan* out, std::string* why) {
-                return nr::plan_d3d12_network(nr::pe::module_folder(), w, h, experimental, out, why);
+            [](uint32_t w, uint32_t h, int model, bool experimental, nr::D3d12NetPlan* out, std::string* why) {
+                return nr::plan_d3d12_network(nr::pe::module_folder(), w, h, experimental, out, why, model);
             },
-            &nr::d3d12_net_controls);
+            &nr::d3d12_net_controls,
+            &nr::dlssnr::frame_network);
         nr::dlssnr::set_d3d12_backend(&nr::pe::asd::evaluate_backend);
     }
     nr::pe::menu::set_extra_diagnostics(&nr::pe::asd::draw_panel);

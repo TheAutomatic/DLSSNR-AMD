@@ -261,7 +261,7 @@ struct PlanReader {
     }
     std::string str() { const auto v = blob(); return std::string(v.begin(), v.end()); }
 };
-bool file_planner(uint32_t w, uint32_t h, bool, nr::D3d12NetPlan* p, std::string* why) {
+bool file_planner(uint32_t w, uint32_t h, int, bool, nr::D3d12NetPlan* p, std::string* why) {
     *p = nr::D3d12NetPlan{};
     std::vector<uint8_t> b;
     if (!slurp_file(g_plan, &b) || b.size() < 8 || std::memcmp(b.data(), "NRPLAN02", 8) != 0) { *why = "no NRPLAN02 " + g_plan; return false; }

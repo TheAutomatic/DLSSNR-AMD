@@ -13,6 +13,7 @@
 #include "nr_pe_log.hpp"
 #include "nr_pe_vkdevice.hpp"
 #include "nr_pipeline_binary.hpp"
+#include "nr_d3d12_asd.hpp"
 #include "nr_log.hpp"
 #include "nr_screenshot.hpp"
 #include "nr_test_fault.hpp"
@@ -2705,7 +2706,7 @@ bool Session::Impl::carry(VkCommandBuffer cmd, uint64_t feature) {
 // What can run in this run, from the files installed, this build and the game's device; a UI shows the reason
 // beside a network that cannot, and the hotkey skips it. A build that falls back later says more (network_note).
 void Session::Impl::check_availability() {
-    if (!handles.device) return;
+    if (!handles.device && !nr::pe::asd::enabled()) return;
     availability_checked = true;
     auto exists = [&](const char* rel) {
         const DWORD a = nr::u8::attributes((root + "\\" + rel).c_str());
@@ -2719,16 +2720,19 @@ void Session::Impl::check_availability() {
         net_switch.unavailable(nr::kSmallFp8Experimental, "not installed (run install.bat again)");
     else if (!exists("dlssnr-amd\\dlssnr-small-experimental.bin"))
         net_switch.unavailable(nr::kSmallFp8Experimental, "needs the model of the 310.9.16 nvngx_dlssnr.dll (install.ps1 -Dll)");
-    else if (make_host().rdna3)
+    else if (!nr::pe::asd::enabled() && make_host().rdna3)
         net_switch.unavailable(nr::kSmallFp8Experimental, "not on RDNA3 GPUs (RX 7000, Radeon 700M / 800M / 8000S)");
-    else if (nr::binary::directory().empty())
+    else if (!nr::pe::asd::enabled() && nr::binary::directory().empty())
         net_switch.unavailable(nr::kSmallFp8Experimental, nr::binary::disabled_why().empty()
             ? std::string("needs ACO Mode, which is off for this run")
             : "needs ACO Mode, which is off for this run: " + nr::binary::disabled_why());
-    else if (!nr::binary::enabled(handles.device))
+    else if (!nr::pe::asd::enabled() && !nr::binary::enabled(handles.device))
         net_switch.unavailable(nr::kSmallFp8Experimental, "the game's device has no pipeline binaries (ACO Mode)");
+    if (nr::pe::asd::enabled()) {
+        net_switch.unavailable(nr::kSilverAardwoldInt4, "not on the D3D12 route (ASD)");
+    }
 #if NR_INT4
-    if (!exists("dlssnr-amd\\dlssnr.bin"))
+    else if (!exists("dlssnr-amd\\dlssnr.bin"))
         net_switch.unavailable(nr::kSilverAardwoldInt4, "the model file is missing (run install.bat again)");
     else if (!exists("dlssnr-amd\\int4\\settings.txt"))
         net_switch.unavailable(nr::kSilverAardwoldInt4, "not installed (run install.bat again)");
@@ -2743,7 +2747,8 @@ void Session::Impl::check_availability() {
     else if (!nr::binary::enabled(handles.device))
         net_switch.unavailable(nr::kSilverAardwoldInt4, "the game's device has no pipeline binaries (ACO Mode)");
 #else
-    net_switch.unavailable(nr::kSilverAardwoldInt4, "not in this build");
+    else
+        net_switch.unavailable(nr::kSilverAardwoldInt4, "not in this build");
 #endif
 }
 
@@ -3681,6 +3686,16 @@ Session::State Session::state() const {
 }
 
 void Session::set_network(int n) { impl_->net_switch.set(n); }
+int Session::frame_network() {
+    auto& m = *impl_;
+    if (!m.availability_checked) m.check_availability();
+    m.net_want = m.wanted_network();
+    return m.net_want;
+}
+
+void Session::set_running_network(int net) {
+    impl_->running_net = net;
+}
 
 void Session::idle() {
     auto& m = *impl_;

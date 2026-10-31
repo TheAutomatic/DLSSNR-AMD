@@ -509,5 +509,9 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
     note_backend(line, true);
     return true;
 }
+AsdNetStatus backend_net_status() {
+    return g.network ? g.network->status() : AsdNetStatus{};
+}
+
 
 }  // namespace nr::pe::asd

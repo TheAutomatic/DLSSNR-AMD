@@ -2881,7 +2881,7 @@ void Runtime::discard_timing() { impl_->timings_recorded = 0; }
 // Vulkan host this has not got: no device checks or adopt, no pipeline binaries check (ACO Mode is the configured
 // directory alone), no --tex-in-format / --out0-format (the D3D12 side hands the network RGBA32F), no int4 network.
 bool plan_d3d12_network(const std::string& root_in, uint32_t mw, uint32_t mh, bool allow_experimental, D3d12NetPlan* out,
-                        std::string* why) {
+                        std::string* why, int model_choice) {
     try {
         *out = D3d12NetPlan{};
         const auto root = std::filesystem::canonical(nr::u8::path(root_in));
@@ -2907,9 +2907,10 @@ bool plan_d3d12_network(const std::string& root_in, uint32_t mw, uint32_t mh, bo
 #endif
             if (env.empty()) if (const char* e = std::getenv("DLSSNR_MODEL")) env = e;
             const int ev = env.empty() ? -1 : nr::network_value(env);
-            const int iv = ev >= 0 ? -1 : nr::ini_network((data.parent_path() / "dlssnr-amd.ini").string());
-            from = ev >= 0 ? "DLSSNR_MODEL" : iv >= 0 ? "dlssnr-amd.ini" : "default";
-            const int v = ev >= 0 ? ev : iv;
+            const int iv = model_choice >= 0 || ev >= 0 ? -1 : nr::ini_network((data.parent_path() / "dlssnr-amd.ini").string());
+            from = model_choice >= 0 ? "caller" : ev >= 0 ? "DLSSNR_MODEL" : iv >= 0 ? "dlssnr-amd.ini" : "default";
+            int v = model_choice >= 0 ? (model_choice == nr::kSmallFp8 ? 1 : model_choice == nr::kSmallFp8Experimental ? 2 : 0)
+                                      : (ev >= 0 ? ev : iv);
             if (v == 0) network = NetworkModel::Original;
             std::error_code ec;
             if (v == 2) {
@@ -2919,8 +2920,12 @@ bool plan_d3d12_network(const std::string& root_in, uint32_t mw, uint32_t mh, bo
                     : !std::filesystem::is_regular_file(data / "dlssnr-small-experimental.bin", ec)
                               ? "dlssnr-amd/dlssnr-small-experimental.bin is missing"
                     : nullptr;
-                if (missing) out->note = std::string("CC_SMALL_FP8_EXPERIMENTAL, but ") + missing + ": CC_SMALL_FP8";
-                else experimental = true;
+                if (missing) {
+                    out->note = std::string("CC_SMALL_FP8_EXPERIMENTAL, but ") + missing + ": CC_SMALL_FP8";
+                    v = 1;
+                } else {
+                    experimental = true;
+                }
             }
             if (network == NetworkModel::Small && !experimental &&
                 !std::filesystem::is_regular_file(data / "dlssnr-small.bin", ec)) {

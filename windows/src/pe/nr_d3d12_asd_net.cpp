@@ -13,6 +13,7 @@
 //   - the temporal params buffer travels with the frame's tables (one upload, one copy).
 #include "nr_d3d12_asd_net.hpp"
 #include "nr_d3d12_asd.hpp"
+#include "nr_ini_network.hpp"
 #include "nr_pe_log.hpp"
 
 #include <windows.h>
@@ -25,6 +26,7 @@
 #include <map>
 #include <mutex>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -35,6 +37,7 @@ template <class T> void release(T*& p) { if (p) { p->Release(); p = nullptr; } }
 
 std::atomic<NetPlanner> g_planner{nullptr};
 std::atomic<NetControlsPatch> g_patch{nullptr};
+std::atomic<NetModelQuery> g_model_query{nullptr};
 
 std::wstring wide(const std::string& s) {
     const int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
@@ -220,6 +223,7 @@ struct Built {
     bool table_uav = false;                       // the table buffer's state: UNORDERED_ACCESS (else COPY_DEST)
     uint32_t ring_slot = 0;
     uint64_t used = 0;
+    int net = -1;
     std::map<uint64_t, std::shared_ptr<FeatureState>> features;
     ~Built() {
         for (auto& [n, k] : kern) release(k.pso);
@@ -234,13 +238,15 @@ struct Shared {
     std::mutex m;
     bool building = false;
     uint32_t bw = 0, bh = 0;
+    int bnet = -1;
+    std::chrono::steady_clock::time_point build_started{};
     std::shared_ptr<Built> done;                  // built, not yet taken by ready()
-    std::map<std::pair<uint32_t, uint32_t>, std::string> failed;   // extents that cannot run (not built again)
+    std::map<std::tuple<uint32_t, uint32_t, int>, std::string> failed;   // extents & models that cannot run (not built again)
 };
 
 // build: the lowering and everything of the device's it needs. On the build thread.
 std::shared_ptr<Built> build(ID3D12Device* device, const Carriers& carriers, ID3D12RootSignature* rs, uint32_t w,
-                             uint32_t h, std::string* why) {
+                             uint32_t h, int want_net, std::string* why) {
     const auto t0 = std::chrono::steady_clock::now();
     NetPlanner planner = g_planner.load();
     if (!planner) { *why = "no network planner"; return nullptr; }
@@ -271,7 +277,9 @@ std::shared_ptr<Built> build(ID3D12Device* device, const Carriers& carriers, ID3
     for (int attempt = 0; attempt < 2; ++attempt) {
         // CC_SMALL_FP8_EXPERIMENTAL first, as the runtime picks it; a kernel the PSDB lacks: CC_SMALL_FP8 (the
         // runtime's own "anything missing: the small model").
-        if (!planner(w, h, attempt == 0, &b->plan, why)) return nullptr;
+        const bool try_experimental = (want_net == nr::kSmallFp8Experimental && attempt == 0);
+        const int plan_model = (want_net == nr::kSmallFp8Experimental && attempt == 1) ? nr::kSmallFp8 : want_net;
+        if (!planner(w, h, plan_model, try_experimental, &b->plan, why)) return nullptr;
         found.clear(); missing.clear();
         c_pre = c_post = c_grade = nullptr;
         const auto& t = b->plan.temporal;
@@ -301,6 +309,8 @@ std::shared_ptr<Built> build(ID3D12Device* device, const Carriers& carriers, ID3
         *why = "dlssnr-amd.ini [Network] Motion Without Depth = 0: the depth input is not in the ASD path yet";
         return nullptr;
     }
+    b->net = nr::network_choice(b->plan.model.substr(0, b->plan.model.find(' ')));
+    if (b->net < 0) b->net = want_net >= 0 ? want_net : nr::kSmallFp8;
     auto make = [&](const std::string& kern, const Carrier& c, Built::Kern* k) {
         if (!family_of(kern, &k->fam)) { *why = "no binding table for kernel " + kern; return false; }
         D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
@@ -429,60 +439,79 @@ public:
         current_ = nullptr;
         building_ = false;
         if (w % 8) { *why = "width " + std::to_string(w) + " is not a multiple of 8 (the network's RGBA32F image rows)"; return false; }
-        const auto key = std::make_pair(w, h);
+        NetModelQuery query = g_model_query.load();
+        const int q = query ? query() : -1;
+        const int want = q >= 0 ? q : (last_want_ >= 0 ? last_want_ : nr::kSmallFp8);
+        last_want_ = want;
+        const auto key = std::make_tuple(w, h, want);
         if (auto it = nets_.find(key); it != nets_.end()) {
             current_ = it->second.get();
             current_->used = tick_;
+            name_ = "the ACO network, " + current_->plan.model + ", " + std::to_string(current_->plan.disp.size()) + " dispatches, temporal";
             return true;
         }
         std::lock_guard<std::mutex> lock(shared_->m);
-        if (shared_->done && shared_->done->w == w && shared_->done->h == h) {
-            // Several extents at once (NR before and after the upscaler): one network each, the least recently used
-            // dropped beyond kMaxExtents, as the session keeps a runtime per extent.
+        if (shared_->done) {
+            auto done = std::move(shared_->done);
+            const auto done_key = std::make_tuple(done->w, done->h, done->net);
             if (nets_.size() >= kMaxExtents) {
                 auto lru = nets_.begin();
                 for (auto it = nets_.begin(); it != nets_.end(); ++it) if (it->second->used < lru->second->used) lru = it;
                 retired_.emplace_back(tick_ + 64, std::move(lru->second));
                 nets_.erase(lru);
             }
-            auto& b = nets_[key];
-            b = std::move(shared_->done);
+            auto& b = nets_[done_key];
+            b = std::move(done);
             b->used = tick_;
-            current_ = b.get();
-            name_ = "the ACO network, " + b->plan.model + ", " + std::to_string(b->plan.disp.size()) + " dispatches, temporal";
-            nr::pe::log("[asd] network ACTIVE for %ux%u: %s (frames of this extent now run on the ASD network)", w, h, name_.c_str());
-            return true;
+            if (done_key == key) {
+                current_ = b.get();
+                name_ = "the ACO network, " + b->plan.model + ", " + std::to_string(b->plan.disp.size()) + " dispatches, temporal";
+                nr::pe::log("[asd] network ACTIVE for %ux%u: %s (frames of this extent now run on the ASD network)", w, h, name_.c_str());
+                return true;
+            }
         }
         const auto f = shared_->failed.find(key);
         if (f != shared_->failed.end()) { *why = f->second; return false; }
         if (!shared_->building) {
             shared_->building = true;
-            shared_->bw = w; shared_->bh = h;
+            shared_->bw = w; shared_->bh = h; shared_->bnet = want;
+            shared_->build_started = std::chrono::steady_clock::now();
             shared_->done.reset();
             device_->AddRef();
             rs_->AddRef();
-            nr::pe::log("[asd] building the network for %ux%u (until it is done these frames pass through with no NR; "
-                        "the bridge is not used)", w, h);
-            std::thread([sh = shared_, dev = device_, rs = rs_, c = carriers_, w, h] {
+            nr::pe::log("[asd] building the %s network for %ux%u (until it is done these frames pass through with no NR; "
+                        "the bridge is not used)", nr::network_codename(want), w, h);
+            std::thread([sh = shared_, dev = device_, rs = rs_, c = carriers_, w, h, want] {
                 std::string e;
                 std::shared_ptr<Built> b;
-                try { b = build(dev, *c, rs, w, h, &e); } catch (const std::exception& x) { e = x.what(); }
+                try { b = build(dev, *c, rs, w, h, want, &e); } catch (const std::exception& x) { e = x.what(); }
                 if (!b) nr::pe::log("[asd] ERROR: the network for %ux%u cannot run: %s (the 0.0.8.1 path)", w, h, e.c_str());
                 {
                     std::lock_guard<std::mutex> l(sh->m);
-                    if (b) sh->done = std::move(b); else sh->failed[{w, h}] = e;
+                    if (b) sh->done = std::move(b); else sh->failed[{w, h, want}] = e;
                     sh->building = false;
                 }
                 rs->Release();
                 dev->Release();
             }).detach();
         }
-        *why = "the network for " + std::to_string(shared_->bw) + "x" + std::to_string(shared_->bh) + " is building";
+        *why = std::string("the ") + nr::network_codename(shared_->bnet) + " network for " + std::to_string(shared_->bw) + "x" + std::to_string(shared_->bh) + " is building";
         building_ = true;   // v2.6: it will run these frames (no bridge meanwhile)
         return false;
     }
     bool building() const override { return building_; }
-
+    AsdNetStatus status() const override {
+        AsdNetStatus s;
+        s.running_net = current_ ? current_->net : -1;
+        s.want_net = last_want_;
+        std::lock_guard<std::mutex> l(shared_->m);
+        s.building = shared_->building;
+        s.building_net = shared_->building ? shared_->bnet : -1;
+        if (shared_->building) {
+            s.building_seconds = std::chrono::duration<float>(std::chrono::steady_clock::now() - shared_->build_started).count();
+        }
+        return s;
+    }
     void controls(const nr::D3d12NetControls& c) override { controls_ = c; }
     void temporal(const NetTemporal& t) override { temporal_ = t; }
 
@@ -734,9 +763,10 @@ private:
     ID3D12RootSignature* alpha_rs_ = nullptr;
     ID3D12PipelineState* alpha_pso_ = nullptr;
     std::shared_ptr<Shared> shared_;
-    std::map<std::pair<uint32_t, uint32_t>, std::shared_ptr<Built>> nets_;
+    std::map<std::tuple<uint32_t, uint32_t, int>, std::shared_ptr<Built>> nets_;
     Built* current_ = nullptr;                   // ready()'s answer for this evaluate
     bool building_ = false;                      // v2.6: ready() said no only because a network is building
+    int last_want_ = -1;
     std::vector<std::pair<uint64_t, std::shared_ptr<Built>>> retired_;
     std::vector<std::pair<uint64_t, std::shared_ptr<FeatureState>>> retired_features_;
     std::vector<std::pair<uint64_t, ID3D12Resource*>> retire_upload_;
@@ -754,7 +784,9 @@ private:
 
 }  // namespace
 
-void set_net_planner(NetPlanner planner, NetControlsPatch patch) { g_planner = planner; g_patch = patch; }
+void set_net_planner(NetPlanner planner, NetControlsPatch patch, NetModelQuery model_query) {
+    g_planner = planner; g_patch = patch; g_model_query = model_query;
+}
 NetPlanner net_planner() { return g_planner.load(); }
 
 std::unique_ptr<D3d12AsdNetwork> make_aco_network(const std::wstring& folder) {

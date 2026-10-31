@@ -18,6 +18,14 @@
 namespace nr::pe::asd {
 
 // The linear buffers: float4 (RGBA, fp32) per pixel, row-major, width x height, as UAV-capable default-heap buffers.
+struct AsdNetStatus {
+    int running_net = -1;
+    int want_net = -1;
+    bool building = false;
+    int building_net = -1;
+    float building_seconds = 0.f;
+};
+
 // PLACEHOLDER layout: the real one comes with the network (M4).
 struct LinearFrame {
     ID3D12Resource* buffer;
@@ -51,6 +59,7 @@ public:
     // these frames; the caller passes them through, no NR, rather than starting the bridge), false when it never will.
     virtual bool building() const { return false; }
     // The frame's model controls, before record.
+    virtual AsdNetStatus status() const { return {}; }
     virtual void controls(const nr::D3d12NetControls&) {}
     // The frame's temporal inputs, before record.
     virtual void temporal(const NetTemporal&) {}
@@ -72,5 +81,7 @@ bool wilsjo2_ready(ID3D12Device* device, ID3D12GraphicsCommandList* cmd, uint32_
 
 // The backend slot nr::dlssnr::evaluate_d3d12 calls (nr::dlssnr::set_d3d12_backend, from InitializeASI).
 bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& frame);
+AsdNetStatus backend_net_status();
+
 
 }  // namespace nr::pe::asd

@@ -53,7 +53,7 @@ struct D3d12NetControls {
 // dlssnr-amd\ in it), the model as the Vulkan runtime picks it (DLSSNR_MODEL over dlssnr-amd.ini [Network] Model);
 // `experimental` false: CC_SMALL_FP8_EXPERIMENTAL is planned as CC_SMALL_FP8. False, and `why`: no network.
 bool plan_d3d12_network(const std::string& root, uint32_t width, uint32_t height, bool experimental, D3d12NetPlan* out,
-                        std::string* why);
+                        std::string* why, int model = -1);
 // The frame's controls into one dispatch's push block (Runtime::Impl::patch_push, the same code).
 void d3d12_net_controls(D3d12NetPlan::Dispatch& d, const D3d12NetControls& c, bool grade);
 

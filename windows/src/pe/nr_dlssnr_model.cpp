@@ -34,6 +34,7 @@
 #include "nr_screenshot.hpp"
 #include "nr_pe_session.hpp"
 #include "nr_pe_vkdevice.hpp"
+#include "nr_d3d12_asd_backend.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -83,6 +84,7 @@ namespace {
 
 std::mutex g_lock;
 std::atomic<D3d12Backend> g_d3d12_backend{nullptr};   // set_d3d12_backend
+std::atomic<int> g_d3d12_network{-1};
 
 // One session for the whole process per API, not one per NGX feature. A feature here is a handle and
 // a set of controls; the expensive thing -- the device, the queue and a ~300 MB weight upload -- is
@@ -420,21 +422,33 @@ void report_control(nr::pe::Session& session, const Feature* f, uint32_t route, 
     }
     if (asd) {   // v2.2: the native ASD backend recorded this frame - the network runs as ACO through ASD on the game's
                  // D3D12 device; the Vulkan session's own build (started by the bridge's first evaluates) is not NR's state
-        st.ran = true;
-        st.waiting = false;
-        st.waiting_why.clear();
-        st.building = false;
-        st.building_net = -1;
-        st.build_progress = 0.f;
-        st.build_phase.clear();
-        if (st.net_running < 0 || (ss.want_net >= 0 && st.net_running != ss.want_net)) st.net_running = ss.want_net;
-        if (st.net_running < 0) st.net_running = st.net_want;
-        st.gpu_ms = g_native_ms.load();
+        const auto as = nr::pe::asd::backend_net_status();
+        st.ran = ran;
+        st.waiting = !ran;
+        if (st.waiting) st.waiting_why = "building the network in the background; frames pass through until it is ready";
+        else st.waiting_why.clear();
+        st.building = as.building;
+        st.building_net = as.building_net;
+        st.net_want = as.want_net >= 0 ? as.want_net : ss.want_net;
+        st.net_running = as.running_net >= 0 ? as.running_net : (as.building ? -1 : st.net_want);
+        if (as.building) {
+            Session::State bst;
+            bst.stage = 4;
+            bst.building_seconds = as.building_seconds;
+            char phase[128] = {};
+            st.build_progress = nr::pe::build_progress(bst, phase, sizeof phase);
+            st.build_phase = phase;
+        } else {
+            st.build_progress = 0.f;
+            st.build_phase.clear();
+        }
+        st.gpu_ms = ran ? g_native_ms.load() : 0.f;
         st.network_ms = 0.f;   // (the [asd] timing lines have the network's share)
         st.aco = 1;
         st.aco_rdna3 = false;
         st.aco_why = "via ASD, active: the network runs as ACO (public ASD + PSDB) on the game's D3D12 device";
         st.device_path = 3;   // v2.4: Path "D3D12" (the session's own is the bridge's Vulkan device, which this frame did not use)
+        d3d12_session().set_running_network(st.net_running);
     }
     nr::pe::control::report(st);
 }
@@ -1304,6 +1318,7 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
 
     // The .asi's native D3D12 ASD backend, when one is set (off: never set, and this is 0.0.8.1 as it was).
     if (D3d12Backend backend = g_d3d12_backend.load()) {
+        g_d3d12_network.store(d3d12_session().frame_network());
         auto* direct = nr::pe::renodx_route::installed() ? static_cast<ID3D12Resource*>(nr::pe::renodx_route::direct())
                                                          : nullptr;
         D3d12BackendFrame frame{};
@@ -1373,6 +1388,16 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
                 barrier(cmd, output, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             }
             note_route(kRouteAsdWaiting);
+            {
+                uint32_t render_w = depth_rect.width, render_h = depth_rect.height;
+                if ((!render_w || !render_h) && depth) {
+                    const D3D12_RESOURCE_DESC dd = depth->GetDesc();
+                    render_w = uint32_t(dd.Width); render_h = dd.Height;
+                }
+                report_control(d3d12_session(), f, 1, width, height, nullptr, g_live_d3d12.size(), render_w, render_h,
+                               panel_guides_d3d12(color, motion, depth, motion_rect, reset != 0, mv_scale_x, mv_scale_y),
+                               false, true);
+            }
             device->Release();
             return static_cast<int>(NVSDK_NGX_Result_Success);
         }
@@ -2132,6 +2157,10 @@ void layer_changed(int layer) {
 }
 
 void set_d3d12_backend(D3d12Backend backend) { g_d3d12_backend = backend; }
+int frame_network() {
+    return g_d3d12_network.load();
+}
+
 
 void note_native_ms(float ms) {
     const float old = g_native_ms.load();

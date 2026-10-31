@@ -513,6 +513,9 @@ class Session {
     State state() const;
     // [Network] Model from the host's UI, as the hotkey does (the switch writes Model to the ini).
     void set_network(int n);
+    // The network wanted now: steps NetworkSwitch (hotkey, dlssnr-amd.ini).
+    int frame_network();
+    void set_running_network(int net);
     // Between evaluations, from the host's own clock (with whatever lock its evaluations hold): after a while with no
     // evaluation (NR off), [Network] Residency frees what it would free of an inactive network, the running one included,
     // and networks retired since are freed (their frames are long done).

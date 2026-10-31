@@ -21,9 +21,10 @@ namespace nr::pe::asd {
 
 // Who lowers the network: the .asi sets nr::plan_d3d12_network for its installation (nr_asi_main.cpp); a test sets
 // one of its own. None set: the backend keeps the placeholder copy network.
-using NetPlanner = bool (*)(uint32_t width, uint32_t height, bool experimental, nr::D3d12NetPlan* out, std::string* why);
+using NetPlanner = bool (*)(uint32_t width, uint32_t height, int model, bool experimental, nr::D3d12NetPlan* out, std::string* why);
 using NetControlsPatch = void (*)(nr::D3d12NetPlan::Dispatch& d, const nr::D3d12NetControls& c, bool grade);
-void set_net_planner(NetPlanner planner, NetControlsPatch patch);
+using NetModelQuery = int (*)();
+void set_net_planner(NetPlanner planner, NetControlsPatch patch = nullptr, NetModelQuery model_query = nullptr);
 NetPlanner net_planner();
 
 // net-carriers.bin in `folder` (the PSDB's): the network's carriers.
