@@ -87,6 +87,7 @@ HMODULE dllModule = nullptr;
 
 namespace nr::pe::menu {
 namespace {
+std::atomic<void (*)()> g_extra_diagnostics{nullptr};   // set_extra_diagnostics
 using nr::lang::tr;
 using nr::lang::tr_text;
 
@@ -732,6 +733,7 @@ struct Menu {
                              "Copied to the clipboard and saved as dlssnr-amd\\nr-report.txt next to the game. Nothing "
                              "is sent anywhere.");
         if (!report_said.empty()) nr::control_ui::text_dim_wrapped("%s", report_said.c_str());
+        if (auto draw = g_extra_diagnostics.load()) draw();
     }
 
     void draw_menu_settings() {
@@ -1929,6 +1931,8 @@ void install_now() {
 }
 
 }  // namespace
+
+void set_extra_diagnostics(void (*draw)()) { g_extra_diagnostics = draw; }
 
 void abandon_at_exit() {
     for (auto& [k, v] : g_vulkan) (void)v.release();
