@@ -1719,12 +1719,31 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top) {
     const bool plain = bd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && bd.DepthOrArraySize == 1 && bd.SampleDesc.Count == 1;
     // wilsjo2's finished picture (the fork's colour space defaults to ours): scRGB needs RGBA16F, HDR10 (PQ)
     // and SDR R8G8B8A8_UNORM or R10G10B10A2_UNORM; anything else is refused. 1 SDR, 2 PQ, 3 scRGB, 0 refused.
-    const int w2_space = space_set ? space
+    // wilsjo2's colour space: the game's on this swap chain, else NR Control's guess (encoding_of: the one set on
+    // another swap chain - OptiScaler's / frame generation's pass SetColorSpace1 down - or the display's for 10-bit).
+    // v2.1: before, an HDR10 (PQ) R10G10B10A2 back buffer whose colour space was set on the other swap chain was taken
+    // as SDR and the PQ code values went to the network as SDR ones.
+    int w2_space_in = space;
+    bool w2_set = space_set;
+    const char* w2_how = space_set ? "set by the game" : "not known: the format's default";
+    if (!space_set && nr::pe::menu::colour_space_guess(sc, int(bd.Format), &w2_space_in, &w2_how)) w2_set = true;
+    const int w2_space = w2_set ? w2_space_in
                          : int(bd.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ? DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
                                                                           : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
     // (an 8-bit BGRA back buffer too, as on D3D11 / Vulkan - one rule, w2_present_encoding)
-    const uint32_t w2_encoding = plain ? w2_present_encoding(space, space_set, bd.Format) : 0u;
+    const uint32_t w2_encoding = plain ? w2_present_encoding(w2_space_in, w2_set, bd.Format) : 0u;
     static uint32_t w2_said = ~0u;
+    {   // said once per change (no per-frame lines)
+        static std::string said;
+        char line[256];
+        std::snprintf(line, sizeof line, "[nr] wilsjo2 at Present (D3D12): back buffer %ux%u format %u, colour space %d (%s) -> %s",
+                      w, h, unsigned(bd.Format), w2_space, w2_how,
+                      w2_encoding == 1 ? "SDR" : w2_encoding == 2 ? "HDR10 (PQ): linear for the network, PQ again after"
+                      : w2_encoding == 3 ? "scRGB" : "refused");
+        bool any_w2 = false;
+        for (const Layer* l : layers) any_w2 = any_w2 || !renodx_layer(*l);
+        if (any_w2 && said != line) { said = line; log("%s", line); }
+    }
     bool w2_any = false;
     for (const Layer* l : layers) {
         if (!renodx_layer(*l)) {
@@ -5132,10 +5151,13 @@ uint32_t w2_present_encoding(int space, bool space_set, DXGI_FORMAT format) {
 }
 
 // The runs for `layers` on a back buffer of this encoding (rows of the refused ones say so).
+// `w2_space` / `w2_set`: wilsjo2's colour space when it differs from RenoDX's (D3D11: NR Control's guess); -1: theirs.
 std::vector<VkPresentRun> present_runs(const std::vector<const Layer*>& layers, int space, bool space_set,
-                                       DXGI_FORMAT format, float windows_white, bool plain, bool* unusable) {
+                                       DXGI_FORMAT format, float windows_white, bool plain, bool* unusable,
+                                       int w2_space = -1, bool w2_set = false) {
     std::vector<VkPresentRun> runs;
-    const uint32_t w2e = plain ? w2_present_encoding(space, space_set, format) : 0u;
+    if (w2_space < 0) { w2_space = space; w2_set = space_set; }
+    const uint32_t w2e = plain ? w2_present_encoding(w2_space, w2_set, format) : 0u;
     for (const Layer* l : layers) {
         if (!renodx_layer(*l)) {
             if (w2e) runs.push_back({l, w2e, 203.0f});
@@ -7338,7 +7360,12 @@ void d11_present_layers(IDXGISwapChain* sc, ID3D11Device* device) {
     static float windows_white = 0.f;
     if (const ULONGLONG now = GetTickCount64(); !polled || now - polled >= 1000) { polled = now; windows_white = sdr_white(sc); }
     bool unusable = false;
-    const std::vector<VkPresentRun> runs = present_runs(layers, space, space_set, format, windows_white, plain, &unusable);
+    int w2_space = space;   // wilsjo2's: as on D3D12, NR Control's guess when the game set none here (v2.1)
+    bool w2_set = space_set;
+    const char* w2_how = "";
+    if (!space_set && nr::pe::menu::colour_space_guess(sc, int(bd.Format), &w2_space, &w2_how)) w2_set = true;
+    const std::vector<VkPresentRun> runs = present_runs(layers, space, space_set, format, windows_white, plain, &unusable,
+                                                        w2_space, w2_set);
     if (unusable != P.unusable) {
         P.unusable = unusable;
         log(unusable ? "[nr] Present layers (D3D11): this swap chain cannot be served (colour space %d%s, format %u); the "

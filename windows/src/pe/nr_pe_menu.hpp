@@ -57,6 +57,11 @@ void draw_game(IDXGISwapChain* swap_chain, IUnknown* device);
 // The colour space the game set on `swap_chain` (IDXGISwapChain3::SetColorSpace1, a DXGI_COLOR_SPACE_TYPE); false when
 // it never set one.
 bool colour_space_of(IDXGISwapChain* swap_chain, int* space);
+// When the game set none on `swap_chain` (colour_space_of false), what NR Control's own encoding takes (encoding_of):
+// the last one set on any swap chain (the game's, passed down by OptiScaler's or frame generation's swap chain), else
+// for a 10-bit format the display's (HDR10 on an HDR display; asked at most once a second). False: not known (the
+// format's default applies). `how`: "set on another swap chain" / "the display's".
+bool colour_space_guess(IDXGISwapChain* swap_chain, int format, int* space, const char** how);
 // The process is ending (see nr::dlssnr::abandon_at_exit): the overlays are left as they are, not destroyed (their
 // destructors wait for the GPU and release objects of modules detached already).
 void abandon_at_exit();

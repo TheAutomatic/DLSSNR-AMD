@@ -455,6 +455,7 @@ public:
         }
         if (o_.models.size() <= k) o_.models.resize(k + 1, nullptr);
         o_.models[k] = m;
+        made_ = true;
         return w2::PassReady::kMade;
     }
     void release_passes(size_t from) override {
@@ -516,6 +517,7 @@ public:
     void say(const char* text) override { log("[nr] wilsjo2 style: %s", text); }
     void spatial_ran(const w2::SpatialLayout& layout) override { wilsjo2_note_spatial(nr::pe::renodx_route::call_layer(), layout); }
     DXGI_FORMAT frame_format() const { return frame_; }
+    bool made() const { return made_; }   // a pass's feature was made this run (the flow leaves that frame as it came)
 
 private:
     // One recording of the flow's into the game's list as D3D12 compute: the list's state saved and given back (the
@@ -562,6 +564,7 @@ private:
     bool before_;
     uint32_t w_, h_;
     DXGI_FORMAT frame_ = DXGI_FORMAT_UNKNOWN;
+    bool made_ = false;
     std::map<ID3D12Resource*, State> states_;
     nr::pe::Session* session_ = nullptr;
     w2::Stage* nstage_ = nullptr;
@@ -663,6 +666,16 @@ std::string native_refusal(ID3D12GraphicsCommandList* cmd, ID3D12Device* device,
                            const w2::Settings& s, ID3D12Resource* target, uint32_t w, uint32_t h, w2::Stage** stage,
                            native::Stage12** impl) {
     if (!nr::pe::asd::enabled()) return "ASD is off (dlssnr-amd-asd.ini)";
+    // v2.1 A/B: [D3D12ASD] W2Native = 0 in dlssnr-amd-asd.ini runs wilsjo2 on the bridge (the 0.0.8.1 route) with the
+    // same package, to tell a native-route fault from the game's / frame generation's (read once a launch; default 1)
+    static const bool native_off = [] {
+        const std::wstring ini = nr::pe::asd::folder() + L"\\dlssnr-amd-asd.ini";
+        const bool off = GetPrivateProfileIntW(L"D3D12ASD", L"W2Native", 1, ini.c_str()) == 0;
+        nr::pe::log("[asd] wilsjo2 on D3D12: W2Native = %d (dlssnr-amd-asd.ini)%s", off ? 0 : 1,
+                    off ? ": the bridge runs it (A/B test)" : "");
+        return off;
+    }();
+    if (native_off) return "W2Native = 0 (dlssnr-amd-asd.ini, A/B test)";
     if (w2::fast_requested(s)) return "Passes (fast) is not on the D3D12 route (ASD)";
     if (nr::dlssnr::preprocess_settings().active()) return "[Preprocess] is on (its network calls are not ASD's)";
     const auto readable = [](ID3D12Resource* r, const char* what) -> std::string {
@@ -762,6 +775,32 @@ bool wilsjo2_run(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, Wilsjo2Ow
     ff.before_upscale = before_upscale;
     ff.at_present = o.at_present;
     if (!nstage) return w2::flow_run(io, o.flow, ff, s, uint64_t(format));
+    {   // v2.1: what the native route runs on, said once per change (no per-frame lines)
+        static std::mutex m;
+        static std::string said;
+        const D3D12_RESOURCE_DESC td = target->GetDesc(), md = f.motion->GetDesc();
+        char line[400];
+        std::snprintf(line, sizeof line,
+                      "[asd] wilsjo2 on D3D12: runs %s on a %llux%u texture (format %u, flags 0x%X), frame %ux%u, %s, %s; motion "
+                      "%llux%u format %u, rect %u,%u %ux%u, MVecScale %.3g %.3g; reset %d",
+                      o.at_present ? "at Present" : before_upscale ? "before the upscaler" : "after the upscaler",
+                      (unsigned long long)td.Width, td.Height, unsigned(td.Format),
+                      unsigned(td.Flags), w, h, f.hdr ? "HDR (linear)" : "SDR", ff.unorm ? "UNORM" : "float",
+                      (unsigned long long)md.Width, md.Height, unsigned(md.Format), f.motion_rect.x, f.motion_rect.y,
+                      f.motion_rect.width, f.motion_rect.height, double(f.mv_x), double(f.mv_y), f.reset ? 1 : 0);
+        std::lock_guard<std::mutex> l(m);
+        // the reset flag and the pointer move between frames; the line is compared without the reset
+        std::string key(line);
+        key = key.substr(0, key.rfind("; reset"));
+        if (key != said) { said = key; nr::pe::log("%s", line); }
+        // the textures it is handed, each said once (the first 8): at Present the back buffers in turn; elsewhere more
+        // than one would be the game's / OptiScaler's outputs in turn (with one feature's history across them)
+        static std::set<std::pair<const void*, bool>> seen;
+        const auto k = std::make_pair(static_cast<const void*>(target), o.at_present);
+        if (seen.size() < 8 && seen.insert(k).second)
+            nr::pe::log("[asd] wilsjo2 on D3D12: texture %p is run on (%s; %zu distinct so far)", static_cast<void*>(target),
+                        o.at_present ? "at Present" : "in the evaluate", seen.size());
+    }
     // the native route: timed (the stage's programs and the ASD network together, as the bridge's "network" time is)
     native::g_timing.begin(device, cmd, w, h);
     const bool ran = w2::flow_run(io, o.flow, ff, s, uint64_t(format));
@@ -770,7 +809,10 @@ bool wilsjo2_run(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, Wilsjo2Ow
         wilsjo2_vk_release(o.vk);
         o.vk = nullptr;
     }
-    if (!ran) native::say_route("a run on the D3D12 route was not recorded (see above); the frame passes through");
+    if (!ran)
+        native::say_route(io.made() ? "a run on the D3D12 route made its feature (the flow runs it from the next frame); "
+                                      "this frame passes through"
+                                    : "a run on the D3D12 route was not recorded (see above); the frame passes through");
     return ran;
 }
 

@@ -2057,6 +2057,40 @@ bool colour_space_of(IDXGISwapChain* swap_chain, int* space) {
     return true;
 }
 
+bool colour_space_guess(IDXGISwapChain* swap_chain, int format, int* space, const char** how) {
+    {
+        std::lock_guard<std::mutex> lock(g_spaces_mutex);
+        // the last one set, when this format can carry it (an HDR10 one on a 10-bit, scRGB on an RGBA16F one, SDR any)
+        const bool fits = g_last_space == int(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) ? format == int(DXGI_FORMAT_R10G10B10A2_UNORM)
+                          : g_last_space == int(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709) ? format == int(DXGI_FORMAT_R16G16B16A16_FLOAT)
+                          : g_last_space >= 0;
+        if (fits) { *space = g_last_space; *how = "set on another swap chain"; return true; }
+    }
+    if (!swap_chain || format != int(DXGI_FORMAT_R10G10B10A2_UNORM)) return false;
+    static std::mutex m;
+    static IDXGISwapChain* asked = nullptr;
+    static ULONGLONG at = 0;
+    static int display = -1;
+    std::lock_guard<std::mutex> l(m);
+    if (const ULONGLONG now = GetTickCount64(); asked != swap_chain || !at || now - at >= 1000) {
+        asked = swap_chain;
+        at = now;
+        display = -1;
+        IDXGIOutput* out = nullptr;
+        IDXGIOutput6* out6 = nullptr;
+        DXGI_OUTPUT_DESC1 d{};
+        if (SUCCEEDED(swap_chain->GetContainingOutput(&out)) && out && SUCCEEDED(out->QueryInterface(IID_PPV_ARGS(&out6))) &&
+            out6 && SUCCEEDED(out6->GetDesc1(&d)))
+            display = int(d.ColorSpace);
+        release(out6);
+        release(out);
+    }
+    if (display != int(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)) return false;   // SDR display: the format's default
+    *space = display;
+    *how = "the display's";
+    return true;
+}
+
 void install() {
     static std::once_flag once;
     std::call_once(once, [] {
