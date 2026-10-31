@@ -10,9 +10,11 @@
 // Needs <exe dir>\dlssnr-amd-asd\dlssnr-amd-asd.ini (Enabled = 1) and the SODB and PSDB it names.
 #include "nr_d3d12_asd.hpp"
 #include "nr_d3d12_asd_backend.hpp"
+#include "nr_d3d12_asd_reprofile.hpp"
 #include "nr_pe_d3d12split.hpp"
 
 #include <windows.h>
+#include <shellapi.h>
 #include <d3d12.h>
 
 #include <cstdarg>
@@ -204,6 +206,8 @@ bool frame_path(ID3D12Device* d, bool in_place) {
 
 int main(int argc, char** argv) {
     const std::string mode = argc > 1 ? argv[1] : "early";
+        auto wide = [](const char* a) { const int n = MultiByteToWideChar(CP_ACP, 0, a, -1, nullptr, 0);
+            std::wstring w(size_t(n > 0 ? n : 1), L'\0'); MultiByteToWideChar(CP_ACP, 0, a, -1, w.data(), n); w.resize(n > 0 ? n - 1 : 0); return w; };
     log("[test] mode %s, d3d12.dll %s at start", mode.c_str(), GetModuleHandleW(L"d3d12.dll") ? "loaded" : "not loaded");
     if (mode == "dump-canary" && argc > 2) {
         asd::start(GetModuleHandleW(nullptr));
@@ -230,10 +234,36 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (mode == "targets" && argc > 2) {   // targets <exe file name> [app name]: the driver's precompile targets for it
-        auto wide = [](const char* a) { const int n = MultiByteToWideChar(CP_ACP, 0, a, -1, nullptr, 0);
-            std::wstring w(size_t(n > 0 ? n : 1), L'\0'); MultiByteToWideChar(CP_ACP, 0, a, -1, w.data(), n); w.resize(n > 0 ? n - 1 : 0); return w; };
         log("[targets] %s", asd::precompile_targets(wide(argv[2]), wide(argc > 3 ? argv[3] : "ACO public entry probe")).c_str());
         return 0;
+    }
+    // reprofile <D3D12StateObjectCompiler.dll> <plugin dll> <source psdb> <sodb> <out psdb> <exe file name> [groups,]
+    //   (profile <D3D12StateObjectCompiler.dll> <plugin dll> <exe file name>: only the profile the plugin gives it)
+    if ((mode == "reprofile" && argc > 7) || (mode == "profile" && argc > 4)) {
+        // The arguments as UTF-16 (paths outside the ANSI code page, e.g. a Chinese folder name).
+        int wargc = 0;
+        LPWSTR* wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+        auto warg = [&](int i) { return wargv && i < wargc ? std::wstring(wargv[i]) : wide(argv[i]); };
+        asd::ReprofileJob job;
+        job.compiler_dll = warg(2); job.plugin_dll = warg(3); job.family = L"AMD_NAVI48:gfx1201";
+        job.name = L"ACO public entry probe"; job.version = 1; job.engine = L"ACO lab"; job.engine_version = 1;
+        job.src_exe = L"asd_probe.exe";
+        if (mode == "profile") {
+            job.exe = warg(4);
+            log("[reprofile] %s", asd::reprofile_psdb(job, true).text.c_str());
+            return 0;
+        }
+        job.src_psdb = warg(4); job.sodb = warg(5); job.out_psdb = warg(6); job.exe = warg(7);
+        std::string groups = argc > 8 ? argv[8] : "g_pbptr";
+        for (size_t at = 0; at <= groups.size();) {
+            size_t e = groups.find(',', at);
+            if (e == std::string::npos) e = groups.size();
+            if (e > at) job.groups.push_back(groups.substr(at, e - at));
+            at = e + 1;
+        }
+        const auto r = asd::reprofile_psdb(job);
+        log("[reprofile] %s: %s", r.ok ? "OK" : "FAILED", r.text.c_str());
+        return r.ok ? 0 : 1;
     }
     if ((mode == "system-register" || mode == "system-unregister") && argc > 2) {
         asd::start(GetModuleHandleW(nullptr), false);   // the ini only: no user-scope registration of this tool

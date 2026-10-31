@@ -11,7 +11,9 @@
 
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <cwchar>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -219,10 +221,12 @@ bool copy_to_local(std::wstring* sodb, std::wstring* psdb) {
     if (!GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH)) return false;
     const std::wstring dir = std::wstring(base) + L"\\dlssnr-amd-asd";
     CreateDirectoryW(dir.c_str(), nullptr);
-    const std::wstring s2 = dir + L"\\" + g_sodb_name, p2 = dir + L"\\" + g_psdb_name;
-    const BOOL a = CopyFileW(sodb_path().c_str(), s2.c_str(), FALSE), b = CopyFileW(psdb_path().c_str(), p2.c_str(), FALSE);
-    log("[asd] registration: CopyToLocal: %s -> %s (%s), %s -> %s (%s)", utf8(sodb_path()).c_str(), utf8(s2).c_str(),
-        a ? "ok" : ("error " + std::to_string(GetLastError())).c_str(), utf8(psdb_path()).c_str(), utf8(p2).c_str(),
+    auto leaf = [](const std::wstring& p) { const size_t k = p.find_last_of(L"\\/"); return k == std::wstring::npos ? p : p.substr(k + 1); };
+    const std::wstring s2 = dir + L"\\" + leaf(*sodb), p2 = dir + L"\\" + leaf(*psdb);
+    // A PSDB made for the exe's app profile is already in this folder (the cache): nothing to copy for it.
+    const BOOL a = CopyFileW(sodb->c_str(), s2.c_str(), FALSE), b = same_path(psdb->c_str(), p2) || CopyFileW(psdb->c_str(), p2.c_str(), FALSE);
+    log("[asd] registration: CopyToLocal: %s -> %s (%s), %s -> %s (%s)", utf8(*sodb).c_str(), utf8(s2).c_str(),
+        a ? "ok" : ("error " + std::to_string(GetLastError())).c_str(), utf8(*psdb).c_str(), utf8(p2).c_str(),
         b ? "ok" : "error");
     if (!a || !b) return false;
     *sodb = s2;
@@ -231,6 +235,98 @@ bool copy_to_local(std::wstring* sodb, std::wstring* psdb) {
 }
 std::string register_one(api::PFN_GetInterface get, const wchar_t* installer_name, const std::wstring& exe,
                          const std::wstring& sodb, const std::wstring& psdb, bool remove_first, bool core_loaded);
+
+// The driver application profile (D3DSCR GetPrecompileTargets, public): the driver keys a PSDB's values by the
+// profile it gives the running exe (by its file name; e.g. Minecraft.Windows.exe has one, most exes have 0), so a
+// PSDB compiled for another profile misses. Our PSDB was compiled for [D3D12ASD] PsdbProfile (default 0). If the
+// running exe's profile for our family differs, the PSDB used is <Psdb stem>-<profile hex>.psdb: from
+// %LOCALAPPDATA%\dlssnr-amd-asd (made earlier) or the plugin folder (shipped), else made now by the reprofile tool
+// ([D3D12ASD] ReprofileTool, default <folder>\reprofile\dlssnr-amd-asd-reprofile.exe with D3D12StateObjectCompiler.dll,
+// the vendor's public ASD compiler plugin amdxc_compiler.dll and D3D12\D3D12Core.dll beside it) into
+// %LOCALAPPDATA%\dlssnr-amd-asd: same keys as the plugin gives that profile, our object code (nr_d3d12_asd_reprofile).
+// No exe or adapter list: whatever profile the system reports is followed.
+bool running_profile(api::PFN_GetInterface get, const std::wstring& exe_name, const Identity& id, UINT64* profile) {
+    std::string why;
+    Client client;
+    api::InstallerFactory* factory = nullptr;
+    api::Installer* installer = make_installer(get, client, &factory, &why);
+    if (!installer) return false;
+    api::ApplicationDesc desc{};
+    desc.pExeFilename = exe_name.c_str();
+    desc.pName = id.name.c_str();
+    desc.Version.Version = id.version;
+    desc.pEngineName = id.engine.c_str();
+    desc.EngineVersion.Version = id.engine_version;
+    const UINT max = installer->GetMaxPrecompileTargetCount();
+    std::vector<api::CompilerProperties> t(max ? max : 1);
+    UINT n = UINT(t.size());
+    const HRESULT hr = installer->GetPrecompileTargets(&desc, &n, t.data(), api::kTargetNone);
+    bool found = false;
+    for (UINT i = 0; SUCCEEDED(hr) && i < n && i < t.size() && !found; ++i)
+        if (g_family == t[i].szAdapterFamily) { *profile = t[i].ApplicationProfileVersion.Version; found = true; }
+    log("[asd] registration: app profile of \"%s\" for %s: %s (GetPrecompileTargets %s)", utf8(exe_name).c_str(),
+        utf8(g_family).c_str(), found ? ("0x" + [](UINT64 v) { char b[20]; std::snprintf(b, sizeof b, "%016llX", (unsigned long long)v); return std::string(b); }(*profile)).c_str() : "no such target",
+        hr_text(hr).c_str());
+    installer->Release();
+    factory->Release();
+    return found;
+}
+std::wstring psdb_for_profile(api::PFN_GetInterface get, const std::wstring& exe, const Identity& id) {
+    const std::wstring psdb = psdb_path();
+    const size_t slash = exe.find_last_of(L"\\/");
+    const std::wstring exe_name = slash == std::wstring::npos ? exe : exe.substr(slash + 1);
+    UINT64 profile = 0;
+    if (!running_profile(get, exe_name, id, &profile)) return psdb;
+    const UINT64 built = std::wcstoull(ini_string(L"PsdbProfile", L"0").c_str(), nullptr, 0);
+    if (profile == built) return psdb;
+    wchar_t hex[20];
+    std::swprintf(hex, 20, L"%016llX", (unsigned long long)profile);
+    std::wstring stem = g_psdb_name;
+    if (stem.size() > 5 && _wcsicmp(stem.c_str() + stem.size() - 5, L".psdb") == 0) stem.resize(stem.size() - 5);
+    const std::wstring name = stem + L"-" + hex + L".psdb";
+    wchar_t base[MAX_PATH] = L"";
+    const std::wstring local = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH) ? std::wstring(base) + L"\\dlssnr-amd-asd" : L"";
+    for (const std::wstring& p : {local.empty() ? std::wstring() : local + L"\\" + name, g_folder + L"\\" + name})
+        if (!p.empty() && exists(p)) {
+            log("[asd] registration: our PSDB was made for app profile 0x%016llX: using %s (made for this exe's profile)",
+                (unsigned long long)built, utf8(p).c_str());
+            return p;
+        }
+    const std::wstring tool = ini_string(L"ReprofileTool", g_folder + L"\\reprofile\\dlssnr-amd-asd-reprofile.exe");
+    const size_t ts = tool.find_last_of(L"\\/");
+    const std::wstring tool_dir = ts == std::wstring::npos ? L"." : tool.substr(0, ts);
+    if (local.empty() || !exists(tool)) {
+        log("[asd] registration: no PSDB for app profile 0x%016llX (%s, or %s to make one): expect ASD_MISS",
+            (unsigned long long)profile, utf8(name).c_str(), utf8(tool).c_str());
+        return psdb;
+    }
+    CreateDirectoryW(local.c_str(), nullptr);
+    const std::wstring out = local + L"\\" + name;
+    std::wstring cmd = L"\"" + tool + L"\" reprofile \"" + tool_dir + L"\\D3D12StateObjectCompiler.dll\" \"" + tool_dir +
+                       L"\\amdxc_compiler.dll\" \"" + psdb + L"\" \"" + sodb_path() + L"\" \"" + out + L"\" \"" + exe_name + L"\"";
+    const std::wstring groups = ini_string(L"Groups", L"");
+    if (!groups.empty()) cmd += L" \"" + groups + L"\"";
+    log("[asd] registration: making the PSDB for app profile 0x%016llX: %s", (unsigned long long)profile, utf8(cmd).c_str());
+    STARTUPINFOW si{};
+    si.cb = sizeof si;
+    PROCESS_INFORMATION pi{};
+    const DWORD t0 = GetTickCount();
+    if (!CreateProcessW(tool.c_str(), cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, tool_dir.c_str(), &si, &pi)) {
+        log("[asd] registration: CreateProcess error %lu: expect ASD_MISS", GetLastError());
+        return psdb;
+    }
+    const DWORD w = WaitForSingleObject(pi.hProcess, 180000);
+    DWORD code = 0;
+    GetExitCodeProcess(pi.hProcess, &code);
+    if (w != WAIT_OBJECT_0) TerminateProcess(pi.hProcess, 1);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    const bool ok = w == WAIT_OBJECT_0 && code == 0 && exists(out);
+    log("[asd] registration: reprofile tool %s in %lu ms (exit %lu)%s", (ok ? "made " + utf8(out) : std::string("FAILED")).c_str(),
+        GetTickCount() - t0, code, ok ? "" : ": expect ASD_MISS");
+    return ok ? out : psdb;
+}
+
 DWORD registration_work() {
     const std::wstring exe = exe_path();
     const bool d3d12_loaded = GetModuleHandleW(L"d3d12.dll") != nullptr;
@@ -262,7 +358,7 @@ DWORD registration_work() {
                 "will not be found", utf8(sodb_id.exe).c_str(), utf8(sodb_id.name).c_str());
     }
 
-    std::wstring sodb = sodb_path(), psdb = psdb_path();
+    std::wstring sodb = sodb_path(), psdb = psdb_for_profile(get, exe, id);
     if (GetPrivateProfileIntW(L"D3D12ASD", L"CopyToLocal", 1, g_ini.c_str()) == 1 && !copy_to_local(&sodb, &psdb))
         log("[asd] registration: CopyToLocal failed: the game folder's files are registered");
     const std::wstring mode = ini_string(L"ExePath", L"both");
