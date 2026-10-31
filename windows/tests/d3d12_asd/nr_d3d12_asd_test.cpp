@@ -230,13 +230,19 @@ int main(int argc, char** argv) {
         return 0;
     }
     if ((mode == "system-register" || mode == "system-unregister") && argc > 2) {
-        asd::start(GetModuleHandleW(nullptr));
+        asd::start(GetModuleHandleW(nullptr), false);   // the ini only: no user-scope registration of this tool
         for (int i = 2; i < argc; ++i) {
             const int n = MultiByteToWideChar(CP_ACP, 0, argv[i], -1, nullptr, 0);
             std::wstring w(n, L'\0');
             MultiByteToWideChar(CP_ACP, 0, argv[i], -1, w.data(), n);
             w.resize(n ? n - 1 : 0);
-            log("[reg] %s %s: %s", mode.c_str(), argv[i], asd::system_registration(w, mode == "system-unregister").c_str());
+            if (mode == "system-unregister") {
+                for (const wchar_t* name : {L"DLSSNR-AMD-ASD", L"DLSSNR-AMD-ASD-FINAL"})
+                    log("[reg] %s %s: %s", mode.c_str(), argv[i], asd::system_registration(w, true, name).c_str());
+            } else {
+                log("[reg] %s %s: %s", mode.c_str(), argv[i],
+                    asd::system_registration(w, false, i == 2 ? L"DLSSNR-AMD-ASD" : L"DLSSNR-AMD-ASD-FINAL").c_str());
+            }
         }
         return 0;
     }
