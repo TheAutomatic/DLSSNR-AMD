@@ -229,6 +229,12 @@ int main(int argc, char** argv) {
             node_mask, argv[2]);
         return 0;
     }
+    if (mode == "targets" && argc > 2) {   // targets <exe file name> [app name]: the driver's precompile targets for it
+        auto wide = [](const char* a) { const int n = MultiByteToWideChar(CP_ACP, 0, a, -1, nullptr, 0);
+            std::wstring w(size_t(n > 0 ? n : 1), L'\0'); MultiByteToWideChar(CP_ACP, 0, a, -1, w.data(), n); w.resize(n > 0 ? n - 1 : 0); return w; };
+        log("[targets] %s", asd::precompile_targets(wide(argv[2]), wide(argc > 3 ? argv[3] : "ACO public entry probe")).c_str());
+        return 0;
+    }
     if ((mode == "system-register" || mode == "system-unregister") && argc > 2) {
         asd::start(GetModuleHandleW(nullptr), false);   // the ini only: no user-scope registration of this tool
         for (int i = 2; i < argc; ++i) {

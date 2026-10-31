@@ -84,7 +84,7 @@ struct Installer : IUnknown {
     virtual HRESULT STDMETHODCALLTYPE GetApplication(UINT index, REFIID riid, void** ppvApp) = 0;
     virtual HRESULT STDMETHODCALLTYPE ClearAllState() = 0;   // never called: it would drop every app of this installer
     virtual UINT STDMETHODCALLTYPE GetMaxPrecompileTargetCount() = 0;
-    virtual HRESULT STDMETHODCALLTYPE GetPrecompileTargets(const ApplicationDesc* pApplicationDesc, UINT ArraySize,
+    virtual HRESULT STDMETHODCALLTYPE GetPrecompileTargets(const ApplicationDesc* pApplicationDesc, UINT* pArraySize,
                                                            CompilerProperties* pArray, TargetFlags flags) = 0;
 };
 struct Explorer : IUnknown {
