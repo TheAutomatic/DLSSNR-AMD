@@ -2,6 +2,7 @@
 // reader through d3d12.dll's D3D12GetInterface, and the game's own D3D12 device and queue.
 #include "nr_d3d12_asd.hpp"
 #include "nr_d3d12_asd_api.h"
+#include "nr_d3d12_asd_canary_blob.h"
 #include "nr_pe_d3d12split.hpp"
 #include "nr_pe_log.hpp"
 
@@ -21,7 +22,6 @@ std::wstring g_folder, g_ini;
 bool g_enabled = false, g_register = true, g_tint = false;
 std::wstring g_sodb_name = L"dlssnr-amd-asd.sodb", g_psdb_name = L"dlssnr-amd-asd-gfx1201.psdb";
 std::wstring g_family = L"AMD_NAVI48:gfx1201";
-std::string g_canary_key = "g_pbptr";
 std::string g_registration = "not run", g_backend = "not run", g_network;
 std::atomic<int> g_canary{int(Canary::kNotRun)};
 std::atomic<bool> g_canary_started{false};
@@ -104,6 +104,13 @@ void __stdcall take_identity(const api::D3D12AppDesc* d, void* context) {
     id->engine_version = d->EngineVersion.Version;
     id->found = true;
 }
+// PLACEHOLDER: the lab canary's identity (the M4 compile sets the product's, here and in its SODB/PSDB alike).
+Identity builtin_identity() {
+    Identity id;
+    id.exe = L"asd_probe.exe"; id.name = L"ACO public entry probe"; id.version = 1;
+    id.engine = L"ACO lab"; id.engine_version = 1; id.found = true;
+    return id;
+}
 api::StateObjectDatabase* open_sodb(api::PFN_GetInterface get, std::string* why) {
     api::StateObjectDatabaseFactory* factory = nullptr;
     HRESULT hr = get(api::kClsidStateObjectFactory, api::kIidStateObjectDatabaseFactory, reinterpret_cast<void**>(&factory));
@@ -166,7 +173,19 @@ api::Installer* make_installer(api::PFN_GetInterface get, Client& client, api::I
     return installer;
 }
 
+// One installer at a time (a second live installer of the same name fails with ERROR_ALREADY_EXISTS), and an
+// Unregister made while the registration still runs wins: it waits for it, then removes what it registered.
+std::mutex g_installer_lock;
+DWORD registration_work();
 DWORD WINAPI registration_thread(void*) {
+    std::lock_guard<std::mutex> installer(g_installer_lock);
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        if (!g_register) { g_registration = "not registered: Register = 0 (NR Control's Unregister)"; return 0; }
+    }
+    return registration_work();
+}
+DWORD registration_work() {
     const std::wstring exe = exe_path();
     const bool d3d12_loaded = GetModuleHandleW(L"d3d12.dll") != nullptr;
     const bool core_loaded = GetModuleHandleW(L"D3D12Core.dll") != nullptr;
@@ -181,15 +200,21 @@ DWORD WINAPI registration_thread(void*) {
     const auto get = api::get_interface();
     if (!get) { set_registration("not registered: d3d12.dll has no D3D12GetInterface"); return 0; }
     std::string why;
-    Identity id;
-    if (api::StateObjectDatabase* db = open_sodb(get, &why)) {
-        const HRESULT hr = db->GetApplicationDesc(&take_identity, &id);
-        log("[asd] registration: SODB GetApplicationDesc %s", hr_text(hr).c_str());
-        db->Release();
-    }
-    if (!id.found) { set_registration("not registered: the SODB's application identity could not be read (" + why + ")"); return 0; }
-    log("[asd] registration: identity from the SODB: exe \"%s\", name \"%s\" v%llu, engine \"%s\" v%llu", utf8(id.exe).c_str(),
+    // The identity the SODB and PSDB were made with (asd_probe's fill_app_identity), built in: the in-box runtime that
+    // games with an older Agility SDK run on has no state object database reader (CLSID_D3D12StateObjectFactory), so
+    // it is not read from the SODB (the M1 615/in-box runs did not read it either).
+    const Identity id = builtin_identity();
+    log("[asd] registration: identity (built in): exe \"%s\", name \"%s\" v%llu, engine \"%s\" v%llu", utf8(id.exe).c_str(),
         utf8(id.name).c_str(), (unsigned long long)id.version, utf8(id.engine).c_str(), (unsigned long long)id.engine_version);
+    if (api::StateObjectDatabase* db = open_sodb(get, &why)) {   // diagnostics only, where the runtime has the reader
+        Identity sodb_id;
+        db->GetApplicationDesc(&take_identity, &sodb_id);
+        db->Release();
+        if (sodb_id.found && (sodb_id.exe != id.exe || sodb_id.name != id.name || sodb_id.engine != id.engine ||
+                              sodb_id.version != id.version || sodb_id.engine_version != id.engine_version))
+            log("[asd] registration: warning: the SODB was stored with another identity (exe \"%s\", name \"%s\"): the PSDB "
+                "will not be found", utf8(sodb_id.exe).c_str(), utf8(sodb_id.name).c_str());
+    }
 
     Client client;   // outlives the installer
     api::InstallerFactory* factory = nullptr;
@@ -264,6 +289,7 @@ DWORD WINAPI registration_thread(void*) {
 DWORD WINAPI unregister_thread(void*) {
     WritePrivateProfileStringW(L"D3D12ASD", L"Register", L"0", g_ini.c_str());
     { std::lock_guard<std::mutex> g(g_lock); g_register = false; }
+    std::lock_guard<std::mutex> installer_lock(g_installer_lock);
     const auto get = api::get_interface();
     if (!get) { set_registration("unregister: d3d12.dll has no D3D12GetInterface"); return 0; }
     Client client;
@@ -372,6 +398,24 @@ ID3D12Resource* buffer(ID3D12Device* device, D3D12_HEAP_TYPE heap, uint64_t size
     return r;
 }
 
+}  // namespace
+
+bool sodb_pipeline(const char* key, std::vector<uint8_t>* root, std::vector<uint8_t>* cs, unsigned* flags,
+                   unsigned* node_mask, std::string* why) {
+    const auto get = api::get_interface();
+    if (!get) { *why = "d3d12.dll has no D3D12GetInterface"; return false; }
+    api::StateObjectDatabase* db = open_sodb(get, why);
+    if (!db) return false;
+    Pipeline pl;
+    const HRESULT hr = db->FindPipelineStateDesc(key, UINT(std::strlen(key) + 1), &take_pipeline, &pl);
+    db->Release();
+    if (FAILED(hr)) { *why = std::string("FindPipelineStateDesc(") + key + ") " + hr_text(hr); return false; }
+    if (!pl.found) { *why = pl.why; return false; }
+    *root = pl.root; *cs = pl.cs; *flags = pl.flags; *node_mask = pl.node_mask;
+    return true;
+}
+
+namespace {
 struct CanaryJob { ID3D12Device* device; ID3D12CommandQueue* queue; };
 void finish_canary(Canary c, const std::string& line) {
     { std::lock_guard<std::mutex> g(g_lock); g_canary_line = std::string(canary_name(c)) + ": " + line; }
@@ -384,17 +428,15 @@ DWORD WINAPI canary_thread(void* p) {
     CanaryJob job = *static_cast<CanaryJob*>(p);
     delete static_cast<CanaryJob*>(p);
     ID3D12Device* device = job.device;
-    std::string why;
+    // The pipeline exactly as stored in the SODB (its serialized root signature and DXIL, built into the ASI: no SODB
+    // reader needed, as asd_probe's --execute in the M1 615/in-box runs): the runtime looks the PSDB up by this desc.
     Pipeline pl;
-    const auto get = api::get_interface();
-    if (!get) why = "d3d12.dll has no D3D12GetInterface";
-    else if (api::StateObjectDatabase* db = open_sodb(get, &why)) {
-        const std::string key = g_canary_key;   // stored with its terminating NUL (the lab's group key)
-        const HRESULT hr = db->FindPipelineStateDesc(key.c_str(), UINT(key.size() + 1), &take_pipeline, &pl);
-        if (FAILED(hr)) why = "FindPipelineStateDesc(" + key + ") " + hr_text(hr);
-        else if (!pl.found) why = "the SODB's " + key + ": " + pl.why;
-        db->Release();
-    }
+    pl.root.assign(canary_blob::kRoot, canary_blob::kRoot + sizeof canary_blob::kRoot);
+    pl.cs.assign(canary_blob::kCs, canary_blob::kCs + sizeof canary_blob::kCs);
+    pl.flags = canary_blob::kFlags;
+    pl.node_mask = canary_blob::kNodeMask;
+    pl.found = true;
+    std::string why;
     ID3D12RootSignature* rs = nullptr;
     ID3D12PipelineState* pso = nullptr;
     ID3D12Resource *in = nullptr, *out = nullptr, *table = nullptr, *readback = nullptr;
@@ -537,7 +579,6 @@ void start(HMODULE self) {
     g_sodb_name = ini_string(L"Sodb", g_sodb_name);
     g_psdb_name = ini_string(L"Psdb", g_psdb_name);
     g_family = ini_string(L"AdapterFamily", g_family);
-    g_canary_key = utf8(ini_string(L"CanaryKey", L"g_pbptr"));
     log("[asd] D3D12 ASD backend %s (%s: Enabled %d, Register %d)", g_enabled ? "on" : "off", utf8(g_ini).c_str(),
         g_enabled ? 1 : 0, g_register ? 1 : 0);
     if (!g_enabled) return;

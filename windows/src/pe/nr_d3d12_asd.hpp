@@ -12,7 +12,7 @@
 //      removed first, so every launch leaves one - and releases the installer at once. Before the game makes its D3D12
 //      device it serves this launch; after, the next one. [D3D12ASD] Register = 0 (NR Control's Unregister sets it)
 //      registers nothing.
-//   2. the canary (on_device): once, on the game's device, a queue of ours, the SODB's g_pbptr pipeline - the M1 pbptr
+//   2. the canary (on_device): once, on the game's device, a queue of ours, the g_pbptr pipeline exactly as stored in the SODB (built in; no SODB reader at run time) - the M1 pbptr
 //      carrier - run and read back: ASD_HIT when it ran the ACO kernel of the PSDB, ASD_MISS when the driver compiled
 //      the HLSL carrier, ASD_FAIL otherwise. Only ASD_HIT lets the backend run.
 //   3. the backend (nr_d3d12_asd_backend.hpp): the evaluate's frame copied into linear buffers, the network
@@ -21,6 +21,7 @@
 #include <d3d12.h>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace nr::pe::asd {
 
@@ -57,6 +58,10 @@ std::wstring sodb_path();
 std::wstring psdb_path();
 std::wstring ini_path();
 bool debug_tint();
-void draw_panel();   // NR Control's Diagnostics lines (nr_d3d12_asd_panel.cpp)   // [D3D12ASD] DebugTint = 1: the placeholder's output tinted, to see in game that the path runs
+void draw_panel();
+// Tools/tests: a pipeline's serialized root signature and DXIL as stored in the SODB under `key` (needs a runtime with
+// the SODB reader, Agility 1.619+; the ASI itself does not use it). Makes nr_d3d12_asd_canary_blob.h.
+bool sodb_pipeline(const char* key, std::vector<uint8_t>* root, std::vector<uint8_t>* cs, unsigned* flags,
+                   unsigned* node_mask, std::string* why);   // NR Control's Diagnostics lines (nr_d3d12_asd_panel.cpp)   // [D3D12ASD] DebugTint = 1: the placeholder's output tinted, to see in game that the path runs
 
 }  // namespace nr::pe::asd
