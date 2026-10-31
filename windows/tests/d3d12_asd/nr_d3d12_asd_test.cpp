@@ -19,6 +19,7 @@
 #include <shellapi.h>
 #include <d3d12.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -308,6 +309,13 @@ uint16_t half_of(float f) {   // positive and negative normal values only (the t
     if (f == 0.0f || e <= 0) return uint16_t(sign);
     return uint16_t(sign | (uint32_t(e) << 10) | ((x >> 13) & 0x3ffu));
 }
+// v2.3 netstab: the same network, temporal path on, on sequences whose right answer is known to be steady.
+//   variant 1: tex-f0 every frame, zero motion, reset on frame 0 only - the output must settle, not alternate
+//   variant 2: the same with history 0 (the gate closed) - every frame must be the same bits
+//   variant 3: tex-f0 translated 3 px right per frame (wrapping), motion -3 px (the previous position) - the output's
+//              frame-to-frame change measured after undoing the shift, inside a border, must stay small
+//   variant 5: tex-f0 frames 0-7, tex-f1 from frame 8, zero motion - frame 8's |out - in| shows how much history is blended
+int g_variant = 0;
 int net_frames(ID3D12Device* d) {
     const uint32_t w = 640, h = 384, pitch = w * 16, bytes = pitch * h;
     ID3D12CommandQueue* q = nullptr;
@@ -343,7 +351,8 @@ int net_frames(ID3D12Device* d) {
         void* m = nullptr;
         mup->Map(0, nullptr, &m);
         auto* px = static_cast<uint16_t*>(m);
-        for (uint32_t i = 0; i < w * h; ++i) { px[i * 2] = half_of(2.5f); px[i * 2 + 1] = half_of(-1.25f); }
+        const float mx = g_variant == 3 ? -3.0f : g_variant ? 0.0f : 2.5f, my = g_variant ? 0.0f : -1.25f;
+        for (uint32_t i = 0; i < w * h; ++i) { px[i * 2] = half_of(mx); px[i * 2 + 1] = half_of(my); }
         mup->Unmap(0, nullptr);
         D3D12_TEXTURE_COPY_LOCATION tex{}, lin{};
         tex.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; tex.pResource = motion;
@@ -355,13 +364,22 @@ int net_frames(ID3D12Device* d) {
         submit();
     }
     int rc = 0;
-    std::vector<float> previous;
-    for (int frame = 0; frame < 24 && rc == 0; ++frame) {
+    std::vector<float> previous, before_previous;
+    std::vector<uint8_t> base0;
+    const int frames = g_variant ? 16 : 24;
+    for (int frame = 0; frame < frames && rc == 0; ++frame) {
         std::vector<uint8_t> src;
-        const std::string fi = std::to_string(frame & 1);
+        const std::string fi = std::to_string(g_variant == 5 ? (frame >= 8 ? 1 : 0) : g_variant ? 0 : frame & 1);
         if (!slurp_file(g_m4 + "\\input\\tex-f" + fi + ".bin", &src) || src.size() != bytes) {
             log("[net] frame %d: the input does not read", frame);
             rc = 10; break;
+        }
+        if (g_variant == 3) {   // content at x came from x - 3*frame (wrapping)
+            if (base0.empty()) base0 = src;
+            const uint32_t sh = uint32_t(3 * frame) % w;
+            for (uint32_t y = 0; y < h; ++y)
+                for (uint32_t x = 0; x < w; ++x)
+                    std::memcpy(&src[(size_t(y) * w + x) * 16], &base0[(size_t(y) * w + (x + w - sh) % w) * 16], 16);
         }
         bool ran = false, done = false;
         const DWORD t0 = GetTickCount();
@@ -388,9 +406,9 @@ int net_frames(ID3D12Device* d) {
             fr.style = 0; fr.intensity = 1.0f; fr.local_tone = 1.0f; fr.local_structure = 1.0f; fr.skin_structure = -1.0f;
             fr.motion = motion;
             fr.motion_scale_x = 1.0f / float(w); fr.motion_scale_y = 1.0f / float(h);
-            fr.reset = frame == 0 || frame == 4;
+            fr.reset = frame == 0 || (!g_variant && frame == 4);
             fr.feature = 7;
-            fr.history_strength = -1.0f;
+            fr.history_strength = g_variant == 2 ? 0.0f : -1.0f;
             ran = asd::evaluate_backend(fr);
             if (ran) {
                 barrier(l, output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -432,9 +450,35 @@ int net_frames(ID3D12Device* d) {
                 sum_in / (double(w) * h * 3), (unsigned long long)same_as_input, w * h * 3,
                 previous.empty() ? 0.0 : prev_d / (double(w) * h * 3), (unsigned long long)alpha_bits);
         };
-        if (frame < 6 || frame == 23) log_frame();
+        if (g_variant) {
+            // the steadiness numbers: |out - previous| (after undoing the shift in variant 3, 16 px border left out),
+            // |out - the one before the previous| (an alternation shows as this small while the first is large),
+            // the same for the input, and the largest single-texel change
+            double dp = 0, dpp = 0, din = 0, mx = 0; uint64_t n = 0;
+            const int s3 = g_variant == 3 ? 3 : 0;
+            if (!previous.empty())
+                for (uint32_t y = 16; y < h - 16; ++y)
+                    for (uint32_t x = 16; x < w - 16; ++x) {
+                        const size_t i = (size_t(y) * w + x) * 4, j = (size_t(y) * w + x - s3) * 4, k = (size_t(y) * w + x - 2 * s3) * 4;
+                        for (int c = 0; c < 3; ++c) {
+                            const double e = std::fabs(double(got[i + c]) - previous[j + c]);
+                            dp += e; mx = std::max(mx, e);
+                            if (!before_previous.empty()) dpp += std::fabs(double(got[i + c]) - before_previous[k + c]);
+                            ++n;
+                        }
+                    }
+            log("[stab] variant %d frame %2d: mean |out-in| %.5f, mean |out-prev| %.6f, max %.4f, mean |out-prev2| %.6f, %llu non-finite",
+                g_variant, frame, sum_in / (double(w) * h * 3), n ? dp / n : 0.0, mx, n && !before_previous.empty() ? dpp / n : 0.0,
+                (unsigned long long)nonfinite);
+            (void)din;
+        } else if (frame < 6 || frame == 23) log_frame();
+        before_previous = previous;
         previous.assign(got, got + size_t(w) * h * 4);
-        if (frame < 6) {
+        if (g_variant && frame < 6 && std::getenv("NR_TEST_DUMP")) {
+            FILE* o = std::fopen(("netstab-v" + std::to_string(g_variant) + std::getenv("NR_TEST_DUMP") + "-f" + std::to_string(frame) + ".bin").c_str(), "wb");
+            if (o) { std::fwrite(got, 1, bytes, o); std::fclose(o); }
+        }
+        if (frame < 6 && !g_variant) {
             FILE* o = std::fopen(("netplan-out-f" + std::to_string(frame) + ".bin").c_str(), "wb");
             if (o) { std::fwrite(got, 1, bytes, o); std::fclose(o); }
         }
@@ -533,7 +577,9 @@ int main(int argc, char** argv) {
         log("[test] %s", asd::status().registration.c_str());
         return 0;
     }
-    if (mode == "netplan") {
+    const bool netstab = mode == "netstab";
+    if (netstab) { g_variant = argc > 4 ? std::atoi(argv[4]) : 1; }
+    if (mode == "netplan" || netstab) {
         if (argc < 4) { log("[test] netplan <plan.bin> <m4 run dir>"); return 2; }
         g_plan = argv[2]; g_m4 = argv[3];
         asd::set_net_planner(&file_planner, nullptr);   // the dumped push blocks as they are: no controls patch
@@ -559,7 +605,7 @@ int main(int argc, char** argv) {
     log("[test] canary: %s", s.canary.c_str());
     int rc = 0;
     if (asd::canary() == asd::Canary::kHit) {
-        if (mode == "netplan") {
+        if (mode == "netplan" || netstab) {
             rc = net_frames(device);
         } else {
             const bool a = frame_path(device, false), b = frame_path(device, true);
