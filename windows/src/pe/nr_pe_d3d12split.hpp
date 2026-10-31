@@ -33,6 +33,9 @@ namespace nr::pe::split {
 // cut, or when this list's state since its last Reset is not known yet - the hooks were installed
 // after it was reset - in which case the frame passes through and the next one is cut.
 bool prepare(ID3D12GraphicsCommandList* list, std::string* why);
+// v2.7: the cut is off for good in this process (a class could not be hooked, or a cut list was reset unexecuted):
+// prepare() never succeeds again. False while a refusal is only this list's or this moment's.
+bool disabled();
 
 // The list's recorded state at this moment, for cut().
 struct Snapshot;

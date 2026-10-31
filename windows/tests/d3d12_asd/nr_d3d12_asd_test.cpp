@@ -48,6 +48,7 @@ void log(const char* format, ...) {
 namespace split {
 struct Snapshot {};
 bool prepare(ID3D12GraphicsCommandList*, std::string*) { return true; }
+bool disabled() { return false; }
 std::shared_ptr<Snapshot> snapshot(ID3D12GraphicsCommandList*) { return std::make_shared<Snapshot>(); }
 void restore(ID3D12GraphicsCommandList*, const std::shared_ptr<Snapshot>&) {}
 ID3D12CommandQueue* last_direct_queue() { return nullptr; }

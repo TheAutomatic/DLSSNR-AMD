@@ -65,6 +65,8 @@ ID3DBlob* compile_cs(const char* source, size_t bytes, const char* entry, std::s
 // known and the network ready for w x h (one is built on a thread otherwise: false until it is). False: `why`, and the
 // layer takes the 0.0.8.1 path (the Vulkan bridge) for the frame.
 // v2.6 `building` (may be null): set when false only because the network is still being made (no bridge then).
+// v2.7: also when the command list's state is not known yet / its recording is blocked this moment, or the canary has
+// not answered yet (not run, running): those frames wait too. The bridge only for lasting reasons.
 bool wilsjo2_ready(ID3D12Device* device, ID3D12GraphicsCommandList* cmd, uint32_t w, uint32_t h, std::string* why,
                    bool* building = nullptr);
 
