@@ -1,0 +1,6 @@
+﻿Xbox ASD 条目一次性停用测试（新版：日志追加、失败自动回滚、先检查管理员）
+1. 关掉 Minecraft 和 C:\XboxGames\Minecraft for Windows\Content\dlssnr-amd\nr_present_probe.exe
+2. 右键 C:\dlssnr-asd-xbox-test\disable-xbox-admin.bat -> 以管理员身份运行，窗口最后一行必须是 "OK: ... disabled"；不是就停，把 C:\dlssnr-asd-xbox-test\disable-log.txt 发我
+3. 启动 Minecraft，开 NR 跑 30 秒，退出
+4. 右键 C:\dlssnr-asd-xbox-test\restore-xbox-admin.bat -> 以管理员身份运行，最后一行必须是 "OK: ... restored"
+5. 发我：C:\XboxGames\Minecraft for Windows\Content\dlssnr-amd.log 里的 [asd] 行 + C:\dlssnr-asd-xbox-test\disable-log.txt + C:\dlssnr-asd-xbox-test\restore-log.txt
