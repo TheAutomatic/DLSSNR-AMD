@@ -31,6 +31,8 @@
 // dlssnr-amd\, dlssnr-amd.log, control.bin for NR Control).
 #include "nr_path_win.hpp"
 #include "MinHook.h"
+#include "nr_d3d12_asd.hpp"
+#include "nr_d3d12_asd_backend.hpp"
 #include "nr_asi_wilsjo2.hpp"
 #include "nr_device_features.hpp"
 #include "nr_dlssnr_model.hpp"
@@ -7695,6 +7697,11 @@ extern "C" __declspec(dllexport) void InitializeASI() {
     nr::pe::configure_network(nr::pe::module_folder());
     nr::pe::control::asi_facts(NR_BUILD_STAMP, nullptr);
     nr::pe::watchdog::start();   // its thread runs once OptiScaler's DllMain has returned
+    // The native D3D12 ASD backend (M5): off unless <plugins>\dlssnr-amd-asd\dlssnr-amd-asd.ini says Enabled = 1;
+    // its registration thread, like the watchdog's, runs once OptiScaler's DllMain has returned.
+    nr::pe::asd::start(g_self);
+    if (nr::pe::asd::enabled()) nr::dlssnr::set_d3d12_backend(&nr::pe::asd::evaluate_backend);
+    nr::pe::menu::set_extra_diagnostics(&nr::pe::asd::draw_panel);
     judge_executable();
     read_ini_barriers();
     nr::dlssnr::keep_caller_state();   // the RenoDX style is said per evaluate (renodx_route::CallStyle), not set here
