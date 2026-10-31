@@ -6,6 +6,9 @@
 #include "nr_pe_d3d12split.hpp"
 #include "nr_pe_log.hpp"
 
+#include <dxgi1_4.h>
+#include <tlhelp32.h>
+
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -26,6 +29,7 @@ std::wstring g_family = L"AMD_NAVI48:gfx1201";
 std::string g_registration = "not run", g_backend = "not run", g_network;
 std::atomic<int> g_canary{int(Canary::kNotRun)};
 std::atomic<bool> g_canary_started{false};
+std::atomic<bool> g_diag_done{false};
 std::string g_canary_line = "not run";
 std::atomic<uint64_t> g_runs{0}, g_fallbacks{0};
 const wchar_t kInstallerName[] = L"DLSSNR-AMD-ASD";
@@ -588,6 +592,218 @@ void log_lookup(ID3D12Device* device) {
 }
 
 struct CanaryJob { ID3D12Device* device; ID3D12CommandQueue* queue; };
+Canary run_canary(ID3D12Device* device, ID3D12CommandQueue* queue, std::string* out_line);
+void finish_canary(Canary c, const std::string& line);
+
+// ---- v4 diagnostics (all public, read-only): what is in this process, what the game's device is, and the canary on
+// fresh devices of ours made through the system d3d12.dll, beside the one on the game's device. Logged once.
+std::string module_of(const void* a) {
+    HMODULE m = nullptr;
+    if (!a || !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                  static_cast<LPCWSTR>(a), &m) || !m)
+        return "?";
+    std::wstring p(32768, L'\0');
+    p.resize(GetModuleFileNameW(m, p.data(), DWORD(p.size())));
+    char off[32];
+    std::snprintf(off, sizeof off, "+0x%llx", (unsigned long long)(static_cast<const char*>(a) - reinterpret_cast<const char*>(m)));
+    return utf8(p) + off;
+}
+std::wstring lower(std::wstring s) { for (auto& c : s) c = wchar_t(towlower(c)); return s; }
+std::wstring system_dir() {
+    wchar_t d[MAX_PATH] = L"";
+    GetSystemDirectoryW(d, MAX_PATH);
+    return d;
+}
+// An export's first bytes, and where a jmp there leads (a detour of it shows as a jmp into another module).
+std::string export_head(HMODULE m, const char* name) {
+    if (!m) return "no module";
+    auto* f = reinterpret_cast<const unsigned char*>(GetProcAddress(m, name));
+    if (!f) return "not exported";
+    char b[96];
+    std::snprintf(b, sizeof b, "%02X %02X %02X %02X %02X %02X", f[0], f[1], f[2], f[3], f[4], f[5]);
+    std::string r = std::string(name) + " at " + module_of(f) + ": " + b;
+    const unsigned char* to = nullptr;
+    if (f[0] == 0xE9) { int32_t d; std::memcpy(&d, f + 1, 4); to = f + 5 + d; }
+    else if (f[0] == 0xFF && f[1] == 0x25) { int32_t d; std::memcpy(&d, f + 2, 4); std::memcpy(&to, f + 6 + d, sizeof to); }
+    else if (f[0] == 0x48 && f[1] == 0xB8 && f[10] == 0xFF && f[11] == 0xE0) std::memcpy(&to, f + 2, sizeof to);
+    if (to) r += " -> jmp to " + module_of(to);
+    return r;
+}
+void diag_process() {
+    log("[asd] diag4: exe %s; its exports D3D12SDKVersion %s, D3D12SDKPath %s", utf8(exe_path()).c_str(),
+        GetProcAddress(GetModuleHandleW(nullptr), "D3D12SDKVersion") ? "present" : "none",
+        GetProcAddress(GetModuleHandleW(nullptr), "D3D12SDKPath") ? "present" : "none");
+    if (auto* v = reinterpret_cast<const UINT*>(GetProcAddress(GetModuleHandleW(nullptr), "D3D12SDKVersion")))
+        log("[asd] diag4: exe D3D12SDKVersion = %u", *v);
+    HMODULE d3d12 = GetModuleHandleW(L"d3d12.dll");
+    log("[asd] diag4: d3d12.dll %s", d3d12 ? module_of(d3d12).c_str() : "not loaded");
+    for (const char* e : {"D3D12CreateDevice", "D3D12GetInterface", "D3D12EnableExperimentalFeatures", "D3D12GetDebugInterface"})
+        log("[asd] diag4:   %s", export_head(d3d12, e).c_str());
+    const std::wstring sys = lower(system_dir()) + L"\\";
+    const std::wstring win = lower(sys.substr(0, sys.find(L'\\') + 1)) + L"windows\\";
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, 0);
+    if (snap == INVALID_HANDLE_VALUE) { log("[asd] diag4: no module snapshot (%lu)", GetLastError()); return; }
+    MODULEENTRY32W me{};
+    me.dwSize = sizeof me;
+    int total = 0, shown = 0, cores = 0, dxgis = 0, d3d12s = 0;
+    for (BOOL ok = Module32FirstW(snap, &me); ok; ok = Module32NextW(snap, &me)) {
+        ++total;
+        const std::wstring path = lower(me.szExePath), name = lower(me.szModule);
+        cores += name == L"d3d12core.dll";
+        dxgis += name == L"dxgi.dll";
+        d3d12s += name == L"d3d12.dll";
+        const bool graphics = name.find(L"d3d") != std::wstring::npos || name.find(L"dxgi") != std::wstring::npos ||
+                              name.find(L"amd") != std::wstring::npos || name.find(L"dxc") != std::wstring::npos ||
+                              name.find(L"dxil") != std::wstring::npos || name.find(L"opti") != std::wstring::npos ||
+                              name.find(L"nvapi") != std::wstring::npos || name.find(L"ngx") != std::wstring::npos ||
+                              name.find(L"xess") != std::wstring::npos || name.find(L"fsr") != std::wstring::npos ||
+                              name.find(L"ffx") != std::wstring::npos || name.find(L"fidelity") != std::wstring::npos;
+        if (path.compare(0, win.size(), win) != 0 || graphics) {
+            ++shown;
+            log("[asd] diag4: module %s (base %p, %lu KB)", utf8(me.szExePath).c_str(), static_cast<void*>(me.modBaseAddr),
+                (unsigned long)(me.modBaseSize / 1024));
+        }
+    }
+    CloseHandle(snap);
+    log("[asd] diag4: %d modules (%d listed: outside Windows or graphics); D3D12Core.dll x%d, d3d12.dll x%d, dxgi.dll x%d",
+        total, shown, cores, d3d12s, dxgis);
+}
+
+// ID3D12DeviceConfiguration's IID (d3d12.h).
+inline constexpr GUID kIidDeviceConfiguration = {0x78dbf87b, 0xf766, 0x422b, {0xa6, 0x1c, 0xc8, 0xc4, 0x46, 0xbd, 0xb9, 0xad}};
+IDXGIFactory4* system_dxgi_factory() {
+    HMODULE m = LoadLibraryW((system_dir() + L"\\dxgi.dll").c_str());
+    using Fn = HRESULT(WINAPI*)(REFIID, void**);
+    auto fn = m ? reinterpret_cast<Fn>(reinterpret_cast<void*>(GetProcAddress(m, "CreateDXGIFactory1"))) : nullptr;
+    IDXGIFactory4* f = nullptr;
+    if (!fn || FAILED(fn(__uuidof(IDXGIFactory4), reinterpret_cast<void**>(&f)))) return nullptr;
+    return f;
+}
+IDXGIAdapter1* adapter_of(LUID luid) {
+    IDXGIFactory4* f = system_dxgi_factory();
+    if (!f) return nullptr;
+    IDXGIAdapter1* a = nullptr;
+    if (FAILED(f->EnumAdapterByLuid(luid, __uuidof(IDXGIAdapter1), reinterpret_cast<void**>(&a)))) a = nullptr;
+    f->Release();
+    return a;
+}
+
+void diag_device(const char* tag, ID3D12Device* d, ID3D12Device* game) {
+    const LUID luid = d->GetAdapterLuid();
+    std::string adapter = "?";
+    if (IDXGIAdapter1* a = adapter_of(luid)) {
+        DXGI_ADAPTER_DESC1 ad{};
+        if (SUCCEEDED(a->GetDesc1(&ad))) {
+            char b[96];
+            std::snprintf(b, sizeof b, " (vendor 0x%04X device 0x%04X, %llu MB VRAM)", ad.VendorId, ad.DeviceId,
+                          (unsigned long long)(ad.DedicatedVideoMemory >> 20));
+            adapter = utf8(ad.Description) + b;
+        }
+        a->Release();
+    }
+    log("[asd] diag4: %s %p: adapter LUID %08lX:%08lX %s, %u node(s)", tag, static_cast<void*>(d),
+        (unsigned long)luid.HighPart, (unsigned long)luid.LowPart, adapter.c_str(), d->GetNodeCount());
+    // every adapter of the system, to see which one the game's device is on
+    if (!game) {
+        if (IDXGIFactory4* f = system_dxgi_factory()) {
+            IDXGIAdapter1* a = nullptr;
+            for (UINT i = 0; SUCCEEDED(f->EnumAdapters1(i, &a)); ++i) {
+                DXGI_ADAPTER_DESC1 ad{};
+                a->GetDesc1(&ad);
+                log("[asd] diag4:   system adapter %u: LUID %08lX:%08lX %s%s", i, (unsigned long)ad.AdapterLuid.HighPart,
+                    (unsigned long)ad.AdapterLuid.LowPart, utf8(ad.Description).c_str(),
+                    ad.AdapterLuid.LowPart == luid.LowPart && ad.AdapterLuid.HighPart == luid.HighPart ? "  <- this device" : "");
+                a->Release();
+            }
+            f->Release();
+        }
+    }
+    static const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_12_2, D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_0,
+                                               D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+    D3D12_FEATURE_DATA_FEATURE_LEVELS fl{UINT(sizeof levels / sizeof levels[0]), levels, D3D_FEATURE_LEVEL_11_0};
+    const HRESULT hfl = d->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &fl, sizeof fl);
+    D3D12_FEATURE_DATA_SHADER_MODEL sm{D3D_SHADER_MODEL(0x69)};
+    HRESULT hsm = d->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof sm);
+    for (int v = 0x68; FAILED(hsm) && v >= 0x60; --v) { sm.HighestShaderModel = D3D_SHADER_MODEL(v); hsm = d->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof sm); }
+    D3D12_FEATURE_DATA_SHADER_CACHE sc{};
+    const HRESULT hsc = d->CheckFeatureSupport(D3D12_FEATURE_SHADER_CACHE, &sc, sizeof sc);
+    log("[asd] diag4:   max feature level 0x%X (%s), shader model 0x%X (%s), shader cache support 0x%X (%s)",
+        unsigned(fl.MaxSupportedFeatureLevel), hr_text(hfl).c_str(), unsigned(sm.HighestShaderModel), hr_text(hsm).c_str(),
+        unsigned(sc.SupportFlags), hr_text(hsc).c_str());
+    // ID3D12DeviceConfiguration: only whether the device has it (its GetDesc faulted on the in-box runtime here).
+    IUnknown* cfg = nullptr;
+    HRESULT hr = d->QueryInterface(kIidDeviceConfiguration, reinterpret_cast<void**>(&cfg));
+    log("[asd] diag4:   ID3D12DeviceConfiguration: %s%s", hr_text(hr).c_str(),
+        SUCCEEDED(hr) && cfg ? (" (" + module_of(*reinterpret_cast<void**>(cfg)) + ")").c_str() : "");
+    if (cfg) cfg->Release();
+    // Where its methods are (the vtable, read only): a device of another runtime or a wrapper shows here.
+    void** vt = *reinterpret_cast<void***>(d);
+    log("[asd] diag4:   vtable %p (%s)%s", static_cast<void*>(vt), module_of(vt).c_str(),
+        game ? (*reinterpret_cast<void***>(game) == vt ? ", the same as the game's device" : ", NOT the game's device's") : "");
+    static const struct { int i; const char* n; } methods[] = {{0, "QueryInterface"}, {8, "CreateCommandQueue"},
+        {10, "CreateGraphicsPipelineState"}, {11, "CreateComputePipelineState"}, {16, "CreateRootSignature"},
+        {44, "CreatePipelineLibrary"}, {47, "CreatePipelineState"}};
+    for (const auto& m : methods) {
+        std::string extra;
+        if (game) extra = (*reinterpret_cast<void***>(game))[m.i] == vt[m.i] ? " (same as game's)" : " (DIFFERS from game's)";
+        log("[asd] diag4:     [%d] %s -> %s%s", m.i, m.n, module_of(vt[m.i]).c_str(), extra.c_str());
+    }
+}
+
+void fresh_one(const char* how, ID3D12Device* fresh, ID3D12Device* game) {
+    diag_device(how, fresh, game);
+    log_lookup(fresh);
+    D3D12_COMMAND_QUEUE_DESC qd{};
+    qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    ID3D12CommandQueue* q = nullptr;
+    HRESULT hr = fresh->CreateCommandQueue(&qd, IID_PPV_ARGS(&q));
+    if (FAILED(hr) || !q) { log("[asd] fresh canary (%s): ASD_FAIL: CreateCommandQueue %s", how, hr_text(hr).c_str()); return; }
+    std::string line;
+    const Canary c = run_canary(fresh, q, &line);
+    q->Release();
+    log("[asd] fresh canary (%s): %s: %s", how, canary_name(c), line.c_str());
+}
+
+void fresh_canaries(ID3D12Device* game) {
+    const LUID luid = game->GetAdapterLuid();
+    IDXGIAdapter1* adapter = adapter_of(luid);
+    log("[asd] diag4: fresh devices of ours on the game's adapter (%s), through %s", adapter ? "found by LUID" : "NOT found: default adapter",
+        module_of(GetModuleHandleW(L"d3d12.dll")).c_str());
+    HMODULE d3d12 = GetModuleHandleW(L"d3d12.dll");
+    using Create = HRESULT(WINAPI*)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
+    auto create = d3d12 ? reinterpret_cast<Create>(reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12CreateDevice"))) : nullptr;
+    ID3D12Device* a = nullptr;
+    HRESULT hr = create ? create(adapter, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&a)) : E_NOINTERFACE;
+    log("[asd] diag4: fresh device A: D3D12CreateDevice %s", hr_text(hr).c_str());
+    if (SUCCEEDED(hr) && a) {
+        log("[asd] diag4: fresh device A is %s", a == game ? "THE GAME'S DEVICE (the runtime handed the same one back)" : "a new device");
+        fresh_one("A: D3D12CreateDevice", a, game);
+        a->Release();
+    }
+    // (ID3D12DeviceFactory from D3D12GetInterface faulted on the in-box runtime offline: not used.)
+    if (adapter) adapter->Release();
+    // C: a device on every other hardware adapter (its own singleton there), to see the canary on each.
+    if (IDXGIFactory4* f = system_dxgi_factory()) {
+        IDXGIAdapter1* o = nullptr;
+        for (UINT i = 0; create && SUCCEEDED(f->EnumAdapters1(i, &o)); ++i) {
+            DXGI_ADAPTER_DESC1 ad{};
+            o->GetDesc1(&ad);
+            if ((ad.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) || (ad.AdapterLuid.LowPart == luid.LowPart && ad.AdapterLuid.HighPart == luid.HighPart)) {
+                o->Release();
+                continue;
+            }
+            ID3D12Device* c = nullptr;
+            hr = create(o, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&c));
+            const std::string how = "C" + std::to_string(i) + ": " + utf8(ad.Description);
+            log("[asd] diag4: fresh device %s: D3D12CreateDevice %s", how.c_str(), hr_text(hr).c_str());
+            if (SUCCEEDED(hr) && c) { fresh_one(how.c_str(), c, game); c->Release(); }
+            o->Release();
+        }
+        f->Release();
+    }
+    log("[asd] diag4: done");
+}
+
 void finish_canary(Canary c, const std::string& line) {
     { std::lock_guard<std::mutex> g(g_lock); g_canary_line = std::string(canary_name(c)) + ": " + line; }
     g_canary = int(c);
@@ -595,11 +811,8 @@ void finish_canary(Canary c, const std::string& line) {
         c == Canary::kHit ? " - the D3D12 ASD backend may run" : " - the D3D12 ASD backend stays off (the 0.0.8.1 path runs)");
 }
 
-DWORD WINAPI canary_thread(void* p) {
-    CanaryJob job = *static_cast<CanaryJob*>(p);
-    delete static_cast<CanaryJob*>(p);
-    ID3D12Device* device = job.device;
-    log_lookup(device);
+// The canary on `device` with `queue` (the M1 pbptr carrier): ASD_HIT, ASD_MISS or ASD_FAIL, and the line saying why.
+Canary run_canary(ID3D12Device* device, ID3D12CommandQueue* queue, std::string* out_line) {
     // The pipeline exactly as stored in the SODB (its serialized root signature and DXIL, built into the ASI: no SODB
     // reader needed, as asd_probe's --execute in the M1 615/in-box runs): the runtime looks the PSDB up by this desc.
     Pipeline pl;
@@ -683,8 +896,8 @@ DWORD WINAPI canary_thread(void* p) {
         list->CopyBufferRegion(readback, 0, out, 0, kN * 4);
         if (FAILED(list->Close())) { line = "Close(the canary's list)"; break; }
         ID3D12CommandList* lists[] = {list};
-        job.queue->ExecuteCommandLists(1, lists);
-        if (FAILED(job.queue->Signal(fence, 1)) || FAILED(fence->SetEventOnCompletion(1, event))) { line = "Signal"; break; }
+        queue->ExecuteCommandLists(1, lists);
+        if (FAILED(queue->Signal(fence, 1)) || FAILED(fence->SetEventOnCompletion(1, event))) { line = "Signal"; break; }
         if (WaitForSingleObject(event, 5000) != WAIT_OBJECT_0) {
             line = "the GPU did not finish the canary within 5 s";
             // what the GPU may still use is left as it is (never released under it)
@@ -711,9 +924,24 @@ DWORD WINAPI canary_thread(void* p) {
     if (event) CloseHandle(event);
     release(fence); release(list); release(alloc); release(readback); release(table); release(out); release(in);
     release(pso); release(rs);
+    *out_line = line;
+    return result;
+}
+
+DWORD WINAPI canary_thread(void* p) {
+    CanaryJob job = *static_cast<CanaryJob*>(p);
+    delete static_cast<CanaryJob*>(p);
+    ID3D12Device* device = job.device;
+    log_lookup(device);
+    diag_process();
+    diag_device("the game's device", device, nullptr);
+    std::string line;
+    const Canary result = run_canary(device, job.queue, &line);
     job.queue->Release();
-    device->Release();
     finish_canary(result, line);
+    if (GetPrivateProfileIntW(L"D3D12ASD", L"FreshCanary", 1, g_ini.c_str()) != 0) fresh_canaries(device);
+    device->Release();
+    g_diag_done = true;
     return 0;
 }
 
@@ -736,6 +964,7 @@ std::wstring psdb_path() { return g_folder + L"\\" + g_psdb_name; }
 bool enabled() { return g_enabled; }
 bool debug_tint() { return g_tint; }
 Canary canary() { return Canary(g_canary.load()); }
+bool diagnostics_done() { return g_diag_done.load(); }
 
 void start(HMODULE self) { start(self, true); }
 void start(HMODULE self, bool register_now) {
