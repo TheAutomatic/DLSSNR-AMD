@@ -33,6 +33,7 @@
 #include "MinHook.h"
 #include "nr_d3d12_asd.hpp"
 #include "nr_d3d12_asd_backend.hpp"
+#include "nr_d3d12_asd_net.hpp"
 #include "nr_asi_wilsjo2.hpp"
 #include "nr_device_features.hpp"
 #include "nr_dlssnr_model.hpp"
@@ -7700,7 +7701,15 @@ extern "C" __declspec(dllexport) void InitializeASI() {
     // The native D3D12 ASD backend (M5): off unless <plugins>\dlssnr-amd-asd\dlssnr-amd-asd.ini says Enabled = 1;
     // its registration thread, like the watchdog's, runs once OptiScaler's DllMain has returned.
     nr::pe::asd::start(g_self);
-    if (nr::pe::asd::enabled()) nr::dlssnr::set_d3d12_backend(&nr::pe::asd::evaluate_backend);
+    if (nr::pe::asd::enabled()) {
+        // The real network (nr_d3d12_asd_net.hpp): lowered as the Vulkan runtime lowers it, for this installation.
+        nr::pe::asd::set_net_planner(
+            [](uint32_t w, uint32_t h, bool experimental, nr::D3d12NetPlan* out, std::string* why) {
+                return nr::plan_d3d12_network(nr::pe::module_folder(), w, h, experimental, out, why);
+            },
+            &nr::d3d12_net_controls);
+        nr::dlssnr::set_d3d12_backend(&nr::pe::asd::evaluate_backend);
+    }
     nr::pe::menu::set_extra_diagnostics(&nr::pe::asd::draw_panel);
     judge_executable();
     read_ini_barriers();

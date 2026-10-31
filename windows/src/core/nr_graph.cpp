@@ -1422,6 +1422,9 @@ struct NrSession {
     // The weight blob past weights_end (noise field, records) and a hash of the weights before it.
     std::vector<uint8_t> tail;
     uint64_t weights_hash = 0;
+    // A plan's whole weight blob (the weights, then the tail at weights_end), for a caller that uploads it itself (the
+    // D3D12 ASD backend: nr::plan_d3d12_network); null: not kept.
+    std::vector<uint8_t>* weights_out = nullptr;
     size_t arena_total = 0;   // the activation arena's bytes (values, sync words, tile counters)
     void keep_tail(const WeightBlob& wblob);
     std::shared_ptr<const struct GraphCore> make_core(int argc, char** argv, const std::string& spv_dir);
@@ -5303,6 +5306,10 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     }
     // A plan ends here (the resize path): what it lowered, for build_shared.
     if (plan_only) {
+        if (weights_out) {
+            weights_out->assign(wblob.size(), 0);
+            if (!weights_out->empty()) wblob.read(0, weights_out->data(), weights_out->size());
+        }
         keep_tail(wblob);
         core = make_core(argc, argv, spv_dir);
         return 4;

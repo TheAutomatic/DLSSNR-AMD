@@ -109,6 +109,22 @@ struct D3d12BackendFrame {
     ID3D12Resource* output;
     int output_state;   // D3D12_RESOURCE_STATES
     unsigned int width, height;
+    // The frame's model controls (nr::Controls of the evaluate's Controls6: controls_from).
+    int style;
+    float intensity, local_tone, local_structure, skin_structure;
+    int automatic_mask;
+    int reversible_mode;   // Controls::reversible_mode (proxy_curve)
+    // The temporal inputs, as the session's EngineResources takes them (evaluate_d3d12): the motion guide in
+    // NON_PIXEL_SHADER_RESOURCE, its subrect (0 extent: the whole texture), MVecScale over the region's extent
+    // (normalized_mv_scale), DLSSNR.Reset, the feature (its history).
+    ID3D12Resource* motion;
+    unsigned int motion_x, motion_y, motion_w, motion_h;
+    float motion_scale_x, motion_scale_y;
+    int reset;
+    unsigned long long feature;
+    float history_strength;   // < 0: the session's
+    // The 0.0.8.1 path's own stages this backend does not run: the RenoDX route installed, [Preprocess] active.
+    int renodx_route, preprocess;
 };
 using D3d12Backend = bool (*)(const D3d12BackendFrame& frame);
 void set_d3d12_backend(D3d12Backend backend);

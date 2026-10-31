@@ -7,9 +7,11 @@
 //     late        make the device, then register: this launch is expected to miss (the next one hits)
 //     dump-canary write nr_d3d12_asd_canary_blob.h from the SODB's g_pbptr (needs the 619 runtime's SODB reader)
 //     unregister  remove this exe's registration of ours (and write Register = 0)
+//     netplan <plan.bin> <m4 run dir>  the ACO network on a dumped plan_d3d12_network plan, temporal frames (net_frames)
 // Needs <exe dir>\dlssnr-amd-asd\dlssnr-amd-asd.ini (Enabled = 1) and the SODB and PSDB it names.
 #include "nr_d3d12_asd.hpp"
 #include "nr_d3d12_asd_backend.hpp"
+#include "nr_d3d12_asd_net.hpp"
 #include "nr_d3d12_asd_reprofile.hpp"
 #include "nr_pe_d3d12split.hpp"
 
@@ -17,6 +19,7 @@
 #include <shellapi.h>
 #include <d3d12.h>
 
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -130,6 +133,20 @@ void barrier(ID3D12GraphicsCommandList* l, ID3D12Resource* r, D3D12_RESOURCE_STA
     l->ResourceBarrier(1, &x);
 }
 
+// A motion guide as OptiScaler hands it over: R16G16_FLOAT in NON_PIXEL_SHADER_RESOURCE (zero: no motion).
+ID3D12Resource* motion_texture(ID3D12Device* d, uint32_t w, uint32_t h) {
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = w; rd.Height = h; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+    rd.Format = DXGI_FORMAT_R16G16_FLOAT;
+    rd.SampleDesc.Count = 1;
+    ID3D12Resource* r = nullptr;
+    d->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&r));
+    return r;
+}
+
 // The frame path on a 61x37 RGBA8 frame (odd, so the 8x8 groups' edges are exercised): separate colour and output,
 // then in place (colour == output, UNORDERED_ACCESS). True when the output is the input, texel for texel.
 bool frame_path(ID3D12Device* d, bool in_place) {
@@ -174,6 +191,10 @@ bool frame_path(ID3D12Device* d, bool in_place) {
     fr.output_state = int(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     fr.width = w;
     fr.height = h;
+    ID3D12Resource* mv = motion_texture(d, w, h);
+    fr.motion = mv;
+    fr.motion_scale_x = fr.motion_scale_y = 1.0f;
+    fr.feature = 1;
     const bool ran = asd::evaluate_backend(fr);
     barrier(l, output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     tex.pResource = output;
@@ -199,7 +220,229 @@ bool frame_path(ID3D12Device* d, bool in_place) {
     log("[test] frame path %s: backend %s, GPU %s, device 0x%08lX, %u of %u bytes differ", in_place ? "in place" : "colour -> output",
         ran ? "ran" : "declined", done ? "done" : "TIMEOUT", static_cast<unsigned long>(removed), diff, w * h * 4);
     release(rb); release(up); release(output); release(color); release(f); release(l); release(a); release(q);
+    if (done) release(mv);
     return ran && done && removed == S_OK && diff == 0;
+}
+
+// netplan <plan.bin> <m4 run dir>: the ACO network through evaluate_backend on the real lowering - nr::plan_d3d12_network
+// as the .asi calls it, dumped by plan_dump into plan.bin (NRPLAN02) - with the temporal path on: 24 frames of
+// <m4 run dir>\input\tex-f<N>.bin (640x384 RGBA32F, f0 and f1 in turn) with a motion guide (R16G16_FLOAT, a constant
+// vector), Reset on frame 0 and frame 4, one feature. A sanity run, not a comparison: every frame must run on the
+// network, the GPU finish with the device alive, every output float be finite and the alpha be the input's.
+std::string g_plan, g_m4;
+bool slurp_file(const std::string& path, std::vector<uint8_t>* out) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    std::fseek(f, 0, SEEK_END);
+    const long n = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    out->resize(size_t(n > 0 ? n : 0));
+    const bool ok = n >= 0 && std::fread(out->data(), 1, out->size(), f) == out->size();
+    std::fclose(f);
+    return ok;
+}
+struct PlanReader {
+    const std::vector<uint8_t>& b;
+    size_t at = 0;
+    bool ok = true;
+    template <class T> T get() {
+        T v{};
+        if (at + sizeof v > b.size()) { ok = false; return v; }
+        std::memcpy(&v, b.data() + at, sizeof v); at += sizeof v;
+        return v;
+    }
+    std::vector<uint8_t> blob() {
+        const uint64_t n = get<uint64_t>();
+        if (!ok || at + n > b.size()) { ok = false; return {}; }
+        std::vector<uint8_t> v(b.begin() + long(at), b.begin() + long(at + n)); at += n;
+        return v;
+    }
+    std::string str() { const auto v = blob(); return std::string(v.begin(), v.end()); }
+};
+bool file_planner(uint32_t w, uint32_t h, bool, nr::D3d12NetPlan* p, std::string* why) {
+    *p = nr::D3d12NetPlan{};
+    std::vector<uint8_t> b;
+    if (!slurp_file(g_plan, &b) || b.size() < 8 || std::memcmp(b.data(), "NRPLAN02", 8) != 0) { *why = "no NRPLAN02 " + g_plan; return false; }
+    PlanReader r{b};
+    r.at = 8;
+    p->spv_dir = r.str(); p->model = r.str(); p->note = r.str();
+    p->width = r.get<uint32_t>(); p->height = r.get<uint32_t>(); p->work_w = r.get<uint32_t>(); p->work_h = r.get<uint32_t>();
+    p->style_grade = r.get<uint8_t>() != 0;
+    p->act_total = r.get<uint64_t>(); p->weights_end = r.get<uint64_t>();
+    p->weights = r.blob();
+    const uint32_t nd = r.get<uint32_t>();
+    for (uint32_t i = 0; r.ok && i < nd; ++i) {
+        nr::D3d12NetPlan::Dispatch d;
+        d.kern = r.str(); d.gx = r.get<uint32_t>(); d.gy = r.get<uint32_t>(); d.gz = r.get<uint32_t>();
+        d.act_at = r.get<int32_t>(); d.push = r.blob();
+        p->disp.push_back(std::move(d));
+    }
+    const uint32_t nn = r.get<uint32_t>();
+    for (uint32_t i = 0; r.ok && i < nn; ++i) p->noise.push_back(r.get<nr::D3d12NetPlan::Noise>());
+    auto& t = p->temporal;
+    t.pre = r.get<int32_t>(); t.post = r.get<int32_t>();
+    t.pre_spv = r.str(); t.post_spv = r.str(); t.post_grade_spv = r.str();
+    t.pre_push_bytes = r.get<uint32_t>(); t.seed_at = r.get<uint32_t>(); t.noise_field_at = r.get<uint32_t>();
+    t.blend_scale = r.get<float>(); t.motion_without_depth = r.get<uint8_t>() != 0;
+    if (!r.ok) { *why = "plan.bin is truncated"; return false; }
+    if (w != p->width || h != p->height) { *why = "plan.bin is for " + std::to_string(p->width) + "x" + std::to_string(p->height); return false; }
+    return true;
+}
+ID3D12Resource* texture_of(ID3D12Device* d, uint32_t w, uint32_t h, DXGI_FORMAT format, D3D12_RESOURCE_STATES state) {
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = w; rd.Height = h; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+    rd.Format = format;
+    rd.SampleDesc.Count = 1;
+    rd.Flags = format == DXGI_FORMAT_R32G32B32A32_FLOAT ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
+    ID3D12Resource* r = nullptr;
+    d->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, state, nullptr, IID_PPV_ARGS(&r));
+    return r;
+}
+uint16_t half_of(float f) {   // positive and negative normal values only (the test's motion)
+    uint32_t x; std::memcpy(&x, &f, 4);
+    const uint32_t sign = (x >> 16) & 0x8000u;
+    const int e = int((x >> 23) & 0xff) - 127 + 15;
+    if (f == 0.0f || e <= 0) return uint16_t(sign);
+    return uint16_t(sign | (uint32_t(e) << 10) | ((x >> 13) & 0x3ffu));
+}
+int net_frames(ID3D12Device* d) {
+    const uint32_t w = 640, h = 384, pitch = w * 16, bytes = pitch * h;
+    ID3D12CommandQueue* q = nullptr;
+    ID3D12CommandAllocator* a = nullptr;
+    ID3D12GraphicsCommandList* l = nullptr;
+    ID3D12Fence* f = nullptr;
+    D3D12_COMMAND_QUEUE_DESC qd{};
+    qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    d->CreateCommandQueue(&qd, IID_PPV_ARGS(&q));
+    d->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&a));
+    d->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, a, nullptr, IID_PPV_ARGS(&l));
+    d->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f));
+    ID3D12Resource* color = texture_of(d, w, h, DXGI_FORMAT_R32G32B32A32_FLOAT, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    ID3D12Resource* output = texture_of(d, w, h, DXGI_FORMAT_R32G32B32A32_FLOAT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ID3D12Resource* motion = texture_of(d, w, h, DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_STATE_COPY_DEST);
+    ID3D12Resource* up = buffer(d, D3D12_HEAP_TYPE_UPLOAD, bytes, D3D12_RESOURCE_STATE_GENERIC_READ);
+    ID3D12Resource* mup = buffer(d, D3D12_HEAP_TYPE_UPLOAD, uint64_t(w) * 4 * h, D3D12_RESOURCE_STATE_GENERIC_READ);
+    ID3D12Resource* rb = buffer(d, D3D12_HEAP_TYPE_READBACK, bytes, D3D12_RESOURCE_STATE_COPY_DEST);
+    UINT64 fence = 0;
+    auto submit = [&]() {
+        ID3D12CommandList* ls[] = {l};
+        q->ExecuteCommandLists(1, ls);
+        q->Signal(f, ++fence);
+        HANDLE e = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        f->SetEventOnCompletion(fence, e);
+        const bool done = WaitForSingleObject(e, 60000) == WAIT_OBJECT_0;
+        CloseHandle(e);
+        return done;
+    };
+    {
+        // The guide: 2.5 px right, 1.25 px up of a 640x384 motion texture, MVecScale 1 (normalized by the backend's
+        // caller: 1 / 640, 1 / 384).
+        void* m = nullptr;
+        mup->Map(0, nullptr, &m);
+        auto* px = static_cast<uint16_t*>(m);
+        for (uint32_t i = 0; i < w * h; ++i) { px[i * 2] = half_of(2.5f); px[i * 2 + 1] = half_of(-1.25f); }
+        mup->Unmap(0, nullptr);
+        D3D12_TEXTURE_COPY_LOCATION tex{}, lin{};
+        tex.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; tex.pResource = motion;
+        lin.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; lin.pResource = mup;
+        lin.PlacedFootprint.Footprint = {DXGI_FORMAT_R16G16_FLOAT, w, h, 1, w * 4};
+        l->CopyTextureRegion(&tex, 0, 0, 0, &lin, nullptr);
+        barrier(l, motion, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        l->Close();
+        submit();
+    }
+    int rc = 0;
+    std::vector<float> previous;
+    for (int frame = 0; frame < 24 && rc == 0; ++frame) {
+        std::vector<uint8_t> src;
+        const std::string fi = std::to_string(frame & 1);
+        if (!slurp_file(g_m4 + "\\input\\tex-f" + fi + ".bin", &src) || src.size() != bytes) {
+            log("[net] frame %d: the input does not read", frame);
+            rc = 10; break;
+        }
+        bool ran = false, done = false;
+        const DWORD t0 = GetTickCount();
+        for (int attempt = 0; !ran && GetTickCount() - t0 < 180000; ++attempt) {
+            void* m = nullptr;
+            up->Map(0, nullptr, &m);
+            std::memcpy(m, src.data(), bytes);
+            up->Unmap(0, nullptr);
+            a->Reset();
+            l->Reset(a, nullptr);
+            D3D12_TEXTURE_COPY_LOCATION tex{}, lin{};
+            tex.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            lin.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            lin.PlacedFootprint.Footprint = {DXGI_FORMAT_R32G32B32A32_FLOAT, w, h, 1, pitch};
+            barrier(l, color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+            tex.pResource = color; lin.pResource = up;
+            l->CopyTextureRegion(&tex, 0, 0, 0, &lin, nullptr);
+            barrier(l, color, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            nr::dlssnr::D3d12BackendFrame fr{};
+            fr.device = d; fr.cmd = l; fr.color = color;
+            fr.color_state = int(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            fr.output = output; fr.output_state = int(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            fr.width = w; fr.height = h;
+            fr.style = 0; fr.intensity = 1.0f; fr.local_tone = 1.0f; fr.local_structure = 1.0f; fr.skin_structure = -1.0f;
+            fr.motion = motion;
+            fr.motion_scale_x = 1.0f / float(w); fr.motion_scale_y = 1.0f / float(h);
+            fr.reset = frame == 0 || frame == 4;
+            fr.feature = 7;
+            fr.history_strength = -1.0f;
+            ran = asd::evaluate_backend(fr);
+            if (ran) {
+                barrier(l, output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                tex.pResource = output; lin.pResource = rb;
+                l->CopyTextureRegion(&lin, 0, 0, 0, &tex, nullptr);
+                barrier(l, output, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            }
+            l->Close();
+            done = submit();
+            if (!done) break;
+            if (!ran) Sleep(250);
+        }
+        const HRESULT removed = d->GetDeviceRemovedReason();
+        const asd::Status st = asd::status();
+        if (!ran || !done || removed != S_OK || st.backend.find("recorded nothing") != std::string::npos) {
+            log("[net] frame %d: backend %s, GPU %s, device 0x%08lX; %s", frame, ran ? "ran" : "declined", done ? "done" : "TIMEOUT",
+                static_cast<unsigned long>(removed), st.backend.c_str());
+            rc = 11; break;
+        }
+        void* m = nullptr;
+        rb->Map(0, nullptr, &m);
+        const float* got = static_cast<const float*>(m);
+        const float* in = reinterpret_cast<const float*>(src.data());
+        uint64_t nonfinite = 0, alpha_bits = 0, same_as_input = 0;
+        double sum_in = 0, prev_d = 0;
+        for (uint32_t i = 0; i < w * h; ++i) {
+            for (int c = 0; c < 3; ++c) {
+                const float g = got[i * 4 + c];
+                if (!(g == g) || g - g != 0) { ++nonfinite; continue; }
+                sum_in += std::fabs(double(g) - double(in[i * 4 + c]));
+                if (g == in[i * 4 + c]) ++same_as_input;
+                if (!previous.empty()) prev_d += std::fabs(double(g) - double(previous[i * 4 + c]));
+            }
+            if (std::memcmp(&got[i * 4 + 3], &in[i * 4 + 3], 4) != 0) ++alpha_bits;
+        }
+        auto log_frame = [&]() {
+            log("[net] frame %d (input f%s, reset %d): %llu non-finite, mean |out - in| %.4g (%llu of %u equal), mean |out - previous "
+                "out| %.4g, alpha vs the input: %llu differ", frame, fi.c_str(), frame == 0 || frame == 4, (unsigned long long)nonfinite,
+                sum_in / (double(w) * h * 3), (unsigned long long)same_as_input, w * h * 3,
+                previous.empty() ? 0.0 : prev_d / (double(w) * h * 3), (unsigned long long)alpha_bits);
+        };
+        if (frame < 6 || frame == 23) log_frame();
+        previous.assign(got, got + size_t(w) * h * 4);
+        if (frame < 6) {
+            FILE* o = std::fopen(("netplan-out-f" + std::to_string(frame) + ".bin").c_str(), "wb");
+            if (o) { std::fwrite(got, 1, bytes, o); std::fclose(o); }
+        }
+        rb->Unmap(0, nullptr);
+        if (nonfinite || alpha_bits) rc = 12;
+    }
+    release(rb); release(mup); release(up); release(motion); release(output); release(color); release(f); release(l); release(a); release(q);
+    return rc;
 }
 
 }  // namespace
@@ -290,6 +533,11 @@ int main(int argc, char** argv) {
         log("[test] %s", asd::status().registration.c_str());
         return 0;
     }
+    if (mode == "netplan") {
+        if (argc < 4) { log("[test] netplan <plan.bin> <m4 run dir>"); return 2; }
+        g_plan = argv[2]; g_m4 = argv[3];
+        asd::set_net_planner(&file_planner, nullptr);   // the dumped push blocks as they are: no controls patch
+    }
     ID3D12Device* device = nullptr;
     if (mode == "late") device = make_device();
     asd::start(GetModuleHandleW(nullptr));
@@ -311,8 +559,12 @@ int main(int argc, char** argv) {
     log("[test] canary: %s", s.canary.c_str());
     int rc = 0;
     if (asd::canary() == asd::Canary::kHit) {
-        const bool a = frame_path(device, false), b = frame_path(device, true);
-        rc = a && b ? 0 : 5;
+        if (mode == "netplan") {
+            rc = net_frames(device);
+        } else {
+            const bool a = frame_path(device, false), b = frame_path(device, true);
+            rc = a && b ? 0 : 5;
+        }
         const asd::Status t = asd::status();
         log("[test] backend: %s; network: %s; %llu runs, %llu fallbacks", t.backend.c_str(), t.network.c_str(),
             (unsigned long long)t.runs, (unsigned long long)t.fallbacks);
