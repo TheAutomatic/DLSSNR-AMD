@@ -76,6 +76,7 @@ template <class T> void release(T*& p) { if (p) { p->Release(); p = nullptr; } }
 
 struct Client final : api::InstallerClient {
     std::wstring installer = kInstallerName;
+    api::Scope scope = api::kScopeUser;
     HRESULT STDMETHODCALLTYPE GetInstallerName(SIZE_T* length, wchar_t* name) override {
         if (!length) return E_INVALIDARG;
         const SIZE_T need = installer.size() + 1;
@@ -85,7 +86,7 @@ struct Client final : api::InstallerClient {
         *length = need;
         return S_OK;
     }
-    api::Scope STDMETHODCALLTYPE GetInstallerScope() override { return api::kScopeUser; }
+    api::Scope STDMETHODCALLTYPE GetInstallerScope() override { return scope; }
     HRESULT STDMETHODCALLTYPE HandleDriverUpdate(api::Installer*) override { return E_NOTIMPL; }
 };
 
@@ -170,7 +171,7 @@ api::Installer* make_installer(api::PFN_GetInterface get, Client& client, api::I
     if (FAILED(hr) || !factory) { *why = "no D3DSCR installer factory (" + hr_text(hr) + ")"; return nullptr; }
     api::Installer* installer = nullptr;
     hr = factory->CreateInstaller(&client, api::kIidInstaller, reinterpret_cast<void**>(&installer));
-    log("[asd] registration: CreateInstaller(user scope) %s", hr_text(hr).c_str());
+    log("[asd] registration: CreateInstaller(%s scope) %s", client.scope == api::kScopeSystem ? "system" : "user", hr_text(hr).c_str());
     if (FAILED(hr) || !installer) { factory->Release(); *why = "CreateInstaller " + hr_text(hr); return nullptr; }
     *factory_out = factory;
     return installer;
@@ -793,6 +794,54 @@ void on_device(ID3D12Device* device) {
         delete job;
         finish_canary(Canary::kFail, "no thread");
     }
+}
+
+// Tools (dlssnr-amd-asd-reg.exe, run elevated once): the same entry at SYSTEM scope for `exe`, the files copied to
+// C:\ProgramData\dlssnr-amd-asd. A packaged game with a system-scope ASD entry of its store (the Xbox app's
+// GRTS-XboxContent-*) is looked up there; one entry per exe is used, by installer name order.
+std::string system_registration(const std::wstring& exe, bool remove_only) {
+    const auto get = api::get_interface();
+    if (!get) return "no D3D12GetInterface";
+    const std::wstring dir = L"C:\\ProgramData\\dlssnr-amd-asd";
+    const std::wstring sodb = dir + L"\\" + g_sodb_name, psdb = dir + L"\\" + g_psdb_name;
+    if (!remove_only) {
+        CreateDirectoryW(dir.c_str(), nullptr);
+        if (!CopyFileW(sodb_path().c_str(), sodb.c_str(), FALSE) || !CopyFileW(psdb_path().c_str(), psdb.c_str(), FALSE))
+            return "copy to " + utf8(dir) + " failed (error " + std::to_string(GetLastError()) + ")";
+    }
+    const Identity id = builtin_identity();
+    std::string why;
+    Client client;
+    client.scope = api::kScopeSystem;
+    api::InstallerFactory* factory = nullptr;
+    api::Installer* installer = make_installer(get, client, &factory, &why);
+    if (!installer) return why + " (run it as administrator)";
+    bool foreign = false;
+    const UINT removed = remove_ours(installer, exe, &foreign, &why);
+    std::string result = "removed " + std::to_string(removed);
+    if (!remove_only) {
+        api::ApplicationDesc desc{};
+        desc.pExeFilename = id.exe.c_str();
+        desc.pName = id.name.c_str();
+        desc.Version.Version = id.version;
+        desc.pEngineName = id.engine.c_str();
+        desc.EngineVersion.Version = id.engine_version;
+        api::Application* app = nullptr;
+        HRESULT hr = installer->RegisterApplication(exe.c_str(), &desc, api::kIidApplication, reinterpret_cast<void**>(&app));
+        result += "; RegisterApplication(system) " + hr_text(hr);
+        if (SUCCEEDED(hr) && app) {
+            const api::PsdbProperties property{g_family.c_str(), psdb.c_str()};
+            api::Component* component = nullptr;
+            hr = app->RegisterComponent(L"default", sodb.c_str(), 1, &property, api::kIidComponent,
+                                        reinterpret_cast<void**>(&component));
+            result += "; RegisterComponent " + hr_text(hr);
+            if (component) component->Release();
+            app->Release();
+        }
+    }
+    installer->Release();
+    factory->Release();
+    return result;
 }
 
 void unregister_async() {
