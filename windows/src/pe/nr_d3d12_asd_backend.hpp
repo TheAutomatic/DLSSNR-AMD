@@ -45,6 +45,7 @@ struct NetTemporal {
     bool depth_inverted = false;
     bool reset = false;
     uint64_t feature = 0;
+    bool have_motion = true;
 };
 
 // What the ACO network becomes on this side: records into the game's list. Both buffers arrive in UNORDERED_ACCESS

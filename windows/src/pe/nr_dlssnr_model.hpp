@@ -114,6 +114,7 @@ struct D3d12BackendFrame {
     float intensity, local_tone, local_structure, skin_structure;
     int automatic_mask;
     int reversible_mode;   // Controls::reversible_mode (proxy_curve)
+    int noise_every_frame;
     // The temporal inputs, as the session's EngineResources takes them (evaluate_d3d12): the motion guide in
     // NON_PIXEL_SHADER_RESOURCE, its subrect (0 extent: the whole texture), MVecScale over the region's extent
     // (normalized_mv_scale), DLSSNR.Reset, the feature (its history).

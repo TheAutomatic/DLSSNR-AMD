@@ -1339,6 +1339,7 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
             frame.skin_structure = c.skin_structure;
             frame.automatic_mask = c.automatic_mask ? 1 : 0;
             frame.reversible_mode = c.reversible_mode;
+            frame.noise_every_frame = c.noise_every_frame ? 1 : 0;
         }
         // The temporal inputs, as the session's resources below take them.
         frame.motion = motion;

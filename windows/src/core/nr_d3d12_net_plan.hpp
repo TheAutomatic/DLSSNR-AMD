@@ -47,6 +47,7 @@ struct D3d12NetControls {
     bool round_u8 = false;         // the output is 8-bit: the alpha pass rounds as the post block would
     uint32_t reversible = 0;       // reversible_of(Controls): part of the input domain a history was made under
     float history_strength = -1.0f;   // Controls::history_strength (< 0: the session's, 1)
+    bool noise_every_frame = false;
 };
 
 // nr_runtime.cpp. The network for a `width` x `height` frame of the installation at `root` (the folder with

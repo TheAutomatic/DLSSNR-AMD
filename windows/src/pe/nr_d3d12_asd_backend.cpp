@@ -153,6 +153,7 @@ struct Backend {
     UINT increment = 0, slot = 0;
     static constexpr UINT kSlots = 2048;   // four a frame: 512 evaluates before one is reused
     ID3D12Resource *lin_in = nullptr, *lin_out = nullptr, *lin_mv = nullptr, *lin_depth = nullptr;
+    ID3D12Resource* neutral_mv = nullptr;
     uint32_t w = 0, h = 0;
     std::unique_ptr<D3d12AsdNetwork> network;
     bool broken = false;   // something of the device's could not be made: the 0.0.8.1 path from now on
@@ -235,14 +236,30 @@ bool build(ID3D12Device* device, std::string* why) {
     const char* nwhy = "";
     if (!g.network->create(device, &nwhy)) { *why = std::string("the network: ") + nwhy; return false; }
     note_network(g.network->name());
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd_mv{};
+    rd_mv.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd_mv.Width = 1; rd_mv.Height = 1; rd_mv.DepthOrArraySize = 1; rd_mv.MipLevels = 1;
+    rd_mv.Format = DXGI_FORMAT_R16G16_FLOAT;
+    rd_mv.SampleDesc.Count = 1;
+    // Neutral (0, 0) motion buffer for no-MV frames: D3D12_HEAP_FLAG_NONE without
+    // D3D12_HEAP_FLAG_CREATE_NOT_ZEROED guarantees zero-initialisation (0.0f, 0.0f).
+    if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd_mv,
+                                               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                               nullptr, IID_PPV_ARGS(&g.neutral_mv)))) {
+        *why = "CreateCommittedResource(neutral_mv) failed"; return false;
+    }
     return true;
 }
 
 void drop_device() {
     retire(g.rs); retire(g.to_linear); retire(g.from_linear); retire(g.to_motion); retire(g.to_depth); retire(g.heap);
     retire(g.lin_in); retire(g.lin_out); retire(g.lin_mv); retire(g.lin_depth);
+    retire(g.neutral_mv);
     g.rs = nullptr; g.to_linear = g.from_linear = g.to_motion = g.to_depth = nullptr; g.heap = nullptr;
     g.lin_in = g.lin_out = g.lin_mv = g.lin_depth = nullptr;
+    g.neutral_mv = nullptr;
     g.w = g.h = 0;
     g.network.reset();
     if (g.device) g.device->Release();
@@ -331,7 +348,6 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
     // Stages of the 0.0.8.1 path this backend does not run yet: that path takes the frame whole.
     if (f.renodx_route) return fallback("the RenoDX route is installed (its stage runs on the 0.0.8.1 path)");
     if (f.preprocess) return fallback("[Preprocess] is active (it runs on the 0.0.8.1 path)");
-    if (!f.motion) return fallback("no motion guide (the runtime's motion estimator is not in this path)");
     const auto color_state = static_cast<D3D12_RESOURCE_STATES>(f.color_state);
     const auto output_state = static_cast<D3D12_RESOURCE_STATES>(f.output_state);
     sweep();
@@ -367,11 +383,22 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
         return fallback("colour or output is not a single-sampled 2D texture");
     const DXGI_FORMAT sf = view_format(sd.Format), df = view_format(dd.Format);
     if (sf == DXGI_FORMAT_UNKNOWN || df == DXGI_FORMAT_UNKNOWN) return fallback("an sRGB colour or output format");
-    const D3D12_RESOURCE_DESC md = f.motion->GetDesc();
-    const DXGI_FORMAT mf = view_format(md.Format);
-    if (md.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || md.SampleDesc.Count != 1 || mf == DXGI_FORMAT_UNKNOWN || !md.Width ||
-        !md.Height)
-        return fallback("the motion guide is not a single-sampled 2D texture");
+    const bool have_motion = f.motion != nullptr;
+    ID3D12Resource* motion_res = f.motion;
+    D3D12_RESOURCE_DESC md{};
+    DXGI_FORMAT mf = DXGI_FORMAT_UNKNOWN;
+    if (have_motion) {
+        md = f.motion->GetDesc();
+        mf = view_format(md.Format);
+        if (md.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || md.SampleDesc.Count != 1 || mf == DXGI_FORMAT_UNKNOWN || !md.Width ||
+            !md.Height)
+            return fallback("the motion guide is not a single-sampled 2D texture");
+    } else {
+        if (!g.neutral_mv) return fallback("the neutral motion texture is missing");
+        motion_res = g.neutral_mv;
+        md = g.neutral_mv->GetDesc();
+        mf = DXGI_FORMAT_R16G16_FLOAT;
+    }
     if (!(dd.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) || !typed_uav(f.device, df))
         return fallback("the output's format has no typed UAV store");
     const uint32_t w = std::min<uint64_t>({f.width, sd.Width, dd.Width}), h = std::min<uint32_t>({f.height, sd.Height, dd.Height});
@@ -413,8 +440,9 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
         nc.round_u8 = df == DXGI_FORMAT_R8G8B8A8_UNORM || df == DXGI_FORMAT_B8G8R8A8_UNORM || df == DXGI_FORMAT_B8G8R8X8_UNORM;
         nc.reversible = f.reversible_mode >= 0 && f.reversible_mode <= 4 ? uint32_t(f.reversible_mode) : 0u;   // reversible_of
         nc.history_strength = f.history_strength;
+        nc.noise_every_frame = f.noise_every_frame != 0;
         g.network->controls(nc);
-        const bool wants_depth = f.depth && !g.network->motion_without_depth();
+        const bool wants_depth = have_motion && f.depth && !g.network->motion_without_depth();
         DXGI_FORMAT depth_view = DXGI_FORMAT_UNKNOWN;
         D3D12_RESOURCE_DESC depth_desc{};
         if (wants_depth) {
@@ -443,13 +471,14 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
         }
         NetTemporal nt;
         nt.motion_va = g.lin_mv->GetGPUVirtualAddress();
-        nt.motion_scale_x = f.motion_scale_x;
-        nt.motion_scale_y = f.motion_scale_y;
+        nt.motion_scale_x = have_motion ? f.motion_scale_x : 1.0f;
+        nt.motion_scale_y = have_motion ? f.motion_scale_y : 1.0f;
         nt.depth_va = have_depth ? g.lin_depth->GetGPUVirtualAddress() : 0;
         nt.have_depth = have_depth;
         nt.depth_inverted = f.depth_inverted != 0;
         nt.reset = f.reset != 0;
         nt.feature = f.feature;
+        nt.have_motion = have_motion;
         g.network->temporal(nt);
     }
     const auto state = nr::pe::split::snapshot(f.cmd);
@@ -482,7 +511,7 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
     D3D12_GPU_DESCRIPTOR_HANDLE gpu_mv = gpu;
     gpu_mv.ptr += UINT64(2) * g.increment;
     srv.Format = mf;
-    f.device->CreateShaderResourceView(f.motion, &srv, cpu_mv);
+    f.device->CreateShaderResourceView(motion_res, &srv, cpu_mv);
     // The depth guide's SRV (to_depth).
     D3D12_GPU_DESCRIPTOR_HANDLE gpu_depth = gpu;
     gpu_depth.ptr += UINT64(3) * g.increment;
@@ -499,11 +528,14 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
     UINT constants[8] = {w, h, debug_tint() ? 1u : 0u, 0u, 0u, 0u, 0u, 0u};
     UINT mv_constants[8] = {w, h, 0u, 0u, 0u, 0u, 0u, 0u};
     UINT depth_constants[8] = {w, h, 0u, 0u, 0u, 0u, 0u, 0u};
-    {
+    if (have_motion) {
         // nr_runtime.cpp's params[8..11] for a guide sampled in place: the subrect's share of the allocation, its base.
         const float mtw = float(md.Width), mth = float(md.Height);
         const float mw = float(f.motion_w ? f.motion_w : uint32_t(md.Width)), mh = float(f.motion_h ? f.motion_h : md.Height);
         const float region[4] = {mw / mtw, mh / mth, float(f.motion_x) / mtw, float(f.motion_y) / mth};
+        std::memcpy(mv_constants + 4, region, sizeof region);
+    } else {
+        const float region[4] = {1.0f, 1.0f, 0.0f, 0.0f};
         std::memcpy(mv_constants + 4, region, sizeof region);
     }
     if (have_depth) {

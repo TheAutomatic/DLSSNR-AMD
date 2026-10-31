@@ -531,7 +531,11 @@ public:
                     auto lru = b->features.end();
                     for (auto it = b->features.begin(); it != b->features.end(); ++it)
                         if (it->second && (lru == b->features.end() || it->second->used < lru->second->used)) lru = it;
-                    if (lru != b->features.end()) { retired_features_.emplace_back(tick_ + 64, std::move(lru->second)); b->features.erase(lru); }
+                    if (lru != b->features.end()) {
+                        plain_seeds_.erase(lru->first);
+                        retired_features_.emplace_back(tick_ + 64, std::move(lru->second));
+                        b->features.erase(lru);
+                    }
                 }
                 auto& fresh = b->features[temporal_.feature];
                 fresh = std::make_shared<FeatureState>();
@@ -544,13 +548,25 @@ public:
             }
         }
         fs->used = tick_;
-        // The gate and the seed, the runtime's rule: the first-frame latch, DLSSNR.Reset, the input domain; the pre
-        // block's seed a counter zeroed by any of them (frames with seed 0 use the precomputed noise field).
-        const bool domain_changed = fs->latch && fs->domain != controls_.reversible;
-        bool gate = fs->latch && !temporal_.reset && !domain_changed;
-        if (!fs->latch || temporal_.reset || domain_changed) fs->seed = 0;
-        fs->domain = controls_.reversible;
-        uint32_t pre_seed = fs->seed++;
+        // The gate and the seed, the runtime's rule (nr_runtime.cpp lines 2420-2440 and 2626-2630):
+        // with motion: the first-frame latch, DLSSNR.Reset, the input domain; the pre block's seed
+        // a counter zeroed by any of them (frames with seed 0 use the precomputed noise field).
+        // without motion: gate is false (no history accumulation); the seed is 0 unless
+        // Controls::noise_every_frame, then a separate per-feature counter across no-MV frames.
+        bool gate = false;
+        uint32_t pre_seed = 0;
+        if (temporal_.have_motion) {
+            const bool domain_changed = fs->latch && fs->domain != controls_.reversible;
+            gate = fs->latch && !temporal_.reset && !domain_changed;
+            if (!fs->latch || temporal_.reset || domain_changed) fs->seed = 0;
+            fs->domain = controls_.reversible;
+            pre_seed = fs->seed++;
+        } else {
+            uint32_t& seed = temporal_.feature ? plain_seeds_[temporal_.feature] : plain_seed_;
+            if (temporal_.reset) seed = 0;
+            if (controls_.noise_every_frame) pre_seed = seed++;
+            else seed = 0;
+        }
         // [D3D12ASD] NetTemporal / NetNoiseEveryFrame (dlssnr-amd-asd.ini, read once; v2.4: default 1 = the runtime's
         // rule above, which the bridge's network (nr_runtime.cpp) runs for a wilsjo2 layer: the history gate and a seed
         // that moves every frame). 0 turns either off - a diagnosis only (v2.3's default, not the cause of the flicker).
@@ -711,10 +727,13 @@ public:
             cmd->EndQuery(queries_, D3D12_QUERY_TYPE_TIMESTAMP, ts * 2 + 1);
             cmd->ResolveQueryData(queries_, D3D12_QUERY_TYPE_TIMESTAMP, ts * 2, 2, stamps_, uint64_t(ts) * 16);
         }
-        // After the frame (record_all): the latch set (reset suppresses consumption, it does not un-write the
-        // history), the post block wrote this frame's history into the other image.
-        fs->latch = true;
-        fs->hcur ^= 1u;
+        // After the frame (record_all): with motion, the latch is set (reset suppresses consumption,
+        // it does not un-write the history), and the post block wrote this frame's history into the other
+        // image (flip hcur). Without motion (temporal == nullptr in 0.0.8.1), latch and hcur are untouched.
+        if (temporal_.have_motion) {
+            fs->latch = true;
+            fs->hcur ^= 1u;
+        }
         ++frames_;
         if (temporal_.reset) ++resets_;
         const double cpu_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count();
@@ -778,6 +797,8 @@ private:
     uint64_t tick_ = 0;
     nr::D3d12NetControls controls_;
     NetTemporal temporal_;
+    uint32_t plain_seed_ = 0;
+    std::map<uint64_t, uint32_t> plain_seeds_;
     ID3D12QueryHeap* queries_ = nullptr;
     ID3D12Resource* stamps_ = nullptr;
     uint8_t* stamps_map_ = nullptr;

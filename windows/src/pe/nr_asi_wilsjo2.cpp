@@ -686,6 +686,7 @@ std::string native_refusal(ID3D12GraphicsCommandList* cmd, ID3D12Device* device,
     if (w2::fast_requested(s)) return "Passes (fast) is not on the D3D12 route (ASD)";
     if (nr::dlssnr::preprocess_settings().active()) return "[Preprocess] is on (its network calls are not ASD's)";
     const auto readable = [](ID3D12Resource* r, const char* what) -> std::string {
+        if (!r) return std::string("the ") + what + " is missing";
         const D3D12_RESOURCE_DESC d = r->GetDesc();
         if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.SampleDesc.Count != 1)
             return std::string("the ") + what + " is not a single-sample 2-D texture";
