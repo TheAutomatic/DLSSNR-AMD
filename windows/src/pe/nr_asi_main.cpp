@@ -2270,7 +2270,17 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top) {
 // picture at the system's Present - logs the mean of a 256x256 block in the middle of the picture (the queue waits for
 // each probe). A black screen shows which step lost the picture.
 uint32_t present_probe_budget() {
-    static const uint32_t n = [] { char b[16] = {}; return GetEnvironmentVariableA("NR_DEBUG_PRESENT_PROBE", b, 16) ? uint32_t(std::strtoul(b, nullptr, 10)) : 0u; }();
+    // v2.5: also [D3D12ASD] PresentProbe = <presents> in dlssnr-amd-asd.ini (default 0), for the W2Native A/B at the frame
+    // level without an environment variable (each probed Present waits for the GPU: a diagnosis only)
+    static const uint32_t n = [] {
+        char b[16] = {};
+        if (GetEnvironmentVariableA("NR_DEBUG_PRESENT_PROBE", b, 16)) return uint32_t(std::strtoul(b, nullptr, 10));
+        if (!nr::pe::asd::enabled()) return 0u;
+        const std::wstring ini = nr::pe::asd::folder() + L"\\dlssnr-amd-asd.ini";
+        const uint32_t k = uint32_t(GetPrivateProfileIntW(L"D3D12ASD", L"PresentProbe", 0, ini.c_str()));
+        if (k) log("[nr] debug present probe: %u Presents (PresentProbe, dlssnr-amd-asd.ini)", k);
+        return k;
+    }();
     return n;
 }
 void probe_present(ID3D12CommandQueue* queue, ID3D12Resource* res, D3D12_RESOURCE_STATES state, const char* step,
@@ -2343,7 +2353,8 @@ void probe_present(ID3D12CommandQueue* queue, ID3D12Resource* res, D3D12_RESOURC
         else bits = sign | ((exp + 112) << 23) | (man << 13);
         float f; std::memcpy(&f, &bits, 4); return f;
     };
-    double sum[3] = {}, zero = 0;
+    double sum[3] = {}, zero = 0, detail = 0;   // detail: mean |luma(x) - luma(x+1)| (NR lowers it: its trace on a frame)
+    float prev_luma = 0.f;
     for (uint32_t y = 0; y < bh; ++y)
         for (uint32_t x = 0; x < bw; ++x) {
             const uint8_t* p = m + size_t(y) * fp.Footprint.RowPitch + size_t(x) * bpp;
@@ -2359,13 +2370,17 @@ void probe_present(ID3D12CommandQueue* queue, ID3D12Resource* res, D3D12_RESOURC
             }
             for (int k = 0; k < 3; ++k) sum[k] += c[k];
             if (c[0] == 0.f && c[1] == 0.f && c[2] == 0.f) ++zero;
+            const float luma = 0.2126f * c[0] + 0.7152f * c[1] + 0.0722f * c[2];
+            if (x) detail += std::fabs(double(luma) - double(prev_luma));
+            prev_luma = luma;
         }
     D3D12_RANGE none{0, 0};
     readback->Unmap(0, &none);
     const double n = double(bw) * bh;
-    log("[nr] debug present probe %llu %s: %ux%u format %u, queue type %d; middle block mean %.4f %.4f %.4f, %.1f%% black",
+    log("[nr] debug present probe %llu %s: %ux%u format %u, queue type %d; middle block mean %.4f %.4f %.4f, %.1f%% black, "
+        "detail %.5f (res %p)",
         (unsigned long long)present, step, unsigned(d.Width), d.Height, unsigned(d.Format), int(qd.Type), sum[0] / n,
-        sum[1] / n, sum[2] / n, 100.0 * zero / n);
+        sum[1] / n, sum[2] / n, 100.0 * zero / n, bw > 1 ? detail / (double(bw - 1) * bh) : 0.0, static_cast<void*>(res));
 }
 
 // A probe of the swap chain's current back buffer (NR_DEBUG_PRESENT_PROBE), in the state it has between Presents; never
@@ -2767,6 +2782,24 @@ void game_present_before(IDXGISwapChain* sc) {
         if (g_present.wanted.load()) {   // v2.4: the routes line's game Presents, and those NR's work did not reach
             nr::dlssnr::note_route(nr::dlssnr::kRoutePresentGame);
             if (g_present_nr_lists.load() == lists_before) nr::dlssnr::note_route(nr::dlssnr::kRoutePresentGameNoNr);
+            {   // v2.5: the game Presents one by one once frame generation is seen (24 lines, once): its thread, the back
+                // buffer it hands, whether NR's work went into it, the gap - which of the two a game frame has gets NR
+                static int left = -1;
+                static ULONGLONG last_us = 0;
+                const ULONGLONG now_us = pacing_us();
+                if (left < 0 && g_present.multiplier > 1) left = 24;
+                if (left > 0) {
+                    --left;
+                    UINT index = ~0u;
+                    IDXGISwapChain3* sc3 = nullptr;
+                    if (SUCCEEDED(sc->QueryInterface(IID_PPV_ARGS(&sc3))) && sc3) { index = sc3->GetCurrentBackBufferIndex(); sc3->Release(); }
+                    log("[nr] game Present (frame generation %ux): thread %lu, back buffer %u, NR %s, %.1f ms after the last",
+                        g_present.multiplier, GetCurrentThreadId(), index,
+                        g_present_nr_lists.load() == lists_before ? "not run on it" : "ran on it",
+                        last_us ? double(now_us - last_us) / 1000.0 : 0.0);
+                }
+                last_us = now_us;
+            }
         }
         if (probing) probe_back(sc, queue, "the game's swap chain, after the layers", probe);
         g_present.top_ms = GetTickCount64();
