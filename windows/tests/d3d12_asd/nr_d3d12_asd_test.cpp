@@ -17,6 +17,7 @@
 
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -64,7 +65,28 @@ bool wait_for(bool (*done)(), int ms) {
 bool registration_done() { return asd::status().registration != "not run"; }
 bool canary_done() { const auto c = asd::canary(); return c != asd::Canary::kNotRun && c != asd::Canary::kRunning; }
 
+// NR_TEST_DEBUG=1: the D3D12 debug layer on, and its messages (the runtime's shader cache / PSDB lines) printed.
+bool debug_on() { const char* e = std::getenv("NR_TEST_DEBUG"); return e && *e == '1'; }
+void dump_messages(ID3D12Device* d) {
+    ID3D12InfoQueue* q = nullptr;
+    if (!d || FAILED(d->QueryInterface(IID_PPV_ARGS(&q))) || !q) { log("[test] debug: no info queue"); return; }
+    const UINT64 n = q->GetNumStoredMessages();
+    log("[test] debug: %llu message(s)", (unsigned long long)n);
+    for (UINT64 i = 0; i < n; ++i) {
+        SIZE_T len = 0;
+        q->GetMessage(i, nullptr, &len);
+        std::vector<char> b(len);
+        auto* m = reinterpret_cast<D3D12_MESSAGE*>(b.data());
+        if (SUCCEEDED(q->GetMessage(i, m, &len))) log("[test] debug %d/%d: %s", int(m->Severity), int(m->ID), m->pDescription);
+    }
+    q->Release();
+}
 ID3D12Device* make_device() {
+    if (debug_on()) {
+        ID3D12Debug* dbg = nullptr;
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg))) && dbg) { dbg->EnableDebugLayer(); dbg->Release(); log("[test] debug layer on"); }
+        else log("[test] debug layer not available");
+    }
     ID3D12Device* d = nullptr;
     const HRESULT hr = D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&d));
     log("[test] D3D12CreateDevice 0x%08lX", static_cast<unsigned long>(hr));
@@ -246,6 +268,7 @@ int main(int argc, char** argv) {
         log("[test] no ASD_HIT: the backend must decline (%s)", asd::evaluate_backend(fr) ? "it RAN" : "declined");
         rc = 1;
     }
+    if (debug_on()) dump_messages(device);
     device->Release();
     log("[test] RESULT %s %d", asd::canary_name(asd::canary()), rc);
     return rc;

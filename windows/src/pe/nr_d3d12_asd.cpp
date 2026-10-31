@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <vector>
 
 namespace nr::pe::asd {
@@ -74,12 +75,13 @@ bool under_folder(const wchar_t* path) {
 template <class T> void release(T*& p) { if (p) { p->Release(); p = nullptr; } }
 
 struct Client final : api::InstallerClient {
+    std::wstring installer = kInstallerName;
     HRESULT STDMETHODCALLTYPE GetInstallerName(SIZE_T* length, wchar_t* name) override {
         if (!length) return E_INVALIDARG;
-        const SIZE_T need = sizeof kInstallerName / sizeof kInstallerName[0];
+        const SIZE_T need = installer.size() + 1;
         if (!name) { *length = need; return S_OK; }
         if (*length < need) return E_INVALIDARG;
-        std::memcpy(name, kInstallerName, sizeof kInstallerName);
+        std::memcpy(name, installer.c_str(), need * sizeof(wchar_t));
         *length = need;
         return S_OK;
     }
@@ -126,7 +128,8 @@ api::StateObjectDatabase* open_sodb(api::PFN_GetInterface get, std::string* why)
 // Earlier registrations of this exe that are ours (by our installer's name, or a component whose SODB is in our
 // folder) are removed; one of another installer's (a store's own ASD for the game) is left as it is, and then nothing
 // is registered over it. Returns the number removed; `foreign` set when such an entry is there.
-UINT remove_ours(api::Installer* installer, const std::wstring& exe, bool* foreign, std::string* why) {
+UINT remove_ours(api::Installer* installer, const std::wstring& exe, bool* foreign, std::string* why,
+                 const wchar_t* mine = kInstallerName) {
     UINT removed = 0;
     *foreign = false;
     for (UINT i = installer->GetApplicationCount(); i-- > 0;) {
@@ -136,7 +139,7 @@ UINT remove_ours(api::Installer* installer, const std::wstring& exe, bool* forei
         if (FAILED(app->GetExePath(&path)) || !path || !same_path(path, exe)) { app->Release(); continue; }
         bool ours = false;
         const wchar_t* by = nullptr;
-        if (SUCCEEDED(app->GetInstallerName(&by)) && by && std::wcscmp(by, kInstallerName) == 0) ours = true;
+        if (SUCCEEDED(app->GetInstallerName(&by)) && by && (std::wcscmp(by, mine) == 0 || std::wcsncmp(by, kInstallerName, 14) == 0)) ours = true;
         for (UINT c = 0, n = app->GetComponentCount(); !ours && c < n; ++c) {
             api::Component* comp = nullptr;
             if (FAILED(app->GetComponent(c, api::kIidComponent, reinterpret_cast<void**>(&comp))) || !comp) continue;
@@ -185,6 +188,44 @@ DWORD WINAPI registration_thread(void*) {
     }
     return registration_work();
 }
+// The diagnostic options of the M5 v2 package ([D3D12ASD] in the ini):
+//   CopyToLocal = 1 (default): the SODB and PSDB copied to %LOCALAPPDATA%\dlssnr-amd-asd and registered from there
+//                (not from the game's folder: a WindowsApps/XboxGames folder may not be readable where the runtime reads it)
+//   ExePath = both (default) | module | final: the exe path registered - GetModuleFileNameW's (C:\Program Files\WindowsApps\...
+//             for a store game), the final path of the exe's file (C:\XboxGames\...\Content\..., the path the Xbox app's
+//             own ASD entry uses), or both (one entry each, under installer DLSSNR-AMD-ASD and DLSSNR-AMD-ASD-FINAL)
+//   RemoveFirst = 1 (default): earlier entries of ours for the exe removed before registering; 0 registers over them
+std::wstring final_exe_path() {
+    const std::wstring exe = exe_path();
+    HANDLE f = CreateFileW(exe.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                           FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return exe;
+    std::wstring p(32768, L'\0');
+    const DWORD n = GetFinalPathNameByHandleW(f, p.data(), DWORD(p.size()), FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    CloseHandle(f);
+    if (!n || n >= p.size()) return exe;
+    p.resize(n);
+    if (p.rfind(L"\\\\?\\UNC\\", 0) == 0) p = L"\\" + p.substr(7);
+    else if (p.rfind(L"\\\\?\\", 0) == 0) p = p.substr(4);
+    return p;
+}
+bool copy_to_local(std::wstring* sodb, std::wstring* psdb) {
+    wchar_t base[MAX_PATH] = L"";
+    if (!GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH)) return false;
+    const std::wstring dir = std::wstring(base) + L"\\dlssnr-amd-asd";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    const std::wstring s2 = dir + L"\\" + g_sodb_name, p2 = dir + L"\\" + g_psdb_name;
+    const BOOL a = CopyFileW(sodb_path().c_str(), s2.c_str(), FALSE), b = CopyFileW(psdb_path().c_str(), p2.c_str(), FALSE);
+    log("[asd] registration: CopyToLocal: %s -> %s (%s), %s -> %s (%s)", utf8(sodb_path()).c_str(), utf8(s2).c_str(),
+        a ? "ok" : ("error " + std::to_string(GetLastError())).c_str(), utf8(psdb_path()).c_str(), utf8(p2).c_str(),
+        b ? "ok" : "error");
+    if (!a || !b) return false;
+    *sodb = s2;
+    *psdb = p2;
+    return true;
+}
+std::string register_one(api::PFN_GetInterface get, const wchar_t* installer_name, const std::wstring& exe,
+                         const std::wstring& sodb, const std::wstring& psdb, bool remove_first, bool core_loaded);
 DWORD registration_work() {
     const std::wstring exe = exe_path();
     const bool d3d12_loaded = GetModuleHandleW(L"d3d12.dll") != nullptr;
@@ -216,13 +257,36 @@ DWORD registration_work() {
                 "will not be found", utf8(sodb_id.exe).c_str(), utf8(sodb_id.name).c_str());
     }
 
+    std::wstring sodb = sodb_path(), psdb = psdb_path();
+    if (GetPrivateProfileIntW(L"D3D12ASD", L"CopyToLocal", 1, g_ini.c_str()) == 1 && !copy_to_local(&sodb, &psdb))
+        log("[asd] registration: CopyToLocal failed: the game folder's files are registered");
+    const std::wstring mode = ini_string(L"ExePath", L"both");
+    const bool remove_first = GetPrivateProfileIntW(L"D3D12ASD", L"RemoveFirst", 1, g_ini.c_str()) != 0;
+    const std::wstring final_exe = final_exe_path();
+    log("[asd] registration: ExePath = %s, RemoveFirst = %d; module path %s, final path %s", utf8(mode).c_str(),
+        remove_first ? 1 : 0, utf8(exe).c_str(), utf8(final_exe).c_str());
+    std::string result;
+    if (mode != L"final") result = register_one(get, kInstallerName, exe, sodb, psdb, remove_first, core_loaded);
+    if (mode == L"final" || (mode == L"both" && !same_path(final_exe.c_str(), exe))) {
+        const std::string r2 = register_one(get, L"DLSSNR-AMD-ASD-FINAL", final_exe, sodb, psdb, remove_first, core_loaded);
+        result = result.empty() ? r2 : result + " | final path: " + r2;
+    }
+    set_registration(result);
+    return 0;
+}
+std::string register_one(api::PFN_GetInterface get, const wchar_t* installer_name, const std::wstring& exe,
+                         const std::wstring& sodb, const std::wstring& psdb, bool remove_first, bool core_loaded) {
+    const Identity id = builtin_identity();
+    std::string why;
+    log("[asd] registration: installer %s, exe %s", utf8(installer_name).c_str(), utf8(exe).c_str());
     Client client;   // outlives the installer
+    client.installer = installer_name;
     api::InstallerFactory* factory = nullptr;
     api::Installer* installer = make_installer(get, client, &factory, &why);
-    if (!installer) { set_registration("not registered: " + why); return 0; }
+    if (!installer) return "not registered: " + why;
     const UINT before = installer->GetApplicationCount();
     bool foreign = false;
-    const UINT removed = remove_ours(installer, exe, &foreign, &why);
+    const UINT removed = remove_first ? remove_ours(installer, exe, &foreign, &why, installer_name) : 0;
     std::string result;
     if (foreign) {
         result = "not registered: this exe has an ASD entry of another installer (left as it is)";
@@ -256,7 +320,6 @@ DWORD registration_work() {
             if (!reported)
                 log("[asd] registration: the system reports no target %s (the PSDB's family): expect ASD_MISS",
                     utf8(g_family).c_str());
-            const std::wstring sodb = sodb_path(), psdb = psdb_path();
             const api::PsdbProperties property{g_family.c_str(), psdb.c_str()};
             api::Component* component = nullptr;
             hr = app->RegisterComponent(L"default", sodb.c_str(), 1, &property, api::kIidComponent,
@@ -282,8 +345,7 @@ DWORD registration_work() {
     char counts[96];
     std::snprintf(counts, sizeof counts, "; apps %u -> %u, %u earlier entr%s removed", before, after, removed,
                   removed == 1 ? "y" : "ies");
-    set_registration(result + counts);
-    return 0;
+    return result + counts;
 }
 
 DWORD WINAPI unregister_thread(void*) {
@@ -292,15 +354,22 @@ DWORD WINAPI unregister_thread(void*) {
     std::lock_guard<std::mutex> installer_lock(g_installer_lock);
     const auto get = api::get_interface();
     if (!get) { set_registration("unregister: d3d12.dll has no D3D12GetInterface"); return 0; }
-    Client client;
-    api::InstallerFactory* factory = nullptr;
     std::string why;
-    api::Installer* installer = make_installer(get, client, &factory, &why);
-    if (!installer) { set_registration("unregister: " + why); return 0; }
     bool foreign = false;
-    const UINT removed = remove_ours(installer, exe_path(), &foreign, &why);
-    installer->Release();
-    factory->Release();
+    UINT removed = 0;
+    for (const wchar_t* name : {kInstallerName, L"DLSSNR-AMD-ASD-FINAL"}) {
+        Client client;
+        client.installer = name;
+        api::InstallerFactory* factory = nullptr;
+        api::Installer* installer = make_installer(get, client, &factory, &why);
+        if (!installer) { set_registration("unregister: " + why); return 0; }
+        bool f = false;
+        removed += remove_ours(installer, exe_path(), &f, &why, name);
+        if (final_exe_path() != exe_path()) removed += remove_ours(installer, final_exe_path(), &f, &why, name);
+        foreign |= f;
+        installer->Release();
+        factory->Release();
+    }
     char line[160];
     std::snprintf(line, sizeof line, "unregistered (%u entr%s removed; Register = 0: no launch registers again)%s", removed,
                   removed == 1 ? "y" : "ies", foreign ? "; another installer's entry left as it is" : "");
@@ -416,6 +485,107 @@ bool sodb_pipeline(const char* key, std::vector<uint8_t>* root, std::vector<uint
 }
 
 namespace {
+
+// Diagnostics, logged once before the canary (all public APIs): this process's package identity, the D3D12Core.dll in
+// use, whether the PSDB and SODB can be read by this process, and the registration the D3DSCR explorer finds for this
+// exe - the entry the runtime goes by (its installer and PSDB paths), or none.
+std::string module_path(const wchar_t* name) {
+    HMODULE m = GetModuleHandleW(name);
+    if (!m) return "not loaded";
+    std::wstring p(32768, L'\0');
+    p.resize(GetModuleFileNameW(m, p.data(), DWORD(p.size())));
+    return utf8(p);
+}
+#ifndef APPMODEL_ERROR_NO_PACKAGE
+#define APPMODEL_ERROR_NO_PACKAGE 15700L
+#endif
+std::string package_name() {
+    using Fn = LONG(WINAPI*)(UINT32*, PWSTR);
+    auto fn = reinterpret_cast<Fn>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetCurrentPackageFullName")));
+    if (!fn) return "unknown (no GetCurrentPackageFullName)";
+    UINT32 n = 0;
+    LONG r = fn(&n, nullptr);
+    if (r == APPMODEL_ERROR_NO_PACKAGE) return "none (not a packaged process)";
+    std::wstring w(n, L'\0');
+    r = fn(&n, w.data());
+    if (r != ERROR_SUCCESS) return "unknown (error " + std::to_string(r) + ")";
+    w.resize(n ? n - 1 : 0);
+    return utf8(w);
+}
+std::string readable(const std::wstring& path) {
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return "NOT readable (error " + std::to_string(GetLastError()) + ")";
+    char b[16];
+    DWORD got = 0;
+    const BOOL ok = ReadFile(f, b, sizeof b, &got, nullptr);
+    LARGE_INTEGER size{};
+    GetFileSizeEx(f, &size);
+    CloseHandle(f);
+    return ok && got ? "readable (" + std::to_string(size.QuadPart) + " bytes)" : "opened, read failed";
+}
+void log_lookup(ID3D12Device* device) {
+    log("[asd] diag: package identity: %s", package_name().c_str());
+    log("[asd] diag: D3D12Core.dll in use: %s; d3d12.dll: %s", module_path(L"D3D12Core.dll").c_str(),
+        module_path(L"d3d12.dll").c_str());
+    log("[asd] diag: PSDB %s: %s", utf8(psdb_path()).c_str(), readable(psdb_path()).c_str());
+    log("[asd] diag: SODB %s: %s", utf8(sodb_path()).c_str(), readable(sodb_path()).c_str());
+    {
+        wchar_t base[MAX_PATH] = L"";
+        if (GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH)) {
+            const std::wstring p2 = std::wstring(base) + L"\\dlssnr-amd-asd\\" + g_psdb_name;
+            log("[asd] diag: local PSDB %s: %s", utf8(p2).c_str(), readable(p2).c_str());
+        }
+    }
+    const auto get = api::get_interface();
+    if (!get) return;
+    api::InstallerFactory* factory = nullptr;
+    HRESULT hr = get(api::kClsidInstallerFactory, api::kIidInstallerFactory, reinterpret_cast<void**>(&factory));
+    if (FAILED(hr) || !factory) { log("[asd] diag: no D3DSCR factory %s", hr_text(hr).c_str()); return; }
+    api::Explorer* explorer = nullptr;
+    hr = factory->CreateExplorer(device, api::kIidExplorer, reinterpret_cast<void**>(&explorer));
+    if (FAILED(hr) || !explorer) {
+        log("[asd] diag: CreateExplorer(device) %s", hr_text(hr).c_str());
+        hr = factory->CreateExplorer(nullptr, api::kIidExplorer, reinterpret_cast<void**>(&explorer));
+    }
+    log("[asd] diag: CreateExplorer %s", hr_text(hr).c_str());
+    if (SUCCEEDED(hr) && explorer) {
+        const std::wstring exe = exe_path();
+        api::Application* app = nullptr;
+        hr = explorer->GetApplicationFromExePath(exe.c_str(), api::kIidApplication, reinterpret_cast<void**>(&app));
+        log("[asd] diag: explorer GetApplicationFromExePath(%s) %s", utf8(exe).c_str(), hr_text(hr).c_str());
+        if (SUCCEEDED(hr) && app) {
+            const wchar_t *by = nullptr, *path = nullptr;
+            app->GetInstallerName(&by);
+            app->GetExePath(&path);
+            api::ApplicationDesc d{};
+            app->GetDesc(&d);
+            log("[asd] diag: the runtime's entry for this exe: installer \"%s\", exe path %s, app \"%s\" (exe name \"%s\")",
+                by ? utf8(by).c_str() : "?", path ? utf8(path).c_str() : "?", d.pName ? utf8(d.pName).c_str() : "?",
+                d.pExeFilename ? utf8(d.pExeFilename).c_str() : "?");
+            for (UINT c = 0, n = app->GetComponentCount(); c < n; ++c) {
+                api::Component* comp = nullptr;
+                if (FAILED(app->GetComponent(c, api::kIidComponent, reinterpret_cast<void**>(&comp))) || !comp) continue;
+                const wchar_t *cn = nullptr, *sodb = nullptr;
+                comp->GetComponentName(&cn);
+                comp->GetStateObjectDatabasePath(&sodb);
+                const UINT np = comp->GetPrecompiledShaderDatabaseCount();
+                std::vector<api::PsdbProperties> ps(np);
+                if (np) comp->GetPrecompiledShaderDatabases(np, ps.data());
+                log("[asd] diag:   component \"%s\", SODB %s, %u PSDB(s)", cn ? utf8(cn).c_str() : "?",
+                    sodb ? utf8(sodb).c_str() : "", np);
+                for (const auto& x : ps)
+                    log("[asd] diag:     %s: %s", x.pAdapterFamily ? utf8(x.pAdapterFamily).c_str() : "?",
+                        x.pPsdbPath ? utf8(x.pPsdbPath).c_str() : "?");
+                comp->Release();
+            }
+            app->Release();
+        }
+        explorer->Release();
+    }
+    factory->Release();
+}
+
 struct CanaryJob { ID3D12Device* device; ID3D12CommandQueue* queue; };
 void finish_canary(Canary c, const std::string& line) {
     { std::lock_guard<std::mutex> g(g_lock); g_canary_line = std::string(canary_name(c)) + ": " + line; }
@@ -428,6 +598,7 @@ DWORD WINAPI canary_thread(void* p) {
     CanaryJob job = *static_cast<CanaryJob*>(p);
     delete static_cast<CanaryJob*>(p);
     ID3D12Device* device = job.device;
+    log_lookup(device);
     // The pipeline exactly as stored in the SODB (its serialized root signature and DXIL, built into the ASI: no SODB
     // reader needed, as asd_probe's --execute in the M1 615/in-box runs): the runtime looks the PSDB up by this desc.
     Pipeline pl;
