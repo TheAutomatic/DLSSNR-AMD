@@ -287,6 +287,7 @@ private:
         const double ms = double(t[1] - t[0]) * 1000.0 / hz_;
         if (ms > 1000.0) return;   // not (yet) a pair of this run's
         ++n_; sum_ += ms;
+        nr::dlssnr::note_native_ms(float(ms));   // v2.2: NR Control's line
         min_ = n_ - n_base_ == 1 ? ms : std::min(min_, ms);
         max_ = std::max(max_, ms);
         if (n_ <= 3)
@@ -722,6 +723,7 @@ bool wilsjo2_run(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, Wilsjo2Ow
             const std::string why = native_refusal(cmd, device, o, f, s, target, w, h, &nstage, &nimpl);
             if (!why.empty()) {
                 if (nr::pe::asd::enabled()) native::say_route("the Vulkan bridge (the 0.0.8.1 route) for now: " + why);
+                nr::dlssnr::note_route(nr::dlssnr::kRouteNativeBridged);   // v2.2: the routes' counts
                 return run_bridged(cmd, device, o, f, s, target, w, h, before_upscale);
             }
             native::say_route(std::string("on the D3D12 route (canary ") + nr::pe::asd::canary_name(nr::pe::asd::canary()) +
@@ -805,6 +807,7 @@ bool wilsjo2_run(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, Wilsjo2Ow
     native::g_timing.begin(device, cmd, w, h);
     const bool ran = w2::flow_run(io, o.flow, ff, s, uint64_t(format));
     native::g_timing.end(cmd);
+    nr::dlssnr::note_route(ran ? nr::dlssnr::kRouteNativeRan : nr::dlssnr::kRouteNativePassed);
     if (ran && o.vk) {   // the bridge's own surfaces of this owner, no longer used
         wilsjo2_vk_release(o.vk);
         o.vk = nullptr;

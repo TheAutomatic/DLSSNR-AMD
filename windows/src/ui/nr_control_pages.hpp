@@ -398,6 +398,10 @@ inline void draw_layer_status(const nr::control::Shared* s) {
 // [Network] OSD's text (the caller's window around it): while a switch builds, its progress; NR off; a line a layer
 // (`mode` 3, cost: with each layer's GPU time split into the network and the processing around it, and the sums);
 // else the running network.
+// v2.2: the network runs as ACO through ASD on the game's D3D12 device (the model's report: aco_why "via ASD, ...")
+inline bool osd_via_asd(const nr::control::Shared* s) {
+    return s->aco_state == 1 && std::strncmp(s->aco_why, "via ASD", 7) == 0;
+}
 inline bool osd_switching(const nr::control::Shared* s) {
     return s->building && s->building_net < nr::control::kNoNet && s->building_net != s->net_running;
 }
@@ -475,6 +479,7 @@ inline void draw_osd_lines(const nr::control::Shared* s, int mode) {
     } else {
         ImGui::Text(tr("NR: %s"), nr::network_codename(int(s->net_running)));
     }
+    if (osd_via_asd(s)) ImGui::TextUnformatted(tr("NR: ACO via ASD, active"));   // v2.2: the native D3D12 ASD backend runs
 }
 
 // ---- the menus' frame (NR Control and the Add-ons page): the bar of facts, the sidebar's foot, NR's cost ----------
