@@ -97,6 +97,22 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* feature, void* param
 
 void release_d3d12(Feature* feature);
 
+// A backend that can take the evaluate's frame instead of everything evaluate_d3d12 does after NR Control is installed
+// (the .asi's native D3D12 ASD backend, nr_d3d12_asd_backend.cpp; no other build sets one). True: it recorded the frame
+// (colour -> output); false: nothing was recorded and evaluate_d3d12 goes on as without it. Colour and output are the
+// same resource (in UNORDERED_ACCESS) on the RenoDX route's direct frame.
+struct D3d12BackendFrame {
+    ID3D12Device* device;
+    ID3D12GraphicsCommandList* cmd;
+    ID3D12Resource* color;
+    int color_state;    // D3D12_RESOURCE_STATES (this header has no d3d12.h)
+    ID3D12Resource* output;
+    int output_state;   // D3D12_RESOURCE_STATES
+    unsigned int width, height;
+};
+using D3d12Backend = bool (*)(const D3d12BackendFrame& frame);
+void set_d3d12_backend(D3d12Backend backend);
+
 // The frame's keys, once a frame: [RenoDX] NRToggleKey (NR on / off for this run) and the screenshot keys. True while NR
 // is on. The OptiScaler route's evaluate does it itself; the .asi's NR chain calls it once before its layers.
 bool frame_keys();

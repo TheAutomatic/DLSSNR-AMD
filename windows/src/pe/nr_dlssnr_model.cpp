@@ -36,6 +36,7 @@
 #include "nr_pe_vkdevice.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <map>
 #include <cmath>
 #include <cstdint>
@@ -81,6 +82,7 @@ struct Feature {
 namespace {
 
 std::mutex g_lock;
+std::atomic<D3d12Backend> g_d3d12_backend{nullptr};   // set_d3d12_backend
 
 // One session for the whole process per API, not one per NGX feature. A feature here is a handle and
 // a set of controls; the expensive thing -- the device, the queue and a ~300 MB weight upload -- is
@@ -1245,6 +1247,25 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
     }
     nr::pe::menu::install();   // NR Control (End), once per process
 
+    // The .asi's native D3D12 ASD backend, when one is set (off: never set, and this is 0.0.8.1 as it was).
+    if (D3d12Backend backend = g_d3d12_backend.load()) {
+        auto* direct = nr::pe::renodx_route::installed() ? static_cast<ID3D12Resource*>(nr::pe::renodx_route::direct())
+                                                         : nullptr;
+        D3d12BackendFrame frame{};
+        frame.device = device;
+        frame.cmd = cmd;
+        frame.color = direct ? direct : color;
+        frame.color_state = int(direct ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        frame.output = direct ? direct : output;
+        frame.output_state = int(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        frame.width = width;
+        frame.height = height;
+        if (backend(frame)) {
+            device->Release();
+            return static_cast<int>(NVSDK_NGX_Result_Success);
+        }
+    }
+
     // NR_DEBUG_READBACK=1: which evaluate this is, and the pair the previous one recorded.
     //
     // The drain has to come first, before anything is recorded into this list, because the pair is
@@ -1994,5 +2015,7 @@ void layer_changed(int layer) {
     if (g_d3d12_session) g_d3d12_session->reset_layer_timing(layer);
     if (g_vk_session) g_vk_session->reset_layer_timing(layer);
 }
+
+void set_d3d12_backend(D3d12Backend backend) { g_d3d12_backend = backend; }
 
 }  // namespace nr::dlssnr
