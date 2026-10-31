@@ -36,6 +36,7 @@ bool enabled();
 // The game's device, from the evaluate (every call; the first one starts the canary on a thread of ours).
 void on_device(ID3D12Device* device);
 Canary canary();
+bool diagnostics_done();   // v4: the canary thread (fresh-device canaries included) has finished
 
 // NR Control: the registration removed (on a thread) and Register = 0 written, so no launch registers again; Enabled
 // written (takes effect at the next launch: the registration has to come before the game's device).

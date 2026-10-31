@@ -285,6 +285,8 @@ int main(int argc, char** argv) {
         log("[test] no ASD_HIT: the backend must decline (%s)", asd::evaluate_backend(fr) ? "it RAN" : "declined");
         rc = 1;
     }
+    // v4: the canary thread's fresh-device diagnostics run on after the game's canary; wait for them before exiting.
+    if (!wait_for(&asd::diagnostics_done, 60000)) log("[test] the fresh-device diagnostics did not finish in 60 s");
     if (debug_on()) dump_messages(device);
     device->Release();
     log("[test] RESULT %s %d", asd::canary_name(asd::canary()), rc);
