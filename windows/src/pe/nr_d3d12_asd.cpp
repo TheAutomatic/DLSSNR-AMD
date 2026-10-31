@@ -1075,6 +1075,40 @@ std::string system_registration(const std::wstring& exe, bool remove_only, const
     return result;
 }
 
+// Tools (v5 finding): the precompile targets the system reports for an application identity (exe file name, name),
+// read only - an installer is made and released, nothing registered. Shows whether the driver gives that exe an
+// application profile version of its own.
+std::string precompile_targets(const std::wstring& exe_name, const std::wstring& name) {
+    const auto get = api::get_interface();
+    if (!get) return "no D3D12GetInterface";
+    std::string why;
+    Client client;
+    api::InstallerFactory* factory = nullptr;
+    api::Installer* installer = make_installer(get, client, &factory, &why);
+    if (!installer) return why;
+    const Identity id = builtin_identity();
+    api::ApplicationDesc desc{};
+    desc.pExeFilename = exe_name.c_str();
+    desc.pName = name.c_str();
+    desc.Version.Version = id.version;
+    desc.pEngineName = id.engine.c_str();
+    desc.EngineVersion.Version = id.engine_version;
+    const UINT max = installer->GetMaxPrecompileTargetCount();
+    std::vector<api::CompilerProperties> t(max ? max : 1);
+    UINT n = UINT(t.size());
+    const HRESULT hr = installer->GetPrecompileTargets(&desc, &n, t.data(), api::kTargetNone);
+    std::string r = "exe \"" + utf8(exe_name) + "\" name \"" + utf8(name) + "\": GetPrecompileTargets " + hr_text(hr);
+    for (UINT i = 0; SUCCEEDED(hr) && i < n && i < t.size(); ++i) {
+        char b[160];
+        std::snprintf(b, sizeof b, "; %s compiler 0x%016llX app profile 0x%016llX", utf8(t[i].szAdapterFamily).c_str(),
+                      (unsigned long long)t[i].CompilerVersion.Version, (unsigned long long)t[i].ApplicationProfileVersion.Version);
+        r += b;
+    }
+    installer->Release();
+    factory->Release();
+    return r;
+}
+
 void unregister_async() {
     if (g_ini.empty()) return;
     if (HANDLE t = CreateThread(nullptr, 0, &unregister_thread, nullptr, 0, nullptr)) CloseHandle(t);

@@ -63,6 +63,7 @@ bool debug_tint();
 void draw_panel();
 // Tools/tests: a pipeline's serialized root signature and DXIL as stored in the SODB under `key` (needs a runtime with
 // the SODB reader, Agility 1.619+; the ASI itself does not use it). Makes nr_d3d12_asd_canary_blob.h.
+std::string precompile_targets(const std::wstring& exe_name, const std::wstring& name);   // tools: read only
 std::string system_registration(const std::wstring& exe, bool remove_only, const wchar_t* installer_name);   // tools: SYSTEM scope (admin)
 bool sodb_pipeline(const char* key, std::vector<uint8_t>* root, std::vector<uint8_t>* cs, unsigned* flags,
                    unsigned* node_mask, std::string* why);   // NR Control's Diagnostics lines (nr_d3d12_asd_panel.cpp)   // [D3D12ASD] DebugTint = 1: the placeholder's output tinted, to see in game that the path runs
