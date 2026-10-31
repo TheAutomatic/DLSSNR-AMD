@@ -1657,6 +1657,8 @@ struct PresentShot {
     }
 };
 
+std::atomic<uint64_t> g_present_nr_lists{0};   // v2.4: Present layers' lists that carried a layer's work
+
 void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top) {
     nr::pe::watchdog::Phase phase("Present layers");
     const nr::asi::hudcap::Own own;   // its commands pass HUD FIX's capture hooks unseen
@@ -2247,6 +2249,7 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top) {
     guard.unlock();   // our own ExecuteCommandLists comes through on_execute
     ID3D12CommandList* lists[] = {l};
     queue->ExecuteCommandLists(1, lists);
+    if (ran) ++g_present_nr_lists;   // v2.4: the routes line's Presents with NR
     shot.submitted = true;
     const HRESULT signalled = queue->Signal(g_present.fence, value);
     std::lock_guard<std::mutex> relock(g_lock);
@@ -2652,6 +2655,7 @@ void on_present(IDXGISwapChain* sc, ID3D12CommandQueue* queue, int encoding) {
     nr::pe::watchdog::beat();
     nr::pe::watchdog::Phase phase("the system's Present (NR Control's hook)");
     frame_generation_line();
+    if (g_present.wanted.load()) nr::dlssnr::note_route(nr::dlssnr::kRoutePresentAll);   // v2.4: the routes line
     const bool served_above = GetTickCount64() - g_present.top_ms.load() < 1000;
     const uint64_t probe = present_probe_budget() ? g_probe_presents.fetch_add(1) : ~0ull;
     const bool probing = probe < present_probe_budget();
@@ -2758,7 +2762,12 @@ void game_present_before(IDXGISwapChain* sc) {
         const uint64_t probe = present_probe_budget() ? g_probe_presents.load() : ~0ull;   // (the system's Present counts it)
         const bool probing = probe < present_probe_budget();
         if (probing) probe_back(sc, queue, "the game's swap chain, as the game hands it", probe);
+        const uint64_t lists_before = g_present_nr_lists.load();
         present_layers(sc, queue, true);
+        if (g_present.wanted.load()) {   // v2.4: the routes line's game Presents, and those NR's work did not reach
+            nr::dlssnr::note_route(nr::dlssnr::kRoutePresentGame);
+            if (g_present_nr_lists.load() == lists_before) nr::dlssnr::note_route(nr::dlssnr::kRoutePresentGameNoNr);
+        }
         if (probing) probe_back(sc, queue, "the game's swap chain, after the layers", probe);
         g_present.top_ms = GetTickCount64();
     }

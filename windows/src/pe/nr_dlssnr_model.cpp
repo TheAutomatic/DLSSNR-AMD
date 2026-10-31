@@ -277,7 +277,9 @@ std::atomic<ULONGLONG> g_asd_at{0};   // the last ASD-recorded evaluate (GetTick
 
 const char* const kRouteNames[kRouteKinds] = {"ASD network (ACO, D3D12)", "Vulkan bridge ran its network",
                                               "Vulkan bridge passed the frame through", "wilsjo2 D3D12 route ran",
-                                              "wilsjo2 D3D12 route passed the frame through", "wilsjo2 sent to the bridge"};
+                                              "wilsjo2 D3D12 route passed the frame through", "wilsjo2 sent to the bridge",
+                                              "game Presents (NR's place, before frame generation)",
+                                              "of them with no NR", "Presents shown (frame generation's included)"};
 
 std::string route_counts_text(const uint64_t* c) {
     std::string t;
@@ -431,6 +433,7 @@ void report_control(nr::pe::Session& session, const Feature* f, uint32_t route, 
         st.aco = 1;
         st.aco_rdna3 = false;
         st.aco_why = "via ASD, active: the network runs as ACO (public ASD + PSDB) on the game's D3D12 device";
+        st.device_path = 3;   // v2.4: Path "D3D12" (the session's own is the bridge's Vulkan device, which this frame did not use)
     }
     nr::pe::control::report(st);
 }
@@ -1340,11 +1343,10 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
         frame.preprocess = preprocess_now().active() ? 1 : 0;
         if (backend(frame)) {
             note_route(kRouteAsd);
-            {   // v2.2: NR Control's state from this frame (it used to keep the bridge's last one: "building ... 20%")
-                static ULONGLONG reported = 0;
-                const ULONGLONG now = GetTickCount64();
-                if (now - reported >= 100) {   // the shared page takes four a second; the layer's row every report
-                    reported = now;
+            {   // NR Control's state from this frame, every frame as the bridge's evaluate reports its runs (v2.4: it was
+                // at most every 100 ms, so the layer's row - noted "not recorded yet" before each run at Present - kept
+                // that note on most frames: NR Control showed "0 layers" / "NR: -" and "1 layer" / "0 ms" in turn)
+                {
                     uint32_t render_w = depth_rect.width, render_h = depth_rect.height;
                     if ((!render_w || !render_h) && depth) {
                         const D3D12_RESOURCE_DESC dd = depth->GetDesc();

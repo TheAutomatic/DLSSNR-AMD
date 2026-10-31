@@ -223,8 +223,11 @@ void layer_changed(int layer);
 // kRouteBridgeRan / kRouteBridgePassed the Vulkan bridge (the 0.0.8.1 route) ran its network / passed the frame through;
 // kRouteNativeRan / kRouteNativePassed / kRouteNativeBridged the .asi's wilsjo2 style on D3D12 (its flow on the D3D12
 // route ran / passed the frame through / went to the bridge).
+// v2.4: the Presents too - kRoutePresentGame the game's own Presents with Present layers wanted (before frame
+// generation: the layers' place), kRoutePresentGameNoNr those where no layer's work went out, kRoutePresentAll every
+// Present at the system's DXGI (frame generation's included).
 enum RouteKind { kRouteAsd, kRouteBridgeRan, kRouteBridgePassed, kRouteNativeRan, kRouteNativePassed, kRouteNativeBridged,
-                 kRouteKinds };
+                 kRoutePresentGame, kRoutePresentGameNoNr, kRoutePresentAll, kRouteKinds };
 void note_route(int kind);
 // The wilsjo2 native route's GPU time of one run (its programs + the ASD network), for NR Control's line.
 void note_native_ms(float ms);
