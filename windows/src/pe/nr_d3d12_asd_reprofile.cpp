@@ -65,6 +65,36 @@ Values find_value(capi::CompilerCacheSession* s, const std::vector<uint8_t>& key
     return v;
 }
 
+// The group keys of our databases when the job names none (see ReprofileJob::groups): the record tags of
+// net-carriers.bin ("NRCAR001" u32 rs_bytes rs u32 count, each u32 tag u32 dims[3] str file str src u32 n dxil).
+std::vector<std::string> our_groups(const std::wstring& src_psdb, const std::wstring& sodb, std::string* where) {
+    std::vector<std::string> g{"g_pbptr"};
+    for (const std::wstring& db : {src_psdb, sodb}) {
+        const size_t s = db.find_last_of(L"\\/");
+        const std::wstring path = (s == std::wstring::npos ? std::wstring() : db.substr(0, s + 1)) + L"net-carriers.bin";
+        FILE* f = _wfopen(path.c_str(), L"rb");
+        if (!f) continue;
+        std::vector<uint8_t> b;
+        uint8_t chunk[65536];
+        for (size_t n; (n = std::fread(chunk, 1, sizeof chunk, f)) > 0;) b.insert(b.end(), chunk, chunk + n);
+        std::fclose(f);
+        size_t at = 8;
+        auto u32 = [&](uint32_t* v) { if (at + 4 > b.size()) return false; std::memcpy(v, b.data() + at, 4); at += 4; return true; };
+        auto skip = [&]() { uint32_t n = 0; if (!u32(&n) || at + n > b.size()) return false; at += n; return true; };
+        uint32_t count = 0, tag = 0, dim = 0;
+        bool ok = b.size() >= 8 && std::memcmp(b.data(), "NRCAR001", 8) == 0 && skip() && u32(&count);
+        std::vector<std::string> found{"g_pbptr"};
+        for (uint32_t i = 0; ok && i < count; ++i) {
+            ok = u32(&tag) && u32(&dim) && u32(&dim) && u32(&dim) && skip() && skip() && skip();
+            if (ok) found.push_back("m2-" + std::to_string(tag));
+        }
+        *where = u8(path) + (ok ? ": " + std::to_string(count) + " records" : ": unreadable, the canary only");
+        return ok ? found : g;
+    }
+    *where = "no net-carriers.bin beside the PSDB or SODB: the canary only";
+    return g;
+}
+
 }  // namespace
 
 ReprofileResult reprofile_psdb(const ReprofileJob& job, bool profile_only) {
@@ -144,9 +174,15 @@ ReprofileResult reprofile_psdb(const ReprofileJob& job, bool profile_only) {
     bool good = SUCCEEDED(a) && SUCCEEDED(b) && SUCCEEDED(c) && SUCCEEDED(d) && ss && ns && os && compiler;
     if (!good) note("sessions " + hx(a) + " " + hx(b) + " " + hx(c) + ", CreateCompiler " + hx(d));
 
+    std::vector<std::string> groups = job.groups;
+    if (groups.empty()) {
+        std::string where;
+        groups = our_groups(job.src_psdb, job.sodb, &where);
+        note("groups: " + std::to_string(groups.size()) + " (" + where + ")");
+    }
     size_t stored = 0, same_key = 0;
-    for (size_t g = 0; good && g < job.groups.size(); ++g) {
-        const std::string& name = job.groups[g];
+    for (size_t g = 0; good && g < groups.size(); ++g) {
+        const std::string& name = groups[g];
         const capi::GroupKey gk{name.c_str(), UINT(name.size() + 1)};
         CompileCall call;
         call.compiler = compiler; call.group = &gk;

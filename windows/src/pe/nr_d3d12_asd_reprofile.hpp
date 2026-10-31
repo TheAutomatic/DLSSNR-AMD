@@ -20,7 +20,10 @@ struct ReprofileJob {
     std::wstring exe, name, engine;   // the identity; exe = the running exe's file name for the new profile
     UINT64 version = 0, engine_version = 0;
     std::wstring src_exe;        // the exe name the source PSDB was compiled for (its identity's)
-    std::vector<std::string> groups;  // SODB / PSDB group keys (NUL-terminated strings)
+    // SODB / PSDB group keys (NUL-terminated strings). Empty: every group of ours, as the lab's m5-build names them - the
+    // canary "g_pbptr" and "m2-<tag>" for each record of net-carriers.bin beside src_psdb (or beside sodb); the canary alone
+    // when there is no net-carriers.bin (the placeholder package).
+    std::vector<std::string> groups;
 };
 struct ReprofileResult {
     bool ok = false;
