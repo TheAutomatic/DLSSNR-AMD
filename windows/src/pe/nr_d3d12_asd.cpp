@@ -737,7 +737,8 @@ bool enabled() { return g_enabled; }
 bool debug_tint() { return g_tint; }
 Canary canary() { return Canary(g_canary.load()); }
 
-void start(HMODULE self) {
+void start(HMODULE self) { start(self, true); }
+void start(HMODULE self, bool register_now) {
     std::wstring here(32768, L'\0');
     here.resize(GetModuleFileNameW(self, here.data(), DWORD(here.size())));
     const size_t slash = here.find_last_of(L"\\/");
@@ -753,7 +754,7 @@ void start(HMODULE self) {
     g_family = ini_string(L"AdapterFamily", g_family);
     log("[asd] D3D12 ASD backend %s (%s: Enabled %d, Register %d)", g_enabled ? "on" : "off", utf8(g_ini).c_str(),
         g_enabled ? 1 : 0, g_register ? 1 : 0);
-    if (!g_enabled) return;
+    if (!g_enabled || !register_now) return;
     if (!g_register) { set_registration("not registered: Register = 0 (NR Control's Unregister)"); return; }
     // Under the loader lock here: the thread runs once OptiScaler's DllMain has returned (as the watchdog's).
     if (HANDLE t = CreateThread(nullptr, 0, &registration_thread, nullptr, 0, nullptr)) CloseHandle(t);
@@ -799,7 +800,7 @@ void on_device(ID3D12Device* device) {
 // Tools (dlssnr-amd-asd-reg.exe, run elevated once): the same entry at SYSTEM scope for `exe`, the files copied to
 // C:\ProgramData\dlssnr-amd-asd. A packaged game with a system-scope ASD entry of its store (the Xbox app's
 // GRTS-XboxContent-*) is looked up there; one entry per exe is used, by installer name order.
-std::string system_registration(const std::wstring& exe, bool remove_only) {
+std::string system_registration(const std::wstring& exe, bool remove_only, const wchar_t* installer_name) {
     const auto get = api::get_interface();
     if (!get) return "no D3D12GetInterface";
     const std::wstring dir = L"C:\\ProgramData\\dlssnr-amd-asd";
@@ -813,12 +814,13 @@ std::string system_registration(const std::wstring& exe, bool remove_only) {
     std::string why;
     Client client;
     client.scope = api::kScopeSystem;
+    client.installer = installer_name;
     api::InstallerFactory* factory = nullptr;
     api::Installer* installer = make_installer(get, client, &factory, &why);
     if (!installer) return why + " (run it as administrator)";
     bool foreign = false;
-    const UINT removed = remove_ours(installer, exe, &foreign, &why);
-    std::string result = "removed " + std::to_string(removed);
+    const UINT removed = remove_ours(installer, exe, &foreign, &why, installer_name);
+    std::string result = std::string("installer ") + utf8(installer_name) + ", SODB " + utf8(sodb) + ", PSDB " + utf8(psdb) + "; removed " + std::to_string(removed);
     if (!remove_only) {
         api::ApplicationDesc desc{};
         desc.pExeFilename = id.exe.c_str();
