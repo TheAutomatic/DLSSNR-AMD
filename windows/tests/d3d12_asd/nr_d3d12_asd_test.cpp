@@ -525,6 +525,7 @@ int main(int argc, char** argv) {
         return 0;
     }
     // reprofile <D3D12StateObjectCompiler.dll> <plugin dll> <source psdb> <sodb> <out psdb> <exe file name> [groups,]
+    //   (no groups: g_pbptr + m2-<tag> for every record of net-carriers.bin beside the source PSDB - the real network)
     //   (profile <D3D12StateObjectCompiler.dll> <plugin dll> <exe file name>: only the profile the plugin gives it)
     if ((mode == "reprofile" && argc > 7) || (mode == "profile" && argc > 4)) {
         // The arguments as UTF-16 (paths outside the ANSI code page, e.g. a Chinese folder name).
@@ -541,7 +542,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         job.src_psdb = warg(4); job.sodb = warg(5); job.out_psdb = warg(6); job.exe = warg(7);
-        std::string groups = argc > 8 ? argv[8] : "g_pbptr";
+        std::string groups = argc > 8 ? argv[8] : "";   // none: every group of ours (net-carriers.bin beside the source PSDB)
         for (size_t at = 0; at <= groups.size();) {
             size_t e = groups.find(',', at);
             if (e == std::string::npos) e = groups.size();
