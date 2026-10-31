@@ -517,19 +517,16 @@ public:
         if (!fs->latch || temporal_.reset || domain_changed) fs->seed = 0;
         fs->domain = controls_.reversible;
         uint32_t pre_seed = fs->seed++;
-        // v2.3: dlssnr-amd-asd.ini [D3D12ASD] NetTemporal / NetNoiseEveryFrame, read once. Measured offline
-        // (nr_d3d12_asd_test netstab, 640x384, the same picture every frame and no motion): with the history gate open
-        // or the seed moving the network's answer changes every frame (mean 0.004-0.006, single texels 0.04-0.05 of
-        // the 0..1 range, about a third of what NR changes at all) and does not settle; the post block's history weight
-        // came out near 0.003, so nothing smooths it. With both off the answer is the same bits every frame. Default
-        // off (both); 1 brings back v2.2's DLL rule (the history and a seed that moves every frame).
-        static const int ini_temporal = GetPrivateProfileIntW(L"D3D12ASD", L"NetTemporal", 0, ini_path().c_str());
-        static const int ini_noise = GetPrivateProfileIntW(L"D3D12ASD", L"NetNoiseEveryFrame", 0, ini_path().c_str());
+        // [D3D12ASD] NetTemporal / NetNoiseEveryFrame (dlssnr-amd-asd.ini, read once; v2.4: default 1 = the runtime's
+        // rule above, which the bridge's network (nr_runtime.cpp) runs for a wilsjo2 layer: the history gate and a seed
+        // that moves every frame). 0 turns either off - a diagnosis only (v2.3's default, not the cause of the flicker).
+        static const int ini_temporal = GetPrivateProfileIntW(L"D3D12ASD", L"NetTemporal", 1, ini_path().c_str());
+        static const int ini_noise = GetPrivateProfileIntW(L"D3D12ASD", L"NetNoiseEveryFrame", 1, ini_path().c_str());
         static std::once_flag said;
         std::call_once(said, [] {
             nr::pe::log("[asd] network temporal mode (dlssnr-amd-asd.ini): NetTemporal %d (%s), NetNoiseEveryFrame %d (%s)",
-                        ini_temporal, ini_temporal ? "the history, as v2.2" : "off: no history",
-                        ini_noise, ini_noise ? "a new seed every frame, as v2.2" : "off: seed 0, the same noise every frame");
+                        ini_temporal, ini_temporal ? "the history, the runtime's rule" : "off: no history (diagnosis)",
+                        ini_noise, ini_noise ? "a new seed every frame, the runtime's rule" : "off: seed 0 (diagnosis)");
         });
         if (!ini_temporal) gate = false;
         if (!ini_noise) pre_seed = 0;
