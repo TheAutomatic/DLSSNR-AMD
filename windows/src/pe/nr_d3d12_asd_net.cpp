@@ -305,10 +305,6 @@ std::shared_ptr<Built> build(ID3D12Device* device, const Carriers& carriers, ID3
     }
     if (!missing.empty()) { *why = "kernel " + missing + " has no record in the PSDB (" + b->plan.model + ")"; return nullptr; }
     if (b->plan.temporal.pre < 0 || b->plan.temporal.post < 0) { *why = "the plan has no temporal pre / post block"; return nullptr; }
-    if (!b->plan.temporal.motion_without_depth) {
-        *why = "dlssnr-amd.ini [Network] Motion Without Depth = 0: the depth input is not in the ASD path yet";
-        return nullptr;
-    }
     b->net = nr::network_choice(b->plan.model.substr(0, b->plan.model.find(' ')));
     if (b->net < 0) b->net = want_net >= 0 ? want_net : nr::kSmallFp8;
     auto make = [&](const std::string& kern, const Carrier& c, Built::Kern* k) {
@@ -335,7 +331,7 @@ std::shared_ptr<Built> build(ID3D12Device* device, const Carriers& carriers, ID3
     b->wgt = buffer(device, D3D12_HEAP_TYPE_DEFAULT, wbytes, D3D12_RESOURCE_STATE_COPY_DEST, true);
     b->wgt_upload = buffer(device, D3D12_HEAP_TYPE_UPLOAD, wbytes, D3D12_RESOURCE_STATE_GENERIC_READ, false);
     b->surf1 = buffer(device, D3D12_HEAP_TYPE_DEFAULT, uint64_t(w) * h * 16, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
-    // t.depth: never written with Motion Without Depth (the pre block reads have_depth 0), bound as a valid image.
+    // t.depth: dummy fallback when depth is not provided (the pre block reads have_depth 0), bound as a valid image.
     b->depth = buffer(device, D3D12_HEAP_TYPE_DEFAULT, uint64_t(w) * h * 16, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
     b->tables = uint32_t(b->plan.noise.size() + b->plan.disp.size());
     b->slot_bytes = uint64_t(b->tables) * kTableBytes + kParamsBytes;
@@ -514,12 +510,17 @@ public:
     }
     void controls(const nr::D3d12NetControls& c) override { controls_ = c; }
     void temporal(const NetTemporal& t) override { temporal_ = t; }
+    bool motion_without_depth() const override {
+        if (current_) return current_->plan.temporal.motion_without_depth;
+        if (!nets_.empty()) return nets_.begin()->second->plan.temporal.motion_without_depth;
+        return true;
+    }
 
     bool record(ID3D12GraphicsCommandList* cmd, const LinearFrame& in, const LinearFrame& out, const char** why) override {
         const auto c0 = std::chrono::steady_clock::now();
         Built* b = current_;
         if (!b || b->w != in.width || b->h != in.height) { *why = "no network for this extent"; return false; }
-        if ((in.va & 255) || (out.va & 255) || (temporal_.motion_va & 255)) { *why = "a linear buffer is not 256-byte aligned"; return false; }
+        if ((in.va & 255) || (out.va & 255) || (temporal_.motion_va & 255) || (temporal_.depth_va & 255)) { *why = "a linear buffer is not 256-byte aligned"; return false; }
         const auto& tp = b->plan.temporal;
         // This frame's feature (Runtime::record_all): its state, made on its first frame.
         FeatureState* fs = nullptr;
@@ -595,7 +596,7 @@ public:
             case FLOW: return temporal_.motion_va;
             case HIST: return hist_va;
             case HIST_STORE: return store_va;
-            case DEPTH: return depth_va;
+            case DEPTH: return temporal_.depth_va ? temporal_.depth_va : depth_va;
             }
             return in.va;
         };
@@ -649,11 +650,15 @@ public:
             table(base + uint32_t(i), *k, d.push, d.gx, d.gy, d.gz);
         }
         {
-            // params[12] (record_all): the gate, MVecScale, the history weight, the history's extent, no depth, and the
+            // params[12] (record_all): the gate, MVecScale, the history weight, the history's extent, depth flags, and the
             // motion field covering the frame (the backend resampled the guide's region onto it).
             const float hs = controls_.history_strength >= 0.f ? std::min(std::max(controls_.history_strength, 0.f), 1.f) : 1.0f;
+            const bool have_depth = temporal_.have_depth && !b->plan.temporal.motion_without_depth;
             const float params[12] = {gate ? 1.0f : 0.0f, temporal_.motion_scale_x, temporal_.motion_scale_y,
-                                      hs * tp.blend_scale, float(b->w), float(b->h), 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 0.0f};
+                                      hs * tp.blend_scale, float(b->w), float(b->h),
+                                      have_depth ? 1.0f : 0.0f,
+                                      have_depth && temporal_.depth_inverted ? 1.0f : 0.0f,
+                                      1.0f, 1.0f, 0.0f, 0.0f};
             std::memset(ring + uint64_t(b->tables) * kTableBytes, 0, kParamsBytes);
             std::memcpy(ring + uint64_t(b->tables) * kTableBytes, params, sizeof params);
         }

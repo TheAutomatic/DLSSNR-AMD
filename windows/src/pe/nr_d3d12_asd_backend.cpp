@@ -73,6 +73,14 @@ const char kShaders[] =
     "    if (id.x >= g_w || id.y >= g_h) return;\n"
     "    const float2 uv = (float2(id.xy) + 0.5) / float2(g_w, g_h);\n"
     "    lin_dst[id.y * g_w + id.x] = float4(src_tex.SampleLevel(linear_clamp, uv * g_region.xy + g_region.zw, 0).xy, 0, 0);\n"
+    "}\n"
+    // The engine's depth into the temporal path's linear buffer: texel for texel what a NEAREST blit
+    // of the subrect picks (runtime_depth.comp), stored as RGBA32F with depth in .r.
+    "[numthreads(8, 8, 1)] void to_depth(uint3 id : SV_DispatchThreadID) {\n"
+    "    if (id.x >= g_w || id.y >= g_h) return;\n"
+    "    const float2 s = floor((float2(id.xy) + 0.5) * g_region.xy / float2(g_w, g_h));\n"
+    "    const int2 t = min(int2(s), int2(g_region.xy) - 1);\n"
+    "    lin_dst[id.y * g_w + id.x] = float4(src_tex.Load(int3(t + int2(g_region.zw), 0)).r, 0, 0, 0);\n"
     "}\n";
 
 ID3DBlob* compile(const char* entry, std::string* why) { return compile_cs(kShaders, sizeof kShaders - 1, entry, why); }
@@ -118,15 +126,33 @@ DXGI_FORMAT view_format(DXGI_FORMAT f) {
     default: return f;
     }
 }
+DXGI_FORMAT depth_view_format(DXGI_FORMAT format) {
+    switch (format) {
+    case DXGI_FORMAT_R32_TYPELESS: case DXGI_FORMAT_D32_FLOAT: case DXGI_FORMAT_R32_FLOAT:
+        return DXGI_FORMAT_R32_FLOAT;
+    case DXGI_FORMAT_R24G8_TYPELESS: case DXGI_FORMAT_D24_UNORM_S8_UINT: case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+        return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    case DXGI_FORMAT_R32G8X24_TYPELESS: case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+    case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+        return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    case DXGI_FORMAT_R16_TYPELESS: case DXGI_FORMAT_D16_UNORM: case DXGI_FORMAT_R16_UNORM:
+        return DXGI_FORMAT_R16_UNORM;
+    case DXGI_FORMAT_R16_FLOAT:
+        return DXGI_FORMAT_R16_FLOAT;
+    default:
+        return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
 
 struct Backend {
     ID3D12Device* device = nullptr;
     ID3D12RootSignature* rs = nullptr;
-    ID3D12PipelineState *to_linear = nullptr, *from_linear = nullptr, *to_motion = nullptr;
+    ID3D12PipelineState *to_linear = nullptr, *from_linear = nullptr, *to_motion = nullptr, *to_depth = nullptr;
     ID3D12DescriptorHeap* heap = nullptr;
     UINT increment = 0, slot = 0;
-    static constexpr UINT kSlots = 1536;   // three a frame: 512 evaluates before one is reused
-    ID3D12Resource *lin_in = nullptr, *lin_out = nullptr, *lin_mv = nullptr;
+    static constexpr UINT kSlots = 2048;   // four a frame: 512 evaluates before one is reused
+    ID3D12Resource *lin_in = nullptr, *lin_out = nullptr, *lin_mv = nullptr, *lin_depth = nullptr;
     uint32_t w = 0, h = 0;
     std::unique_ptr<D3d12AsdNetwork> network;
     bool broken = false;   // something of the device's could not be made: the 0.0.8.1 path from now on
@@ -186,7 +212,7 @@ bool build(ID3D12Device* device, std::string* why) {
     release(blob);
     if (FAILED(hr)) { *why = "CreateRootSignature failed"; return false; }
     for (auto [entry, pso] : {std::pair{"to_linear", &g.to_linear}, std::pair{"from_linear", &g.from_linear},
-                              std::pair{"to_motion", &g.to_motion}}) {
+                              std::pair{"to_motion", &g.to_motion}, std::pair{"to_depth", &g.to_depth}}) {
         ID3DBlob* code = compile(entry, why);
         if (!code) return false;
         D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
@@ -213,10 +239,10 @@ bool build(ID3D12Device* device, std::string* why) {
 }
 
 void drop_device() {
-    retire(g.rs); retire(g.to_linear); retire(g.from_linear); retire(g.to_motion); retire(g.heap);
-    retire(g.lin_in); retire(g.lin_out); retire(g.lin_mv);
-    g.rs = nullptr; g.to_linear = g.from_linear = g.to_motion = nullptr; g.heap = nullptr;
-    g.lin_in = g.lin_out = g.lin_mv = nullptr;
+    retire(g.rs); retire(g.to_linear); retire(g.from_linear); retire(g.to_motion); retire(g.to_depth); retire(g.heap);
+    retire(g.lin_in); retire(g.lin_out); retire(g.lin_mv); retire(g.lin_depth);
+    g.rs = nullptr; g.to_linear = g.from_linear = g.to_motion = g.to_depth = nullptr; g.heap = nullptr;
+    g.lin_in = g.lin_out = g.lin_mv = g.lin_depth = nullptr;
     g.w = g.h = 0;
     g.network.reset();
     if (g.device) g.device->Release();
@@ -351,14 +377,15 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
     const uint32_t w = std::min<uint64_t>({f.width, sd.Width, dd.Width}), h = std::min<uint32_t>({f.height, sd.Height, dd.Height});
     if (!w || !h) return fallback("an empty extent");
     if (w != g.w || h != g.h) {
-        retire(g.lin_in); retire(g.lin_out); retire(g.lin_mv);
+        retire(g.lin_in); retire(g.lin_out); retire(g.lin_mv); retire(g.lin_depth);
         const uint64_t bytes = uint64_t(w) * h * 16;
         g.lin_in = linear_buffer(f.device, bytes);
         g.lin_out = linear_buffer(f.device, bytes);
         g.lin_mv = linear_buffer(f.device, bytes);
-        if (!g.lin_in || !g.lin_out || !g.lin_mv) {
-            retire(g.lin_in); retire(g.lin_out); retire(g.lin_mv);
-            g.lin_in = g.lin_out = g.lin_mv = nullptr;
+        g.lin_depth = linear_buffer(f.device, bytes);
+        if (!g.lin_in || !g.lin_out || !g.lin_mv || !g.lin_depth) {
+            retire(g.lin_in); retire(g.lin_out); retire(g.lin_mv); retire(g.lin_depth);
+            g.lin_in = g.lin_out = g.lin_mv = g.lin_depth = nullptr;
             g.w = g.h = 0;
             return fallback("the linear buffers could not be made");
         }
@@ -387,10 +414,40 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
         nc.reversible = f.reversible_mode >= 0 && f.reversible_mode <= 4 ? uint32_t(f.reversible_mode) : 0u;   // reversible_of
         nc.history_strength = f.history_strength;
         g.network->controls(nc);
+        const bool wants_depth = f.depth && !g.network->motion_without_depth();
+        DXGI_FORMAT depth_view = DXGI_FORMAT_UNKNOWN;
+        D3D12_RESOURCE_DESC depth_desc{};
+        if (wants_depth) {
+            depth_desc = f.depth->GetDesc();
+            if (depth_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && depth_desc.SampleDesc.Count == 1 &&
+                !(depth_desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)) {
+                depth_view = depth_view_format(depth_desc.Format);
+            }
+        }
+        const bool have_depth = depth_view != DXGI_FORMAT_UNKNOWN;
+        if (wants_depth && !have_depth) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                nr::pe::log("[asd] the depth buffer (DXGI format %u) cannot be read; running without depth",
+                            unsigned(depth_desc.Format));
+            }
+        }
+        if (have_depth) {
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                nr::pe::log("[asd] depth read from guide (DXGI format %u -> %u)", unsigned(depth_desc.Format),
+                            unsigned(depth_view));
+            }
+        }
         NetTemporal nt;
         nt.motion_va = g.lin_mv->GetGPUVirtualAddress();
         nt.motion_scale_x = f.motion_scale_x;
         nt.motion_scale_y = f.motion_scale_y;
+        nt.depth_va = have_depth ? g.lin_depth->GetGPUVirtualAddress() : 0;
+        nt.have_depth = have_depth;
+        nt.depth_inverted = f.depth_inverted != 0;
         nt.reset = f.reset != 0;
         nt.feature = f.feature;
         g.network->temporal(nt);
@@ -400,7 +457,7 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
 
     // The descriptors: the colour's SRV, the output's UAV.
     const UINT slot = g.slot;
-    g.slot = (g.slot + 3) % Backend::kSlots;
+    g.slot = (g.slot + 4) % Backend::kSlots;
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = g.heap->GetCPUDescriptorHandleForHeapStart();
     D3D12_GPU_DESCRIPTOR_HANDLE gpu = g.heap->GetGPUDescriptorHandleForHeapStart();
     cpu.ptr += SIZE_T(slot) * g.increment;
@@ -426,12 +483,22 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
     gpu_mv.ptr += UINT64(2) * g.increment;
     srv.Format = mf;
     f.device->CreateShaderResourceView(f.motion, &srv, cpu_mv);
+    // The depth guide's SRV (to_depth).
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu_depth = gpu;
+    gpu_depth.ptr += UINT64(3) * g.increment;
+    if (have_depth) {
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu_depth = cpu;
+        cpu_depth.ptr += SIZE_T(3) * g.increment;
+        srv.Format = depth_view;
+        f.device->CreateShaderResourceView(f.depth, &srv, cpu_depth);
+    }
 
     const bool in_place = f.color == f.output;
     const LinearFrame in{g.lin_in, g.lin_in->GetGPUVirtualAddress(), w, h, uint64_t(w) * h * 16};
     const LinearFrame out{g.lin_out, g.lin_out->GetGPUVirtualAddress(), w, h, in.bytes};
     UINT constants[8] = {w, h, debug_tint() ? 1u : 0u, 0u, 0u, 0u, 0u, 0u};
     UINT mv_constants[8] = {w, h, 0u, 0u, 0u, 0u, 0u, 0u};
+    UINT depth_constants[8] = {w, h, 0u, 0u, 0u, 0u, 0u, 0u};
     {
         // nr_runtime.cpp's params[8..11] for a guide sampled in place: the subrect's share of the allocation, its base.
         const float mtw = float(md.Width), mth = float(md.Height);
@@ -439,15 +506,34 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
         const float region[4] = {mw / mtw, mh / mth, float(f.motion_x) / mtw, float(f.motion_y) / mth};
         std::memcpy(mv_constants + 4, region, sizeof region);
     }
+    if (have_depth) {
+        float region[4];
+        if (f.depth_x >= depth_desc.Width || f.depth_y >= depth_desc.Height) {
+            region[0] = float(depth_desc.Width);
+            region[1] = float(depth_desc.Height);
+            region[2] = 0.0f;
+            region[3] = 0.0f;
+        } else {
+            const uint32_t max_w = uint32_t(depth_desc.Width) - f.depth_x;
+            const uint32_t max_h = depth_desc.Height - f.depth_y;
+            region[0] = float(f.depth_w ? std::min(f.depth_w, max_w) : max_w);
+            region[1] = float(f.depth_h ? std::min(f.depth_h, max_h) : max_h);
+            region[2] = float(f.depth_x);
+            region[3] = float(f.depth_y);
+        }
+        std::memcpy(depth_constants + 4, region, sizeof region);
+    }
     const UINT gx = (w + 7) / 8, gy = (h + 7) / 8;
     auto* cmd = f.cmd;
-    D3D12_RESOURCE_BARRIER b[4];
+    D3D12_RESOURCE_BARRIER b[6];
 
-    // copy-in: colour -> lin_in, motion -> lin_mv
+    // copy-in: colour -> lin_in, motion -> lin_mv, depth -> lin_depth
     int n = 0;
     transition(b[n++], g.lin_in, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     transition(b[n++], g.lin_out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     transition(b[n++], g.lin_mv, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (have_depth)
+        transition(b[n++], g.lin_depth, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     if (color_state != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
         transition(b[n++], f.color, color_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     cmd->ResourceBarrier(n, b);
@@ -465,9 +551,16 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
     cmd->SetComputeRootDescriptorTable(1, gpu_mv);
     cmd->SetComputeRootUnorderedAccessView(4, g.lin_mv->GetGPUVirtualAddress());
     cmd->Dispatch(gx, gy, 1);
+    if (have_depth) {
+        cmd->SetPipelineState(g.to_depth);
+        cmd->SetComputeRoot32BitConstants(0, 8, depth_constants, 0);
+        cmd->SetComputeRootDescriptorTable(1, gpu_depth);
+        cmd->SetComputeRootUnorderedAccessView(4, g.lin_depth->GetGPUVirtualAddress());
+        cmd->Dispatch(gx, gy, 1);
+    }
     b[0] = D3D12_RESOURCE_BARRIER{};
     b[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-    b[0].UAV.pResource = nullptr;   // lin_in and lin_mv
+    b[0].UAV.pResource = nullptr;   // lin_in, lin_mv and lin_depth
     cmd->ResourceBarrier(1, b);
 
     // the network (both in UNORDERED_ACCESS, and left so)
@@ -500,6 +593,8 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
                D3D12_RESOURCE_STATE_COMMON);
     transition(b[n++], g.lin_out, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
     transition(b[n++], g.lin_mv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+    if (have_depth)
+        transition(b[n++], g.lin_depth, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
     cmd->ResourceBarrier(n, b);
     nr::pe::split::restore(cmd, state);
 

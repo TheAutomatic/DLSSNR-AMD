@@ -1351,6 +1351,10 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
             frame.motion_scale_x = normalized_mv_scale(mv_scale_x, mw);
             frame.motion_scale_y = normalized_mv_scale(mv_scale_y, mh);
         }
+        frame.depth = debug_depth() == DebugDepth::Off ? nullptr : depth;
+        frame.depth_x = depth_rect.x; frame.depth_y = depth_rect.y;
+        frame.depth_w = depth_rect.width; frame.depth_h = depth_rect.height;
+        frame.depth_inverted = (depth_inverted != 0) != (debug_depth() == DebugDepth::Flip) ? 1 : 0;
         frame.reset = reset != 0 ? 1 : 0;
         frame.feature = static_cast<unsigned long long>(f->id);
         frame.history_strength = -1.0f;

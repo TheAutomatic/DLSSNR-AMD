@@ -120,6 +120,9 @@ struct D3d12BackendFrame {
     ID3D12Resource* motion;
     unsigned int motion_x, motion_y, motion_w, motion_h;
     float motion_scale_x, motion_scale_y;
+    ID3D12Resource* depth;
+    unsigned int depth_x, depth_y, depth_w, depth_h;
+    int depth_inverted;
     int reset;
     unsigned long long feature;
     float history_strength;   // < 0: the session's

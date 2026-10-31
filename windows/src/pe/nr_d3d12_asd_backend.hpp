@@ -40,6 +40,9 @@ struct LinearFrame {
 struct NetTemporal {
     uint64_t motion_va = 0;
     float motion_scale_x = 1.0f, motion_scale_y = 1.0f;
+    uint64_t depth_va = 0;
+    bool have_depth = false;
+    bool depth_inverted = false;
     bool reset = false;
     uint64_t feature = 0;
 };
@@ -58,6 +61,8 @@ public:
     // v2.6: after a false ready(): true when only because the network for that extent is still building (it will run
     // these frames; the caller passes them through, no NR, rather than starting the bridge), false when it never will.
     virtual bool building() const { return false; }
+    // [Network] Motion Without Depth: true when the network reads motion without depth (default 1).
+    virtual bool motion_without_depth() const { return true; }
     // The frame's model controls, before record.
     virtual AsdNetStatus status() const { return {}; }
     virtual void controls(const nr::D3d12NetControls&) {}
