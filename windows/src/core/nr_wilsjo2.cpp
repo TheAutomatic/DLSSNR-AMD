@@ -810,7 +810,12 @@ Stage::Stage(const HostDevice& host, const std::string& shaders) : impl_(std::ma
     }
 }
 
+Stage::Stage(std::unique_ptr<Backend> other) : other_(std::move(other)) {
+    if (!other_) throw std::runtime_error("wilsjo2 stage: no programs");
+}
+
 Stage::~Stage() {
+    if (!impl_) return;
     Impl& m = *impl_;
     for (auto& s : m.slots) {
         for (VkImageView v : s->views) vkDestroyImageView(m.device, v, nullptr);
@@ -829,6 +834,7 @@ Stage::~Stage() {
 }
 
 void Stage::record(VkCommandBuffer cmd, const Dispatch& d) {
+    if (other_) { other_->record(d); return; }
     Impl& m = *impl_;
     const uint32_t mode = d.constants.mode;
     if (mode >= m.programs.size() || !m.programs[mode].pipeline) throw std::runtime_error("wilsjo2 stage: no program for mode " + std::to_string(mode));
@@ -871,10 +877,11 @@ void Stage::record(VkCommandBuffer cmd, const Dispatch& d) {
     m.prof_mark(s, cmd, mode_name(mode), true);
 }
 
-bool Stage::has_fast() const { return impl_->fast_loaded; }
+bool Stage::has_fast() const { return !other_ && impl_->fast_loaded; }
 
 void Stage::record_fast(VkCommandBuffer cmd, uint32_t program, const FastImage* images, uint32_t count, const void* push,
                         uint32_t bytes, uint32_t gx, uint32_t gy) {
+    if (other_) throw std::runtime_error("wilsjo2 stage: no fast programs on this route");
     Impl& m = *impl_;
     if (!m.fast_loaded || program >= nr::fast::kProgramCount) throw std::runtime_error("wilsjo2 stage: no fast program");
     const Impl::FastProgram& pr = m.fast[program];
@@ -920,8 +927,14 @@ void Stage::record_fast(VkCommandBuffer cmd, uint32_t program, const FastImage* 
     m.prof_mark(s, cmd, nr::fast::program_name(nr::fast::Program(program)), true);
 }
 
-void Stage::end_recording() { ++impl_->recordings; }
+void Stage::end_recording() {
+    if (other_) { other_->end_recording(); return; }
+    ++impl_->recordings;
+}
 
-bool Stage::has(Mode mode) const { return mode < impl_->programs.size() && impl_->programs[mode].pipeline; }
+bool Stage::has(Mode mode) const {
+    if (other_) return other_->has(mode);
+    return mode < impl_->programs.size() && impl_->programs[mode].pipeline;
+}
 
 }  // namespace nr::wilsjo2
