@@ -47,6 +47,9 @@ public:
     // Before anything is recorded, every evaluate: false (and why) - not ready for this extent yet (the network builds
     // on a thread) or never; the frame takes the 0.0.8.1 path.
     virtual bool ready(ID3D12Device*, uint32_t, uint32_t, std::string*) { return true; }
+    // v2.6: after a false ready(): true when only because the network for that extent is still building (it will run
+    // these frames; the caller passes them through, no NR, rather than starting the bridge), false when it never will.
+    virtual bool building() const { return false; }
     // The frame's model controls, before record.
     virtual void controls(const nr::D3d12NetControls&) {}
     // The frame's temporal inputs, before record.
@@ -61,7 +64,9 @@ ID3DBlob* compile_cs(const char* source, size_t bytes, const char* entry, std::s
 // will run on this backend - ASD enabled, the canary ASD_HIT, the backend made on `device`, the command list's state
 // known and the network ready for w x h (one is built on a thread otherwise: false until it is). False: `why`, and the
 // layer takes the 0.0.8.1 path (the Vulkan bridge) for the frame.
-bool wilsjo2_ready(ID3D12Device* device, ID3D12GraphicsCommandList* cmd, uint32_t w, uint32_t h, std::string* why);
+// v2.6 `building` (may be null): set when false only because the network is still being made (no bridge then).
+bool wilsjo2_ready(ID3D12Device* device, ID3D12GraphicsCommandList* cmd, uint32_t w, uint32_t h, std::string* why,
+                   bool* building = nullptr);
 
 // The backend slot nr::dlssnr::evaluate_d3d12 calls (nr::dlssnr::set_d3d12_backend, from InitializeASI).
 bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& frame);

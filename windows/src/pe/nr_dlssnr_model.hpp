@@ -125,6 +125,10 @@ struct D3d12BackendFrame {
     float history_strength;   // < 0: the session's
     // The 0.0.8.1 path's own stages this backend does not run: the RenoDX route installed, [Preprocess] active.
     int renodx_route, preprocess;
+    // v2.6 (out, may be null): set to 1 by a backend that returns false only because its network for this extent is
+    // still being made - it will take such frames; evaluate_d3d12 then passes the frame through (output := colour) with
+    // no NR and does not start the Vulkan bridge's network (Kenny: no bridge while ASD builds).
+    int* waiting;
 };
 using D3d12Backend = bool (*)(const D3d12BackendFrame& frame);
 void set_d3d12_backend(D3d12Backend backend);
@@ -227,7 +231,9 @@ void layer_changed(int layer);
 // generation: the layers' place), kRoutePresentGameNoNr those where no layer's work went out, kRoutePresentAll every
 // Present at the system's DXGI (frame generation's included).
 enum RouteKind { kRouteAsd, kRouteBridgeRan, kRouteBridgePassed, kRouteNativeRan, kRouteNativePassed, kRouteNativeBridged,
-                 kRoutePresentGame, kRoutePresentGameNoNr, kRoutePresentAll, kRouteKinds };
+                 kRoutePresentGame, kRoutePresentGameNoNr, kRoutePresentAll, kRouteAsdWaiting, kRouteKinds };
+// v2.6: kRouteAsdWaiting - a frame passed through with no NR while ASD's network (or wilsjo2's D3D12 programs) is made
+// (the bridge is not used for it)
 void note_route(int kind);
 // The wilsjo2 native route's GPU time of one run (its programs + the ASD network), for NR Control's line.
 void note_native_ms(float ms);

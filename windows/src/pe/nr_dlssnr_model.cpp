@@ -279,7 +279,8 @@ const char* const kRouteNames[kRouteKinds] = {"ASD network (ACO, D3D12)", "Vulka
                                               "Vulkan bridge passed the frame through", "wilsjo2 D3D12 route ran",
                                               "wilsjo2 D3D12 route passed the frame through", "wilsjo2 sent to the bridge",
                                               "game Presents (NR's place, before frame generation)",
-                                              "of them with no NR", "Presents shown (frame generation's included)"};
+                                              "of them with no NR", "Presents shown (frame generation's included)",
+                                              "passed through while ASD's network is made (no NR, no bridge)"};
 
 std::string route_counts_text(const uint64_t* c) {
     std::string t;
@@ -1341,6 +1342,8 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
         if (const auto* w2 = nr::pe::renodx_route::call_wilsjo2()) frame.history_strength = w2->history;
         frame.renodx_route = nr::pe::renodx_route::installed() ? 1 : 0;
         frame.preprocess = preprocess_now().active() ? 1 : 0;
+        int waiting = 0;
+        frame.waiting = &waiting;
         if (backend(frame)) {
             note_route(kRouteAsd);
             {   // NR Control's state from this frame, every frame as the bridge's evaluate reports its runs (v2.4: it was
@@ -1357,6 +1360,19 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
                                    true, true);
                 }
             }
+            device->Release();
+            return static_cast<int>(NVSDK_NGX_Result_Success);
+        }
+        if (waiting) {
+            // v2.6: ASD takes these frames once its network is made; until then the frame as it came, no NR, no bridge
+            if (frame.output != frame.color) {
+                barrier(cmd, color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                barrier(cmd, output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+                cmd->CopyResource(output, color);
+                barrier(cmd, color, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                barrier(cmd, output, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            }
+            note_route(kRouteAsdWaiting);
             device->Release();
             return static_cast<int>(NVSDK_NGX_Result_Success);
         }
