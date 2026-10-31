@@ -17,6 +17,7 @@ inline constexpr GUID kClsidInstallerFactory = {0x16195a0b, 0x607c, 0x41f1, {0xb
 inline constexpr GUID kIidInstallerFactory = {0x09b2dfe4, 0x840f, 0x401a, {0x80, 0x4c, 0x0d, 0xd8, 0xaa, 0xdc, 0x9e, 0x9f}};
 inline constexpr GUID kIidInstaller = {0xbbe30de1, 0x6318, 0x4526, {0xae, 0x17, 0x77, 0x66, 0x93, 0x19, 0x1b, 0xb4}};
 inline constexpr GUID kIidApplication = {0xfc688ee2, 0x1b35, 0x4913, {0x93, 0xbe, 0x1c, 0xa3, 0xfa, 0x7d, 0xf3, 0x9e}};
+inline constexpr GUID kIidExplorer = {0x90432322, 0x32f5, 0x487f, {0x92, 0x64, 0xe9, 0x39, 0x0f, 0xa5, 0x8b, 0x2a}};
 inline constexpr GUID kIidComponent = {0xeed1bf00, 0xf5c7, 0x4cf7, {0x88, 0x5c, 0xd0, 0xf9, 0xc0, 0xcb, 0x48, 0x28}};
 
 enum Scope : int { kScopeUser = 0, kScopeSystem = 1 };
@@ -85,6 +86,9 @@ struct Installer : IUnknown {
     virtual UINT STDMETHODCALLTYPE GetMaxPrecompileTargetCount() = 0;
     virtual HRESULT STDMETHODCALLTYPE GetPrecompileTargets(const ApplicationDesc* pApplicationDesc, UINT ArraySize,
                                                            CompilerProperties* pArray, TargetFlags flags) = 0;
+};
+struct Explorer : IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE GetApplicationFromExePath(const wchar_t* pFullExePath, REFIID riid, void** ppvApp) = 0;
 };
 struct InstallerFactory : IUnknown {
     virtual HRESULT STDMETHODCALLTYPE CreateInstaller(InstallerClient* pClient, REFIID riid, void** ppvInstaller) = 0;
