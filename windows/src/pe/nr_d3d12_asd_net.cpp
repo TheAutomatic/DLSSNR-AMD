@@ -427,6 +427,7 @@ public:
     bool ready(ID3D12Device*, uint32_t w, uint32_t h, std::string* why) override {
         sweep();
         current_ = nullptr;
+        building_ = false;
         if (w % 8) { *why = "width " + std::to_string(w) + " is not a multiple of 8 (the network's RGBA32F image rows)"; return false; }
         const auto key = std::make_pair(w, h);
         if (auto it = nets_.find(key); it != nets_.end()) {
@@ -460,7 +461,8 @@ public:
             shared_->done.reset();
             device_->AddRef();
             rs_->AddRef();
-            nr::pe::log("[asd] building the network for %ux%u (the 0.0.8.1 path runs these frames until it is done)", w, h);
+            nr::pe::log("[asd] building the network for %ux%u (until it is done these frames pass through with no NR; "
+                        "the bridge is not used)", w, h);
             std::thread([sh = shared_, dev = device_, rs = rs_, c = carriers_, w, h] {
                 std::string e;
                 std::shared_ptr<Built> b;
@@ -476,8 +478,10 @@ public:
             }).detach();
         }
         *why = "the network for " + std::to_string(shared_->bw) + "x" + std::to_string(shared_->bh) + " is building";
+        building_ = true;   // v2.6: it will run these frames (no bridge meanwhile)
         return false;
     }
+    bool building() const override { return building_; }
 
     void controls(const nr::D3d12NetControls& c) override { controls_ = c; }
     void temporal(const NetTemporal& t) override { temporal_ = t; }
@@ -732,6 +736,7 @@ private:
     std::shared_ptr<Shared> shared_;
     std::map<std::pair<uint32_t, uint32_t>, std::shared_ptr<Built>> nets_;
     Built* current_ = nullptr;                   // ready()'s answer for this evaluate
+    bool building_ = false;                      // v2.6: ready() said no only because a network is building
     std::vector<std::pair<uint64_t, std::shared_ptr<Built>>> retired_;
     std::vector<std::pair<uint64_t, std::shared_ptr<FeatureState>>> retired_features_;
     std::vector<std::pair<uint64_t, ID3D12Resource*>> retire_upload_;

@@ -192,7 +192,8 @@ w2::Stage* programs(ID3D12Device* device, std::string* why) {
     g_programs.state = 1;
     *why = "its D3D12 programs are being made";
     const std::wstring folder = nr::pe::asd::folder() + L"\\wilsjo2-d3d12";
-    nr::pe::log("[asd] wilsjo2 on D3D12: making its programs from %ls (the bridge runs these frames until they are made)",
+    nr::pe::log("[asd] wilsjo2 on D3D12: making its programs from %ls (until they are made these frames pass through "
+                "with no NR; the bridge is not used)",
                 folder.c_str());
     device->AddRef();
     std::thread([device, folder] {
@@ -220,6 +221,10 @@ w2::Stage* programs(ID3D12Device* device, std::string* why) {
         device->Release();
     }).detach();
     return nullptr;
+}
+bool programs_failed() {   // v2.6: the programs cannot be made on this device (the bridge runs wilsjo2)
+    std::lock_guard<std::mutex> l(g_programs.m);
+    return g_programs.state == 3;
 }
 Stage12* programs_impl() {
     std::lock_guard<std::mutex> l(g_programs.m);
@@ -665,7 +670,8 @@ namespace {
 // of the run is recorded, so a frame's NR runs once, on one route.
 std::string native_refusal(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, const Wilsjo2Owner& o, const Wilsjo2Frame& f,
                            const w2::Settings& s, ID3D12Resource* target, uint32_t w, uint32_t h, w2::Stage** stage,
-                           native::Stage12** impl) {
+                           native::Stage12** impl, bool* waiting) {
+    *waiting = false;
     if (!nr::pe::asd::enabled()) return "ASD is off (dlssnr-amd-asd.ini)";
     // v2.1 A/B: [D3D12ASD] W2Native = 0 in dlssnr-amd-asd.ini runs wilsjo2 on the bridge (the 0.0.8.1 route) with the
     // same package, to tell a native-route fault from the game's / frame generation's (read once a launch; default 1)
@@ -698,14 +704,23 @@ std::string native_refusal(ID3D12GraphicsCommandList* cmd, ID3D12Device* device,
         if (ed.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && native::srv_format(ed.Format) == DXGI_FORMAT_UNKNOWN)
             return "the exposure texture's format is the bridge's";
     }
+    // v2.6 (Kenny): while ASD's pieces are made - the programs, the network - the frames pass through with no NR (the
+    // bridge is neither run nor built for them); both are made at once. The bridge only where ASD will not run.
     std::string why;
     *stage = native::programs(device, &why);
-    if (!*stage) return why;
-    *impl = native::programs_impl();
-    if (!*impl) return "its D3D12 programs are being made";
     uint32_t mw = w, mh = h;
     w2::flow_model_extent(s, w, h, o.flow, true, &mw, &mh);
-    if (!nr::pe::asd::wilsjo2_ready(device, cmd, mw, mh, &why)) return why;
+    std::string nwhy;
+    bool building = false;
+    const bool net_ready = nr::pe::asd::wilsjo2_ready(device, cmd, mw, mh, &nwhy, &building);
+    if (!net_ready && !building) return nwhy;   // ASD will not run it: the bridge
+    if (!*stage) {
+        if (!native::programs_failed()) { *waiting = true; return why; }
+        return why;   // the programs cannot be made: the bridge
+    }
+    *impl = native::programs_impl();
+    if (!*impl) { *waiting = true; return "its D3D12 programs are being made"; }
+    if (!net_ready) { *waiting = true; return nwhy; }
     return "";
 }
 }  // namespace
@@ -720,7 +735,13 @@ bool wilsjo2_run(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, Wilsjo2Ow
         nr::dlssnr::with_d3d12_session([&](nr::pe::Session& session) { bridged = session.bridged(device); });
         if (bridged) {
             o.capture_layer = false;
-            const std::string why = native_refusal(cmd, device, o, f, s, target, w, h, &nstage, &nimpl);
+            bool waiting = false;
+            const std::string why = native_refusal(cmd, device, o, f, s, target, w, h, &nstage, &nimpl, &waiting);
+            if (!why.empty() && waiting) {   // v2.6: ASD will run it once made; until then no NR, no bridge
+                native::say_route("waiting for ASD (" + why + "): frames pass through with no NR; the bridge is not used");
+                nr::dlssnr::note_route(nr::dlssnr::kRouteAsdWaiting);
+                return false;
+            }
             if (!why.empty()) {
                 if (nr::pe::asd::enabled()) native::say_route("the Vulkan bridge (the 0.0.8.1 route) for now: " + why);
                 nr::dlssnr::note_route(nr::dlssnr::kRouteNativeBridged);   // v2.2: the routes' counts

@@ -262,7 +262,9 @@ bool fallback(const std::string& why) {
 
 }  // namespace
 
-bool wilsjo2_ready(ID3D12Device* device, ID3D12GraphicsCommandList* cmd, uint32_t w, uint32_t h, std::string* why) {
+bool wilsjo2_ready(ID3D12Device* device, ID3D12GraphicsCommandList* cmd, uint32_t w, uint32_t h, std::string* why,
+                   bool* building) {
+    if (building) *building = false;
     std::string w_;
     std::string& y = why ? *why : w_;
     if (!enabled()) { y = "ASD is off (dlssnr-amd-asd.ini Enabled = 0)"; return false; }
@@ -278,7 +280,11 @@ bool wilsjo2_ready(ID3D12Device* device, ID3D12GraphicsCommandList* cmd, uint32_
         if (!build(device, &y)) { g.broken = true; g.broken_why = y; }
     }
     if (g.broken) { y = g.broken_why; return false; }
-    if (!g.network->ready(device, w, h, &y)) { y = "the network: " + y; return false; }
+    if (!g.network->ready(device, w, h, &y)) {
+        if (building) *building = g.network->building();
+        y = "the network: " + y;
+        return false;
+    }
     note_network(g.network->name());
     return true;
 }
@@ -337,7 +343,15 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
     }
     {
         std::string nwhy;
-        if (!g.network->ready(f.device, w, h, &nwhy)) return fallback("the network: " + nwhy);
+        if (!g.network->ready(f.device, w, h, &nwhy)) {
+            // v2.6 (Kenny): while ASD's network builds, no bridge - the model passes the frame through with no NR
+            if (g.network->building() && f.waiting) {
+                *f.waiting = 1;
+                note_backend(("not run yet: " + nwhy + " (frames pass through with no NR; the bridge is not used)").c_str(), false);
+                return false;
+            }
+            return fallback("the network: " + nwhy);
+        }
         note_network(g.network->name());   // "(building)" until a network is active, then the model
         nr::D3d12NetControls nc;
         nc.style = f.style;
