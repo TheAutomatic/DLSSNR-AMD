@@ -713,7 +713,7 @@ std::string native_refusal(ID3D12GraphicsCommandList* cmd, ID3D12Device* device,
     std::string nwhy;
     bool building = false;
     const bool net_ready = nr::pe::asd::wilsjo2_ready(device, cmd, mw, mh, &nwhy, &building);
-    if (!net_ready && !building) return nwhy;   // ASD will not run it: the bridge
+    if (!net_ready && !building) return nwhy;   // ASD will not run it: the bridge (v2.7: passing states set `building`)
     if (!*stage) {
         if (!native::programs_failed()) { *waiting = true; return why; }
         return why;   // the programs cannot be made: the bridge

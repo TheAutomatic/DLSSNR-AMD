@@ -21,6 +21,7 @@ bool prepare(ID3D12GraphicsCommandList*, std::string* why) {
     *why = "the command-list cut is x86-64 only";
     return false;
 }
+bool disabled() { return true; }
 struct Snapshot {};
 std::shared_ptr<Snapshot> snapshot(ID3D12GraphicsCommandList*) { return nullptr; }
 void restore(ID3D12GraphicsCommandList*, const std::shared_ptr<Snapshot>&) {}
@@ -1490,6 +1491,11 @@ bool cut(List* list, Job job, const std::shared_ptr<Snapshot>& state, std::strin
     c.segments.push_back(Segment{std::move(job), cont});
     set_pair(list, reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(cont->list) | (foreign ? kForeign : 0)));
     return true;
+}
+
+bool disabled() {   // v2.7
+    std::lock_guard<std::recursive_mutex> guard(g_mutex);
+    return g_disabled;
 }
 
 #endif

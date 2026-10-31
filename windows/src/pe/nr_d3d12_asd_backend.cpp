@@ -269,10 +269,21 @@ bool wilsjo2_ready(ID3D12Device* device, ID3D12GraphicsCommandList* cmd, uint32_
     std::string& y = why ? *why : w_;
     if (!enabled()) { y = "ASD is off (dlssnr-amd-asd.ini Enabled = 0)"; return false; }
     if (!device || !cmd) { y = "no device or command list"; return false; }
-    if (!nr::pe::split::prepare(cmd, &y)) { y = "the command list's state is not known (" + y + ")"; return false; }
+    // v2.7: a list state not known yet (the hooks came after its Reset), a recording blocked this moment (render pass,
+    // query, predicate, bundle, too many cuts) and a canary not run / still running are waits, not the bridge; only the
+    // cut off for good and a canary MISS / FAIL take the bridge
+    if (!nr::pe::split::prepare(cmd, &y)) {
+        if (building && !nr::pe::split::disabled()) *building = true;
+        y = "the command list's state is not known (" + y + ")";
+        return false;
+    }
     on_device(device);   // the canary, once
     const Canary c = canary();
-    if (c != Canary::kHit) { y = std::string("canary ") + canary_name(c); return false; }
+    if (c != Canary::kHit) {
+        if (building && (c == Canary::kNotRun || c == Canary::kRunning)) *building = true;
+        y = std::string("canary ") + canary_name(c);
+        return false;
+    }
     if (g.device != device) {
         drop_device();
         device->AddRef();
@@ -299,10 +310,22 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
     const auto output_state = static_cast<D3D12_RESOURCE_STATES>(f.output_state);
     sweep();
     std::string why;
-    if (!nr::pe::split::prepare(f.cmd, &why)) return fallback("the command list's state is not known (" + why + ")");
+    // v2.7: as wilsjo2_ready - passing states wait (the frame as it came, no NR, no bridge); lasting ones take the bridge
+    const auto wait = [&](const std::string& y) {
+        *f.waiting = 1;
+        note_backend(("not run yet: " + y + " (frames pass through with no NR; the bridge is not used)").c_str(), false);
+        return false;
+    };
+    if (!nr::pe::split::prepare(f.cmd, &why)) {
+        if (f.waiting && !nr::pe::split::disabled()) return wait("the command list's state is not known (" + why + ")");
+        return fallback("the command list's state is not known (" + why + ")");
+    }
     on_device(f.device);   // the canary, once
     const Canary c = canary();
-    if (c != Canary::kHit) return fallback(std::string("canary ") + canary_name(c));
+    if (c != Canary::kHit) {
+        if (f.waiting && (c == Canary::kNotRun || c == Canary::kRunning)) return wait(std::string("canary ") + canary_name(c));
+        return fallback(std::string("canary ") + canary_name(c));
+    }
 
     if (g.device != f.device) {
         drop_device();
