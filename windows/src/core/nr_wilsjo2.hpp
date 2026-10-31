@@ -490,6 +490,16 @@ Constants copy_constants(Mode mode, uint32_t sx, uint32_t sy, uint32_t dx, uint3
 
 class Stage {
 public:
+    // Another API's programs behind the same interface (the .asi's native D3D12 route, M5 v2: the same programs
+    // compiled by the D3D12 driver; nr_asi_wilsjo2.cpp). An Image there names that API's resource; the
+    // VkCommandBuffer handed to record() is not used.
+    struct Backend {
+        virtual ~Backend() = default;
+        virtual void record(const Dispatch&) = 0;   // throws as record() does
+        virtual bool has(Mode mode) const = 0;
+        virtual void end_recording() {}
+    };
+    explicit Stage(std::unique_ptr<Backend> other);
     // `shaders`: the folder holding wilsjo2_<mode>.spv.
     Stage(const HostDevice&, const std::string& shaders);
     ~Stage();
@@ -515,6 +525,7 @@ public:
     struct Impl;
 private:
     std::unique_ptr<Impl> impl_;
+    std::unique_ptr<Backend> other_;   // set: every call goes to it (impl_ is empty)
 };
 
 }  // namespace nr::wilsjo2

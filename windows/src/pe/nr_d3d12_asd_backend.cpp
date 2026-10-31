@@ -262,6 +262,27 @@ bool fallback(const std::string& why) {
 
 }  // namespace
 
+bool wilsjo2_ready(ID3D12Device* device, ID3D12GraphicsCommandList* cmd, uint32_t w, uint32_t h, std::string* why) {
+    std::string w_;
+    std::string& y = why ? *why : w_;
+    if (!enabled()) { y = "ASD is off (dlssnr-amd-asd.ini Enabled = 0)"; return false; }
+    if (!device || !cmd) { y = "no device or command list"; return false; }
+    if (!nr::pe::split::prepare(cmd, &y)) { y = "the command list's state is not known (" + y + ")"; return false; }
+    on_device(device);   // the canary, once
+    const Canary c = canary();
+    if (c != Canary::kHit) { y = std::string("canary ") + canary_name(c); return false; }
+    if (g.device != device) {
+        drop_device();
+        device->AddRef();
+        g.device = device;
+        if (!build(device, &y)) { g.broken = true; g.broken_why = y; }
+    }
+    if (g.broken) { y = g.broken_why; return false; }
+    if (!g.network->ready(device, w, h, &y)) { y = "the network: " + y; return false; }
+    note_network(g.network->name());
+    return true;
+}
+
 bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
     if (!f.device || !f.cmd || !f.color || !f.output) return false;
     // Stages of the 0.0.8.1 path this backend does not run yet: that path takes the frame whole.
