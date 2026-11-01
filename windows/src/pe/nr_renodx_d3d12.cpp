@@ -1149,8 +1149,21 @@ struct Stage::Impl {
         states[r] = D3D12_RESOURCE_STATE_COMMON;
         return r;
     }
-    void drop(Tex& t) { if (t.res) { release(t.res); states.erase(t.res); t = {}; } }
-    void drop_buf(ID3D12Resource*& r) { if (r) { release(r); states.erase(r); r = nullptr; } }
+    // A replaced surface may still be read by a recorded frame another list has not run yet, so the release goes
+    // through the caller's completion watermark when it gave one; `states` forgets it either way.
+    std::function<void(ID3D12Resource*)> retire;
+    void drop(Tex& t) {
+        if (!t.res) return;
+        states.erase(t.res);
+        if (retire) retire(t.res); else release(t.res);
+        t = {};
+    }
+    void drop_buf(ID3D12Resource*& r) {
+        if (!r) return;
+        states.erase(r);
+        if (retire) retire(r); else release(r);
+        r = nullptr;
+    }
 
     // One descriptor slot: a texture (SRV or UAV) or a buffer (structured float4 or raw uints, read or written).
     struct View {
@@ -1690,6 +1703,19 @@ void Stage::Impl::run_look(ID3D12GraphicsCommandList* cmd, uint32_t pass, Tex& r
 }
 
 // The frame as it came: colour into the output (a byte copy; the same image: nothing at all).
+
+// The float formats v6_exposure_scale reads (.r), as RenoDX's Vulkan path lists them.
+static bool exposure_format_readable(DXGI_FORMAT f) {
+    switch (f) {
+        case DXGI_FORMAT_R16_FLOAT: case DXGI_FORMAT_R16G16_FLOAT: case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        case DXGI_FORMAT_R32_FLOAT: case DXGI_FORMAT_R32G32_FLOAT: case DXGI_FORMAT_R32G32B32A32_FLOAT:
+        case DXGI_FORMAT_R11G11B10_FLOAT:
+            return true;
+        default:
+            return false;
+    }
+}
+
 void Stage::Impl::copy_frame(ID3D12GraphicsCommandList* cmd, const Frame& f) {
     if (f.colour == f.output) {
         if (f.colour_state != f.output_state)
@@ -1855,6 +1881,40 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
     facts.hdr_mode = hdr;
     facts.absolute = units.absolute;
     facts.prep_exposure = prep_on && pp.exposure != 0;
+    // Everything a frame may need that can fail to be made is made before any command of this frame's pass is
+    // recorded: a creation failure then returns with the caller's list as it came (his states came back in
+    // copy_frame, nothing is bound, no half frame), instead of after bindings the next caller would inherit.
+    const bool have_motion = f.motion && f.motion_w && f.motion_h;
+    const look::Settings ls = look::snapshot(s, f.after_upscale && have_motion);
+    const uint32_t fast_slot = std::min(s.fast_method, 2u);
+    const bool fast = s.passes_mode == 1u && (s.fast_method == 3u ? s.fast_edit_strength != 1.f : s.fast_passes[fast_slot] > 1.f);
+    const bool fast_motion = have_motion && f.fast_motion_available;
+    const bool fast_history = s.fast_method == 1u || s.fast_method == 2u;
+    const bool fast_feedback = fast && fast_history && fast_motion;
+    facts.fast_passes = s.passes_mode == 1u ? (s.fast_method == 3u ? s.fast_edit_strength : s.fast_passes[fast_slot]) : 0.f;
+    facts.motion = fast_motion;
+    {
+        std::string why;
+        const bool motion_wanted = (ls.stabilize == 2u && have_motion && look::dispatched(ls, false)) || fast_feedback;
+        if (motion_wanted && have_motion) {
+            const D3D12_RESOURCE_DESC md = f.motion->GetDesc();
+            if (motion.res && (motion.w != f.motion_w || motion.h != f.motion_h || motion.format != md.Format)) drop(motion);
+            if (!motion.res) motion = make_tex(f.motion_w, f.motion_h, md.Format, false, &why);
+            if (!motion.res) return 0;
+        }
+        if (hdr && f.exposure) {
+            const DXGI_FORMAT ef = f.exposure->GetDesc().Format;
+            const bool readable = exposure_format_readable(ef);
+            if (readable && select_feed(s, hdr, units, readable, f.auto_exposure || !f.create_flags_known) == kFeedTexture) {
+                if (!exposure_1x1.res || exposure_1x1.format != ef) {
+                    drop(exposure_1x1);
+                    exposure_1x1 = make_tex(1, 1, ef, false, &why);
+                }
+                if (!exposure_1x1.res) return 0;
+            }
+        }
+    }
+
     // HDR with Preprocess: the resolve's ratio is taken behind Preprocess's curve (the _prep programs); with its
     // Inverse off, in the picture the network was shown (RenoDX's own resolve).
     const bool prep_exposure = prep_on && pp.exposure != 0;
@@ -1904,16 +1964,7 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
     };
 
 
-    // Passes (fast) this frame (nr_renodx.cpp's planning).
-    const bool have_motion = f.motion && f.motion_w && f.motion_h;
-    const look::Settings ls = look::snapshot(s, f.after_upscale && have_motion);
-    const uint32_t fast_slot = std::min(s.fast_method, 2u);
-    const bool fast = s.passes_mode == 1u && (s.fast_method == 3u ? s.fast_edit_strength != 1.f : s.fast_passes[fast_slot] > 1.f);
-    const bool fast_motion = have_motion && f.fast_motion_available;
-    const bool fast_history = s.fast_method == 1u || s.fast_method == 2u;
-    const bool fast_feedback = fast && fast_history && fast_motion;
-    facts.fast_passes = s.passes_mode == 1u ? (s.fast_method == 3u ? s.fast_edit_strength : s.fast_passes[fast_slot]) : 0.f;
-    facts.motion = fast_motion;
+    // Passes (fast) this frame (nr_renodx.cpp's planning): the decisions above, only their line.
     facts.fast_fallback = fast && fast_history && !fast_motion;
     if (!fast && st_fineh.res) {   // Passes (fast) off: its images go (nr_renodx.cpp's retire)
         for (Tex* t : {&st_fineh, &st_fbadd, &st_d0, &st_d1, &st_t0, &st_t1, &st_g0, &st_g1, &st_f0[0], &st_f0[1],
@@ -1928,12 +1979,6 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
     const bool motion_wanted = (ls.stabilize == 2u && have_motion && look::dispatched(ls, false)) || fast_feedback;
     if (motion_wanted && have_motion) {
         const D3D12_RESOURCE_DESC md = f.motion->GetDesc();
-        if (motion.res && (motion.w != f.motion_w || motion.h != f.motion_h || motion.format != md.Format)) drop(motion);
-        if (!motion.res) {
-            std::string why;
-            motion = make_tex(f.motion_w, f.motion_h, md.Format, false, &why);
-            if (!motion.res) return 0;
-        }
         transition(cmd, f.motion, f.motion_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
         ensure(cmd, motion.res, D3D12_RESOURCE_STATE_COPY_DEST);
         D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
@@ -2082,16 +2127,7 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
                 commit_cleared = true;
             }
             // The float formats v6_exposure_scale reads (.r), as RenoDX's Vulkan path lists them.
-            bool readable = false;
-            switch (f.exposure ? f.exposure->GetDesc().Format : DXGI_FORMAT_UNKNOWN) {
-                case DXGI_FORMAT_R16_FLOAT: case DXGI_FORMAT_R16G16_FLOAT: case DXGI_FORMAT_R16G16B16A16_FLOAT:
-                case DXGI_FORMAT_R32_FLOAT: case DXGI_FORMAT_R32G32_FLOAT: case DXGI_FORMAT_R32G32B32A32_FLOAT:
-                case DXGI_FORMAT_R11G11B10_FLOAT:
-                    readable = true;
-                    break;
-                default:
-                    break;
-            }
+            const bool readable = exposure_format_readable(f.exposure ? f.exposure->GetDesc().Format : DXGI_FORMAT_UNKNOWN);
             feed = select_feed(s, hdr, units, readable, f.auto_exposure || !f.create_flags_known);
             facts.feed = feed == kFeedV1 ? 0 : feed == kFeedTexture ? 1 : 2;
             facts.exposure_texture = !f.exposure ? 0 : readable ? 1 : 2;
@@ -2121,13 +2157,6 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
                 const bool texture = feed == kFeedTexture && readable;
                 if (texture) {
                     // Texel (0,0), the one v6_exposure_scale reads, into the stage's own image.
-                    const DXGI_FORMAT ef = f.exposure->GetDesc().Format;
-                    if (!exposure_1x1.res || exposure_1x1.format != ef) {
-                        drop(exposure_1x1);
-                        std::string why;
-                        exposure_1x1 = make_tex(1, 1, ef, false, &why);
-                        if (!exposure_1x1.res) return 0;
-                    }
                     transition(cmd, f.exposure, f.exposure_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
                     ensure(cmd, exposure_1x1.res, D3D12_RESOURCE_STATE_COPY_DEST);
                     D3D12_TEXTURE_COPY_LOCATION esrc{}, edst{};
@@ -2611,5 +2640,9 @@ uint32_t Stage::record(ID3D12GraphicsCommandList* cmd, const Frame& f, const Fra
 
 uint8_t Stage::hdr_mode() const { return impl_->hdr; }
 Stage::Facts Stage::facts() const { return impl_->facts; }
+
+void Stage::set_retire(std::function<void(ID3D12Resource*)> f) {
+    if (impl_) impl_->retire = std::move(f);
+}
 
 }  // namespace nr::pe::asd::renodx12

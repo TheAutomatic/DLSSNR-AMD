@@ -99,6 +99,10 @@ public:
     };
     Facts facts() const;
 
+    // Where a resource this stage drops goes: the caller retires it (its own completion watermark), because a stage
+    // may replace a surface while earlier frames that used it are still in flight. Unset: dropped at once.
+    void set_retire(std::function<void(ID3D12Resource*)> f);
+
 private:
     Stage() = default;
     struct Impl;

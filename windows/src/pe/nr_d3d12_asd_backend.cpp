@@ -993,6 +993,7 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
         c.feature = f.feature;
         g.renodx_retired.emplace_back(int64_t(g.frames), std::move(e.stage));   // released once the GPU ran past this frame
         auto made = renodx12::Stage::make(c, &why);
+        if (made) made->set_retire([](ID3D12Resource* r) { retire(r); });   // released on the backend's watermark
         if (!made) return fallback("the RenoDX route: " + why);
         e.stage = std::move(made);
         e.w = w; e.h = h; e.nw = nw; e.nh = nh; e.format = sf;
@@ -1014,6 +1015,7 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
         c.settings = s;
         c.feature = f.feature;
         e.stage = renodx12::Stage::make(c, &why);
+        if (e.stage) e.stage->set_retire([](ID3D12Resource* r) { retire(r); });
         if (!e.stage) return fallback("the RenoDX route: " + why);
     }
 
