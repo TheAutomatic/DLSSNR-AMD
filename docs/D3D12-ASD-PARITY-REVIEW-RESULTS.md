@@ -121,3 +121,19 @@
 读数：**ACO + D3D12 路线与参考路线的误差比 DXIL 路线低一个数量级**，说明 stage 的 host 逻辑与网络接线一致；
 残余 ~1/1023 归因未做（需要逐层对照）。对照仅用于**正确性**：参考宿主是纯 Vulkan，**不是**
 D3D12→Vulkan 共享资源/fence 的 bridge，不能拿它的时间当桥接或 ACO 的性能。
+
+## 真实桥接 A/B（D3D12 ↔ Vulkan 共享纹理/fence，完整 stage）
+
+`windows/tests/d3d12_asd/nr_bridge_host.cpp`：D3D12 设备 → `bridge::Device::get(LUID)` → `create_d3d12` 的
+colour/output/motion/depth 共享图像 → 参考 `nr::renodx::Stage` 在共享 job 上跑完整流程（预处理/编码/网络/resolve）
+→ `run_between` → D3D12 队列回读。ACO 在桥接设备上生效（`ACO network: pipeline binaries ... (LLPC)`）。
+
+| 对比（R10G10B10A2，通道绝对值） | R max/mean | G max/mean | B max/mean |
+|---|---|---|---|
+| 桥接输出 vs 纯 Vulkan 参考宿主 | 0 / 0.000 | 0 / 0.000 | 0 / 0.000 |
+| 桥接输出 vs D3D12-ASD(ACO) | 30 / 1.12 | 36 / 1.00 | 38 / 2.30 |
+| 桥接输出 vs D3D12-ASD(驱动 DXIL) | 221 / 16.24 | 144 / 11.85 | 242 / 43.97 |
+
+读数：桥接交接**逐位不改变**参考路线的结果（与参考宿主完全一致），说明共享纹理/fence 与 job 顺序正确；
+桥接(ACO) 与 D3D12-ASD(ACO) 的差仍在 ~1/1023 量级，DXIL 路线差一个数量级。**这不是性能测量**：
+还没有多帧计时、没有同 HDR preprocess/resolve 的 A/B 计时，也没有帧时间数据；`P4-bridge-host-run.txt` 为完整日志。
