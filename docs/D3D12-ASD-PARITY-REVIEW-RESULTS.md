@@ -63,6 +63,30 @@
 | 资源/状态/表/push/内存序与计划一致 | 与旧桥接的数值一致（桥接对照宿主未搭） |
 | 完成信号与退休生命周期（等 GPU 水位） | 多 pass / resize / 特征回收边界 |
 
+## P2 资源状态/描述符（逐条核对结果）
+
+| 项 | 结果 | 依据 |
+|---|---|---|
+| 入表规则：只有 `make_tex`/`make_buffer` 以 COMMON 入表 | 符合 | `make_tex()` 同时插表；外部资源每帧重登记 |
+| 外部资源首帧按调用者状态 | 符合 | `f.colour`/`f.output` 用调用者声明的状态登记 |
+| 同状态不转换 | 符合 | `transition()` 比较即返回 |
+| 手写 barrier 与状态表一致 | 符合 | `copy_frame()`、`ensure()` 每个改动都写表 |
+| 每条路径都恢复调用者状态 | 符合 | record 尾部恢复并 `restore()` 调用者的 split 状态 |
+| 每帧重新登记指针与状态 | 符合 | `f` 每帧 `ensure()` 后登记 |
+| 复用前清理/改写描述符 | 符合 | 每个 dispatch 都重建 SRV/UAV 描述符 |
+| 堆/表/根签名在网络上运行后有效 | 符合 | 网络只设自己的根签名（`nr_d3d12_asd_net.cpp` 无 `SetDescriptorHeaps`），stage 每个 dispatch 重新设 RS+PSO+两张表 |
+| 失败返回导致半帧已录制 | 已记录，影响仅内部资源 | 5 处 `return 0`（`prep_keep`/`prep_state`/`motion`/`exposure_1x1` 等）都在写回帧之前；调用者按“未运行”原样放过 |
+
+## P3 完成信号/退休（逐条核对结果）
+
+| 项 | 结果 | 依据 |
+|---|---|---|
+| 网络退休：copy 与 exec 两段水位 | 已修（前次提交） | `refresh_copied`/`refresh_executed`，torn read 过滤 |
+| 后端退休：stage/资源 | 本轮修复 | `mark_frame` + `refresh_executed` + `token_slots` 增长；证据 `P3-completion-watermark-3frames.txt`（3 帧 `S_OK`） |
+| 后端水位与 device 代际 | 本轮修复 | `drop_device()` 释放 token/done/两张退休表并清水位 |
+| stage 内部纹理 | 随 stage 一起退休 | stage 由后端水位决定释放时刻 |
+| 后端 broken 路径 | 不走 ASD，重试有界 | `broken` + `broken_why`，`evaluate` 早退 |
+
 ## P1 资源契约（当前帧实际用到的资源）
 
 | 资源 | owner | 进入状态 | 本帧用途 | 所需状态/依赖 | 退出状态 | 状态表更新者 |
