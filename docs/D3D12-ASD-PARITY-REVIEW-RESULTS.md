@@ -105,3 +105,19 @@
 
 规则：只有 `make_tex`/`make_buffer` 造出来的资源以 COMMON 入表；外部资源每帧按调用者声明重新登记；
 所有转换（`transition()`、`ensure()`、`copy_frame()` 的手写 barrier）都写同一张表；同状态不转换。
+
+## 参考宿主（Vulkan,0.0.8.1 路线）与 D3D12 路线的对照
+
+`windows/tests/d3d12_asd/nr_parity_host.cpp`（`windows/build/build_parity_host.sh`）在**生产设备创建**
+（`nrvk::Context::create`，与 D3D12 设备 LUID 对应的适配器，`buffer_device_address` 取自设备本身）上构建
+`nr::Runtime`（temporal 开启，root = 组装的安装树，`configure_network` 打开 ACO Mode），并用参考
+`nr::renodx::Stage` 跑同一帧（同 HDR10/present 2/203 nits、同 guide 字节、同输入图案）：
+
+| 对比（R10G10B10A2，通道绝对值，3840x2160） | R max/mean | G max/mean | B max/mean |
+|---|---|---|---|
+| 参考(Vulkan, ACO Mode) vs D3D12-ASD(ACO) | 32 / 1.14 | 34 / 1.05 | 41 / 2.47 |
+| 参考(Vulkan, ACO Mode) vs D3D12-ASD(驱动 DXIL) | 222 / 16.06 | 144 / 11.63 | 247 / 43.99 |
+
+读数：**ACO + D3D12 路线与参考路线的误差比 DXIL 路线低一个数量级**，说明 stage 的 host 逻辑与网络接线一致；
+残余 ~1/1023 归因未做（需要逐层对照）。对照仅用于**正确性**：参考宿主是纯 Vulkan，**不是**
+D3D12→Vulkan 共享资源/fence 的 bridge，不能拿它的时间当桥接或 ACO 的性能。
