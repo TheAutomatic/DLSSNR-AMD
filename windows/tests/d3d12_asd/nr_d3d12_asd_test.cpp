@@ -52,7 +52,11 @@ void log(const char* format, ...) {
     std::printf("\n");
     std::fflush(stdout);
 }
-const char* module_folder() { return "."; }
+// The backend resolves its shaders and model under module_folder() (in the .asi that is the game's folder); a test
+// decides it, so the renodx mode can point at a real installation.
+static std::string g_module_folder = ".";
+void set_module_folder(const std::string& f) { g_module_folder = f; }
+const char* module_folder() { return g_module_folder.c_str(); }
 namespace split {
 struct Snapshot {};
 bool prepare(ID3D12GraphicsCommandList*, std::string*) { return true; }
@@ -616,6 +620,11 @@ int renodx_run(int argc, char** argv) {
                                                  nullptr, IID_PPV_ARGS(&frame));
     if (FAILED(hc) || !frame) { log("[test] renodx: the frame could not be made (0x%08lX)", static_cast<unsigned long>(hc)); return 4; }
 
+    if (const char* fc = std::getenv("NR_TEST_FORCE_CANARY"); fc && fc[0] == '1') {
+        asd::force_canary_for_test();
+        log("[test] renodx: canary forced (test): no driver registration needed");
+    }
+    nr::pe::set_module_folder(game);
     asd::on_device(d);
     if (!wait_for(&canary_done, 30000)) { log("[test] renodx: the canary did not finish"); return 5; }
     log("[test] renodx: canary %s", asd::status().canary.c_str());
@@ -726,6 +735,8 @@ int stage_run(int argc, char** argv) {
     const HRESULT hr = D3D12CreateDevice(best, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&d));
     log("[test] stage: D3D12CreateDevice 0x%08lX", static_cast<unsigned long>(hr));
     if (FAILED(hr) || !d) return 3;
+    // The capture attaches its info queue and DRED to the device here: without the backend there is no other caller.
+    nr::pe::capture::adopt(d);
 
     ID3D12CommandQueue* q = nullptr;
     ID3D12CommandAllocator* a = nullptr;

@@ -28,6 +28,7 @@ using nr::pe::log;
 std::mutex g_lock;            // the strings below
 std::wstring g_folder, g_ini;
 bool g_enabled = false, g_register = true, g_tint = false;
+std::atomic<bool> g_canary_forced{false};   // tests only: see force_canary_for_test
 int g_dispatch_limit = 0;   // [D3D12ASD] DispatchLimit: record only the first N dispatches (0: all), to bisect a fault
 std::wstring g_sodb_name = L"dlssnr-amd-asd.sodb", g_psdb_name = L"dlssnr-amd-asd-gfx1201.psdb";
 std::wstring g_family = L"AMD_NAVI48:gfx1201";
@@ -1062,8 +1063,9 @@ std::wstring sodb_path() { return g_folder + L"\\" + g_sodb_name; }
 std::wstring psdb_path() { return g_folder + L"\\" + g_psdb_name; }
 bool enabled() { return g_enabled; }
 int dispatch_limit() { return g_dispatch_limit; }
+void force_canary_for_test() { g_canary_forced.store(true); }
 bool debug_tint() { return g_tint; }
-Canary canary() { return Canary(g_canary.load()); }
+Canary canary() { return g_canary_forced.load() ? Canary::kHit : Canary(g_canary.load()); }
 bool diagnostics_done() { return g_diag_done.load(); }
 
 void start(HMODULE self) { start(self, true); }

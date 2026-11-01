@@ -36,6 +36,9 @@ bool enabled();
 // [D3D12ASD] DispatchLimit: only the first N dispatches of a frame are recorded (0: all). For bisecting a fault: a
 // build that survives N but not N+1 names the dispatch that kills it.
 int dispatch_limit();
+// Tests only (nr_d3d12_asd_test): report the canary as ASD_HIT without a driver registration, so the offline host can
+// run the network's recording path. The product never calls this, and nothing in the shipped route reads it.
+void force_canary_for_test();
 // The game's device, from the evaluate (every call; the first one starts the canary on a thread of ours).
 void on_device(ID3D12Device* device);
 Canary canary();

@@ -1197,8 +1197,35 @@ struct Stage::Impl {
     // One dispatch. `srv` / `uav` hold the register-numbered slots (t0.. / u0..); a null slot takes the first
     // non-null one's view (a binding the stage leaves out is one the program never reads, and D3D12 never
     // validates an unaccessed descriptor).
+    // NR_STAGE_DISPATCH_LIMIT=<n>: record only the first n dispatches of a run (0/unset: all). Bisecting which one
+    // loses the device offline, without the game and without guessing.
+    static uint32_t dispatch_limit() {
+        static const uint32_t v = [] {
+            char b[16] = {};
+            const DWORD n = GetEnvironmentVariableA("NR_STAGE_DISPATCH_LIMIT", b, sizeof b);
+            return n && n < sizeof b ? uint32_t(std::atoi(b)) : 0u;
+        }();
+        return v;
+    }
+    uint32_t dispatches_done = 0;
     void dispatch(ID3D12GraphicsCommandList* cmd, P p, View srv[8], View uav[14], const void* push,
                   uint32_t dwords, uint32_t gx, uint32_t gy) {
+        // NR_STAGE_ONLY=<program>: record only that program's dispatches (bisecting a single one in isolation).
+        static const int only = [] {
+            char b[16] = {};
+            const DWORD n = GetEnvironmentVariableA("NR_STAGE_ONLY", b, sizeof b);
+            return n && n < sizeof b ? std::atoi(b) : -1;
+        }();
+        if (only >= 0 && int(p) != only) {
+            jlog("renodx dispatch skipped (only %d): program %u", only, static_cast<unsigned>(p));
+            return;
+        }
+        const uint32_t limit = dispatch_limit();
+        if (limit && dispatches_done >= limit) {
+            jlog("renodx dispatch skipped (limit %u): program %u", limit, static_cast<unsigned>(p));
+            return;
+        }
+        ++dispatches_done;
         const bool codec = codec_sig(p);
         const UINT n_srv = codec ? 6 : 8, n_uav = codec ? 14 : 8;
         bind_heap(cmd);
@@ -1234,6 +1261,7 @@ struct Stage::Impl {
                         D3D12_SHADER_RESOURCE_VIEW_DESC d{};
                         d.Format = DXGI_FORMAT_UNKNOWN;
                         d.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+                        d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
                         if (v.raw) {
                             d.Buffer.NumElements = UINT(v.bytes / 4);
                             d.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
@@ -1276,6 +1304,28 @@ struct Stage::Impl {
         cmd->SetComputeRoot32BitConstants(0, dwords, push, 0);
         cmd->SetComputeRootDescriptorTable(1, gpu);
         cmd->SetComputeRootDescriptorTable(2, gpu_uav);
+        if (journal) {
+            for (UINT i = 0; i < n_srv; ++i)
+                if (srv[i].res) {
+                    const D3D12_RESOURCE_DESC d = srv[i].res->GetDesc();
+                    jlog("  srv%u res %p buffer %d bytes %llu fmt %d | res fmt %d %llux%u flags 0x%X state %u", i,
+                         static_cast<void*>(srv[i].res), srv[i].buffer ? 1 : 0,
+                         static_cast<unsigned long long>(srv[i].bytes), static_cast<int>(srv[i].fmt),
+                         static_cast<int>(d.Format), static_cast<unsigned long long>(d.Width), static_cast<unsigned>(d.Height),
+                         static_cast<unsigned>(d.Flags),
+                         static_cast<unsigned>(states.count(srv[i].res) ? states[srv[i].res] : 0));
+                }
+            for (UINT i = 0; i < n_uav; ++i)
+                if (uav[i].res) {
+                    const D3D12_RESOURCE_DESC d = uav[i].res->GetDesc();
+                    jlog("  uav%u res %p buffer %d bytes %llu fmt %d | res fmt %d %llux%u flags 0x%X state %u", i,
+                         static_cast<void*>(uav[i].res), uav[i].buffer ? 1 : 0,
+                         static_cast<unsigned long long>(uav[i].bytes), static_cast<int>(uav[i].fmt),
+                         static_cast<int>(d.Format), static_cast<unsigned long long>(d.Width), static_cast<unsigned>(d.Height),
+                         static_cast<unsigned>(d.Flags),
+                         static_cast<unsigned>(states.count(uav[i].res) ? states[uav[i].res] : 0));
+                }
+        }
         jlog("renodx dispatch p %u pso %p rs %p srv %u uav %u grid %ux%u push %u dwords", static_cast<unsigned>(p),
              static_cast<void*>(pso[p]), static_cast<void*>(codec ? rs_codec : rs_aux), n_srv, n_uav, gx, gy, dwords);
         cmd->Dispatch(gx, gy, 1);
