@@ -2347,6 +2347,17 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
         nt.have_motion = true;
         // The net reaches these by raw address: lin_proxy and the guides are read (UAV), lin_neural is written (UAV).
         // A real barrier each frame entry - the table is not evidence that the GPU moved.
+        // The guides the net will read, after the stage resampled them.
+        if (f.capture_mv) {
+            ensure(cmd, lin_mv, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            cmd->CopyBufferRegion(f.capture_mv, 0, lin_mv, 0, uint64_t(NW) * NH * 16);
+            ensure(cmd, lin_mv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
+        if (f.capture_depth) {
+            ensure(cmd, lin_depth, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            cmd->CopyBufferRegion(f.capture_depth, 0, lin_depth, 0, uint64_t(NW) * NH * 16);
+            ensure(cmd, lin_depth, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
         ensure(cmd, lin_proxy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         ensure(cmd, lin_neural, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         ensure(cmd, lin_mv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);

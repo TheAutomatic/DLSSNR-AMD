@@ -180,3 +180,15 @@ RGB=0、alpha=1，正好是这个行为，而不是"DXIL 编译的网络"。因�
 - 之前的"ACO vs DXIL/HLSL 差一个数量级"**不是编译器或精度差异**，只是"有网络 vs 无网络"；
 - ASD 路线上网络只有 ACO 一种；与 Vulkan 参考的对比正是 ACO vs ACO；
 - 本文件里所有"DXIL"字样已改为"载体/无 PSDB"。
+
+## 噪声与 guide 的实际输入（逐项核实，不靠假设）
+
+- **噪声规则**：把 ASD 侧 `noise_every_frame` 设为 0、参考侧 `Controls::noise_every_frame=false` 后重跑，
+  ASD 的帧哈希不变（`8DCA…/9E91…/5ED5…`），与参考的网络答案差也不变（mean 0.0072、max 0.1016）。
+  第 0 帧的 seed 本来就是 0（两条规则的差别只在后续帧），所以**帧 0 的差与 seed 无关**；
+  ASD 的 `+1 noise` 是首帧的场生成（不是每帧 seed），它的**内容**是否与参考构建时预计算的场一致**尚未验证**。
+- **guide**：两侧的 motion/depth 都是**全零**、同 extent（ASD 侧 `NR_TEST_ZERO_GUIDES=1`；参考宿主填零）。
+  但 ASD 阶段会把 guide 重采样到 NW×NH（`to_motion`/`to_depth`），参考的运行时在自己的 pre 块里采样，
+  两者的**重采样结果未比对**——已加 `Stage::Frame::capture_mv/capture_depth` 钩子（D3D12 侧可抓），
+  参考侧需要等价的内部钩子，这是下一步。
+- 因此"proxy 一致"不等于"guide 一致"；在当前全零 guide 下，剩余差异不能归因于 guide 输入，只能继续往网络内部分段。

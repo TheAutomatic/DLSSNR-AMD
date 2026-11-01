@@ -801,7 +801,12 @@ int renodx_run(int argc, char** argv) {
     }
     fr.width = W; fr.height = H;
     fr.style = 0; fr.intensity = 1.f; fr.local_tone = 1.f; fr.local_structure = 1.f; fr.skin_structure = -1.f;
-    fr.automatic_mask = 0; fr.reversible_mode = 0; fr.noise_every_frame = 1;
+    fr.automatic_mask = 0; fr.reversible_mode = 0;
+    // NR_TEST_NOISE_EVERY_FRAME=0: the same noise rule as the reference host's Controls, for boundary comparisons.
+    fr.noise_every_frame = [] {
+        const char* n = std::getenv("NR_TEST_NOISE_EVERY_FRAME");
+        return n && n[0] == '0' ? 0 : 1;
+    }();
     fr.motion_scale_x = 1.f / float(W); fr.motion_scale_y = 1.f / float(H);
     fr.history_strength = -1.f;
     fr.feature = 1;

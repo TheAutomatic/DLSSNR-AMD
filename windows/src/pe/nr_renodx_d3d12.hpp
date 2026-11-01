@@ -64,6 +64,10 @@ struct Frame {
     // The network's answer straight from its linear buffer (NW*NH*16 bytes, float4): the raw value before the
     // stage copies it into a texture, so a zero can be told apart from a lost readback.
     ID3D12Resource* capture_raw = nullptr;
+    // The guides as the network reads them (the stage's own resampling), NW*NH*16 bytes each: a proxy match does not
+    // prove the guides match.
+    ID3D12Resource* capture_mv = nullptr;
+    ID3D12Resource* capture_depth = nullptr;
     using Net = std::function<bool(uint32_t pass, uint64_t feature, const nr::D3d12NetControls& controls,
                                    const NetTemporal& nt, ID3D12Resource* in, ID3D12Resource* out)>;
 };

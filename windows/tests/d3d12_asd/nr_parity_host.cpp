@@ -344,7 +344,8 @@ int main(int argc, char** argv) {
             // The ASD route's own settings (dlssnr-amd-asd.ini: NetNoiseEveryFrame 1, automatic mask off), so the
             // two boundaries are compared under the same controls and not just the same proxy.
             nr::Controls controls;
-            controls.noise_every_frame = true;   // the ASD test's frame (noise_every_frame = 1)
+            controls.noise_every_frame =
+                [] { const char* n = std::getenv("NR_STAGE_NOISE_EVERY_FRAME"); return !(n && n[0] == '0'); }();
             controls.automatic_mask = false;
             rt.record_engine(cmd, e, controls);
             // The network's input and answer, recorded in the same command buffer.
