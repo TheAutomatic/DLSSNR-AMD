@@ -1141,9 +1141,18 @@ public:
             if (b->pre_dump && !b->pre_dump_written && int(i) == tp.pre && b->act) {
                 const char* lo = std::getenv("NR_NET_PRE_OFF");
                 const uint64_t roff = lo && lo[0] ? std::strtoull(lo, nullptr, 0) : 0;
-                transition(cmd, b->act, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-                cmd->CopyBufferRegion(b->pre_dump, 0, b->act, roff, b->pre_dump_bytes);
-                transition(cmd, b->act, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                // NR_NET_PRE_SURF=1: the same dump from surf1 instead of the act arena (where the pre block's
+                // output may live on this route).
+                ID3D12Resource* src = std::getenv("NR_NET_PRE_SURF") ? b->surf1 : b->act;
+                const uint64_t cap = src ? src->GetDesc().Width : 0;
+                uint64_t len = b->pre_dump_bytes;
+                if (roff >= cap) len = 0; else if (len > cap - roff) len = cap - roff;
+                if (src && len) {
+                    transition(cmd, src, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    cmd->CopyBufferRegion(b->pre_dump, 0, src, roff, len);
+                    transition(cmd, src, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                    b->pre_dump_bytes = len;
+                }
                 b->pre_dump_written = true;
             }
         }

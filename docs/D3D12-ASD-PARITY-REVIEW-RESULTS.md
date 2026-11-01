@@ -239,3 +239,20 @@ sha256 `cd173835…` / `edcbed17…`）。fswin 的 push 第二个字为 0（输
 因此——剩余变量是各自使用的
 ACO 机器码（ASD 的 `public-copy.psdb` vs 参考安装树的 `aco/records`）。下一步比较两者为 `fswin32nh` 装载的
 ELF（记录文件/PSDB 内容），而不是再比下游。
+
+## pre 的落点：act 里没有（实测扫描）
+
+对 `act` 做 64 MiB 窗口扫描（pre dispatch 之后立即抓取）：
+
+| 区域 | ASD | 参考 |
+|---|---|---|
+| 0–512 MiB | 全零 | 非零窗口在 448 MiB |
+| 512–1024 MiB | 全零 | 非零窗口在 960 MiB |
+| 1024–1408 MiB | 全零 | 未抓 |
+| surf1[0,64 MiB) | 全零 | n/a |
+
+结论：**temporal pre 在 ASD 路线上没有向 act 写任何东西**（至少不在其 1.5 GB 的已扫描区间），而参考路线在 act
+的 448/960 MiB 有非零写入。结合参考侧 pre 的绑定表（`nr_runtime.cpp:1452`，pre 读 `act, act, wgt, wgt, wgt, act`），
+pre 的一部分输出本来就在 **wgt**，下一步应抓 pre 之后的 wgt 区域而不是继续扫 act。
+
+因此"pre 一致"到目前为止**不成立**；已确定的只有 noise 与 weights 逐字节一致。
