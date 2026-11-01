@@ -128,14 +128,6 @@ da430e0a9c6eecefa0d1b27d05e16c426fb5d04e808b194d914eaac4b31bc0f8  $rs/ReShade32.
 EOF
 get "$rs/ReShade-LICENSE.md" https://raw.githubusercontent.com/crosire/reshade/v6.8.0/LICENSE.md \
     237ded5b8344f820113efab1e65e91e1f159d9202c5b4856606a0590d3ffdab0
-# OptiScaler-NR (GPL-3.0), the Windows OptiScaler route's host, shipped as released: 0.8.91. 0.8.4 still works with
-# the same core (NR_OPTI_ZIP=, windows/build/build_package.sh).
-get artifacts/ref/downloads/OptiScaler-NR-v0.8.4.zip \
-    https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass/releases/download/v0.8.4/OptiScaler-NR-v0.8.4.zip \
-    8789912859882e66b3f3a1aa768db947da779dfd65225df69ea919052e73a2e4
-get artifacts/ref/downloads/OptiScaler-NR-v0.8.91.zip \
-    https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass/releases/download/v0.8.91/OptiScaler-NR-v0.8.91.zip \
-    19a2852bb3f88e09075e3ccc66e0318c52e83a5901d9020a10384ae49d59ff77
 
 # OptiScaler (GPL-3.0), the Linux OptiScaler route's host, shipped as released: the official nightly the Linux packages
 # were tested with (OptiScaler v10.0.0-pre1, nightly-20261030), and its licence from its source tree at that nightly.
@@ -167,15 +159,19 @@ EOF
 if [[ $windows == 1 ]]; then
     # DXVK as GE-Proton 11-7 ships it (PE build, it runs on Windows): the DX9 route's d3d9.dll and dxgi.dll.
     ge=GE-Proton11-7-x86_64
-    if [[ ! -f "artifacts/ref/downloads/$ge.tar.gz" ]]; then
-        echo "fetch $ge.tar.gz"
-        curl -fsSL --retry 3 -o "artifacts/ref/downloads/$ge.tar.gz.part" \
-            "https://github.com/GloriousEggroll/proton-ge-custom/releases/download/GE-Proton11-7/$ge.tar.gz"
-        mv -- "artifacts/ref/downloads/$ge.tar.gz.part" "artifacts/ref/downloads/$ge.tar.gz"
+    # The tarball only delivers two DLLs and a version file; already in place (e.g. taken from a release
+    # built from this same pinned GE-Proton), the 400 MB download is skipped.
+    if [[ ! -f "toolchain/$ge/files/lib/wine/dxvk/x86_64-windows/d3d9.dll" ]]; then
+        if [[ ! -f "artifacts/ref/downloads/$ge.tar.gz" ]]; then
+            echo "fetch $ge.tar.gz"
+            curl -fsSL --retry 3 -o "artifacts/ref/downloads/$ge.tar.gz.part" \
+                "https://github.com/GloriousEggroll/proton-ge-custom/releases/download/GE-Proton11-7/$ge.tar.gz"
+            mv -- "artifacts/ref/downloads/$ge.tar.gz.part" "artifacts/ref/downloads/$ge.tar.gz"
+        fi
+        echo "7db87e9787e20c35cbdac26018431d5794626b626e4067b050684e45a88cc2ca229d7d263519eafb2e168cde5bef57611065d159d3685aaec152ccb9abe3073f  artifacts/ref/downloads/$ge.tar.gz" |
+            sha512sum -c --quiet - || { echo "checksum mismatch: $ge.tar.gz" >&2; exit 1; }
+        [[ -d "toolchain/$ge" ]] || tar -C toolchain -xzf "artifacts/ref/downloads/$ge.tar.gz"
     fi
-    echo "7db87e9787e20c35cbdac26018431d5794626b626e4067b050684e45a88cc2ca229d7d263519eafb2e168cde5bef57611065d159d3685aaec152ccb9abe3073f  artifacts/ref/downloads/$ge.tar.gz" |
-        sha512sum -c --quiet - || { echo "checksum mismatch: $ge.tar.gz" >&2; exit 1; }
-    [[ -d "toolchain/$ge" ]] || tar -C toolchain -xzf "artifacts/ref/downloads/$ge.tar.gz"
     mkdir -p artifacts/ref/dxvk
     get artifacts/ref/dxvk/LICENSE \
         https://raw.githubusercontent.com/doitsujin/dxvk/601930949d111edbbcf9dd463948426d9f8f6ddd/LICENSE \
