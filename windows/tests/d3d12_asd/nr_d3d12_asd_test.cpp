@@ -625,6 +625,51 @@ int renodx_run(int argc, char** argv) {
         log("[test] renodx: canary forced (test): no driver registration needed");
     }
     nr::pe::set_module_folder(game);
+    // A fixed pattern in the frame (x*13+y*7 etc. at 10 bits), so the run has a defined input and its output can be
+    // hashed and compared between runs and against another route later.
+    {
+        const uint64_t pitch = uint64_t(W) * 4;
+        D3D12_TEXTURE_COPY_LOCATION dst_loc{}, src_loc{};
+        dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst_loc.pResource = frame;
+        dst_loc.SubresourceIndex = 0;
+        src_loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src_loc.pResource = nullptr;   // set below, once the upload buffer exists
+        src_loc.PlacedFootprint.Footprint = {DXGI_FORMAT_R10G10B10A2_UNORM, W, H, 1, UINT(pitch)};
+        ID3D12Resource* up = buffer(d, D3D12_HEAP_TYPE_UPLOAD, pitch * H, D3D12_RESOURCE_STATE_GENERIC_READ);
+        src_loc.pResource = up;
+        void* m = nullptr;
+        if (!up || FAILED(up->Map(0, nullptr, &m)) || !m) { log("[test] renodx: the input buffer failed"); return 4; }
+        auto* px = static_cast<uint32_t*>(m);
+        for (uint32_t y = 0; y < H; ++y)
+            for (uint32_t x = 0; x < W; ++x)
+                px[uint64_t(y) * W + x] = ((x * 13u + y * 7u) & 0x3FF) | (((x * 5u + y * 11u) & 0x3FF) << 10) |
+                                          (((x * 3u + y * 17u) & 0x3FF) << 20) | (0x3FFu << 30);
+        up->Unmap(0, nullptr);
+        D3D12_RESOURCE_BARRIER tb{};
+        tb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        tb.Transition.pResource = frame;
+        tb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        tb.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        tb.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        l->ResourceBarrier(1, &tb);
+        l->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, nullptr);
+        tb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        tb.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        l->ResourceBarrier(1, &tb);
+        l->Close();
+        ID3D12CommandList* ls[] = {l};
+        q->ExecuteCommandLists(1, ls);
+        q->Signal(f, 100);
+        HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        f->SetEventOnCompletion(100, ev);
+        const bool ok = WaitForSingleObject(ev, 60000) == WAIT_OBJECT_0;
+        CloseHandle(ev);
+        up->Release();
+        if (!ok) { log("[test] renodx: the input copy did not finish"); return 4; }
+        a->Reset();
+        l->Reset(a, nullptr);
+    }
     asd::on_device(d);
     if (!wait_for(&canary_done, 30000)) { log("[test] renodx: the canary did not finish"); return 5; }
     log("[test] renodx: canary %s", asd::status().canary.c_str());
@@ -645,6 +690,7 @@ int renodx_run(int argc, char** argv) {
     fr.renodx_present = 2;         // HDR10
     fr.renodx_white_nits = 203.f;
     fr.renodx_hdr_flag = 1;
+    const int frames = argc > 6 ? std::max(1, std::atoi(argv[6])) : 1;
     int waiting = 0;
     fr.waiting = &waiting;
     bool ran = false;
@@ -656,26 +702,90 @@ int renodx_run(int argc, char** argv) {
         }
     }
     log("[test] renodx: evaluate -> %d (%s)", ran ? 1 : 0, asd::status().backend.c_str());
+    if (!ran) return 7;
 
-    const HRESULT closed = l->Close();
-    log("[test] renodx: Close 0x%08lX", static_cast<unsigned long>(closed));
-    ID3D12CommandList* lists[] = {l};
-    q->ExecuteCommandLists(1, lists);
-    q->Signal(f, 1);
-    HANDLE e = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    f->SetEventOnCompletion(1, e);
-    const bool done = WaitForSingleObject(e, 60000) == WAIT_OBJECT_0;
-    CloseHandle(e);
-    const HRESULT removed = d->GetDeviceRemovedReason();
-    log("[test] renodx: submitted, fence %s, device reason 0x%08lX", done ? "signalled" : "TIMED OUT",
-        static_cast<unsigned long>(removed));
-    nr::pe::capture::drain();
-    if (FAILED(removed)) {
-        nr::pe::capture::device_removed(removed);
-        log("[test] renodx: FAILED - see the diagnostic folder");
-        return 6;
+    // The frames after the first are what exercise the history, the latch and the reset paths.
+    uint64_t fence_value = 0;
+    for (int fi = 0; fi < frames; ++fi) {
+        if (fi > 0) {
+            const HRESULT ra = a->Reset();
+            if (FAILED(ra)) { log("[test] renodx: allocator Reset 0x%08lX", static_cast<unsigned long>(ra)); return 8; }
+            const HRESULT rl = l->Reset(a, nullptr);
+            if (FAILED(rl)) { log("[test] renodx: list Reset 0x%08lX", static_cast<unsigned long>(rl)); return 8; }
+            fr.reset = false;
+            ran = false;
+            for (int attempt = 0; attempt < 600 && !ran; ++attempt) ran = asd::evaluate_backend(fr);
+            if (!ran) { log("[test] renodx: frame %d: not run (%s)", fi, asd::status().backend.c_str()); return 7; }
+        }
+        const HRESULT closed = l->Close();
+        log("[test] renodx: frame %d Close 0x%08lX", fi, static_cast<unsigned long>(closed));
+        if (FAILED(closed)) { log("[test] renodx: FAILED - Close rejected the list"); return 8; }
+        ID3D12CommandList* lists[] = {l};
+        q->ExecuteCommandLists(1, lists);
+        const HRESULT hs = q->Signal(f, ++fence_value);
+        if (FAILED(hs)) { log("[test] renodx: Signal 0x%08lX", static_cast<unsigned long>(hs)); return 8; }
+        HANDLE e = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        const HRESULT hw = f->SetEventOnCompletion(fence_value, e);
+        if (FAILED(hw)) { CloseHandle(e); log("[test] renodx: SetEventOnCompletion 0x%08lX", static_cast<unsigned long>(hw)); return 8; }
+        const bool done = WaitForSingleObject(e, 60000) == WAIT_OBJECT_0;
+        CloseHandle(e);
+        if (!done) { log("[test] renodx: frame %d: the GPU did not finish in 60 s", fi); return 9; }
+        const HRESULT removed = d->GetDeviceRemovedReason();
+        log("[test] renodx: frame %d submitted, fence %s, device reason 0x%08lX", fi,
+            done ? "signalled" : "TIMED OUT", static_cast<unsigned long>(removed));
+        // What the frame became: the same input and route must give the same bytes run to run.
+        {
+            if (a->Reset() == S_OK && l->Reset(a, nullptr) == S_OK) {
+                const uint64_t pitch = uint64_t(W) * 4;
+                ID3D12Resource* rb = buffer(d, D3D12_HEAP_TYPE_READBACK, pitch * H, D3D12_RESOURCE_STATE_COPY_DEST);
+                D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+                dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst.pResource = rb;
+                dst.PlacedFootprint.Footprint = {DXGI_FORMAT_R10G10B10A2_UNORM, W, H, 1, UINT(pitch)};
+                src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.pResource = frame; src.SubresourceIndex = 0;
+                D3D12_RESOURCE_BARRIER tb{};
+                tb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                tb.Transition.pResource = frame;
+                tb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                tb.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                tb.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                l->ResourceBarrier(1, &tb);
+                l->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                tb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                tb.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                l->ResourceBarrier(1, &tb);
+                const HRESULT rc = l->Close();
+                if (SUCCEEDED(rc)) {
+                    ID3D12CommandList* ls[] = {l};
+                    q->ExecuteCommandLists(1, ls);
+                    q->Signal(f, ++fence_value);
+                    HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                    if (SUCCEEDED(f->SetEventOnCompletion(fence_value, ev)) &&
+                        WaitForSingleObject(ev, 60000) == WAIT_OBJECT_0) {
+                        void* m = nullptr;
+                        if (rb && SUCCEEDED(rb->Map(0, nullptr, &m)) && m) {
+                            const auto* p8 = static_cast<const uint8_t*>(m);
+                            uint64_t hh = 1469598103934665603ull;
+                            for (uint64_t i = 0; i < pitch * H; ++i) { hh ^= p8[i]; hh *= 1099511628211ull; }
+                            log("[test] renodx: frame %d output hash %016llX", fi, static_cast<unsigned long long>(hh));
+                            rb->Unmap(0, nullptr);
+                        }
+                    }
+                    CloseHandle(ev);
+                }
+                if (rb) rb->Release();
+                // Leave the list closed, not opened: the next frame resets the allocator first, and an allocator
+                // cannot be reset while an open list still refers to it.
+                l->Close();
+            }
+        }
+        nr::pe::capture::drain();
+        if (FAILED(removed)) {
+            nr::pe::capture::device_removed(removed);
+            log("[test] renodx: FAILED at frame %d - see the diagnostic folder", fi);
+            return 6;
+        }
     }
-    log("[test] renodx: the frame completed with no device error");
+    log("[test] renodx: %d frame(s) completed with no device error", frames);
     return 0;
 }
 

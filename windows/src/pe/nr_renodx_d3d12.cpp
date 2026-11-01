@@ -1062,6 +1062,7 @@ struct Stage::Impl {
 
     // The resource states of ours (external ones - the frame, the guides - are transitioned by the record itself).
     std::map<ID3D12Resource*, D3D12_RESOURCE_STATES> states;
+    D3D12_RESOURCE_STATES& state_of(ID3D12Resource* r) { return states.emplace(r, D3D12_RESOURCE_STATE_COMMON).first->second; }
     void ensure(ID3D12GraphicsCommandList* cmd, ID3D12Resource* r, D3D12_RESOURCE_STATES want) {
         if (!r) return;
         auto [it, fresh] = states.emplace(r, D3D12_RESOURCE_STATE_COMMON);
@@ -1242,7 +1243,8 @@ struct Stage::Impl {
                 View v = views[i].res ? views[i] : first;
                 if (!v.res) continue;
                 if (v.buffer) {
-                    // buffers take no state transitions - only the dispatch's barrier orders them
+                    ensure(cmd, v.res, write ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+                                             : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                     D3D12_CPU_DESCRIPTOR_HANDLE h = cpu;
                     if (v.write) {
                         D3D12_UNORDERED_ACCESS_VIEW_DESC d{};
@@ -1738,11 +1740,13 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
     // The frame's resources are not this stage's: they arrive in the states OptiScaler's evaluate declared. Register
     // those, or the first ensure() would name COMMON after a resource that is already in UNORDERED_ACCESS (in place,
     // colour and output are the same texture, and its UAV state is what the copy below restores).
-    if (f.colour && states.find(f.colour) == states.end()) states[f.colour] = f.colour_state;
-    if (f.output && states.find(f.output) == states.end()) states[f.output] = f.output_state;
-    if (f.motion && states.find(f.motion) == states.end()) states[f.motion] = f.motion_state;
-    if (f.depth && states.find(f.depth) == states.end()) states[f.depth] = f.depth_state;
-    if (f.exposure && states.find(f.exposure) == states.end()) states[f.exposure] = f.exposure_state;
+    // Every frame: the caller declares these again, and after a submission a promotion the driver decayed is not a
+    // state to trust. (A pointer the caller no longer uses simply keeps its last entry; harmless and bounded.)
+    if (f.colour) states[f.colour] = f.colour_state;
+    if (f.output) states[f.output] = f.output_state;
+    if (f.motion) states[f.motion] = f.motion_state;
+    if (f.depth) states[f.depth] = f.depth_state;
+    if (f.exposure) states[f.exposure] = f.exposure_state;
     journal = false;
     if (nr::pe::capture::on() && frames_recorded < 2) {
         journal = true;
@@ -2303,6 +2307,13 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
         nt.reset = reset;
         nt.feature = (cfg.feature || passes > 1) ? stack_feature(cfg.feature ? cfg.feature : kUnnamedStack, k) : 0;
         nt.have_motion = true;
+        // The net reaches these by raw address: lin_proxy and the guides are read (UAV), lin_neural is written (UAV).
+        // A real barrier each frame entry - the table is not evidence that the GPU moved.
+        ensure(cmd, lin_proxy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        ensure(cmd, lin_neural, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        ensure(cmd, lin_mv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        ensure(cmd, lin_depth, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        uav_barrier(cmd);   // the guides and lin_proxy are read by the net by raw address
         if (!net(k, nt.feature, ck, nt, lin_proxy, lin_neural)) {
             if (!net_failed_logged) {
                 net_failed_logged = true;
@@ -2312,6 +2323,9 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
             break;
         }
         {
+            // The net's writes are UAV (the entry's ensure said so): order them against the read, then move the state.
+            uav_barrier(cmd);
+            ensure(cmd, lin_neural, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             struct { uint32_t w, h, what, pad; float region[4]; } c{NW, NH, 0, 0, {1.f, 1.f, 0.f, 0.f}};
             View srv[8] = {};
             srv[0] = bv(lin_neural, uint64_t(NW) * NH * 16, false, false);
