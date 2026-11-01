@@ -1067,10 +1067,12 @@ struct Stage::Impl {
         auto [it, fresh] = states.emplace(r, D3D12_RESOURCE_STATE_COMMON);
         (void)fresh;
         if (it->second == want) return;
-        // No COMMON shortcut: D3D12 does not promote a *texture* out of COMMON. A resource this stage has just made
-        // is in COMMON, and its first read as an SRV or write as a UAV needs the transition - the debug layer calls
-        // the missing one a state mismatch, and the driver answers the list with DXGI_ERROR_INVALID_CALL. (Buffers
-        // may be used from any state, which is why the plain path never showed this.)
+        // No COMMON shortcut: D3D12 promotes a resource out of COMMON for reads and copies (SRV, COPY_SOURCE,
+        // COPY_DEST), but *not* for UNORDERED_ACCESS - a texture written as a UAV from COMMON is a state mismatch the
+        // driver answers with DXGI_ERROR_INVALID_CALL, which is what this route kept dying of. Buffers follow the same
+        // rules for promotion; what a buffer does not need is the texture-side per-state bookkeeping. The transition
+        // below names whatever the table holds, so a stage-made resource starts at COMMON and an external one at the
+        // state its caller declared.
         transition(cmd, r, it->second, want);   // journaled like every other barrier
         it->second = want;
     }
@@ -1108,6 +1110,7 @@ struct Stage::Impl {
         b.Transition.StateBefore = from;
         b.Transition.StateAfter = to;
         cmd->ResourceBarrier(1, &b);
+        states[r] = to;   // the table follows every explicit transition, external resources included
     }
 
     Tex make_tex(uint32_t w, uint32_t h, DXGI_FORMAT f, bool uav, std::string* why) {
@@ -1661,9 +1664,13 @@ void Stage::Impl::copy_frame(ID3D12GraphicsCommandList* cmd, const Frame& f) {
              static_cast<unsigned>(f.output_state));
     }
     cmd->ResourceBarrier(2, b);
+    states[f.colour] = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    states[f.output] = D3D12_RESOURCE_STATE_COPY_DEST;
     cmd->CopyResource(f.output, f.colour);
     for (auto& x : b) std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
     cmd->ResourceBarrier(2, b);
+    states[f.colour] = f.colour_state;
+    states[f.output] = f.output_state;
 }
 
 uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, const Frame::Net& net) {
@@ -1678,6 +1685,14 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
         return 0;
     }
     if (recreate) history_reset = true;
+    // The frame's resources are not this stage's: they arrive in the states OptiScaler's evaluate declared. Register
+    // those, or the first ensure() would name COMMON after a resource that is already in UNORDERED_ACCESS (in place,
+    // colour and output are the same texture, and its UAV state is what the copy below restores).
+    if (f.colour && states.find(f.colour) == states.end()) states[f.colour] = f.colour_state;
+    if (f.output && states.find(f.output) == states.end()) states[f.output] = f.output_state;
+    if (f.motion && states.find(f.motion) == states.end()) states[f.motion] = f.motion_state;
+    if (f.depth && states.find(f.depth) == states.end()) states[f.depth] = f.depth_state;
+    if (f.exposure && states.find(f.exposure) == states.end()) states[f.exposure] = f.exposure_state;
     journal = false;
     if (nr::pe::capture::on() && frames_recorded < 2) {
         journal = true;
