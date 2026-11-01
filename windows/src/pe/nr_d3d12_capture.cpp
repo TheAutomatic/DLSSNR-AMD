@@ -301,12 +301,14 @@ void device_removed(HRESULT why) {
     write(f, b);
     write(g_errors, b);
     nr::pe::log("[capture] %s - writing breadcrumbs, page faults and a minidump", b);
-    drain();
+    // No drain() here: walking the info queue of a removed device is not safe, and every frame already drained it.
 
     if (g_device) {
+        nr::pe::log("[capture] querying DRED");
         ID3D12DeviceRemovedExtendedData* dred = nullptr;
         if (SUCCEEDED(g_device->QueryInterface(IID_PPV_ARGS(&dred))) && dred) {
             D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT bc{};
+            nr::pe::log("[capture] asking for auto breadcrumbs");
             if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&bc)) && bc.pHeadAutoBreadcrumbNode) {
                 write(f, "auto breadcrumbs (the last commands each command list reached):");
                 for (auto* node = bc.pHeadAutoBreadcrumbNode; node; node = node->pNext) {
@@ -329,6 +331,7 @@ void device_removed(HRESULT why) {
                 write(f, "auto breadcrumbs: none (DRED was not on when the device was made)");
             }
             D3D12_DRED_PAGE_FAULT_OUTPUT pf{};
+            nr::pe::log("[capture] asking for page faults");
             if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&pf)) && pf.PageFaultVA) {
                 std::snprintf(b, sizeof b, "page fault at 0x%llX", static_cast<unsigned long long>(pf.PageFaultVA));
                 write(f, b);
