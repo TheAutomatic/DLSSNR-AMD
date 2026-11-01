@@ -26,7 +26,7 @@
 | 外部资源状态登记 | 旧桥接 `lookup12`/`begin_recording` 的外部契约 | `record()` 入口 | 外部资源曾以"第一次见到即 COMMON"登记；就地路径 `colour == output` 且真实状态为 UAV，导致名不副实的 `COMMON → UAV` | **已修** `117e53d` | 每帧按调用者声明重新登记；`transition()` 与复制 helper 同步状态表 |
 | buffer 状态与依赖 | 旧桥接经 Vulkan 隐式排序 | `record()` around `net` / `fill()` buffer 分支 | 线性缓冲曾完全绕过状态表；网络按下标地址写 `lin_neural`、读 `lin_proxy`/guides，缺少真实转换与 UAV 依赖 | **已修** `694de0f` | 每帧入口 `ensure(...UAV)` + `uav_barrier`；网络返回后用 `ensure(SRV)` 而非赋值 |
 | 渲染目标 UAV 能力 | 旧桥接 `lookup12` 的格式/尺寸限制 | `nr_d3d12_asd_backend.cpp` 入口校验 | 复用调用者纹理时需确认 `ALLOW_UNORDERED_ACCESS` 与实际用途一致 | 待执行（P2） | — |
-| 输出可重复性（宿主） | — | `windows/tests/d3d12_asd/nr_d3d12_asd_test.cpp` 的提交/等待 | 上传段 `Signal(100)` 与帧循环 `Signal(1)` 混用，`SetEventOnCompletion(1)` 立即满足；读回与 `Reset` 与在飞的 GPU 工作竞争 | **已修** `61c0c9c`* | 统一单调计数 + 每次核对 `GetCompletedValue() >= 期望`；1 帧与 3 帧两次运行哈希一致。`P4-determinism.md` |
+| 输出可重复性（宿主） | — | `windows/tests/d3d12_asd/nr_d3d12_asd_test.cpp` 的提交/等待 | 上传段 `Signal(100)` 与帧循环 `Signal(1)` 混用，`SetEventOnCompletion(1)` 立即满足；读回与 `Reset` 与在飞的 GPU 工作竞争 | **已修** `74db8b9` | 统一单调计数 + 每次核对 `GetCompletedValue() >= 期望`；1 帧与 3 帧两次运行哈希一致。`P4-determinism.md` |
 
 ## 离线宿主（P4/P5 用）
 
@@ -42,7 +42,26 @@
 
 ## 未运行 / 待办
 
-- 分离输出（`colour != output`）与非 UAV 入口状态的离线案例：未运行。
+- 分离输出（`colour != output`）：已运行，2 帧 `S_OK`（`P4-separate-output.txt`）。
+- guides（motion + depth）：已运行，历史门 0→1→1，3 帧 `S_OK`（`P4-guides-history-3frames.txt`）。
+- 非 UAV 入口状态：未运行。
 - resize / 多 pass / 特征回收边界的定向案例：未运行。
-- 输出与旧桥接数值对齐：未运行（先解决首帧可重复性）。
-- 正常注册路径（不借 `force_canary`）：未验证；测试 exe 的安装器路径在注册线程崩溃，需单独定位。
+- 输出与旧桥接数值对齐：未运行（桥接对照宿主待搭）。
+- 正常注册路径：**本机对离线宿主 exe 不可用**——`RegisterApplication` 返回 `E_HANDLE`（系统 Core 与
+  1.619.5 Agility Core 均如此，清空条目后亦同）；产品 exe（PBZ.exe）在同一台机器注册成功。
+  离线 ACO 运行因此保留测试专用 `force_canary`（只绕过驱动使用 ACO 二进制的门槛，不绕录制路径）。
+  证据：`P5-registration.md`、`P5-registration-agility619.txt`。
+
+## P1 资源契约（当前帧实际用到的资源）
+
+| 资源 | owner | 进入状态 | 本帧用途 | 所需状态/依赖 | 退出状态 | 状态表更新者 |
+|---|---|---|---|---|---|---|
+| `f.colour` | 调用者 | 调用者声明的 `colour_state`（就地时 UAV） | 复制进 original；`kCopyOut` 时写入（就地） | COPY_SOURCE / UAV；复制前后各一次转换 | 恢复为调用者状态 | `record()` 每帧登记；`transition()`/`copy_frame()` 写入 |
+| `f.output` | 调用者 | 调用者声明的 `output_state` | UAV 写回 | UAV（非 simultaneous-access 纹理不可从 COMMON 提升） | 恢复为调用者状态 | 同上（就地时与 colour 同一份） |
+| `f.motion` / `f.depth` | 调用者 | NON_PIXEL_SHADER_RESOURCE | 复制子矩形 / 作为 SRV | COPY_SOURCE → 复制 → SRV；子矩形夹紧到来源范围 | 恢复调用者状态 | `ensure()`/`transition()` |
+| `original`、`work*`、`proxy`、`neural`、`decoded*`、`block_mean`、`scale`、`commit` | stage（`make_tex`） | COMMON（创建态） | UAV 写 / SRV 读 | 首次按用途转换；之后按表转换 | 内部保留 | `ensure()`（唯一入口） |
+| `prep_state`、`lin_proxy`、`lin_neural`、`lin_mv`、`lin_depth` | stage / net | COMMON（`make_buffer`） | 网络按 raw address 读写；stage 也读 | 每帧入口 `ensure(UAV)` + UAV barrier；网络返回后 `ensure(SRV)` | 内部保留 | `ensure()` + 显式登记 |
+| `f.exposure` | 调用者 | 调用者状态 | SRV（若有） | SRV | 不变 | 每帧登记 |
+
+规则：只有 `make_tex`/`make_buffer` 造出来的资源以 COMMON 入表；外部资源每帧按调用者声明重新登记；
+所有转换（`transition()`、`ensure()`、`copy_frame()` 的手写 barrier）都写同一张表；同状态不转换。
