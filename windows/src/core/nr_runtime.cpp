@@ -2906,8 +2906,20 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
                 push = pre_push;
             }
             dispatch(cmd, *use, step.gx, step.gy, step.gz, push, step.push_bytes, set);
+            if (impl_->pre_cap_wanted && !impl_->pre_cap_done && temporal && step.k == t.original_pre && s.act.handle &&
+                i < s.disp.size() && s.disp[i].push.size() >= 8) {
+                uint32_t p0 = 0, p1 = 0;
+                std::memcpy(&p0, s.disp[i].push.data(), 4);
+                std::memcpy(&p1, s.disp[i].push.data() + 4, 4);
+                std::fprintf(stderr, "pre push head: %u %u (push %zu bytes)\n", p0, p1, s.disp[i].push.size());
+            }
             if (impl_->pre_cap_wanted && !impl_->pre_cap_done && temporal && step.k == t.original_pre && s.act.handle) {
-                const uint64_t bytes = std::min<uint64_t>(64ull << 20, s.act.bytes);
+                const char* lo = std::getenv("NR_RUNTIME_PRE_OFF");
+                const char* ln = std::getenv("NR_RUNTIME_PRE_LEN");
+                const uint64_t roff = lo && lo[0] ? std::strtoull(lo, nullptr, 0) : 0;
+                uint64_t bytes = ln && ln[0] ? std::strtoull(ln, nullptr, 0) : (64ull << 20);
+                if (roff >= s.act.bytes) bytes = 0;
+                else if (bytes > s.act.bytes - roff) bytes = s.act.bytes - roff;
                 if (!impl_->pre_cap) {
                     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
                     bi.size = bytes;
@@ -2965,7 +2977,12 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
                     for (size_t q = 0; q < s.disp[i].push.size() && q < 96; ++q)
                         std::fprintf(stderr, "%02x", static_cast<unsigned>(s.disp[i].push[q]));
                     std::fprintf(stderr, "\n");
-                    const uint64_t bytes = std::min<uint64_t>(64ull << 20, s.act.bytes);
+                    const char* lo = std::getenv("NR_RUNTIME_REGION_OFF");
+                    const char* ln = std::getenv("NR_RUNTIME_REGION_LEN");
+                    const uint64_t roff = lo && lo[0] ? std::strtoull(lo, nullptr, 0) : 0;
+                    uint64_t bytes = ln && ln[0] ? std::strtoull(ln, nullptr, 0) : (64ull << 20);
+                    if (roff >= s.act.bytes) bytes = 0;
+                    else if (bytes > s.act.bytes - roff) bytes = s.act.bytes - roff;
                     if (!impl_->kern_cap) {
                         VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
                         bi.size = bytes;
@@ -2996,14 +3013,15 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
                         bb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
                         bb.srcQueueFamilyIndex = bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
                         bb.buffer = s.act.handle;
-                        bb.offset = 0;
+                        bb.offset = roff;
                         bb.size = bytes;
                         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
                                              0, nullptr, 1, &bb, 0, nullptr);
                         VkBufferCopy bc{};
-                        bc.srcOffset = 0;
+                        bc.srcOffset = roff;
                         bc.dstOffset = 0;
                         bc.size = bytes;
+                        bc.srcOffset = roff;
                         vkCmdCopyBuffer(cmd, s.act.handle, impl_->kern_cap, 1, &bc);
                         bb.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
                         bb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;

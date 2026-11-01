@@ -1049,7 +1049,13 @@ public:
             }
         }
         if (!b->kern_dump && std::getenv("NR_NET_KERN_DUMP") && b->act) {
-            const uint64_t nbytes = std::min<uint64_t>(64ull << 20, b->act->GetDesc().Width);
+            const char* lo = std::getenv("NR_NET_REGION_OFF");
+            const char* ln = std::getenv("NR_NET_REGION_LEN");
+            const uint64_t roff = lo && lo[0] ? std::strtoull(lo, nullptr, 0) : 0;
+            uint64_t nbytes = ln && ln[0] ? std::strtoull(ln, nullptr, 0) : (64ull << 20);
+            const uint64_t cap = b->act->GetDesc().Width;
+            if (roff >= cap) nbytes = 0;
+            else if (nbytes > cap - roff) nbytes = cap - roff;
             D3D12_HEAP_PROPERTIES hp{};
             hp.Type = D3D12_HEAP_TYPE_READBACK;
             D3D12_RESOURCE_DESC rd{};
@@ -1061,7 +1067,13 @@ public:
                 b->kern_dump_bytes = nbytes;
         }
         if (!b->pre_dump && std::getenv("NR_NET_PRE_DUMP") && b->act) {
-            const uint64_t nbytes = std::min<uint64_t>(64ull << 20, b->act->GetDesc().Width);
+            const char* lo = std::getenv("NR_NET_PRE_OFF");
+            const char* ln = std::getenv("NR_NET_PRE_LEN");
+            const uint64_t roff = lo && lo[0] ? std::strtoull(lo, nullptr, 0) : 0;
+            uint64_t nbytes = ln && ln[0] ? std::strtoull(ln, nullptr, 0) : (64ull << 20);
+            const uint64_t cap = b->act->GetDesc().Width;
+            if (roff >= cap) nbytes = 0;
+            else if (nbytes > cap - roff) nbytes = cap - roff;
             D3D12_HEAP_PROPERTIES hp{};
             hp.Type = D3D12_HEAP_TYPE_READBACK;
             D3D12_RESOURCE_DESC rd{};
@@ -1071,6 +1083,8 @@ public:
             if (SUCCEEDED(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST,
                                                            nullptr, IID_PPV_ARGS(&b->pre_dump))) && b->pre_dump) {
                 b->pre_dump_bytes = nbytes;
+                { char m4[160]; std::snprintf(m4, sizeof m4, "pre dump: region %llu+%llu", static_cast<unsigned long long>(roff),
+                                              static_cast<unsigned long long>(nbytes)); capture::schedule(m4); }
                 char msg[128];
                 std::snprintf(msg, sizeof msg, "pre dump: act prefix %llu bytes", static_cast<unsigned long long>(nbytes));
                 capture::schedule(msg);
@@ -1104,15 +1118,31 @@ public:
                 const char* knm = "temporal";
                 for (const auto& [nm, kk] : b->kern) if (&kk == &k) { knm = nm.c_str(); break; }
                 if (want && want[0] && std::strcmp(knm, want) == 0) {
+                    const char* lo = std::getenv("NR_NET_REGION_OFF");
+                    const uint64_t roff = lo && lo[0] ? std::strtoull(lo, nullptr, 0) : 0;
                     transition(cmd, b->act, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-                    cmd->CopyBufferRegion(b->kern_dump, 0, b->act, 0, b->kern_dump_bytes);
+                    cmd->CopyBufferRegion(b->kern_dump, 0, b->act, roff, b->kern_dump_bytes);
                     transition(cmd, b->act, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                     b->kern_dump_written = true;
+                    { char m2[160]; std::snprintf(m2, sizeof m2, "kern dump: %s region %llu+%llu", want,
+                        static_cast<unsigned long long>(roff), static_cast<unsigned long long>(b->kern_dump_bytes));
+                      capture::schedule(m2); }
                 }
             }
+            if (!b->pre_dump_written && int(i) == tp.pre && i < b->plan.disp.size() && b->plan.disp[i].push.size() >= 8) {
+                const uint8_t* pp = b->plan.disp[i].push.data();
+                uint32_t p0 = 0, p1 = 0;
+                std::memcpy(&p0, pp, 4);
+                std::memcpy(&p1, pp + 4, 4);
+                char m3[160];
+                std::snprintf(m3, sizeof m3, "pre push head: %u %u (push %zu bytes)", p0, p1, b->plan.disp[i].push.size());
+                capture::schedule(m3);
+            }
             if (b->pre_dump && !b->pre_dump_written && int(i) == tp.pre && b->act) {
+                const char* lo = std::getenv("NR_NET_PRE_OFF");
+                const uint64_t roff = lo && lo[0] ? std::strtoull(lo, nullptr, 0) : 0;
                 transition(cmd, b->act, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-                cmd->CopyBufferRegion(b->pre_dump, 0, b->act, 0, b->pre_dump_bytes);
+                cmd->CopyBufferRegion(b->pre_dump, 0, b->act, roff, b->pre_dump_bytes);
                 transition(cmd, b->act, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 b->pre_dump_written = true;
             }

@@ -225,12 +225,17 @@ RGB=0、alpha=1，正好是这个行为，而不是"DXIL 编译的网络"。因�
 | 边界 | ASD vs 参考 | 证据 |
 |---|---|---|
 | 噪声场 `wgt[off*4, +3840*2176*8)` | **逐字节相同**（66,846,720 B，sha256 `07e23073c3690247…`） | `netdump/asd_noise.bin` / `vulkan_noise.bin` |
-| temporal_pre 之后 `act[0, 64 MiB)` | **逐字节相同**（67,108,864 B，sha256 `3b6a07d0d404fab4…`） | `asd_pre.bin` / `vulkan_pre.bin` |
+| `act[0, 64 MiB)`（pre 之后） | 两侧相同但**全为 0**——pre 不写这里，此行不构成"pre 一致"的证据 | `asd_pre.bin` / `vulkan_pre.bin` |
+| `act[534,773,760, +64 MiB)`（pre 的 push 第 2 个字面值） | 仍**全为 0**，pre 的真实输出区**尚未定位** | 同上重抓 |
 | 权重块 `wgt[0, weights_end)` | **逐字节相同**（115,736,784 B，sha256 `da0f18be1ae5fcbb…`） | `asd_wgt.bin` / `vulkan_wgt.bin` |
 | 首个 `fswin32nh` 之后 `act[0, 64 MiB)` | **不同**：49,371,484 / 67,108,864 B 不同（73.57%），首字节即不同 | `asd_kern.bin` / `ref/vulkan_kern.bin` |
 
 两条路线的该 dispatch：同一索引（1）、同 grid `240x136x1`、**同 push 84 字节**（`00 00 d0 2f 00 00 00 00 00 92 …`）。
 
-因此：输入（pre）、权重、参数、网格、索引都相同，**首个 fswin 的输出就已经不同**——剩余变量是各自使用的
+注意：pre 的落点未定（两处候选区都为零），所以"输入相同"目前只对**权重/噪声/push/grid**成立；
+首个 fswin 之后 `act[0, +64 MiB)` 非零且两侧 73.57% 字节不同（`asd_kern.bin` vs `vulkan_kern.bin`，
+sha256 `cd173835…` / `edcbed17…`）。fswin 的 push 第二个字为 0（输出在 act 偏移 0）与其输入偏移 800,063,488 待核。
+
+因此——剩余变量是各自使用的
 ACO 机器码（ASD 的 `public-copy.psdb` vs 参考安装树的 `aco/records`）。下一步比较两者为 `fswin32nh` 装载的
 ELF（记录文件/PSDB 内容），而不是再比下游。
