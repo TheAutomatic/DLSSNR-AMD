@@ -127,8 +127,16 @@ struct D3d12BackendFrame {
     int reset;
     unsigned long long feature;
     float history_strength;   // < 0: the session's
-    // The 0.0.8.1 path's own stages this backend does not run: the RenoDX route installed, [Preprocess] active.
-    int renodx_route, preprocess;
+    // The 0.0.8.1 path's own stages this backend does not run: the RenoDX route installed.
+    int renodx_route;
+    // [Preprocess] settings (0.0.8.1: nr::Preprocess)
+    int preprocess;
+    int prep_exposure;
+    float prep_bias_ev;
+    int prep_curve;
+    float prep_contrast;
+    float prep_saturation;
+    int prep_inverse;
     // v2.6 (out, may be null): set to 1 by a backend that returns false only because its network for this extent is
     // still being made - it will take such frames; evaluate_d3d12 then passes the frame through (output := colour) with
     // no NR and does not start the Vulkan bridge's network (Kenny: no bridge while ASD builds).

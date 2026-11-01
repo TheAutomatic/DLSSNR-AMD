@@ -684,7 +684,6 @@ std::string native_refusal(ID3D12GraphicsCommandList* cmd, ID3D12Device* device,
     }();
     if (native_off) return "W2Native = 0 (dlssnr-amd-asd.ini, A/B test)";
     if (w2::fast_requested(s)) return "Passes (fast) is not on the D3D12 route (ASD)";
-    if (nr::dlssnr::preprocess_settings().active()) return "[Preprocess] is on (its network calls are not ASD's)";
     const auto readable = [](ID3D12Resource* r, const char* what) -> std::string {
         if (!r) return std::string("the ") + what + " is missing";
         const D3D12_RESOURCE_DESC d = r->GetDesc();

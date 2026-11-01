@@ -1359,11 +1359,24 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
         frame.reset = reset != 0 ? 1 : 0;
         frame.feature = static_cast<unsigned long long>(f->id);
         frame.history_strength = -1.0f;
-        if (const auto* w2 = nr::pe::renodx_route::call_wilsjo2()) frame.history_strength = w2->history;
+        const auto* w2 = nr::pe::renodx_route::call_wilsjo2();
+        if (w2) frame.history_strength = w2->history;
+        const bool prep_outside = w2 && w2->prep_outside;
+        const nr::Preprocess pp = prep_outside ? nr::Preprocess{} : preprocess_now();
         frame.renodx_route = nr::pe::renodx_route::installed() ? 1 : 0;
-        frame.preprocess = preprocess_now().active() ? 1 : 0;
+        frame.preprocess = pp.active() ? 1 : 0;
+        frame.prep_exposure = pp.exposure;
+        frame.prep_bias_ev = pp.bias_ev;
+        frame.prep_curve = pp.curve;
+        frame.prep_contrast = pp.contrast;
+        frame.prep_saturation = pp.saturation;
+        frame.prep_inverse = pp.inverse ? 1 : 0;
         int waiting = 0;
         frame.waiting = &waiting;
+        f->controls = controls_from(controls);
+        if (w2) f->controls.history_strength = w2->history;
+        f->controls.preprocess = pp;
+        f->prep_by_layer = prep_outside && preprocess_now().active() && !w2->prep_missing;
         if (backend(frame)) {
             note_route(kRouteAsd);
             {   // NR Control's state from this frame, every frame as the bridge's evaluate reports its runs (v2.4: it was
