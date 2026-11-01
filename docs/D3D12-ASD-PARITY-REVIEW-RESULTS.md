@@ -202,3 +202,20 @@ RGB=0、alpha=1，正好是这个行为，而不是"DXIL 编译的网络"。因�
   `vitattn / gemmvqkvnorm / gemmvact / gemmprojw / gemmprojc / gemmproj / ffwd3w / attn / noisefield / temporal`。
 - 参考侧 runtime 的 plan 没有内核名字段，逐 dispatch 名字无法直接对齐；下一步要在两个引擎里各加一个
   **按索引 dump 该 dispatch 的 UAV** 的钩子（同一索引、同一帧），按"首个不一致"停止，而不是盲扫 71 层。
+
+## 语义边界抓取的落点（已定位，尚未产出 dump）
+
+四处边界在两侧都按**名字/语义**可取，不需要全局计数：
+
+| 边界 | D3D12 侧 | 参考侧 |
+|---|---|---|
+| noise 场 | 调度日志 `kern noisefield`（`nr-diag/run.txt` 第 0 条） | 计划里的 `t.noise_field_at`（`nr_runtime.cpp:3055`） |
+| temporal_pre 输出 | `kern temporal`（第 1 条，pre） | `t.pre` 索引与 `fswinimagepreds32nh`（`nr_runtime.cpp:3041`） |
+| 首个 fswin 输出 | `kern fswin32nh` / `fswindsp32nh`（第 3、4 条） | 同名 `Disp::kern`（`nr_graph.cpp:2523`） |
+| temporal_post 前 surf1 | `kern temporal`（post） | `t.post` 与 `fswinimagepost32`（`nr_runtime.cpp:3042`） |
+
+两条录制入口：ASD `nr_d3d12_asd_net.cpp` 的 `for (i = lo; i < hi; ++i)` 循环（已有 `kern` 名字）；
+参考 `Runtime::record_all`（`record_temporal` 只是转发）。四处 dump 需要在两侧各加"名字命中→copy 该 dispatch
+的输出区"的代码，并知道每个 dispatch 的输出 offset/字节数（计划 push 里的 `o_off`/`x_off`）。
+
+本轮**没有**产出这四处 dump，也没有据此的修复；不把已定位当已完成。
