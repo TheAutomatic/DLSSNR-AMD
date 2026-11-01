@@ -73,6 +73,8 @@ uint64_t stamp_of(const std::string& path) {
 
 // One pass field, named as OptiScaler's Pass<N><Field> (Pass2Intensity ...).
 bool set_pass_field(PassOverride& o, const std::string& field, const std::string& value) {
+    // "auto" is this file's "the default" (pass 1's own value): not a number to complain about.
+    { const std::string v = lower(trim(value)); if (v.empty() || v == "auto") return true; }
     if (field != "automask" && field != "automatic_mask") {
         size_t end = 0; nr::parse_float(value, 0.f, &end); if (!end) return true;
     }
