@@ -231,7 +231,7 @@ struct Built {
     ID3D12Resource* done = nullptr;    // the frame numbers the GPU copied back, kDoneSlots of them
     uint64_t* done_map = nullptr;
     int64_t executed = -1;              // the newest frame seen in done_map; -1: none has landed yet (frame 0's
-                                        // slot is then NOT free - a count starting at 0 must not look done)
+    int64_t last_frame = -1;            // the newest frame recorded into this Built; -1: none
     uint32_t tables = 0;                          // per frame: noise jobs + dispatches
     uint64_t slot_bytes = 0;                      // one frame's ring slot: the tables, then the params
     bool retargeted = false;
@@ -401,7 +401,7 @@ public:
     ~AcoNetwork() override {
         nets_.clear();
         retired_.clear();
-        for (auto& r : retire_upload_) r.second->Release();
+        for (auto& r : retire_upload_) if (r.upload) r.upload->Release();
         if (stamps_map_) stamps_->Unmap(0, nullptr);
         release(stamps_); release(queries_);
         release(alpha_pso_); release(alpha_rs_); release(rs_);
@@ -468,6 +468,7 @@ public:
 
     bool ready(ID3D12Device*, uint32_t w, uint32_t h, std::string* why) override {
         sweep();
+        current_shared_.reset();
         current_ = nullptr;
         building_ = false;
         if (w % 8) { *why = "width " + std::to_string(w) + " is not a multiple of 8 (the network's RGBA32F image rows)"; return false; }
@@ -477,7 +478,8 @@ public:
         last_want_ = want;
         const auto key = std::make_tuple(w, h, want);
         if (auto it = nets_.find(key); it != nets_.end()) {
-            current_ = it->second.get();
+            current_shared_ = it->second;
+            current_ = current_shared_.get();
             current_->used = tick_;
             name_ = "the ACO network, " + current_->plan.model + ", " + std::to_string(current_->plan.disp.size()) + " dispatches, temporal";
             return true;
@@ -494,7 +496,7 @@ public:
             if (nets_.size() >= kMaxExtents) {
                 auto lru = nets_.begin();
                 for (auto it = nets_.begin(); it != nets_.end(); ++it) if (it->second->used < lru->second->used) lru = it;
-                retired_.emplace_back(tick_ + 64, std::move(lru->second));
+                retired_.push_back({std::move(lru->second)});
                 nets_.erase(lru);
             }
             auto& b = nets_[done_key];
@@ -573,16 +575,27 @@ public:
         {
             auto& slot = b->features[temporal_.feature];
             if (!slot) {
-                if (b->features.size() > kMaxFeatures) {
-                    auto lru = b->features.end();
-                    for (auto it = b->features.begin(); it != b->features.end(); ++it)
-                        if (it->second && (lru == b->features.end() || it->second->used < lru->second->used)) lru = it;
-                    if (lru != b->features.end()) {
-                        plain_seeds_.erase(lru->first);
-                        retired_features_.emplace_back(tick_ + 64, std::move(lru->second));
-                        b->features.erase(lru);
-                    }
+                // Evict only what has gone stale (not used since the previous evaluate): a multi-pass stack
+                // runs each pass on a feature of its own every frame, and those must never evict each other -
+                // the Vulkan runtime keeps every active feature's history too. The kMaxFeatures ceiling only
+                // guards against unbounded growth; past it the stalest entry goes.
+                auto lru = b->features.end();
+                for (auto it = b->features.begin(); it != b->features.end(); ++it) {
+                    if (!it->second) continue;
+                    if (it->second->used >= tick_) continue;   // live in this evaluate
+                    if (b->features.size() < kMaxFeatures) break;   // room to spare: keep it
+                    if (lru == b->features.end() || it->second->used < lru->second->used) lru = it;
                 }
+                if (lru != b->features.end()) {
+                    plain_seeds_.erase(lru->first);
+                    RetiredUse r;
+                    r.hold = std::move(lru->second);
+                    r.net = b;
+                    r.frame = frames_;   // its history may still be read by the commands up to this frame
+                    retired_features_.push_back(std::move(r));
+                    b->features.erase(lru);
+                }
+
                 auto& fresh = b->features[temporal_.feature];
                 fresh = std::make_shared<FeatureState>();
                 for (auto& hh : fresh->hist)
@@ -693,6 +706,7 @@ public:
             }
             return false;
         }
+        b->last_frame = int64_t(frame);
         slot_buf->owner[slot_i] = frame;
         const uint64_t slot_off = uint64_t(slot_i) * (b->slot_bytes + 8);
         uint8_t* ring = slot_buf->map + slot_off;
@@ -806,7 +820,12 @@ public:
         }
         if (first) {
             b->retargeted = true;
-            retire_upload_.emplace_back(tick_ + 64, b->wgt_upload);
+            RetiredUse r;
+            r.hold = current_shared_;   // keeps the Built (and its watermark) alive
+            r.upload = b->wgt_upload;
+            r.net = b;
+            r.frame = frame;   // this record's CopyBufferRegion reads it
+            retire_upload_.push_back(std::move(r));
             b->wgt_upload = nullptr;
         }
         // The alpha pass (runtime_alpha.comp): NR_POST_ALPHA is 0, so the post block left the alpha to it.
@@ -866,12 +885,14 @@ private:
     void sweep() {
         ++tick_;
         for (size_t i = 0; i < retired_.size();)
-            if (retired_[i].first <= tick_) retired_.erase(retired_.begin() + long(i)); else ++i;
+            if (retired_[i].done()) retired_.erase(retired_.begin() + long(i)); else ++i;
         for (size_t i = 0; i < retired_features_.size();)
-            if (retired_features_[i].first <= tick_) retired_features_.erase(retired_features_.begin() + long(i)); else ++i;
+            if (retired_features_[i].done()) retired_features_.erase(retired_features_.begin() + long(i)); else ++i;
         for (size_t i = 0; i < retire_upload_.size();)
-            if (retire_upload_[i].first <= tick_) { retire_upload_[i].second->Release(); retire_upload_.erase(retire_upload_.begin() + long(i)); }
-            else ++i;
+            if (retire_upload_[i].done()) {
+                if (retire_upload_[i].upload) retire_upload_[i].upload->Release();
+                retire_upload_.erase(retire_upload_.begin() + long(i));
+            } else ++i;
     }
 
     std::wstring folder_;
@@ -883,12 +904,27 @@ private:
     ID3D12PipelineState* alpha_pso_ = nullptr;
     std::shared_ptr<Shared> shared_;
     std::map<std::tuple<uint32_t, uint32_t, int>, std::shared_ptr<Built>> nets_;
+    std::shared_ptr<Built> current_shared_;
     Built* current_ = nullptr;                   // ready()'s answer for this evaluate
     bool building_ = false;                      // v2.6: ready() said no only because a network is building
     int last_want_ = -1;
-    std::vector<std::pair<uint64_t, std::shared_ptr<Built>>> retired_;
-    std::vector<std::pair<uint64_t, std::shared_ptr<FeatureState>>> retired_features_;
-    std::vector<std::pair<uint64_t, ID3D12Resource*>> retire_upload_;
+    // Retirement waits for the GPU, not a call count: an entry goes only when its Built's completion watermark
+    // has passed the frame that last used the resource (a stack of many passes records that many evaluates
+    // into one still-unsubmitted command list; a tick_ counter would release under it).
+    struct RetiredNet {
+        std::shared_ptr<Built> net;   // kept alive: its watermark is what releases it
+        bool done() const { return net->last_frame < 0 || net->executed >= net->last_frame; }
+    };
+    struct RetiredUse {
+        std::shared_ptr<void> hold;   // the resource (FeatureState, or the Built that owns a raw upload buffer)
+        ID3D12Resource* upload = nullptr;   // set when hold is the Built owning this upload buffer
+        Built* net = nullptr;               // the Built whose commands use it
+        uint64_t frame = 0;                 // the last frame whose commands use it
+        bool done() const { return net->executed >= int64_t(frame); }
+    };
+    std::vector<RetiredNet> retired_;
+    std::vector<RetiredUse> retired_features_;
+    std::vector<RetiredUse> retire_upload_;
     uint64_t tick_ = 0;
     nr::D3d12NetControls controls_;
     NetTemporal temporal_;
