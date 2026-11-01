@@ -683,8 +683,93 @@ int renodx_run(int argc, char** argv) {
     }
     nr::dlssnr::D3d12BackendFrame fr{};
     fr.device = d; fr.cmd = l;
+    // NR_TEST_SEPARATE_OUTPUT=1: a second texture as the output (copy_frame's two-barrier path, and a store into an
+    // output that is not the colour).
+    ID3D12Resource* out_tex = frame;
+    if (const char* sep = std::getenv("NR_TEST_SEPARATE_OUTPUT"); sep && sep[0] == '1') {
+        D3D12_HEAP_PROPERTIES ohp{}; ohp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC ord{};
+        ord.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        ord.Width = W; ord.Height = H; ord.DepthOrArraySize = 1; ord.MipLevels = 1;
+        ord.Format = DXGI_FORMAT_R10G10B10A2_UNORM; ord.SampleDesc.Count = 1;
+        ord.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        if (FAILED(d->CreateCommittedResource(&ohp, D3D12_HEAP_FLAG_NONE, &ord, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                              nullptr, IID_PPV_ARGS(&out_tex))) || !out_tex) {
+            log("[test] renodx: the separate output could not be made");
+            return 4;
+        }
+        log("[test] renodx: separate output");
+    }
     fr.color = frame; fr.color_state = int(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    fr.output = frame; fr.output_state = int(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    fr.output = out_tex; fr.output_state = int(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    // NR_TEST_GUIDES=1: motion and depth with fixed patterns, so the temporal path (history gate, latch) runs.
+    if (const char* g = std::getenv("NR_TEST_GUIDES"); g && g[0] == '1') {
+        auto make_guide = [&](DXGI_FORMAT fmt, uint32_t bpp, uint8_t fill_a, uint8_t fill_b) -> ID3D12Resource* {
+            D3D12_HEAP_PROPERTIES gp{}; gp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC gr{};
+            gr.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            gr.Width = W; gr.Height = H; gr.DepthOrArraySize = 1; gr.MipLevels = 1;
+            gr.Format = fmt; gr.SampleDesc.Count = 1;
+            ID3D12Resource* t = nullptr;
+            if (FAILED(d->CreateCommittedResource(&gp, D3D12_HEAP_FLAG_NONE, &gr, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                  nullptr, IID_PPV_ARGS(&t))) || !t) return nullptr;
+            const uint64_t pitch = uint64_t(W) * bpp;
+            ID3D12Resource* up = buffer(d, D3D12_HEAP_TYPE_UPLOAD, pitch * H, D3D12_RESOURCE_STATE_GENERIC_READ);
+            void* m = nullptr;
+            if (!up || FAILED(up->Map(0, nullptr, &m)) || !m) return nullptr;
+            auto* p8 = static_cast<uint8_t*>(m);
+            for (uint32_t y = 0; y < H; ++y)
+                for (uint32_t x = 0; x < W; ++x) {
+                    uint8_t* px = p8 + uint64_t(y) * pitch + uint64_t(x) * bpp;
+                    px[0] = fill_a; px[1] = fill_b;
+                    for (uint32_t k = 2; k < bpp; ++k) px[k] = uint8_t((x * 3u + y * 5u) & 0xFF);
+                }
+            up->Unmap(0, nullptr);
+            D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dst.pResource = t; dst.SubresourceIndex = 0;
+            src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; src.pResource = up;
+            src.PlacedFootprint.Footprint = {fmt, W, H, 1, UINT(pitch)};
+            D3D12_RESOURCE_BARRIER tb{};
+            tb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            tb.Transition.pResource = t;
+            tb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            tb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            tb.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            l->ResourceBarrier(1, &tb);
+            l->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            l->ResourceBarrier(1, &tb);
+            return t;
+        };
+        // motion: 1.5 px right, 0.75 px up in half floats; depth: a fixed gradient in floats
+        auto half_of = [](float v) { uint32_t f; std::memcpy(&f, &v, 4); uint32_t s = (f >> 16) & 0x8000;
+            int32_t e = int32_t((f >> 23) & 0xFF) - 127 + 15; uint32_t mnt = (f >> 13) & 0x3FF;
+            if (e <= 0) return uint16_t(s); if (e >= 31) return uint16_t(s | 0x7C00);
+            return uint16_t(s | (uint32_t(e) << 10) | mnt); };
+        (void)half_of;
+        ID3D12Resource* mv = make_guide(DXGI_FORMAT_R16G16_FLOAT, 4, 0, 0);
+        ID3D12Resource* dp = make_guide(DXGI_FORMAT_R32_FLOAT, 4, 0, 0);
+        if (!mv || !dp) { log("[test] renodx: the guides could not be made"); return 4; }
+        fr.motion = mv;   // the backend takes the guides in NON_PIXEL_SHADER_RESOURCE
+        fr.motion_x = 0; fr.motion_y = 0; fr.motion_w = W; fr.motion_h = H;
+        fr.motion_scale_x = 1.0f / float(W); fr.motion_scale_y = 1.0f / float(H);
+        fr.depth = dp;
+        fr.depth_x = 0; fr.depth_y = 0; fr.depth_w = W; fr.depth_h = H;
+        log("[test] renodx: guides (motion %ux%u, depth %ux%u)", W, H, W, H);
+        // submit the guide uploads now
+        const HRESULT gc = l->Close();
+        if (FAILED(gc)) { log("[test] renodx: guides Close 0x%08lX", static_cast<unsigned long>(gc)); return 4; }
+        ID3D12CommandList* gl[] = {l};
+        q->ExecuteCommandLists(1, gl);
+        const uint64_t gfence = ++fence_value;
+        q->Signal(f, gfence);
+        HANDLE gev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        f->SetEventOnCompletion(gfence, gev);
+        const bool gok = WaitForSingleObject(gev, 60000) == WAIT_OBJECT_0;
+        CloseHandle(gev);
+        if (!gok || f->GetCompletedValue() < gfence) { log("[test] renodx: the guides did not finish"); return 4; }
+        a->Reset();
+        l->Reset(a, nullptr);
+    }
     fr.width = W; fr.height = H;
     fr.style = 0; fr.intensity = 1.f; fr.local_tone = 1.f; fr.local_structure = 1.f; fr.skin_structure = -1.f;
     fr.automatic_mask = 0; fr.reversible_mode = 0; fr.noise_every_frame = 1;
@@ -750,10 +835,10 @@ int renodx_run(int argc, char** argv) {
                 D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
                 dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst.pResource = rb;
                 dst.PlacedFootprint.Footprint = {DXGI_FORMAT_R10G10B10A2_UNORM, W, H, 1, UINT(pitch)};
-                src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.pResource = frame; src.SubresourceIndex = 0;
+                src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.pResource = out_tex; src.SubresourceIndex = 0;
                 D3D12_RESOURCE_BARRIER tb{};
                 tb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-                tb.Transition.pResource = frame;
+                tb.Transition.pResource = out_tex;
                 tb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
                 tb.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
                 tb.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
