@@ -230,7 +230,8 @@ struct Built {
     std::vector<Upload> upload;
     ID3D12Resource* done = nullptr;    // the frame numbers the GPU copied back, kDoneSlots of them
     uint64_t* done_map = nullptr;
-    uint64_t executed = 0;             // the newest frame whose number is seen in done_map
+    int64_t executed = -1;              // the newest frame seen in done_map; -1: none has landed yet (frame 0's
+                                        // slot is then NOT free - a count starting at 0 must not look done)
     uint32_t tables = 0;                          // per frame: noise jobs + dispatches
     uint64_t slot_bytes = 0;                      // one frame's ring slot: the tables, then the params
     bool retargeted = false;
@@ -655,13 +656,15 @@ public:
         const uint64_t frame = frames_;
         for (uint32_t s = 0; s < kDoneSlots; ++s) {
             const uint64_t v = b->done_map[s];
-            if (v != ~uint64_t(0) && v <= frame && (v % kDoneSlots) == s && v > b->executed) b->executed = v;
+            if (v != ~uint64_t(0) && v <= frame && (v % kDoneSlots) == s && int64_t(v) > b->executed)
+                b->executed = int64_t(v);
         }
         Built::Upload* slot_buf = nullptr;
         uint32_t slot_i = 0;
         for (auto& u : b->upload) {
             for (uint32_t i = 0; i < kRing; ++i)
-                if (u.owner[i] == ~uint64_t(0) || u.owner[i] <= b->executed) { slot_buf = &u; slot_i = i; break; }
+                if (u.owner[i] == ~uint64_t(0) ||
+                    (b->executed >= 0 && u.owner[i] <= uint64_t(b->executed))) { slot_buf = &u; slot_i = i; break; }
             if (slot_buf) break;
         }
         if (!slot_buf) {   // every slot still in flight: another buffer of them, however many it takes
@@ -680,9 +683,15 @@ public:
                 }
             }
         }
-        if (!slot_buf) {   // could not grow either (out of memory): the oldest slot, as a fixed ring would
-            slot_buf = &b->upload.front();
-            slot_i = 0;
+        if (!slot_buf) {   // could not grow either (out of memory): no slot may be taken - reusing a held one
+                           // would corrupt a copy the GPU has not read; this record declines, the frame passes
+            static bool said = false;
+            if (!said) {
+                said = true;
+                nr::pe::log("[asd] the network's upload slots are all in flight and no more could be made; "
+                            "this evaluate is not recorded");
+            }
+            return false;
         }
         slot_buf->owner[slot_i] = frame;
         const uint64_t slot_off = uint64_t(slot_i) * (b->slot_bytes + 8);
