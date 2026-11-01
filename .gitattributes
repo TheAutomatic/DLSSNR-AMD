@@ -1,0 +1,5 @@
+# bash scripts must stay LF: they run in CI (Linux) and in Git Bash / WSL on Windows, where CRLF
+# line endings break them ("set: pipefail: invalid option name", "\r': No such file or directory").
+# With core.autocrlf=true (the Windows default this repo is often cloned with) every checkout
+# converts them to CRLF; this file forces them back to LF in the working tree as well.
+*.sh text eol=lf
