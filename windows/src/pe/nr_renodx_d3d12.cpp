@@ -1943,18 +1943,27 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
         dst.pResource = motion.res;
         dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         dst.SubresourceIndex = 0;
+        // The caller reports the region; a box outside the source, or an empty one, is not a copy D3D12 accepts.
+        const uint32_t mx = std::min(f.motion_x, uint32_t(md.Width)), my = std::min(f.motion_y, uint32_t(md.Height));
+        const uint32_t mw = std::min(f.motion_w, uint32_t(md.Width) - mx), mh = std::min(f.motion_h, uint32_t(md.Height) - my);
         D3D12_BOX box{};
-        box.left = f.motion_x;
-        box.top = f.motion_y;
-        box.right = f.motion_x + f.motion_w;
-        box.bottom = f.motion_y + f.motion_h;
+        box.left = mx;
+        box.top = my;
+        box.right = mx + mw;
+        box.bottom = my + mh;
         box.back = 1;
-        jlog("renodx motion copy: box %u,%u..%u,%u of source %llux%u into %ux%u", box.left, box.top, box.right,
-             box.bottom, static_cast<unsigned long long>(md.Width), static_cast<unsigned>(md.Height), motion.w, motion.h);
-        cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+        if (!mw || !mh) {
+            // An empty or out-of-bounds region is not a copy D3D12 accepts: skip it and let the look run without motion.
+            static bool said = false;
+            if (!said) { said = true; nr::pe::log("[nr] RenoDX stage (D3D12): the motion region is outside the guide; the look runs without motion"); }
+        } else {
+            jlog("renodx motion copy: box %u,%u..%u,%u of source %llux%u into %ux%u", box.left, box.top, box.right,
+                 box.bottom, static_cast<unsigned long long>(md.Width), static_cast<unsigned>(md.Height), motion.w, motion.h);
+            cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+            motion_copied = true;
+        }
         ensure(cmd, motion.res, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         transition(cmd, f.motion, D3D12_RESOURCE_STATE_COPY_SOURCE, f.motion_state);
-        motion_copied = true;
     }
     const bool recreate_epoch = recreate || history_reset;   // the governor's reset-epoch snap (PlanFrameScale)
     const bool reset_all = f.reset || history_reset;
