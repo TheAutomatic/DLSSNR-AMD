@@ -290,6 +290,8 @@ int main(int argc, char** argv) {
         sc.present = 2;
         nr::renodx::StageConfig& scc = sc;
         (void)scc;
+        // The noise field the pre block reads, from the same region the D3D12 route dumps (wgt at noise[0].off*4).
+        if (std::getenv("NR_RUNTIME_NOISE_DUMP")) rt.capture_noise();
         nr::renodx::Stage stage(host, sc);
         // The stage's own network boundary, for a comparison with the D3D12 route's capture (RGBA16F, W*H*8).
         VkBuffer bproxy{}, bneural{};
@@ -417,6 +419,12 @@ int main(int argc, char** argv) {
                     }
                 }
             }
+        }
+        if (const char* nd = std::getenv("NR_RUNTIME_NOISE_DUMP"); nd && nd[0]) {
+            std::string cw;
+            const std::string path = std::string(nd) + "\\vulkan_noise.bin";
+            const bool wrote = rt.write_noise_capture(path, &cw);
+            std::printf("noise capture %s (%s)\n", wrote ? "written" : "FAILED", cw.c_str());
         }
         std::printf("stage: %s\n", stage.recordings_done() ? "recorded" : "no recordings");
     } catch (const std::exception& x) {

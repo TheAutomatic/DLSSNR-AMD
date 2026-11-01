@@ -423,6 +423,12 @@ struct Runtime::Impl {
     // the DLL's counter moves on every launch whatever the motion vectors (FUN_180060cf0 copies +0xc8 into the
     // packet and increments it), and Reset zeroes it (FUN_1800616e0).
     uint32_t plain_seed{};
+    // Debug: the precomputed noise field, copied once from wgt (j.off is an absolute u32 index into wgt).
+    VkBuffer noise_cap{};
+    VkDeviceMemory noise_cap_mem{};
+    void* noise_cap_map{};
+    uint64_t noise_cap_bytes{};
+    bool noise_cap_wanted{}, noise_cap_done{};
     // The network's extent: the frame's (mw x mh = width x height).
     uint32_t mw{}, mh{};
     // Why this runtime runs another network than it was asked for ("" when it runs the one asked for).
@@ -2119,6 +2125,26 @@ ControlMaskResult Runtime::record(VkCommandBuffer cmd, const ColourFrame& frame,
     return record_all(cmd,frame,c,mask,nullptr,nullptr,nullptr);
 }
 
+void Runtime::capture_noise() { impl_->noise_cap_wanted = true; }
+
+bool Runtime::write_noise_capture(const std::string& path, std::string* why) {
+    if (!impl_->noise_cap || !impl_->noise_cap_bytes) {
+        *why = "no noise capture was recorded";
+        return false;
+    }
+    void* m = nullptr;
+    if (vkMapMemory(impl_->session.ctx.device, impl_->noise_cap_mem, 0, impl_->noise_cap_bytes, 0, &m) != VK_SUCCESS || !m) {
+        *why = "the noise capture could not be mapped";
+        return false;
+    }
+    FILE* f = std::fopen(path.c_str(), "wb");
+    const bool ok = f && std::fwrite(m, 1, size_t(impl_->noise_cap_bytes), f) == size_t(impl_->noise_cap_bytes);
+    if (f) std::fclose(f);
+    vkUnmapMemory(impl_->session.ctx.device, impl_->noise_cap_mem);
+    *why = ok ? "" : "the noise capture could not be written";
+    return ok;
+}
+
 TemporalResult Runtime::record_temporal(VkCommandBuffer cmd, const ColourFrame& frame,
                                         const Controls& c, const TemporalFrame& temporal) {
     if (!impl_->temporal.enabled)
@@ -2685,6 +2711,55 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         const uint32_t net_query = timing_slot * impl_->timing_stride + 2 + 2 * pass;
         if (c.network_timestamp) c.network_timestamp(cmd, true);
         if (time_net) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, impl_->timing, net_query);
+        if (impl_->noise_cap_wanted && !impl_->noise_cap_done && s.core && !s.core->noise.empty() && s.wgt.handle) {
+            const NoiseJob& j = s.core->noise[0];
+            const uint64_t off = uint64_t(j.off) * 4;
+            const uint64_t bytes = uint64_t(j.width) * j.height * 8;
+            if (off + bytes <= s.wgt.bytes) {
+                if (!impl_->noise_cap) {
+                    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+                    bi.size = bytes;
+                    bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+                    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+                    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+                    VkMemoryRequirements mr{};
+                    if (vkCreateBuffer(impl_->session.ctx.device, &bi, nullptr, &impl_->noise_cap) == VK_SUCCESS) {
+                        vkGetBufferMemoryRequirements(impl_->session.ctx.device, impl_->noise_cap, &mr);
+                        uint32_t type = 0;
+                        for (uint32_t i = 0; i < impl_->session.ctx.mem.memoryTypeCount; ++i)
+                            if ((mr.memoryTypeBits & (1u << i)) &&
+                                (impl_->session.ctx.mem.memoryTypes[i].propertyFlags &
+                                 (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
+                                    (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+                                type = i;
+                                break;
+                            }
+                        ai.allocationSize = mr.size;
+                        ai.memoryTypeIndex = type;
+                        if (vkAllocateMemory(impl_->session.ctx.device, &ai, nullptr, &impl_->noise_cap_mem) == VK_SUCCESS)
+                            vkBindBufferMemory(impl_->session.ctx.device, impl_->noise_cap, impl_->noise_cap_mem, 0);
+                    }
+                }
+                if (impl_->noise_cap) {
+                    VkBufferMemoryBarrier bb{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+                    bb.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+                    bb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                    bb.srcQueueFamilyIndex = bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    bb.buffer = s.wgt.handle;
+                    bb.offset = off;
+                    bb.size = bytes;
+                    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                                         0, nullptr, 1, &bb, 0, nullptr);
+                    VkBufferCopy bc{};
+                    bc.srcOffset = off;
+                    bc.dstOffset = 0;
+                    bc.size = bytes;
+                    vkCmdCopyBuffer(cmd, s.wgt.handle, impl_->noise_cap, 1, &bc);
+                    impl_->noise_cap_bytes = bytes;
+                    impl_->noise_cap_done = true;
+                }
+            }
+        }
         for (size_t i = 0; i < s.steps.size(); ++i) {
             const auto& step = s.steps[i];
             const nrvk::Kernel* use = step.k;

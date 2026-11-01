@@ -432,6 +432,11 @@ public:
     // caller resources; neither overload acquires game guides or supplies temporal
     // history, depth/motion integration or a Present hook by itself.
     RecordResult record(VkCommandBuffer, const ColourFrame&, const Controls&);
+    // Debug: copy the plan's precomputed noise field (wgt at noise[0].off*4, width*height*8 bytes) once, from the
+    // next recording; write_noise_capture after the GPU has run that recording writes it out.
+    void capture_noise();
+    bool write_noise_capture(const std::string& path, std::string* why);
+
     // The same, for a frame the caller has a Reset flag for (DLSSNR.Reset): with Controls::noise_every_frame the
     // seed starts again from 0 on it, as the DLL's counter does.
     RecordResult record(VkCommandBuffer, const ColourFrame&, const Controls&, bool reset);
