@@ -229,14 +229,26 @@ struct Built {
         std::vector<uint64_t> owner;   // per slot: the frame that holds it, ~0ull = never used
     };
     std::vector<Upload> upload;
-    ID3D12Resource* done = nullptr;    // the frame numbers the GPU copied back, kDoneSlots of them
-    uint64_t* done_map = nullptr;
-    int64_t executed = -1;              // the newest frame seen in done_map; -1: none has landed yet (frame 0's
-    int64_t last_frame = -1;            // the newest frame recorded into this Built; -1: none
-    void refresh_executed(uint64_t max_f) {
-        if (!done_map) return;
+    ID3D12Resource* exec_token = nullptr; // upload buffer: kDoneSlots uint64s carrying frame numbers for execution completion
+    uint64_t* exec_token_map = nullptr;
+    ID3D12Resource* done = nullptr;       // readback buffer: [0..kDoneSlots) for copy completion, [kDoneSlots..2*kDoneSlots) for execution completion
+    uint64_t* copy_map = nullptr;
+    uint64_t* exec_map = nullptr;
+    int64_t copied = -1;                  // newest frame where parameter copy to GPU has finished (upload slots recyclable)
+    int64_t executed = -1;                // newest frame where all model dispatches have finished on GPU (resources releasable)
+    int64_t last_frame = -1;              // newest frame recorded into this Built; -1: none
+    void refresh_copied(uint64_t max_f) {
+        if (!copy_map) return;
         for (uint32_t s = 0; s < kDoneSlots; ++s) {
-            const uint64_t v = done_map[s];
+            const uint64_t v = copy_map[s];
+            if (v != ~uint64_t(0) && v <= max_f && (v % kDoneSlots) == s && int64_t(v) > copied)
+                copied = int64_t(v);
+        }
+    }
+    void refresh_executed(uint64_t max_f) {
+        if (!exec_map) return;
+        for (uint32_t s = 0; s < kDoneSlots; ++s) {
+            const uint64_t v = exec_map[s];
             if (v != ~uint64_t(0) && v <= max_f && (v % kDoneSlots) == s && int64_t(v) > executed)
                 executed = int64_t(v);
         }
@@ -255,7 +267,9 @@ struct Built {
             if (u.map) u.buf->Unmap(0, nullptr);
             release(u.buf);
         }
-        if (done_map) done->Unmap(0, nullptr);
+        if (exec_token_map) exec_token->Unmap(0, nullptr);
+        release(exec_token);
+        if (copy_map) done->Unmap(0, nullptr);
         release(done);
         release(act); release(wgt); release(wgt_upload); release(surf1); release(depth); release(table);
     }
@@ -386,13 +400,21 @@ std::shared_ptr<Built> build(ID3D12Device* device, const Carriers& carriers, ID3
         u.map = static_cast<uint8_t*>(m);
         b->upload.push_back(std::move(u));
     }
-    b->done = buffer(device, D3D12_HEAP_TYPE_READBACK, kDoneSlots * 8, D3D12_RESOURCE_STATE_COPY_DEST, false);
+    b->exec_token = buffer(device, D3D12_HEAP_TYPE_UPLOAD, kDoneSlots * 8, D3D12_RESOURCE_STATE_GENERIC_READ, false);
+    if (!b->exec_token) { *why = "the execution completion token buffer could not be made"; return nullptr; }
+    {
+        void* m = nullptr;
+        if (FAILED(b->exec_token->Map(0, nullptr, &m)) || !m) { *why = "the execution completion token could not be mapped"; return nullptr; }
+        b->exec_token_map = static_cast<uint64_t*>(m);
+    }
+    b->done = buffer(device, D3D12_HEAP_TYPE_READBACK, kDoneSlots * 16, D3D12_RESOURCE_STATE_COPY_DEST, false);
     if (!b->done) { *why = "the completion readback could not be made"; return nullptr; }
     {
         void* m = nullptr;
         if (FAILED(b->done->Map(0, nullptr, &m)) || !m) { *why = "the completion readback could not be mapped"; return nullptr; }
-        b->done_map = static_cast<uint64_t*>(m);
-        std::memset(b->done_map, 0xFF, kDoneSlots * 8);   // never a frame number
+        b->copy_map = static_cast<uint64_t*>(m);
+        b->exec_map = b->copy_map + kDoneSlots;
+        std::memset(b->copy_map, 0xFF, kDoneSlots * 16);   // never a frame number
     }
     const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     nr::pe::log("[asd] network %s for %ux%u (working %ux%u): %zu dispatches, %zu kernels + temporal %s / %s%s, %zu noise jobs, "
@@ -680,13 +702,13 @@ public:
         // multi-pass stack records into one not-yet-submitted command list each keep their own tables, however
         // many there are.
         const uint64_t frame = frames_;
-        b->refresh_executed(frame);
+        b->refresh_copied(frame);
         Built::Upload* slot_buf = nullptr;
         uint32_t slot_i = 0;
         for (auto& u : b->upload) {
             for (uint32_t i = 0; i < kRing; ++i)
                 if (u.owner[i] == ~uint64_t(0) ||
-                    (b->executed >= 0 && u.owner[i] <= uint64_t(b->executed))) { slot_buf = &u; slot_i = i; break; }
+                    (b->copied >= 0 && u.owner[i] <= uint64_t(b->copied))) { slot_buf = &u; slot_i = i; break; }
             if (slot_buf) break;
         }
         if (!slot_buf) {   // every slot still in flight: another buffer of them, however many it takes
@@ -721,6 +743,7 @@ public:
         const uint64_t slot_off = uint64_t(slot_i) * (b->slot_bytes + 8);
         uint8_t* ring = slot_buf->map + slot_off;
         std::memcpy(ring + b->slot_bytes, &frame, 8);
+        b->exec_token_map[frame % kDoneSlots] = frame;
         std::vector<const Built::Kern*> kern(b->tables, nullptr);
         auto image_va = [&](Img m) {
             switch (m) {
@@ -850,6 +873,12 @@ public:
             cmd->EndQuery(queries_, D3D12_QUERY_TYPE_TIMESTAMP, ts * 2 + 1);
             cmd->ResolveQueryData(queries_, D3D12_QUERY_TYPE_TIMESTAMP, ts * 2, 2, stamps_, uint64_t(ts) * 16);
         }
+        // The model execution completion marker: recorded AFTER all compute dispatches,
+        // alpha pass, and UAV barriers. Once it lands in exec_map, the GPU has completely finished
+        // executing the entire model for this frame. Only then may retired networks, activations,
+        // weights, and feature history buffers be freed by sweep().
+        cmd->CopyBufferRegion(b->done, (kDoneSlots + uint64_t(frame % kDoneSlots)) * 8,
+                              b->exec_token, uint64_t(frame % kDoneSlots) * 8, 8);
         // After the frame (record_all): with motion, the latch is set (reset suppresses consumption,
         // it does not un-write the history), and the post block wrote this frame's history into the other
         // image (flip hcur). Without motion (temporal == nullptr in 0.0.8.1), latch and hcur are untouched.
