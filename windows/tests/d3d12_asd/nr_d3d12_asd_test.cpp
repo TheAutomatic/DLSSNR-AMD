@@ -891,6 +891,17 @@ int renodx_run(int argc, char** argv) {
                             uint64_t hh = 1469598103934665603ull;
                             for (uint64_t i = 0; i < pitch * H; ++i) { hh ^= p8[i]; hh *= 1099511628211ull; }
                             log("[test] renodx: frame %d output hash %016llX", fi, static_cast<unsigned long long>(hh));
+                            // NR_TEST_DUMP=<dir>: each frame's raw output (R10G10B10A2, w*h*4 B) for a numeric
+                            // comparison between two loads of the same frame (HLSL vs the ACO binary).
+                            if (const char* dd = std::getenv("NR_TEST_DUMP"); dd && dd[0]) {
+                                char path[512];
+                                std::snprintf(path, sizeof path, "%s\\frame%d.bin", dd, fi);
+                                if (FILE* out = std::fopen(path, "wb")) {
+                                    std::fwrite(p8, 1, size_t(pitch * H), out);
+                                    std::fclose(out);
+                                    log("[test] renodx: frame %d output dumped to %s", fi, path);
+                                }
+                            }
                             rb->Unmap(0, nullptr);
                         }
                     }

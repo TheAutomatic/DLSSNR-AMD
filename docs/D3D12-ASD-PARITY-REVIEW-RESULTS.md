@@ -47,6 +47,11 @@
 - 非 UAV 入口状态：未运行。
 - resize / 多 pass / 特征回收边界的定向案例：未运行。
 - 输出与旧桥接数值对齐：未运行（桥接对照宿主待搭）。
+- **ACO 真实执行已单独证实（诊断装载）**：关闭注册、不用 `force_canary`，仅用 Microsoft 文档的本地 D3DConfig
+  PSDB override 指向离线测试 exe，canary **ASD_HIT**（0/128 与 ACO 一致），71 dispatches，3 帧 `S_OK`，
+  退出后 override 已恢复原状。证据 `P5-real-aco-execution.md`。这与产品程序化注册（下表）分开。
+- ACO 输出与驱动编译的 HLSL 载体输出**不一致**（逐像素：B 通道 mean 44–72/1023、max 246–338），
+  这是两份不同的机器码（ACO ELF over Linux SPIR-V vs 驱动 DXIL），不是可比的数值等价；不用载体时间当 ACO 性能。
 - 正常注册路径：**本机此刻对所有 exe 都不可用**——实验室旧 `asd_probe.exe` 用它自己的路径（历史上成功过）
   现在同样返回 `E_HANDLE`；换成 1.619.5 Agility Core、清空条目、换目录、换目标 exe 均无差别。
   因此 `E_HANDLE` 不是宿主 exe 的属性，而是这台机器上 D3DSCR 存储的瞬时状态（实验室 `docs/ASD-PUBLIC-IMPORT.md`
