@@ -1662,10 +1662,10 @@ void Stage::Impl::copy_frame(ID3D12GraphicsCommandList* cmd, const Frame& f) {
     b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
     {
         const D3D12_RESOURCE_DESC cd = f.colour->GetDesc(), od = f.output->GetDesc();
-        jlog("renodx frame copy: colour %p %llux%llu fmt %u state %u -> output %p %llux%llu fmt %u state %u",
-             static_cast<void*>(f.colour), static_cast<unsigned long long>(cd.Width), cd.Height, static_cast<unsigned>(cd.Format),
-             static_cast<unsigned>(f.colour_state), static_cast<void*>(f.output),
-             static_cast<unsigned long long>(od.Width), od.Height, static_cast<unsigned>(od.Format),
+        jlog("renodx frame copy: colour %p %llux%u fmt %u state %u -> output %p %llux%u fmt %u state %u",
+             static_cast<void*>(f.colour), static_cast<unsigned long long>(cd.Width), static_cast<unsigned>(cd.Height),
+             static_cast<unsigned>(cd.Format), static_cast<unsigned>(f.colour_state), static_cast<void*>(f.output),
+             static_cast<unsigned long long>(od.Width), static_cast<unsigned>(od.Height), static_cast<unsigned>(od.Format),
              static_cast<unsigned>(f.output_state));
     }
     cmd->ResourceBarrier(2, b);
@@ -1691,10 +1691,11 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
         journal = true;
         ++frames_recorded;
         const D3D12_RESOURCE_DESC cd = f.colour->GetDesc(), od = f.output->GetDesc();
-        jlog("renodx frame %u: %ux%u network %ux%u passes %u hdr %d; colour %llux%llu fmt %u state %u; output %llux%llu fmt %u "
+        jlog("renodx frame %u: %ux%u network %ux%u passes %u hdr %d; colour %llux%u fmt %u state %u; output %llux%u fmt %u "
              "state %u", frames_recorded, W, H, NW, NH, passes, hdr ? 1 : 0,
-             static_cast<unsigned long long>(cd.Width), cd.Height, static_cast<unsigned>(cd.Format),
-             static_cast<unsigned>(f.colour_state), static_cast<unsigned long long>(od.Width), od.Height,
+             static_cast<unsigned long long>(cd.Width), static_cast<unsigned>(cd.Height), static_cast<unsigned>(cd.Format),
+             static_cast<unsigned>(f.colour_state), static_cast<unsigned long long>(od.Width),
+             static_cast<unsigned>(od.Height),
              static_cast<unsigned>(od.Format), static_cast<unsigned>(f.output_state));
     }
 
@@ -1887,8 +1888,8 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
         box.right = f.motion_x + f.motion_w;
         box.bottom = f.motion_y + f.motion_h;
         box.back = 1;
-        jlog("renodx motion copy: box %u,%u..%u,%u of source %llux%llu into %ux%u", box.left, box.top, box.right,
-             box.bottom, static_cast<unsigned long long>(md.Width), md.Height, motion.w, motion.h);
+        jlog("renodx motion copy: box %u,%u..%u,%u of source %llux%u into %ux%u", box.left, box.top, box.right,
+             box.bottom, static_cast<unsigned long long>(md.Width), static_cast<unsigned>(md.Height), motion.w, motion.h);
         cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
         ensure(cmd, motion.res, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         transition(cmd, f.motion, D3D12_RESOURCE_STATE_COPY_SOURCE, f.motion_state);
