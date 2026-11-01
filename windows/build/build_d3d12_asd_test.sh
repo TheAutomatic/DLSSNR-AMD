@@ -13,7 +13,7 @@ srcs=(windows/tests/d3d12_asd/nr_d3d12_asd_test.cpp windows/src/pe/nr_d3d12_asd.
 libs=(-ld3d12 -lole32 -lshell32 -static -static-libgcc -static-libstdc++)
 # nr_renodx.cpp (the RenoDX stage's host logic, shared with the D3D12 one) imports Vulkan: resolved at run time,
 # as in the .asi (vulkan_lazy.sh).
-count=$(bash windows/build/vulkan_lazy.sh "$out" "$cxx" "${srcs[@]}" "${libs[@]}" | grep -o '[0-9]*$')
+count=$(bash windows/build/vulkan_lazy.sh "$out" "$cxx" "${flags[@]}" "${srcs[@]}" "${libs[@]}" | grep -o '[0-9]*$' || echo 0)
 "$cxx" "${flags[@]}" "${srcs[@]}" -o "$out/nr_d3d12_asd_test_inbox.exe" "$out/vulkan_lazy_s.o" "$out/vulkan_lazy_c.o" "${libs[@]}"
 "$cxx" "${flags[@]}" -DNR_TEST_AGILITY=619 "${srcs[@]}" -o "$out/nr_d3d12_asd_test_619.exe" "$out/vulkan_lazy_s.o" "$out/vulkan_lazy_c.o" "${libs[@]}"
 "$cxx" "${flags[@]}" -DNR_TEST_AGILITY=615 "${srcs[@]}" -o "$out/nr_d3d12_asd_test_615.exe" "$out/vulkan_lazy_s.o" "$out/vulkan_lazy_c.o" "${libs[@]}"

@@ -45,6 +45,7 @@ void log(const char* format, ...) {
     std::printf("\n");
     std::fflush(stdout);
 }
+const char* module_folder() { return "."; }
 namespace split {
 struct Snapshot {};
 bool prepare(ID3D12GraphicsCommandList*, std::string*) { return true; }

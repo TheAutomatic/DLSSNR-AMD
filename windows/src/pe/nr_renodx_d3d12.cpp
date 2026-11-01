@@ -584,7 +584,6 @@ uint32_t band_radius(const Settings& s, uint32_t nr_height) {
     return std::clamp(uint32_t(std::lround(half_pixels)), 1u, 64u);
 }
 
-uint32_t bits_of(float v) { uint32_t u; std::memcpy(&u, &v, 4); return u; }
 
 Constants make_constants(const Settings& s, const Frame& f) {
     Constants c{};
@@ -1819,6 +1818,7 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
         transition(cmd, f.motion, D3D12_RESOURCE_STATE_COPY_SOURCE, f.motion_state);
         motion_copied = true;
     }
+    const bool recreate_epoch = recreate || history_reset;   // the governor's reset-epoch snap (PlanFrameScale)
     const bool reset_all = f.reset || history_reset;
     if (reset_all || !fast_feedback) st_valid = false;
     history_reset = false;
@@ -1902,6 +1902,116 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
     }
     transition(cmd, f.colour, D3D12_RESOURCE_STATE_COPY_SOURCE, f.colour_state);
     ensure(cmd, original.res, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+    if (v6) {
+        // 2a. linearize: original -> work0, the linear source everything after reads.
+        const V6Constants lin = make_v6(s, f6, W, H, W, H, W, H, W, H, 0.f, 0.f, 0.f);
+        View srv[8] = {};
+        srv[0] = srv[1] = srv[2] = srv[3] = tv(original, false);
+        View uav[14] = {};
+        uav[0] = tv(work0, true);
+        dispatch(cmd, kLinearize, srv, uav, &lin, sizeof lin / 4, gx, gy);
+        // with Preprocess's exposure the frame is metered after its forward half; without it before (RenoDX's scale)
+        if (prep_on && !prep_normalise) prep_forward_hdr(work0, true);
+        Tex& metered = (prep_on && !prep_normalise) ? work_p : work0;
+        feed = kFeedV1;
+        if (!units.absolute && !prep_exposure) {
+            // 2b. this frame's scale texel: the v1 meter and the governor (feed v1).
+            if (!commit_cleared) {
+                D3D12_CPU_DESCRIPTOR_HANDLE cpu = clear_heap->GetCPUDescriptorHandleForHeapStart();
+                D3D12_GPU_DESCRIPTOR_HANDLE gpu = clear_heap->GetGPUDescriptorHandleForHeapStart();
+                D3D12_UNORDERED_ACCESS_VIEW_DESC d{};
+                d.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+                d.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+                device->CreateUnorderedAccessView(commit.res, nullptr, &d, cpu);
+                const float zero[4] = {};
+                cmd->ClearUnorderedAccessViewFloat(gpu, cpu, commit.res, zero, 0, nullptr);
+                ensure(cmd, commit.res, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                uav_barrier(cmd);
+                commit_cleared = true;
+            }
+            // The float formats v6_exposure_scale reads (.r), as RenoDX's Vulkan path lists them.
+            bool readable = false;
+            switch (f.exposure ? f.exposure->GetDesc().Format : DXGI_FORMAT_UNKNOWN) {
+                case DXGI_FORMAT_R16_FLOAT: case DXGI_FORMAT_R16G16_FLOAT: case DXGI_FORMAT_R16G16B16A16_FLOAT:
+                case DXGI_FORMAT_R32_FLOAT: case DXGI_FORMAT_R32G32_FLOAT: case DXGI_FORMAT_R32G32B32A32_FLOAT:
+                case DXGI_FORMAT_R11G11B10_FLOAT:
+                    readable = true;
+                    break;
+                default:
+                    break;
+            }
+            feed = select_feed(s, hdr, units, readable, f.auto_exposure || !f.create_flags_known);
+            facts.feed = feed == kFeedV1 ? 0 : feed == kFeedTexture ? 1 : 2;
+            facts.exposure_texture = !f.exposure ? 0 : readable ? 1 : 2;
+            if (feed != logged_feed) {   // SelectFeed's line, once per decision
+                logged_feed = feed;
+                nr::pe::log("[nr] RenoDX stage (D3D12): NR feed %s (NRFeedMode=%u; exposure texture %s, auto "
+                            "exposure %s, pre-exposure %.4g, exposure scale %.4g)",
+                            feed == kFeedV1 ? "v1 (the content meter)" : feed == kFeedTexture ? "v2 (the game's exposure)"
+                                                                                              : "v2 (fixed 1)",
+                            s.feed_mode, !f.exposure ? "none" : readable ? "readable" : "unreadable",
+                            !f.create_flags_known ? "unknown" : f.auto_exposure ? "1" : "0", f.pre_exposure,
+                            f.exposure_scale);
+            }
+            const ScalePlan plan = plan_frame_scale(s, norm, f.reset, feed, recreate_epoch);
+            if (feed == kFeedV1 || plan.guarded) {
+                V6Constants meter = make_v6(s, f6, 1, 1, W, H, 1, 1, 1, 1, 0.f, 0.f, 0.f);
+                meter.divisor = 0.f; meter.pedestal_cap = 0.f; meter.encoding = 1u; meter.dark_gate = 0.f;
+                std::memcpy(&meter.slew_stops, plan.governor, sizeof plan.governor);
+                View msrv[8] = {};
+                msrv[0] = msrv[1] = msrv[2] = msrv[3] = tv(metered, false);
+                View muav[14] = {};
+                muav[0] = tv(scale, true);
+                muav[1] = tv(commit, true);
+                dispatch(cmd, kAutoscale, msrv, muav, &meter, sizeof meter / 4, 1, 1);
+            }
+            if (feed != kFeedV1) {
+                const bool texture = feed == kFeedTexture && readable;
+                if (texture) {
+                    // Texel (0,0), the one v6_exposure_scale reads, into the stage's own image.
+                    const DXGI_FORMAT ef = f.exposure->GetDesc().Format;
+                    if (!exposure_1x1.res || exposure_1x1.format != ef) {
+                        drop(exposure_1x1);
+                        std::string why;
+                        exposure_1x1 = make_tex(1, 1, ef, false, &why);
+                        if (!exposure_1x1.res) return 0;
+                    }
+                    transition(cmd, f.exposure, f.exposure_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    ensure(cmd, exposure_1x1.res, D3D12_RESOURCE_STATE_COPY_DEST);
+                    D3D12_TEXTURE_COPY_LOCATION esrc{}, edst{};
+                    esrc.pResource = f.exposure;
+                    esrc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                    esrc.SubresourceIndex = 0;
+                    edst.pResource = exposure_1x1.res;
+                    edst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                    edst.SubresourceIndex = 0;
+                    D3D12_BOX ebox{};
+                    ebox.right = ebox.bottom = ebox.back = 1;
+                    cmd->CopyTextureRegion(&edst, 0, 0, 0, &esrc, &ebox);
+                    ensure(cmd, exposure_1x1.res, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                    transition(cmd, f.exposure, D3D12_RESOURCE_STATE_COPY_SOURCE, f.exposure_state);
+                }
+                // v6_exposure_scale's own cbuffer view: dwords 0..6. The fixed feed reads no texture: the metered
+                // image fills the slot, as RenoDX's own sets do.
+                const uint32_t feed_constants[7] = {texture ? uint32_t(kFeedTexture) : uint32_t(kFeedFixed),
+                                                    bits(f.pre_exposure > 0.f ? f.pre_exposure : 1.f),
+                                                    bits(f.exposure_scale > 0.f ? f.exposure_scale : 1.f),
+                                                    bits(plan.v2_snap ? 1.f : 0.f), plan.guarded ? 1u : 0u, W, H};
+                View esrv[8] = {};
+                esrv[0] = texture ? tv(exposure_1x1, false) : tv(metered, false);
+                esrv[1] = tv(metered, false);
+                esrv[2] = texture ? tv(exposure_1x1, false) : tv(metered, false);
+                esrv[3] = texture ? tv(exposure_1x1, false) : tv(metered, false);
+                View euav[14] = {};
+                euav[0] = tv(scale, true);
+                euav[1] = tv(commit, true);
+                dispatch(cmd, kExposureScale, esrv, euav, feed_constants, 7, 1, 1);
+            }
+        }
+        if (prep_normalise) prep_forward_hdr(work0, false);   // after RenoDX's scale, which it divides by
+    }
+
 
     const float nfast = std::clamp(s.fast_passes[fast_slot], 1.f, 8.f);
     const uint32_t segment = std::min(uint32_t(nfast), 3u) - 1u;
@@ -2331,6 +2441,10 @@ bool Stage::set(const Settings& s) {
     m.settings = s;
     m.units = units;
     return true;
+}
+
+uint32_t Stage::record(ID3D12GraphicsCommandList* cmd, const Frame& f, const Frame::Net& net) {
+    return impl_->record(cmd, f, net);
 }
 
 uint8_t Stage::hdr_mode() const { return impl_->hdr; }

@@ -843,8 +843,6 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
         return fallback("the RenoDX route: colour or output is not a single-sampled 2D texture");
     const DXGI_FORMAT sf = view_format(sd.Format), df = view_format(dd.Format);
     if (sf == DXGI_FORMAT_UNKNOWN || df == DXGI_FORMAT_UNKNOWN) return fallback("the RenoDX route: an sRGB format");
-    const uint8_t hdr = f.renodx_present ? uint8_t(f.renodx_present == 2 ? 2 : f.renodx_present == 3 ? 1 : 0)
-                                         : renodx12::frame_hdr_mode(sf, f.renodx_hdr_flag != 0);
     if (!(dd.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) || !typed_uav(f.device, df))
         return fallback("the RenoDX route: the output's format has no typed UAV store");
     const uint32_t w = std::min<uint64_t>({f.width, sd.Width, dd.Width});

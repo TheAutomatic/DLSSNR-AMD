@@ -276,6 +276,32 @@ cp -- "${NR_IMGUI_ROOT:-toolchain/imgui-nr}/LICENSE.txt" "$op/asi/DearImGui-LICE
 cmp -s <(cd artifacts/windows/asi/shaders/wilsjo2 && sha256sum -- *.spv) <(cd "$pkg/dlssnr-amd/shaders/wilsjo2" && sha256sum -- *.spv) ||
     { echo "the plugin's wilsjo2 shaders are not dlssnr-amd/shaders/wilsjo2's" >&2; exit 1; }
 
+# dlssnr-amd-asd/: the native D3D12 ASD backend (M5). Optional: NR_ASD_DIR points to a directory holding the SODB,
+# PSDB and dlssnr-amd-asd.ini. If NR_ASD_TOOLS is also given, builds the reprofile tool from nr_d3d12_asd_test_619.exe
+# and bundles the vendor compiler DLLs from that folder.
+if [[ -n "${NR_ASD_DIR:-}" && -d "$NR_ASD_DIR" ]]; then
+    asd_src=$(realpath -- "$NR_ASD_DIR")
+    asd_pkg="$pkg/dlssnr-amd-asd"
+    mkdir -p -- "$asd_pkg"
+    cp -r -- "$asd_src"/* "$asd_pkg/"
+    if [[ -n "${NR_ASD_TOOLS:-}" && -d "$NR_ASD_TOOLS" ]]; then
+        tools_src=$(realpath -- "$NR_ASD_TOOLS")
+        mkdir -p -- "$asd_pkg/reprofile"
+        bash windows/build/build_d3d12_asd_test.sh "$out/asd_reprofile" > /dev/null
+        cp -- "$out/asd_reprofile/nr_d3d12_asd_test_619.exe" "$asd_pkg/reprofile/dlssnr-amd-asd-reprofile.exe"
+        for dll in amdxc_compiler.dll D3D12StateObjectCompiler.dll; do
+            [[ -f "$tools_src/$dll" ]] && cp -- "$tools_src/$dll" "$asd_pkg/reprofile/"
+        done
+        if [[ -d "$tools_src/D3D12" ]]; then
+            mkdir -p -- "$asd_pkg/reprofile/D3D12"
+            cp -- "$tools_src/D3D12/"* "$asd_pkg/reprofile/D3D12/" 2>/dev/null || true
+        fi
+        echo "dlssnr-amd-asd: packaged with reprofile tools (from $tools_src)"
+    else
+        echo "dlssnr-amd-asd: packaged (without reprofile tools; set NR_ASD_TOOLS to include them)"
+    fi
+fi
+
 # experimental/: what install.ps1 makes CC_SMALL_FP8_EXPERIMENTAL's weights with - the difference of its fitted weights
 # from the small model's (linux/data/experimental: each changed entry XOR the small model's, so it holds none of NVIDIA's
 # weights) and the SHA-256 of the result.

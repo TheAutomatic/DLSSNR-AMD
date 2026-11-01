@@ -650,6 +650,11 @@ if ($Route -eq 'optiscaler') {
     New-Item -ItemType Directory -Force -Path (Join-Path $game 'OptiScaler\plugins') | Out-Null
     Copy-Item -LiteralPath (Join-Path $here 'optiscaler\asi\dlssnr-amd.asi') -Destination (Join-Path $game 'OptiScaler\plugins\dlssnr-amd.asi') -Force
     Copy-Item -LiteralPath (Join-Path $here 'optiscaler\asi\nr_present_probe.exe') -Destination (Join-Path $game 'dlssnr-amd') -Force
+    $asdSrc = Join-Path $here 'dlssnr-amd-asd'
+    if (Test-Path -LiteralPath $asdSrc -PathType Container) {
+        Put-Tree $asdSrc 'OptiScaler\plugins\dlssnr-amd-asd'
+        Say 'D3D12 ASD backend: installed into OptiScaler\plugins\dlssnr-amd-asd'
+    }
     Record-Logs @('OptiScaler.log')
 
     # OptiScaler loads the .asi plugins in OptiScaler\plugins only when asked to; its own log (OptiScaler.log, which the
