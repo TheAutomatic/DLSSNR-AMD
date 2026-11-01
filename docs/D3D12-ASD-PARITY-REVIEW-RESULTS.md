@@ -262,3 +262,16 @@ pre 的一部分输出本来就在 **wgt**，下一步应抓 pre 之后的 wgt �
 - 修正后同偏移 `act[534,773,760, +64 MiB)`、pre 之后：两侧都非零，但**内容不同**：
   ASD sha256 `136de105…`、参考 `dfc867f8…`，49,602,675 / 67,108,864 字节不同（73.91%），f16 上 max|d| = 1.509。
 - 因此**首个不一致点在 temporal pre 的输出**（或它读取的输入）。已逐字节一致：noise、weights。
+
+## pre 的内核身份（第 1 项证据）
+
+记录文件按 `fnv64(SPIR-V)` 命名（`nr_pipeline_binary.hpp`，`pal::hash`）：
+
+| 来源 | SPIR-V sha256 前缀 | fnv64（= 记录名） | 记录是否存在 |
+|---|---|---|---|
+| `parity-root/dlssnr-amd/aco/shaders/temporal/temporal_pre_fp32nh.spv`（参考侧 ACO 用） | `63396fd0…` | `3ccbc35ad9ececb3` | **存在**（`windows/data/aco/records/3ccbc35ad9ececb3.nrp`） |
+| `parity-root/dlssnr-amd/shaders/temporal/temporal_pre_fp32nh.spv`（原生/Windows 网络） | `8c2c57bc…` | `58161c1ca21f22e5` | **不存在** |
+
+即：ACO 包里的 pre 与 Windows 原生网络里的 pre 是**两份不同的 SPIR-V**；只有前者有 ACO 记录。ASD 侧的
+PSDB 由实验室流程生成，尚未从运行时侧证明它装载的是哪一个 ELF（第 1 项证据只完成了一半：记录身份已明确，
+两侧实际装载的 ELF 还需运行时取证）。
