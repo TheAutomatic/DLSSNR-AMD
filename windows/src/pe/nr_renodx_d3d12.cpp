@@ -1149,6 +1149,29 @@ struct Stage::Impl {
     // HDR resolves pass k into the work images, SDR into the decoded ones.
     Tex& stack_out(uint32_t pass) { return hdr ? ((pass & 1u) ? work_b : work_a) : ((pass & 1u) ? decoded_alt : decoded); }
 
+    // ClearUnorderedAccessView* reads its GPU handle from the heap bound right now and its CPU handle from a heap the
+    // driver reads beside it (D3D12's signature: ViewGPUHandleInCurrentHeap, ViewCPUHandle). The dispatch slots rotate,
+    // so the clears get two slots of their own after them: a recorded clear must keep the view it was given.
+    static constexpr UINT kClearSlot = kSlots * 20;
+    D3D12_CPU_DESCRIPTOR_HANDLE main_cpu(UINT i) const {
+        D3D12_CPU_DESCRIPTOR_HANDLE h = heap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += SIZE_T(i) * inc;
+        return h;
+    }
+    D3D12_GPU_DESCRIPTOR_HANDLE main_gpu(UINT i) const {
+        D3D12_GPU_DESCRIPTOR_HANDLE h = heap->GetGPUDescriptorHandleForHeapStart();
+        h.ptr += UINT64(i) * inc;
+        return h;
+    }
+    D3D12_CPU_DESCRIPTOR_HANDLE clear_cpu(UINT i) const {
+        D3D12_CPU_DESCRIPTOR_HANDLE h = clear_heap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += SIZE_T(i) * inc;
+        return h;
+    }
+    void bind_heap(ID3D12GraphicsCommandList* cmd) const {
+        ID3D12DescriptorHeap* heaps[1] = {heap};
+        cmd->SetDescriptorHeaps(1, heaps);
+    }
     // One dispatch. `srv` / `uav` hold the register-numbered slots (t0.. / u0..); a null slot takes the first
     // non-null one's view (a binding the stage leaves out is one the program never reads, and D3D12 never
     // validates an unaccessed descriptor).
@@ -1156,11 +1179,7 @@ struct Stage::Impl {
                   uint32_t dwords, uint32_t gx, uint32_t gy) {
         const bool codec = codec_sig(p);
         const UINT n_srv = codec ? 6 : 8, n_uav = codec ? 14 : 8;
-        // The heap has to be bound on the list before a root descriptor table: the game's command list arrives with
-        // its own (or none), and a table set without it is an invalid call - the driver answers it by removing the
-        // device (DXGI_ERROR_INVALID_CALL, which is what the ASD route died of on its first frame).
-        ID3D12DescriptorHeap* heaps[1] = {heap};
-        cmd->SetDescriptorHeaps(1, heaps);
+        bind_heap(cmd);
         D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap->GetCPUDescriptorHandleForHeapStart();
         D3D12_GPU_DESCRIPTOR_HANDLE gpu = heap->GetGPUDescriptorHandleForHeapStart();
         cpu.ptr += SIZE_T(slot) * 20 * inc;
@@ -1441,11 +1460,11 @@ bool Stage::Impl::build(std::string* why) {
     }
     D3D12_DESCRIPTOR_HEAP_DESC hd{};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = kSlots * 20;
+    hd.NumDescriptors = kSlots * 20 + 2;   // + the two clear slots (kClearSlot)
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)))) { *why = "renodx: the descriptor heap failed"; return false; }
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
-    hd.NumDescriptors = 1;
+    hd.NumDescriptors = 2;   // one per cleared resource, beside the GPU ones
     if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&clear_heap)))) { *why = "renodx: the clear heap failed"; return false; }
     Impl::inc = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
@@ -1692,16 +1711,17 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
             prep_state_fresh = true;
         }
         if (prep_state_fresh) {
-            D3D12_CPU_DESCRIPTOR_HANDLE cpu = clear_heap->GetCPUDescriptorHandleForHeapStart();
-            D3D12_GPU_DESCRIPTOR_HANDLE gpu = clear_heap->GetGPUDescriptorHandleForHeapStart();
             D3D12_UNORDERED_ACCESS_VIEW_DESC d{};
             d.Format = DXGI_FORMAT_UNKNOWN;
             d.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
             d.Buffer.NumElements = 1;
             d.Buffer.StructureByteStride = 16;
-            device->CreateUnorderedAccessView(prep_state, nullptr, &d, cpu);
+            device->CreateUnorderedAccessView(prep_state, nullptr, &d, main_cpu(kClearSlot));
+            device->CreateUnorderedAccessView(prep_state, nullptr, &d, clear_cpu(0));
+            ensure(cmd, prep_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);   // the clear writes it
+            bind_heap(cmd);                                                   // the GPU handle's heap
             const UINT zero[4] = {};
-            cmd->ClearUnorderedAccessViewUint(gpu, cpu, prep_state, zero, 1, nullptr);
+            cmd->ClearUnorderedAccessViewUint(main_gpu(kClearSlot), clear_cpu(0), prep_state, zero, 0, nullptr);
             uav_barrier(cmd);
             prep_state_fresh = false;
         }
@@ -1923,15 +1943,15 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
         if (!units.absolute && !prep_exposure) {
             // 2b. this frame's scale texel: the v1 meter and the governor (feed v1).
             if (!commit_cleared) {
-                D3D12_CPU_DESCRIPTOR_HANDLE cpu = clear_heap->GetCPUDescriptorHandleForHeapStart();
-                D3D12_GPU_DESCRIPTOR_HANDLE gpu = clear_heap->GetGPUDescriptorHandleForHeapStart();
                 D3D12_UNORDERED_ACCESS_VIEW_DESC d{};
                 d.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
                 d.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-                device->CreateUnorderedAccessView(commit.res, nullptr, &d, cpu);
+                device->CreateUnorderedAccessView(commit.res, nullptr, &d, main_cpu(kClearSlot + 1));
+                device->CreateUnorderedAccessView(commit.res, nullptr, &d, clear_cpu(1));
+                ensure(cmd, commit.res, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);   // the clear writes it
+                bind_heap(cmd);                                                   // the GPU handle's heap
                 const float zero[4] = {};
-                cmd->ClearUnorderedAccessViewFloat(gpu, cpu, commit.res, zero, 0, nullptr);
-                ensure(cmd, commit.res, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                cmd->ClearUnorderedAccessViewFloat(main_gpu(kClearSlot + 1), clear_cpu(1), commit.res, zero, 0, nullptr);
                 uav_barrier(cmd);
                 commit_cleared = true;
             }
