@@ -225,17 +225,10 @@ bool copy_to_local(std::wstring* sodb, std::wstring* psdb) {
     const std::wstring s2 = dir + L"\\" + leaf(*sodb), p2 = dir + L"\\" + leaf(*psdb);
     // A PSDB made for the exe's app profile is already in this folder (the cache): nothing to copy for it.
     const BOOL a = CopyFileW(sodb->c_str(), s2.c_str(), FALSE), b = same_path(psdb->c_str(), p2) || CopyFileW(psdb->c_str(), p2.c_str(), FALSE);
-    // The network's carriers are read beside the PSDB, so they travel with it: without this copy the ASD network
-    // cannot be made from the local folder. The canary still runs from the PSDB alone, so the miss only showed as
-    // the bridge being taken for the whole launch.
-    auto folder_of = [](const std::wstring& p) { const size_t k = p.find_last_of(L"\\/"); return k == std::wstring::npos ? std::wstring() : p.substr(0, k); };
-    const std::wstring pc = folder_of(*psdb) + L"\\net-carriers.bin", c2 = dir + L"\\net-carriers.bin";
-    BOOL c = TRUE;
-    if (exists(pc) && !same_path(pc.c_str(), c2)) c = CopyFileW(pc.c_str(), c2.c_str(), FALSE);
-    log("[asd] registration: CopyToLocal: %s -> %s (%s), %s -> %s (%s), %s -> %s (%s)", utf8(*sodb).c_str(), utf8(s2).c_str(),
+    log("[asd] registration: CopyToLocal: %s -> %s (%s), %s -> %s (%s)", utf8(*sodb).c_str(), utf8(s2).c_str(),
         a ? "ok" : ("error " + std::to_string(GetLastError())).c_str(), utf8(*psdb).c_str(), utf8(p2).c_str(),
-        b ? "ok" : "error", utf8(pc).c_str(), utf8(c2).c_str(), !exists(pc) ? "absent" : (c ? "ok" : "error"));
-    if (!a || !b || !c) return false;
+        b ? "ok" : "error");
+    if (!a || !b) return false;
     *sodb = s2;
     *psdb = p2;
     return true;
