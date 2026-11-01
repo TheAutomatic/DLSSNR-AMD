@@ -1129,16 +1129,19 @@ public:
                       capture::schedule(m2); }
                 }
             }
-            if (!b->pre_dump_written && int(i) == tp.pre && i < b->plan.disp.size() && b->plan.disp[i].push.size() >= 8) {
-                const uint8_t* pp = b->plan.disp[i].push.data();
+            const int plan_i = int(i) - int(base);   // the table index includes the noise dispatches
+            if (!b->pre_dump_written && plan_i == tp.pre && plan_i >= 0 && size_t(plan_i) < b->plan.disp.size() &&
+                b->plan.disp[size_t(plan_i)].push.size() >= 8) {
+                const uint8_t* pp = b->plan.disp[size_t(plan_i)].push.data();
                 uint32_t p0 = 0, p1 = 0;
                 std::memcpy(&p0, pp, 4);
                 std::memcpy(&p1, pp + 4, 4);
                 char m3[160];
-                std::snprintf(m3, sizeof m3, "pre push head: %u %u (push %zu bytes)", p0, p1, b->plan.disp[i].push.size());
+                std::snprintf(m3, sizeof m3, "pre push head: %u %u (push %zu bytes) table %u plan %d",
+                              p0, p1, b->plan.disp[size_t(plan_i)].push.size(), i, plan_i);
                 capture::schedule(m3);
             }
-            if (b->pre_dump && !b->pre_dump_written && int(i) == tp.pre && b->act) {
+            if (b->pre_dump && !b->pre_dump_written && plan_i == tp.pre && b->act) {
                 const char* lo = std::getenv("NR_NET_PRE_OFF");
                 const uint64_t roff = lo && lo[0] ? std::strtoull(lo, nullptr, 0) : 0;
                 // NR_NET_PRE_SURF=1: the same dump from surf1 instead of the act arena (where the pre block's
