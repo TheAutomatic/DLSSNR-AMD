@@ -892,9 +892,24 @@ public:
             std::memcpy(ring + uint64_t(b->tables) * kTableBytes, params, sizeof params);
         }
         const uint32_t lo = first ? 0 : base;
+        if (sched) {
+            char l[256];
+            std::snprintf(l, sizeof l, "frame %llu barrier table %s->COPY_DEST (uav before: %d)",
+                          static_cast<unsigned long long>(frame), b->table_uav ? "UAV" : "COPY_DEST", b->table_uav ? 1 : 0);
+            capture::schedule(l);
+        }
         if (b->table_uav) transition(cmd, b->table, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
         cmd->CopyBufferRegion(b->table, uint64_t(lo) * kTableBytes, slot_buf->buf, slot_off + uint64_t(lo) * kTableBytes,
                               b->slot_bytes - uint64_t(lo) * kTableBytes);
+        if (sched) {
+            char l[256];
+            std::snprintf(l, sizeof l, "frame %llu CopyBufferRegion table+%llu <- upload+%llu, %llu bytes (table %llu, slot %llu)",
+                          static_cast<unsigned long long>(frame), static_cast<unsigned long long>(uint64_t(lo) * kTableBytes),
+                          static_cast<unsigned long long>(slot_off + uint64_t(lo) * kTableBytes),
+                          static_cast<unsigned long long>(b->slot_bytes - uint64_t(lo) * kTableBytes),
+                          static_cast<unsigned long long>(b->slot_bytes), static_cast<unsigned long long>(b->slot_bytes + 8));
+            capture::schedule(l);
+        }
         transition(cmd, b->table, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         b->table_uav = true;
         // The slot's frame number back where the CPU can see it: once it lands, this record's copy has run.
@@ -918,6 +933,17 @@ public:
             uint32_t grid[3];
             std::memcpy(grid, t + kTableGridOff, sizeof grid);
             const uint32_t tag = k.tag + 1;
+            if (sched) {
+                const char* kn = "temporal";
+                for (const auto& [nm, kk] : b->kern) if (&kk == &k) { kn = nm.c_str(); break; }
+                char l[320];
+                std::snprintf(l, sizeof l,
+                              "frame %llu [%u] pso %p rs %p rootUAV 0x%llX (table base 0x%llX, %u bytes) tag %u grid %ux%ux%u kern %s",
+                              static_cast<unsigned long long>(frame), i, static_cast<void*>(k.pso), static_cast<void*>(rs_),
+                              static_cast<unsigned long long>(table_va + uint64_t(i) * kTableBytes),
+                              static_cast<unsigned long long>(table_va), kTableBytes, tag, grid[0], grid[1], grid[2], kn);
+                capture::schedule(l);
+            }
             cmd->SetPipelineState(k.pso);
             cmd->SetComputeRoot32BitConstants(0, 1, &tag, 0);
             cmd->SetComputeRootUnorderedAccessView(1, table_va + uint64_t(i) * kTableBytes);

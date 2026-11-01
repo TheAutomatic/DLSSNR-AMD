@@ -136,11 +136,16 @@ void start(const std::string& game_folder, bool wanted, bool wanted_debug_layer)
         nr::pe::log("[capture] off (NR_ASD_CAPTURE=0): a device fault leaves nothing to read");
         return;
     }
-    g_game = std::wstring(game_folder.begin(), game_folder.end());
+    // The game's folder: the main module's, whatever path the ASI itself sits in.
+    wchar_t exe[MAX_PATH * 2] = L"";
+    const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH * 2);
+    std::wstring root = n ? std::wstring(exe, n) : std::wstring(game_folder.begin(), game_folder.end());
+    if (const size_t slash = root.find_last_of(L"\\/"); slash != std::wstring::npos) root.resize(slash);
+    g_game = root;
     g_dir = g_game + L"\\nr-diag";
     CreateDirectoryW(g_dir.c_str(), nullptr);
 
-    g_run = _wfopen(path_of(L"run.txt").c_str(), L"w, ccs=UTF-8");
+    g_run = _wfopen(path_of(L"run.txt").c_str(), L"wb");
     write(g_run, "DLSSNR-AMD diagnostic capture");
     write(g_run, ("folder: " + narrow(g_dir.c_str())).c_str());
 
@@ -193,7 +198,7 @@ void start(const std::string& game_folder, bool wanted, bool wanted_debug_layer)
     std::snprintf(line, sizeof line, "debug layer: %s | DRED breadcrumbs: %s | page faults: %s",
                   debug_layer ? "on" : "off (DebugLayer=0)", breadcrumbs ? "on" : "no", faults ? "on" : "no");
     write(g_run, line);
-    g_errors = _wfopen(path_of(L"d3d12-messages.txt").c_str(), L"w, ccs=UTF-8");
+    g_errors = _wfopen(path_of(L"d3d12-messages.txt").c_str(), L"wb");
     write(g_errors, "D3D12 debug layer messages, as they appeared");
     nr::pe::log("[capture] run folder %s", narrow(g_dir.c_str()).c_str());
 }
@@ -281,7 +286,7 @@ void device_removed(HRESULT why) {
     if (g_removed_written) return;
     g_removed_written = true;
     const std::wstring path = path_of(L"device-removed.txt");
-    FILE* f = _wfopen(path.c_str(), L"w, ccs=UTF-8");
+    FILE* f = _wfopen(path.c_str(), L"wb");
     char b[512];
     std::snprintf(b, sizeof b, "device removed: 0x%08lX", static_cast<unsigned long>(why));
     write(f, b);
