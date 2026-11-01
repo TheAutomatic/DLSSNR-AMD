@@ -432,7 +432,7 @@ void report_control(nr::pe::Session& session, const Feature* f, uint32_t route, 
         st.net_want = as.want_net >= 0 ? as.want_net : ss.want_net;
         st.net_running = as.running_net >= 0 ? as.running_net : (as.building ? -1 : st.net_want);
         if (as.building) {
-            Session::State bst;
+            nr::pe::Session::State bst;
             bst.stage = 4;
             bst.building_seconds = as.building_seconds;
             char phase[128] = {};

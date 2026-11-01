@@ -81,7 +81,8 @@ common=(-std=c++17 -O2 -DNDEBUG -DNR_BUILD_STAMP="\"$stamp\"" -Itoolchain/Vulkan
 "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_bridge.cpp -o "$out/bridge.o"
 "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_d3d12split.cpp -o "$out/d3d12split.o"
 "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_config.cpp -o "$out/config.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_screenshot.cpp -o "$out/screenshot.o"
+# The ReShade add-on's session asks the ASD shell whether it is on (nr_pe_session.cpp, M5): its object too.
+"$cxx" "${common[@]}" -c windows/src/pe/nr_d3d12_asd.cpp -o "$out/d3d12_asd.o"
 # ReShade's headers include <Windows.h>; the case shim maps that onto mingw's.
 "$cxx" "${common[@]}" -Iwindows/src/pe/reshade_compat -I"$reshade_inc" -I"$minhook/include" \
     -Iartifacts/ref/DLSS5-Feeder/external/imgui -Iwindows/src/ui -c windows/src/pe/nr_reshade_addon.cpp -o "$out/reshade_addon.o"
@@ -93,6 +94,7 @@ ldflags=(-ld3d12 -ld3d11 -ldxgi -ldwmapi -lgdi32 -lole32 -static -static-libgcc 
 
 # No static import of vulkan-1.dll (it would load before the game set up its graphics): windows/build/vulkan_lazy.sh.
 objs=("$out/reshade_addon.o" "$out/session.o" "$out/bridge.o" "$out/d3d12split.o" "$out/config.o" "$out/screenshot.o" "$out/interop.o"
+      "$out/d3d12_asd.o"
       "$out/vram_ledger.o" "$out/log.o" "$out/crash.o" "$out/vkdevice.o" "$out/nr_runtime.o" "$out/nr_native_plan.o"
       "$out/nr_renodx.o" "$out/nr_wilsjo2.o" "$out"/mh_*.o)
 bash windows/build/vulkan_lazy.sh "$out" "$cxx" -shared "${objs[@]}" "${ldflags[@]}" > /dev/null
