@@ -12,6 +12,8 @@ namespace nr::asi::native {
 }
 #include "nr_d3d12_asd.hpp"
 #include "nr_pe_log.hpp"
+#include "nr_d3d12_capture.hpp"
+#include <cstdarg>
 
 #include <d3dcompiler.h>
 #include <windows.h>
@@ -1065,7 +1067,12 @@ struct Stage::Impl {
         auto [it, fresh] = states.emplace(r, D3D12_RESOURCE_STATE_COMMON);
         if (it->second == want) return;
         // COMMON promotes to every state the stage uses without a barrier; after that, real transitions.
-        if (fresh || it->second == D3D12_RESOURCE_STATE_COMMON) { it->second = want; return; }
+        if (fresh || it->second == D3D12_RESOURCE_STATE_COMMON) {
+            jlog("renodx ensure %p %u -> %u (no barrier: %s)", static_cast<void*>(r), static_cast<unsigned>(it->second),
+                 static_cast<unsigned>(want), fresh ? "new" : "COMMON");
+            it->second = want;
+            return;
+        }
         D3D12_RESOURCE_BARRIER b{};
         b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         b.Transition.pResource = r;
@@ -1080,8 +1087,28 @@ struct Stage::Impl {
         b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
         cmd->ResourceBarrier(1, &b);
     }
-    static void transition(ID3D12GraphicsCommandList* cmd, ID3D12Resource* r, D3D12_RESOURCE_STATES from,
-                           D3D12_RESOURCE_STATES to) {
+    // The stage's own command journal (nr-diag\run.txt): what it recorded for a frame, in order. A barrier whose
+    // StateBefore is not the resource's real state, or a copy outside a resource, is an invalid call the driver answers
+    // by removing the device, and nothing else in the log says which one it was.
+    bool journal = false;
+    uint32_t frames_recorded = 0;
+    void jlog(const char* fmt, ...) {
+        if (!journal) return;
+        char line[512];
+        va_list ap;
+        va_start(ap, fmt);
+        std::vsnprintf(line, sizeof line, fmt, ap);
+        va_end(ap);
+        nr::pe::capture::schedule(line);
+    }
+
+    void transition(ID3D12GraphicsCommandList* cmd, ID3D12Resource* r, D3D12_RESOURCE_STATES from,
+                    D3D12_RESOURCE_STATES to) {
+        jlog("renodx barrier %p %u -> %u%s", static_cast<void*>(r), static_cast<unsigned>(from), static_cast<unsigned>(to),
+             from == to ? " (skipped: already there)" : "");
+        // A transition to the state the resource is already in is not the no-op it looks like: D3D12 rejects the
+        // barrier and the driver answers the list with DXGI_ERROR_INVALID_CALL (the frame's last command here).
+        if (from == to) return;
         D3D12_RESOURCE_BARRIER b{};
         b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         b.Transition.pResource = r;
@@ -1254,6 +1281,8 @@ struct Stage::Impl {
         cmd->SetComputeRoot32BitConstants(0, dwords, push, 0);
         cmd->SetComputeRootDescriptorTable(1, gpu);
         cmd->SetComputeRootDescriptorTable(2, gpu_uav);
+        jlog("renodx dispatch p %u pso %p rs %p srv %u uav %u grid %ux%u push %u dwords", static_cast<unsigned>(p),
+             static_cast<void*>(pso[p]), static_cast<void*>(codec ? rs_codec : rs_aux), n_srv, n_uav, gx, gy, dwords);
         cmd->Dispatch(gx, gy, 1);
         uav_barrier(cmd);
     }
@@ -1631,6 +1660,14 @@ void Stage::Impl::copy_frame(ID3D12GraphicsCommandList* cmd, const Frame& f) {
     b[1].Transition.pResource = f.output;
     b[1].Transition.StateBefore = f.output_state;
     b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    {
+        const D3D12_RESOURCE_DESC cd = f.colour->GetDesc(), od = f.output->GetDesc();
+        jlog("renodx frame copy: colour %p %llux%llu fmt %u state %u -> output %p %llux%llu fmt %u state %u",
+             static_cast<void*>(f.colour), static_cast<unsigned long long>(cd.Width), cd.Height, static_cast<unsigned>(cd.Format),
+             static_cast<unsigned>(f.colour_state), static_cast<void*>(f.output),
+             static_cast<unsigned long long>(od.Width), od.Height, static_cast<unsigned>(od.Format),
+             static_cast<unsigned>(f.output_state));
+    }
     cmd->ResourceBarrier(2, b);
     cmd->CopyResource(f.output, f.colour);
     for (auto& x : b) std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
@@ -1649,6 +1686,17 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
         return 0;
     }
     if (recreate) history_reset = true;
+    journal = false;
+    if (nr::pe::capture::on() && frames_recorded < 2) {
+        journal = true;
+        ++frames_recorded;
+        const D3D12_RESOURCE_DESC cd = f.colour->GetDesc(), od = f.output->GetDesc();
+        jlog("renodx frame %u: %ux%u network %ux%u passes %u hdr %d; colour %llux%llu fmt %u state %u; output %llux%llu fmt %u "
+             "state %u", frames_recorded, W, H, NW, NH, passes, hdr ? 1 : 0,
+             static_cast<unsigned long long>(cd.Width), cd.Height, static_cast<unsigned>(cd.Format),
+             static_cast<unsigned>(f.colour_state), static_cast<unsigned long long>(od.Width), od.Height,
+             static_cast<unsigned>(od.Format), static_cast<unsigned>(f.output_state));
+    }
 
     // The stack's own images and look histories, as this frame's depth needs them.
     if (hdr && passes > 1 && !work_b.res) {
@@ -1721,6 +1769,7 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
             ensure(cmd, prep_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);   // the clear writes it
             bind_heap(cmd);                                                   // the GPU handle's heap
             const UINT zero[4] = {};
+            jlog("renodx clear prep_state %p uav slot %u (gpu handle in the bound heap)", static_cast<void*>(prep_state), kClearSlot);
             cmd->ClearUnorderedAccessViewUint(main_gpu(kClearSlot), clear_cpu(0), prep_state, zero, 0, nullptr);
             uav_barrier(cmd);
             prep_state_fresh = false;
@@ -1838,6 +1887,8 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
         box.right = f.motion_x + f.motion_w;
         box.bottom = f.motion_y + f.motion_h;
         box.back = 1;
+        jlog("renodx motion copy: box %u,%u..%u,%u of source %llux%llu into %ux%u", box.left, box.top, box.right,
+             box.bottom, static_cast<unsigned long long>(md.Width), md.Height, motion.w, motion.h);
         cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
         ensure(cmd, motion.res, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         transition(cmd, f.motion, D3D12_RESOURCE_STATE_COPY_SOURCE, f.motion_state);
@@ -1923,6 +1974,9 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
         box.right = W;
         box.bottom = H;
         box.back = 1;
+        jlog("renodx original copy: %u x %u from a %llux%u source into %ux%u", W, H,
+             static_cast<unsigned long long>(f.colour->GetDesc().Width),
+             static_cast<unsigned>(f.colour->GetDesc().Height), original.w, original.h);
         cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
     }
     transition(cmd, f.colour, D3D12_RESOURCE_STATE_COPY_SOURCE, f.colour_state);
@@ -1951,6 +2005,7 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
                 ensure(cmd, commit.res, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);   // the clear writes it
                 bind_heap(cmd);                                                   // the GPU handle's heap
                 const float zero[4] = {};
+                jlog("renodx clear commit %p uav slot %u", static_cast<void*>(commit.res), kClearSlot + 1);
                 cmd->ClearUnorderedAccessViewFloat(main_gpu(kClearSlot + 1), clear_cpu(1), commit.res, zero, 0, nullptr);
                 uav_barrier(cmd);
                 commit_cleared = true;
@@ -2406,9 +2461,10 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
         uav[0].res = f.output;
         uav[0].fmt = uav_format_of(f.output->GetDesc().Format);
         uav[0].write = true;
-        if (f.output != f.colour) transition(cmd, f.output, f.output_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        const bool output_is_uav = f.output_state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        if (!output_is_uav) transition(cmd, f.output, f.output_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         dispatch(cmd, kCopyOut, srv, uav, &c, 8, (W + 7) / 8, (H + 7) / 8);
-        transition(cmd, f.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, f.output_state);
+        if (!output_is_uav) transition(cmd, f.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, f.output_state);
     }
     return ran;
 }
