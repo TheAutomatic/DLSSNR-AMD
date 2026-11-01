@@ -13,6 +13,12 @@
 #include "nr_d3d12_asd_backend.hpp"
 #include "nr_d3d12_asd_net.hpp"
 #include "nr_d3d12_asd_reprofile.hpp"
+#include "nr_d3d12_capture.hpp"
+#include "nr_pe_config.hpp"
+#include "nr_d3d12_net_plan.hpp"
+#include "nr_dlssnr_model.hpp"
+#include "nr_renodx.hpp"
+#include <dxgi1_6.h>
 #include "nr_pe_d3d12split.hpp"
 
 #include <windows.h>
@@ -493,6 +499,176 @@ int net_frames(ID3D12Device* d) {
 
 }  // namespace
 
+
+// ---- renodx: the game's own first frame, reproduced offline ------------------------------------------------
+// The ASD route as the game runs it: 4K, HDR10 (R10G10B10A2), the frame in place (colour == output, both in
+// UNORDERED_ACCESS), the RenoDX stage and the real ACO network with the package's PSDB/carriers. The debug layer
+// and DRED come from this exe's own D3D12 runtime, so they match the device - unlike inside the game, where the
+// system layers and the app-local Agility ones do not.
+//
+//   renodx [W H] [game folder]
+// Records one frame, closes the list (the HRESULT is the validation verdict), submits, waits, then reports the
+// device's state, DRED's breadcrumbs/page faults and the debug layer's messages.
+
+// The harness's own fault printer: WerSvc is off on this machine, so a crash otherwise leaves no trace at all.
+static LONG CALLBACK harness_veh(EXCEPTION_POINTERS* ep) {
+    const auto* r = ep->ExceptionRecord;
+    HMODULE m = nullptr;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(r->ExceptionAddress), &m) && m) {
+        wchar_t path[MAX_PATH] = L"";
+        GetModuleFileNameW(m, path, MAX_PATH);
+        log("[test] FAULT 0x%08lX at %p in %ls +0x%llX", static_cast<unsigned long>(r->ExceptionCode),
+            r->ExceptionAddress, path,
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(r->ExceptionAddress) -
+                                            reinterpret_cast<uintptr_t>(m)));
+    } else {
+        log("[test] FAULT 0x%08lX at %p (no module)", static_cast<unsigned long>(r->ExceptionCode), r->ExceptionAddress);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+int renodx_run(int argc, char** argv) {
+    const uint32_t W = argc > 2 ? uint32_t(std::atoi(argv[2])) : 3840, H = argc > 3 ? uint32_t(std::atoi(argv[3])) : 2160;
+    const std::string game = argc > 4 ? argv[4]
+                                           : "C:\\Program Files (x86)\\Steam\\steamapps\\common\\PBZ\\platform\\steam";
+    wchar_t here[MAX_PATH] = L"";
+    GetModuleFileNameW(nullptr, here, MAX_PATH);
+    if (wchar_t* slash = std::wcsrchr(here, L'\\')) *slash = 0;
+    char here8[MAX_PATH * 3] = "";
+    WideCharToMultiByte(CP_UTF8, 0, here, -1, here8, sizeof here8, nullptr, nullptr);
+    AddVectoredExceptionHandler(1, &harness_veh);
+    nr::pe::capture::start(here8, true, true);   // before any device: the debug layer and DRED apply to devices made after
+    asd::start(GetModuleHandleW(nullptr));       // the ini beside this exe (dlssnr-amd-asd\), after the capture: it must
+                                                 // not be the one that decides whether the debug layer is on
+    nr::pe::configure_network(game);             // ACO Mode and the model, from the installation's dlssnr-amd.ini
+    log("[test] renodx: %ux%u, game folder %s", W, H, game.c_str());
+
+    // The network for this installation: the runtime's own lowering (nr_native_plan.cpp).
+    static std::string root = game;
+    if (argc > 5) {   // a plan the game lowered (NR_DUMP_PLAN): no Vulkan session needed here
+        g_plan = argv[5];
+        g_m4 = argc > 6 ? argv[6] : "";
+        asd::set_net_planner(&file_planner, nullptr);
+        log("[test] renodx: plan %s", g_plan.c_str());
+    } else {
+        auto planner = +[](uint32_t w, uint32_t h, int model, bool experimental, nr::D3d12NetPlan* p, std::string* why) {
+            return nr::plan_d3d12_network(root, w, h, experimental, p, why, model);
+        };
+        asd::set_net_planner(planner, &nr::d3d12_net_controls, nullptr);
+    }
+
+    // The device on the game's own adapter.
+    IDXGIFactory1* factory = nullptr;
+    IDXGIAdapter1* best = nullptr;
+    if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) && factory) {
+        for (UINT i = 0;; ++i) {
+            IDXGIAdapter1* a = nullptr;
+            if (factory->EnumAdapters1(i, &a) != S_OK || !a) break;
+            DXGI_ADAPTER_DESC1 d{};
+            a->GetDesc1(&d);
+            char name[256] = "";
+            WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, name, sizeof name - 1, nullptr, nullptr);
+            log("[test] adapter %u: %s (vendor 0x%04X, %llu MB)", i, name, d.VendorId,
+                static_cast<unsigned long long>(d.DedicatedVideoMemory >> 20));
+            static SIZE_T best_mem = 0;
+            if (d.VendorId == 0x1002 && d.DedicatedVideoMemory > best_mem) {
+                best_mem = d.DedicatedVideoMemory;
+                if (best) best->Release();
+                best = a;
+                continue;
+            }
+            a->Release();
+        }
+    }
+    if (!best) { log("[test] renodx: no AMD adapter"); return 2; }
+    ID3D12Device* d = nullptr;
+    if (debug_on()) {
+        ID3D12Debug* dbg = nullptr;
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg))) && dbg) { dbg->EnableDebugLayer(); dbg->Release(); }
+    }
+    log("[test] renodx: creating the device on %p", static_cast<void*>(best));
+    const HRESULT hr = D3D12CreateDevice(best, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&d));
+    log("[test] renodx: D3D12CreateDevice 0x%08lX", static_cast<unsigned long>(hr));
+    if (FAILED(hr) || !d) return 3;
+
+    ID3D12CommandQueue* q = nullptr;
+    ID3D12CommandAllocator* a = nullptr;
+    ID3D12GraphicsCommandList* l = nullptr;
+    ID3D12Fence* f = nullptr;
+    D3D12_COMMAND_QUEUE_DESC qd{}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    d->CreateCommandQueue(&qd, IID_PPV_ARGS(&q));
+    d->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&a));
+    d->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, a, nullptr, IID_PPV_ARGS(&l));
+    d->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f));
+
+    // The frame: the game's format 24 (R10G10B10A2), in place, in UNORDERED_ACCESS both ways.
+    D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = W; rd.Height = H; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+    rd.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
+    rd.SampleDesc.Count = 1;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    ID3D12Resource* frame = nullptr;
+    const HRESULT hc = d->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                                 nullptr, IID_PPV_ARGS(&frame));
+    if (FAILED(hc) || !frame) { log("[test] renodx: the frame could not be made (0x%08lX)", static_cast<unsigned long>(hc)); return 4; }
+
+    asd::on_device(d);
+    if (!wait_for(&canary_done, 30000)) { log("[test] renodx: the canary did not finish"); return 5; }
+    log("[test] renodx: canary %s", asd::status().canary.c_str());
+
+    nr::renodx::Settings settings{};   // the shipped defaults: 1 pass, Standard, intensity 1
+    nr::dlssnr::D3d12BackendFrame fr{};
+    fr.device = d; fr.cmd = l;
+    fr.color = frame; fr.color_state = int(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    fr.output = frame; fr.output_state = int(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    fr.width = W; fr.height = H;
+    fr.style = 0; fr.intensity = 1.f; fr.local_tone = 1.f; fr.local_structure = 1.f; fr.skin_structure = -1.f;
+    fr.automatic_mask = 0; fr.reversible_mode = 0; fr.noise_every_frame = 1;
+    fr.motion_scale_x = 1.f / float(W); fr.motion_scale_y = 1.f / float(H);
+    fr.history_strength = -1.f;
+    fr.feature = 1;
+    fr.renodx_route = 1;
+    fr.renodx_settings = &settings;
+    fr.renodx_present = 2;         // HDR10
+    fr.renodx_white_nits = 203.f;
+    fr.renodx_hdr_flag = 1;
+    int waiting = 0;
+    fr.waiting = &waiting;
+    bool ran = false;
+    for (int attempt = 0; attempt < 600 && !ran; ++attempt) {
+        ran = asd::evaluate_backend(fr);
+        if (!ran) {
+            if (attempt % 25 == 0) log("[test] renodx: waiting for the network (%s)", asd::status().backend.c_str());
+            Sleep(200);
+        }
+    }
+    log("[test] renodx: evaluate -> %d (%s)", ran ? 1 : 0, asd::status().backend.c_str());
+
+    const HRESULT closed = l->Close();
+    log("[test] renodx: Close 0x%08lX", static_cast<unsigned long>(closed));
+    ID3D12CommandList* lists[] = {l};
+    q->ExecuteCommandLists(1, lists);
+    q->Signal(f, 1);
+    HANDLE e = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    f->SetEventOnCompletion(1, e);
+    const bool done = WaitForSingleObject(e, 60000) == WAIT_OBJECT_0;
+    CloseHandle(e);
+    const HRESULT removed = d->GetDeviceRemovedReason();
+    log("[test] renodx: submitted, fence %s, device reason 0x%08lX", done ? "signalled" : "TIMED OUT",
+        static_cast<unsigned long>(removed));
+    nr::pe::capture::drain();
+    if (FAILED(removed)) {
+        nr::pe::capture::device_removed(removed);
+        log("[test] renodx: FAILED - see the diagnostic folder");
+        return 6;
+    }
+    log("[test] renodx: the frame completed with no device error");
+    return 0;
+}
+
 int main(int argc, char** argv) {
     const std::string mode = argc > 1 ? argv[1] : "early";
         auto wide = [](const char* a) { const int n = MultiByteToWideChar(CP_ACP, 0, a, -1, nullptr, 0);
@@ -522,6 +698,7 @@ int main(int argc, char** argv) {
             node_mask, argv[2]);
         return 0;
     }
+    if (mode == "renodx") return renodx_run(argc, argv);
     if (mode == "targets" && argc > 2) {   // targets <exe file name> [app name]: the driver's precompile targets for it
         log("[targets] %s", asd::precompile_targets(wide(argv[2]), wide(argc > 3 ? argv[3] : "ACO public entry probe")).c_str());
         return 0;

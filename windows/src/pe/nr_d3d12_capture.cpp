@@ -155,6 +155,8 @@ void start(const std::string& game_folder, bool wanted, bool wanted_debug_layer)
     // DebugLayer=1 asks for it anyway, for a case where the layers are known to match.
     g_on = true;   // the schedule and the device-removal report need nothing from D3D12
     bool debug_layer = false;
+    wchar_t no_layer[4] = L"";
+    if (GetEnvironmentVariableW(L"NR_CAPTURE_LAYER", no_layer, 4) && no_layer[0] == L'0') wanted_debug_layer = false;
 #ifndef NR_ASD_NO_DEBUG_LAYER
     if (wanted_debug_layer) {
         ID3D12Debug* debug = nullptr;
@@ -173,27 +175,24 @@ void start(const std::string& game_folder, bool wanted, bool wanted_debug_layer)
     }
 #endif
 
-    // DRED: auto breadcrumbs (the last command of each list) and page faults (the address and its allocations). The
-    // settings object is reached by its class id, which only the DirectX-Headers' d3d12.h declares; a toolchain
-    // without it leaves DRED at the driver's default and the log says so.
-    bool breadcrumbs = false, faults = false;
-#ifdef CLSID_D3D12DeviceRemovedExtendedDataSettings
+    // DRED: auto breadcrumbs (the last commands each list reached) and page faults (the address and the allocations
+    // it may belong to). The settings interface comes from D3D12GetDebugInterface by its IID - no class id, and it
+    // is read before the device is made, which is the only moment it applies.
     ID3D12DeviceRemovedExtendedDataSettings* dred = nullptr;
-    r = D3D12GetInterface(CLSID_D3D12DeviceRemovedExtendedDataSettings, IID_PPV_ARGS(&dred));
-    if (SUCCEEDED(r) && dred) {
+    wchar_t no_dred[4] = L"";
+    const bool want_dred = !(GetEnvironmentVariableW(L"NR_CAPTURE_DRED", no_dred, 4) && no_dred[0] == L'0');
+    HRESULT rd = want_dred ? D3D12GetDebugInterface(IID_PPV_ARGS(&dred)) : E_NOTIMPL;
+    bool breadcrumbs = false, faults = false;
+    if (SUCCEEDED(rd) && dred) {
         dred->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
         dred->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-        dred->SetWatsonDumpOnDeviceLoss(D3D12_DRED_ENABLEMENT_FORCED_ON);
+        dred->SetWatsonDumpEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
         dred->Release();
         breadcrumbs = faults = true;
         nr::pe::log("[capture] DRED: breadcrumbs and page faults forced on (set before the device was made)");
     } else {
-        nr::pe::log("[capture] DRED settings are not available (0x%08lX)", static_cast<unsigned long>(r));
+        nr::pe::log("[capture] DRED settings are not available (0x%08lX)", static_cast<unsigned long>(rd));
     }
-#else
-    nr::pe::log("[capture] DRED settings: this toolchain's d3d12.h has no CLSID for them (breadcrumbs and page faults "
-                "stay at the driver's default; the debug layer's messages are still captured)");
-#endif
     char line[256];
     std::snprintf(line, sizeof line, "debug layer: %s | DRED breadcrumbs: %s | page faults: %s",
                   debug_layer ? "on" : "off (DebugLayer=0)", breadcrumbs ? "on" : "no", faults ? "on" : "no");

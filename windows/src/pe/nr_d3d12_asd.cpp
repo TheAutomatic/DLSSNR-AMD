@@ -1078,6 +1078,10 @@ void start(HMODULE self, bool register_now) {
     g_register = GetPrivateProfileIntW(L"D3D12ASD", L"Register", 1, g_ini.c_str()) != 0;
     g_tint = GetPrivateProfileIntW(L"D3D12ASD", L"DebugTint", 0, g_ini.c_str()) == 1;
     g_dispatch_limit = static_cast<int>(GetPrivateProfileIntW(L"D3D12ASD", L"DispatchLimit", 0, g_ini.c_str()));
+    // [D3D12ASD] PlanDump=<file>: the lowered plan, for reproducing a frame outside the game (nr_d3d12_asd_test
+    // renodx ... <plan>). Set here so a run needs no environment of its own.
+    if (const std::wstring dump = ini_string(L"PlanDump", L""); !dump.empty())
+        SetEnvironmentVariableA("NR_DUMP_PLAN", utf8(dump).c_str());
     g_sodb_name = ini_string(L"Sodb", g_sodb_name);
     g_psdb_name = ini_string(L"Psdb", g_psdb_name);
     g_family = ini_string(L"AdapterFamily", g_family);
