@@ -677,6 +677,13 @@ int renodx_run(int argc, char** argv) {
 // in place, UAV, the shipped settings. The net callback copies in->out so the pass still runs end to end.
 //
 //   stage [W H] [game folder]
+//
+// Measured here (2026-11-02): the stage alone removes the device with 0x887A0001 - Close() returns 0x00000000 and
+// the fence signals, so the list is accepted when it is recorded and the device is lost at or after execution. The
+// same with the debug layer and GPU-based validation on (empty info queue) and with both off, so the failure is not
+// an artefact of the validation settings and it needs no ACO network to reproduce.
+// Next step is inside this mode: nr_enabled=false (copies only), then the passes one at a time, comparing the
+// device's reason after each.
 std::wstring widen(const char* s) {
     if (!s) return {};
     const int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, nullptr, 0);
