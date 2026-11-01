@@ -530,6 +530,28 @@ static LONG CALLBACK harness_veh(EXCEPTION_POINTERS* ep) {
     } else {
         log("[test] FAULT 0x%08lX at %p (no module)", static_cast<unsigned long>(r->ExceptionCode), r->ExceptionAddress);
     }
+    if (ep->ContextRecord) {   // who called it: a null function pointer is only useful with its caller
+        CONTEXT c = *ep->ContextRecord;
+        for (int i = 0; i < 12 && c.Rip; ++i) {
+            HMODULE mm = nullptr;
+            GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCWSTR>(c.Rip), &mm);
+            wchar_t path[MAX_PATH] = L"?";
+            if (mm) GetModuleFileNameW(mm, path, MAX_PATH);
+            log("[test]   from %ls+0x%llX", path, static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(c.Rip) -
+                                                                                  reinterpret_cast<uintptr_t>(mm)));
+            DWORD64 base = 0;
+            if (PRUNTIME_FUNCTION fe = RtlLookupFunctionEntry(c.Rip, &base, nullptr)) {
+                PVOID data = nullptr; DWORD64 frame = 0;
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, c.Rip, fe, &c, &data, &frame, nullptr);
+            } else {
+                DWORD64 ret = 0; SIZE_T got = 0;
+                if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(c.Rsp), &ret, sizeof ret, &got) ||
+                    got != sizeof ret) break;
+                c.Rip = ret; c.Rsp += 8;
+            }
+        }
+    }
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -547,6 +569,9 @@ int renodx_run(int argc, char** argv) {
     asd::start(GetModuleHandleW(nullptr));       // the ini beside this exe (dlssnr-amd-asd\), after the capture: it must
                                                  // not be the one that decides whether the debug layer is on
     nr::pe::configure_network(game);             // ACO Mode and the model, from the installation's dlssnr-amd.ini
+    // Registration is what makes the driver use the ACO machine code, and it must be finished before a device exists
+    // (in the game the ASI registers at load, before the game's device): let the thread finish first.
+    if (!wait_for(&registration_done, 20000)) log("[test] renodx: registration did not finish in 20 s");
     log("[test] renodx: %ux%u, game folder %s", W, H, game.c_str());
 
     // The network for this installation: the runtime's own lowering (nr_native_plan.cpp).
@@ -785,10 +810,15 @@ int renodx_run(int argc, char** argv) {
     int waiting = 0;
     fr.waiting = &waiting;
     bool ran = false;
-    for (int attempt = 0; attempt < 600 && !ran; ++attempt) {
+    int attempt = 0;
+    for (; attempt < 600 && !ran; ++attempt) {
         ran = asd::evaluate_backend(fr);
         if (!ran) {
-            if (attempt % 25 == 0) log("[test] renodx: waiting for the network (%s)", asd::status().backend.c_str());
+            const std::string st = asd::status().backend;
+            if (attempt % 25 == 0) log("[test] renodx: waiting for the network (%s)", st.c_str());
+            // Nothing about these fixes itself by waiting: the canary verdict and a broken backend are final.
+            if (st.find("canary ASD_MISS") != std::string::npos || st.find("ACO Mode is off") != std::string::npos)
+                { log("[test] renodx: the network cannot run here (%s); stopping", st.c_str()); return 7; }
             Sleep(200);
         }
     }

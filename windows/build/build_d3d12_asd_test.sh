@@ -9,8 +9,8 @@ out=$(realpath -m -- "${1:-artifacts/windows/d3d12_asd_test}")
 mkdir -p -- "$out"
 cxx=${NR_MINGW:-x86_64-w64-mingw32-g++}
 flags=(-std=c++17 -O2 -Wall -Iwindows/src -Iwindows/src/core -Iwindows/src/pe -Itoolchain/Vulkan-Headers/include)
-srcs=(windows/tests/d3d12_asd/nr_d3d12_asd_test.cpp windows/src/pe/nr_d3d12_asd.cpp windows/src/pe/nr_d3d12_asd_backend.cpp windows/src/pe/nr_renodx_d3d12.cpp windows/src/pe/nr_d3d12_asd_net.cpp windows/src/pe/nr_d3d12_capture.cpp windows/src/pe/nr_d3d12_asd_reprofile.cpp windows/src/core/nr_renodx.cpp windows/src/core/nr_runtime.cpp windows/src/core/nr_native_plan.cpp)
-libs=(-ld3d12 -ldxgi -lole32 -lshell32 -static -static-libgcc -static-libstdc++)
+srcs=(windows/tests/d3d12_asd/nr_d3d12_asd_test.cpp windows/src/pe/nr_d3d12_asd.cpp windows/src/pe/nr_d3d12_asd_backend.cpp windows/src/pe/nr_renodx_d3d12.cpp windows/src/pe/nr_d3d12_asd_net.cpp windows/src/pe/nr_d3d12_capture.cpp windows/src/pe/nr_d3d12_asd_reprofile.cpp windows/src/core/nr_renodx.cpp windows/src/core/nr_runtime.cpp windows/src/core/nr_native_plan.cpp windows/src/pe/nr_pe_config.cpp)
+libs=(-ld3d12 -ldxgi -lole32 -lshell32 -lversion -static -static-libgcc -static-libstdc++)
 # nr_renodx.cpp (the RenoDX stage's host logic, shared with the D3D12 one) imports Vulkan: resolved at run time,
 # as in the .asi (vulkan_lazy.sh).
 count=$(bash windows/build/vulkan_lazy.sh "$out" "$cxx" "${flags[@]}" "${srcs[@]}" "${libs[@]}" | grep -o '[0-9]*$' || echo 0)

@@ -371,9 +371,23 @@ DWORD registration_work() {
     log("[asd] registration: ExePath = %s, RemoveFirst = %d; module path %s, final path %s", utf8(mode).c_str(),
         remove_first ? 1 : 0, utf8(exe).c_str(), utf8(final_exe).c_str());
     std::string result;
-    if (mode != L"final") result = register_one(get, kInstallerName, exe, sodb, psdb, remove_first, core_loaded);
+    // The driver's installer interface is code we do not own: on some exes it raises a C++ exception out of
+    // RemoveApplication/RegisterApplication. Registration is optional (ASD falls back), so a throw must be recorded,
+    // never thrown onwards - it would end the game at startup.
+    const auto guarded = [&](const wchar_t* name, const std::wstring& target) -> std::string {
+        try {
+            return register_one(get, name, target, sodb, psdb, remove_first, core_loaded);
+        } catch (const std::exception& e) {
+            log("[asd] registration: the driver threw (%s): %s", utf8(name).c_str(), e.what());
+            return std::string("not registered: the driver threw (") + e.what() + ")";
+        } catch (...) {
+            log("[asd] registration: the driver threw an exception: %s", utf8(name).c_str());
+            return "not registered: the driver threw";
+        }
+    };
+    if (mode != L"final") result = guarded(kInstallerName, exe);
     if (mode == L"final" || (mode == L"both" && !same_path(final_exe.c_str(), exe))) {
-        const std::string r2 = register_one(get, L"DLSSNR-AMD-ASD-FINAL", final_exe, sodb, psdb, remove_first, core_loaded);
+        const std::string r2 = guarded(L"DLSSNR-AMD-ASD-FINAL", final_exe);
         result = result.empty() ? r2 : result + " | final path: " + r2;
     }
     set_registration(result);
@@ -466,7 +480,13 @@ DWORD WINAPI unregister_thread(void*) {
         Client client;
         client.installer = name;
         api::InstallerFactory* factory = nullptr;
-        api::Installer* installer = make_installer(get, client, &factory, &why);
+        api::Installer* installer = nullptr;
+        try {
+            installer = make_installer(get, client, &factory, &why);
+        } catch (...) {
+            set_registration("unregister: the driver threw");
+            return 0;
+        }
         if (!installer) { set_registration("unregister: " + why); return 0; }
         bool f = false;
         removed += remove_ours(installer, exe_path(), &f, &why, name);
