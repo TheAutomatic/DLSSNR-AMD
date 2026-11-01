@@ -5,8 +5,8 @@
 #include "nr_d3d12_asd.hpp"
 #include "nr_d3d12_asd_net.hpp"
 #include "nr_pe_d3d12split.hpp"
+#include "nr_renodx_d3d12.hpp"   // the RenoDX stage on this route (M5 item 6)
 #include "nr_pe_log.hpp"
-
 #include <d3dcompiler.h>
 #include <windows.h>
 
@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <string>
 #include <utility>
@@ -601,6 +602,20 @@ struct Backend {
     std::string broken_why;
     uint64_t tick = 0;
     std::vector<std::pair<uint64_t, IUnknown*>> retired;   // released 64 evaluates later (the GPU may still use them)
+    // The RenoDX route's stages, one a feature (nr_pe_session.cpp's RenoDXEntry: its working resolution's debounce
+    // and its stage, keyed by everything a change of takes a new one).
+    struct RenodxEntry {
+        std::unique_ptr<renodx12::Stage> stage;
+        uint32_t w = 0, h = 0, nw = 0, nh = 0;
+        DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+        int hdr = 0, present = 0;
+        float scale = 1.0f;
+        bool follow = false;
+        uint32_t applied_w = 0, applied_h = 0, pending_w = 0, pending_h = 0, pending_frames = 0;
+    };
+    std::map<uint64_t, RenodxEntry> renodx;
+    // A replaced stage (an extent change) is released once the frames in flight are past it, like `retired`.
+    std::vector<std::pair<uint64_t, std::unique_ptr<renodx12::Stage>>> renodx_retired;
 };
 Backend g;
 
@@ -613,7 +628,13 @@ void sweep() {
         return true;
     });
     g.retired.erase(it, g.retired.end());
+    auto rs = std::remove_if(g.renodx_retired.begin(), g.renodx_retired.end(), [](const auto& r) {
+        return r.first <= g.tick;
+    });
+    g.renodx_retired.erase(rs, g.renodx_retired.end());
 }
+
+ID3D12Resource* linear_buffer(ID3D12Device* device, uint64_t bytes);   // (defined below drop_device)
 
 bool build(ID3D12Device* device, std::string* why) {
     D3D12_DESCRIPTOR_RANGE ranges[2]{};
@@ -759,6 +780,7 @@ void drop_device() {
     g.prep_last_kind = 0;
     g.w = g.h = 0;
     g.network.reset();
+    g.renodx.clear();   // its stages own nothing of the device's that outlives it
     if (g.device) g.device->Release();
     g.device = nullptr;
     g.broken = false;
@@ -800,6 +822,151 @@ bool fallback(const std::string& why) {
     return false;
 }
 
+
+std::wstring widen(const char* u8) {
+    std::wstring out;
+    const int n = MultiByteToWideChar(CP_UTF8, 0, u8, -1, nullptr, 0);
+    if (n > 0) { out.resize(size_t(n) - 1); MultiByteToWideChar(CP_UTF8, 0, u8, -1, out.data(), n); }
+    return out;
+}
+
+// The RenoDX route's frame (nr_pe_session.cpp's run_renodx, on the ASD route): the stage around the network, one a
+// feature, the network through this backend's own (g.network) over its linear buffers. HDR still takes the 0.0.8.1
+// path (the v6 codec is item 6b).
+bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES color_state,
+                  D3D12_RESOURCE_STATES output_state) {
+    if (!f.renodx_settings) return fallback("the RenoDX route without its frame (no settings)");
+    const nr::renodx::Settings& s = *f.renodx_settings;
+    const D3D12_RESOURCE_DESC sd = f.color->GetDesc(), dd = f.output->GetDesc();
+    if (sd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || dd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        sd.DepthOrArraySize != 1 || dd.DepthOrArraySize != 1 || sd.SampleDesc.Count != 1 || dd.SampleDesc.Count != 1)
+        return fallback("the RenoDX route: colour or output is not a single-sampled 2D texture");
+    const DXGI_FORMAT sf = view_format(sd.Format), df = view_format(dd.Format);
+    if (sf == DXGI_FORMAT_UNKNOWN || df == DXGI_FORMAT_UNKNOWN) return fallback("the RenoDX route: an sRGB format");
+    const uint8_t hdr = f.renodx_present ? uint8_t(f.renodx_present == 2 ? 2 : f.renodx_present == 3 ? 1 : 0)
+                                         : renodx12::frame_hdr_mode(sf, f.renodx_hdr_flag != 0);
+    if (hdr != 0) return fallback("the RenoDX route: an HDR frame (item 6b; the 0.0.8.1 path runs it)");
+    if (!(dd.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) || !typed_uav(f.device, df))
+        return fallback("the RenoDX route: the output's format has no typed UAV store");
+    const uint32_t w = std::min<uint64_t>({f.width, sd.Width, dd.Width});
+    const uint32_t h = std::min<uint64_t>({f.height, sd.Height, dd.Height});
+    if (!w || !h) return fallback("the RenoDX route: an empty extent");
+
+    // The network's extent (nr_pe_session.cpp's renodx_extent: RenoDX's ComputeNrWorkingResolution, a size the
+    // game's guides change to taken once it has held kContractDebounceFrames).
+    Backend::RenodxEntry& e = g.renodx[f.feature];
+    uint32_t nw = 0, nh = 0;
+    renodx::working_resolution(s, w, h, f.motion_w, f.motion_h, &nw, &nh);
+    const bool settings_changed = e.scale != s.resolution_scale || e.follow != s.follow_input_res || e.w != w ||
+                                  e.h != h;
+    e.scale = s.resolution_scale;
+    e.follow = s.follow_input_res;
+    if (e.applied_w == 0 || settings_changed || (nw == e.applied_w && nh == e.applied_h)) {
+        e.applied_w = nw; e.applied_h = nh; e.pending_frames = 0;
+    } else {
+        if (nw != e.pending_w || nh != e.pending_h) { e.pending_w = nw; e.pending_h = nh; e.pending_frames = 0; }
+        if (++e.pending_frames >= renodx::kContractDebounceFrames) { e.applied_w = nw; e.applied_h = nh; e.pending_frames = 0; }
+        else { nw = e.applied_w; nh = e.applied_h; }
+    }
+
+    std::string why;
+    if (!g.network->ready(f.device, nw, nh, &why)) {
+        if (g.network->building() && f.waiting) {
+            *f.waiting = 1;
+            note_backend(("not run yet: the network: " + why + " (frames pass through with no NR; the bridge is not used)").c_str(), false);
+            return false;
+        }
+        return fallback("the RenoDX route: the network: " + why);
+    }
+    note_network(g.network->name());
+
+    if (!e.stage || e.w != w || e.h != h || e.nw != nw || e.nh != nh || e.format != sf ||
+        e.hdr != f.renodx_hdr_flag || e.present != f.renodx_present) {
+        renodx12::Stage::Config c;
+        c.device = f.device;
+        c.shaders = widen(nr::pe::module_folder()) + L"\\dlssnr-amd\\shaders\\renodx";
+        c.width = w; c.height = h;
+        c.nr_width = nw; c.nr_height = nh;
+        c.frame_format = sf;
+        c.hdr_flag = f.renodx_hdr_flag != 0;
+        c.present = uint32_t(f.renodx_present);
+        c.settings = s;
+        c.feature = f.feature;
+        e.stage = renodx12::Stage::make(c, &why);
+        if (!e.stage) return fallback("the RenoDX route: " + why);
+        e.w = w; e.h = h; e.nw = nw; e.nh = nh; e.format = sf;
+        e.hdr = f.renodx_hdr_flag; e.present = f.renodx_present;
+        nr::pe::log("[nr] the RenoDX route (D3D12): feature #%u at %ux%u (network %ux%u)", unsigned(f.feature), w, h, nw, nh);
+    }
+    e.stage->set(s);
+
+    renodx12::Frame rf;
+    rf.colour = f.color;
+    rf.colour_state = color_state;
+    rf.output = f.output;
+    rf.output_state = output_state;
+    rf.reset = f.reset != 0;
+    rf.after_upscale = f.renodx_after_upscale != 0;
+    rf.fast_motion_available = f.renodx_fast_motion != 0;
+    rf.motion = f.motion;
+    rf.motion_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    rf.motion_x = f.motion_x; rf.motion_y = f.motion_y;
+    rf.motion_w = f.motion_w ? f.motion_w : (f.motion ? uint32_t(f.motion->GetDesc().Width) : 0);   // 0: the whole texture
+    rf.motion_h = f.motion_h ? f.motion_h : (f.motion ? f.motion->GetDesc().Height : 0);
+    rf.motion_scale_x = f.motion_scale_x;
+    rf.motion_scale_y = f.motion_scale_y;
+    rf.depth = f.depth;
+    rf.depth_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    rf.depth_x = f.depth_x; rf.depth_y = f.depth_y;
+    rf.depth_w = f.depth_w; rf.depth_h = f.depth_h;
+    rf.depth_inverted = f.depth_inverted != 0;
+    rf.exposure = f.exposure;
+    rf.exposure_state = static_cast<D3D12_RESOURCE_STATES>(f.exposure_state);
+    rf.pre_exposure = f.pre_exposure;
+    rf.exposure_scale = f.exposure_scale;
+    rf.auto_exposure = f.auto_exposure != 0;
+    rf.create_flags_known = f.create_flags_known != 0;
+    rf.preprocess.enabled = f.preprocess != 0;
+    rf.preprocess.exposure = f.prep_exposure;
+    rf.preprocess.bias_ev = f.prep_bias_ev;
+    rf.preprocess.curve = f.prep_curve;
+    rf.preprocess.contrast = f.prep_contrast;
+    rf.preprocess.saturation = f.prep_saturation;
+    rf.preprocess.inverse = f.prep_inverse != 0;
+    rf.present_white_nits = f.renodx_white_nits;
+    rf.motion_without_depth = g.network->motion_without_depth();
+    rf.base_controls.style = f.style;
+    rf.base_controls.intensity = f.intensity;
+    rf.base_controls.local_tone = f.local_tone;
+    rf.base_controls.local_structure = f.local_structure;
+    rf.base_controls.skin_structure = f.skin_structure;
+    rf.base_controls.automatic_mask = f.automatic_mask != 0;
+    rf.base_controls.round_u8 = df == DXGI_FORMAT_R8G8B8A8_UNORM || df == DXGI_FORMAT_B8G8R8A8_UNORM ||
+                                df == DXGI_FORMAT_B8G8R8X8_UNORM;
+    rf.base_controls.reversible = f.reversible_mode >= 0 && f.reversible_mode <= 4 ? uint32_t(f.reversible_mode) : 0u;
+    rf.base_controls.history_strength = f.history_strength;
+    rf.base_controls.noise_every_frame = f.noise_every_frame != 0;
+
+    const uint64_t bytes = uint64_t(nw) * nh * 16;
+    const auto net = [&](uint32_t, uint64_t, const nr::D3d12NetControls& controls, const NetTemporal& nt,
+                         ID3D12Resource* in, ID3D12Resource* out) {
+        g.network->controls(controls);
+        g.network->temporal(nt);
+        const char* nwhy = "";
+        const LinearFrame lin{in, in->GetGPUVirtualAddress(), nw, nh, bytes};
+        const LinearFrame lout{out, out->GetGPUVirtualAddress(), nw, nh, bytes};
+        return g.network->record(f.cmd, lin, lout, &nwhy);
+    };
+    const auto state = nr::pe::split::snapshot(f.cmd);
+    if (!state) return fallback("the RenoDX route: no snapshot of the command list's state");
+    const uint32_t ran = e.stage->record(f.cmd, rf, net);
+    nr::pe::split::restore(f.cmd, state);
+    char line[160];
+    std::snprintf(line, sizeof line, "ran the RenoDX stage (D3D12) %ux%u, network %ux%u: %u pass%s", w, h, nw, nh,
+                  ran, ran == 1 ? "" : "es");
+    note_backend(line, true);
+    return true;
+}
 }  // namespace
 
 bool wilsjo2_ready(ID3D12Device* device, ID3D12GraphicsCommandList* cmd, uint32_t w, uint32_t h, std::string* why,
@@ -842,10 +1009,12 @@ bool wilsjo2_ready(ID3D12Device* device, ID3D12GraphicsCommandList* cmd, uint32_
 
 bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
     if (!f.device || !f.cmd || !f.color || !f.output) return false;
-    // Stages of the 0.0.8.1 path this backend does not run yet: that path takes the frame whole.
-    if (f.renodx_route) return fallback("the RenoDX route is installed (its stage runs on the 0.0.8.1 path)");
+    // Stages of the 0.0.8.1 path this backend does not run (that path takes the frame whole) - except the RenoDX
+    // route, whose stage runs here on the ASD route (M5 item 6).
     const auto color_state = static_cast<D3D12_RESOURCE_STATES>(f.color_state);
     const auto output_state = static_cast<D3D12_RESOURCE_STATES>(f.output_state);
+    const bool renodx = f.renodx_route != 0;
+
     sweep();
     std::string why;
     // v2.7: as wilsjo2_ready - passing states wait (the frame as it came, no NR, no bridge); lasting ones take the bridge
@@ -872,6 +1041,8 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
         if (!build(f.device, &why)) { g.broken = true; g.broken_why = why; }
     }
     if (g.broken) return fallback(g.broken_why);
+
+    if (renodx) return renodx_frame(f, color_state, output_state);
 
     const D3D12_RESOURCE_DESC sd = f.color->GetDesc(), dd = f.output->GetDesc();
     if (sd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || dd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
@@ -918,6 +1089,33 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
     const bool prep_on = (f.preprocess != 0);
     PrepConstants pc{};
     bool prep_reset = false;
+    const bool wants_depth = have_motion && f.depth && !g.network->motion_without_depth();
+    DXGI_FORMAT depth_view = DXGI_FORMAT_UNKNOWN;
+    D3D12_RESOURCE_DESC depth_desc{};
+    if (wants_depth) {
+        depth_desc = f.depth->GetDesc();
+        if (depth_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && depth_desc.SampleDesc.Count == 1 &&
+            !(depth_desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)) {
+            depth_view = depth_view_format(depth_desc.Format);
+        }
+    }
+    const bool have_depth = depth_view != DXGI_FORMAT_UNKNOWN;
+    if (wants_depth && !have_depth) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            nr::pe::log("[asd] the depth buffer (DXGI format %u) cannot be read; running without depth",
+                        unsigned(depth_desc.Format));
+        }
+    }
+    if (have_depth) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            nr::pe::log("[asd] depth read from guide (DXGI format %u -> %u)", unsigned(depth_desc.Format),
+                        unsigned(depth_view));
+        }
+    }
     {
         std::string nwhy;
         if (!g.network->ready(f.device, w, h, &nwhy)) {
@@ -942,33 +1140,6 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
         nc.history_strength = f.history_strength;
         nc.noise_every_frame = f.noise_every_frame != 0;
         g.network->controls(nc);
-        const bool wants_depth = have_motion && f.depth && !g.network->motion_without_depth();
-        DXGI_FORMAT depth_view = DXGI_FORMAT_UNKNOWN;
-        D3D12_RESOURCE_DESC depth_desc{};
-        if (wants_depth) {
-            depth_desc = f.depth->GetDesc();
-            if (depth_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && depth_desc.SampleDesc.Count == 1 &&
-                !(depth_desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)) {
-                depth_view = depth_view_format(depth_desc.Format);
-            }
-        }
-        const bool have_depth = depth_view != DXGI_FORMAT_UNKNOWN;
-        if (wants_depth && !have_depth) {
-            static bool warned = false;
-            if (!warned) {
-                warned = true;
-                nr::pe::log("[asd] the depth buffer (DXGI format %u) cannot be read; running without depth",
-                            unsigned(depth_desc.Format));
-            }
-        }
-        if (have_depth) {
-            static bool logged = false;
-            if (!logged) {
-                logged = true;
-                nr::pe::log("[asd] depth read from guide (DXGI format %u -> %u)", unsigned(depth_desc.Format),
-                            unsigned(depth_view));
-            }
-        }
 
         const uint32_t curve = uint32_t(std::clamp(f.prep_curve, 0, 6));
         const bool is_float = (sf == DXGI_FORMAT_R16G16B16A16_FLOAT || sf == DXGI_FORMAT_R11G11B10_FLOAT ||

@@ -29,6 +29,7 @@ struct ID3D12GraphicsCommandList;
 struct ID3D12Resource;
 
 namespace nr::pe { class Session; }
+namespace nr::renodx { struct Settings; }   // D3d12BackendFrame::renodx_settings (defined in nr_renodx.hpp)
 namespace nr { struct Preprocess; }
 
 namespace nr::dlssnr {
@@ -129,6 +130,18 @@ struct D3d12BackendFrame {
     float history_strength;   // < 0: the session's
     // The 0.0.8.1 path's own stages this backend does not run: the RenoDX route installed.
     int renodx_route;
+    // The RenoDX route's own frame, as evaluate_d3d12 builds it for the 0.0.8.1 path (nr_pe_session.hpp RenoDXFrame)
+    // - the backend runs the RenoDX stage on the ASD route from these. Null settings: not the RenoDX route.
+    const nr::renodx::Settings* renodx_settings;
+    int renodx_present;            // 0 the DLSS-output path, 2 HDR10, 3 scRGB (the .asi's Present layer)
+    float renodx_white_nits;
+    int renodx_hdr_flag;           // the game's colour is HDR (OptiScaler's judgement)
+    int renodx_after_upscale;      // NR runs on the upscaler's output
+    int renodx_fast_motion;        // a bound neutral texture is not a provider for temporal fast passes
+    ID3D12Resource* exposure;      // the game's exposure texture, as DLSS got it
+    int exposure_state;
+    float pre_exposure, exposure_scale;
+    int auto_exposure, create_flags_known;
     // [Preprocess] settings (0.0.8.1: nr::Preprocess)
     int preprocess;
     int prep_exposure;

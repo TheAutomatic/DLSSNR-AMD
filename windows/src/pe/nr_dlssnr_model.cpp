@@ -1315,6 +1315,38 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
         return 0;
     }
     nr::pe::menu::install();   // NR Control (End), once per process
+    // The RenoDX-style option's frame for this evaluate (nr_pe_session.cpp's run_renodx block, as one builder so
+    // the ASD backend and the 0.0.8.1 path cannot drift): OptiScaler's own judgement and frame, the .asi's Present
+    // layer overriding it.
+    const auto renodx_frame_of = [&](const nr::Preprocess& preprocess) {
+        const auto encode = nr::pe::renodx_route::last_encode();
+        note_renodx_extent(encode, width, height);
+        const auto rframe = nr::pe::renodx_route::current_frame();
+        nr::pe::Session::RenoDXFrame rf;
+        rf.hdr_flag = encode.hdr;
+        rf.settings = renodx_frame_settings();
+        rf.preprocess = preprocess;
+        note_finished(rf, rframe.known && rframe.finished_picture);
+        if (rframe.known && rframe.present) {   // the .asi's Present layer: as the ReShade routes run it
+            rf.present = rframe.present;
+            rf.present_white_nits = rframe.present_white_nits;
+            rf.hdr_flag = rframe.present == 3;
+            rf.after_upscale = true;
+        }
+        if (rframe.known && !rframe.present) {
+            // OptiScaler's own frame: NR before or after the upscaler, and the game's exposure as DLSS got it.
+            rf.after_upscale = !rframe.before_upscale;
+            rf.exposure = static_cast<ID3D12Resource*>(rframe.exposure);
+            rf.exposure_state = static_cast<D3D12_RESOURCE_STATES>(rframe.exposure_state);
+            rf.pre_exposure = rframe.pre_exposure > 0.0f ? rframe.pre_exposure : 1.0f;
+            rf.exposure_scale = rframe.exposure_scale;
+            rf.auto_exposure = rframe.flags_known && (rframe.create_flags & 0x40u) != 0;   // AutoExposure
+            rf.create_flags_known = rframe.flags_known;
+        } else {
+            rf.create_flags_known = false;
+        }
+        return rf;
+    };
 
     // The .asi's native D3D12 ASD backend, when one is set (off: never set, and this is 0.0.8.1 as it was).
     if (D3d12Backend backend = g_d3d12_backend.load()) {
@@ -1377,6 +1409,24 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
         if (w2) f->controls.history_strength = w2->history;
         f->controls.preprocess = pp;
         f->prep_by_layer = prep_outside && preprocess_now().active() && !w2->prep_missing;
+        nr::pe::Session::RenoDXFrame renodx_rf;   // (outlives the backend call: renodx_settings points into it)
+        if (nr::pe::renodx_route::installed()) {  // the RenoDX stage's own frame, for the ASD route's stage
+            renodx_rf = renodx_frame_of(pp);
+            frame.renodx_settings = &renodx_rf.settings;
+            frame.renodx_present = int(renodx_rf.present);
+            frame.renodx_white_nits = renodx_rf.present_white_nits;
+            frame.renodx_hdr_flag = renodx_rf.hdr_flag ? 1 : 0;
+            frame.renodx_after_upscale = renodx_rf.after_upscale ? 1 : 0;
+            frame.renodx_fast_motion = renodx_rf.fast_motion_available ? 1 : 0;
+            frame.exposure = renodx_rf.exposure;
+            frame.exposure_state = int(renodx_rf.exposure_state);
+            frame.pre_exposure = renodx_rf.pre_exposure;
+            frame.exposure_scale = renodx_rf.exposure_scale;
+            frame.auto_exposure = renodx_rf.auto_exposure ? 1 : 0;
+            frame.create_flags_known = renodx_rf.create_flags_known ? 1 : 0;
+        } else {
+            frame.renodx_settings = nullptr;
+        }
         if (backend(frame)) {
             note_route(kRouteAsd);
             {   // NR Control's state from this frame, every frame as the bridge's evaluate reports its runs (v2.4: it was
@@ -1538,31 +1588,7 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
     // then outputs unchanged. It never runs the network on the raw frame.
     if (nr::pe::renodx_route::installed()) {
         const auto encode = nr::pe::renodx_route::last_encode();
-        note_renodx_extent(encode, width, height);
-        const auto frame = nr::pe::renodx_route::current_frame();
-        nr::pe::Session::RenoDXFrame rf;
-        rf.hdr_flag = encode.hdr;
-        rf.settings = renodx_frame_settings();
-        rf.preprocess = f->controls.preprocess;
-        note_finished(rf, frame.known && frame.finished_picture);
-        if (frame.known && frame.present) {   // the .asi's Present layer: as the ReShade routes run it
-            rf.present = frame.present;
-            rf.present_white_nits = frame.present_white_nits;
-            rf.hdr_flag = frame.present == 3;
-            rf.after_upscale = true;
-        }
-        if (frame.known && !frame.present) {
-            // OptiScaler's own frame: NR before or after the upscaler, and the game's exposure as DLSS got it.
-            rf.after_upscale = !frame.before_upscale;
-            rf.exposure = static_cast<ID3D12Resource*>(frame.exposure);
-            rf.exposure_state = static_cast<D3D12_RESOURCE_STATES>(frame.exposure_state);
-            rf.pre_exposure = frame.pre_exposure > 0.0f ? frame.pre_exposure : 1.0f;
-            rf.exposure_scale = frame.exposure_scale;
-            rf.auto_exposure = frame.flags_known && (frame.create_flags & 0x40u) != 0;   // AutoExposure
-            rf.create_flags_known = frame.flags_known;
-        } else {
-            rf.create_flags_known = false;
-        }
+        const nr::pe::Session::RenoDXFrame rf = renodx_frame_of(f->controls.preprocess);
         // OptiScaler's encode skipped (nr_pe_optifix.cpp): the frame itself is read and written, in the state
         // OptiScaler holds it in across the call, and left as it is when NR does not run (its resolve is skipped too).
         auto* direct = static_cast<ID3D12Resource*>(nr::pe::renodx_route::direct());

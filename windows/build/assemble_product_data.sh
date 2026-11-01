@@ -29,6 +29,11 @@ cp -- "$NR_PRODUCT_SPV"/runtime/* "$dst/shaders/runtime/"
 cp -- "$NR_PRODUCT_SPV"/temporal/* "$dst/shaders/temporal/"
 bash windows/build/build_renodx.sh "$dst/shaders/renodx" > /dev/null   # the RenoDX style
 cp -- windows/shaders/renodx/LICENSE "$dst/shaders/renodx/RenoDX-LICENSE.txt"
+# The RenoDX stage on the native D3D12 ASD route compiles RenoDX's own HLSL (the .cs_5_1.hlsl and their .hlsli,
+# RENODX_VULKAN not defined) at run time, from this folder (nr_renodx_d3d12.cpp).
+cp -- windows/shaders/renodx/*.hlsl windows/shaders/renodx/*.hlsli "$dst/shaders/renodx/"
+mkdir -p "$dst/shaders/renodx/renodx-prep"
+cp -- windows/shaders/renodx-prep/*.hlsli "$dst/shaders/renodx/renodx-prep/"
 bash windows/build/build_wilsjo2.sh "$dst/shaders/wilsjo2" > /dev/null   # the wilsjo2 style, HUD FIX on every route
 # wilsjo2_classic.spv carries AMD FidelityFX Super Resolution 1 (MIT): its notice goes with it
 cp -- windows/shaders/passes/include/fsr1/LICENSE.txt "$dst/shaders/wilsjo2/FidelityFX-FSR1-LICENSE.txt"
