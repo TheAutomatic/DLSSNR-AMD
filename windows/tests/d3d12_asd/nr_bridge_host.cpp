@@ -12,8 +12,13 @@
 #include <windows.h>
 #include <d3d12.h>
 
+#include "nr_pe_config.hpp"
+
 #include <cstdio>
+#include <cstring>
 #include <string>
+#include <memory>
+#include <vector>
 
 int main(int argc, char** argv) {
     if (argc < 4) {
@@ -28,6 +33,8 @@ int main(int argc, char** argv) {
     }
     const LUID luid = d3d->GetAdapterLuid();
     std::string why;
+    // Before the device: ACO Mode is enabled per device as it is created.
+    nr::pe::configure_network(argv[1]);
     nr::pe::bridge::Device* dev = nr::pe::bridge::Device::get(luid, &why);
     if (!dev) {
         std::printf("bridge: %s\n", why.c_str());
@@ -42,10 +49,173 @@ int main(int argc, char** argv) {
         std::printf("bridge neural: %s\n", why.c_str());
         return 6;
     }
+    nr::pe::bridge::Image motion{};
+    if (!dev->create_d3d12(d3d, W, H, DXGI_FORMAT_R16G16_FLOAT, &motion, &why)) {
+        std::printf("bridge motion: %s\n", why.c_str());
+        return 6;
+    }
     std::printf("bridge: %ux%u proxy %p neural %p (rdna3 %d)\n", W, H, static_cast<void*>(proxy.image),
                 static_cast<void*>(neural.image), dev->rdna3() ? 1 : 0);
+
+    // The network on the bridge's own Vulkan device, then one job over the shared fence.
+    nr::HostDevice host{};
+    host.instance = dev->handles().instance;
+    host.physical = dev->handles().physical;
+    host.device = dev->handles().device;
+    host.queue = dev->queue();
+    host.queue_family = dev->family();
+    host.buffer_device_address = true;   // the bridge device is created with the network's features
+    host.rdna3 = dev->rdna3();
+    nr::RuntimeConfig cfg;
+    cfg.root = argv[1];
+    cfg.width = W;
+    cfg.height = H;
+    cfg.colour_format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    cfg.network = 1;
+    nr::TemporalConfig temporal;
+    temporal.enable = true;
+    nr::ControlMaskConfig mask;
+    std::unique_ptr<nr::Runtime> rt_holder;
+    try {
+        rt_holder = std::make_unique<nr::Runtime>(host, cfg, mask, temporal);
+    } catch (const std::exception& x) {
+        std::printf("runtime: %s\n", x.what());
+        return 12;
+    }
+    nr::Runtime& rt = *rt_holder;
+    std::printf("network built on the bridge's device\n");
+
+    // The shared images are filled on the D3D12 side and that queue is waited on before the GPU is asked to read
+    // them: motion zero, neural zero, the frame the same pattern the D3D12 test writes, as half floats.
+    D3D12_COMMAND_QUEUE_DESC qd{};
+    qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    ID3D12CommandQueue* queue = nullptr;
+    ID3D12CommandAllocator* alloc = nullptr;
+    ID3D12GraphicsCommandList* list = nullptr;
+    ID3D12Fence* fence = nullptr;
+    if (FAILED(d3d->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue))) || !queue ||
+        FAILED(d3d->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc))) || !alloc ||
+        FAILED(d3d->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, nullptr, IID_PPV_ARGS(&list))) || !list ||
+        FAILED(d3d->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))) || !fence) {
+        std::printf("no D3D12 queue/allocator/list/fence\n");
+        return 9;
+    }
+    auto upload = [&](const nr::pe::bridge::Image& img, const std::vector<uint8_t>& bytes) {
+        ID3D12Resource* res = nullptr;
+        if (FAILED(img.d3d->QueryInterface(IID_PPV_ARGS(&res))) || !res) return false;
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC bd{};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = bytes.size(); bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        ID3D12Resource* up = nullptr;
+        if (FAILED(d3d->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                                nullptr, IID_PPV_ARGS(&up))) || !up) { res->Release(); return false; }
+        void* m = nullptr;
+        bool ok = SUCCEEDED(up->Map(0, nullptr, &m)) && m;
+        if (ok) { std::memcpy(m, bytes.data(), bytes.size()); up->Unmap(0, nullptr); }
+        D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dst.pResource = res; dst.SubresourceIndex = 0;
+        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; src.pResource = up;
+        src.PlacedFootprint.Footprint = {img.dxgi, img.width, img.height, 1, UINT(uint64_t(img.width) * uint64_t(bytes.size() / (uint64_t(img.width) * img.height)))};
+        if (ok) list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        res->Release();
+        // the upload buffer is kept alive by the command list's reference to the copy
+        return ok;
+    };
+    {
+        const uint64_t px = uint64_t(W) * H;
+        std::vector<uint8_t> frame(size_t(px * 8)), zero(size_t(px * 8)), mv(size_t(px * 4), 0);
+        auto* f16 = reinterpret_cast<uint16_t*>(frame.data());
+        auto half = [](float v) {
+            uint32_t x; std::memcpy(&x, &v, 4);
+            const uint32_t s = (x >> 16) & 0x8000;
+            int32_t e = int32_t((x >> 23) & 0xFF) - 127 + 15;
+            const uint32_t mnt = (x >> 13) & 0x3FF;
+            if (e <= 0) return uint16_t(s);
+            if (e >= 31) return uint16_t(s | 0x7C00);
+            return uint16_t(s | (uint32_t(e) << 10) | mnt);
+        };
+        for (uint32_t y = 0; y < H; ++y)
+            for (uint32_t x = 0; x < W; ++x) {
+                const uint64_t i = uint64_t(y) * W + x;
+                f16[i * 4 + 0] = half(float((x * 13u + y * 7u) & 0x3FF) / 1023.f);
+                f16[i * 4 + 1] = half(float((x * 5u + y * 11u) & 0x3FF) / 1023.f);
+                f16[i * 4 + 2] = half(float((x * 3u + y * 17u) & 0x3FF) / 1023.f);
+                f16[i * 4 + 3] = half(1.f);
+            }
+        if (!upload(proxy, frame) || !upload(neural, zero) || !upload(motion, mv)) {
+            std::printf("the shared images could not be filled\n");
+            return 10;
+        }
+        if (FAILED(list->Close())) { std::printf("list close failed\n"); return 11; }
+        ID3D12CommandList* ls[] = {list};
+        queue->ExecuteCommandLists(1, ls);
+        queue->Signal(fence, 1);
+        HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        fence->SetEventOnCompletion(1, ev);
+        const bool ok = WaitForSingleObject(ev, 60000) == WAIT_OBJECT_0;
+        CloseHandle(ev);
+        if (!ok) { std::printf("the shared images did not finish\n"); return 11; }
+    }
+    std::printf("shared images filled on the D3D12 queue\n");
+
+    nr::pe::bridge::Job* job = dev->begin(&why, &rt);
+    if (!job) {
+        std::printf("bridge job: %s\n", why.c_str());
+        return 7;
+    }
+    const VkCommandBuffer cmd = dev->command_buffer(job);
+    const auto frame_of = [&](const nr::pe::bridge::Image& img) {
+        nr::ColourFrame f;
+        f.image = img.image;
+        f.format = img.format;
+        f.width = img.width;
+        f.height = img.height;
+        f.before = f.after = VK_IMAGE_LAYOUT_GENERAL;
+        f.before_stage = f.after_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        f.before_access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        f.after_access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        return f;
+    };
+    dev->acquire(job, {&proxy, &neural, &motion});   // the ownership barrier goes in before anything reads them
+    nr::EngineFrame e{};
+    e.motion = frame_of(motion);
+    e.motion_scale_x = 1.0f / float(W);
+    e.motion_scale_y = 1.0f / float(H);
+    e.colour = frame_of(proxy);
+    e.target = frame_of(neural);
+    e.feature = 1;
+    nr::Controls controls;
+    rt.record_engine(cmd, e, controls);
+    if (!dev->end(job, &why)) {
+        std::printf("bridge end: %s\n", why.c_str());
+        return 8;
+    }
+    const uint64_t gen = dev->generation(job);
+    const uint64_t mark = dev->hand_over_mark();   // where the queue is before this frame is given to it
+    const bool ran = dev->run_between(queue, job, gen);
+    std::printf("run_between -> %d\n", ran ? 1 : 0);
+    dev->wait_idle();
+    // The D3D12 queue must be past the hand-over before the shared resources go (D3D12 does not keep them alive):
+    // a signal of its own behind everything run_between queued, waited on, is that completion.
+    queue->Signal(fence, 2);
+    {
+        HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        fence->SetEventOnCompletion(2, ev);
+        const bool ok = WaitForSingleObject(ev, 60000) == WAIT_OBJECT_0;
+        CloseHandle(ev);
+        std::printf("D3D12 queue past the hand-over -> %d, hand_over_passed -> %d\n", ok ? 1 : 0,
+                    dev->hand_over_passed(mark) ? 1 : 0);
+    }
+    queue->Release();
     dev->destroy(proxy);
     dev->destroy(neural);
+    dev->destroy(motion);
+    fence->Release();
+    list->Release();
+    alloc->Release();
     d3d->Release();
-    return 0;
+    return ran ? 0 : 10;
 }

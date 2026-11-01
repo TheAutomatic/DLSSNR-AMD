@@ -146,8 +146,9 @@ class Device {
     // The same on D3D11's immediate context (ID3D11DeviceContext4 and a shared ID3D11Fence).
     bool run_between(ID3D11DeviceContext* context, Job* job, uint64_t generation);
 
-    // Where the hand-over queue is now (taken after a run_between), and whether that queue has since
-    // got past everything it was given with that frame, the copy back out of the shared images
+    // Where the hand-over queue is now (taken BEFORE the run_between that gives it this frame's work: after
+    // it the queue is already at or past the new value and the answer reads as not passed), and whether that
+    // queue has since got past everything it was given with that frame, the copy back out of the shared images
     // included. A D3D12 resource may only be released then: D3D12 does not keep it alive for its GPU work.
     uint64_t hand_over_mark();
     bool hand_over_passed(uint64_t mark);
