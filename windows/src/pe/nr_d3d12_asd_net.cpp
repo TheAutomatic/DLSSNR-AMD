@@ -125,7 +125,8 @@ bool family_of(std::string k, Family* f) {
 
 constexpr uint32_t kTableBytes = 4096, kTablePushOff = 512, kTableGridOff = 640;
 constexpr uint32_t kRing = 16;        // upload slots a buffer; more buffers are added while every slot is held
-constexpr uint64_t kSlotHold = 3;     // evaluates an upload slot stays owned: a game fences its lists within a few
+constexpr uint64_t kSlotHold = 64;    // evaluates an upload slot stays owned (the deferred-release cadence of
+                                      // this file: a game fences its lists within that many of its own evaluates)
 constexpr uint32_t kParamsBytes = 256;   // the temporal params (12 floats), after the frame's tables
 constexpr uint32_t kMaxFeatures = 8, kMaxExtents = 4;
 
@@ -347,7 +348,7 @@ std::shared_ptr<Built> build(ID3D12Device* device, const Carriers& carriers, ID3
     // t.depth: dummy fallback when depth is not provided (the pre block reads have_depth 0), bound as a valid image.
     b->depth = buffer(device, D3D12_HEAP_TYPE_DEFAULT, uint64_t(w) * h * 16, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
     b->tables = uint32_t(b->plan.noise.size() + b->plan.disp.size());
-    b->slot_bytes = uint64_t(b->tables) * kTableBytes + kParamsBytes;
+    b->table = buffer(device, D3D12_HEAP_TYPE_DEFAULT, b->slot_bytes, D3D12_RESOURCE_STATE_COPY_DEST, true);
     if (!b->act || !b->wgt || !b->wgt_upload || !b->surf1 || !b->depth || !b->table) {
         *why = "the network memory could not be made"; return nullptr;
     }
