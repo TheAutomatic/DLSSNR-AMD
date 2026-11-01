@@ -125,6 +125,10 @@ struct D3d12BackendFrame {
     ID3D12Resource* depth;
     unsigned int depth_x, depth_y, depth_w, depth_h;
     int depth_inverted;
+    // Optional readback buffers for the RenoDX stage's network input and answer (W*H*16 each); tests only.
+    ID3D12Resource* capture_in;
+    ID3D12Resource* capture_out;
+    ID3D12Resource* capture_raw;
     int reset;
     unsigned long long feature;
     float history_strength;   // < 0: the session's

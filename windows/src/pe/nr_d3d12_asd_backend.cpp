@@ -1039,6 +1039,9 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
     rf.depth_x = f.depth_x; rf.depth_y = f.depth_y;
     rf.depth_w = f.depth_w; rf.depth_h = f.depth_h;
     rf.depth_inverted = f.depth_inverted != 0;
+    rf.capture_in = f.capture_in;      // the boundary capture is the test's; the stage only copies when set
+    rf.capture_out = f.capture_out;
+    rf.capture_raw = f.capture_raw;
     rf.exposure = f.exposure;
     rf.exposure_state = static_cast<D3D12_RESOURCE_STATES>(f.exposure_state);
     rf.pre_exposure = f.pre_exposure;

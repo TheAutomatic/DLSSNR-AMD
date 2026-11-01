@@ -57,6 +57,13 @@ struct Frame {
     // The network's motion/depth guides resampled by the stage (to_motion / to_depth at the network's extent);
     // `net` runs one pass: the controls the ASD network takes, its temporal inputs, and the pass's linear buffers
     // (both UNORDERED_ACCESS, `out` to hold the answer). Returns false when it recorded nothing.
+    // Optional readback buffers (NW*NH*16 bytes each): when set, the network's input (the proxy) and its answer are
+    // copied into them, so two routes' boundary values can be compared; unset costs nothing.
+    ID3D12Resource* capture_in = nullptr;
+    ID3D12Resource* capture_out = nullptr;
+    // The network's answer straight from its linear buffer (NW*NH*16 bytes, float4): the raw value before the
+    // stage copies it into a texture, so a zero can be told apart from a lost readback.
+    ID3D12Resource* capture_raw = nullptr;
     using Net = std::function<bool(uint32_t pass, uint64_t feature, const nr::D3d12NetControls& controls,
                                    const NetTemporal& nt, ID3D12Resource* in, ID3D12Resource* out)>;
 };

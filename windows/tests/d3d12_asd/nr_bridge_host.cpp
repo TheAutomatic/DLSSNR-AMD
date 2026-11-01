@@ -251,27 +251,59 @@ int main(int argc, char** argv) {
                 dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst.pResource = rb;
                 dst.PlacedFootprint.Footprint = {DXGI_FORMAT_R10G10B10A2_UNORM, W, H, 1, UINT(uint64_t(W) * 4)};
                 src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.pResource = out_res;
-                alloc->Reset();
-                list->Reset(alloc, nullptr);
-                list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-                list->Close();
-                ID3D12CommandList* ls[] = {list};
-                queue->ExecuteCommandLists(1, ls);
-                queue->Signal(fence, 3);
-                HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-                fence->SetEventOnCompletion(3, ev);
-                if (WaitForSingleObject(ev, 60000) == WAIT_OBJECT_0) {
-                    void* m = nullptr;
-                    if (SUCCEEDED(rb->Map(0, nullptr, &m)) && m) {
-                        if (FILE* f = std::fopen(argv[4], "wb")) {
-                            std::fwrite(m, 1, size_t(bytes), f);
-                            std::fclose(f);
-                            std::printf("bridge output written to %s\n", argv[4]);
-                        }
-                        rb->Unmap(0, nullptr);
-                    }
+                // The shared image is left in COMMON by run_between's hand-back: say what it is before reading it,
+                // and put it back, or the next consumer writes into a resource D3D12 thinks is a copy source.
+                D3D12_RESOURCE_BARRIER bar{};
+                bar.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                bar.Transition.pResource = out_res;
+                bar.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                bar.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+                bar.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                HRESULT hr = alloc->Reset();
+                if (SUCCEEDED(hr)) hr = list->Reset(alloc, nullptr);
+                if (SUCCEEDED(hr)) { list->ResourceBarrier(1, &bar); }
+                if (SUCCEEDED(hr)) list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                bar.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                bar.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+                if (SUCCEEDED(hr)) { list->ResourceBarrier(1, &bar); }
+                if (SUCCEEDED(hr)) hr = list->Close();
+                bool done = false;
+                if (SUCCEEDED(hr)) {
+                    ID3D12CommandList* ls[] = {list};
+                    queue->ExecuteCommandLists(1, ls);
+                    hr = queue->Signal(fence, 3);
                 }
-                CloseHandle(ev);
+                if (SUCCEEDED(hr)) {
+                    HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                    done = fence->SetEventOnCompletion(3, ev) == S_OK && WaitForSingleObject(ev, 60000) == WAIT_OBJECT_0;
+                    CloseHandle(ev);
+                }
+                if (!done) {
+                    std::printf("FAIL: the readback did not complete (hr 0x%08lX)\n", static_cast<unsigned long>(hr));
+                    rb->Release();
+                    out_res->Release();
+                    return 14;
+                }
+                {
+                    void* m = nullptr;
+                    if (FAILED(rb->Map(0, nullptr, &m)) || !m) {
+                        std::printf("FAIL: the readback could not be mapped\n");
+                        rb->Release();
+                        out_res->Release();
+                        return 15;
+                    }
+                    FILE* f = std::fopen(argv[4], "wb");
+                    const bool wrote = f && std::fwrite(m, 1, size_t(bytes), f) == size_t(bytes);
+                    if (f) std::fclose(f);
+                    rb->Unmap(0, nullptr);
+                    if (!wrote) {
+                        std::printf("FAIL: the dump could not be written to %s\n", argv[4]);
+                        rb->Release();
+                        out_res->Release();
+                        return 16;
+                    }
+                    std::printf("bridge output written to %s\n", argv[4]);
+                }
                 rb->Release();
             }
             out_res->Release();

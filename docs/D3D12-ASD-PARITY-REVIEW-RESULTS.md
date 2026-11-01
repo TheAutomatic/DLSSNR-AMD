@@ -137,3 +137,21 @@ colour/output/motion/depth 共享图像 → 参考 `nr::renodx::Stage` 在共享
 读数：桥接交接**逐位不改变**参考路线的结果（与参考宿主完全一致），说明共享纹理/fence 与 job 顺序正确；
 桥接(ACO) 与 D3D12-ASD(ACO) 的差仍在 ~1/1023 量级，DXIL 路线差一个数量级。**这不是性能测量**：
 还没有多帧计时、没有同 HDR preprocess/resolve 的 A/B 计时，也没有帧时间数据；`P4-bridge-host-run.txt` 为完整日志。
+
+## 首个差异定位（网络入口/出口，同帧同配置）
+
+抓取：`NR_TEST_STAGE_DUMP`（ASD 测试，阶段纹理 + 原始线性缓冲）与 `NR_STAGE_DUMP`（参考/桥接宿主），两侧都是
+RGBA16F、NW x NH。严格比较脚本 `windows/tests/d3d12_asd/compare_dumps.py`（两份文件必须精确等于 W*H*4 或
+W*H*8 字节，不截断；逐通道 max/mean/RMSE/p50/p90/p99/不同像素，float 检查非有限值）。
+
+| 边界 | 结果 |
+|---|---|
+| 网络入口 proxy（encode 之后） | **逐位相同**（0 在所有通道，0.00% 像素不同） |
+| 网络出口 neural | 差 mean 0.0045–0.0064、max 0.064–0.109、p99 0.022–0.025（单位：纹理值 0..1）；alpha 完全相同 |
+
+结论：**差异起点在网络内部**（proxy 完全一致，说明 encode/guide/输入链一致）；把网络输出喂给编解码后才放大为
+最终帧的 30–38/1023。下一步是匹配网络侧的配置（`noise_every_frame`、控件、temporal 参数），再决定这是配置差
+还是 ACO/DXIL 之外的实现差。
+
+抓取不影响输出：开关两次的 frame0/1/2 哈希完全相同（`8DCA…/9E91…/5ED5…`）。
+`hand_over_mark()` 必须在 `run_between` 之前取（已在头注释更正）。

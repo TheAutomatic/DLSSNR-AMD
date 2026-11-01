@@ -2352,6 +2352,16 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
         ensure(cmd, lin_mv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         ensure(cmd, lin_depth, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         uav_barrier(cmd);   // the guides and lin_proxy are read by the net by raw address
+        if (f.capture_in) {   // the proxy texture the network is fed from (RGBA16F, as the Vulkan stage's proxy)
+            ensure(cmd, proxy.res, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            D3D12_TEXTURE_COPY_LOCATION di{}, si{};
+            di.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; di.pResource = f.capture_in;
+            di.PlacedFootprint.Footprint = {DXGI_FORMAT_R16G16B16A16_FLOAT, NW, NH, 1, NW * 8};
+            si.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; si.pResource = proxy.res; si.SubresourceIndex = 0;
+            cmd->CopyTextureRegion(&di, 0, 0, 0, &si, nullptr);
+            ensure(cmd, proxy.res, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            uav_barrier(cmd);
+        }
         if (!net(k, nt.feature, ck, nt, lin_proxy, lin_neural)) {
             if (!net_failed_logged) {
                 net_failed_logged = true;
@@ -2363,6 +2373,12 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
         {
             // The net's writes are UAV (the entry's ensure said so): order them against the read, then move the state.
             uav_barrier(cmd);
+            if (f.capture_raw) {   // the network's answer as its buffer holds it
+                ensure(cmd, lin_neural, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                cmd->CopyBufferRegion(f.capture_raw, 0, lin_neural, 0, uint64_t(NW) * NH * 16);
+                ensure(cmd, lin_neural, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                uav_barrier(cmd);
+            }
             ensure(cmd, lin_neural, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             struct { uint32_t w, h, what, pad; float region[4]; } c{NW, NH, 0, 0, {1.f, 1.f, 0.f, 0.f}};
             View srv[8] = {};
@@ -2370,6 +2386,16 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
             View uav[14] = {};
             uav[0] = tv(neural, true);
             dispatch(cmd, kBufToTex, srv, uav, &c, 8, (NW + 7) / 8, (NH + 7) / 8);
+            if (f.capture_out) {   // the answer texture the codec reads, after the network's buffer is put in it
+                ensure(cmd, neural.res, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                D3D12_TEXTURE_COPY_LOCATION di{}, si{};
+                di.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; di.pResource = f.capture_out;
+                di.PlacedFootprint.Footprint = {DXGI_FORMAT_R16G16B16A16_FLOAT, NW, NH, 1, NW * 8};
+                si.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; si.pResource = neural.res; si.SubresourceIndex = 0;
+                cmd->CopyTextureRegion(&di, 0, 0, 0, &si, nullptr);
+                ensure(cmd, neural.res, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                uav_barrier(cmd);
+            }
         }
         ++ran;   // the network ran this pass
         if (fast) {

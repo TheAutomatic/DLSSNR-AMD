@@ -92,6 +92,7 @@ int main(int argc, char** argv) {
     const std::string root = argv[1];
     const uint32_t W = uint32_t(std::atoi(argv[2])), H = uint32_t(std::atoi(argv[3]));
     std::string why;
+    nr::pe::configure_network(root);   // before the device: ACO Mode is enabled per device as it is created
     if (!make_device(&why)) { std::printf("device: %s\n", why.c_str()); return 3; }
     nr::HostDevice host{};
     // The production device's own handles and its reported support (not an assumption about the field).
@@ -102,6 +103,8 @@ int main(int argc, char** argv) {
     host.queue_family = vkctx().family;
     host.buffer_device_address = vkctx().buffer_device_address;
     host.rdna3 = vkctx().rdna3;
+    // The device-level answer, not the configuration's: ACO's records are used by a device marked enabled.
+    std::printf("ACO records active on this device: %d\n", nr::binary::enabled(host.device) ? 1 : 0);
     nr::RuntimeConfig cfg;
     cfg.root = root;
     cfg.width = W;
@@ -112,9 +115,6 @@ int main(int argc, char** argv) {
     cfg.network = 1;   // the small model
     try {
         // The RenoDX stage hands the network a temporal frame (history, guides): the runtime must carry that path.
-        // ACO Mode as the product sets it (the installed dlssnr-amd\aco bundle), so the reference runs the same
-        // configuration and reports whether its records loaded.
-        nr::pe::configure_network(root);
         {
             const std::string why = nr::binary::disabled_why();
             std::printf("ACO Mode: %s\n", why.empty() ? "configured (a record exists for each pipeline's SPIR-V)"
@@ -280,6 +280,17 @@ int main(int argc, char** argv) {
         nr::renodx::StageConfig& scc = sc;
         (void)scc;
         nr::renodx::Stage stage(host, sc);
+        // The stage's own network boundary, for a comparison with the D3D12 route's capture (RGBA16F, W*H*8).
+        VkBuffer bproxy{}, bneural{};
+        VkDeviceMemory bproxy_mem{}, bneural_mem{};
+        const uint64_t bbytes = uint64_t(width) * height * 8;
+        if (!buffer(VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, bbytes, &bproxy, &bproxy_mem) ||
+            !buffer(VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, bbytes, &bneural, &bneural_mem)) {
+            std::printf("capture buffers failed\n");
+            return 17;
+        }
         nr::renodx::StageFrame sf;
         sf.colour.image = colour;
         sf.colour.format = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
@@ -321,6 +332,21 @@ int main(int argc, char** argv) {
             e.feature = uint64_t(k) + 1;
             nr::Controls controls;
             rt.record_engine(cmd, e, controls);
+            // The network's input and answer, recorded in the same command buffer.
+            const auto grab = [&](const nr::ColourFrame& src, VkBuffer dst) {
+                barrier(src.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                VkBufferImageCopy r{};
+                r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                r.imageExtent = {src.width, src.height, 1};
+                vkCmdCopyImageToBuffer(cmd, src.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, 1, &r);
+                barrier(src.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_READ_BIT,
+                        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+            };
+            grab(proxy, bproxy);
+            grab(neural, bneural);
         };
         passes = stage.record(cmd, sf, net);
         std::printf("stage recorded %u pass(es)\n", passes);
@@ -346,6 +372,23 @@ int main(int argc, char** argv) {
                 std::printf("reference output written to %s\n", path.c_str());
             }
             vkUnmapMemory(vkctx().device, down_mem);
+        }
+        if (const char* sd = std::getenv("NR_STAGE_DUMP"); sd && sd[0]) {
+            const VkBuffer bufs[2] = {bproxy, bneural};
+            const VkDeviceMemory mems[2] = {bproxy_mem, bneural_mem};
+            const char* names[] = {"vulkan_proxy.bin", "vulkan_neural.bin"};
+            for (int i = 0; i < 2; ++i) {
+                void* m = nullptr;
+                if (vkMapMemory(vkctx().device, mems[i], 0, bbytes, 0, &m) == VK_SUCCESS) {
+                    const std::string path = std::string(sd) + "\\" + names[i];
+                    if (FILE* f = std::fopen(path.c_str(), "wb")) {
+                        std::fwrite(m, 1, size_t(bbytes), f);
+                        std::fclose(f);
+                        std::printf("boundary written to %s\n", path.c_str());
+                    }
+                    vkUnmapMemory(vkctx().device, mems[i]);
+                }
+            }
         }
         std::printf("stage: %s\n", stage.recordings_done() ? "recorded" : "no recordings");
     } catch (const std::exception& x) {

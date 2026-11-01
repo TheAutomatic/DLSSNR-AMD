@@ -729,6 +729,10 @@ int renodx_run(int argc, char** argv) {
     fr.output = out_tex; fr.output_state = int(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     // NR_TEST_GUIDES=1: motion and depth with fixed patterns, so the temporal path (history gate, latch) runs.
     if (const char* g = std::getenv("NR_TEST_GUIDES"); g && g[0] == '1') {
+        const bool zero_guides = [] {
+            const char* z = std::getenv("NR_TEST_ZERO_GUIDES");
+            return z && z[0] == '1';
+        }();
         auto make_guide = [&](DXGI_FORMAT fmt, uint32_t bpp, uint8_t fill_a, uint8_t fill_b) -> ID3D12Resource* {
             D3D12_HEAP_PROPERTIES gp{}; gp.Type = D3D12_HEAP_TYPE_DEFAULT;
             D3D12_RESOURCE_DESC gr{};
@@ -747,7 +751,7 @@ int renodx_run(int argc, char** argv) {
                 for (uint32_t x = 0; x < W; ++x) {
                     uint8_t* px = p8 + uint64_t(y) * pitch + uint64_t(x) * bpp;
                     px[0] = fill_a; px[1] = fill_b;
-                    for (uint32_t k = 2; k < bpp; ++k) px[k] = uint8_t((x * 3u + y * 5u) & 0xFF);
+                    for (uint32_t k = 2; k < bpp; ++k) px[k] = zero_guides ? 0 : uint8_t((x * 3u + y * 5u) & 0xFF);
                 }
             up->Unmap(0, nullptr);
             D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
@@ -803,6 +807,35 @@ int renodx_run(int argc, char** argv) {
     fr.feature = 1;
     fr.renodx_route = 1;
     fr.renodx_settings = &settings;
+    // The network's input and answer, for a comparison with another route's boundary values.
+    ID3D12Resource* cap_in = nullptr;
+    ID3D12Resource* cap_out = nullptr;
+    ID3D12Resource* cap_raw = nullptr;
+    const bool capture_boundaries = std::getenv("NR_TEST_STAGE_DUMP") != nullptr;
+    if (capture_boundaries) {
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = uint64_t(W) * H * 8; rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1; rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(d->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                              IID_PPV_ARGS(&cap_in))) ||
+            FAILED(d->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                              IID_PPV_ARGS(&cap_out)))) {
+            log("[test] renodx: the boundary capture buffers could not be made");
+            return 4;
+        }
+        rd.Width = uint64_t(W) * H * 16;
+        if (FAILED(d->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                              IID_PPV_ARGS(&cap_raw)))) {
+            log("[test] renodx: the raw capture buffer could not be made");
+            return 4;
+        }
+        fr.capture_in = cap_in;
+        fr.capture_out = cap_out;
+        fr.capture_raw = cap_raw;
+    }
     fr.renodx_present = 2;         // HDR10
     fr.renodx_white_nits = 203.f;
     fr.renodx_hdr_flag = 1;
@@ -893,6 +926,34 @@ int renodx_run(int argc, char** argv) {
                             log("[test] renodx: frame %d output hash %016llX", fi, static_cast<unsigned long long>(hh));
                             // NR_TEST_DUMP=<dir>: each frame's raw output (R10G10B10A2, w*h*4 B) for a numeric
                             // comparison between two loads of the same frame (HLSL vs the ACO binary).
+                            if (capture_boundaries) {
+                                void* mi = nullptr;
+                                void* mn = nullptr;
+                                const uint64_t cb = uint64_t(W) * H * 8;
+                                if (cap_in && SUCCEEDED(cap_in->Map(0, nullptr, &mi)) && mi &&
+                                    cap_out && SUCCEEDED(cap_out->Map(0, nullptr, &mn)) && mn) {
+                                    if (const char* sd = std::getenv("NR_TEST_STAGE_DUMP"); sd && sd[0]) {
+                                        void* mr = nullptr;
+                                        if (cap_raw && SUCCEEDED(cap_raw->Map(0, nullptr, &mr)) && mr) {
+                                            char p3[512];
+                                            std::snprintf(p3, sizeof p3, "%s\\raw_frame%d.bin", sd, fi);
+                                            if (FILE* f = std::fopen(p3, "wb")) {
+                                                std::fwrite(mr, 1, size_t(uint64_t(W) * H * 16), f);
+                                                std::fclose(f);
+                                            }
+                                            cap_raw->Unmap(0, nullptr);
+                                        }
+                                        char p1[512], p2[512];
+                                        std::snprintf(p1, sizeof p1, "%s\\proxy_frame%d.bin", sd, fi);
+                                        std::snprintf(p2, sizeof p2, "%s\\neural_frame%d.bin", sd, fi);
+                                        if (FILE* f = std::fopen(p1, "wb")) { std::fwrite(mi, 1, size_t(cb), f); std::fclose(f); }
+                                        if (FILE* f = std::fopen(p2, "wb")) { std::fwrite(mn, 1, size_t(cb), f); std::fclose(f); }
+                                        log("[test] renodx: boundary dumped (proxy %s, neural %s)", p1, p2);
+                                    }
+                                    cap_in->Unmap(0, nullptr);
+                                    cap_out->Unmap(0, nullptr);
+                                }
+                            }
                             if (const char* dd = std::getenv("NR_TEST_DUMP"); dd && dd[0]) {
                                 char path[512];
                                 std::snprintf(path, sizeof path, "%s\\frame%d.bin", dd, fi);
