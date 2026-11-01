@@ -3169,8 +3169,17 @@ void start_heartbeat() {
     if (started.exchange(true)) return;
     HANDLE t = CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
         const ULONGLONG t0 = GetTickCount64();
+        HRESULT removed = S_OK;
         for (int i = 0; i < 50; ++i) {
             Sleep(200);
+            // A removed device is the only trace a game that dies without an exception leaves: poll it while the
+            // heartbeat runs (the first frames, when a new route's first dispatches go in).
+            if (removed == S_OK) {
+                removed = nr::pe::asd::device_removed_reason();
+                if (FAILED(removed))
+                    log("[nr] the D3D12 device was removed (0x%08lX): the frame's commands failed on the GPU, or the "
+                        "driver gave up on them", static_cast<unsigned long>(removed));
+            }
             log("[nr] heartbeat %llu ms: %llu presents, network build stage %d (%u of %u pipelines); in NR's code: %s",
                 static_cast<unsigned long long>(GetTickCount64() - t0), nr::pe::watchdog::presents_seen(),
                 nr::g_build_stage.load(), nr::g_build_pipes_done.load(), nr::g_build_pipes_total.load(),

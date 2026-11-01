@@ -88,6 +88,9 @@ bool wilsjo2_ready(ID3D12Device* device, ID3D12GraphicsCommandList* cmd, uint32_
 // The backend slot nr::dlssnr::evaluate_d3d12 calls (nr::dlssnr::set_d3d12_backend, from InitializeASI).
 bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& frame);
 AsdNetStatus backend_net_status();
+// The ASD backend's device as it stands (S_OK when there is none): a removed device is the one signal a game that dies
+// without an exception leaves behind, so a watchdog can poll it.
+HRESULT device_removed_reason();
 
 
 }  // namespace nr::pe::asd

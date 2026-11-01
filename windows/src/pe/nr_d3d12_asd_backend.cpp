@@ -1440,6 +1440,10 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
     note_backend(line, true);
     return true;
 }
+HRESULT device_removed_reason() {
+    ID3D12Device* d = g.device;
+    return d ? d->GetDeviceRemovedReason() : S_OK;
+}
 AsdNetStatus backend_net_status() {
     return g.network ? g.network->status() : AsdNetStatus{};
 }
