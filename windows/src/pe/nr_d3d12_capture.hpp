@@ -17,7 +17,7 @@
 namespace nr::pe::capture {
 // Before any device is made: the debug layer, GPU validation, DRED, and the run's folder. Logs each step and whether
 // it took, so a reproduction that captures nothing says so at the top of the log instead of at the end.
-void start(const std::string& game_folder, bool wanted);
+void start(const std::string& game_folder, bool wanted, bool wanted_debug_layer);
 bool on();
 const std::wstring& folder();
 // The first device: the info queue (debug messages) and the adapter, for the run's header.

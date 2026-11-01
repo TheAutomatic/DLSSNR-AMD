@@ -1085,7 +1085,15 @@ void start(HMODULE self, bool register_now) {
         g_enabled ? 1 : 0, g_register ? 1 : 0);
     // The diagnostic capture has to be set up before anything makes a device (the debug layer and DRED are
     // process-wide and only apply to devices made afterwards): this runs from InitializeASI, under the loader lock.
-    if (g_enabled) capture::start(utf8(here), GetPrivateProfileIntW(L"D3D12ASD", L"Capture", 1, g_ini.c_str()) != 0);
+        if (g_enabled) {
+        // The run's folder is the game's, not the plugin's: nr-diag\ beside the exe.
+        std::wstring game = here;
+        if (const size_t up = game.find_last_of(L"\\/"); up != std::wstring::npos) game.resize(up);
+        if (const size_t up2 = game.find_last_of(L"\\/"); up2 != std::wstring::npos &&
+            _wcsicmp(game.c_str() + up2 + 1, L"plugins") == 0) game.resize(up2);
+        capture::start(utf8(game), GetPrivateProfileIntW(L"D3D12ASD", L"Capture", 1, g_ini.c_str()) != 0,
+                       GetPrivateProfileIntW(L"D3D12ASD", L"DebugLayer", 0, g_ini.c_str()) != 0);
+    }
     if (!g_enabled || !register_now) return;
     if (!g_register) { set_registration("not registered: Register = 0 (NR Control's Unregister)"); return; }
     // Under the loader lock here: the thread runs once OptiScaler's DllMain has returned (as the watchdog's).

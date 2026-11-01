@@ -126,7 +126,7 @@ const char* severity_name(D3D12_MESSAGE_SEVERITY s) {
 const std::wstring& folder() { return g_dir; }
 bool on() { return g_on; }
 
-void start(const std::string& game_folder, bool wanted) {
+void start(const std::string& game_folder, bool wanted, bool wanted_debug_layer) {
     std::lock_guard<std::mutex> guard(g_mutex);
     if (g_on) return;
     // [D3D12ASD] Capture / NR_ASD_CAPTURE: on by default while the route is young - the debug layer costs frames and
@@ -144,25 +144,29 @@ void start(const std::string& game_folder, bool wanted) {
     write(g_run, "DLSSNR-AMD diagnostic capture");
     write(g_run, ("folder: " + narrow(g_dir.c_str())).c_str());
 
-    // The debug layer: every recorded call is validated and the first error names the resource and the call.
-    ID3D12Debug* debug = nullptr;
-    HRESULT r = D3D12GetDebugInterface(IID_PPV_ARGS(&debug));
-    if (SUCCEEDED(r) && debug) {
-        debug->EnableDebugLayer();
-        // GPU-based validation runs the pipeline's validation in shaders: slow, but it names the failing call itself.
-        if (ID3D12Debug1* debug1 = nullptr; SUCCEEDED(debug->QueryInterface(IID_PPV_ARGS(&debug1))) && debug1) {
-            debug1->SetEnableGPUBasedValidation(TRUE);
-            debug1->Release();
-            nr::pe::log("[capture] D3D12 debug layer on, GPU-based validation on");
+    // The debug layer is NOT enabled by default: a game that ships its own Agility SDK layers (D3D12\x64\...) hands
+    // D3D12CreateDevice an app-local D3D12Core, and the debug layer this ASI can create is the system one - the two do
+    // not match, and device creation then faults inside D3D12SDKLayers.dll before the game's first frame. [D3D12ASD]
+    // DebugLayer=1 asks for it anyway, for a case where the layers are known to match.
+    g_on = true;   // the schedule and the device-removal report need nothing from D3D12
+    bool debug_layer = false;
+#ifndef NR_ASD_NO_DEBUG_LAYER
+    if (wanted_debug_layer) {
+        ID3D12Debug* debug = nullptr;
+        const HRESULT r = D3D12GetDebugInterface(IID_PPV_ARGS(&debug));
+        if (SUCCEEDED(r) && debug) {
+            debug->EnableDebugLayer();
+            debug->Release();
+            debug_layer = true;
+            nr::pe::log("[capture] D3D12 debug layer on (DebugLayer=1): messages are captured below");
         } else {
-            nr::pe::log("[capture] D3D12 debug layer on (no ID3D12Debug1: no GPU-based validation)");
+            nr::pe::log("[capture] the D3D12 debug layer is not available (0x%08lX)", static_cast<unsigned long>(r));
         }
-        debug->Release();
-        g_on = true;
     } else {
-        nr::pe::log("[capture] the D3D12 debug layer is not available (0x%08lX): install 'Graphics Tools' in Windows' "
-                    "optional features for validation messages", static_cast<unsigned long>(r));
+        nr::pe::log("[capture] D3D12 debug layer off (DebugLayer=0): this game ships its own SDK layers; the schedule "
+                    "and the device-removal report are captured without it");
     }
+#endif
 
     // DRED: auto breadcrumbs (the last command of each list) and page faults (the address and its allocations). The
     // settings object is reached by its class id, which only the DirectX-Headers' d3d12.h declares; a toolchain
@@ -186,8 +190,8 @@ void start(const std::string& game_folder, bool wanted) {
                 "stay at the driver's default; the debug layer's messages are still captured)");
 #endif
     char line[256];
-    std::snprintf(line, sizeof line, "debug layer: %s | GPU validation: see the log | DRED breadcrumbs: %s | page faults: %s",
-                  g_on ? "on" : "NOT AVAILABLE", breadcrumbs ? "on" : "no", faults ? "on" : "no");
+    std::snprintf(line, sizeof line, "debug layer: %s | DRED breadcrumbs: %s | page faults: %s",
+                  debug_layer ? "on" : "off (DebugLayer=0)", breadcrumbs ? "on" : "no", faults ? "on" : "no");
     write(g_run, line);
     g_errors = _wfopen(path_of(L"d3d12-messages.txt").c_str(), L"w, ccs=UTF-8");
     write(g_errors, "D3D12 debug layer messages, as they appeared");
