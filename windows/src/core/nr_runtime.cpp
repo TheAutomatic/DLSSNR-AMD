@@ -2880,6 +2880,44 @@ void Runtime::discard_timing() { impl_->timings_recorded = 0; }
 // pipelines), for a caller that runs the dispatches itself. Divergences from the constructor, all of them about the
 // Vulkan host this has not got: no device checks or adopt, no pipeline binaries check (ACO Mode is the configured
 // directory alone), no --tex-in-format / --out0-format (the D3D12 side hands the network RGBA32F), no int4 network.
+
+namespace {
+std::string g_plan_dump;   // set_plan_dump_path: where the next lowered plan is written, empty: nowhere
+}  // namespace
+
+void set_plan_dump_path(const char* path) { g_plan_dump = path ? path : ""; }
+
+// The plan in NRPLAN02, the layout nr_d3d12_asd_test's file_planner reads back.
+bool dump_d3d12_plan(const D3d12NetPlan& p, const char* path) {
+    FILE* f = path && *path ? std::fopen(path, "wb") : nullptr;
+    if (!f) return false;
+    auto u32 = [&](uint32_t v) { std::fwrite(&v, 4, 1, f); };
+    auto u64 = [&](uint64_t v) { std::fwrite(&v, 8, 1, f); };
+    auto i32 = [&](int32_t v) { std::fwrite(&v, 4, 1, f); };
+    auto str = [&](const std::string& v) { u64(v.size()); if (!v.empty()) std::fwrite(v.data(), 1, v.size(), f); };
+    std::fwrite("NRPLAN02", 8, 1, f);
+    str(p.spv_dir); str(p.model); str(p.note);
+    u32(p.width); u32(p.height); u32(p.work_w); u32(p.work_h);
+    std::fwrite(&p.style_grade, 1, 1, f);
+    u64(p.act_total); u64(p.weights_end);
+    u64(p.weights.size()); if (!p.weights.empty()) std::fwrite(p.weights.data(), 1, p.weights.size(), f);
+    u32(uint32_t(p.disp.size()));
+    for (const auto& d : p.disp) {
+        str(d.kern); u32(d.gx); u32(d.gy); u32(d.gz); i32(d.act_at);
+        u64(d.push.size()); if (!d.push.empty()) std::fwrite(d.push.data(), 1, d.push.size(), f);
+    }
+    u32(uint32_t(p.noise.size()));
+    for (const auto& n : p.noise) std::fwrite(&n, sizeof n, 1, f);
+    const auto& t = p.temporal;
+    i32(t.pre); i32(t.post); str(t.pre_spv); str(t.post_spv); str(t.post_grade_spv);
+    u32(t.pre_push_bytes); u32(t.seed_at); u32(t.noise_field_at);
+    std::fwrite(&t.blend_scale, 4, 1, f);
+    std::fwrite(&t.motion_without_depth, 1, 1, f);
+    const bool ok = std::ferror(f) == 0;
+    std::fclose(f);
+    return ok;
+}
+
 bool plan_d3d12_network(const std::string& root_in, uint32_t mw, uint32_t mh, bool allow_experimental, D3d12NetPlan* out,
                         std::string* why, int model_choice) {
     try {
@@ -3033,35 +3071,10 @@ bool plan_d3d12_network(const std::string& root_in, uint32_t mw, uint32_t mh, bo
         // The tail (noise field, records) at weights_end, as retarget puts it into the network memory.
         if (out->weights.size() < c.weights_end + c.tail.size()) out->weights.resize(c.weights_end + c.tail.size(), 0);
         if (!c.tail.empty()) std::memcpy(out->weights.data() + c.weights_end, c.tail.data(), c.tail.size());
-        // NR_DUMP_PLAN=<file>: the lowered plan as the offline harness reads it (NRPLAN02, the layout the test's
-        // file_planner takes), so a frame can be reproduced outside the game with a matching D3D12 runtime.
-        if (const char* want = std::getenv("NR_DUMP_PLAN"); want && *want) {
-            if (FILE* f = std::fopen(want, "wb")) {
-                auto u32 = [&](uint32_t v) { std::fwrite(&v, 4, 1, f); };
-                auto u64 = [&](uint64_t v) { std::fwrite(&v, 8, 1, f); };
-                auto i32 = [&](int32_t v) { std::fwrite(&v, 4, 1, f); };
-                auto str = [&](const std::string& v) { u64(v.size()); std::fwrite(v.data(), 1, v.size(), f); };
-                std::fwrite("NRPLAN02", 8, 1, f);
-                str(out->spv_dir); str(out->model); str(out->note);
-                u32(out->width); u32(out->height); u32(out->work_w); u32(out->work_h);
-                std::fwrite(&out->style_grade, 1, 1, f);
-                u64(out->act_total); u64(out->weights_end);
-                u64(out->weights.size()); std::fwrite(out->weights.data(), 1, out->weights.size(), f);
-                u32(uint32_t(out->disp.size()));
-                for (const auto& d : out->disp) {
-                    str(d.kern); u32(d.gx); u32(d.gy); u32(d.gz); i32(d.act_at);
-                    u64(d.push.size()); std::fwrite(d.push.data(), 1, d.push.size(), f);
-                }
-                u32(uint32_t(out->noise.size()));
-                for (const auto& n : out->noise) std::fwrite(&n, sizeof n, 1, f);
-                const auto& t = out->temporal;
-                i32(t.pre); i32(t.post); str(t.pre_spv); str(t.post_spv); str(t.post_grade_spv);
-                u32(t.pre_push_bytes); u32(t.seed_at); u32(t.noise_field_at);
-                std::fwrite(&t.blend_scale, 4, 1, f);
-                std::fwrite(&t.motion_without_depth, 1, 1, f);
-                std::fclose(f);
-            }
-        }
+        // The plan as the offline harness reads it (NRPLAN02, the layout the test's file_planner takes), written when the
+        // installation asked for it ([D3D12ASD] PlanDump -> set_plan_dump_path): a frame can then be reproduced outside
+        // the game with a matching D3D12 runtime.
+        if (!g_plan_dump.empty()) dump_d3d12_plan(*out, g_plan_dump.c_str());
         return true;
     } catch (const std::exception& e) {
         *why = e.what();

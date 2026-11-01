@@ -1065,21 +1065,13 @@ struct Stage::Impl {
     void ensure(ID3D12GraphicsCommandList* cmd, ID3D12Resource* r, D3D12_RESOURCE_STATES want) {
         if (!r) return;
         auto [it, fresh] = states.emplace(r, D3D12_RESOURCE_STATE_COMMON);
+        (void)fresh;
         if (it->second == want) return;
-        // COMMON promotes to every state the stage uses without a barrier; after that, real transitions.
-        if (fresh || it->second == D3D12_RESOURCE_STATE_COMMON) {
-            jlog("renodx ensure %p %u -> %u (no barrier: %s)", static_cast<void*>(r), static_cast<unsigned>(it->second),
-                 static_cast<unsigned>(want), fresh ? "new" : "COMMON");
-            it->second = want;
-            return;
-        }
-        D3D12_RESOURCE_BARRIER b{};
-        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        b.Transition.pResource = r;
-        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        b.Transition.StateBefore = it->second;
-        b.Transition.StateAfter = want;
-        cmd->ResourceBarrier(1, &b);
+        // No COMMON shortcut: D3D12 does not promote a *texture* out of COMMON. A resource this stage has just made
+        // is in COMMON, and its first read as an SRV or write as a UAV needs the transition - the debug layer calls
+        // the missing one a state mismatch, and the driver answers the list with DXGI_ERROR_INVALID_CALL. (Buffers
+        // may be used from any state, which is why the plain path never showed this.)
+        transition(cmd, r, it->second, want);   // journaled like every other barrier
         it->second = want;
     }
     void uav_barrier(ID3D12GraphicsCommandList* cmd) {

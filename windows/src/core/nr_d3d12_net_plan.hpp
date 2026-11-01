@@ -53,6 +53,12 @@ struct D3d12NetControls {
 // nr_runtime.cpp. The network for a `width` x `height` frame of the installation at `root` (the folder with
 // dlssnr-amd\ in it), the model as the Vulkan runtime picks it (DLSSNR_MODEL over dlssnr-amd.ini [Network] Model);
 // `experimental` false: CC_SMALL_FP8_EXPERIMENTAL is planned as CC_SMALL_FP8. False, and `why`: no network.
+// Where the next lowered plan is written (empty: nowhere). The .asi sets it from [D3D12ASD] PlanDump, so a frame can be
+// reproduced outside the game (nr_d3d12_asd_test renodx ... <plan>).
+void set_plan_dump_path(const char* path);
+// The plan in NRPLAN02 (the layout the test reads back). True when it was written whole.
+bool dump_d3d12_plan(const D3d12NetPlan& plan, const char* path);
+
 bool plan_d3d12_network(const std::string& root, uint32_t width, uint32_t height, bool experimental, D3d12NetPlan* out,
                         std::string* why, int model = -1);
 // The frame's controls into one dispatch's push block (Runtime::Impl::patch_push, the same code).

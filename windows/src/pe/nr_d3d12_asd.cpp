@@ -2,6 +2,7 @@
 // reader through d3d12.dll's D3D12GetInterface, and the game's own D3D12 device and queue.
 #include "nr_d3d12_asd.hpp"
 #include "nr_d3d12_capture.hpp"
+#include "nr_d3d12_net_plan.hpp"
 #include "nr_d3d12_asd_api.h"
 #include "nr_d3d12_asd_canary_blob.h"
 #include "nr_pe_d3d12split.hpp"
@@ -1080,8 +1081,10 @@ void start(HMODULE self, bool register_now) {
     g_dispatch_limit = static_cast<int>(GetPrivateProfileIntW(L"D3D12ASD", L"DispatchLimit", 0, g_ini.c_str()));
     // [D3D12ASD] PlanDump=<file>: the lowered plan, for reproducing a frame outside the game (nr_d3d12_asd_test
     // renodx ... <plan>). Set here so a run needs no environment of its own.
+    // No environment variable: the lowering is told directly (nr_runtime.cpp's set_plan_dump_path), so nothing depends
+    // on which copy of the environment a call happens to read.
     if (const std::wstring dump = ini_string(L"PlanDump", L""); !dump.empty())
-        SetEnvironmentVariableA("NR_DUMP_PLAN", utf8(dump).c_str());
+        nr::set_plan_dump_path(utf8(dump).c_str());
     g_sodb_name = ini_string(L"Sodb", g_sodb_name);
     g_psdb_name = ini_string(L"Psdb", g_psdb_name);
     g_family = ini_string(L"AdapterFamily", g_family);
