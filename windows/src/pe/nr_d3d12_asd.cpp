@@ -1,6 +1,7 @@
 // The native D3D12 ASD backend's registration and canary (nr_d3d12_asd.hpp). Public APIs only: D3DSCR and the SODB
 // reader through d3d12.dll's D3D12GetInterface, and the game's own D3D12 device and queue.
 #include "nr_d3d12_asd.hpp"
+#include "nr_d3d12_capture.hpp"
 #include "nr_d3d12_asd_api.h"
 #include "nr_d3d12_asd_canary_blob.h"
 #include "nr_pe_d3d12split.hpp"
@@ -26,6 +27,7 @@ using nr::pe::log;
 std::mutex g_lock;            // the strings below
 std::wstring g_folder, g_ini;
 bool g_enabled = false, g_register = true, g_tint = false;
+int g_dispatch_limit = 0;   // [D3D12ASD] DispatchLimit: record only the first N dispatches (0: all), to bisect a fault
 std::wstring g_sodb_name = L"dlssnr-amd-asd.sodb", g_psdb_name = L"dlssnr-amd-asd-gfx1201.psdb";
 std::wstring g_family = L"AMD_NAVI48:gfx1201";
 std::string g_registration = "not run", g_backend = "not run", g_network;
@@ -1058,6 +1060,7 @@ std::wstring ini_path() { return g_ini; }
 std::wstring sodb_path() { return g_folder + L"\\" + g_sodb_name; }
 std::wstring psdb_path() { return g_folder + L"\\" + g_psdb_name; }
 bool enabled() { return g_enabled; }
+int dispatch_limit() { return g_dispatch_limit; }
 bool debug_tint() { return g_tint; }
 Canary canary() { return Canary(g_canary.load()); }
 bool diagnostics_done() { return g_diag_done.load(); }
@@ -1074,11 +1077,15 @@ void start(HMODULE self, bool register_now) {
     g_enabled = GetPrivateProfileIntW(L"D3D12ASD", L"Enabled", 0, g_ini.c_str()) == 1;
     g_register = GetPrivateProfileIntW(L"D3D12ASD", L"Register", 1, g_ini.c_str()) != 0;
     g_tint = GetPrivateProfileIntW(L"D3D12ASD", L"DebugTint", 0, g_ini.c_str()) == 1;
+    g_dispatch_limit = static_cast<int>(GetPrivateProfileIntW(L"D3D12ASD", L"DispatchLimit", 0, g_ini.c_str()));
     g_sodb_name = ini_string(L"Sodb", g_sodb_name);
     g_psdb_name = ini_string(L"Psdb", g_psdb_name);
     g_family = ini_string(L"AdapterFamily", g_family);
     log("[asd] D3D12 ASD backend %s (%s: Enabled %d, Register %d)", g_enabled ? "on" : "off", utf8(g_ini).c_str(),
         g_enabled ? 1 : 0, g_register ? 1 : 0);
+    // The diagnostic capture has to be set up before anything makes a device (the debug layer and DRED are
+    // process-wide and only apply to devices made afterwards): this runs from InitializeASI, under the loader lock.
+    if (g_enabled) capture::start(utf8(here), GetPrivateProfileIntW(L"D3D12ASD", L"Capture", 1, g_ini.c_str()) != 0);
     if (!g_enabled || !register_now) return;
     if (!g_register) { set_registration("not registered: Register = 0 (NR Control's Unregister)"); return; }
     // Under the loader lock here: the thread runs once OptiScaler's DllMain has returned (as the watchdog's).

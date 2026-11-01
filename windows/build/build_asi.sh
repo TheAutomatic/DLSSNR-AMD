@@ -72,6 +72,7 @@ glslang=${NR_GLSLANG:-toolchain/glslang/bin/glslang}
 "$cxx" "${common[@]}" -c windows/src/pe/nr_d3d12_asd_backend.cpp -o "$out/d3d12_asd_backend.o"
 "$cxx" "${common[@]}" -c windows/src/pe/nr_renodx_d3d12.cpp -o "$out/renodx_d3d12.o"
 "$cxx" "${common[@]}" -c windows/src/pe/nr_d3d12_asd_net.cpp -o "$out/d3d12_asd_net.o"
+"$cxx" "${common[@]}" -c windows/src/pe/nr_d3d12_capture.cpp -o "$out/d3d12_capture.o"
 "$cxx" "${common[@]}" -I"$imgui" -Iwindows/src/ui -c windows/src/pe/nr_d3d12_asd_panel.cpp -o "$out/d3d12_asd_panel.o"
 for unit in imgui imgui_draw imgui_tables imgui_widgets imgui_impl_dx11 imgui_impl_vulkan; do
     "$cxx" -std=c++17 -O2 -DNDEBUG -Itoolchain/Vulkan-Headers/include -I"$imgui" -c "$imgui/$unit.cpp" -o "$out/im_$unit.o"
@@ -86,7 +87,7 @@ done
 "$cxx" -std=c++17 -O2 -DNDEBUG -municode windows/src/pe/nr_present_probe.cpp -o "$out/nr_present_probe.exe" \
     -ldxgi -static -static-libgcc -static-libstdc++
 
-objs=("$out/asi_main.o" "$out/d3d12_asd.o" "$out/d3d12_asd_backend.o" "$out/d3d12_asd_net.o" "$out/d3d12_asd_panel.o" "$out/asi_wilsjo2.o" "$out/asi_wilsjo2_vk.o" "$out/nr_wilsjo2.o" "$out/asi_hudcap.o" "$out/menu.o" "$out/renodx_d3d12.o"
+objs=("$out/asi_main.o" "$out/d3d12_asd.o" "$out/d3d12_asd_backend.o" "$out/d3d12_asd_net.o" "$out/d3d12_capture.o" "$out/d3d12_asd_panel.o" "$out/asi_wilsjo2.o" "$out/asi_wilsjo2_vk.o" "$out/nr_wilsjo2.o" "$out/asi_hudcap.o" "$out/menu.o" "$out/renodx_d3d12.o"
       "$out"/im_*.o "$out/model.o" "$out/session.o" "$out/bridge.o" "$out/d3d12split.o" "$out/config.o" "$out/interop.o"
       "$out/vram_ledger.o" "$out/log.o" "$out/crash.o" "$out/vkdevice.o" "$out/nr_runtime.o" "$out/nr_native_plan.o"
       "$out/nr_renodx.o" "$out/renodx_route.o" "$out/control.o" "$out/screenshot.o" "$out"/mh_*.o)

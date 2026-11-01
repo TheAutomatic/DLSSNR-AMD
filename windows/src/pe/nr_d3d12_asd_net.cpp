@@ -12,6 +12,7 @@
 //   - the alpha pass is HLSL on the linear buffers (runtime_alpha.comp's arithmetic);
 //   - the temporal params buffer travels with the frame's tables (one upload, one copy).
 #include "nr_d3d12_asd_net.hpp"
+#include "nr_d3d12_capture.hpp"
 #include "nr_d3d12_asd.hpp"
 #include "nr_ini_network.hpp"
 #include "nr_pe_log.hpp"
@@ -386,6 +387,21 @@ std::shared_ptr<Built> build(ID3D12Device* device, const Carriers& carriers, ID3
     if (!b->act || !b->wgt || !b->wgt_upload || !b->surf1 || !b->depth || !b->table) {
         *why = "the network memory could not be made"; return nullptr;
     }
+    capture::name(b->act, L"nr:act");
+    capture::name(b->wgt, L"nr:wgt");
+    capture::name(b->wgt_upload, L"nr:wgt_upload");
+    capture::name(b->surf1, L"nr:surf1");
+    capture::name(b->depth, L"nr:depth");
+    capture::name(b->table, L"nr:table");
+    capture::name(b->done, L"nr:done");
+    capture::name(b->exec_token, L"nr:exec_token");
+    {
+        char line[256];
+        std::snprintf(line, sizeof line, "network %s %ux%u (working %ux%u), %zu dispatches, %zu kernels, weights %llu B, arena %llu B",
+                      b->plan.model.c_str(), w, h, b->plan.work_w, b->plan.work_h, b->plan.disp.size(), b->kern.size(),
+                      static_cast<unsigned long long>(wbytes), static_cast<unsigned long long>(b->plan.act_total));
+        capture::note("network", line);
+    }
     for (ID3D12Resource* r : {b->act, b->wgt, b->surf1, b->depth, b->table})
         if ((r->GetGPUVirtualAddress() >> 48) != 0) { *why = "a buffer address above 48 bits"; return nullptr; }
     {
@@ -707,6 +723,11 @@ public:
         // The parameters are all the sequence reads from it, so a later dispatch of the same frame does not
         // keep the slot held: only the record that reads it does.
         const uint64_t frame = frames_;
+        // Diagnostics: a PIX marker per dispatch (DRED's breadcrumbs keep the last one reached), the schedule of the
+        // first frames in the run folder, and an optional limit for bisecting which dispatch faults.
+        const bool diag = capture::on();
+        const bool sched = diag && frame < 3;
+        const uint32_t limit = uint32_t(std::max(0, asd::dispatch_limit()));
         b->refresh_copied(frame);
         // This record's execution token, into a slot whose previous holder the GPU has executed. A stack of many
         // passes records that many frames into one still-unsubmitted list, so the block grows when the CPU has
@@ -836,7 +857,26 @@ public:
             } else {
                 k = &b->kern.at(d.kern);
             }
+            if (limit && i >= limit) break;
             table(base + uint32_t(i), *k, d.push, d.gx, d.gy, d.gz);
+            if (diag) {
+                wchar_t mark[128];
+                std::swprintf(mark, 128, L"NR: ACO %hs [%zu]", d.kern.c_str(), i);
+                capture::mark(cmd, mark);
+            }
+            if (sched) {
+                char push_hex[3 * 96 + 1] = {};
+                const size_t pn = std::min<size_t>(d.push.size(), 96);
+                for (size_t p = 0; p < pn; ++p)
+                    std::snprintf(push_hex + p * 3, 4, "%02x ", static_cast<unsigned char>(d.push[p]));
+                char line[640];
+                std::snprintf(line, sizeof line,
+                              "frame %llu dispatch %zu %s grid %ux%ux%u push[%zu] %s| in 0x%llX out 0x%llX act 0x%llX wgt 0x%llX",
+                              static_cast<unsigned long long>(frame), i, d.kern.c_str(), d.gx, d.gy, d.gz, d.push.size(),
+                              push_hex, static_cast<unsigned long long>(in.va), static_cast<unsigned long long>(out.va),
+                              static_cast<unsigned long long>(act_va), static_cast<unsigned long long>(wgt_va));
+                capture::schedule(line);
+            }
         }
         {
             // params[12] (record_all): the gate, MVecScale, the history weight, the history's extent, depth flags, and the
@@ -870,6 +910,7 @@ public:
         if (stamps_map_) cmd->EndQuery(queries_, D3D12_QUERY_TYPE_TIMESTAMP, ts * 2);
 
         // record: every dispatch in plan order, a barrier after each.
+        if (diag) capture::mark(cmd, L"NR: ACO network");
         cmd->SetComputeRootSignature(rs_);
         for (uint32_t i = lo; i < b->tables; ++i) {
             const Built::Kern& k = *kern[i];
@@ -892,7 +933,12 @@ public:
             retire_upload_.push_back(std::move(r));
             b->wgt_upload = nullptr;
         }
+        if (diag) capture::mark(cmd, limit ? L"NR: alpha (skipped: DispatchLimit)" : L"NR: alpha");
         // The alpha pass (runtime_alpha.comp): NR_POST_ALPHA is 0, so the post block left the alpha to it.
+        if (limit) {   // bisecting: the frame stays as the network left it
+            ++frames_;
+            return true;
+        }
         const UINT c[4] = {b->w, b->h, controls_.round_u8 ? 1u : 0u, 0u};
         cmd->SetComputeRootSignature(alpha_rs_);
         cmd->SetPipelineState(alpha_pso_);

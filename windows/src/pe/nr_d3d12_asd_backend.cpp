@@ -2,6 +2,7 @@
 // the game's command list. Everything that can fail is checked before the first command is recorded, so a false
 // return leaves the list as it came and the 0.0.8.1 path runs the frame.
 #include "nr_d3d12_asd_backend.hpp"
+#include "nr_d3d12_capture.hpp"
 #include "nr_d3d12_asd.hpp"
 #include "nr_d3d12_asd_net.hpp"
 #include "nr_pe_d3d12split.hpp"
@@ -1053,8 +1054,12 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
         drop_device();
         f.device->AddRef();
         g.device = f.device;
+        capture::adopt(f.device);
         if (!build(f.device, &why)) { g.broken = true; g.broken_why = why; }
     }
+    // Whatever the debug layer said since the last frame: drained here so the first error is in the log before a
+    // game that dies on the GPU takes the rest of the run with it.
+    capture::drain();
     if (g.broken) return fallback(g.broken_why);
 
     if (renodx) return renodx_frame(f, color_state, output_state);

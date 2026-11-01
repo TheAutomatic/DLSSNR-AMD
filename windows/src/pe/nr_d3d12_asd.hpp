@@ -33,6 +33,9 @@ void start(HMODULE self);
 void start(HMODULE self, bool register_now);   // tools: false reads the ini only
 // [D3D12ASD] Enabled as read at start.
 bool enabled();
+// [D3D12ASD] DispatchLimit: only the first N dispatches of a frame are recorded (0: all). For bisecting a fault: a
+// build that survives N but not N+1 names the dispatch that kills it.
+int dispatch_limit();
 // The game's device, from the evaluate (every call; the first one starts the canary on a thread of ours).
 void on_device(ID3D12Device* device);
 Canary canary();

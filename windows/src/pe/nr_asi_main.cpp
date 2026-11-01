@@ -33,6 +33,7 @@
 #include "MinHook.h"
 #include "nr_d3d12_asd.hpp"
 #include "nr_d3d12_asd_backend.hpp"
+#include "nr_d3d12_capture.hpp"
 #include "nr_d3d12_asd_net.hpp"
 #include "nr_asi_wilsjo2.hpp"
 #include "nr_device_features.hpp"
@@ -3174,11 +3175,14 @@ void start_heartbeat() {
             Sleep(200);
             // A removed device is the only trace a game that dies without an exception leaves: poll it while the
             // heartbeat runs (the first frames, when a new route's first dispatches go in).
+            nr::pe::capture::drain();
             if (removed == S_OK) {
                 removed = nr::pe::asd::device_removed_reason();
-                if (FAILED(removed))
+                if (FAILED(removed)) {
                     log("[nr] the D3D12 device was removed (0x%08lX): the frame's commands failed on the GPU, or the "
                         "driver gave up on them", static_cast<unsigned long>(removed));
+                    nr::pe::capture::device_removed(removed);   // breadcrumbs, page faults, a minidump: written now
+                }
             }
             log("[nr] heartbeat %llu ms: %llu presents, network build stage %d (%u of %u pipelines); in NR's code: %s",
                 static_cast<unsigned long long>(GetTickCount64() - t0), nr::pe::watchdog::presents_seen(),
