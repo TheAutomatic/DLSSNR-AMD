@@ -219,3 +219,18 @@ RGB=0、alpha=1，正好是这个行为，而不是"DXIL 编译的网络"。因�
 的输出区"的代码，并知道每个 dispatch 的输出 offset/字节数（计划 push 里的 `o_off`/`x_off`）。
 
 本轮**没有**产出这四处 dump，也没有据此的修复；不把已定位当已完成。
+
+## 首个不一致边界（实测，逐字节）
+
+| 边界 | ASD vs 参考 | 证据 |
+|---|---|---|
+| 噪声场 `wgt[off*4, +3840*2176*8)` | **逐字节相同**（66,846,720 B，sha256 `07e23073c3690247…`） | `netdump/asd_noise.bin` / `vulkan_noise.bin` |
+| temporal_pre 之后 `act[0, 64 MiB)` | **逐字节相同**（67,108,864 B，sha256 `3b6a07d0d404fab4…`） | `asd_pre.bin` / `vulkan_pre.bin` |
+| 权重块 `wgt[0, weights_end)` | **逐字节相同**（115,736,784 B，sha256 `da0f18be1ae5fcbb…`） | `asd_wgt.bin` / `vulkan_wgt.bin` |
+| 首个 `fswin32nh` 之后 `act[0, 64 MiB)` | **不同**：49,371,484 / 67,108,864 B 不同（73.57%），首字节即不同 | `asd_kern.bin` / `ref/vulkan_kern.bin` |
+
+两条路线的该 dispatch：同一索引（1）、同 grid `240x136x1`、**同 push 84 字节**（`00 00 d0 2f 00 00 00 00 00 92 …`）。
+
+因此：输入（pre）、权重、参数、网格、索引都相同，**首个 fswin 的输出就已经不同**——剩余变量是各自使用的
+ACO 机器码（ASD 的 `public-copy.psdb` vs 参考安装树的 `aco/records`）。下一步比较两者为 `fswin32nh` 装载的
+ELF（记录文件/PSDB 内容），而不是再比下游。

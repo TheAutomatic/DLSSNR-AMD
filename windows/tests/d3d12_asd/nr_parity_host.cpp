@@ -292,6 +292,9 @@ int main(int argc, char** argv) {
         (void)scc;
         // The noise field the pre block reads, from the same region the D3D12 route dumps (wgt at noise[0].off*4).
         if (std::getenv("NR_RUNTIME_NOISE_DUMP")) rt.capture_noise();
+        if (std::getenv("NR_RUNTIME_PRE_DUMP")) rt.capture_pre();
+        if (std::getenv("NR_RUNTIME_KERN_DUMP")) rt.capture_kernel();
+        if (std::getenv("NR_RUNTIME_WGT_DUMP")) rt.capture_weights();
         nr::renodx::Stage stage(host, sc);
         // The stage's own network boundary, for a comparison with the D3D12 route's capture (RGBA16F, W*H*8).
         VkBuffer bproxy{}, bneural{};
@@ -419,6 +422,24 @@ int main(int argc, char** argv) {
                     }
                 }
             }
+        }
+        if (const char* wd = std::getenv("NR_RUNTIME_WGT_DUMP"); wd && wd[0]) {
+            std::string cw;
+            const std::string path = std::string(wd) + "\\vulkan_wgt.bin";
+            const bool wrote = rt.write_weights_capture(path, &cw);
+            std::printf("weights capture %s (%s)\n", wrote ? "written" : "FAILED", cw.c_str());
+        }
+        if (const char* kd = std::getenv("NR_RUNTIME_KERN_DUMP"); kd && kd[0]) {
+            std::string cw;
+            const std::string path = std::string(argv[4]) + "\\vulkan_kern.bin";
+            const bool wrote = rt.write_kernel_capture(path, &cw);
+            std::printf("kernel capture %s (%s)\n", wrote ? "written" : "FAILED", cw.c_str());
+        }
+        if (const char* pd = std::getenv("NR_RUNTIME_PRE_DUMP"); pd && pd[0]) {
+            std::string cw;
+            const std::string path = std::string(pd) + "\\vulkan_pre.bin";
+            const bool wrote = rt.write_pre_capture(path, &cw);
+            std::printf("pre capture %s (%s)\n", wrote ? "written" : "FAILED", cw.c_str());
         }
         if (const char* nd = std::getenv("NR_RUNTIME_NOISE_DUMP"); nd && nd[0]) {
             std::string cw;

@@ -435,7 +435,16 @@ public:
     // Debug: copy the plan's precomputed noise field (wgt at noise[0].off*4, width*height*8 bytes) once, from the
     // next recording; write_noise_capture after the GPU has run that recording writes it out.
     void capture_noise();
+    // Debug: the activation arena's first 64 MiB after the temporal pre block, as the D3D12 route dumps it.
+    void capture_pre();
+    // Debug: the act prefix after the first dispatch whose plan name is NR_RUNTIME_KERN_DUMP.
+    void capture_kernel();
+    // Debug: the weight blob [0, weights_end) the network runs with.
+    void capture_weights();
     bool write_noise_capture(const std::string& path, std::string* why);
+    bool write_pre_capture(const std::string& path, std::string* why);
+    bool write_kernel_capture(const std::string& path, std::string* why);
+    bool write_weights_capture(const std::string& path, std::string* why);
 
     // The same, for a frame the caller has a Reset flag for (DLSSNR.Reset): with Controls::noise_every_frame the
     // seed starts again from 0 on it, as the DLL's counter does.

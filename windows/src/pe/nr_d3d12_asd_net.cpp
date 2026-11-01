@@ -219,6 +219,20 @@ struct Built {
     Kern t_pre, t_post, t_grade;                  // the temporal pre / post (t_grade.pso null: no Style grade)
     ID3D12Resource *act = nullptr, *wgt = nullptr, *wgt_upload = nullptr, *surf1 = nullptr, *depth = nullptr;
     ID3D12Resource* table = nullptr;
+    // Debug: the noise field the plan precomputes into wgt's tail (readback, filled on the first frame).
+    ID3D12Resource* noise_dump = nullptr;
+    // Debug: the activation arena's fixed prefix after the temporal pre block (a layout-free comparison).
+    ID3D12Resource* pre_dump = nullptr;
+    uint64_t pre_dump_bytes = 0;
+    bool pre_dump_written = false;
+    ID3D12Resource* wgt_dump = nullptr;   // the weight blob [0, weights_end) (N_R_NET_WGT_DUMP)
+    uint64_t wgt_dump_bytes = 0;
+    bool wgt_dump_written = false;
+    ID3D12Resource* kern_dump = nullptr;   // the act prefix after the first named kernel (NR_NET_KERN_DUMP)
+    uint64_t kern_dump_bytes = 0;
+    bool kern_dump_written = false;
+    uint64_t noise_dump_bytes = 0;
+    bool noise_dump_written = false;
     // The upload slots: ring buffers of kRing slots each, grown while every slot of every buffer is still held.
     // A slot is written by the CPU and read by the CopyBufferRegion of the same record(); its last 8 bytes carry
     // the record's frame number, and a second recorded copy lands that number in `copy_map`. A slot is handed
@@ -461,6 +475,70 @@ public:
         if (device_) device_->Release();
     }
     const char* name() const override { return name_.c_str(); }
+
+    bool write_capture(const std::string& dir, std::string* why) override {
+        for (auto& [key, b] : nets_) {
+            if (!b || !b->noise_dump || !b->noise_dump_written) continue;
+            void* m = nullptr;
+            if (FAILED(b->noise_dump->Map(0, nullptr, &m)) || !m) { *why = "the noise capture could not be mapped"; return false; }
+            if (b->pre_dump && b->pre_dump_written) {
+                void* pm = nullptr;
+                if (SUCCEEDED(b->pre_dump->Map(0, nullptr, &pm)) && pm) {
+                    const std::string ppath = dir + "\\asd_pre.bin";
+                    if (FILE* pf = std::fopen(ppath.c_str(), "wb")) {
+                        std::fwrite(pm, 1, size_t(b->pre_dump_bytes), pf);
+                        std::fclose(pf);
+                        char msg[192];
+                        std::snprintf(msg, sizeof msg, "pre dump written: %s (%llu bytes)", ppath.c_str(),
+                                      static_cast<unsigned long long>(b->pre_dump_bytes));
+                        capture::schedule(msg);
+                    }
+                    b->pre_dump->Unmap(0, nullptr);
+                }
+            }
+            if (b->wgt_dump && b->wgt_dump_written) {
+                void* wm = nullptr;
+                if (SUCCEEDED(b->wgt_dump->Map(0, nullptr, &wm)) && wm) {
+                    const std::string wpath = dir + "\\asd_wgt.bin";
+                    if (FILE* wf = std::fopen(wpath.c_str(), "wb")) {
+                        std::fwrite(wm, 1, size_t(b->wgt_dump_bytes), wf);
+                        std::fclose(wf);
+                    }
+                    b->wgt_dump->Unmap(0, nullptr);
+                }
+            }
+            if (b->kern_dump && b->kern_dump_written) {
+                void* km = nullptr;
+                if (SUCCEEDED(b->kern_dump->Map(0, nullptr, &km)) && km) {
+                    const std::string kpath = dir + "\\asd_kern.bin";
+                    if (FILE* kf = std::fopen(kpath.c_str(), "wb")) {
+                        std::fwrite(km, 1, size_t(b->kern_dump_bytes), kf);
+                        std::fclose(kf);
+                    }
+                    b->kern_dump->Unmap(0, nullptr);
+                }
+            }
+            const std::string path = dir + "\\asd_noise.bin";
+            FILE* f = std::fopen(path.c_str(), "wb");
+            const bool ok = f && std::fwrite(m, 1, size_t(b->noise_dump_bytes), f) == size_t(b->noise_dump_bytes);
+            if (f) std::fclose(f);
+            b->noise_dump->Unmap(0, nullptr);
+            if (!ok) { *why = "the noise capture could not be written"; return false; }
+            const auto& j = b->plan.noise[0];
+            FILE* meta = std::fopen((dir + "\\asd_noise.txt").c_str(), "w");
+            if (meta) {
+                std::fprintf(meta, "file=%s\ndtype=f16x4\noff=%u\nsize=%llu\nwidth=%u\nheight=%u\nseed=%u\nnoise=%g\n"
+                                   "weights_end=%llu\nact_total=%llu\n",
+                             path.c_str(), j.off, static_cast<unsigned long long>(b->noise_dump_bytes), j.width, j.height,
+                             j.seed, double(j.noise), static_cast<unsigned long long>(b->plan.weights_end),
+                             static_cast<unsigned long long>(b->plan.act_total));
+                std::fclose(meta);
+            }
+            return true;
+        }
+        *why = "no capture was recorded (NR_NET_NOISE_DUMP unset or no noise job)";
+        return false;
+    }
 
     bool create(ID3D12Device* device, const char** why) override {
         static std::string w;
@@ -928,6 +1006,76 @@ public:
         if (diag) capture::mark(cmd, L"NR: ACO network");
         cmd->SetComputeRootSignature(rs_);
         // With DispatchLimit only the first ones have a table and a kernel: the loop stops where they stop.
+        if (!b->noise_dump && !b->plan.noise.empty() && std::getenv("NR_NET_NOISE_DUMP")) {
+            const auto& j = b->plan.noise[0];
+            uint64_t nbytes = uint64_t(j.width) * j.height * 8;
+            const uint64_t from = uint64_t(j.off) * 4; // NoiseJob::off is an absolute uint32 index in wgt.
+            const uint64_t have = b->wgt->GetDesc().Width;
+            if (from > have || nbytes > have - from) {
+                *why = "noise capture region is outside the weight buffer";
+                return false;
+            }
+            char msg[192];
+            std::snprintf(msg, sizeof msg, "noise dump: wgt %llu bytes, region %llu+%llu (%ux%u)",
+                          static_cast<unsigned long long>(have), static_cast<unsigned long long>(from),
+                          static_cast<unsigned long long>(nbytes), j.width, j.height);
+            capture::schedule(msg);
+            D3D12_HEAP_PROPERTIES hp{};
+            hp.Type = D3D12_HEAP_TYPE_READBACK;
+            D3D12_RESOURCE_DESC rd{};
+            rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            rd.Width = nbytes; rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+            rd.SampleDesc.Count = 1; rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            if (SUCCEEDED(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                           nullptr, IID_PPV_ARGS(&b->noise_dump))) && b->noise_dump) {
+                b->noise_dump_bytes = nbytes;
+            }
+        }
+        if (!b->wgt_dump && std::getenv("NR_NET_WGT_DUMP") && b->wgt && b->plan.weights_end) {
+            const uint64_t nbytes = b->plan.weights_end;
+            D3D12_HEAP_PROPERTIES hp{};
+            hp.Type = D3D12_HEAP_TYPE_READBACK;
+            D3D12_RESOURCE_DESC rd{};
+            rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            rd.Width = nbytes; rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+            rd.SampleDesc.Count = 1; rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            if (SUCCEEDED(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                           nullptr, IID_PPV_ARGS(&b->wgt_dump))) && b->wgt_dump) {
+                b->wgt_dump_bytes = nbytes;
+                transition(cmd, b->wgt, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                cmd->CopyBufferRegion(b->wgt_dump, 0, b->wgt, 0, nbytes);
+                transition(cmd, b->wgt, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                b->wgt_dump_written = true;
+            }
+        }
+        if (!b->kern_dump && std::getenv("NR_NET_KERN_DUMP") && b->act) {
+            const uint64_t nbytes = std::min<uint64_t>(64ull << 20, b->act->GetDesc().Width);
+            D3D12_HEAP_PROPERTIES hp{};
+            hp.Type = D3D12_HEAP_TYPE_READBACK;
+            D3D12_RESOURCE_DESC rd{};
+            rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            rd.Width = nbytes; rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+            rd.SampleDesc.Count = 1; rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            if (SUCCEEDED(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                           nullptr, IID_PPV_ARGS(&b->kern_dump))) && b->kern_dump)
+                b->kern_dump_bytes = nbytes;
+        }
+        if (!b->pre_dump && std::getenv("NR_NET_PRE_DUMP") && b->act) {
+            const uint64_t nbytes = std::min<uint64_t>(64ull << 20, b->act->GetDesc().Width);
+            D3D12_HEAP_PROPERTIES hp{};
+            hp.Type = D3D12_HEAP_TYPE_READBACK;
+            D3D12_RESOURCE_DESC rd{};
+            rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            rd.Width = nbytes; rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+            rd.SampleDesc.Count = 1; rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            if (SUCCEEDED(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                           nullptr, IID_PPV_ARGS(&b->pre_dump))) && b->pre_dump) {
+                b->pre_dump_bytes = nbytes;
+                char msg[128];
+                std::snprintf(msg, sizeof msg, "pre dump: act prefix %llu bytes", static_cast<unsigned long long>(nbytes));
+                capture::schedule(msg);
+            }
+        }
         const uint32_t hi = limit ? std::min<uint32_t>(b->tables, base + limit) : b->tables;
         for (uint32_t i = lo; i < hi; ++i) {
             const Built::Kern& k = *kern[i];
@@ -951,6 +1099,31 @@ public:
             cmd->SetComputeRootUnorderedAccessView(1, table_va + uint64_t(i) * kTableBytes);
             cmd->Dispatch(grid[0], grid[1], grid[2]);
             uav_barrier(cmd);
+            if (b->kern_dump && !b->kern_dump_written && b->act) {
+                const char* want = std::getenv("NR_NET_KERN_DUMP");
+                const char* knm = "temporal";
+                for (const auto& [nm, kk] : b->kern) if (&kk == &k) { knm = nm.c_str(); break; }
+                if (want && want[0] && std::strcmp(knm, want) == 0) {
+                    transition(cmd, b->act, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    cmd->CopyBufferRegion(b->kern_dump, 0, b->act, 0, b->kern_dump_bytes);
+                    transition(cmd, b->act, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                    b->kern_dump_written = true;
+                }
+            }
+            if (b->pre_dump && !b->pre_dump_written && int(i) == tp.pre && b->act) {
+                transition(cmd, b->act, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                cmd->CopyBufferRegion(b->pre_dump, 0, b->act, 0, b->pre_dump_bytes);
+                transition(cmd, b->act, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                b->pre_dump_written = true;
+            }
+        }
+        // Debug capture: the precomputed noise field, as the noise kernel left it in wgt's tail.
+        if (b->noise_dump && !b->noise_dump_written) {
+            transition(cmd, b->wgt, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            cmd->CopyBufferRegion(b->noise_dump, 0, b->wgt, uint64_t(b->plan.noise[0].off) * 4,
+                                  b->noise_dump_bytes);
+            transition(cmd, b->wgt, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            b->noise_dump_written = true;
         }
         if (first) {
             b->retargeted = true;
