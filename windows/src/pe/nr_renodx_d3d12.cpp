@@ -6,6 +6,7 @@
 // values"); the network runs between the encode and the resolve through the backend's ASD network over linear
 // buffers, its guides resampled onto the network's extent (to_motion / to_depth, the frame path's own shaders).
 #include "nr_renodx_d3d12.hpp"
+#include "renodx/codec_gain.hpp"   // the codec's divisors and anchors (dlssnr.hpp's, as nr_renodx.cpp includes it)
 namespace nr::asi::native {
 #include "nr_fast_shaders.hpp"   // kFastShaders: the Passes (fast) programs, shared with the wilsjo2 stage
 }
@@ -501,7 +502,8 @@ struct FolderInclude final : ID3DInclude {
     STDMETHOD(Close)(LPCVOID data) override { delete[] static_cast<const char*>(data); return S_OK; }
 };
 
-ID3DBlob* compile_hlsl(const char* source, size_t bytes, const char* entry, std::string* why, FolderInclude* inc) {
+ID3DBlob* compile_hlsl(const char* source, size_t bytes, const char* entry, std::string* why, FolderInclude* inc,
+                       const D3D_SHADER_MACRO* macros = nullptr) {
     using PFN = HRESULT(WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO*, ID3DInclude*, LPCSTR, LPCSTR,
                                  UINT, UINT, ID3DBlob**, ID3DBlob**);
     static PFN fn = [] {
@@ -510,7 +512,7 @@ ID3DBlob* compile_hlsl(const char* source, size_t bytes, const char* entry, std:
     }();
     if (!fn) { *why = "d3dcompiler_47.dll (D3DCompile) is not available"; return nullptr; }
     ID3DBlob *code = nullptr, *errors = nullptr;
-    const HRESULT hr = fn(source, bytes, entry, nullptr, inc, entry, "cs_5_1", 1u << 15, 0, &code, &errors);
+    const HRESULT hr = fn(source, bytes, entry, macros, inc, entry, "cs_5_1", 1u << 15, 0, &code, &errors);
     if (FAILED(hr) || !code) {
         *why = std::string("the ") + entry + " shader did not compile";
         if (errors) { *why += ": "; *why += static_cast<const char*>(errors->GetBufferPointer()); }
@@ -745,6 +747,249 @@ uint64_t stack_feature(uint64_t feature, uint32_t k) {
 }
 constexpr uint64_t kUnnamedStack = 0xFFFFFFu;
 
+// ---- RenoDX host logic for the v6 codec (nr_renodx.cpp, verbatim where it decides what the shaders are given) ----
+namespace codec = ::renodx::dlss5::codec;
+
+codec::SourceUnits interpret_source_units(const Settings& s, uint8_t hdr_mode) {
+    codec::SourceUnits units;
+    uint8_t choice = 0;
+    if (s.source_encoding != 0u) choice = uint8_t(s.source_encoding);
+    else if (hdr_mode == 2u) choice = 3u;
+    else if (hdr_mode == 1u) choice = 2u;
+    switch (choice) {
+        case 1u: units.encoding = codec::Encoding::Sdr; break;
+        case 2u: units.encoding = codec::Encoding::Linear; break;
+        case 3u: units.encoding = codec::Encoding::Pq; units.absolute = true; units.unit_nits = 10000.f; break;
+        default: units.encoding = codec::Encoding::Linear; break;
+    }
+    if (units.encoding == codec::Encoding::Linear && s.linear_unit_nits > 0.f) {
+        units.absolute = true;
+        units.unit_nits = s.linear_unit_nits;
+    }
+    return units;
+}
+
+uint32_t v6_encoding_constant(const codec::SourceUnits& u) {
+    switch (u.encoding) {
+        case codec::Encoding::Pq: return u.bt2020 ? 4u : 2u;
+        case codec::Encoding::Sdr: return 3u;
+        default: return 1u;
+    }
+}
+
+float v6_dark_gate(const codec::SourceUnits& u) {
+    return u.absolute && u.unit_nits > 0.f ? 1.f / u.unit_nits : 0.005f;
+}
+
+bool frame_display_codec(const Settings& s, uint8_t hdr_mode, const codec::SourceUnits& u) {
+    if (hdr_mode == 0) return false;
+    if (s.codec_mode == 3u) return true;
+    if (s.codec_mode == 2u) return !(u.absolute && u.unit_nits > 0.f);
+    return false;
+}
+
+bool frame_pedestal_removal(const Settings& s, uint8_t hdr_mode, const codec::SourceUnits& u) {
+    if (!frame_display_codec(s, hdr_mode, u)) return true;
+    if (s.display_pedestal == 1u) return true;
+    return u.absolute && u.unit_nits > 0.f;
+}
+
+float frame_codec_divisor(const Settings& s, uint8_t hdr_mode, const codec::SourceUnits& u) {
+    if (hdr_mode == 0) return 1.f;
+    if (!u.absolute || !(u.unit_nits > 0.f)) return 0.f;
+    if (frame_display_codec(s, hdr_mode, u))
+        return codec::DisplayAnchorLinear(u, s.proxy_anchor_nits, s.diffuse_white_nits);
+    if (s.codec_mode == 1u) return codec::AnchoredDivisor(s.proxy_anchor_nits, u);
+    return u.encoding == codec::Encoding::Pq
+        ? codec::ClassicPqDivisor(s.diffuse_white_nits, s.paper_white_scale, s.pq_calibration)
+        : codec::ClassicLinearDivisor(s.paper_white_scale);
+}
+
+// The frame's snapshots (ProcessInline): one divisor, encoding, gate and cap.
+struct Frame6 {
+    uint8_t hdr_mode{};
+    codec::SourceUnits units;
+    float divisor{}, cap{}, gate{};
+    uint32_t encoding{};
+};
+
+// cbuffer CodecConstants of v6_common.hlsli (V6CodecConstants).
+struct V6Constants {
+    uint32_t width, height, source_width, source_height, source_base_x, source_base_y;
+    uint32_t proxy_width, proxy_height, neural_width, neural_height;
+    float divisor, pedestal_cap, transfer_strength, color_strength;
+    uint32_t encoding;
+    float dark_gate;
+    uint32_t curve;
+    float pedestal_gate, slew_stops, snap_now, chroma_clamp_stops, release_stops;
+    uint32_t governor_mode, transfer_mode;
+    float highlight_guard_stops;
+    uint32_t dark_gate_mode;
+    uint32_t padding[2];
+};
+static_assert(sizeof(V6Constants) == 28 * 4);
+// The _prep builds' cbuffer (v6_common.hlsli under NR_PREP_RESOLVE): dwords 26 / 27 carry [Preprocess]'s curve
+// and its input scale, then its contrast and saturation.
+struct V6PrepConstants {
+    V6Constants v;
+    float contrast, saturation;
+    float floor;   // prep_floor()
+};
+static_assert(sizeof(V6PrepConstants) == 31 * 4);
+
+V6Constants make_v6(const Settings& s, const Frame6& f, uint32_t w, uint32_t h, uint32_t sw, uint32_t sh,
+                    uint32_t pw, uint32_t ph, uint32_t nw, uint32_t nh, float transfer, float color, float chroma,
+                    bool ratio_resolve = false) {
+    V6Constants c{};
+    c.width = w; c.height = h; c.source_width = sw; c.source_height = sh;
+    c.proxy_width = pw; c.proxy_height = ph; c.neural_width = nw; c.neural_height = nh;
+    c.divisor = f.divisor; c.pedestal_cap = f.cap;
+    c.transfer_strength = transfer; c.color_strength = color;
+    c.encoding = f.encoding; c.dark_gate = f.gate;
+    c.curve = ratio_resolve || frame_display_codec(s, f.hdr_mode, f.units) ? 1u : s.neural_floor_guard ? 2u : 0u;
+    c.pedestal_gate = frame_pedestal_removal(s, f.hdr_mode, f.units) ? 1.f : 0.f;
+    c.chroma_clamp_stops = chroma;
+    c.transfer_mode = s.transfer_mode;
+    c.highlight_guard_stops = s.style_highlight_guard;
+    c.dark_gate_mode = s.display_pedestal;
+    return c;
+}
+
+// PrepBackward(float3(1/1024)).y of prep_resolve.hlsli on the CPU: the resolve's floor behind [Preprocess]'s curve,
+// the same for every pixel (nr_renodx.cpp's prep_floor, verbatim).
+float prep_floor(uint32_t curve, float k, float contrast, float saturation) {
+    const float y = 1.0f / 1024.0f;
+    float v[3] = {y, y, y};
+    auto each = [&](float (*f)(float)) { for (float& c : v) c = f(c) / k; };
+    switch (curve) {
+        case 1: {   // neutral: below its start the identity (1/1024 always is)
+            for (float& c : v) c /= k;
+            break;
+        }
+        case 2: each([](float c) { c = std::min(c, 0.9999f); return c / (1.0f - c); }); break;
+        case 3: each([](float c) {
+            const float A = 0.15f, B = 0.50f, C = 0.10f, D = 0.20f, E = 0.02f, F = 0.30f;
+            auto h1 = [&](float x) { return ((x * (A * x + C * B) + D * E) / (x * (A * x + B) + D * F)) - E / F; };
+            const float t = std::min(c * h1(11.2f) + E / F, 0.999f);
+            const float qa = A * (1.0f - t), qb = C * B - B * t, qc = D * E - D * F * t;
+            return std::max((-qb + std::sqrt(std::max(qb * qb - 4.0f * qa * qc, 0.0f))) / (2.0f * qa), 0.0f);
+        }); break;
+        case 4: each([](float c) {   // gt's toe (1/1024 < m): Newton on t = x / m, as gt_inv1
+            const float m = 0.22f, cc = 1.33f;
+            float t = std::pow(std::max(c, 0.0f) / m, 1.0f / cc);
+            for (int i = 0; i < 4; ++i) {
+                const float s = t * t * (3.0f - 2.0f * t), ds = 6.0f * t * (1.0f - t), tc = std::pow(t, cc);
+                const float g = tc * (1.0f - s) + t * s - c / m;
+                const float dg = cc * std::pow(std::max(t, 1e-20f), cc - 1.0f) * (1.0f - s) - tc * ds + s + t * ds;
+                t = std::clamp(t - g / std::max(dg, 1e-6f), 0.0f, 1.0f);
+            }
+            return m * t;
+        }); break;
+        case 5: each([](float c) {
+            c = std::min(c, 0.9999f);
+            const float qa = 2.51f - 2.43f * c, qb = 0.03f - 0.59f * c, qc = -0.14f * c;
+            return std::max((-qb + std::sqrt(std::max(qb * qb - 4.0f * qa * qc, 0.0f))) / (2.0f * qa), 0.0f);
+        }); break;
+        case 6: {   // agx: inverse(AGX_OUT) = AGX_IN, the sigmoid's inverse, exp2, inverse(AGX_IN) = AGX_OUT
+            static const float in[3][3] = {{0.842479062253094f, 0.0423282422610123f, 0.0423756549057051f},
+                                           {0.0784335999999992f, 0.878468636469772f, 0.0784336f},
+                                           {0.0792237451477643f, 0.0791661274605434f, 0.879142973793104f}};
+            static const float out[3][3] = {{1.19687900512017f, -0.0528968517574562f, -0.0529716355144438f},
+                                            {-0.0980208811401368f, 1.15190312990417f, -0.0980434501171241f},
+                                            {-0.0990297440797205f, -0.0989611768448433f, 1.15107367264116f}};
+            auto sig = [](float x) { const float x2 = x * x, x4 = x2 * x2;
+                return 15.5f * x4 * x2 - 40.14f * x4 * x + 31.96f * x4 - 6.868f * x2 * x + 0.4298f * x2 + 0.1191f * x - 0.00232f; };
+            auto dsig = [](float x) { const float x2 = x * x, x4 = x2 * x2;
+                return 93.0f * x4 * x - 200.7f * x4 + 127.84f * x2 * x - 20.604f * x2 + 0.8596f * x + 0.1191f; };
+            const float g = std::pow(y, 1.0f / 2.2f);
+            float u[3] = {}, w[3] = {};
+            for (int col = 0; col < 3; ++col) for (int r = 0; r < 3; ++r) u[r] += in[col][r] * g;
+            for (float& c : u) {
+                c = std::clamp(c, sig(0.0f), sig(1.0f));
+                float lo = 0.0f, hi = 1.0f;
+                for (int i = 0; i < 8; ++i) { const float mid = 0.5f * (lo + hi); if (sig(mid) < c) lo = mid; else hi = mid; }
+                float x = 0.5f * (lo + hi);
+                for (int i = 0; i < 3; ++i) x = std::clamp(x - (sig(x) - c) / dsig(x), lo, hi);
+                c = std::exp2(x * (4.026069f + 12.47393f) - 12.47393f);
+            }
+            for (int col = 0; col < 3; ++col) for (int r = 0; r < 3; ++r) w[r] += out[col][r] * u[col];
+            for (int i = 0; i < 3; ++i) v[i] = w[i] / k;
+            break;
+        }
+        case 7: {   // v6_encode's toe; the floor is below the shoulder
+            const float b = y - 0.014f - 0.001f;
+            const float root = std::sqrt(b * b + 4.0f * y * 0.001f);
+            for (float& c : v) c = 2.0f * y * 0.001f / (root - b);
+            break;
+        }
+        // 8: the classic codec's shoulder is the identity at the floor.
+        default: break;
+    }
+    if (saturation != 1.0f) {
+        const float l = 0.2126f * v[0] + 0.7152f * v[1] + 0.0722f * v[2];
+        for (float& c : v) c = l + (c - l) / saturation;
+    }
+    if (contrast != 1.0f)
+        for (float& c : v) c = 0.18f * std::pow(std::max(c, 0.0f) / 0.18f, 1.0f / contrast);
+    return std::max(v[1], 1e-8f);
+}
+
+// FeedSource: where a relative-HDR frame's NR input scale comes from.
+enum Feed : uint32_t { kFeedV1 = 0, kFeedTexture = 1, kFeedFixed = 2 };
+
+// The governor's per-stream state (NormStream) and PlanFrameScale.
+struct NormStream {
+    bool primed = false;
+    uint32_t feed = kFeedV1;
+    int64_t last_ns = 0, last_reset_ns = 0;
+};
+constexpr int64_t kNormResetQuietNs = 250'000'000;
+
+struct ScalePlan {
+    uint32_t governor[5] = {};   // slew_stops .. governor_mode
+    bool guarded = false;        // Auto's texture feed, range-guarded against v1
+    bool v2_snap = false;        // v6_exposure_scale's SnapNow
+};
+
+// SelectFeed: v2 needs positive evidence (a readable exposure texture on a stream without AutoExposure).
+uint32_t select_feed(const Settings& s, uint8_t hdr_mode, const codec::SourceUnits& u, bool readable, bool auto_flag) {
+    if (hdr_mode == 0 || u.absolute || u.encoding == codec::Encoding::Sdr || s.feed_mode == 1u) return kFeedV1;
+    if (s.feed_mode == 2u) return readable ? kFeedTexture : kFeedFixed;
+    return readable && !auto_flag ? kFeedTexture : kFeedV1;
+}
+
+ScalePlan plan_frame_scale(const Settings& s, NormStream& stream, bool frame_reset, uint32_t feed, bool epoch) {
+    ScalePlan plan;
+    const uint32_t mode = s.norm_governor == 2u && s.norm_cut_aware ? 3u : s.norm_governor;
+    const bool stable = mode >= 2u, cut_aware = mode >= 3u;
+    const int64_t now = now_ns();
+    bool reset_snap = !stable && frame_reset;
+    if (cut_aware && frame_reset) {
+        reset_snap = stream.last_reset_ns == 0 || now - stream.last_reset_ns >= kNormResetQuietNs;
+        stream.last_reset_ns = now;
+    }
+    // The reset-epoch snap of modes 0/1: RenoDX's epoch advances on every history reset it requests - here `epoch`
+    // (recreate or history_reset of the frame before).
+    const bool prime = !stream.primed, feed_change = stream.primed && stream.feed != feed;
+    const bool snap = prime || reset_snap || feed_change || (!stable && epoch);
+    stream.primed = true;
+    stream.feed = feed;
+    const float frame_seconds = stream.last_ns != 0
+        ? std::clamp((now - stream.last_ns) / 1e9f, cut_aware ? 0.f : 1.f / 240.f, 0.1f)
+        : 1.f / 60.f;
+    stream.last_ns = now;
+    const float attack = stable ? s.norm_attack_stops * frame_seconds : s.norm_slew_stops;
+    const float release = stable ? s.norm_release_stops * frame_seconds : 0.f;
+    plan.governor[0] = bits(mode == 0u ? 0.f : attack);
+    plan.governor[1] = bits(snap ? 1.f : 0.f);
+    plan.governor[3] = bits(release);
+    plan.governor[4] = mode;
+    plan.guarded = feed == kFeedTexture && s.feed_mode == 0u;
+    plan.v2_snap = prime || feed_change || (reset_snap && !cut_aware);
+    return plan;
+}
+
+
 }  // namespace
 
 uint8_t frame_hdr_mode(DXGI_FORMAT format, bool hdr_flag) { return frame_hdr_mode_dxgi(format, hdr_flag); }
@@ -755,7 +1000,13 @@ struct Stage::Impl {
     uint8_t hdr = 0;
     bool broken = false;
 
-    enum P { kEncodeL, kDecodeL, kReduceL, kReduceLU, kApplyL, kDecodeReduceL, kCompose, kUpsample, kBand, kDebug,
+    enum P { kEncodeL, kDecodeL, kReduceL, kReduceLU, kApplyL, kDecodeReduceL, kCompose, kUpsample, kBand,
+             // the v6 codec's (HDR), RenoDX's own files as well
+             kLinearize, kAutoscale, kExposureScale, kEncode6, kResolve6, kReduce6, kReduce6U, kCommit6,
+             kCommitExposure, kResolveCommit6, kPrepEncode,
+             // the resolve when [Preprocess] made the proxy (NR_PREP_RESOLVE builds of v6_resolve & co)
+             kResolve6Prep, kResolveCommit6Prep, kReduce6UPrep,
+             kDebug,
              // the aux root signature (kFastShaders', the prep port, the plumbing)
              kStFbIn, kStPrep, kStBox, kStApply, kPrep, kTexToBuf, kBufToTex, kCopyOut, kToMotion, kToDepth,
              kCount };
@@ -797,6 +1048,16 @@ struct Stage::Impl {
     bool st_valid = false;
     bool net_failed_logged = false;
     Stage::Facts facts;
+    // The v6 codec's (HDR): its work surfaces (RGBA16F at the frame's extent; work_b made when a stack first
+    // needs it), the 1x1 scale and commit, Preprocess's forward-half image, the exposure texel's copy.
+    Tex work0, work_a, work_b, scale, commit, work_p, exposure_1x1;
+    bool commit_cleared = false;
+    codec::SourceUnits units;
+    NormStream norm;
+    uint32_t feed = kFeedV1;
+    uint32_t logged_feed = ~0u;
+    Frame6 f6;
+
 
     // The resource states of ours (external ones - the frame, the guides - are transitioned by the record itself).
     std::map<ID3D12Resource*, D3D12_RESOURCE_STATES> states;
@@ -886,7 +1147,8 @@ struct Stage::Impl {
         v.res = r; v.buffer = true; v.raw = raw; v.bytes = bytes; v.write = write;
         return v;
     }
-    Tex& stack_out(uint32_t pass) { return (pass & 1u) ? decoded_alt : decoded; }
+    // HDR resolves pass k into the work images, SDR into the decoded ones.
+    Tex& stack_out(uint32_t pass) { return hdr ? ((pass & 1u) ? work_b : work_a) : ((pass & 1u) ? decoded_alt : decoded); }
 
     // One dispatch. `srv` / `uav` hold the register-numbered slots (t0.. / u0..); a null slot takes the first
     // non-null one's view (a binding the stage leaves out is one the program never reads, and D3D12 never
@@ -1097,17 +1359,32 @@ bool Stage::Impl::build(std::string* why) {
     // resolve's - the HDR builds).
     FolderInclude includer;
     includer.dirs = {cfg.shaders, cfg.shaders + L"\\renodx-prep"};
-    struct File { P p; const char* name; };
+    struct File { P p; const char* name; const char* macro; };
     const File files[] = {
-        {kEncodeL, "legacy_encode"}, {kDecodeL, "legacy_decode"}, {kReduceL, "legacy_reduce"},
-        {kReduceLU, "legacy_reduce_unshaped"}, {kApplyL, "legacy_apply"}, {kDecodeReduceL, "legacy_decode_reduce"},
-        {kCompose, "look_compose"}, {kUpsample, "look_upsample"}, {kBand, "look_band"},
+        {kEncodeL, "legacy_encode", nullptr}, {kDecodeL, "legacy_decode", nullptr},
+        {kReduceL, "legacy_reduce", nullptr}, {kReduceLU, "legacy_reduce_unshaped", nullptr},
+        {kApplyL, "legacy_apply", nullptr}, {kDecodeReduceL, "legacy_decode_reduce", nullptr},
+        {kCompose, "look_compose", nullptr}, {kUpsample, "look_upsample", nullptr}, {kBand, "look_band", nullptr},
     };
-    for (const File& f : files) {
+    const File files6[] = {
+        {kLinearize, "v6_linearize", nullptr}, {kAutoscale, "v6_autoscale", nullptr},
+        {kExposureScale, "v6_exposure_scale", nullptr}, {kEncode6, "v6_encode", nullptr},
+        {kResolve6, "v6_resolve", nullptr}, {kReduce6, "v6_pedestal_reduce", nullptr},
+        {kReduce6U, "v6_pedestal_reduce_unshaped", nullptr}, {kCommit6, "v6_commit", nullptr},
+        {kCommitExposure, "v6_commit_exposure", nullptr}, {kResolveCommit6, "v6_resolve_commit", nullptr},
+        {kPrepEncode, "renodx-prep\\prep_encode", nullptr},   // ours (renodx_prep_encode.comp, as HLSL)
+        // the resolve when [Preprocess] made the proxy (v6_common.hlsli under NR_PREP_RESOLVE)
+        {kResolve6Prep, "v6_resolve", "NR_PREP_RESOLVE"},
+        {kResolveCommit6Prep, "v6_resolve_commit", "NR_PREP_RESOLVE"},
+        {kReduce6UPrep, "v6_pedestal_reduce_unshaped", "NR_PREP_RESOLVE"},
+    };
+    const auto make_file_pso = [&](const File& f) -> bool {
         const std::string text = read_text(cfg.shaders + L"\\" +
-            std::wstring(f.name, f.name + std::strlen(f.name)) + L".cs_5_1.hlsl");
-        if (text.empty()) { *why = std::string("renodx: ") + f.name + ".cs_5_1.hlsl is missing"; return false; }
-        ID3DBlob* code = compile_hlsl(text.data(), text.size(), "main", why, &includer);
+            std::wstring(f.name, f.name + std::strlen(f.name)) + (f.p == kPrepEncode ? L".hlsl" : L".cs_5_1.hlsl"));
+        if (text.empty()) { *why = std::string("renodx: ") + f.name + " is missing"; return false; }
+        const D3D_SHADER_MACRO macros[] = {{f.macro, "1"}, {nullptr, nullptr}};
+        ID3DBlob* code = compile_hlsl(text.data(), text.size(), "main", why, &includer,
+                                      f.macro ? macros : nullptr);
         if (!code) return false;
         D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
         pd.pRootSignature = rs_codec;
@@ -1116,7 +1393,13 @@ bool Stage::Impl::build(std::string* why) {
         const HRESULT hr = device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso[f.p]));
         release(code);
         if (FAILED(hr) || !pso[f.p]) { *why = std::string("renodx: ") + f.name + " does not make a pipeline"; return false; }
-    }
+        return true;
+    };
+    for (const File& f : files)
+        if (!make_file_pso(f)) return false;
+    if (hdr)
+        for (const File& f : files6)
+            if (!make_file_pso(f)) return false;
     // The inline ones: the debug views on the codec signature, the rest on the aux one.
     {
         ID3DBlob* code = compile_hlsl(kDebugShader, sizeof kDebugShader - 1, "debug_main", why, nullptr);
@@ -1189,6 +1472,17 @@ bool Stage::Impl::build(std::string* why) {
     neutral_mv = make_tex(1, 1, DXGI_FORMAT_R16G16_FLOAT, false, why);   // zero: the heap guarantees it
     if (!neutral_mv.res) return false;
     looks.resize(1);
+    if (hdr) {
+        // The v6 codec's surfaces: the work images RGBA16F like the proxy, the scale and the commit 1x1 RGBA32F.
+        work0 = make_tex(W, H, DXGI_FORMAT_R16G16B16A16_FLOAT, true, why);
+        work_a = make_tex(W, H, DXGI_FORMAT_R16G16B16A16_FLOAT, true, why);
+        scale = make_tex(1, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, true, why);
+        commit = make_tex(1, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, true, why);
+        if (!work0.res || !work_a.res || !scale.res || !commit.res) {
+            *why = "renodx: a v6 surface could not be made";
+            return false;
+        }
+    }
     nr::pe::log("[nr] RenoDX stage (D3D12): %ux%u (network %ux%u), frame format %u%s", W, H, NW, NH,
                 unsigned(frame), decoded_storage ? "" : ", result through RGBA16F");
     return true;
@@ -1334,7 +1628,12 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
     if (recreate) history_reset = true;
 
     // The stack's own images and look histories, as this frame's depth needs them.
-    if (passes > 1 && !decoded_alt.res) {
+    if (hdr && passes > 1 && !work_b.res) {
+        std::string why;
+        work_b = make_tex(W, H, DXGI_FORMAT_R16G16B16A16_FLOAT, true, &why);
+        if (!work_b.res) return 0;
+    }
+    if (!hdr && passes > 1 && !decoded_alt.res) {
         std::string why;
         decoded_alt = make_tex(W, H, decoded.format, true, &why);
         if (!decoded_alt.res) return 0;
@@ -1355,15 +1654,34 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
         area_input = area; area_known = true;
     }
 
-    // Preprocess this frame (renodx_prep.comp's push block; RESET when it has just come on).
+    // The v6 codec's frame snapshots (ProcessInline): one divisor, encoding, gate and cap. The Present path's own
+    // divisor, from the HDR diffuse white; Anchored (1) and Display (3) keep their anchors.
+    const bool v6 = hdr != 0;
+    f6.hdr_mode = hdr;
+    f6.units = units;
+    f6.divisor = v6 ? frame_codec_divisor(s, hdr, units) : 0.f;
+    if (cfg.present && v6 && s.codec_mode != 1u && s.codec_mode != 3u)
+        f6.divisor = codec::PresentDivisor(units, f.present_white_nits, s.paper_white_scale, s.pq_calibration);
+    f6.encoding = v6_encoding_constant(units);
+    f6.gate = v6_dark_gate(units);
+    f6.cap = codec::BlackPedestalCap(units);
+
+    // Preprocess this frame (renodx_prep.comp's push block; RESET when it has just come on). On HDR its forward
+    // half runs before RenoDX's encode (the running image -> work_p); on SDR it runs on the proxy, around the
+    // network.
     const Preprocess& pp = f.preprocess;
     const bool prep_on = pp.active();
     if (prep_on != prep_was_on || (prep_on && !(pp == prep_last))) history_reset = true;
     PrepPush prep_push{};
     if (prep_on) {
         std::string why;
-        if (!prep_keep.res) prep_keep = make_tex(NW, NH, DXGI_FORMAT_R16G16B16A16_FLOAT, true, &why);
-        if (!prep_keep.res) return 0;
+        if (hdr) {
+            if (!work_p.res) work_p = make_tex(W, H, DXGI_FORMAT_R16G16B16A16_FLOAT, true, &why);
+            if (!work_p.res) return 0;
+        } else {
+            if (!prep_keep.res) prep_keep = make_tex(NW, NH, DXGI_FORMAT_R16G16B16A16_FLOAT, true, &why);
+            if (!prep_keep.res) return 0;
+        }
         if (!prep_state) {
             prep_state = make_buffer(16, &why);
             if (!prep_state) return 0;
@@ -1385,24 +1703,71 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
         }
         const uint32_t curve = uint32_t(std::clamp(pp.curve, 0, 6));
         const int64_t now = now_ns();
-        prep_push = {NW, NH, 0u,
-                     (pp.exposure == 1 ? uint32_t(kPrepAuto) : 0u) | (prep_was_on ? 0u : uint32_t(kPrepReset)) |
-                         (pp.inverse ? 0u : uint32_t(kPrepRatio)),
+        prep_push = {hdr ? W : NW, hdr ? H : NH, 0u,
+                     (pp.exposure == 1 ? uint32_t(kPrepAuto) : 0u) | (hdr ? uint32_t(kPrepLinear) : 0u) |
+                         (prep_was_on ? 0u : uint32_t(kPrepReset)) | (pp.inverse ? 0u : uint32_t(kPrepRatio)),
                      curve, pp.exposure == 0 ? 0.0f : std::clamp(pp.bias_ev, -8.0f, 8.0f),
                      std::clamp(pp.contrast, 0.5f, 2.0f), std::clamp(pp.saturation, 0.05f, 2.0f), kPrepAnchor[curve],
                      4.0f, prep_was_on ? float(now - prep_metered_ns) / 1e9f : 0.0f, 0.0f};
         prep_metered_ns = now;
-    } else if (prep_keep.res) {
+    } else if (prep_keep.res || work_p.res) {   // off: its images go
         drop(prep_keep);
+        drop(work_p);
     }
     prep_was_on = prep_on;
     prep_last = pp;
     facts = Stage::Facts{};
     facts.hdr_mode = hdr;
+    facts.absolute = units.absolute;
     facts.prep_exposure = prep_on && pp.exposure != 0;
+    // HDR with Preprocess: the resolve's ratio is taken behind Preprocess's curve (the _prep programs); with its
+    // Inverse off, in the picture the network was shown (RenoDX's own resolve).
+    const bool prep_exposure = prep_on && pp.exposure != 0;
+    const bool ratio_resolve = prep_on && hdr && !frame_display_codec(s, hdr, units);
+    // Without Preprocess's exposure (HDR) RenoDX's own exposure stays: Preprocess's forward half divides by
+    // RenoDX's divisor (or its same-frame scale) and the encode then divides by 1.
+    const bool prep_normalise = prep_on && hdr && !prep_exposure;
+    if (prep_normalise) {
+        prep_push.flags |= kPrepNormalise;
+        prep_push.divisor = f6.divisor > 0.f ? f6.divisor : 0.f;
+    }
+    if (prep_exposure && hdr) f6.divisor = 1.f;
+    // Curve = none keeps v6_encode. Tell the inverse which codec it applied, rather than treating it as identity.
+    // Internal curve IDs 7 / 8 are the display toe+shoulder / classic shoulder, not Preprocess menu choices.
+    const uint32_t prep_inverse_curve = prep_push.curve != 0u ? prep_push.curve
+        : frame_display_codec(s, hdr, units) ? 7u : 8u;
+    const float floor_behind = ratio_resolve ? prep_floor(prep_inverse_curve, prep_push.k, prep_push.contrast,
+                                                          prep_push.saturation) : 0.f;
+    const auto prep_constants = [&](const V6Constants& v) {
+        V6PrepConstants c{v, prep_push.contrast, prep_push.saturation, floor_behind};
+        c.v.padding[0] = prep_inverse_curve;
+        std::memcpy(&c.v.padding[1], &prep_push.k, sizeof(float));
+        return c;
+    };
     // SDR Preprocess with the network's input in its own image (NR_PREP_APART, the Vulkan stage's default).
     static const bool apart_on = [] { const char* e = std::getenv("NR_PREP_APART"); return !(e && e[0] == '0'); }();
-    const bool prep_apart = apart_on && prep_on;
+    const bool prep_apart = apart_on && prep_on && !hdr;
+    // The prep scale (binding 4): RenoDX's same-frame scale texel on HDR, an image of the stage's that is never
+    // read on SDR.
+    const View prep_scale_view = units.absolute ? tv(work0, false) : tv(scale, false);
+    // Preprocess's forward half (HDR): the pass's running image -> work_p, its meter first on the frame.
+    const auto prep_forward_hdr = [&](Tex& from, bool meter) {
+        View srv[8] = {};
+        srv[0] = prep_scale_view;
+        View uav[14] = {};
+        uav[0] = bv(prep_state, 16, false, true);
+        uav[1] = tv(from, true);
+        uav[2] = tv(work_p, true);
+        uav[3] = tv(work_p, true);
+        PrepPush push = prep_push;
+        if (meter && pp.exposure == 1) {
+            PrepPush m = push;
+            dispatch(cmd, kPrep, srv, uav, &m, sizeof m / 4, 1, 1);
+        }
+        push.mode = 1;
+        dispatch(cmd, kPrep, srv, uav, &push, sizeof push / 4, gx, gy);
+    };
+
 
     // Passes (fast) this frame (nr_renodx.cpp's planning).
     const bool have_motion = f.motion && f.motion_w && f.motion_h;
@@ -1546,15 +1911,54 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
     const float fast_w = nfast > 4.f ? std::min(0.8f, 1.f - 1.f / nfast) : wt[segment] + part * (wt[segment + 1] - wt[segment]);
 
     int32_t executed = -1;
+    // The last pass's resolve and the commit in one dispatch when the commit takes no pedestal
+    // (v6_resolve_commit; the recorded RDNA4 fixtures matched the two-dispatch output).
+    static const bool fuse_off = [] { const char* e = std::getenv("NR_RENODX_FUSE"); return e && e[0] == '0'; }();
+    const bool fuse = v6 && !fuse_off && !frame_pedestal_removal(s, hdr, units);
+    bool fused = false;
+    float final_transfer = 0.f, final_color = 0.f;
+    bool final_shaped = false;
     uint32_t ran = 0;
     bool net_ok = true;
     for (uint32_t k = 0; k < passes && net_ok; ++k) {
         float transfer = 1.f, color = 1.f;
         strengths(settings, k, &transfer, &color);
-        Tex& ref = k == 0 ? original : stack_out(k - 1);
+        Tex& ref = k == 0 ? (v6 ? work0 : original) : stack_out(k - 1);
         Tex& write = stack_out(k);
+        if (v6 && transfer <= 0.f && color <= 0.f) {
+            // An explicit zero-strength pass carries the running image across exactly.
+            ensure(cmd, ref.res, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            ensure(cmd, write.res, D3D12_RESOURCE_STATE_COPY_DEST);
+            cmd->CopyResource(write.res, ref.res);
+            uav_barrier(cmd);
+            ensure(cmd, write.res, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            executed = int32_t(k);
+            final_transfer = final_color = 0.f;
+            final_shaped = false;
+            continue;
+        }
         // 3a. encode: the running image -> the proxy at the network's extent.
-        {
+        if (v6) {
+            if (prep_on && k > 0) prep_forward_hdr(ref, false);
+            if (prep_on && pp.curve != 0) {
+                // Preprocess's curve in place of RenoDX's: the same footprint and sRGB, no toe or shoulder.
+                const uint32_t push[4] = {NW, NH, W, H};
+                View srv[8] = {};
+                srv[0] = tv(work_p, false);
+                View uav[14] = {};
+                uav[0] = tv(proxy, true);
+                dispatch(cmd, kPrepEncode, srv, uav, push, 4, nx, ny);
+            } else {
+                V6Constants enc = make_v6(s, f6, NW, NH, W, H, NW, NH, NW, NH, transfer, color, 0.f);
+                if (prep_normalise) enc.divisor = 1.f;   // Preprocess's forward half divided already
+                View srv[8] = {};
+                srv[0] = srv[1] = srv[2] = tv(prep_on ? work_p : ref, false);
+                srv[3] = units.absolute ? tv(work0, false) : tv(scale, false);
+                View uav[14] = {};
+                uav[0] = tv(proxy, true);
+                dispatch(cmd, kEncode6, srv, uav, &enc, sizeof enc / 4, nx, ny);
+            }
+        } else {
             LegacyConstants c{};
             c.size[0] = NW; c.size[1] = NH; c.source_size[0] = W; c.source_size[1] = H;
             c.proxy_size[0] = c.neural_size[0] = NW; c.proxy_size[1] = c.neural_size[1] = NH;
@@ -1568,7 +1972,7 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
             uav[0] = tv(proxy, true);
             dispatch(cmd, kEncodeL, srv, uav, &c, sizeof c / 4, nx, ny);
         }
-        if (prep_on) {   // the network's input in place (mode 1), the meter once a frame
+        if (prep_on && !v6) {   // the network's input in place (mode 1), the meter once a frame
             View srv[8] = {};
             srv[0] = tv(block_mean, false);   // RenoDX's scale (binding 4): never read on SDR
             View uav[14] = {};
@@ -1720,7 +2124,7 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
         // SDR with Preprocess: transfer the edit back through the bounded inverse, restore P to the input
         // (mode 2, RESTORE). Not on the last pass while NR Control's debug view shows this layer.
         const bool debug_raw = s.debug_view >= 1u && s.debug_view <= 3u && k + 1 == passes;
-        if (prep_on && !debug_raw) {
+        if (prep_on && !v6 && !debug_raw) {
             PrepPush back = prep_push;
             back.mode = 2;
             back.flags = (back.flags & ~uint32_t(kPrepReset)) | (prep_apart ? 0u : uint32_t(kPrepRestore));
@@ -1741,8 +2145,35 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
         Tex* rp = transport ? &up_proxy : &proxy;
         Tex* rn = transport ? &up_neural : (shaped ? &look_out : &neural);
         const uint32_t pw = transport ? W : NW, ph = transport ? H : NH;
-        // 3d. resolve onto the running image (the copied path: decode -> [reduce -> apply], into `write`).
-        {
+        // 3d. resolve onto the running image.
+        if (v6 && fuse && k + 1 == passes) {
+            // The last pass's resolve and the commit in one dispatch when the commit takes no pedestal.
+            const V6Constants res = make_v6(s, f6, W, H, W, H, pw, ph, pw, ph, transfer, color,
+                                            s.chroma_clamp_stops, ratio_resolve);
+            View srv[8] = {};
+            srv[0] = tv(ref, false); srv[1] = tv(*rp, false); srv[2] = tv(*rn, false);
+            srv[3] = units.absolute ? tv(work0, false) : tv(scale, false);
+            View uav[14] = {};
+            uav[0] = tv(decoded, true);
+            const V6PrepConstants pres = prep_constants(res);
+            dispatch(cmd, ratio_resolve ? kResolveCommit6Prep : kResolveCommit6, srv, uav,
+                     ratio_resolve ? static_cast<const void*>(&pres) : static_cast<const void*>(&res),
+                     ratio_resolve ? sizeof pres / 4 : sizeof res / 4, gx, gy);
+            fused = true;
+        } else if (v6) {
+            const V6Constants res = make_v6(s, f6, W, H, W, H, pw, ph, pw, ph, transfer, color,
+                                            s.chroma_clamp_stops, ratio_resolve);
+            View srv[8] = {};
+            srv[0] = tv(ref, false); srv[1] = tv(*rp, false); srv[2] = tv(*rn, false);
+            srv[3] = units.absolute ? tv(work0, false) : tv(scale, false);
+            View uav[14] = {};
+            uav[0] = tv(write, true);
+            const V6PrepConstants pres = prep_constants(res);
+            dispatch(cmd, ratio_resolve ? kResolve6Prep : kResolve6, srv, uav,
+                     ratio_resolve ? static_cast<const void*>(&pres) : static_cast<const void*>(&res),
+                     ratio_resolve ? sizeof pres / 4 : sizeof res / 4, gx, gy);
+        } else {
+            // SDR's copied path: decode -> [reduce -> apply], into `write`.
             LegacyConstants c{};
             c.size[0] = W; c.size[1] = H; c.source_size[0] = W; c.source_size[1] = H;
             c.proxy_size[0] = c.neural_size[0] = pw; c.proxy_size[1] = c.neural_size[1] = ph;
@@ -1765,19 +2196,61 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
                 LegacyConstants a = c;
                 a.padding[0] = s.sdr_black_restore == 1u ? 2.f : 0.061f;
                 a.padding[1] = float(s.sdr_black_restore);
-                ruav[1] = tv(block_mean, false);   // the apply reads the means, writes only the picture
-                ruav[0] = tv(write, true);
+                ruav[1] = tv(block_mean, true);   // the apply reads the means back (a UAV load, as its declare)
                 dispatch(cmd, kApplyL, rsrv, ruav, &a, sizeof a / 4, gx, gy);
             }
         }
         executed = int32_t(k);
+        final_transfer = transfer;
+        final_color = color;
+        final_shaped = shaped;
+    }
+
+    // 4. The last pass's result back into the frame's encoding (HDR: the pedestal block means and the commit),
+    // into `decoded`; the copy-out below hands it to the output.
+    if (v6 && net_ok && !fused) {
+        Tex& work_final = executed >= 0 ? stack_out(uint32_t(executed)) : work_a;
+        if (frame_pedestal_removal(s, hdr, units)) {
+            const bool unshaped = executed == 0 && final_shaped;
+            const V6Constants red = make_v6(s, f6, W, H, W, H, NW, NH, NW, NH, final_transfer, final_color,
+                                            s.chroma_clamp_stops, ratio_resolve);
+            if (unshaped) {   // a single shaped pass measures NR's own lift, unshaped
+                const V6PrepConstants pred = prep_constants(red);
+                View srv[8] = {};
+                srv[0] = tv(work0, false); srv[1] = tv(proxy, false); srv[2] = tv(neural, false);
+                srv[3] = units.absolute ? tv(work0, false) : tv(scale, false);
+                View uav[14] = {};
+                uav[0] = tv(block_mean, true);
+                dispatch(cmd, ratio_resolve ? kReduce6UPrep : kReduce6U, srv, uav,
+                         ratio_resolve ? static_cast<const void*>(&pred) : static_cast<const void*>(&red),
+                         ratio_resolve ? sizeof pred / 4 : sizeof red / 4, (W + 31) / 32, (H + 31) / 32);
+            } else {
+                View srv[8] = {};
+                srv[0] = tv(work_final, false); srv[1] = tv(work0, false);
+                srv[2] = units.absolute ? tv(work0, false) : tv(scale, false);
+                srv[3] = tv(work0, false);
+                View uav[14] = {};
+                uav[0] = tv(block_mean, true);
+                dispatch(cmd, kReduce6, srv, uav, &red, sizeof red / 4, (W + 31) / 32, (H + 31) / 32);
+            }
+        }
+        const V6Constants com = make_v6(s, f6, W, H, W, H, W, H, W, H, final_transfer, final_color, 0.f);
+        const bool v2 = !units.absolute && feed != kFeedV1;
+        View srv[8] = {};
+        srv[0] = tv(work_final, false); srv[1] = tv(work0, false);
+        srv[2] = v2 ? tv(scale, false) : (units.absolute ? tv(work0, false) : tv(scale, false));
+        srv[3] = tv(work0, false);
+        View uav[14] = {};
+        uav[0] = tv(decoded, true);
+        uav[1] = tv(block_mean, true);
+        dispatch(cmd, v2 ? kCommitExposure : kCommit6, srv, uav, &com, sizeof com / 4, gx, gy);
     }
 
     if (!net_ok) {   // the network recorded nothing: the frame as it came
         copy_frame(cmd, f);
         return 0;
     }
-    Tex& result = executed < 0 ? decoded : stack_out(uint32_t(executed));
+    Tex& result = v6 ? decoded : (executed < 0 ? decoded : stack_out(uint32_t(executed)));
     // NR Control's debug view of this layer, over what goes to the frame.
     if (s.debug_view >= 1u && s.debug_view <= 3u) {
         const uint32_t dv[5] = {W, H, NW, NH, s.debug_view};
@@ -1815,10 +2288,10 @@ std::unique_ptr<Stage> Stage::make(const Config& c, std::string* why) {
     m.settings = c.settings;
     m.hdr = c.present ? (c.present == 2 ? uint8_t(2) : c.present == 3 ? uint8_t(1) : uint8_t(0))
                       : frame_hdr_mode_dxgi(c.frame_format, c.hdr_flag);
-    if (m.hdr != 0) {   // HDR comes with the v6 codec (M5 item 6b); SDR only on this route for now
-        *why = "renodx: HDR frames stay on the 0.0.8.1 path";
-        return nullptr;
-    }
+    // present_path.hpp: the colour space decides, units are absolute (PQ's 10000 nits, scRGB's 80).
+    if (c.present == 2) m.units = {codec::Encoding::Pq, true, 10000.f, true};
+    else if (c.present == 3) m.units = {codec::Encoding::Linear, true, 80.f, false};
+    else m.units = interpret_source_units(c.settings, m.hdr);
     if (!m.build(why)) return nullptr;
     return s;
 }
@@ -1844,11 +2317,20 @@ Stage::~Stage() {
     release(m.clear_heap);
 }
 
-void Stage::set(const Settings& s) {
+bool Stage::set(const Settings& s) {
     Impl& m = *impl_;
     if (recreate_settings_differ(m.settings, s)) m.recreate = true;
     else if (history_settings_differ(m.settings, s)) m.history_reset = true;
+    if (m.cfg.present) {   // the Present path's units are its colour space's
+        m.settings = s;
+        return true;
+    }
+    const codec::SourceUnits units = interpret_source_units(s, m.hdr);
+    // Relative <-> absolute units (NRLinearUnitNits, NRSourceEncoding): a new stage next frame.
+    if (units.absolute != m.units.absolute) return false;
     m.settings = s;
+    m.units = units;
+    return true;
 }
 
 uint8_t Stage::hdr_mode() const { return impl_->hdr; }

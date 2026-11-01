@@ -845,7 +845,6 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
     if (sf == DXGI_FORMAT_UNKNOWN || df == DXGI_FORMAT_UNKNOWN) return fallback("the RenoDX route: an sRGB format");
     const uint8_t hdr = f.renodx_present ? uint8_t(f.renodx_present == 2 ? 2 : f.renodx_present == 3 ? 1 : 0)
                                          : renodx12::frame_hdr_mode(sf, f.renodx_hdr_flag != 0);
-    if (hdr != 0) return fallback("the RenoDX route: an HDR frame (item 6b; the 0.0.8.1 path runs it)");
     if (!(dd.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) || !typed_uav(f.device, df))
         return fallback("the RenoDX route: the output's format has no typed UAV store");
     const uint32_t w = std::min<uint64_t>({f.width, sd.Width, dd.Width});
@@ -898,7 +897,23 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
         e.hdr = f.renodx_hdr_flag; e.present = f.renodx_present;
         nr::pe::log("[nr] the RenoDX route (D3D12): feature #%u at %ux%u (network %ux%u)", unsigned(f.feature), w, h, nw, nh);
     }
-    e.stage->set(s);
+    if (!e.stage->set(s)) {
+        // Relative <-> absolute units (NRLinearUnitNits, NRSourceEncoding): a stage made with the new settings
+        // takes the frame now (0.0.8.1 retires the old one and waits a frame; the bridge is never used here).
+        g.renodx_retired.emplace_back(g.tick + 64, std::move(e.stage));
+        renodx12::Stage::Config c;
+        c.device = f.device;
+        c.shaders = widen(nr::pe::module_folder()) + L"\\dlssnr-amd\\shaders\\renodx";
+        c.width = w; c.height = h;
+        c.nr_width = nw; c.nr_height = nh;
+        c.frame_format = sf;
+        c.hdr_flag = f.renodx_hdr_flag != 0;
+        c.present = uint32_t(f.renodx_present);
+        c.settings = s;
+        c.feature = f.feature;
+        e.stage = renodx12::Stage::make(c, &why);
+        if (!e.stage) return fallback("the RenoDX route: " + why);
+    }
 
     renodx12::Frame rf;
     rf.colour = f.color;

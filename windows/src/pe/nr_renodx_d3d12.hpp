@@ -77,11 +77,12 @@ public:
     static std::unique_ptr<Stage> make(const Config& c, std::string* why);
     ~Stage();
 
-    void set(const Settings& s);      // nr_renodx.cpp Stage::set (the history / recreate setting rules)
+    // False: a change between relative and absolute units needs a new stage (the caller retires this one).
+    bool set(const Settings& s);   // nr_renodx.cpp Stage::set (the history / recreate setting rules)
     uint8_t hdr_mode() const;
 
-    // The frame through the stack (nr_renodx.cpp Stage::record, the SDR legacy path). Returns how many passes ran
-    // the network (0: NR off - the frame copied to the output as it is).
+    // The frame through the stack (nr_renodx.cpp Stage::record: the SDR legacy codec and the HDR v6 one). Returns
+    // how many passes ran the network (0: NR off - the frame copied to the output as it is).
     uint32_t record(ID3D12GraphicsCommandList* cmd, const Frame& f, const Frame::Net& net);
 
     // The last frame's decisions (nr_renodx.hpp Stage::Facts), for the panel's wording.

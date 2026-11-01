@@ -33,7 +33,7 @@ cp -- windows/shaders/renodx/LICENSE "$dst/shaders/renodx/RenoDX-LICENSE.txt"
 # RENODX_VULKAN not defined) at run time, from this folder (nr_renodx_d3d12.cpp).
 cp -- windows/shaders/renodx/*.hlsl windows/shaders/renodx/*.hlsli "$dst/shaders/renodx/"
 mkdir -p "$dst/shaders/renodx/renodx-prep"
-cp -- windows/shaders/renodx-prep/*.hlsli "$dst/shaders/renodx/renodx-prep/"
+cp -- windows/shaders/renodx-prep/*.hlsli windows/shaders/renodx-prep/*.hlsl "$dst/shaders/renodx/renodx-prep/"
 bash windows/build/build_wilsjo2.sh "$dst/shaders/wilsjo2" > /dev/null   # the wilsjo2 style, HUD FIX on every route
 # wilsjo2_classic.spv carries AMD FidelityFX Super Resolution 1 (MIT): its notice goes with it
 cp -- windows/shaders/passes/include/fsr1/LICENSE.txt "$dst/shaders/wilsjo2/FidelityFX-FSR1-LICENSE.txt"
