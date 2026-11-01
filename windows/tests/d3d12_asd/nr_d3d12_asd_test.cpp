@@ -606,6 +606,7 @@ int renodx_run(int argc, char** argv) {
     d->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&a));
     d->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, a, nullptr, IID_PPV_ARGS(&l));
     d->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f));
+    uint64_t fence_value = 0;   // one monotonic counter: upload, every frame, every readback
 
     // The frame: the game's format 24 (R10G10B10A2), in place, in UNORDERED_ACCESS both ways.
     D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -660,13 +661,14 @@ int renodx_run(int argc, char** argv) {
         l->Close();
         ID3D12CommandList* ls[] = {l};
         q->ExecuteCommandLists(1, ls);
-        q->Signal(f, 100);
+        const uint64_t upload_fence = ++fence_value;
+        q->Signal(f, upload_fence);
         HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        f->SetEventOnCompletion(100, ev);
+        f->SetEventOnCompletion(upload_fence, ev);
         const bool ok = WaitForSingleObject(ev, 60000) == WAIT_OBJECT_0;
         CloseHandle(ev);
         up->Release();
-        if (!ok) { log("[test] renodx: the input copy did not finish"); return 4; }
+        if (!ok || f->GetCompletedValue() < upload_fence) { log("[test] renodx: the input copy did not finish"); return 4; }
         a->Reset();
         l->Reset(a, nullptr);
     }
@@ -675,6 +677,10 @@ int renodx_run(int argc, char** argv) {
     log("[test] renodx: canary %s", asd::status().canary.c_str());
 
     nr::renodx::Settings settings{};   // the shipped defaults: 1 pass, Standard, intensity 1
+    if (const char* off = std::getenv("NR_TEST_NR_OFF"); off && off[0] == '1') {
+        settings.nr_enabled = false;   // the copy path only: separates the stage's work from the host's own copies
+        log("[test] renodx: NR disabled (copy path only)");
+    }
     nr::dlssnr::D3d12BackendFrame fr{};
     fr.device = d; fr.cmd = l;
     fr.color = frame; fr.color_state = int(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -705,7 +711,6 @@ int renodx_run(int argc, char** argv) {
     if (!ran) return 7;
 
     // The frames after the first are what exercise the history, the latch and the reset paths.
-    uint64_t fence_value = 0;
     for (int fi = 0; fi < frames; ++fi) {
         if (fi > 0) {
             const HRESULT ra = a->Reset();
@@ -729,7 +734,11 @@ int renodx_run(int argc, char** argv) {
         if (FAILED(hw)) { CloseHandle(e); log("[test] renodx: SetEventOnCompletion 0x%08lX", static_cast<unsigned long>(hw)); return 8; }
         const bool done = WaitForSingleObject(e, 60000) == WAIT_OBJECT_0;
         CloseHandle(e);
-        if (!done) { log("[test] renodx: frame %d: the GPU did not finish in 60 s", fi); return 9; }
+        if (!done || f->GetCompletedValue() < fence_value) {
+            log("[test] renodx: frame %d: the GPU did not finish in 60 s (completed %llu of %llu)", fi,
+                static_cast<unsigned long long>(f->GetCompletedValue()), static_cast<unsigned long long>(fence_value));
+            return 9;
+        }
         const HRESULT removed = d->GetDeviceRemovedReason();
         log("[test] renodx: frame %d submitted, fence %s, device reason 0x%08lX", fi,
             done ? "signalled" : "TIMED OUT", static_cast<unsigned long>(removed));
@@ -760,7 +769,7 @@ int renodx_run(int argc, char** argv) {
                     q->Signal(f, ++fence_value);
                     HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
                     if (SUCCEEDED(f->SetEventOnCompletion(fence_value, ev)) &&
-                        WaitForSingleObject(ev, 60000) == WAIT_OBJECT_0) {
+                        WaitForSingleObject(ev, 60000) == WAIT_OBJECT_0 && f->GetCompletedValue() >= fence_value) {
                         void* m = nullptr;
                         if (rb && SUCCEEDED(rb->Map(0, nullptr, &m)) && m) {
                             const auto* p8 = static_cast<const uint8_t*>(m);

@@ -11,7 +11,9 @@
 - 修复后：单条 `kBufToTex`、完整 stage、以及**真实路径**（backend + RenoDX stage + 游戏导出的 ACO 计划，
   71 dispatches，1 pass）全部 `Close 0x00000000`、fence 正常、`GetDeviceRemovedReason() = S_OK`；
   连续 3 帧均如此。
-- 仍未解决：**首帧输出跨进程不可重复**（第 1、2 帧可重复）。这不是设备错误，但会阻塞"输出对齐"结论。
+- 输出可重复性已确认：修正宿主的 fence 水位后，同一输入两次进程运行的 1 帧与 3 帧哈希完全一致
+  （`B46B428D44C7D765` / `421BFA5E857523E9` / `27B1B77BDFB3AA51`）。此前"首帧不同"是宿主
+  `SetEventOnCompletion` 用了已被超越的旧值造成的读回竞争，与网络无关；那些旧哈希作废。
 
 ## 差异表
 
@@ -24,7 +26,7 @@
 | 外部资源状态登记 | 旧桥接 `lookup12`/`begin_recording` 的外部契约 | `record()` 入口 | 外部资源曾以"第一次见到即 COMMON"登记；就地路径 `colour == output` 且真实状态为 UAV，导致名不副实的 `COMMON → UAV` | **已修** `117e53d` | 每帧按调用者声明重新登记；`transition()` 与复制 helper 同步状态表 |
 | buffer 状态与依赖 | 旧桥接经 Vulkan 隐式排序 | `record()` around `net` / `fill()` buffer 分支 | 线性缓冲曾完全绕过状态表；网络按下标地址写 `lin_neural`、读 `lin_proxy`/guides，缺少真实转换与 UAV 依赖 | **已修** `694de0f` | 每帧入口 `ensure(...UAV)` + `uav_barrier`；网络返回后用 `ensure(SRV)` 而非赋值 |
 | 渲染目标 UAV 能力 | 旧桥接 `lookup12` 的格式/尺寸限制 | `nr_d3d12_asd_backend.cpp` 入口校验 | 复用调用者纹理时需确认 `ALLOW_UNORDERED_ACCESS` 与实际用途一致 | 待执行（P2） | — |
-| 首帧输出可重复性 | 旧路径以 Vulkan 显式时间/曝光 | `nr_renodx_d3d12.cpp` 的 `now_ns()` 与内容计 | 同输入两次进程运行：第 0 帧哈希不同，第 1、2 帧一致 | **未解决** | `P4-determinism.md` |
+| 输出可重复性（宿主） | — | `windows/tests/d3d12_asd/nr_d3d12_asd_test.cpp` 的提交/等待 | 上传段 `Signal(100)` 与帧循环 `Signal(1)` 混用，`SetEventOnCompletion(1)` 立即满足；读回与 `Reset` 与在飞的 GPU 工作竞争 | **已修** `61c0c9c`* | 统一单调计数 + 每次核对 `GetCompletedValue() >= 期望`；1 帧与 3 帧两次运行哈希一致。`P4-determinism.md` |
 
 ## 离线宿主（P4/P5 用）
 
