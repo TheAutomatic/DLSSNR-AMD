@@ -14,7 +14,9 @@ for o in "$objs"/*.o; do
     case "$(basename -- "$o")" in asi_main.o) continue ;; esac
     list+=("$o")
 done
-"$cxx" -std=c++17 -O2 -DNDEBUG -Itoolchain/Vulkan-Headers/include -Iwindows/src -Iwindows/src/core -Iwindows/src/pe \
-    windows/tests/d3d12_asd/nr_parity_host.cpp "${list[@]}" \
-    -o "$out/nr_parity_host.exe" -ld3d12 -ldxgi -lole32 -lversion -static -static-libgcc -static-libstdc++
-echo "built $out/nr_parity_host.exe"
+for t in nr_parity_host nr_bridge_host; do
+    "$cxx" -std=c++17 -O2 -DNDEBUG -Itoolchain/Vulkan-Headers/include -Iwindows/src -Iwindows/src/core -Iwindows/src/pe \
+        "windows/tests/d3d12_asd/$t.cpp" "${list[@]}" \
+        -o "$out/$t.exe" -ld3d12 -ldxgi -lole32 -lversion -static -static-libgcc -static-libstdc++
+    echo "built $out/$t.exe"
+done
