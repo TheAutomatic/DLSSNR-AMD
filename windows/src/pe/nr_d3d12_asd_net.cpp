@@ -220,7 +220,7 @@ struct Built {
     ID3D12Resource* table = nullptr;
     // The upload slots: ring buffers of kRing slots each, grown while every slot of every buffer is still held.
     // A slot is written by the CPU and read by the CopyBufferRegion of the same record(); its last 8 bytes carry
-    // the record's frame number, and a second recorded copy lands that number in `done_map`. A slot is handed
+    // the record's frame number, and a second recorded copy lands that number in `copy_map`. A slot is handed
     // out again only once its number is seen there: the GPU has then executed this record's copy (and every
     // earlier one in the queue), however many records are still waiting in unsubmitted command lists.
     struct Upload {
@@ -229,8 +229,13 @@ struct Built {
         std::vector<uint64_t> owner;   // per slot: the frame that holds it, ~0ull = never used
     };
     std::vector<Upload> upload;
-    ID3D12Resource* exec_token = nullptr; // upload buffer: kDoneSlots uint64s carrying frame numbers for execution completion
+    // The execution completion token: this record's frame number, copied back once the model's dispatches have
+    // run. A slot of it is written again only once the GPU has executed the record that last held it, so a copy
+    // still waiting in an unsubmitted list never reads a newer number; a stack deep enough to outrun the block
+    // gets a larger one, and the old block stays alive until the last record that reads it has run.
+    ID3D12Resource* exec_token = nullptr;
     uint64_t* exec_token_map = nullptr;
+    uint64_t token_slots = 0;
     ID3D12Resource* done = nullptr;       // readback buffer: [0..kDoneSlots) for copy completion, [kDoneSlots..2*kDoneSlots) for execution completion
     uint64_t* copy_map = nullptr;
     uint64_t* exec_map = nullptr;
@@ -402,6 +407,7 @@ std::shared_ptr<Built> build(ID3D12Device* device, const Carriers& carriers, ID3
     }
     b->exec_token = buffer(device, D3D12_HEAP_TYPE_UPLOAD, kDoneSlots * 8, D3D12_RESOURCE_STATE_GENERIC_READ, false);
     if (!b->exec_token) { *why = "the execution completion token buffer could not be made"; return nullptr; }
+    b->token_slots = kDoneSlots;
     {
         void* m = nullptr;
         if (FAILED(b->exec_token->Map(0, nullptr, &m)) || !m) { *why = "the execution completion token could not be mapped"; return nullptr; }
@@ -687,22 +693,43 @@ public:
         const bool grade = b->t_grade.pso && controls_.style != 0;
 
         // retarget: the weights with their tail once, then the noise field's jobs (their tables first in the ring).
+        // Recorded only after this record has a slot: a record that declines below must not leave the weight copy
+        // in the list, or the next one would transition b->wgt from COPY_DEST when it is already UNORDERED_ACCESS.
         const bool first = !b->retargeted;
-        if (first) {
-            cmd->CopyBufferRegion(b->wgt, 0, b->wgt_upload, 0, b->wgt->GetDesc().Width);
-            transition(cmd, b->wgt, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        }
         // The tables of this frame: [noise jobs (first frame)] [every dispatch] [the params].
         const uint32_t n_noise = first ? uint32_t(b->plan.noise.size()) : 0;
         const uint32_t base = uint32_t(b->plan.noise.size());   // the dispatches' tables keep their place
         // An upload slot of this record's own. The CPU writes it here and the CopyBufferRegion below reads it
         // when the list runs; its last 8 bytes carry this record's frame number, which a second recorded copy
-        // lands in the readback buffer. A slot is only taken again once the GPU has landed its frame's number
-        // (executed: this record's copy, and every earlier one in the queue, has run) - so the many networks a
-        // multi-pass stack records into one not-yet-submitted command list each keep their own tables, however
-        // many there are.
+        // lands in the readback buffer. A slot is only taken again once that number has landed (copied: this
+        // record's copy, and every earlier one in the queue, has run) - so the many networks a multi-pass stack
+        // records into one not-yet-submitted command list each keep their own tables, however many there are.
+        // The parameters are all the sequence reads from it, so a later dispatch of the same frame does not
+        // keep the slot held: only the record that reads it does.
         const uint64_t frame = frames_;
         b->refresh_copied(frame);
+        // This record's execution token, into a slot whose previous holder the GPU has executed. A stack of many
+        // passes records that many frames into one still-unsubmitted list, so the block grows when the CPU has
+        // outrun it; the old one is retired behind the completion of the last record that reads it. Done before
+        // anything of this record is claimed, so a failure here leaves the stage exactly as it was.
+        if (frame >= b->token_slots && int64_t(frame - b->token_slots) > b->executed && b->exec_token) {
+            const uint64_t slots = b->token_slots * 2;
+            ID3D12Resource* grown = buffer(device_, D3D12_HEAP_TYPE_UPLOAD, slots * 8, D3D12_RESOURCE_STATE_GENERIC_READ, false);
+            void* tm = nullptr;
+            if (!grown || FAILED(grown->Map(0, nullptr, &tm)) || !tm) {
+                release(grown);
+                *why = "the execution completion token could not be made";
+                return false;
+            }
+            RetiredUse rt;
+            rt.net = current_shared_;
+            rt.upload = b->exec_token;
+            rt.frame = b->last_frame;   // the last record that reads the old block (-1: none did)
+            retire_upload_.push_back(std::move(rt));
+            b->exec_token = grown;
+            b->exec_token_map = static_cast<uint64_t*>(tm);
+            b->token_slots = slots;
+        }
         Built::Upload* slot_buf = nullptr;
         uint32_t slot_i = 0;
         for (auto& u : b->upload) {
@@ -740,10 +767,15 @@ public:
         b->last_frame = int64_t(frame);
         if (fs) fs->last_frame = int64_t(frame);
         slot_buf->owner[slot_i] = frame;
+        if (first) {
+            cmd->CopyBufferRegion(b->wgt, 0, b->wgt_upload, 0, b->wgt->GetDesc().Width);
+            transition(cmd, b->wgt, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
         const uint64_t slot_off = uint64_t(slot_i) * (b->slot_bytes + 8);
         uint8_t* ring = slot_buf->map + slot_off;
         std::memcpy(ring + b->slot_bytes, &frame, 8);
-        b->exec_token_map[frame % kDoneSlots] = frame;
+        const uint64_t token_off = (frame % b->token_slots) * 8;
+        b->exec_token_map[token_off / 8] = frame;
         std::vector<const Built::Kern*> kern(b->tables, nullptr);
         auto image_va = [&](Img m) {
             switch (m) {
@@ -878,7 +910,7 @@ public:
         // executing the entire model for this frame. Only then may retired networks, activations,
         // weights, and feature history buffers be freed by sweep().
         cmd->CopyBufferRegion(b->done, (kDoneSlots + uint64_t(frame % kDoneSlots)) * 8,
-                              b->exec_token, uint64_t(frame % kDoneSlots) * 8, 8);
+                              b->exec_token, token_off, 8);
         // After the frame (record_all): with motion, the latch is set (reset suppresses consumption,
         // it does not un-write the history), and the post block wrote this frame's history into the other
         // image (flip hcur). Without motion (temporal == nullptr in 0.0.8.1), latch and hcur are untouched.
@@ -958,7 +990,7 @@ private:
         }
     };
     struct RetiredUse {
-        std::shared_ptr<Built> net;          // keeps the Built (and its mapped done_map) alive
+        std::shared_ptr<Built> net;          // keeps the Built (and its mapped completion buffers) alive
         std::shared_ptr<void> hold;          // the resource itself (FeatureState)
         ID3D12Resource* upload = nullptr;   // set when this entry owns a raw upload buffer to Release()
         int64_t frame = -1;                 // the last frame whose commands use it (-1: none recorded)
