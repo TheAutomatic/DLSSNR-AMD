@@ -270,6 +270,17 @@ int main(int argc, char** argv) {
                     VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
         }
 
+        // The uploads are their own submission: a frame's history needs the previous frame submitted first.
+        vkEndCommandBuffer(cmd);
+        {
+            VkSubmitInfo us{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            us.commandBufferCount = 1; us.pCommandBuffers = &cmd;
+            if (vkQueueSubmit(vkctx().queue, 1, &us, fence) != VK_SUCCESS ||
+                vkWaitForFences(vkctx().device, 1, &fence, VK_TRUE, 60000000000ull) != VK_SUCCESS) {
+                std::printf("the uploads did not submit\n");
+                return 18;
+            }
+        }
         nr::renodx::StageConfig sc;
         sc.shaders = root + "\\dlssnr-amd\\shaders\\renodx";
         sc.width = width; sc.height = height;
@@ -352,45 +363,57 @@ int main(int argc, char** argv) {
             grab(proxy, bproxy);
             grab(neural, bneural);
         };
-        passes = stage.record(cmd, sf, net);
-        std::printf("stage recorded %u pass(es)\n", passes);
-        barrier(output, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                VK_PIPELINE_STAGE_TRANSFER_BIT);
-        vkCmdCopyImageToBuffer(cmd, output, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, down, 1, &region);
-        vkEndCommandBuffer(cmd);
-        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
-        if (vkQueueSubmit(vkctx().queue, 1, &si, fence) != VK_SUCCESS ||
-            vkWaitForFences(vkctx().device, 1, &fence, VK_TRUE, 60000000000ull) != VK_SUCCESS) {
-            std::printf("submit failed\n");
-            return 9;
-        }
-        {
-            void* m = nullptr;
-            vkMapMemory(vkctx().device, down_mem, 0, bytes, 0, &m);
-            const std::string path = std::string(argv[4]) + "\\reference_frame0.bin";
-            if (FILE* f = std::fopen(path.c_str(), "wb")) {
-                std::fwrite(m, 1, size_t(bytes), f);
-                std::fclose(f);
-                std::printf("reference output written to %s\n", path.c_str());
+        // Two frames: the second one runs with history, so a first-frame noise initialisation can be told apart
+        // from an arithmetic difference.
+        for (int fi = 0; fi < 2; ++fi) {
+            vkBeginCommandBuffer(cmd, &bi2);
+            vkResetFences(vkctx().device, 1, &fence);
+            passes = stage.record(cmd, sf, net);
+            barrier(output, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT);
+            vkCmdCopyImageToBuffer(cmd, output, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, down, 1, &region);
+            barrier(output, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_READ_BIT,
+                    VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+            vkEndCommandBuffer(cmd);
+            VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
+            if (vkQueueSubmit(vkctx().queue, 1, &si, fence) != VK_SUCCESS ||
+                vkWaitForFences(vkctx().device, 1, &fence, VK_TRUE, 60000000000ull) != VK_SUCCESS) {
+                std::printf("submit failed (frame %d)\n", fi);
+                return 9;
             }
-            vkUnmapMemory(vkctx().device, down_mem);
-        }
-        if (const char* sd = std::getenv("NR_STAGE_DUMP"); sd && sd[0]) {
-            const VkBuffer bufs[2] = {bproxy, bneural};
-            const VkDeviceMemory mems[2] = {bproxy_mem, bneural_mem};
-            const char* names[] = {"vulkan_proxy.bin", "vulkan_neural.bin"};
-            for (int i = 0; i < 2; ++i) {
+            char ref_name[64];
+            std::snprintf(ref_name, sizeof ref_name, "reference_frame%d.bin", fi);
+            {
                 void* m = nullptr;
-                if (vkMapMemory(vkctx().device, mems[i], 0, bbytes, 0, &m) == VK_SUCCESS) {
-                    const std::string path = std::string(sd) + "\\" + names[i];
-                    if (FILE* f = std::fopen(path.c_str(), "wb")) {
-                        std::fwrite(m, 1, size_t(bbytes), f);
-                        std::fclose(f);
-                        std::printf("boundary written to %s\n", path.c_str());
+                vkMapMemory(vkctx().device, down_mem, 0, bytes, 0, &m);
+                const std::string path = std::string(argv[4]) + "\\" + ref_name;
+                if (FILE* f = std::fopen(path.c_str(), "wb")) {
+                    std::fwrite(m, 1, size_t(bytes), f);
+                    std::fclose(f);
+                    std::printf("reference output written to %s\n", path.c_str());
+                }
+                vkUnmapMemory(vkctx().device, down_mem);
+            }
+            if (const char* sd = std::getenv("NR_STAGE_DUMP"); sd && sd[0]) {
+                const VkBuffer bufs[2] = {bproxy, bneural};
+                const VkDeviceMemory mems[2] = {bproxy_mem, bneural_mem};
+                const char* names[] = {"vulkan_proxy", "vulkan_neural"};
+                for (int i = 0; i < 2; ++i) {
+                    void* m = nullptr;
+                    if (vkMapMemory(vkctx().device, mems[i], 0, bbytes, 0, &m) == VK_SUCCESS) {
+                        char nm[64];
+                        std::snprintf(nm, sizeof nm, "%s_f%d.bin", names[i], fi);
+                        const std::string path = std::string(sd) + "\\" + nm;
+                        if (FILE* f = std::fopen(path.c_str(), "wb")) {
+                            std::fwrite(m, 1, size_t(bbytes), f);
+                            std::fclose(f);
+                            std::printf("boundary written to %s\n", path.c_str());
+                        }
+                        vkUnmapMemory(vkctx().device, mems[i]);
                     }
-                    vkUnmapMemory(vkctx().device, mems[i]);
                 }
             }
         }
