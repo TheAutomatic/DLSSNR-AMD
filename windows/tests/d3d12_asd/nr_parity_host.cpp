@@ -330,7 +330,11 @@ int main(int argc, char** argv) {
             e.target = neural;
             e.reset = reset;
             e.feature = uint64_t(k) + 1;
+            // The ASD route's own settings (dlssnr-amd-asd.ini: NetNoiseEveryFrame 1, automatic mask off), so the
+            // two boundaries are compared under the same controls and not just the same proxy.
             nr::Controls controls;
+            controls.noise_every_frame = true;
+            controls.automatic_mask = false;
             rt.record_engine(cmd, e, controls);
             // The network's input and answer, recorded in the same command buffer.
             const auto grab = [&](const nr::ColourFrame& src, VkBuffer dst) {

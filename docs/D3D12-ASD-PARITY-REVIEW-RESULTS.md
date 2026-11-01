@@ -150,8 +150,14 @@ W*H*8 字节，不截断；逐通道 max/mean/RMSE/p50/p90/p99/不同像素，fl
 | 网络出口 neural | 差 mean 0.0045–0.0064、max 0.064–0.109、p99 0.022–0.025（单位：纹理值 0..1）；alpha 完全相同 |
 
 结论：**差异起点在网络内部**（proxy 完全一致，说明 encode/guide/输入链一致）；把网络输出喂给编解码后才放大为
-最终帧的 30–38/1023。下一步是匹配网络侧的配置（`noise_every_frame`、控件、temporal 参数），再决定这是配置差
-还是 ACO/DXIL 之外的实现差。
+最终帧的 30–38/1023。
+
+已排除的配置差：把参考侧 `Controls` 对齐到 ASD 的配置（`noise_every_frame=true`、`automatic_mask=false`）后，
+proxy 仍逐位一致、neural 的差几乎不变（mean 0.0054–0.0072、max 0.074–0.102、p99 0.026–0.029）。两条路线的
+网络规模也一致（71 dispatches、23 kernels、working extent 3840x2176、同一 small model）。
+
+下一步：两侧都跑**第二帧**（有历史）再比对——ASD 第一帧多 1 个 noise job（`+1 noise`），若第二帧差收敛，
+差异来自首帧噪声场初始化；若不收敛，则需逐段（pre/attn/post）定位。
 
 抓取不影响输出：开关两次的 frame0/1/2 哈希完全相同（`8DCA…/9E91…/5ED5…`）。
 `hand_over_mark()` 必须在 `run_between` 之前取（已在头注释更正）。
