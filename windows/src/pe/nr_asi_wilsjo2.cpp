@@ -161,7 +161,7 @@ nr::dlssnr::Controls6 controls_of(const w2::PassControls& pc, bool noise = false
 // (windows/build/build_wilsjo2_d3d12.sh) - created by the D3D12 driver as ordinary compute pipelines, as 0.0.8.1 has the
 // Vulkan driver compile them; the network through nr::dlssnr::evaluate_d3d12, i.e. the ASD backend's ACO network.
 // The layout is the Vulkan one's: t0..t3 (SRVs, static linear-clamp samplers s0..s3), u4 / u5 (UAVs), the constants at
-// t6 (a root SRV into an upload ring). Passes (fast) and anything else not listed falls back to the Vulkan bridge.
+// t6 (a root SRV into an upload ring). Passes (fast) compiles its HLSL compute passes at run time.
 }  // namespace
 namespace native {   // with the stage (nr_asi_wilsjo2_d3d12.hpp)
 
@@ -448,7 +448,7 @@ public:
         return ok;
     }
     bool has(w2::Mode mode) const override { return nstage_ ? nstage_->has(mode) : g_stage && g_stage->has(mode); }
-    bool has_fast() const override { return nstage_ ? false : !g_stage || g_stage->has_fast(); }
+    bool has_fast() const override { return nstage_ ? nstage_->has_fast() : !g_stage || g_stage->has_fast(); }
     bool stage_failed() const override { return nstage_ ? false : g_stage_retry.blocked(); }
     w2::PassReady pass(uint32_t k, const w2::PassControls& pc, uint32_t mw, uint32_t mh) override {
         if (k < o_.models.size() && o_.models[k]) return w2::PassReady::kReady;
@@ -683,7 +683,6 @@ std::string native_refusal(ID3D12GraphicsCommandList* cmd, ID3D12Device* device,
         return off;
     }();
     if (native_off) return "W2Native = 0 (dlssnr-amd-asd.ini, A/B test)";
-    if (w2::fast_requested(s)) return "Passes (fast) is not on the D3D12 route (ASD)";
     const auto readable = [](ID3D12Resource* r, const char* what) -> std::string {
         if (!r) return std::string("the ") + what + " is missing";
         const D3D12_RESOURCE_DESC d = r->GetDesc();

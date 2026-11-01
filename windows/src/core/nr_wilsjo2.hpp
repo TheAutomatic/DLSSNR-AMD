@@ -490,6 +490,8 @@ Constants copy_constants(Mode mode, uint32_t sx, uint32_t sy, uint32_t dx, uint3
 
 class Stage {
 public:
+    struct FastImage { uint32_t binding; Image image; };
+
     // Another API's programs behind the same interface (the .asi's native D3D12 route, M5 v2: the same programs
     // compiled by the D3D12 driver; nr_asi_wilsjo2.cpp). An Image there names that API's resource; the
     // VkCommandBuffer handed to record() is not used.
@@ -497,6 +499,9 @@ public:
         virtual ~Backend() = default;
         virtual void record(const Dispatch&) = 0;   // throws as record() does
         virtual bool has(Mode mode) const = 0;
+        virtual bool has_fast() const { return false; }
+        virtual void record_fast(uint32_t program, const FastImage* images, uint32_t count, const void* push,
+                                 uint32_t bytes, uint32_t gx, uint32_t gy) {}
         virtual void end_recording() {}
     };
     explicit Stage(std::unique_ptr<Backend> other);
@@ -518,7 +523,6 @@ public:
     // each with its own bindings (sampled images and storage images by binding number) and push block. Records one
     // dispatch of gx x gy groups, with a barrier after it. Throws as record() does.
     bool has_fast() const;
-    struct FastImage { uint32_t binding; Image image; };
     void record_fast(VkCommandBuffer, uint32_t program, const FastImage* images, uint32_t count, const void* push,
                      uint32_t bytes, uint32_t gx, uint32_t gy);
 
