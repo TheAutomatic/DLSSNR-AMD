@@ -1,0 +1,161 @@
+# ACO Vulkan 桥接与原生 D3D12：离线性能诊断、修复与审计计划
+
+日期：2026-11-02。无人值守夜间后续任务：前一正确性计划的离线集成验证完成后，由同一执行 agent 自动衔接本文，不等待用户确认。
+
+## 执行顺序与目标
+
+先完成：
+C:\Users\Kenny\Downloads\wt-d3d12-asd-wiring\docs\D3D12-ASD-PARITY-REVIEW-PLAN.md
+
+以其修复后的正确版本为起点，离线比较：
+A = 原 Windows D3D12 → Vulkan 桥接 → ACO 模型 → 返回 D3D12。
+B = 离线宿主提供的 D3D12 对象 → ASD/PSDB 装载的 ACO 模型 → D3D12 输出；后端接收传入对象的方式与产品路径一致。
+
+找出 B 相对 A 的收益、退化和没有实现好的环节；根据实测差异定位后修复，再做同条件复测。既要保留全路径收益，也要把网络计算、包装转换、跨 API 同步、CPU 录制和内存分开解释。不得通过跳过处理、改变画质/历史/精度或少跑算子取得所谓性能提升。
+
+启动时在本文进度表引用上一计划的实际完成证据；若仍有确定的正确性故障，先修故障再计正式性能。已有通过证据直接复用，不重复整套正确性审查。
+
+## 全程离线、自主执行
+
+用户不参与。由 agent 自行准备输入、搭建或扩展两条真实路线的离线宿主、构建、执行、分段诊断、修复、复测和整理证据。没有游戏运行、菜单操作、用户提供截图或人工确认的前置步骤；正确性计划的离线集成通过即可进入正式性能测量，不等待 PBZ 实机通过。
+
+使用现有捕获案例或由 agent 生成固定 seed 的动态图像/guide/曝光/历史序列，记录来源、规则与哈希；缺输入就自行生成，不等待用户。测试进程自行提供 D3D12 设备、command list 与资源，并调用真实后端/桥接入口。此次不启动游戏、不向游戏目录部署、不修改游戏配置。
+
+仅处理本任务范围内的等价实现与性能修复。需要改变产品语义的实验不纳入本轮，直接留作明确的后续事项；不用它阻断其他诊断或要求用户夜间决策。进程超时/失败自动留证，定位修复后继续；无法自行恢复的环境问题记录并跳过相关依赖，继续独立工作，最后统一报告。
+
+## 工作区与资料位置
+
+- 实现 worktree：C:\Users\Kenny\Downloads\wt-d3d12-asd-wiring
+- 分支：feat/d3d12-asd-wiring
+- 本计划：C:\Users\Kenny\Downloads\wt-d3d12-asd-wiring\docs\D3D12-ASD-PERFORMANCE-REVIEW-PLAN.md
+- 文档创建时 HEAD：117e53d8a5ccaddc7a3280052e4f91cd63c28a08；真正测量以开始测量时固定的源码快照为准。
+- 旧 main 源码参考：C:\Users\Kenny\Downloads\DLSSNR-AMD-mochizuki，main 1336d50ace388d5819f372640a00a6cb9be75ea2。
+- 0081 成套模型/record/模板：C:\Users\Kenny\Downloads\DLSSNR-AMD-Vulkan-Windows-0.0.8.1-win11-lang-preview-x86_64\dlssnr-amd
+- ASD 原始实验及已有模型对照产物：C:\Users\Kenny\Downloads\amd-d3d12-aco-lab
+- 当前离线 harness：C:\Users\Kenny\Downloads\wt-d3d12-asd-wiring\artifacts\windows\asd-harness
+- 测试入口：C:\Users\Kenny\Downloads\wt-d3d12-asd-wiring\windows\tests\d3d12_asd\nr_d3d12_asd_test.cpp
+- 构建入口：C:\Users\Kenny\Downloads\wt-d3d12-asd-wiring\windows\build\build_d3d12_asd_test.sh
+
+计时与执行参照（均在 worktree 下的 windows\src）：
+
+- core\nr_runtime.cpp：模型本体、原 Vulkan runtime 的逐帧/逐 pass 计时。
+- core\nr_renodx.cpp：原 RenoDX 包装与 stage/network 的时间区间。
+- pe\nr_pe_session.cpp：read_outer_timing、read_stage_timing、run_renodx、begin_recording。
+- pe\nr_pe_bridge.cpp：D3D12/Vulkan 交接、共享资源与同步。
+- pe\nr_d3d12_asd_net.cpp：B 的图录制、alpha、现有时间戳与完成追踪。
+- pe\nr_d3d12_asd_backend.cpp、pe\nr_renodx_d3d12.cpp：B 的输入输出转换、前后处理与包装。
+- pe\nr_asi_wilsjo2.cpp、pe\nr_asi_wilsjo2_d3d12.hpp：wilsjo2 流程；只在实际差异需要时扩展。
+
+上一计划给出了 Linux/Windows 参考文件与 SDK/工具路径。继续使用已安装工具，不先做下载/新 profiler 平台工程。
+
+## 进度表
+
+| 阶段 | 状态 | 工作与必须留下的证据 |
+|---|---|---|
+| Q0 正确性版本交接 | 部分完成：设备错误已离线修复并 3 帧通过（`3de941e`/`694de0f`）；首帧可重复性未解决，正式计时前需处理 | 引用已通过案例、源码/二进制/配置身份，保留未提交修改快照 |
+| Q1 同条件离线 A/B 宿主 | 待执行 | 两条真实完整路径，同 D3D12 输入/输出边界；case.json、route/dispatch/输出核对 |
+| Q2 最小分段计时 | 待执行 | 完整边界、CPU、GPU、同步各自定义；计时源码、有效性与开销记录 |
+| Q3 初始基线测量 | 待执行 | 成对交替 A/B 原始逐帧样本、汇总、首次/稳态分开、输出证据 |
+| Q4 差异定位 | 待执行 | 按贡献排序的差异表、必要细粒度诊断、对源码的具体解释 |
+| Q5 针对性修复 | 待执行 | 每项单独的前后补丁/二进制、同条件速度与正确性复测；失败尝试也保留 |
+| Q6 最终复核与审计包 | 待执行 | A基线、B原版、B修复版同条件结果及完整 manifest、重现命令、未解决项 |
+
+执行 agent 完成一项就更新本表，附本地证据绝对路径；不只写“通过/快了”。
+
+## Q0/Q1：比较对象必须真正等价
+
+优先复用上一计划离线通过的 PBZ 等价案例与固定输入（捕获或自主生成）：4K/HDR10/format 24、同一输入输出原位关系、同 RenoDX 设置和模型。以该单一真实案例作为首轮，不先铺所有分辨率/模型矩阵。
+
+两边固定以下身份：模型与权重哈希、ACO record 集合、实际 lowered 图/融合配置、图像/工作尺寸、格式和颜色单位、曝光和白点、controls、噪声 seed、motion/depth 子矩形及缩放、历史初态与逐帧 reset/输入序列、pass 数、预处理/后处理、alpha/grade。记录内核变体和 dispatch 数；有意的路线实现差异单独解释，不能默默换成另一计算负载。
+
+A 必须真的经过旧 bridge，从相同 D3D12 输入边界出发，并完成回到 D3D12 的输出交接。仅对比“纯 Vulkan 网络时间”和“B 完整帧时间”不成立。B 必须实际执行 ACO，不能测到 fallback、占位 copy、等待构建或原样放行的帧。留下实际路由、调用数、内核身份及输出检查结果。
+
+优先让同一个离线宿主明确选择两条路线；若用两个 exe，则共享输入/案例格式和计时契约，保存两套构建配置。不要为了测 A 修改 baseline 算法，或在“修桥接基线”时让 A 负载悄悄变化。
+
+先使单帧与最短历史序列输出按既有正确性标准一致；之后正式计时使用可重复、会变化的固定输入序列，避免只测静态帧/空历史。输入可预先驻留显存，磁盘读取/上传输入不计入逐帧稳态，除非真实路径每帧确实需要该操作。
+
+## Q2：计时边界与诊断字段
+
+| 环节 | 两边都应记录什么 | 用途 |
+|---|---|---|
+| 冷启动/首次使用 | 注册、PSDB/PSO 或 Vulkan pipeline、图 lowering、权重打包/上传、第一次执行；CPU wall 与 GPU 可测部分分开 | 解释启动卡顿，不能混入稳态 |
+| 输入交接 | D3D12 源资源到路径内部可读输入；复制/转换字节数、GPU 时间、提交/等待 | 测 A 桥接成本和 B 线性化成本 |
+| 前处理 | HDR/SDR decode、曝光/白点、Preprocess、RenoDX encode、noise 初始化/每帧 noise | 检查包装实现是否比旧路径昂贵 |
+| ACO 模型 | 每 pass 网络 GPU 时间，alpha 单列或明确包含；内核数、dispatch/grid、barrier 数 | 区分机器码本体与执行包装差异 |
+| 后处理/输出 | decode/resolve/look/grade/alpha、写回与回到共同 D3D12 输出状态 | 比较完整可用结果，而非中途结果 |
+| 提交与同步 | 每帧提交数、跨 API fence/queue wait、CPU 等待、空洞/串行化、完成延迟 | 定位额外同步是否抵消移除桥接的收益 |
+| CPU 热路径 | evaluate/record wall time，分配、descriptor 写入、参数表生成/复制/轮询；必要时拆子段 | 找每帧不必要工作 |
+| 显存与搬运 | 持久/临时分配、峰值预算使用、每帧实际搬运字节、缓存/历史数量及增长 | 防止用泄漏或重复存储换取短期结果 |
+| 完整共同边界 | D3D12 输入 ready 到 D3D12 输出完成的端到端 wall/延迟；稳态吞吐另列 | 最终路线收益的依据 |
+
+先粗分段，只对解释不了的主要差异增加算子族/单 dispatch 诊断。不要在开始时对每个微小 helper 都加重型计时。
+
+计时正确性要求：
+
+- CPU 使用单调高分辨率时钟；GPU 使用各 API/队列真实 timestamp 频率/有效位。保存原始 tick 与转换系数。
+- D3D12 和 Vulkan 的时间戳不能直接跨时钟域相减。未做有效校准时，只比较各域内 duration，跨 API 等待用 CPU wall 和提交/同步证据解释。
+- 计时 query/结果存储按实际 GPU 完成回收；不可沿用“过 N 次 evaluate 就算完成”的方法。未完成、失败、fallback 样本要显式标记，不读陈旧值。
+- 完整延迟测量可在共同输出终点等待；另有代表实际帧数在途的稳态吞吐模式。逐 dispatch/逐阶段 fence 等待只用于定位，不能把这种强制串行的结果冒充正式性能。
+- GPU 各段存在重叠时不把它们简单相加作为总耗时，也不将 CPU record 时间相加到 GPU 总时间。用时间线/依赖说明缺口。
+- 正式时间段关闭 debug layer、GPU validation、全量命令流水、逐帧 printf、同步张量读回等定位开销；记录实际开关。保留等价正确性检查在计时区外。两条路线的测量开销尽量对称，并用轻量/关闭细分计时的对照核实开销，不能删掉实际必须的同步来获得好成绩。
+
+## Q3：最小可靠测量流程
+
+1. 固定并保存 A 与 B 未优化版本的源码、完整构建命令、二进制、配置、输入与 reference 身份。先跑已有正确性 smoke，确认实际工作量一致。
+2. 冷启动单独记录，注明新进程、磁盘缓存/PSDB/driver cache 状态。不要清空用户全局驱动缓存；必要时使用专用 sandbox。启动准备与 steady state 分开。
+3. 预热直到 pipeline/图构建结束，稳定执行同一固定输入序列；预热帧数量与退出依据写入结果。丢弃 warmup 的原始数据也保留并标注，而不是删除。
+4. 正式运行先用约 300 帧为一个块、三组成对 A/B 块，顺序交替（AB、BA、AB）；这是初始采样方案，不是要求对每个修复重铺大矩阵。若案例太慢可缩减并记录，若波动淹没差异才补样本。
+5. 记录适配器真实身份/LUID、驱动、OS/runtime、时钟/温度/功耗限制及能取得的状态、时间和其他 GPU 负载。两路线串行；正式测量不同时进行重 CPU 编译或运行游戏。遇到用户游戏停止自己的 benchmark，不停游戏。
+6. 输出每块样本数、均值、中位数、p95/p99、离散程度和成对差异。保留全部原始样本，不只选最快一次，不无声删除异常帧；异常分类、剔除理由和含/不含异常的结果都能复查。
+7. 对 A/B 的每段报告绝对 ms 与 B-A、相对变化；对最终性能结论同时给端到端与吞吐。差异落在当前波动内就标“尚不能区分”，不指定任意百分比保证 native 必须更快。
+
+不要只截图 NR Control 的平滑均值作证据；也不把离线模型 ms 换算成游戏 FPS 并声称实机收益。
+
+## Q4/Q5：从证据找到实现差异，再修
+
+先按实际时间贡献排序，优先定位 B 的总成本、异常尖峰或显著退化。典型排查方向是待核实假设，不是预定必须全部修改的清单：
+
+- ACO 图工作量是否真的相同，ASD 是否某个载体退回 HLSL，variant/融合/grid 是否多做了计算。
+- 同一 ACO 本体差距是否来自 VGPR/LDS/wave/WGP/float mode、PAL 入口/元数据、descriptor/addressing/cache 配置、额外 table 或资源搬运。
+- native 的 texture↔linear buffer、HDR/曝光/前后处理是否重复做，复制字节和临时资源是否超出原逻辑所需。
+- 是否有额外 barrier、每帧查询/分配、shader/PSO 重建、描述符重写、GPU 完成扫描、CPU→GPU 表复制、flush/wait，或吞吐被错误串行化。
+- bridge 的成本到底在共享/同步/转换还是网络，不因名称先认定它必然慢；B 本体更慢但端到端更快也要分别记录。
+
+每个确定瓶颈先写：现象与数值 → 源码来源 → 预期改动 → 正确性风险 → 最小验证。随后做单一或紧密关联的修复；保存修改前结果，保留原版二进制，不能覆盖 baseline。
+
+每项修复复测同案例、同计时边界、同负载。至少检查实际输出与所涉及的历史/颜色语义，并与原始 B 以及固定 A 基线比较。不能通过降低精度、改模型、少跑 pass、关闭历史/噪声/前后处理、违反 barrier/生命周期要求提速。若发现只有改变产品语义才能取得的收益，记录为后续建议并保持现有语义，不在夜间等待用户决策。
+
+发现无收益、变慢或画面变化时，保留失败证据并撤回该实验修改；不要只保留成功尝试。细粒度定位工具改变时序的结果只解释瓶颈，最终收益由正常执行模式复核。
+
+## Q6：足够后期审查的证据包
+
+统一根目录：
+C:\Users\Kenny\Downloads\wt-d3d12-asd-wiring\artifacts\d3d12-performance-review
+
+每次测量创建唯一 run-id 子目录，目录内至少包含：
+
+- manifest.json：UTC/本地时区、A/B/修复身份、case/parent-run、源码提交和未提交 diff、所有二进制/脚本/配置/输入/权重/ACO/PSDB 的 SHA256、工具版本、设备/驱动/runtime、命令行、环境开关、缓存/预热/采样条件。
+- source/：测量代码与修复 patch、未跟踪的必要源码、生成步骤；commit 之外的工作树变更必须可还原，不能只记一个 HEAD。
+- case.json 与输入序列/初始状态描述：尺寸、格式、模型、权重布局、controls、历史/reset/seed、motion/depth/exposure，实际图清单与各路线行为。
+- build.log、run.stdout/stderr、原始路由/错误记录；记录退出码与失败运行，不能清理掉“不好看”的样本。
+- samples.csv 或 jsonl：逐 run/block/frame/pass/stage 的原始 CPU/GPU tick、duration、是否有效、排除理由、提交/等待/搬运计数；附字段与计时边界定义。
+- summary.json 和 report.md：成对汇总、波动、完整边界/各段贡献、结论与局限；每条性能结论能定位到 run-id 和原始行。
+- correctness/：输出哈希、必要输出/边界样本、比较方法与误差结果；修复前后均留证。
+- 只有出现关键差异才保存额外 GPU/队列时间线、单算子 trace；标明诊断开销和采集命令，不要求无差别采所有 trace。
+- checksums.sha256：对整个证据清单校验；汇总能从 raw samples 通过保存的脚本重新生成。
+
+原始 A、原始 B、每个 candidate 的目录不覆盖。大型输入/权重可引用本地不可变文件及哈希，缺失时给重建方式；不要把 NVIDIA DLL/权重或含它们的包提交到 git 或默认公开发布。保留所需本地二进制，不能只留无法复原的哈希。
+
+最终可分享审计包放：
+C:\Users\Kenny\Downloads\wt-d3d12-asd-wiring\artifacts\d3d12-performance-review\audit-package
+
+公开前按实际内容移除第三方权重/私人现场信息；这不影响本地完整证据保留。体积大时分卷/引用本地资产，保留校验清单，不删关键失败产物。
+
+持久结果说明：
+C:\Users\Kenny\Downloads\wt-d3d12-asd-wiring\docs\D3D12-ASD-PERFORMANCE-REVIEW-RESULTS.md
+
+最终表格：环节 | A基线 ms | B原版 ms | B修复版 ms | 差值/波动 | 负载与输出一致性 | 代码改动 | 原始证据路径。另列完整输入到输出延迟、吞吐、初始化、显存峰值与尚未解释的差异。
+
+## 给执行 agent 的指令
+
+自主完成 D3D12-ASD-PARITY-REVIEW-PLAN.md 的全部离线步骤并引用正确性证据，然后自动执行本文 Q0→Q6，直至诊断、修复、复测和证据交付完成；全程不安排用户操作或阶段确认。实现真正经过 ACO bridge 和直接 D3D12 的同条件离线对照；先粗分段找差异，再增加必要诊断，按证据修代码。保留修改前、每次候选及最终结果的源码/二进制/输入身份、原始样本和数值对齐证据，使后续 agent 能复算和审查。不要预设 native 必须更快，不以跳步骤或改变画质换性能，不把定位模式的强制同步算成正式结果。每完成一阶段更新进度表及绝对证据路径。
