@@ -116,10 +116,11 @@
 | 对比（R10G10B10A2，通道绝对值，3840x2160） | R max/mean | G max/mean | B max/mean |
 |---|---|---|---|
 | 参考(Vulkan, ACO Mode) vs D3D12-ASD(ACO) | 32 / 1.14 | 34 / 1.05 | 41 / 2.47 |
-| 参考(Vulkan, ACO Mode) vs D3D12-ASD(驱动 DXIL) | 222 / 16.06 | 144 / 11.63 | 247 / 43.99 |
+| 参考(Vulkan, ACO Mode) vs D3D12-ASD(无 PSDB：载体) | 222 / 16.06 | 144 / 11.63 | 247 / 43.99 |
 
-读数：**ACO + D3D12 路线与参考路线的误差比 DXIL 路线低一个数量级**，说明 stage 的 host 逻辑与网络接线一致；
-残余 ~1/1023 归因未做（需要逐层对照）。对照仅用于**正确性**：参考宿主是纯 Vulkan，**不是**
+读数：**ACO + D3D12 路线与参考路线接近**，而"无 PSDB"的路线差得多。后者的读数**不是编译器差异**：那一路
+跑的是 ASD 的 carrier，按设计不写任何输出（实验室 `docs/ACO-D3D12-ASD-PLAN.md` §2"载体本身不写任何输出"），
+所以它只说明"没有网络"时输出是什么样子。残余差异（ACO vs ACO）归因未做。对照仅用于**正确性**：参考宿主是纯 Vulkan，**不是**
 D3D12→Vulkan 共享资源/fence 的 bridge，不能拿它的时间当桥接或 ACO 的性能。
 
 ## 真实桥接 A/B（D3D12 ↔ Vulkan 共享纹理/fence，完整 stage）
@@ -132,10 +133,10 @@ colour/output/motion/depth 共享图像 → 参考 `nr::renodx::Stage` 在共享
 |---|---|---|---|
 | 桥接输出 vs 纯 Vulkan 参考宿主 | 0 / 0.000 | 0 / 0.000 | 0 / 0.000 |
 | 桥接输出 vs D3D12-ASD(ACO) | 30 / 1.12 | 36 / 1.00 | 38 / 2.30 |
-| 桥接输出 vs D3D12-ASD(驱动 DXIL) | 221 / 16.24 | 144 / 11.85 | 242 / 43.97 |
+| 桥接输出 vs D3D12-ASD（无 PSDB：载体，不写输出） | 221 / 16.24 | 144 / 11.85 | 242 / 43.97 |
 
 读数：桥接交接**逐位不改变**参考路线的结果（与参考宿主完全一致），说明共享纹理/fence 与 job 顺序正确；
-桥接(ACO) 与 D3D12-ASD(ACO) 的差仍在 ~1/1023 量级，DXIL 路线差一个数量级。**这不是性能测量**：
+桥接(ACO) 与 D3D12-ASD(ACO) 的差 mean 1.0–2.3、max 30–38/1023（≈3.7% 满量程），**不能**笼统称为"一致"。**这不是性能测量**：
 还没有多帧计时、没有同 HDR preprocess/resolve 的 A/B 计时，也没有帧时间数据；`P4-bridge-host-run.txt` 为完整日志。
 
 ## 首个差异定位（网络入口/出口，同帧同配置）
@@ -169,3 +170,13 @@ proxy 仍逐位一致、neural 的差几乎不变（mean 0.0054–0.0072、max 0
 
 抓取不影响输出：开关两次的 frame0/1/2 哈希完全相同（`8DCA…/9E91…/5ED5…`）。
 `hand_over_mark()` 必须在 `run_between` 之前取（已在头注释更正）。
+
+## 校正：ASD 路径上"无 PSDB"不是第二条网络实现
+
+ASD 的 PSDB 记录缺失时，驱动执行的是 **carrier**（读全部 root constants、**不写任何输出**，实验室
+`docs/ACO-D3D12-ASD-PLAN.md` §2）。用 `NR_TEST_FORCE_CANARY=1`（无 PSDB override）抓到的 `neural` 是
+RGB=0、alpha=1，正好是这个行为，而不是"DXIL 编译的网络"。因此：
+
+- 之前的"ACO vs DXIL/HLSL 差一个数量级"**不是编译器或精度差异**，只是"有网络 vs 无网络"；
+- ASD 路线上网络只有 ACO 一种；与 Vulkan 参考的对比正是 ACO vs ACO；
+- 本文件里所有"DXIL"字样已改为"载体/无 PSDB"。
