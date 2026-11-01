@@ -279,13 +279,14 @@ cmp -s <(cd artifacts/windows/asi/shaders/wilsjo2 && sha256sum -- *.spv) <(cd "$
 # dlssnr-amd-asd/: the native D3D12 ASD backend (M5). Optional: NR_ASD_DIR points to a directory holding the SODB,
 # PSDB and dlssnr-amd-asd.ini. If NR_ASD_TOOLS is also given, builds the reprofile tool from nr_d3d12_asd_test_619.exe
 # and bundles the vendor compiler DLLs from that folder.
-if [[ -n "${NR_ASD_DIR:-}" && -d "$NR_ASD_DIR" ]]; then
-    asd_src=$(realpath -- "$NR_ASD_DIR")
+asd_dir="${NR_ASD_DIR:-artifacts/ref/asd-data}"
+if [[ -d "$asd_dir" ]]; then
     asd_pkg="$pkg/dlssnr-amd-asd"
     mkdir -p -- "$asd_pkg"
-    cp -r -- "$asd_src"/* "$asd_pkg/"
-    if [[ -n "${NR_ASD_TOOLS:-}" && -d "$NR_ASD_TOOLS" ]]; then
-        tools_src=$(realpath -- "$NR_ASD_TOOLS")
+    cp -r -- "$asd_dir"/* "$asd_pkg/"
+    tools_dir="${NR_ASD_TOOLS:-artifacts/ref/asd-tools}"
+    if [[ -d "$tools_dir" ]]; then
+        tools_src=$(realpath -- "$tools_dir")
         mkdir -p -- "$asd_pkg/reprofile"
         bash windows/build/build_d3d12_asd_test.sh "$out/asd_reprofile" > /dev/null
         cp -- "$out/asd_reprofile/nr_d3d12_asd_test_619.exe" "$asd_pkg/reprofile/dlssnr-amd-asd-reprofile.exe"
