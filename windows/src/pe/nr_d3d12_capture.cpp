@@ -163,6 +163,16 @@ void start(const std::string& game_folder, bool wanted, bool wanted_debug_layer)
         const HRESULT r = D3D12GetDebugInterface(IID_PPV_ARGS(&debug));
         if (SUCCEEDED(r) && debug) {
             debug->EnableDebugLayer();
+            // GPU-based validation runs the validation on the GPU as well, which is what catches a call that Close()
+            // accepted but the driver rejects at execution. NR_CAPTURE_GPU_VALIDATION=1: it costs frames.
+            wchar_t gpu_val[4] = L"";
+            if (GetEnvironmentVariableW(L"NR_CAPTURE_GPU_VALIDATION", gpu_val, 4) && gpu_val[0] == L'1') {
+                if (ID3D12Debug1* d1 = nullptr; SUCCEEDED(debug->QueryInterface(IID_PPV_ARGS(&d1))) && d1) {
+                    d1->SetEnableGPUBasedValidation(TRUE);
+                    d1->Release();
+                    nr::pe::log("[capture] GPU-based validation on");
+                }
+            }
             debug->Release();
             debug_layer = true;
             nr::pe::log("[capture] D3D12 debug layer on (DebugLayer=1): messages are captured below");

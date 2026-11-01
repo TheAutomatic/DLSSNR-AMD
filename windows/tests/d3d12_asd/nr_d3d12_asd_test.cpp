@@ -18,6 +18,7 @@
 #include "nr_d3d12_net_plan.hpp"
 #include "nr_dlssnr_model.hpp"
 #include "nr_renodx.hpp"
+#include "nr_renodx_d3d12.hpp"
 #include <dxgi1_6.h>
 #include "nr_pe_d3d12split.hpp"
 
@@ -669,6 +670,122 @@ int renodx_run(int argc, char** argv) {
     return 0;
 }
 
+
+// ---- stage: the RenoDX D3D12 stage alone, under validation -----------------------------------------------
+// No ACO network (its canary and the debug layer/DRED cannot both be in play: the layer makes the driver ignore
+// the precompiled pipelines the canary compares). The stage's own commands are what this exercises: 4K, format 24,
+// in place, UAV, the shipped settings. The net callback copies in->out so the pass still runs end to end.
+//
+//   stage [W H] [game folder]
+std::wstring widen(const char* s) {
+    if (!s) return {};
+    const int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, nullptr, 0);
+    std::wstring w(size_t(n ? n - 1 : 0), L'\0');
+    if (n > 1) MultiByteToWideChar(CP_UTF8, 0, s, -1, w.data(), n);
+    return w;
+}
+int stage_run(int argc, char** argv) {
+    const uint32_t W = argc > 2 ? uint32_t(std::atoi(argv[2])) : 3840, H = argc > 3 ? uint32_t(std::atoi(argv[3])) : 2160;
+    const std::wstring game = argc > 4 ? widen(argv[4])
+                                       : L"C:\\Program Files (x86)\\Steam\\steamapps\\common\\PBZ\\platform\\steam";
+    wchar_t here[MAX_PATH] = L"";
+    GetModuleFileNameW(nullptr, here, MAX_PATH);
+    if (wchar_t* slash = std::wcsrchr(here, L'\\')) *slash = 0;
+    char here8[MAX_PATH * 3] = "";
+    WideCharToMultiByte(CP_UTF8, 0, here, -1, here8, sizeof here8, nullptr, nullptr);
+    AddVectoredExceptionHandler(1, &harness_veh);
+    nr::pe::capture::start(here8, true, true);   // debug layer + DRED, before the device
+
+    IDXGIFactory1* factory = nullptr;
+    IDXGIAdapter1* best = nullptr;
+    SIZE_T best_mem = 0;
+    if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) && factory) {
+        for (UINT i = 0;; ++i) {
+            IDXGIAdapter1* a = nullptr;
+            if (factory->EnumAdapters1(i, &a) != S_OK || !a) break;
+            DXGI_ADAPTER_DESC1 d{};
+            a->GetDesc1(&d);
+            if (d.VendorId == 0x1002 && d.DedicatedVideoMemory > best_mem) {
+                best_mem = d.DedicatedVideoMemory;
+                if (best) best->Release();
+                best = a;
+                continue;
+            }
+            a->Release();
+        }
+    }
+    if (!best) { log("[test] stage: no AMD adapter"); return 2; }
+    ID3D12Device* d = nullptr;
+    const HRESULT hr = D3D12CreateDevice(best, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&d));
+    log("[test] stage: D3D12CreateDevice 0x%08lX", static_cast<unsigned long>(hr));
+    if (FAILED(hr) || !d) return 3;
+
+    ID3D12CommandQueue* q = nullptr;
+    ID3D12CommandAllocator* a = nullptr;
+    ID3D12GraphicsCommandList* l = nullptr;
+    ID3D12Fence* f = nullptr;
+    D3D12_COMMAND_QUEUE_DESC qd{}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    d->CreateCommandQueue(&qd, IID_PPV_ARGS(&q));
+    d->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&a));
+    d->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, a, nullptr, IID_PPV_ARGS(&l));
+    d->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f));
+
+    D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = W; rd.Height = H; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+    rd.Format = DXGI_FORMAT_R10G10B10A2_UNORM; rd.SampleDesc.Count = 1;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    ID3D12Resource* frame_tex = nullptr;
+    if (FAILED(d->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                          IID_PPV_ARGS(&frame_tex))) || !frame_tex) { log("[test] stage: no frame texture"); return 4; }
+
+    nr::pe::asd::renodx12::Stage::Config cfg{};
+    cfg.device = d;
+    cfg.shaders = game + L"\\dlssnr-amd\\shaders\\renodx";
+    cfg.width = W; cfg.height = H; cfg.nr_width = W; cfg.nr_height = H;
+    cfg.frame_format = DXGI_FORMAT_R10G10B10A2_UNORM;
+    cfg.hdr_flag = true;
+    cfg.present = 2;
+    cfg.settings = nr::renodx::Settings{};
+    cfg.feature = 1;
+    std::string why;
+    auto stage = nr::pe::asd::renodx12::Stage::make(cfg, &why);
+    log("[test] stage: make -> %s (%s)", stage ? "ok" : "FAILED", why.c_str());
+    if (!stage) return 5;
+
+    nr::pe::asd::renodx12::Frame fr{};
+    fr.colour = frame_tex; fr.colour_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    fr.output = frame_tex; fr.output_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    fr.after_upscale = true;
+    fr.base_controls = nr::D3d12NetControls{};
+    fr.motion_without_depth = true;
+    fr.present_white_nits = 203.f;
+    auto net = [](uint32_t, uint64_t, const nr::D3d12NetControls&, const nr::pe::asd::NetTemporal&, ID3D12Resource* in,
+                  ID3D12Resource* out) {
+        return in != nullptr && out != nullptr;   // the stage's own commands are what is under test
+    };
+    const uint32_t passes = stage->record(l, fr, net);
+    log("[test] stage: record -> %u pass(es)", passes);
+
+    const HRESULT closed = l->Close();
+    log("[test] stage: Close 0x%08lX", static_cast<unsigned long>(closed));
+    ID3D12CommandList* lists[] = {l};
+    q->ExecuteCommandLists(1, lists);
+    q->Signal(f, 1);
+    HANDLE e = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    f->SetEventOnCompletion(1, e);
+    const bool done = WaitForSingleObject(e, 60000) == WAIT_OBJECT_0;
+    CloseHandle(e);
+    const HRESULT removed = d->GetDeviceRemovedReason();
+    log("[test] stage: submitted, fence %s, device reason 0x%08lX", done ? "signalled" : "TIMED OUT",
+        static_cast<unsigned long>(removed));
+    nr::pe::capture::drain();
+    if (FAILED(removed)) { nr::pe::capture::device_removed(removed); return 6; }
+    log("[test] stage: no device error");
+    return 0;
+}
+
 int main(int argc, char** argv) {
     const std::string mode = argc > 1 ? argv[1] : "early";
         auto wide = [](const char* a) { const int n = MultiByteToWideChar(CP_ACP, 0, a, -1, nullptr, 0);
@@ -698,6 +815,7 @@ int main(int argc, char** argv) {
             node_mask, argv[2]);
         return 0;
     }
+    if (mode == "stage") return stage_run(argc, argv);
     if (mode == "renodx") return renodx_run(argc, argv);
     if (mode == "targets" && argc > 2) {   // targets <exe file name> [app name]: the driver's precompile targets for it
         log("[targets] %s", asd::precompile_targets(wide(argv[2]), wide(argc > 3 ? argv[3] : "ACO public entry probe")).c_str());

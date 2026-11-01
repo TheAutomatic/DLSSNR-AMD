@@ -927,7 +927,9 @@ public:
         // record: every dispatch in plan order, a barrier after each.
         if (diag) capture::mark(cmd, L"NR: ACO network");
         cmd->SetComputeRootSignature(rs_);
-        for (uint32_t i = lo; i < b->tables; ++i) {
+        // With DispatchLimit only the first ones have a table and a kernel: the loop stops where they stop.
+        const uint32_t hi = limit ? std::min<uint32_t>(b->tables, base + limit) : b->tables;
+        for (uint32_t i = lo; i < hi; ++i) {
             const Built::Kern& k = *kern[i];
             const uint8_t* t = ring + uint64_t(i) * kTableBytes;
             uint32_t grid[3];
@@ -966,6 +968,15 @@ public:
             return true;
         }
         const UINT c[4] = {b->w, b->h, controls_.round_u8 ? 1u : 0u, 0u};
+        if (sched) {
+            char l[320];
+            std::snprintf(l, sizeof l,
+                          "frame %llu alpha pso %p rs %p consts %ux%u uav0 0x%llX uav1 0x%llX grid %ux%ux1",
+                          static_cast<unsigned long long>(frame), static_cast<void*>(alpha_pso_),
+                          static_cast<void*>(alpha_rs_), c[0], c[1], static_cast<unsigned long long>(out.va),
+                          static_cast<unsigned long long>(in.va), (b->w + 7) / 8, (b->h + 7) / 8);
+            capture::schedule(l);
+        }
         cmd->SetComputeRootSignature(alpha_rs_);
         cmd->SetPipelineState(alpha_pso_);
         cmd->SetComputeRoot32BitConstants(0, 4, c, 0);
