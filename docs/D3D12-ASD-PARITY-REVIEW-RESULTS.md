@@ -47,10 +47,21 @@
 - 非 UAV 入口状态：未运行。
 - resize / 多 pass / 特征回收边界的定向案例：未运行。
 - 输出与旧桥接数值对齐：未运行（桥接对照宿主待搭）。
-- 正常注册路径：**本机对离线宿主 exe 不可用**——`RegisterApplication` 返回 `E_HANDLE`（系统 Core 与
-  1.619.5 Agility Core 均如此，清空条目后亦同）；产品 exe（PBZ.exe）在同一台机器注册成功。
-  离线 ACO 运行因此保留测试专用 `force_canary`（只绕过驱动使用 ACO 二进制的门槛，不绕录制路径）。
-  证据：`P5-registration.md`、`P5-registration-agility619.txt`。
+- 正常注册路径：**本机此刻对所有 exe 都不可用**——实验室旧 `asd_probe.exe` 用它自己的路径（历史上成功过）
+  现在同样返回 `E_HANDLE`；换成 1.619.5 Agility Core、清空条目、换目录、换目标 exe 均无差别。
+  因此 `E_HANDLE` 不是宿主 exe 的属性，而是这台机器上 D3DSCR 存储的瞬时状态（实验室 `docs/ASD-PUBLIC-IMPORT.md`
+  §E_HANDLE 记过同样现象）。证据：`P5-registration.md`、`P5-registration-agility619.txt`。
+- 由此：**ACO 真实执行未验证**。`force_canary` 只改门控，不让驱动执行 ACO 二进制；71 次 dispatch 的 `S_OK`
+  与全部数值/历史/分离输出结论只证明**生产录制路径**（命令、资源、表、push、内存序）正确，不证明机器码结果。
+  机器码结果需要注册可用后重跑同一案例（计划：`PASS_ASD_ACO` 等价判据）。
+
+## 结论强度（读本文时先看）
+
+| 已证明 | 未证明 |
+|---|---|
+| 生产 D3D12 录制路径在真实设备上提交执行（`S_OK`，3 帧，ACO/HLSL 两条产出都存在） | 驱动实际执行 ACO 机器码（注册 `E_HANDLE`，canary `ASD_MISS`） |
+| 资源/状态/表/push/内存序与计划一致 | 与旧桥接的数值一致（桥接对照宿主未搭） |
+| 完成信号与退休生命周期（等 GPU 水位） | 多 pass / resize / 特征回收边界 |
 
 ## P1 资源契约（当前帧实际用到的资源）
 
