@@ -125,8 +125,7 @@ bool family_of(std::string k, Family* f) {
 
 constexpr uint32_t kTableBytes = 4096, kTablePushOff = 512, kTableGridOff = 640;
 constexpr uint32_t kRing = 16;        // upload slots a buffer; more buffers are added while every slot is held
-constexpr uint64_t kSlotHold = 64;    // evaluates an upload slot stays owned (the deferred-release cadence of
-                                      // this file: a game fences its lists within that many of its own evaluates)
+constexpr uint32_t kDoneSlots = 128;  // frame numbers the GPU lands in the readback buffer, a ring of these
 constexpr uint32_t kParamsBytes = 256;   // the temporal params (12 floats), after the frame's tables
 constexpr uint32_t kMaxFeatures = 8, kMaxExtents = 4;
 
@@ -218,17 +217,20 @@ struct Built {
     Kern t_pre, t_post, t_grade;                  // the temporal pre / post (t_grade.pso null: no Style grade)
     ID3D12Resource *act = nullptr, *wgt = nullptr, *wgt_upload = nullptr, *surf1 = nullptr, *depth = nullptr;
     ID3D12Resource* table = nullptr;
-    // The upload slots: ring buffers of kRing slots each, grown when every slot of every buffer is still held
-    // (a stack of many passes records that many networks into one not-yet-submitted command list). A slot is
-    // written by the CPU and read by the CopyBufferRegion of the same record(); it is only handed out again
-    // once kSlotHold evaluates have passed, by which every real game has fenced its lists through (it recycles
-    // its own command allocators on the same cadence).
+    // The upload slots: ring buffers of kRing slots each, grown while every slot of every buffer is still held.
+    // A slot is written by the CPU and read by the CopyBufferRegion of the same record(); its last 8 bytes carry
+    // the record's frame number, and a second recorded copy lands that number in `done_map`. A slot is handed
+    // out again only once its number is seen there: the GPU has then executed this record's copy (and every
+    // earlier one in the queue), however many records are still waiting in unsubmitted command lists.
     struct Upload {
         ID3D12Resource* buf = nullptr;
         uint8_t* map = nullptr;
-        std::vector<uint64_t> free_at;   // per slot: the evaluate count from which it may be reused
+        std::vector<uint64_t> owner;   // per slot: the frame that holds it, ~0ull = never used
     };
     std::vector<Upload> upload;
+    ID3D12Resource* done = nullptr;    // the frame numbers the GPU copied back, kDoneSlots of them
+    uint64_t* done_map = nullptr;
+    uint64_t executed = 0;             // the newest frame whose number is seen in done_map
     uint32_t tables = 0;                          // per frame: noise jobs + dispatches
     uint64_t slot_bytes = 0;                      // one frame's ring slot: the tables, then the params
     bool retargeted = false;
@@ -243,6 +245,8 @@ struct Built {
             if (u.map) u.buf->Unmap(0, nullptr);
             release(u.buf);
         }
+        if (done_map) done->Unmap(0, nullptr);
+        release(done);
         release(act); release(wgt); release(wgt_upload); release(surf1); release(depth); release(table);
     }
 };
@@ -348,6 +352,7 @@ std::shared_ptr<Built> build(ID3D12Device* device, const Carriers& carriers, ID3
     // t.depth: dummy fallback when depth is not provided (the pre block reads have_depth 0), bound as a valid image.
     b->depth = buffer(device, D3D12_HEAP_TYPE_DEFAULT, uint64_t(w) * h * 16, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
     b->tables = uint32_t(b->plan.noise.size() + b->plan.disp.size());
+    b->slot_bytes = uint64_t(b->tables) * kTableBytes + kParamsBytes;
     b->table = buffer(device, D3D12_HEAP_TYPE_DEFAULT, b->slot_bytes, D3D12_RESOURCE_STATE_COPY_DEST, true);
     if (!b->act || !b->wgt || !b->wgt_upload || !b->surf1 || !b->depth || !b->table) {
         *why = "the network memory could not be made"; return nullptr;
@@ -363,13 +368,21 @@ std::shared_ptr<Built> build(ID3D12Device* device, const Carriers& carriers, ID3
     std::vector<uint8_t>().swap(b->plan.weights);
     {
         Built::Upload u;
-        u.buf = buffer(device, D3D12_HEAP_TYPE_UPLOAD, b->slot_bytes * kRing, D3D12_RESOURCE_STATE_GENERIC_READ, false);
-        u.free_at.assign(kRing, 0);
+        u.buf = buffer(device, D3D12_HEAP_TYPE_UPLOAD, (b->slot_bytes + 8) * kRing, D3D12_RESOURCE_STATE_GENERIC_READ, false);
+        u.owner.assign(kRing, ~uint64_t(0));
         if (!u.buf) { *why = "the network memory could not be made"; return nullptr; }
         void* m = nullptr;
         if (FAILED(u.buf->Map(0, nullptr, &m)) || !m) { *why = "the table upload could not be mapped"; return nullptr; }
         u.map = static_cast<uint8_t*>(m);
         b->upload.push_back(std::move(u));
+    }
+    b->done = buffer(device, D3D12_HEAP_TYPE_READBACK, kDoneSlots * 8, D3D12_RESOURCE_STATE_COPY_DEST, false);
+    if (!b->done) { *why = "the completion readback could not be made"; return nullptr; }
+    {
+        void* m = nullptr;
+        if (FAILED(b->done->Map(0, nullptr, &m)) || !m) { *why = "the completion readback could not be mapped"; return nullptr; }
+        b->done_map = static_cast<uint64_t*>(m);
+        std::memset(b->done_map, 0xFF, kDoneSlots * 8);   // never a frame number
     }
     const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     nr::pe::log("[asd] network %s for %ux%u (working %ux%u): %zu dispatches, %zu kernels + temporal %s / %s%s, %zu noise jobs, "
@@ -633,25 +646,32 @@ public:
         // The tables of this frame: [noise jobs (first frame)] [every dispatch] [the params].
         const uint32_t n_noise = first ? uint32_t(b->plan.noise.size()) : 0;
         const uint32_t base = uint32_t(b->plan.noise.size());   // the dispatches' tables keep their place
-        // An upload slot of this record's own: the CPU writes it here and the CopyBufferRegion below reads it
-        // when the list runs. A slot is not reused until kSlotHold evaluates later, so the many networks a
-        // multi-pass stack records into one not-yet-submitted list each read their own tables.
+        // An upload slot of this record's own. The CPU writes it here and the CopyBufferRegion below reads it
+        // when the list runs; its last 8 bytes carry this record's frame number, which a second recorded copy
+        // lands in the readback buffer. A slot is only taken again once the GPU has landed its frame's number
+        // (executed: this record's copy, and every earlier one in the queue, has run) - so the many networks a
+        // multi-pass stack records into one not-yet-submitted command list each keep their own tables, however
+        // many there are.
+        const uint64_t frame = frames_;
+        for (uint32_t s = 0; s < kDoneSlots; ++s) {
+            const uint64_t v = b->done_map[s];
+            if (v != ~uint64_t(0) && v <= frame && (v % kDoneSlots) == s && v > b->executed) b->executed = v;
+        }
         Built::Upload* slot_buf = nullptr;
         uint32_t slot_i = 0;
         for (auto& u : b->upload) {
             for (uint32_t i = 0; i < kRing; ++i)
-                if (u.free_at[i] <= tick_) { slot_buf = &u; slot_i = i; break; }
+                if (u.owner[i] == ~uint64_t(0) || u.owner[i] <= b->executed) { slot_buf = &u; slot_i = i; break; }
             if (slot_buf) break;
         }
-        if (!slot_buf) {   // every slot still held (that many passes in flight): another buffer of them
+        if (!slot_buf) {   // every slot still in flight: another buffer of them, however many it takes
             Built::Upload u;
-            u.buf = buffer(device_, D3D12_HEAP_TYPE_UPLOAD, b->slot_bytes * kRing, D3D12_RESOURCE_STATE_GENERIC_READ, false);
+            u.buf = buffer(device_, D3D12_HEAP_TYPE_UPLOAD, (b->slot_bytes + 8) * kRing, D3D12_RESOURCE_STATE_GENERIC_READ, false);
             if (u.buf) {
                 void* m = nullptr;
                 if (SUCCEEDED(u.buf->Map(0, nullptr, &m)) && m) {
                     u.map = static_cast<uint8_t*>(m);
-                    u.free_at.assign(kRing, 0);
-                    u.free_at[0] = tick_ + kSlotHold;
+                    u.owner.assign(kRing, ~uint64_t(0));
                     b->upload.push_back(std::move(u));
                     slot_buf = &b->upload.back();
                     slot_i = 0;
@@ -660,14 +680,14 @@ public:
                 }
             }
         }
-        if (!slot_buf) {   // could not grow either: the oldest slot, as the old fixed ring would have done
+        if (!slot_buf) {   // could not grow either (out of memory): the oldest slot, as a fixed ring would
             slot_buf = &b->upload.front();
             slot_i = 0;
-        } else {
-            slot_buf->free_at[slot_i] = tick_ + kSlotHold;
         }
-        const uint64_t slot_off = uint64_t(slot_i) * b->slot_bytes;
+        slot_buf->owner[slot_i] = frame;
+        const uint64_t slot_off = uint64_t(slot_i) * (b->slot_bytes + 8);
         uint8_t* ring = slot_buf->map + slot_off;
+        std::memcpy(ring + b->slot_bytes, &frame, 8);
         std::vector<const Built::Kern*> kern(b->tables, nullptr);
         auto image_va = [&](Img m) {
             switch (m) {
@@ -749,6 +769,8 @@ public:
                               b->slot_bytes - uint64_t(lo) * kTableBytes);
         transition(cmd, b->table, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         b->table_uav = true;
+        // The slot's frame number back where the CPU can see it: once it lands, this record's copy has run.
+        cmd->CopyBufferRegion(b->done, uint64_t(frame % kDoneSlots) * 8, slot_buf->buf, slot_off + b->slot_bytes, 8);
 
         // The GPU time of the frame kRing frames ago in this timestamp slot, then this frame's.
         const uint32_t ts = uint32_t(frames_ % kRing);
