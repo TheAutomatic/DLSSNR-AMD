@@ -602,7 +602,30 @@ struct Backend {
     bool broken = false;   // something of the device's could not be made: the 0.0.8.1 path from now on
     std::string broken_why;
     uint64_t tick = 0;
-    std::vector<std::pair<uint64_t, IUnknown*>> retired;   // released 64 evaluates later (the GPU may still use them)
+    // The backend's own completion signal: a frame number copied into a readback buffer by the same command list that
+    // used the objects, so a retired stage or buffer is released only after the GPU ran past it. An evaluate count is
+    // not evidence: a stack records many frames into one list that may still be unsubmitted.
+    static constexpr uint32_t kDoneSlots = 128;
+    ID3D12Resource* token = nullptr;     // upload: the frame numbers to echo
+    uint64_t* token_map = nullptr;
+    uint32_t token_slots = 0;            // growable: a slot is rewritten only after its holder executed
+    ID3D12Resource* done = nullptr;      // readback: what the GPU echoed
+    uint64_t* done_map = nullptr;
+    uint64_t frames = 0;                 // frames recorded by this backend
+    int64_t executed = -1;               // newest frame the GPU finished
+    std::vector<std::pair<int64_t, ID3D12Resource*>> token_retired;   // grown-away token buffers
+    // A value the GPU has not written yet reads as ~0, and only a slot whose holder matches its own index is a
+    // completion: a frame number ahead of the newest record is a torn read, not evidence.
+    void refresh_executed() {
+        if (!done_map) return;
+        const uint64_t max_f = frames ? frames - 1 : 0;
+        for (uint32_t s = 0; s < kDoneSlots; ++s) {
+            const uint64_t v = done_map[s];
+            if (v != ~uint64_t(0) && v <= max_f && (v % kDoneSlots) == s && int64_t(v) > executed)
+                executed = int64_t(v);
+        }
+    }
+    std::vector<std::pair<int64_t, IUnknown*>> retired;   // frame that last used it
     // The RenoDX route's stages, one a feature (nr_pe_session.cpp's RenoDXEntry: its working resolution's debounce
     // and its stage, keyed by everything a change of takes a new one).
     struct RenodxEntry {
@@ -616,26 +639,79 @@ struct Backend {
     };
     std::map<uint64_t, RenodxEntry> renodx;
     // A replaced stage (an extent change) is released once the frames in flight are past it, like `retired`.
-    std::vector<std::pair<uint64_t, std::unique_ptr<renodx12::Stage>>> renodx_retired;
+    std::vector<std::pair<int64_t, std::unique_ptr<renodx12::Stage>>> renodx_retired;
 };
 Backend g;
 
-void retire(IUnknown* p) { if (p) g.retired.emplace_back(g.tick + 64, p); }
+// An upload or readback buffer of `bytes` in `state` (the completion pair).
+ID3D12Resource* heap_buffer(ID3D12Device* device, D3D12_HEAP_TYPE type, uint64_t bytes, D3D12_RESOURCE_STATES state) {
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = type;
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = bytes; rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+    rd.SampleDesc.Count = 1; rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ID3D12Resource* r = nullptr;
+    if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, state, nullptr, IID_PPV_ARGS(&r)))) return nullptr;
+    return r;
+}
+
+// The frame the object was last used in: the one about to be recorded (a replaced stage was used by the frame before,
+// so this is one frame of margin, never less).
+void retire(IUnknown* p) { if (p) g.retired.emplace_back(int64_t(g.frames), p); }
 void sweep() {
     ++g.tick;
+    g.refresh_executed();
     auto it = std::remove_if(g.retired.begin(), g.retired.end(), [](const auto& r) {
-        if (r.first > g.tick) return false;
+        if (g.executed < r.first) return false;
         r.second->Release();
         return true;
     });
     g.retired.erase(it, g.retired.end());
     auto rs = std::remove_if(g.renodx_retired.begin(), g.renodx_retired.end(), [](const auto& r) {
-        return r.first <= g.tick;
+        return g.executed >= r.first;
     });
     g.renodx_retired.erase(rs, g.renodx_retired.end());
+    auto rt = std::remove_if(g.token_retired.begin(), g.token_retired.end(), [](const auto& r) {
+        if (g.executed < r.first) return false;
+        r.second->Release();
+        return true;
+    });
+    g.token_retired.erase(rt, g.token_retired.end());
+}
+
+// Recorded at the end of every frame, after everything that uses a stage: the GPU copies this frame's number back,
+// and sweep() releases what an older frame used.
+void mark_frame(ID3D12GraphicsCommandList* cmd) {
+    if (!g.token || !g.token_map || !g.done) return;
+    const uint64_t frame = g.frames;
+    // Grow the token block before rewriting a slot that the GPU has not finished: a stack records many frames into
+    // one still-unsubmitted list, and reusing a slot would make the earlier frame's copy land in a later frame's
+    // number, so sweep() would believe work is done that has not run.
+    if (frame >= g.token_slots && int64_t(frame - g.token_slots) > g.executed) {
+        const uint64_t slots = uint64_t(g.token_slots) * 2;
+        ID3D12Resource* grown = heap_buffer(g.device, D3D12_HEAP_TYPE_UPLOAD, slots * 8, D3D12_RESOURCE_STATE_GENERIC_READ);
+        void* tm = nullptr;
+        if (!grown || FAILED(grown->Map(0, nullptr, &tm)) || !tm) {
+            release(grown);
+            return;   // no completion signal this frame: retirement simply waits (never less safe)
+        }
+        g.token_retired.emplace_back(int64_t(g.frames), g.token);   // the last record that reads the old block
+        g.token = grown;
+        g.token_map = static_cast<uint64_t*>(tm);
+        g.token_slots = uint32_t(slots);
+    }
+    // The upload block grows; the readback keeps kDoneSlots entries (copies run in queue order, so a readback slot
+    // is rewritten only after the copy into it has run).
+    const uint64_t up = (frame % g.token_slots) * 8;
+    const uint64_t rb = (frame % Backend::kDoneSlots) * 8;
+    g.token_map[up / 8] = frame;
+    cmd->CopyBufferRegion(g.done, rb, g.token, up, 8);
+    ++g.frames;
 }
 
 ID3D12Resource* linear_buffer(ID3D12Device* device, uint64_t bytes);   // (defined below drop_device)
+
 
 bool build(ID3D12Device* device, std::string* why) {
     D3D12_DESCRIPTOR_RANGE ranges[2]{};
@@ -698,6 +774,20 @@ bool build(ID3D12Device* device, std::string* why) {
     else g.network = std::make_unique<PlaceholderCopyNetwork>();
     const char* nwhy = "";
     if (!g.network->create(device, &nwhy)) { *why = std::string("the network: ") + nwhy; return false; }
+    // The completion pair: a frame number the GPU echoes back once the commands that used a retired object have run.
+    g.token = heap_buffer(device, D3D12_HEAP_TYPE_UPLOAD, Backend::kDoneSlots * 8, D3D12_RESOURCE_STATE_GENERIC_READ);
+    g.done = heap_buffer(device, D3D12_HEAP_TYPE_READBACK, Backend::kDoneSlots * 8, D3D12_RESOURCE_STATE_COPY_DEST);
+    g.token_slots = Backend::kDoneSlots;
+    if (!g.token || !g.done) { *why = "the backend's completion buffers could not be made"; return false; }
+    {
+        void* m = nullptr;
+        if (FAILED(g.token->Map(0, nullptr, &m)) || !m) { *why = "the backend's token buffer could not be mapped"; return false; }
+        g.token_map = static_cast<uint64_t*>(m);
+        m = nullptr;
+        if (FAILED(g.done->Map(0, nullptr, &m)) || !m) { *why = "the backend's readback could not be mapped"; return false; }
+        g.done_map = static_cast<uint64_t*>(m);
+        std::memset(g.done_map, 0xFF, Backend::kDoneSlots * 8);
+    }
     note_network(g.network->name());
     D3D12_HEAP_PROPERTIES hp{};
     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -765,6 +855,17 @@ void drop_device() {
     retire(g.neutral_mv);
     retire(g.rs_prep); retire(g.prep_meter); retire(g.prep_forward); retire(g.prep_back);
     retire(g.lin_prep_p); retire(g.prep_state);
+    if (g.token_map) g.token->Unmap(0, nullptr);
+    if (g.done_map) g.done->Unmap(0, nullptr);
+    release(g.token); release(g.done);
+    for (auto& r : g.token_retired) r.second->Release();
+    // The lists belong to this device: nothing of it is in flight once drop_device is called (the same reason the
+    // resources above are released here), and a later device must not inherit watermarks from this one.
+    for (auto& r : g.retired) r.second->Release();
+    g.retired.clear();
+    g.renodx_retired.clear();
+    g.token_retired.clear();
+    g.token_map = nullptr; g.done_map = nullptr; g.token_slots = 0; g.frames = 0; g.executed = -1;
     g.rs = nullptr; g.to_linear = g.from_linear = g.to_motion = g.to_depth = nullptr; g.heap = nullptr;
     g.lin_in = g.lin_out = g.lin_mv = g.lin_depth = nullptr;
     g.neutral_mv = nullptr;
@@ -890,7 +991,7 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
         c.present = uint32_t(f.renodx_present);
         c.settings = s;
         c.feature = f.feature;
-        g.renodx_retired.emplace_back(g.tick + 64, std::move(e.stage));   // its surfaces may still be in flight
+        g.renodx_retired.emplace_back(int64_t(g.frames), std::move(e.stage));   // released once the GPU ran past this frame
         auto made = renodx12::Stage::make(c, &why);
         if (!made) return fallback("the RenoDX route: " + why);
         e.stage = std::move(made);
@@ -901,7 +1002,7 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
     if (!e.stage->set(s)) {
         // Relative <-> absolute units (NRLinearUnitNits, NRSourceEncoding): a stage made with the new settings
         // takes the frame now (0.0.8.1 retires the old one and waits a frame; the bridge is never used here).
-        g.renodx_retired.emplace_back(g.tick + 64, std::move(e.stage));
+        g.renodx_retired.emplace_back(int64_t(g.frames), std::move(e.stage));
         renodx12::Stage::Config c;
         c.device = f.device;
         c.shaders = widen(nr::pe::module_folder()) + L"\\dlssnr-amd\\shaders\\renodx";
@@ -1062,7 +1163,11 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
     capture::drain();
     if (g.broken) return fallback(g.broken_why);
 
-    if (renodx) return renodx_frame(f, color_state, output_state);
+    if (renodx) {
+        const bool ran = renodx_frame(f, color_state, output_state);
+        if (ran) mark_frame(f.cmd);
+        return ran;
+    }
 
     const D3D12_RESOURCE_DESC sd = f.color->GetDesc(), dd = f.output->GetDesc();
     if (sd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || dd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
@@ -1439,6 +1544,7 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
     cmd->ResourceBarrier(n, b);
     nr::pe::split::restore(cmd, state);
 
+    mark_frame(f.cmd);
     char line[200];
     std::snprintf(line, sizeof line, "ran %ux%u%s: %s", w, h, in_place ? " in place" : "",
                   net_ok ? g.network->name() : (std::string("the network recorded nothing (") + nwhy + "): input copied back").c_str());
