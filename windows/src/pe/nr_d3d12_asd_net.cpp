@@ -127,7 +127,7 @@ constexpr uint32_t kTableBytes = 4096, kTablePushOff = 512, kTableGridOff = 640;
 constexpr uint32_t kRing = 16;        // upload slots a buffer; more buffers are added while every slot is held
 constexpr uint32_t kDoneSlots = 128;  // frame numbers the GPU lands in the readback buffer, a ring of these
 constexpr uint32_t kParamsBytes = 256;   // the temporal params (12 floats), after the frame's tables
-constexpr uint32_t kMaxFeatures = 8, kMaxExtents = 4;
+constexpr uint32_t kMaxFeatures = 64, kHardMaxFeatures = 128, kMaxExtents = 4;
 
 void put_buf(uint32_t* d, uint64_t va, uint64_t bytes) {
     d[0] = uint32_t(va);
@@ -205,6 +205,7 @@ struct FeatureState {
     uint32_t seed = 0;
     uint32_t domain = 0;
     uint64_t used = 0;
+    int64_t last_frame = -1;
     ~FeatureState() { release(hist[0]); release(hist[1]); }
 };
 
@@ -232,6 +233,14 @@ struct Built {
     uint64_t* done_map = nullptr;
     int64_t executed = -1;              // the newest frame seen in done_map; -1: none has landed yet (frame 0's
     int64_t last_frame = -1;            // the newest frame recorded into this Built; -1: none
+    void refresh_executed(uint64_t max_f) {
+        if (!done_map) return;
+        for (uint32_t s = 0; s < kDoneSlots; ++s) {
+            const uint64_t v = done_map[s];
+            if (v != ~uint64_t(0) && v <= max_f && (v % kDoneSlots) == s && int64_t(v) > executed)
+                executed = int64_t(v);
+        }
+    }
     uint32_t tables = 0;                          // per frame: noise jobs + dispatches
     uint64_t slot_bytes = 0;                      // one frame's ring slot: the tables, then the params
     bool retargeted = false;
@@ -508,7 +517,8 @@ public:
                 alias->used = tick_;
             }
             if (done_key == key || ask_key == key) {
-                current_ = b.get();
+                current_shared_ = b;
+                current_ = current_shared_.get();
                 name_ = "the ACO network, " + b->plan.model + ", " + std::to_string(b->plan.disp.size()) + " dispatches, temporal";
                 nr::pe::log("[asd] network ACTIVE for %ux%u: %s (frames of this extent now run on the ASD network)", w, h, name_.c_str());
                 return true;
@@ -572,39 +582,42 @@ public:
         const auto& tp = b->plan.temporal;
         // This frame's feature (Runtime::record_all): its state, made on its first frame.
         FeatureState* fs = nullptr;
-        {
-            auto& slot = b->features[temporal_.feature];
-            if (!slot) {
-                // Evict only what has gone stale (not used since the previous evaluate): a multi-pass stack
-                // runs each pass on a feature of its own every frame, and those must never evict each other -
-                // the Vulkan runtime keeps every active feature's history too. The kMaxFeatures ceiling only
-                // guards against unbounded growth; past it the stalest entry goes.
+        if (auto it = b->features.find(temporal_.feature); it != b->features.end() && it->second) {
+            fs = it->second.get();
+        } else {
+            // Evict inactive features only when at or above kMaxFeatures.
+            // A feature is active if used within recent evaluates (kActiveWindow): a multi-pass
+            // stack of up to 30 passes evaluates that many times per frame.
+            constexpr uint64_t kActiveWindow = 128;
+            if (b->features.size() >= kMaxFeatures) {
                 auto lru = b->features.end();
-                for (auto it = b->features.begin(); it != b->features.end(); ++it) {
-                    if (!it->second) continue;
-                    if (it->second->used >= tick_) continue;   // live in this evaluate
-                    if (b->features.size() < kMaxFeatures) break;   // room to spare: keep it
-                    if (lru == b->features.end() || it->second->used < lru->second->used) lru = it;
+                for (auto fit = b->features.begin(); fit != b->features.end(); ++fit) {
+                    if (!fit->second) continue;
+                    if (tick_ >= fit->second->used && (tick_ - fit->second->used) < kActiveWindow) continue;
+                    if (lru == b->features.end() || fit->second->used < lru->second->used) lru = fit;
+                }
+                if (lru == b->features.end() && b->features.size() >= kHardMaxFeatures) {
+                    for (auto fit = b->features.begin(); fit != b->features.end(); ++fit)
+                        if (fit->second && (lru == b->features.end() || fit->second->used < lru->second->used)) lru = fit;
                 }
                 if (lru != b->features.end()) {
                     plain_seeds_.erase(lru->first);
+                    const int64_t f_last = lru->second ? lru->second->last_frame : -1;
                     RetiredUse r;
+                    r.net = current_shared_;
                     r.hold = std::move(lru->second);
-                    r.net = b;
-                    r.frame = frames_;   // its history may still be read by the commands up to this frame
+                    r.frame = f_last;
                     retired_features_.push_back(std::move(r));
                     b->features.erase(lru);
                 }
-
-                auto& fresh = b->features[temporal_.feature];
-                fresh = std::make_shared<FeatureState>();
-                for (auto& hh : fresh->hist)
-                    hh = buffer(device_, D3D12_HEAP_TYPE_DEFAULT, uint64_t(b->w) * b->h * 16, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
-                if (!fresh->hist[0] || !fresh->hist[1]) { b->features.erase(temporal_.feature); *why = "the history images could not be made"; return false; }
-                fs = fresh.get();
-            } else {
-                fs = slot.get();
             }
+
+            auto fresh = std::make_shared<FeatureState>();
+            for (auto& hh : fresh->hist)
+                hh = buffer(device_, D3D12_HEAP_TYPE_DEFAULT, uint64_t(b->w) * b->h * 16, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
+            if (!fresh->hist[0] || !fresh->hist[1]) { *why = "the history images could not be made"; return false; }
+            fs = fresh.get();
+            b->features[temporal_.feature] = std::move(fresh);
         }
         fs->used = tick_;
         // The gate and the seed, the runtime's rule (nr_runtime.cpp lines 2420-2440 and 2626-2630):
@@ -667,11 +680,7 @@ public:
         // multi-pass stack records into one not-yet-submitted command list each keep their own tables, however
         // many there are.
         const uint64_t frame = frames_;
-        for (uint32_t s = 0; s < kDoneSlots; ++s) {
-            const uint64_t v = b->done_map[s];
-            if (v != ~uint64_t(0) && v <= frame && (v % kDoneSlots) == s && int64_t(v) > b->executed)
-                b->executed = int64_t(v);
-        }
+        b->refresh_executed(frame);
         Built::Upload* slot_buf = nullptr;
         uint32_t slot_i = 0;
         for (auto& u : b->upload) {
@@ -707,6 +716,7 @@ public:
             return false;
         }
         b->last_frame = int64_t(frame);
+        if (fs) fs->last_frame = int64_t(frame);
         slot_buf->owner[slot_i] = frame;
         const uint64_t slot_off = uint64_t(slot_i) * (b->slot_bytes + 8);
         uint8_t* ring = slot_buf->map + slot_off;
@@ -821,10 +831,9 @@ public:
         if (first) {
             b->retargeted = true;
             RetiredUse r;
-            r.hold = current_shared_;   // keeps the Built (and its watermark) alive
+            r.net = current_shared_;
             r.upload = b->wgt_upload;
-            r.net = b;
-            r.frame = frame;   // this record's CopyBufferRegion reads it
+            r.frame = int64_t(frame);
             retire_upload_.push_back(std::move(r));
             b->wgt_upload = nullptr;
         }
@@ -913,14 +922,22 @@ private:
     // into one still-unsubmitted command list; a tick_ counter would release under it).
     struct RetiredNet {
         std::shared_ptr<Built> net;   // kept alive: its watermark is what releases it
-        bool done() const { return net->last_frame < 0 || net->executed >= net->last_frame; }
+        bool done() {
+            if (!net || net->last_frame < 0) return true;
+            net->refresh_executed(uint64_t(net->last_frame));
+            return net->executed >= net->last_frame;
+        }
     };
     struct RetiredUse {
-        std::shared_ptr<void> hold;   // the resource (FeatureState, or the Built that owns a raw upload buffer)
-        ID3D12Resource* upload = nullptr;   // set when hold is the Built owning this upload buffer
-        Built* net = nullptr;               // the Built whose commands use it
-        uint64_t frame = 0;                 // the last frame whose commands use it
-        bool done() const { return net->executed >= int64_t(frame); }
+        std::shared_ptr<Built> net;          // keeps the Built (and its mapped done_map) alive
+        std::shared_ptr<void> hold;          // the resource itself (FeatureState)
+        ID3D12Resource* upload = nullptr;   // set when this entry owns a raw upload buffer to Release()
+        int64_t frame = -1;                 // the last frame whose commands use it (-1: none recorded)
+        bool done() {
+            if (!net || net->last_frame < 0 || frame < 0) return true;
+            net->refresh_executed(net->last_frame >= 0 ? uint64_t(net->last_frame) : 0);
+            return net->executed >= frame;
+        }
     };
     std::vector<RetiredNet> retired_;
     std::vector<RetiredUse> retired_features_;
