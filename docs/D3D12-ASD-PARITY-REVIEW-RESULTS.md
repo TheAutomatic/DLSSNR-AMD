@@ -192,3 +192,13 @@ RGB=0、alpha=1，正好是这个行为，而不是"DXIL 编译的网络"。因�
   两者的**重采样结果未比对**——已加 `Stage::Frame::capture_mv/capture_depth` 钩子（D3D12 侧可抓），
   参考侧需要等价的内部钩子，这是下一步。
 - 因此"proxy 一致"不等于"guide 一致"；在当前全零 guide 下，剩余差异不能归因于 guide 输入，只能继续往网络内部分段。
+
+## 调度口径与真实映射
+
+- 两条路线**同一份 lowered plan**：ASD 侧日志 `71 dispatches, 23 kernels + temporal pre/post`；参考侧构建
+  `25 pipelines` = 23 kernels + 2 temporal，"25"是流水线数、"71"是每帧 dispatch 数，不是两套不同的网络。
+- ASD 侧的逐 dispatch 映射（内核名、grid、tag、table base）已在
+  `artifacts/d3d12-parity-review/P4-asd-dispatch-map.txt`（3 帧 214 行，约 71/帧）：
+  `vitattn / gemmvqkvnorm / gemmvact / gemmprojw / gemmprojc / gemmproj / ffwd3w / attn / noisefield / temporal`。
+- 参考侧 runtime 的 plan 没有内核名字段，逐 dispatch 名字无法直接对齐；下一步要在两个引擎里各加一个
+  **按索引 dump 该 dispatch 的 UAV** 的钩子（同一索引、同一帧），按"首个不一致"停止，而不是盲扫 71 层。
