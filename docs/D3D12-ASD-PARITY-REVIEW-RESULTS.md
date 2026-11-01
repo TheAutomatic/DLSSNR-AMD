@@ -275,3 +275,16 @@ pre 的一部分输出本来就在 **wgt**，下一步应抓 pre 之后的 wgt �
 即：ACO 包里的 pre 与 Windows 原生网络里的 pre 是**两份不同的 SPIR-V**；只有前者有 ACO 记录。ASD 侧的
 PSDB 由实验室流程生成，尚未从运行时侧证明它装载的是哪一个 ELF（第 1 项证据只完成了一半：记录身份已明确，
 两侧实际装载的 ELF 还需运行时取证）。
+
+## 决定性事实：两条路线跑的不是同一份着色器源码
+
+- `windows/shaders/rdna4/fswin_t.comp`（temporal pre 的源码，`pipelines.json:60,121`）与
+  `linux/shaders/rdna4/fswin_t.comp` **不同**：3663 vs 3651 行，`diff` 966 行（仓库设计如此：两棵树互不共用）。
+- 参考宿主走 ACO Mode，装载 `dlssnr-amd/aco/shaders`（Linux 构建的 SPIR-V，pre 的 sha `63396fd0…`，
+  记录名 `3ccbc35ad9ececb3`）；ASD 路线用 Windows 网络 SPIR-V（pre 的 sha `8c2c57bc…`）配 `net-carriers.bin`
+  的 ELF。
+- 因此 pre 输出 73.9% 的差异与"移植正确性"无直接关系：两侧执行的是**不同源码编译出的不同机器码**。
+
+要让 A/B 成为真正的移植对照，必须让两侧跑同一份 SPIR-V/记录：为参考侧组装 **Windows 着色器**的 ACO 包
+（记录键 = Windows SPIR-V 的 fnv64，ELF 来自 `net-carriers.bin`），或让参考侧不走 ACO、用同一份 Windows SPIR-V。
+在此之前，任何 A/B 数值差异都不能归因于 D3D12 移植。
