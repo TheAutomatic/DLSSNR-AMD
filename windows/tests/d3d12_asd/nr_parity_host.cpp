@@ -437,7 +437,8 @@ int main(int argc, char** argv) {
         }
         if (const char* pd = std::getenv("NR_RUNTIME_PRE_DUMP"); pd && pd[0]) {
             std::string cw;
-            const std::string path = std::string(pd) + "\\vulkan_pre.bin";
+            const char* off = std::getenv("NR_RUNTIME_PRE_OFF");
+            const std::string path = std::string(pd) + "\\vulkan_pre" + (off ? "_off" + std::string(off) : "") + ".bin";
             const bool wrote = rt.write_pre_capture(path, &cw);
             std::printf("pre capture %s (%s)\n", wrote ? "written" : "FAILED", cw.c_str());
         }

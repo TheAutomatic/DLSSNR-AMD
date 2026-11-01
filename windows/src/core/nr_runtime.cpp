@@ -2950,12 +2950,12 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
                     bb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
                     bb.srcQueueFamilyIndex = bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
                     bb.buffer = s.act.handle;
-                    bb.offset = 0;
+                    bb.offset = roff;
                     bb.size = bytes;
                     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
                                          0, nullptr, 1, &bb, 0, nullptr);
                     VkBufferCopy bc{};
-                    bc.srcOffset = 0;
+                    bc.srcOffset = roff;
                     bc.dstOffset = 0;
                     bc.size = bytes;
                     vkCmdCopyBuffer(cmd, s.act.handle, impl_->pre_cap, 1, &bc);
@@ -3021,7 +3021,6 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
                         bc.srcOffset = roff;
                         bc.dstOffset = 0;
                         bc.size = bytes;
-                        bc.srcOffset = roff;
                         vkCmdCopyBuffer(cmd, s.act.handle, impl_->kern_cap, 1, &bc);
                         bb.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
                         bb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;

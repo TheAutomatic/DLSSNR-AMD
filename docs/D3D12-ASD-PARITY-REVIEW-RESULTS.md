@@ -255,4 +255,10 @@ ELF（记录文件/PSDB 内容），而不是再比下游。
 的 448/960 MiB 有非零写入。结合参考侧 pre 的绑定表（`nr_runtime.cpp:1452`，pre 读 `act, act, wgt, wgt, wgt, act`），
 pre 的一部分输出本来就在 **wgt**，下一步应抓 pre 之后的 wgt 区域而不是继续扫 act。
 
-因此"pre 一致"到目前为止**不成立**；已确定的只有 noise 与 weights 逐字节一致。
+### 修正索引/偏移后的重建结果（两侧都修好）
+
+- D3D12：表索引 `i` 与 plan 索引 `tp.pre` 混淆，pre 抓取实际发生在 noise 之后、pre 之前 → 旧"全零"作废。
+- 参考：pre 抓取读了 `roff` 却把 `bb.offset`/`bc.srcOffset` 写成 0 → 旧偏移扫描结论作废。
+- 修正后同偏移 `act[534,773,760, +64 MiB)`、pre 之后：两侧都非零，但**内容不同**：
+  ASD sha256 `136de105…`、参考 `dfc867f8…`，49,602,675 / 67,108,864 字节不同（73.91%），f16 上 max|d| = 1.509。
+- 因此**首个不一致点在 temporal pre 的输出**（或它读取的输入）。已逐字节一致：noise、weights。

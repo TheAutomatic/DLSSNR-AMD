@@ -484,7 +484,8 @@ public:
             if (b->pre_dump && b->pre_dump_written) {
                 void* pm = nullptr;
                 if (SUCCEEDED(b->pre_dump->Map(0, nullptr, &pm)) && pm) {
-                    const std::string ppath = dir + "\\asd_pre.bin";
+                    const char* lo2 = std::getenv("NR_NET_PRE_OFF");
+                    const std::string ppath = dir + "\\asd_pre" + (lo2 ? "_off" + std::string(lo2) : "") + ".bin";
                     if (FILE* pf = std::fopen(ppath.c_str(), "wb")) {
                         std::fwrite(pm, 1, size_t(b->pre_dump_bytes), pf);
                         std::fclose(pf);
