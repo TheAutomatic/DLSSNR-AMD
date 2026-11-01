@@ -124,7 +124,8 @@ bool family_of(std::string k, Family* f) {
 }
 
 constexpr uint32_t kTableBytes = 4096, kTablePushOff = 512, kTableGridOff = 640;
-constexpr uint32_t kRing = 16;   // tables of 16 frames in the upload ring before one is written again
+constexpr uint32_t kRing = 16;        // upload slots a buffer; more buffers are added while every slot is held
+constexpr uint64_t kSlotHold = 3;     // evaluates an upload slot stays owned: a game fences its lists within a few
 constexpr uint32_t kParamsBytes = 256;   // the temporal params (12 floats), after the frame's tables
 constexpr uint32_t kMaxFeatures = 8, kMaxExtents = 4;
 
@@ -215,21 +216,33 @@ struct Built {
     std::map<std::string, Kern> kern;
     Kern t_pre, t_post, t_grade;                  // the temporal pre / post (t_grade.pso null: no Style grade)
     ID3D12Resource *act = nullptr, *wgt = nullptr, *wgt_upload = nullptr, *surf1 = nullptr, *depth = nullptr;
-    ID3D12Resource *table = nullptr, *ring = nullptr;
-    uint8_t* ring_map = nullptr;
+    ID3D12Resource* table = nullptr;
+    // The upload slots: ring buffers of kRing slots each, grown when every slot of every buffer is still held
+    // (a stack of many passes records that many networks into one not-yet-submitted command list). A slot is
+    // written by the CPU and read by the CopyBufferRegion of the same record(); it is only handed out again
+    // once kSlotHold evaluates have passed, by which every real game has fenced its lists through (it recycles
+    // its own command allocators on the same cadence).
+    struct Upload {
+        ID3D12Resource* buf = nullptr;
+        uint8_t* map = nullptr;
+        std::vector<uint64_t> free_at;   // per slot: the evaluate count from which it may be reused
+    };
+    std::vector<Upload> upload;
     uint32_t tables = 0;                          // per frame: noise jobs + dispatches
     uint64_t slot_bytes = 0;                      // one frame's ring slot: the tables, then the params
     bool retargeted = false;
     bool table_uav = false;                       // the table buffer's state: UNORDERED_ACCESS (else COPY_DEST)
-    uint32_t ring_slot = 0;
     uint64_t used = 0;
     int net = -1;
     std::map<uint64_t, std::shared_ptr<FeatureState>> features;
     ~Built() {
         for (auto& [n, k] : kern) release(k.pso);
         release(t_pre.pso); release(t_post.pso); release(t_grade.pso);
-        if (ring && ring_map) ring->Unmap(0, nullptr);
-        release(act); release(wgt); release(wgt_upload); release(surf1); release(depth); release(table); release(ring);
+        for (auto& u : upload) {
+            if (u.map) u.buf->Unmap(0, nullptr);
+            release(u.buf);
+        }
+        release(act); release(wgt); release(wgt_upload); release(surf1); release(depth); release(table);
     }
 };
 
@@ -335,20 +348,28 @@ std::shared_ptr<Built> build(ID3D12Device* device, const Carriers& carriers, ID3
     b->depth = buffer(device, D3D12_HEAP_TYPE_DEFAULT, uint64_t(w) * h * 16, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
     b->tables = uint32_t(b->plan.noise.size() + b->plan.disp.size());
     b->slot_bytes = uint64_t(b->tables) * kTableBytes + kParamsBytes;
-    b->table = buffer(device, D3D12_HEAP_TYPE_DEFAULT, b->slot_bytes, D3D12_RESOURCE_STATE_COPY_DEST, true);
-    b->ring = buffer(device, D3D12_HEAP_TYPE_UPLOAD, b->slot_bytes * kRing, D3D12_RESOURCE_STATE_GENERIC_READ, false);
-    if (!b->act || !b->wgt || !b->wgt_upload || !b->surf1 || !b->depth || !b->table || !b->ring) {
+    if (!b->act || !b->wgt || !b->wgt_upload || !b->surf1 || !b->depth || !b->table) {
         *why = "the network memory could not be made"; return nullptr;
     }
     for (ID3D12Resource* r : {b->act, b->wgt, b->surf1, b->depth, b->table})
         if ((r->GetGPUVirtualAddress() >> 48) != 0) { *why = "a buffer address above 48 bits"; return nullptr; }
-    void* m = nullptr;
-    if (FAILED(b->wgt_upload->Map(0, nullptr, &m)) || !m) { *why = "the weights upload could not be mapped"; return nullptr; }
-    if (wbytes) std::memcpy(m, b->plan.weights.data(), wbytes);
-    b->wgt_upload->Unmap(0, nullptr);
+    {
+        void* wm = nullptr;
+        if (FAILED(b->wgt_upload->Map(0, nullptr, &wm)) || !wm) { *why = "the weights upload could not be mapped"; return nullptr; }
+        if (wbytes) std::memcpy(wm, b->plan.weights.data(), wbytes);
+        b->wgt_upload->Unmap(0, nullptr);
+    }
     std::vector<uint8_t>().swap(b->plan.weights);
-    if (FAILED(b->ring->Map(0, nullptr, &m)) || !m) { *why = "the table ring could not be mapped"; return nullptr; }
-    b->ring_map = static_cast<uint8_t*>(m);
+    {
+        Built::Upload u;
+        u.buf = buffer(device, D3D12_HEAP_TYPE_UPLOAD, b->slot_bytes * kRing, D3D12_RESOURCE_STATE_GENERIC_READ, false);
+        u.free_at.assign(kRing, 0);
+        if (!u.buf) { *why = "the network memory could not be made"; return nullptr; }
+        void* m = nullptr;
+        if (FAILED(u.buf->Map(0, nullptr, &m)) || !m) { *why = "the table upload could not be mapped"; return nullptr; }
+        u.map = static_cast<uint8_t*>(m);
+        b->upload.push_back(std::move(u));
+    }
     const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     nr::pe::log("[asd] network %s for %ux%u (working %ux%u): %zu dispatches, %zu kernels + temporal %s / %s%s, %zu noise jobs, "
                 "weights %llu B, arena %llu B, built in %.2fs%s%s", b->plan.model.c_str(), w, h, b->plan.work_w, b->plan.work_h,
@@ -449,7 +470,12 @@ public:
         std::lock_guard<std::mutex> lock(shared_->m);
         if (shared_->done) {
             auto done = std::move(shared_->done);
+            // The build may have fallen back (CC_SMALL_FP8_EXPERIMENTAL -> CC_SMALL_FP8 when a kernel has no
+            // PSDB record). The result is registered under what it IS and under what was ASKED (shared_->bw/bh/
+            // bnet, still the request this build answered), so the next ask of either finds it instead of
+            // starting the same build again every frame.
             const auto done_key = std::make_tuple(done->w, done->h, done->net);
+            const auto ask_key = std::make_tuple(shared_->bw, shared_->bh, shared_->bnet);
             if (nets_.size() >= kMaxExtents) {
                 auto lru = nets_.begin();
                 for (auto it = nets_.begin(); it != nets_.end(); ++it) if (it->second->used < lru->second->used) lru = it;
@@ -459,7 +485,12 @@ public:
             auto& b = nets_[done_key];
             b = std::move(done);
             b->used = tick_;
-            if (done_key == key) {
+            if (ask_key != done_key) {   // a second name for the same net, not another extent
+                auto& alias = nets_[ask_key];
+                alias = b;
+                alias->used = tick_;
+            }
+            if (done_key == key || ask_key == key) {
                 current_ = b.get();
                 name_ = "the ACO network, " + b->plan.model + ", " + std::to_string(b->plan.disp.size()) + " dispatches, temporal";
                 nr::pe::log("[asd] network ACTIVE for %ux%u: %s (frames of this extent now run on the ASD network)", w, h, name_.c_str());
@@ -601,8 +632,41 @@ public:
         // The tables of this frame: [noise jobs (first frame)] [every dispatch] [the params].
         const uint32_t n_noise = first ? uint32_t(b->plan.noise.size()) : 0;
         const uint32_t base = uint32_t(b->plan.noise.size());   // the dispatches' tables keep their place
-        const uint64_t slot_off = uint64_t(b->ring_slot) * b->slot_bytes;
-        uint8_t* ring = b->ring_map + slot_off;
+        // An upload slot of this record's own: the CPU writes it here and the CopyBufferRegion below reads it
+        // when the list runs. A slot is not reused until kSlotHold evaluates later, so the many networks a
+        // multi-pass stack records into one not-yet-submitted list each read their own tables.
+        Built::Upload* slot_buf = nullptr;
+        uint32_t slot_i = 0;
+        for (auto& u : b->upload) {
+            for (uint32_t i = 0; i < kRing; ++i)
+                if (u.free_at[i] <= tick_) { slot_buf = &u; slot_i = i; break; }
+            if (slot_buf) break;
+        }
+        if (!slot_buf) {   // every slot still held (that many passes in flight): another buffer of them
+            Built::Upload u;
+            u.buf = buffer(device_, D3D12_HEAP_TYPE_UPLOAD, b->slot_bytes * kRing, D3D12_RESOURCE_STATE_GENERIC_READ, false);
+            if (u.buf) {
+                void* m = nullptr;
+                if (SUCCEEDED(u.buf->Map(0, nullptr, &m)) && m) {
+                    u.map = static_cast<uint8_t*>(m);
+                    u.free_at.assign(kRing, 0);
+                    u.free_at[0] = tick_ + kSlotHold;
+                    b->upload.push_back(std::move(u));
+                    slot_buf = &b->upload.back();
+                    slot_i = 0;
+                } else {
+                    release(u.buf);
+                }
+            }
+        }
+        if (!slot_buf) {   // could not grow either: the oldest slot, as the old fixed ring would have done
+            slot_buf = &b->upload.front();
+            slot_i = 0;
+        } else {
+            slot_buf->free_at[slot_i] = tick_ + kSlotHold;
+        }
+        const uint64_t slot_off = uint64_t(slot_i) * b->slot_bytes;
+        uint8_t* ring = slot_buf->map + slot_off;
         std::vector<const Built::Kern*> kern(b->tables, nullptr);
         auto image_va = [&](Img m) {
             switch (m) {
@@ -680,11 +744,10 @@ public:
         }
         const uint32_t lo = first ? 0 : base;
         if (b->table_uav) transition(cmd, b->table, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
-        cmd->CopyBufferRegion(b->table, uint64_t(lo) * kTableBytes, b->ring, slot_off + uint64_t(lo) * kTableBytes,
+        cmd->CopyBufferRegion(b->table, uint64_t(lo) * kTableBytes, slot_buf->buf, slot_off + uint64_t(lo) * kTableBytes,
                               b->slot_bytes - uint64_t(lo) * kTableBytes);
         transition(cmd, b->table, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         b->table_uav = true;
-        b->ring_slot = (b->ring_slot + 1) % kRing;
 
         // The GPU time of the frame kRing frames ago in this timestamp slot, then this frame's.
         const uint32_t ts = uint32_t(frames_ % kRing);

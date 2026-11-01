@@ -81,6 +81,7 @@ common=(-std=c++17 -O2 -DNDEBUG -DNR_BUILD_STAMP="\"$stamp\"" -Itoolchain/Vulkan
 "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_bridge.cpp -o "$out/bridge.o"
 "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_d3d12split.cpp -o "$out/d3d12split.o"
 "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_config.cpp -o "$out/config.o"
+"$cxx" "${common[@]}" -c windows/src/pe/nr_screenshot.cpp -o "$out/screenshot.o"
 # The ReShade add-on's session asks the ASD shell whether it is on (nr_pe_session.cpp, M5): its object too.
 "$cxx" "${common[@]}" -c windows/src/pe/nr_d3d12_asd.cpp -o "$out/d3d12_asd.o"
 # ReShade's headers include <Windows.h>; the case shim maps that onto mingw's.

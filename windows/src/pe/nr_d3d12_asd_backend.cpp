@@ -889,8 +889,10 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
         c.present = uint32_t(f.renodx_present);
         c.settings = s;
         c.feature = f.feature;
-        e.stage = renodx12::Stage::make(c, &why);
-        if (!e.stage) return fallback("the RenoDX route: " + why);
+        g.renodx_retired.emplace_back(g.tick + 64, std::move(e.stage));   // its surfaces may still be in flight
+        auto made = renodx12::Stage::make(c, &why);
+        if (!made) return fallback("the RenoDX route: " + why);
+        e.stage = std::move(made);
         e.w = w; e.h = h; e.nw = nw; e.nh = nh; e.format = sf;
         e.hdr = f.renodx_hdr_flag; e.present = f.renodx_present;
         nr::pe::log("[nr] the RenoDX route (D3D12): feature #%u at %ux%u (network %ux%u)", unsigned(f.feature), w, h, nw, nh);
