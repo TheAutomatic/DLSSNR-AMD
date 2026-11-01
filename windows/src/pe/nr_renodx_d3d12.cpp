@@ -1156,6 +1156,11 @@ struct Stage::Impl {
                   uint32_t dwords, uint32_t gx, uint32_t gy) {
         const bool codec = codec_sig(p);
         const UINT n_srv = codec ? 6 : 8, n_uav = codec ? 14 : 8;
+        // The heap has to be bound on the list before a root descriptor table: the game's command list arrives with
+        // its own (or none), and a table set without it is an invalid call - the driver answers it by removing the
+        // device (DXGI_ERROR_INVALID_CALL, which is what the ASD route died of on its first frame).
+        ID3D12DescriptorHeap* heaps[1] = {heap};
+        cmd->SetDescriptorHeaps(1, heaps);
         D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap->GetCPUDescriptorHandleForHeapStart();
         D3D12_GPU_DESCRIPTOR_HANDLE gpu = heap->GetGPUDescriptorHandleForHeapStart();
         cpu.ptr += SIZE_T(slot) * 20 * inc;
