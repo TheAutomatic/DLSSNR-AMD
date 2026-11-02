@@ -707,6 +707,12 @@ void sweep() {
         if (generation_done(b)) { release_generation(b); g_old_generations.erase(g_old_generations.begin() + long(i)); }
         else ++i;
     }
+    // A recording whose every submission answered no longer gates the generation: drop it, so the set does not
+    // accumulate one entry per frame for the life of the device.
+    for (size_t i = 0; i < g.recordings.size();) {
+        if (nr::pe::split::completed(g.recordings[i])) g.recordings.erase(g.recordings.begin() + long(i));
+        else ++i;
+    }
     g.refresh_executed();
     auto it = std::remove_if(g.retired.begin(), g.retired.end(), [](const auto& r) {
         // An owner released by its own recording's ticket once that recording is sealed and its GPU work finished;
@@ -1667,6 +1673,10 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
     cmd->ResourceBarrier(n, b);
     nr::pe::split::restore(cmd, state);
 
+    // The same recording evidence as the RenoDX route: a generation's completeness is every frame it recorded,
+    // ordinary and RenoDX alike - one branch alone must not stand for the generation.
+    g.booking = nr::pe::split::book(f.cmd);
+    if (g.booking) g.recordings.push_back(g.booking);
     mark_frame(f.cmd);
     char line[200];
     std::snprintf(line, sizeof line, "ran %ux%u%s: %s", w, h, in_place ? " in place" : "",
