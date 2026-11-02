@@ -793,7 +793,10 @@ void sweep() {
         if (!frame_evidence(r.frame, r.uses)) return false;
         // A replaced stage's own destruction: one line, so an extent change can be seen to retire the old stage rather
         // than merely producing output for the new one.
-        nr::pe::log("[asd] a replaced RenoDX stage was released (retired at frame %lld)", (long long)r.frame);
+        // The evidence, not the frame number: how many recordings the retirement waited on and that all of them are
+        // done (each is sealed and every submission has answered).
+        nr::pe::log("[asd] a replaced RenoDX stage was released (retired at frame %lld, %zu recording(s) done)",
+                    (long long)r.frame, r.uses.tickets.size());
         return true;
     });
     g.renodx_retired.erase(rs, g.renodx_retired.end());

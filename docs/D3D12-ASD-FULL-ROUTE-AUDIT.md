@@ -335,8 +335,13 @@ plan-only lowering(`nr_d3d12_net_plan.hpp:63`;`nr_runtime.cpp:3195` 注释即 "n
   1080 两帧各自 `evaluate → 提交 → fence 完成`,device reason 全程 `0x0`,exit=0。backend 的 "a replaced RenoDX stage
   was released" 行出现在每次换代之后(如 retired at frame 5),即旧 stage 确实进入 `renodx_retired` 并在其录制完成后
   被释放——不是只有输出 hash。
-- **待查(来自同一日志)**:切换后**每次 evaluate 都替换一次 stage**(retired at 5、7、10、10、11),说明 extent 相同、
-  设置相同时 stage key 仍在变。退休与释放本身正确,但每帧重建 stage 不合理,需要单独定位(不是本 case 的通过条件)。
+- **更正(先前把丢弃录制当成"每帧重建")**:先前 `for(k<3){evaluate;Close;Reset;}` **录制后不提交**,split 判为
+  never_submitted → 释放 feature → 必然重建,那是**丢弃录制边界**,不是生产在同 extent 的行为。该段已改为独立的
+  `NR_TEST_DROP=1` 用例;resize 段改为每帧真实 `Close/Execute/Signal/fence` 并校验 HRESULT 与设备状态。
+  重跑后的实测(`resize-case.txt`):4K 阶段在 "retired at frame 5, **6 recording(s) done**" 时释放;1080 两帧各自
+  `Close/Signal/watch 0x0`、`completed 4 of 4` / `5 of 5`、device reason `0x0`;切换后另有**一次**替换
+  ("retired at frame 7, 2 recording(s) done"),之后稳定。这次额外替换的来源未定,另行定位;退休日志现在给出的是
+  录制张数(证据),不是"到第几帧"的计数。
 
 ### 包交接收尾
 

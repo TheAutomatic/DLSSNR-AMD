@@ -1102,16 +1102,21 @@ int renodx_run(int argc, char** argv) {
             tb2.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
             tb2.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
             l->ResourceBarrier(1, &tb2);
-            l->Close();
+            const HRESULT rc2 = l->Close();
             ID3D12CommandList* ls2[] = {l};
             q->ExecuteCommandLists(1, ls2);
-            q->Signal(f, ++fence_value);
+            const HRESULT rs2 = q->Signal(f, ++fence_value);
             HANDLE ev2 = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-            f->SetEventOnCompletion(fence_value, ev2);
-            const bool up_ok = WaitForSingleObject(ev2, 60000) == WAIT_OBJECT_0;
-            CloseHandle(ev2);
+            const HRESULT re2 = ev2 ? f->SetEventOnCompletion(fence_value, ev2) : E_OUTOFMEMORY;
+            const DWORD w2 = ev2 ? WaitForSingleObject(ev2, 60000) : WAIT_FAILED;
+            if (ev2) CloseHandle(ev2);
             up2->Release();
-            if (!up_ok || f->GetCompletedValue() < fence_value) { log("[test] resize: the new input did not finish"); return 4; }
+            if (FAILED(rc2) || FAILED(rs2) || FAILED(re2) || w2 != WAIT_OBJECT_0 ||
+                f->GetCompletedValue() < fence_value || FAILED(d->GetDeviceRemovedReason())) {
+                log("[test] resize: the new input did not finish (Close 0x%08lX, wait %lu)", static_cast<unsigned long>(rc2),
+                    static_cast<unsigned long>(w2));
+                return 4;
+            }
             a->Reset();
             l->Reset(a, nullptr);
         }
@@ -1127,25 +1132,66 @@ int renodx_run(int argc, char** argv) {
             }
             log("[test] resize: frame %d at %ux%u -> %d (%s)", fi2, W2, H2, ran ? 1 : 0, asd::status().backend.c_str());
             if (!ran) { frame2->Release(); out2->Release(); return 7; }
-            l->Close();
+            const HRESULT rc3 = l->Close();
             ID3D12CommandList* ls3[] = {l};
             q->ExecuteCommandLists(1, ls3);
-            q->Signal(f, ++fence_value);
+            const HRESULT rs3 = q->Signal(f, ++fence_value);
             HANDLE ev3 = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-            f->SetEventOnCompletion(fence_value, ev3);
-            const bool ok3 = WaitForSingleObject(ev3, 60000) == WAIT_OBJECT_0 && f->GetCompletedValue() >= fence_value;
-            CloseHandle(ev3);
-            log("[test] resize: frame %d submitted %s, device reason 0x%08lX", fi2, ok3 ? "and finished" : "TIMED OUT",
-                static_cast<unsigned long>(d->GetDeviceRemovedReason()));
+            const HRESULT re3 = ev3 ? f->SetEventOnCompletion(fence_value, ev3) : E_OUTOFMEMORY;
+            const DWORD w3 = ev3 ? WaitForSingleObject(ev3, 60000) : WAIT_FAILED;
+            if (ev3) CloseHandle(ev3);
+            const HRESULT removed3 = d->GetDeviceRemovedReason();
+            const bool ok3 = SUCCEEDED(rc3) && SUCCEEDED(rs3) && SUCCEEDED(re3) && w3 == WAIT_OBJECT_0 &&
+                             f->GetCompletedValue() >= fence_value && SUCCEEDED(removed3);
+            log("[test] resize: frame %d Close 0x%08lX Signal 0x%08lX watch 0x%08lX wait %lu, completed %llu of %llu, "
+                "device reason 0x%08lX", fi2, static_cast<unsigned long>(rc3), static_cast<unsigned long>(rs3),
+                static_cast<unsigned long>(re3), static_cast<unsigned long>(w3),
+                static_cast<unsigned long long>(f->GetCompletedValue()),
+                static_cast<unsigned long long>(fence_value), static_cast<unsigned long>(removed3));
             if (!ok3) { frame2->Release(); out2->Release(); return 9; }
             a->Reset();
             l->Reset(a, nullptr);
             fr.reset = false;
         }
-        // The sweep that releases the first extent's stage runs on a later evaluate's path: one more frame gives it the
-        // chance, and the backend's own line says whether the retired stage was released.
-        for (int k = 0; k < 3; ++k) { asd::evaluate_backend(fr); l->Close(); a->Reset(); l->Reset(a, nullptr); }
         log("[test] resize: backend state after the extent change: %s", asd::status().backend.c_str());
+        // NR_TEST_DROP=1: the dropped-recording boundary - a frame recorded into the list and never submitted, which the
+        // split reports as never_submitted so the feature's state is released. The next evaluate then rebuilds it; that
+        // rebuild is this case's expected result and says nothing about a submitted frame.
+        if (const char* dr = std::getenv("NR_TEST_DROP"); dr && dr[0] == '1') {
+            ran = asd::evaluate_backend(fr);
+            const HRESULT dc = l->Close();
+            log("[test] drop: recorded %d, Close 0x%08lX, never submitted", ran ? 1 : 0, static_cast<unsigned long>(dc));
+            if (FAILED(dc)) { frame2->Release(); out2->Release(); return 8; }
+            a->Reset();
+            l->Reset(a, nullptr);
+            ran = false;
+            for (int attempt4 = 0; attempt4 < 600 && !ran; ++attempt4) { ran = asd::evaluate_backend(fr); if (!ran) Sleep(200); }
+            log("[test] drop: after the dropped recording the feature is %s (%s)", ran ? "rebuilt" : "not rebuilt",
+                asd::status().backend.c_str());
+        }
+        // NR_TEST_RELEASE=1: the feature's state goes (the route the model takes on a dropped frame), then the next
+        // frame rebuilds it. This is the release/drop boundary, on the same device and feature.
+        if (const char* rl = std::getenv("NR_TEST_RELEASE"); rl && rl[0] == '1') {
+            asd::release_renodx_feature(fr.feature);
+            log("[test] release: feature released; the next evaluate makes it again");
+            ran = false;
+            for (int attempt3 = 0; attempt3 < 600 && !ran; ++attempt3) {
+                ran = asd::evaluate_backend(fr);
+                if (!ran) Sleep(200);
+            }
+            log("[test] release: rebuilt -> %d (%s)", ran ? 1 : 0, asd::status().backend.c_str());
+            l->Close();
+            ID3D12CommandList* ls4[] = {l};
+            q->ExecuteCommandLists(1, ls4);
+            q->Signal(f, ++fence_value);
+            HANDLE ev4 = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            f->SetEventOnCompletion(fence_value, ev4);
+            const bool ok4 = WaitForSingleObject(ev4, 60000) == WAIT_OBJECT_0 && f->GetCompletedValue() >= fence_value;
+            CloseHandle(ev4);
+            log("[test] release: frame finished %s, device reason 0x%08lX", ok4 ? "yes" : "TIMED OUT",
+                static_cast<unsigned long>(d->GetDeviceRemovedReason()));
+            if (!ok4) { frame2->Release(); out2->Release(); return 9; }
+        }
         frame2->Release();
         out2->Release();
     }
