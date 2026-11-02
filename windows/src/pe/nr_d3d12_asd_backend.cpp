@@ -626,7 +626,11 @@ struct Backend {
     std::shared_ptr<nr::gpu::Recording> booking;
     // Every recording this generation made (one per recorded frame/list), kept so the generation is released only
     // when all of them are strictly done - not by the newest one, and not by a token maximum.
-    std::vector<std::shared_ptr<nr::gpu::Recording>> recordings;
+    struct FrameRecording {
+        int64_t frame;                                // the backend frame number this recording belongs to
+        std::shared_ptr<nr::gpu::Recording> rec;
+    };
+    std::vector<FrameRecording> recordings;
     std::vector<std::pair<int64_t, ID3D12Resource*>> token_retired;   // grown-away token buffers
     // A value the GPU has not written yet reads as ~0, and only a slot whose holder matches its own index is a
     // completion: a frame number ahead of the newest record is a torn read, not evidence.
@@ -649,6 +653,7 @@ struct Backend {
     // and its stage, keyed by everything a change of takes a new one).
     struct RenodxEntry {
         std::unique_ptr<renodx12::Stage> stage;
+        uint32_t stack = 0;
         uint32_t w = 0, h = 0, nw = 0, nh = 0;
         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
         int hdr = 0, present = 0;
@@ -687,12 +692,21 @@ void retire(IUnknown* p) {
 }
 void release_generation(Backend& b);
 
+// Has this backend frame's own recording finished? Frames without a Recording (the harness's early frames, a device
+// the split never hooked) fall back to the token watermark.
+bool frame_done(int64_t frame) {
+    for (const auto& r : g.recordings)
+        if (r.frame == frame && r.rec) return nr::pe::split::completed(r.rec);
+    g.refresh_executed();
+    return g.executed >= frame;
+}
+
 // A generation is finished when every recording it made is strictly ready (sealed, every submission answered). A
 // generation that made none (the offline harness, whose split returns nothing) keeps the token watermark.
 bool generation_done(Backend& b) {
     for (const auto& rec : b.recordings) {
-        if (!rec) continue;
-        if (!nr::pe::split::completed(rec)) return false;
+        if (!rec.rec) continue;
+        if (!nr::pe::split::completed(rec.rec)) return false;
     }
     if (!b.recordings.empty()) return true;
     b.refresh_executed();
@@ -710,7 +724,8 @@ void sweep() {
     // A recording whose every submission answered no longer gates the generation: drop it, so the set does not
     // accumulate one entry per frame for the life of the device.
     for (size_t i = 0; i < g.recordings.size();) {
-        if (nr::pe::split::completed(g.recordings[i])) g.recordings.erase(g.recordings.begin() + long(i));
+        if (!g.recordings[i].rec || nr::pe::split::completed(g.recordings[i].rec))
+            g.recordings.erase(g.recordings.begin() + long(i));
         else ++i;
     }
     g.refresh_executed();
@@ -1021,6 +1036,11 @@ std::wstring widen(const char* u8) {
 // The RenoDX route's frame (nr_pe_session.cpp's run_renodx, on the ASD route): the stage around the network, one a
 // feature, the network through this backend's own (g.network) over its linear buffers. HDR still takes the 0.0.8.1
 // path (the v6 codec is item 6b).
+uint64_t stack_feature(uint64_t feature, uint32_t k) {
+    return k == 0 ? feature : (uint64_t(1) << 62) | (feature << 8) | k;
+}
+constexpr uint64_t kUnnamedStack = 0xFFFFFFu;
+
 bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES color_state,
                   D3D12_RESOURCE_STATES output_state) {
     if (!f.renodx_settings) return fallback("the RenoDX route without its frame (no settings)");
@@ -1040,6 +1060,15 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
     // The network's extent (nr_pe_session.cpp's renodx_extent: RenoDX's ComputeNrWorkingResolution, a size the
     // game's guides change to taken once it has held kContractDebounceFrames).
     Backend::RenodxEntry& e = g.renodx[f.feature];
+    // Session::record_renodx: only passes removed from the stack surrender their histories. The surviving passes
+    // keep their latch/seed; re-added passes start fresh instead of reviving the history from an earlier stack.
+    const uint32_t passes = renodx::stack_passes(s);
+    const uint64_t named = f.feature ? f.feature : kUnnamedStack;
+    if (g.network) {
+        for (uint32_t k = passes; k < e.stack; ++k) g.network->release_feature(stack_feature(named, k));
+        if (!f.feature && passes == 1 && e.stack > 1) g.network->release_feature(named);
+    }
+    e.stack = passes;
     uint32_t nw = 0, nh = 0;
     renodx::working_resolution(s, w, h, f.motion_w, f.motion_h, &nw, &nh);
     const bool settings_changed = e.scale != s.resolution_scale || e.follow != s.follow_input_res || e.w != w ||
@@ -1081,7 +1110,7 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
         auto made = renodx12::Stage::make(c, &why);
         if (made) made->set_retire([](IUnknown* r) { retire(r); });   // released on the backend's watermark
         if (made) {
-            made->set_completed([](uint64_t f) { g.refresh_executed(); return g.executed >= int64_t(f); });
+            made->set_completed([](uint64_t f) { return frame_done(int64_t(f)); });
         }
         if (!made) return fallback("the RenoDX route: " + why);
         e.stage = std::move(made);
@@ -1105,7 +1134,7 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
         c.feature = f.feature;
         e.stage = renodx12::Stage::make(c, &why);
         if (e.stage) e.stage->set_retire([](IUnknown* r) { retire(r); });
-        if (e.stage) e.stage->set_completed([](uint64_t f) { g.refresh_executed(); return g.executed >= int64_t(f); });
+        if (e.stage) e.stage->set_completed([](uint64_t f) { return frame_done(int64_t(f)); });
         if (!e.stage) return fallback("the RenoDX route: " + why);
     }
 
@@ -1266,7 +1295,7 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
 
     if (renodx) {
         g.booking = nr::pe::split::book(f.cmd);
-        if (g.booking) g.recordings.push_back(g.booking);
+        if (g.booking) g.recordings.push_back({int64_t(g.frames), g.booking});
         const bool ran = renodx_frame(f, color_state, output_state);
         // Marked even when the stage reports failure: a failed frame may have recorded some of its dispatches, and
         // those commands still hold internal resources that must not be released until the GPU ran past them.
@@ -1447,7 +1476,7 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
     g.refresh_executed();
     if (g.segment_owner.empty()) g.segment_owner.assign(g.segments, -1);
     UINT seg = g.slot / 4;
-    if (g.segment_owner[seg] >= 0 && g.segment_owner[seg] > g.executed) {
+    if (g.segment_owner[seg] >= 0 && !frame_done(g.segment_owner[seg])) {
         const UINT grown = g.segments * 2;
         ID3D12DescriptorHeap* nh = nullptr;
         D3D12_DESCRIPTOR_HEAP_DESC hd{};
@@ -1676,7 +1705,7 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
     // The same recording evidence as the RenoDX route: a generation's completeness is every frame it recorded,
     // ordinary and RenoDX alike - one branch alone must not stand for the generation.
     g.booking = nr::pe::split::book(f.cmd);
-    if (g.booking) g.recordings.push_back(g.booking);
+    if (g.booking) g.recordings.push_back({int64_t(g.frames), g.booking});
     mark_frame(f.cmd);
     char line[200];
     std::snprintf(line, sizeof line, "ran %ux%u%s: %s", w, h, in_place ? " in place" : "",
@@ -1689,7 +1718,13 @@ void release_renodx_feature(uint64_t feature) {
         if (it->second.stage) g.renodx_retired.emplace_back(int64_t(g.frames), std::move(it->second.stage));
         g.renodx.erase(it);
     }
-    if (g.network) g.network->release_feature(feature);
+    if (g.network) {
+        const uint64_t named = feature ? feature : kUnnamedStack;
+        g.network->release_feature(feature);
+        if (!feature) g.network->release_feature(named);
+        for (uint32_t k = 1; k < renodx::kMaxUnlockedPasses; ++k)
+            g.network->release_feature(stack_feature(named, k));
+    }
 }
 
 bool write_network_capture(const std::string& dir, std::string* why) {
