@@ -54,5 +54,12 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
   if (m > 0.75) {
     proxy *= (0.75 + 0.25 * (1.0 - exp(-5.770780 * (m - 0.75)))) / max(m, 1e-6);
   }
+#if NR_ENCODE_PROBE_IMMEDIATE
+  // Probe only (built with -DNR_ENCODE_PROBE_IMMEDIATE=1 on both routes): the value entering the encode, written
+  // through the same store. Comparing this on both sides answers whether the divergence is before SrgbEncode or in
+  // it - the normal build is untouched (the macro is undefined).
+  Output[pixel] = float4(proxy, 1.0);
+#else
   Output[pixel] = float4(SrgbEncode(proxy), 1.0);
+#endif
 }
