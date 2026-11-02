@@ -624,6 +624,9 @@ struct Backend {
     // The recording ticket of the frame being recorded: every resource that frame makes is retired by it, so the
     // resource's own recording is its completion evidence (not a global "newest frame finished" assumption).
     std::shared_ptr<nr::gpu::Recording> booking;
+    // Every recording this generation made (one per recorded frame/list), kept so the generation is released only
+    // when all of them are strictly done - not by the newest one, and not by a token maximum.
+    std::vector<std::shared_ptr<nr::gpu::Recording>> recordings;
     std::vector<std::pair<int64_t, ID3D12Resource*>> token_retired;   // grown-away token buffers
     // A value the GPU has not written yet reads as ~0, and only a slot whose holder matches its own index is a
     // completion: a frame number ahead of the newest record is a torn read, not evidence.
@@ -682,16 +685,26 @@ void retire(IUnknown* p) {
     if (g.discarding) { p->Release(); return; }
     g.retired.push_back({int64_t(g.frames), g.booking, p});
 }
-void release_generation(Backend& b);   // (defined below drop_device)
+void release_generation(Backend& b);
+
+// A generation is finished when every recording it made is strictly ready (sealed, every submission answered). A
+// generation that made none (the offline harness, whose split returns nothing) keeps the token watermark.
+bool generation_done(Backend& b) {
+    for (const auto& rec : b.recordings) {
+        if (!rec) continue;
+        if (!nr::pe::split::completed(rec)) return false;
+    }
+    if (!b.recordings.empty()) return true;
+    b.refresh_executed();
+    return b.frames == 0 || b.executed >= int64_t(b.frames) - 1;
+}
 
 void sweep() {
     ++g.tick;
     // Previous generations: released only when their own evidence has passed their last recorded frame.
     for (size_t i = 0; i < g_old_generations.size();) {
         Backend& b = *g_old_generations[i];
-        b.refresh_executed();
-        const bool done = b.frames == 0 || b.executed >= int64_t(b.frames) - 1;
-        if (done) { release_generation(b); g_old_generations.erase(g_old_generations.begin() + long(i)); }
+        if (generation_done(b)) { release_generation(b); g_old_generations.erase(g_old_generations.begin() + long(i)); }
         else ++i;
     }
     g.refresh_executed();
@@ -897,7 +910,7 @@ void release_generation(Backend& b);
 void drop_device() {
     // A device is swapped while a frame of ours may still be queued: the whole generation is handed over and released
     // by its own evidence, never here (a pointer change is not proof that the GPU is idle).
-    if (g.device && g.frames > 0 && g.executed < int64_t(g.frames) - 1) {
+    if (g.device && (g.frames > 0 || !g.recordings.empty()) && !generation_done(g)) {
         g_old_generations.push_back(std::make_unique<Backend>(std::move(g)));
         g = Backend{};
         return;
@@ -1247,6 +1260,7 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
 
     if (renodx) {
         g.booking = nr::pe::split::book(f.cmd);
+        if (g.booking) g.recordings.push_back(g.booking);
         const bool ran = renodx_frame(f, color_state, output_state);
         // Marked even when the stage reports failure: a failed frame may have recorded some of its dispatches, and
         // those commands still hold internal resources that must not be released until the GPU ran past them.

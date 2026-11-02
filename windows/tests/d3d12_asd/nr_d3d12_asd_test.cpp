@@ -44,6 +44,9 @@ __declspec(dllexport) extern const char* const D3D12SDKPath = ".\\D3D12\\";
 #endif
 
 namespace nr::pe {
+// The real split (linked here) asks for the trace counter; this host has no product trace.
+int trace_execute() { return 0; }
+
 void log(const char* format, ...) {
     va_list a;
     va_start(a, format);
@@ -57,21 +60,9 @@ void log(const char* format, ...) {
 static std::string g_module_folder = ".";
 void set_module_folder(const std::string& f) { g_module_folder = f; }
 const char* module_folder() { return g_module_folder.c_str(); }
-namespace split {
-struct Snapshot {};
-bool prepare(ID3D12GraphicsCommandList*, std::string*) { return true; }
-bool disabled() { return false; }
-std::shared_ptr<Snapshot> snapshot(ID3D12GraphicsCommandList*) { return std::make_shared<Snapshot>(); }
-void restore(ID3D12GraphicsCommandList*, const std::shared_ptr<Snapshot>&) {}
-ID3D12CommandQueue* last_direct_queue() { return nullptr; }
-// The harness records into its own lists, not through the split hooks: no booking, so the backend keeps its token
-// completion path (the product links the real split and books there).
-std::shared_ptr<nr::gpu::Recording> book(ID3D12CommandList*) { return nullptr; }
-bool completed(const std::shared_ptr<nr::gpu::Recording>&) { return true; }
-void seal(const std::shared_ptr<nr::gpu::Recording>&) {}
-void invalidate(const std::shared_ptr<nr::gpu::Recording>&) {}
-}  // namespace split
 }  // namespace nr::pe
+// The harness uses the real split (nr_pe_d3d12split.cpp): its hooks are what give the backend a recording ticket and
+// what prove completion. Nothing of it is stubbed.
 
 namespace {
 
@@ -639,6 +630,13 @@ int renodx_run(int argc, char** argv) {
     d->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&a));
     d->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, a, nullptr, IID_PPV_ARGS(&l));
     d->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f));
+    // The real split hooks this list's class here, before its first Reset: after that Reset the list's state is known
+    // and the backend can cut it. Without this the hooks arrive too late and every frame waits forever.
+    {
+        std::string why;
+        if (nr::pe::split::prepare(l, &why)) log("[test] renodx: split hooks installed on the list");
+        else log("[test] renodx: split not ready for this list: %s", why.c_str());
+    }
     uint64_t fence_value = 0;   // one monotonic counter: upload, every frame, every readback
 
     // The frame: the game's format 24 (R10G10B10A2), in place, in UNORDERED_ACCESS both ways.
