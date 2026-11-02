@@ -929,6 +929,14 @@ int renodx_run(int argc, char** argv) {
                             uint64_t hh = 1469598103934665603ull;
                             for (uint64_t i = 0; i < pitch * H; ++i) { hh ^= p8[i]; hh *= 1099511628211ull; }
                             log("[test] renodx: frame %d output hash %016llX", fi, static_cast<unsigned long long>(hh));
+                            // The network's own boundary capture (the precomputed noise field), written once the GPU
+                            // has finished the frame it was recorded in.
+                            if (fi == 0 && std::getenv("NR_NET_NOISE_DUMP")) {
+                                std::string cw;
+                                const bool wrote = nr::pe::asd::write_network_capture(
+                                    std::getenv("NR_NET_NOISE_DUMP"), &cw);
+                                log("[test] renodx: network capture %s (%s)", wrote ? "written" : "FAILED", cw.c_str());
+                            }
                             // NR_TEST_DUMP=<dir>: each frame's raw output (R10G10B10A2, w*h*4 B) for a numeric
                             // comparison between two loads of the same frame (HLSL vs the ACO binary).
                             if (capture_boundaries) {

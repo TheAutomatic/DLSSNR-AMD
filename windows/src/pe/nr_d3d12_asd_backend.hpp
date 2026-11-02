@@ -70,6 +70,8 @@ public:
     // The frame's temporal inputs, before record.
     virtual void temporal(const NetTemporal&) {}
     virtual bool record(ID3D12GraphicsCommandList* cmd, const LinearFrame& in, const LinearFrame& out, const char** why) = 0;
+    // Debug: write the boundary capture recorded this frame (the precomputed noise field) with its metadata.
+    virtual bool write_capture(const std::string& dir, std::string*) { return false; }
 };
 
 // An HLSL compute shader (cs_5_0) through d3dcompiler_47.dll; null and why when it does not compile.
@@ -88,6 +90,9 @@ bool wilsjo2_ready(ID3D12Device* device, ID3D12GraphicsCommandList* cmd, uint32_
 // The backend slot nr::dlssnr::evaluate_d3d12 calls (nr::dlssnr::set_d3d12_backend, from InitializeASI).
 bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& frame);
 AsdNetStatus backend_net_status();
+
+// Debug: write the boundary capture the network recorded this frame (the precomputed noise field) with metadata.
+bool write_network_capture(const std::string& dir, std::string* why);
 // The ASD backend's device as it stands (S_OK when there is none): a removed device is the one signal a game that dies
 // without an exception leaves behind, so a watchdog can poll it.
 HRESULT device_removed_reason();

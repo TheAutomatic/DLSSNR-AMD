@@ -283,8 +283,20 @@ PSDB 由实验室流程生成，尚未从运行时侧证明它装载的是哪一
 - 参考宿主走 ACO Mode，装载 `dlssnr-amd/aco/shaders`（Linux 构建的 SPIR-V，pre 的 sha `63396fd0…`，
   记录名 `3ccbc35ad9ececb3`）；ASD 路线用 Windows 网络 SPIR-V（pre 的 sha `8c2c57bc…`）配 `net-carriers.bin`
   的 ELF。
-- 因此 pre 输出 73.9% 的差异与"移植正确性"无直接关系：两侧执行的是**不同源码编译出的不同机器码**。
+- **该结论已被推翻（见下）**：ASD 的 PSDB 里确实有 0081 的同一份 pre 机器码。
 
 要让 A/B 成为真正的移植对照，必须让两侧跑同一份 SPIR-V/记录：为参考侧组装 **Windows 着色器**的 ACO 包
 （记录键 = Windows SPIR-V 的 fnv64，ELF 来自 `net-carriers.bin`），或让参考侧不走 ACO、用同一份 Windows SPIR-V。
 在此之前，任何 A/B 数值差异都不能归因于 D3D12 移植。
+
+## 撤回：PSDB 与 0081 的 pre ELF 是同一份
+
+只读 SQLite 查询 `artifacts/windows/asd-harness/dlssnr-amd-asd/public-copy.psdb`（表 `vals(keyid,type,value)`）：
+
+- `windows/data/aco/records/3ccbc35ad9ececb3.nrp` 的 code（96+8*n 之后的 29,580 字节）SHA256
+  = `e36b137bf7baa5f3aa03c42777afcd313fda0379fbe26944dff9e3f8469402e4`；
+- PSDB 的 `keyid = 99`、`type = 0`、value 长度 31,696，**在 offset 258 完整包含这 29,580 字节**。
+
+所以 ASD 与 0081 参考运行的是**同一份 pre 机器码**；上一节"不同源所以不是 port bug"作废（先前对裸文件做
+`find` 失败，是因为 SQLite 的页分裂，不能作为不存在的证据）。pre 输出 73.9% 的差异因此是**真实的路线差异**，
+应继续在 ABI 层查：carrier tag → PSDB key 的对应、push/params、采样输入（proxy/flow/history/depth）与 extent/format/sampler。

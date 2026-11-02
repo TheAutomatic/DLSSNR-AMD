@@ -1556,6 +1556,11 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
     note_backend(line, true);
     return true;
 }
+bool write_network_capture(const std::string& dir, std::string* why) {
+    if (!g.network) { *why = "no network"; return false; }
+    return g.network->write_capture(dir, why);
+}
+
 HRESULT device_removed_reason() {
     ID3D12Device* d = g.device;
     return d ? d->GetDeviceRemovedReason() : S_OK;
