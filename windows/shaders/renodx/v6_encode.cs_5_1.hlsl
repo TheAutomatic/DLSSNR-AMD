@@ -52,7 +52,11 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
   }
   [branch]
   if (m > 0.75) {
-    proxy *= (0.75 + 0.25 * (1.0 - exp(-5.770780 * (m - 0.75)))) / max(m, 1e-6);
+    // `precise`: the shoulder as written, without the optimizer contracting or reassociating it. The SPIR-V build
+    // evaluates this expression in the written order; fxc is free to fold `0.75 + 0.25 * (1 - exp(x))` differently,
+    // which shows up as a one-ULP difference in the proxy's brightest pixels. No arithmetic is changed here.
+    precise float shoulder = 0.75 + 0.25 * (1.0 - exp(-5.770780 * (m - 0.75)));
+    proxy *= shoulder / max(m, 1e-6);
   }
   Output[pixel] = float4(SrgbEncode(proxy), 1.0);
 }
