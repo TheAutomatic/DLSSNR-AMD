@@ -257,3 +257,13 @@ list 的两段在同一队列上按序执行,`cut()` 的续段继承同一次提
 linear [-68.1875 131.375 -10.1484375]`。把 GPU 实际读回的线性图按 CPU 公式编码得到 0.21568,与 GPU 的 0.21603 一致,
 即 encode 段一致;偏差来自前段(解码 + 16F 存储),该点线性出现 -68/+131 的量级(近黑 PQ 码经宽色域矩阵放大)。
 容差与着色器均未改动。
+
+## 19:15 包交接(W2 DXBC)
+
+- `build_package.sh` 在打包 `dlssnr-amd-asd/` 时把它需要的 wilsjo2 DXBC 放进 `dlssnr-amd-asd/wilsjo2-d3d12/`
+  (运行时 = `asd::folder() + "\wilsjo2-d3d12"`,平铺 `wilsjo2_<name>.dxbc`)。
+- 来源二选一:`NR_SPIRV_CROSS`+`NR_W2_DXBC`(Windows 主机现场构建;最后一步需要 d3dcompiler_47)或
+  `NR_W2_DXBC_DIR`(预构建集)。两者都没有时打包**失败并说明**,不再产出缺程序的包。
+- CI 的 `windows` job 不设置 `NR_ASD_DIR`、`fetch_deps.sh` 也不取 `artifacts/ref/asd-data`,因此 CI 本身不打
+  `dlssnr-amd-asd/`(没有该 ini 时该路线本就不启用),本轮改动不影响 CI;受影响的是"带 ASD 目录"的本地/Windows 打包。
+- 运行时缺该目录时的既有行为:该路线报 "its D3D12 programs: wilsjo2_encode.dxbc is missing",帧走桥,不崩。
