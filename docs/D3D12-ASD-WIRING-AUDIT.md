@@ -110,3 +110,11 @@ x86_64-w64-mingw32-g++ -std=c++17 -O0 -fsyntax-only -Iwindows/src -Iwindows/src/
 退出0。共享controls头已改变，执行agent的后续链接必须重编所有消费者，不能拿旧对象混链。
 
 执行顺序保持不变：完成原Recording消费者和旧device保留 → stack缩减/取消录制语义与准确状态 → 当前HDR10 codec和正常ASD注册 → 同目标case完整离线集成 → 计划2真实桥接/直连分段比较。以上修复纳入现有计划，不新增框架任务；每一修复写真实提交和验证结果，再继续下一项。
+
+
+### 13:00 轮监督的实际修复
+
+- `a36a572`：普通 evaluate 也进入本代 Recording 集合，清理已完成记录。独立审查确认新增分支；尚未以此声称全部消费者已完成。
+- `366b3e0`：stage 两处 slot 完成回调和 backend segment 改问该帧 Recording。该提交同时带入本轮审查者写入的 stack 缩减调用方：沿 Session::record_renodx 的 entry.stack / stack_feature / kUnnamedStack，缩短只释放消失的pass；匿名stack退单pass时释放命名首pass。
+- `77a549e`：配套 network::release_feature 只释放传入的单个历史id，父feature销毁由backend展开全部pass。避免缩短一个pass时重复展开另一套层级。backend/net定向MinGW语法检查退出0；未额外启动GPU。
+- 未完成消费者仍是 net upload/网络资源退休、取消录制历史处理和准确的passthrough状态；执行者继续处理，随后回到codec/注册和原定性能计划。不得将本节已提交项扩大为计划1通过。
