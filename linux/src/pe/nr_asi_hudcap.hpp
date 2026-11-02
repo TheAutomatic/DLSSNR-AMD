@@ -53,16 +53,25 @@ struct Frame {
     bool broken = false;   // the capture cannot run in this game at all (its hooks): greyed in the menu, `why`
     Fg fg;
 };
+// fg_list_copies: a hand-over valid only while it is handed over is copied on the command list it came with (HUD FIX takes
+// it); otherwise only hand-overs valid until the present are kept (read at the Present, nothing put into another's list).
 Frame d3d12_present(ID3D12Device* device, IDXGISwapChain* sc, ID3D12CommandQueue* queue, ID3D12Resource* back,
-                    DXGI_FORMAT format, uint32_t w, uint32_t h, bool armed, bool fg_armed = false);
+                    DXGI_FORMAT format, uint32_t w, uint32_t h, bool armed, bool fg_armed = false, bool fg_list_copies = false);
+// A Present whose layers ran at DLSS-G's evaluate (d3d12_present there with `sc` null): the capture's back buffers from
+// its swap chain.
+void d3d12_backs(IDXGISwapChain* sc);
+// Frame generation's hand-overs are taken from the game's own calls only (`game` says whether a caller address is the
+// game's): OptiScaler's own frame generation calls the same libraries with its own command lists and threads.
+void set_game_caller(bool (*game)(void* caller));
 // After every ExecuteCommandLists of the game's (NR Control's queue hook calls the .asi's observer, which calls this;
 // the capture hooks the queue itself only where that hook is not there): the lists' writes in the GPU's order.
 nr::gpu::Ticket d3d12_recording(ID3D12GraphicsCommandList* list);
 bool vk_lifetime(VkDevice device);
 void d3d12_executed(unsigned count, ID3D12CommandList* const* lists);
 // NGX's DLSS-G evaluate (the .asi's NVSDK_NGX_D3D12_EvaluateFeature hook): its DLSSG.HUDLess (COPY_DEST there, as
-// OptiScaler takes it), copied on its command list.
-void fg_note_dlssg(ID3D12GraphicsCommandList* list, ID3D12Resource* hudless);
+// OptiScaler takes it), copied on its command list. `layers_here`: the Present layers run in this evaluate (d3d12_present
+// is called from it next, `sc` null): the frame is this present's, NR's change may be put into it.
+void fg_note_dlssg(ID3D12GraphicsCommandList* list, ID3D12Resource* hudless, bool layers_here = false);
 // The game's Present call runs (the .asi's Present detours, around the original): frame generation's hand-overs then
 // are OptiScaler's own (a frame late), not taken.
 struct PresentCall {

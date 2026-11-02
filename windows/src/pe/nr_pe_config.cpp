@@ -379,6 +379,11 @@ bool parse(const std::string& path, Config& c, bool& legacy) {
             else if (key == "resize history") { if (auto b = parse_bool(value)) n.resize_history = *b; }
             else if (key == "style grade") { if (auto b = parse_bool(value)) n.style_grade = *b; }
             else if (key == "memory guard") { if (auto b = parse_bool(value)) n.memory_guard = *b; }
+            else if (key == "history precision") {
+                const std::string v = lower(value);
+                if (v == "16" || v == "fp16" || v == "half" || v == "rgba16f") n.history_f16 = true;
+                if (v == "32" || v == "fp32" || v == "full" || v == "rgba32f") n.history_f16 = false;
+            }
             else if (key == "osd") {
                 const std::string v = lower(value);
                 for (int o = 0; o < 4; ++o) if (v == osd_name(o)) n.osd = o;
@@ -1602,13 +1607,19 @@ void write_network(FILE* f, const NetworkConfig& n) {
         "; 0 = no such check: NR builds and runs in whatever video memory is left. A game left short of video memory\n"
         ";     may stutter or fail to load its own data. Applied at once\n"
         "\n"
+        "History Precision = %d\n"
+        "; The precision of the images NR keeps its previous result in:\n"
+        "; 16 = 16-bit, as NVIDIA's DLL keeps it; half the memory (default)\n"
+        "; 32 = 32-bit, as up to 0.0.8.1 (4K: 133 MB more a network, 66 MB more each further pass)\n"
+        "; With several passes the two can differ in fine detail. Applied at once (the previous result starts afresh)\n"
+        "\n"
         "; ACO Mode is not a setting: the network always runs as machine code made in advance by the ACO compiler (the\n"
         "; one the Linux version uses), loaded by the AMD driver. When that cannot be used, NR Control and dlssnr-amd.log\n"
         "; say why, and an RX 9000 runs the network compiled by the AMD driver instead (without CC_SMALL_FP8_EXPERIMENTAL\n"
         "; and CC_SILVER_AARDWOLD_INT4_MIXED); RX 7000 and the Radeon 700M / 800M / 8000S graphics have no NR then.\n"
         "\n", nr::network_codename(n.model), n.hotkey.c_str(), n.sound ? 1 : 0, residency_name(n.residency),
         n.motion_without_depth ? 1 : 0, n.resize_history ? 1 : 0, n.style_grade ? 1 : 0, osd_name(n.osd),
-        n.memory_guard ? 1 : 0);
+        n.memory_guard ? 1 : 0, n.history_f16 ? 16 : 32);
 }
 
 void write_preprocess(FILE* f, const PreprocessConfig& p) {

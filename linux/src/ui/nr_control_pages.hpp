@@ -1109,6 +1109,16 @@ inline void draw_network_options(nr::ini_edit::Ini& ini, const nr::control::Shar
          "a switch builds, its progress; then the new network for 3 s. always: all the time. cost: "
          "all the time, with each layer's GPU time split into the network and its processing (a run, as the "
          "layer table splits it), and their sums. off: never.");
+    {
+        static const char* const precisions[] = {NR_N("16-bit"), NR_N("32-bit")};
+        int pi = ini.get("Network", "History Precision", "16") == "32" ? 1 : 0;
+        const char* shown[2] = {tr(precisions[0]), tr(precisions[1])};
+        if (ImGui::Combo(tr("History precision"), &pi, shown, 2)) ini.set("Network", "History Precision", pi ? "32" : "16");
+        help("[Network] History Precision: the precision of the images NR keeps its previous result in. 16-bit "
+             "(default): as NVIDIA's DLL keeps it, half the video memory. 32-bit: as up to 0.0.8.1; at 4K 133 MB more "
+             "a network and 66 MB more each further pass. With several passes the two can differ in fine detail. "
+             "Takes effect at once; the previous result starts afresh.");
+    }
     ini_flag(ini, "Style grade (Natural / Cinematic)", "Network", "Style Grade", "1",
              "[Network] Style Grade. On (default): Natural and Cinematic are graded after the network as NVIDIA's DLL "
              "does. Off: the picture these styles had up to 0.0.6, without that grade. Standard is not affected. "

@@ -15,6 +15,11 @@ void start();
 // A frame went by (a Present). Starts the watchdog if start() was not called.
 void beat();
 
+// The game's own Present (the .asi's hook on the swap chain the game holds). Under frame generation the presents go on
+// while the game's frames stop (a loading game at a third of a frame a second, its frame generator still presenting):
+// a stall of the game's frames alone of 3 s is reported too, at most twice a process.
+void game_beat();
+
 // The watching thread ends and this waits until it has (it holds the module while it runs, and lets go as it ends):
 // before a module of ours is unloaded - ReShade calls the add-on's AddonUninit, outside the loader lock, before its
 // FreeLibrary when the game's last device goes. Never from DllMain. Nothing starts it again in this module's life.

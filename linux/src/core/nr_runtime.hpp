@@ -519,6 +519,9 @@ public:
     // Natural and Cinematic graded after the post block as NVIDIA's DLL does (true, the default), or not (false: the
     // picture these styles had before the grade was ported). Per frame; nothing is rebuilt.
     void set_style_grade(bool);
+    // [Network] History Precision, live: true = the history images in RGBA16F (the default), false = RGBA32F. Applied
+    // at the next recording; the history starts afresh then. NR_HIST16 in the environment wins (comparisons).
+    void set_history_f16(bool);
 
     // **What the pass costs on the GPU**, from a timestamp pair around the work
     // this runtime records - everything between the first barrier and the last,

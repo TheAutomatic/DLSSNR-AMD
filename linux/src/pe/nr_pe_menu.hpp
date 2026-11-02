@@ -49,7 +49,11 @@ void on_execute(ExecuteObserver observer);
 // OptiScaler draws its menu in its own swap chain's Present: once a game frame, before frame generation, on the queue
 // (D3D12) or device (D3D11) the swap chain was made with - frame generation makes its frames from the picture with the
 // menu. While it is drawn there the system's Present only runs the hooks (on_d3d12_present / on_d3d11_present).
-void draw_game(IDXGISwapChain* swap_chain, IUnknown* device);
+// `new_frame` false: a present of a game frame the menu was already drawn on (DLSS-G through NGX presents the generated
+// frame and the real one, both the game's swap chain's, while the layers ran once at its evaluate): drawn, but NR
+// Control's per-presented-frame bookkeeping (layers not run on it, the spatial outlines) is left as the first present of
+// that frame set it - else the layer rows flicker between running and "not run on this presented frame".
+void draw_game(IDXGISwapChain* swap_chain, IUnknown* device, bool new_frame = true);
 // The colour space the game set on `swap_chain` (IDXGISwapChain3::SetColorSpace1, a DXGI_COLOR_SPACE_TYPE); false when
 // it never set one.
 bool colour_space_of(IDXGISwapChain* swap_chain, int* space);

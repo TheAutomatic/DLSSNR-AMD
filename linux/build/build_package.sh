@@ -14,6 +14,8 @@
 #                       install.sh needs --dll
 #   NR_MODEL_SMALL=dlssnr-small.bin  with NR_MODEL: the new model too (from the 310.9.16 DLL)
 #   NR_VERSION=...      override the version (default: from the git tags, linux/build/version.sh)
+#   NR_LANG_EXTRA=<dir> test packages only: extra language files (and fonts/) into dlssnr-amd/lang
+#   NR_SIGN=1           the package's Windows binaries signed (self-signed, linux/build/sign_pe.py)
 #
 # Packages also carry int4/, the int4 mixed option install.sh adds when asked for: the ReShade add-on built again
 # with NR_INT4=1 (this script with NR_INT4=1 NR_PROGRAMS_ONLY=1), the int4 network, its data, the Vulkan layer and the
@@ -214,6 +216,13 @@ lazy=("$out/vulkan_lazy_s.o" "$out/vulkan_lazy_c.o")
 pkg="$out/package"
 rm -rf -- "$pkg"; mkdir -p -- "$pkg"
 bash linux/build/assemble_product_data.sh "$pkg" ${model:+--model "$model"} ${model:+${small:+--small-model "$small"}}
+# NR_LANG_EXTRA=<dir> (test packages only): its language files (*.txt) into dlssnr-amd/lang and its fonts with their
+# licences (fonts/) into dlssnr-amd/lang/fonts, for a language file's @font = fonts/<file> (as the Windows package)
+if [[ -n "${NR_LANG_EXTRA:-}" ]]; then
+    [[ -d "$NR_LANG_EXTRA" ]] || { echo "NR_LANG_EXTRA: no such folder: $NR_LANG_EXTRA" >&2; exit 1; }
+    cp -- "$NR_LANG_EXTRA"/*.txt "$pkg/dlssnr-amd/lang/"
+    [[ -d "$NR_LANG_EXTRA/fonts" ]] && cp -r -- "$NR_LANG_EXTRA/fonts" "$pkg/dlssnr-amd/lang/"
+fi
 
 # model-tools/: what install.sh --dll runs to rebuild the model from the DLL.
 mt="$pkg/model-tools"
@@ -356,6 +365,10 @@ cp -- linux/build/experimental_weights.py "$pkg/experimental/"
 cp -- linux/data/experimental/dlssnr-small-experimental.sha256 "$pkg/experimental/dlssnr-small-experimental.bin.sha256"
 cp -- linux/package/install.sh linux/package/README.txt linux/package/lumenite.py "$pkg/"
 chmod +x "$pkg/install.sh" "$mt/extract_model.sh"
+
+# NR_SIGN=1: every Windows binary without a signature of its own signed with a self-signed certificate made for this
+# build (linux/build/sign_pe.py; some games load only signed DLLs and do not ask by whom)
+[[ "${NR_SIGN:-0}" == 1 ]] && python3 linux/build/sign_pe.py "$pkg"
 
 # ---- archive ------------------------------------------------------------------
 version=$(bash linux/build/version.sh)

@@ -2531,7 +2531,7 @@ void vulkan_selftest(VkDevice rs_device) {
     if (!GetEnvironmentVariableA("NR_RESHADE_SELFTEST", flag, sizeof flag) || flag[0] != '1') return;
     std::lock_guard<std::mutex> guard(lock);
     log("[nr] selftest: begin");
-    if (!vk_loaded) { nr_vk_use_loader(1); nr_vk_load(); vk_loaded = true; }
+    if (!vk_loaded) { nr_vk_use_loader(1); nr_vk_load(); nr::vram::install_vulkan(); vk_loaded = true; }
     auto h = nr::pe::vkdevice::handles();
     h.device = rs_device;
     log("[nr] selftest: handles instance %p physical %p device %p", static_cast<void*>(h.instance),
@@ -2678,6 +2678,8 @@ void on_destroy_device(device* dev) {
         }
     }
     if (direct > 0) nr_vk_device_direct(nullptr, 0);
+    // what was freed through the driver's own functions (or left to the device's end) passed the VRAM ledger's wrap
+    if (direct != 0) nr::vram::forget_device(uint64_t(dev->get_native()));
     session_device = nullptr;
     reap_effect_resources(dev);
     for (auto i = effect_fences.begin(); i != effect_fences.end();) {
@@ -2992,7 +2994,9 @@ void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
         pf.preprocess_exposure = config.controls.preprocess.active() ? config.controls.preprocess.exposure : 0;
         pf.white_point = renodx_on ? 0.f : config.white_point;
     }
-    if (!vk_loaded) { nr_vk_use_loader(dev->get_api() == device_api::vulkan); nr_vk_load(); vk_loaded = true; log("[nr] feed: Vulkan entry points resolved"); }
+    // the VRAM ledger wraps our allocation entry points (nr_vram_ledger.hpp) - after every load, or NR Control's VRAM
+    // breakdown shows none of the network's memory (the .asi does it in nr_pe_interop.cpp)
+    if (!vk_loaded) { nr_vk_use_loader(dev->get_api() == device_api::vulkan); nr_vk_load(); nr::vram::install_vulkan(); vk_loaded = true; log("[nr] feed: Vulkan entry points resolved"); }
     // An HDR10 back buffer is PQ (or HLG) over BT.2020, and nothing in this
     // pass decodes either. Running on it anyway would hand the model a picture
     // in a transfer function it has never seen and hand back a worse one, which

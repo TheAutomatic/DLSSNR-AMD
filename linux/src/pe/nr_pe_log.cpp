@@ -161,6 +161,10 @@ Slot* my_slot() {
 
 std::atomic<ULONGLONG> g_last_beat{0};
 std::atomic<unsigned long long> g_beats{0};
+std::atomic<ULONGLONG> g_last_game{0};
+std::atomic<unsigned long long> g_games{0};
+constexpr ULONGLONG kGameStallMs = 3000;
+constexpr int kMaxGameReports = 2;
 std::atomic<int> g_reports{0};
 constexpr int kMaxReports = 4;
 std::mutex g_thread_lock;      // the watching thread's start and stop
@@ -417,7 +421,8 @@ DWORD WINAPI watch(void* param) {
         g_describe = reinterpret_cast<Describe>(reinterpret_cast<void*>(GetProcAddress(k32, "GetThreadDescription")));
     }
     const ULONGLONG started = GetTickCount64();
-    bool said_none = false, stalled = false;
+    bool said_none = false, stalled = false, game_stalled = false;
+    int game_reports = 0;
     // Frames stop while the game is not in front (minimised, the desktop in front): no stall then. The time without a
     // frame counts from the later of the last frame and the last second the game was not in front.
     ULONGLONG not_front = 0;
@@ -439,6 +444,18 @@ DWORD WINAPI watch(void* param) {
             continue;
         }
         const ULONGLONG gap = now - std::max(g_last_beat.load(), not_front);
+        if (g_games.load() && game_reports < kMaxGameReports) {   // the game's frames alone (game_beat)
+            const ULONGLONG game_gap = now - std::max(g_last_game.load(), not_front);
+            if (game_gap < kGameStallMs) game_stalled = false;
+            else if (!game_stalled && gap < stall_ms()) {
+                game_stalled = true;
+                ++game_reports;
+                char why[160];
+                std::snprintf(why, sizeof why, "no frame of the game's own (its Present) for %llu ms while presents go on, "
+                              "after %llu of them", (unsigned long long)game_gap, g_games.load());
+                report(why);
+            }
+        }
         if (gap < stall_ms()) { stalled = false; continue; }
         if (stalled) continue;
         stalled = true;
@@ -497,6 +514,11 @@ void stop_and_wait() {
     // (ReShade then says the add-on "was not unregistered" and keeps it), which is better than a game that hangs here.
     WaitForSingleObject(t, 3000);
     CloseHandle(t);
+}
+
+void game_beat() {
+    g_last_game.store(GetTickCount64());
+    g_games.fetch_add(1);
 }
 
 void beat() {

@@ -59,6 +59,7 @@
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <tlhelp32.h>
+#include <psapi.h>
 
 #include <algorithm>
 #include <atomic>
@@ -76,6 +77,7 @@
 #include <mutex>
 #include <thread>
 #include <set>
+#include <unordered_set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -1177,7 +1179,11 @@ uint64_t pacing_us() {
     QueryPerformanceCounter(&c);
     return uint64_t(double(c.QuadPart) / per_us);
 }
-constexpr uint32_t kPresentGuideSets = 4;            // kPresentGuideSets
+constexpr uint32_t kPresentGuideSets = 4;            // kPresentGuideSets (the Vulkan and D3D11 paths: the oldest is reused)
+// D3D12: four sets, more (up to eight, each made when first needed) while every one is still read by a Present on the
+// GPU - a GPU-bound game whose Presents run frames behind found all four in use, its capture skipped: wilsjo2 at
+// Present then left those frames alone and the cadence lost them (NR Control flicking between running and not run)
+constexpr uint32_t kD12GuideSets = 8, kD12GuideSetsBase = 4;
 constexpr uint64_t kPresentGuideMaxAge = 8;          // kPresentGuideMaxAge (presents)
 constexpr ULONGLONG kPresentGuideMaxAgeMs = 250;     // kPresentGuideMaxAgeNs
 
@@ -1190,6 +1196,10 @@ struct GuideSet {
     ULONGLONG captured_ms = 0;
     uint32_t out_w = 0, out_h = 0;             // the upscaler's output (the aspect a back buffer must have)
     uint64_t read_value = 0;                   // the ring's fence value of the last Present that read it
+    uint64_t read_order = 0;                   // when it was last read (PresentPath::reads then): the newest is kept
+    // read on another's command list (DLSS-G's evaluate, present_layers' DlssgAt): that recording; the set is reused
+    // only once it is done (nr_gpu_completion.hpp)
+    nr::gpu::Ticket read_ticket;
     // submission (g_capture_lock): the game's list it was recorded on until that list is executed; then the queue it
     // ran on and our tracker's signal after it
     ID3D12CommandList* list = nullptr;
@@ -1208,14 +1218,14 @@ struct PresentLayer {                          // a Present layer's own
     nr::pe::Processing processing = nr::pe::Processing::kRenoDX;   // what it was made for
 };
 struct PresentPath {
-    GuideSet sets[kPresentGuideSets];
+    GuideSet sets[kD12GuideSets];
     // [Inspect]: the back buffer's copy before and after the compared Present layers (NON_PIXEL_SHADER_RESOURCE)
     ID3D12Resource* inspect_off = nullptr;
     ID3D12Resource* inspect_on = nullptr;
     D3D12_RESOURCE_STATES inspect_off_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                           inspect_on_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     HoldCopy hold;                             // [Inspect] HoldFrame of a Present layer
-    uint64_t serial = 0, presents = 0;
+    uint64_t serial = 0, presents = 0, reads = 0;
     ID3D12Device* device = nullptr;            // the ring's
     ID3D12CommandAllocator* allocators[kPresentRing] = {};
     ID3D12GraphicsCommandList* list = nullptr;
@@ -1237,6 +1247,13 @@ struct PresentPath {
                           hud_stats_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     bool hud_prev_valid = false, hud_fresh = true, hud_said = false;
     uint32_t hud_parity = 0;
+    // frame generation's HUD-less frame with the layers' change (present_layers' fg_delta): the frame before the layers
+    // (when HUD FIX keeps none), the result, an alpha of 0 (R16G16B16A16_FLOAT, zero at creation); UNORDERED_ACCESS
+    ID3D12Resource *fg_pre = nullptr, *fg_out = nullptr, *fg_zero = nullptr;
+    D3D12_RESOURCE_STATES fg_pre_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                          fg_out_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                          fg_zero_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    bool fg_said = false;
     uint64_t hud_estimated_at = ~0ull;   // the estimate's last Present: after a gap it starts afresh
     D3D12_RESOURCE_STATES linear_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS, encoded_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     std::map<int, PresentLayer> layers;        // by layer number
@@ -1259,6 +1276,18 @@ struct PresentPath {
     struct Declaration { uint32_t w = 0, h = 0, multiplier = 0; ULONGLONG ms = 0; uint64_t presents = 0; } declaration;
     std::atomic<ULONGLONG> top_ms{0};          // the game's own swap chain served the layers then (game_present)
     uint64_t chain_version = 0;
+    // The game's swap chain as its last Present saw it (screen_of): colour space and HDR white for the layers at DLSS-G's
+    // evaluate, which has no swap chain in hand
+    struct Screen { int space = 0; bool space_set = false; float white = 0.f; bool known = false; } screen;
+    // DLSS-G through NGX (Streamline's sl.dlss_g with OptiScaler's DLSSG replacement): the layers ran at its evaluate
+    // (dlssg_layers); the presents of that game frame - its generated ones and the real one, made by Streamline on the
+    // swap chain under its proxy - are left alone. dlssg_left: those still to come; dlssg_ms: the last such evaluate.
+    std::atomic<uint32_t> dlssg_left{0};
+    std::atomic<ULONGLONG> dlssg_ms{0};
+    std::atomic<IDXGISwapChain*> dlssg_sc{nullptr};   // the game's swap chain its last Present came on (a key only)
+    ID3D12Resource* dlssg_back = nullptr;      // the last evaluate's DLSSG.Backbuffer (a key only, for one log line)
+    bool dlssg_said = false, dlssg_back_said = false;
+    bool dlssg_menu_frame = false;             // the next taken present is the first of a game frame (for NR Control)
 };
 PresentPath g_present;                         // under g_lock, but the submission fields of `sets`
 std::mutex g_capture_lock;                     // GuideSet's submission fields; never held across ExecuteCommandLists
@@ -1343,13 +1372,41 @@ void capture_guides(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, const 
     // unusable - neutral guides and a history reset at the next Present)
     const GuideSet* last_read = nullptr;
     for (const GuideSet& s : g_present.sets)
-        if (s.serial && s.read_value && (!last_read || s.read_value > last_read->read_value)) last_read = &s;
-    for (GuideSet& s : g_present.sets) {
+        if (s.serial && s.read_order && (!last_read || s.read_order > last_read->read_order)) last_read = &s;
+    GuideSet* spare = nullptr;   // a set not made yet beyond the first four: taken only when no other is free
+    for (uint32_t k = 0; k < kD12GuideSets; ++k) {
+        GuideSet& s = g_present.sets[k];
         if (s.read_value > done && done != ~0ull) continue;   // a Present on the GPU still reads it
+        if (s.read_ticket && !s.read_ticket->ready()) continue;   // DLSS-G's evaluate list still reads it (or may)
         if (&s == last_read) continue;
+        if (k >= kD12GuideSetsBase && !s.depth) {
+            if (!spare) spare = &s;
+            continue;
+        }
         if (!target || s.serial < target->serial) target = &s;
     }
-    if (!target) return;
+    if (!target && spare) {
+        target = spare;
+        log("[nr] Present layers: guide set %u taken into use (every other one still read by a Present on the GPU)",
+            unsigned(spare - g_present.sets) + 1);
+    }
+    // The stream's cadence counts captures of its shape - this game frame, copied or not; two features feeding it at
+    // once are ambiguous for a second (StampPresentCapture: two renders must not read as half the frame generation)
+    const ULONGLONG now_ms = GetTickCount64();
+    if (aspect_matches(f.out_w, f.out_h, g_present.back_w, g_present.back_h)) {
+        if (g_present.cadence_source && g_present.cadence_source != feature &&
+            now_ms - g_present.cadence_source_ms <= kPresentGuideMaxAgeMs)
+            g_present.cadence_ambiguous_until_ms = now_ms + 1000;
+        g_present.cadence_source = feature;
+        g_present.cadence_source_ms = now_ms;
+        ++g_present.cadence_captures;
+    }
+    if (!target) {
+        static int told = 0;
+        if (told++ < 8) log("[nr] Present layers: no free guide set for this game frame (all %u still read on the GPU)",
+                            unsigned(kD12GuideSets));
+        return;
+    }
     for (ID3D12Resource* r : {f.depth, f.motion}) {
         const D3D12_RESOURCE_DESC d = r->GetDesc();
         if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.DepthOrArraySize != 1 || d.SampleDesc.Count != 1) return;
@@ -1369,19 +1426,9 @@ void capture_guides(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, const 
     target->w2 = wf;
     target->serial = ++g_present.serial;
     target->captured_at = g_present.presents;
-    target->captured_ms = GetTickCount64();
+    target->captured_ms = now_ms;
     target->out_w = f.out_w;
     target->out_h = f.out_h;
-    // The stream's cadence counts captures of its shape; two features feeding it at once are ambiguous for a second
-    // (StampPresentCapture: two renders must not read as half the frame generation)
-    if (aspect_matches(f.out_w, f.out_h, g_present.back_w, g_present.back_h)) {
-        if (g_present.cadence_source && g_present.cadence_source != feature &&
-            target->captured_ms - g_present.cadence_source_ms <= kPresentGuideMaxAgeMs)
-            g_present.cadence_ambiguous_until_ms = target->captured_ms + 1000;
-        g_present.cadence_source = feature;
-        g_present.cadence_source_ms = target->captured_ms;
-        ++g_present.cadence_captures;
-    }
     std::lock_guard<std::mutex> guard(g_capture_lock);
     target->list = cmd;
     target->queue = nullptr;
@@ -1649,8 +1696,33 @@ struct PresentShot {
     }
 };
 
-void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top) {
-    nr::pe::watchdog::Phase phase("Present layers");
+// The swap chain's colour space and the display's HDR white (polled at most once a second: DisplayConfig can block),
+// kept for the layers at DLSS-G's evaluate. g_lock.
+PresentPath::Screen screen_of(IDXGISwapChain* sc) {
+    PresentPath::Screen& s = g_present.screen;
+    s.space = 0;
+    s.space_set = nr::pe::menu::colour_space_of(sc, &s.space);
+    static ULONGLONG polled = 0;
+    if (const ULONGLONG now = GetTickCount64(); !polled || now - polled >= 1000) {
+        polled = now;
+        s.white = sdr_white(sc);
+    }
+    s.known = true;
+    return s;
+}
+
+// The Present layers at DLSS-G's evaluate (dlssg_layers): recorded on its command list, in place on its back buffer
+// (in `back_state` there), before frame generation reads it.
+struct DlssgAt {
+    ID3D12GraphicsCommandList* list;
+    ID3D12Resource* back;
+    D3D12_RESOURCE_STATES back_state;
+};
+
+// `sc` / `queue`: the game's swap chain and the queue it presents on; `at`: at DLSS-G's evaluate instead (sc null,
+// `queue` the one the game's swap chain presents on, for the guides' order).
+void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, const DlssgAt* at = nullptr) {
+    nr::pe::watchdog::Phase phase(at ? "Present layers (at DLSS-G's evaluate)" : "Present layers");
     const nr::asi::hudcap::Own own;   // its commands pass HUD FIX's capture hooks unseen
     std::unique_lock<std::mutex> guard(g_lock);
     tick_retired();
@@ -1684,27 +1756,30 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top) {
         return;
     }
     ID3D12Device* device = nullptr;
-    if (FAILED(queue->GetDevice(IID_PPV_ARGS(&device))) || !device) return;
+    if (FAILED(at ? at->list->GetDevice(IID_PPV_ARGS(&device)) : queue->GetDevice(IID_PPV_ARGS(&device))) || !device)
+        return;
     struct Dev { ID3D12Device* d; ~Dev() { d->Release(); } } hold{device};
-    IDXGISwapChain3* sc3 = nullptr;
-    if (FAILED(sc->QueryInterface(IID_PPV_ARGS(&sc3))) || !sc3) return;
-    const UINT index = sc3->GetCurrentBackBufferIndex();
-    sc3->Release();
     ID3D12Resource* back = nullptr;
-    if (FAILED(sc->GetBuffer(index, IID_PPV_ARGS(&back))) || !back) return;
+    if (at) {
+        back = at->back;
+        back->AddRef();
+    } else {
+        IDXGISwapChain3* sc3 = nullptr;
+        if (FAILED(sc->QueryInterface(IID_PPV_ARGS(&sc3))) || !sc3) return;
+        const UINT index = sc3->GetCurrentBackBufferIndex();
+        sc3->Release();
+        if (FAILED(sc->GetBuffer(index, IID_PPV_ARGS(&back))) || !back) return;
+    }
     struct Back { ID3D12Resource* r; ~Back() { r->Release(); } } back_hold{back};
+    // the back buffer's state where the layers find it and leave it
+    const D3D12_RESOURCE_STATES back_state = at ? at->back_state : D3D12_RESOURCE_STATE_PRESENT;
     const D3D12_RESOURCE_DESC bd = back->GetDesc();
     const uint32_t w = uint32_t(bd.Width), h = bd.Height;
     const DXGI_FORMAT format = writable(bd.Format);
-    int space = 0;
-    const bool space_set = nr::pe::menu::colour_space_of(sc, &space);
-    // The white for HDR (polled at most once a second: DisplayConfig can block)
-    static ULONGLONG polled = 0;
-    static float windows_white = 0.f;
-    if (const ULONGLONG now = GetTickCount64(); !polled || now - polled >= 1000) {
-        polled = now;
-        windows_white = sdr_white(sc);
-    }
+    const PresentPath::Screen screen = at ? g_present.screen : screen_of(sc);
+    const int space = screen.space;
+    const bool space_set = screen.space_set;
+    const float windows_white = screen.white;   // the white for HDR
     struct Run { const Layer* layer; uint32_t encoding; float white; };
     std::vector<Run> runs;
     bool unusable = false;
@@ -1757,7 +1832,8 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top) {
     // and frame generation's HUD-less frame (Auto's first choice, Game): what the game handed it this frame
     const nr::asi::hudcap::Frame hud_cap = nr::asi::hudcap::d3d12_present(
         device, sc, queue, back, format, w, h, !runs.empty() && (hud_mode == 1 || hud_mode == 3),
-        !runs.empty() && (hud_mode == 1 || hud_mode == 2));
+        !runs.empty(),   // (every mode: fg_delta below)
+        hud_mode == 1 || hud_mode == 2);   // copies on the hand-over's own command list only for HUD FIX (as 0.0.8.1)
     const bool hud_fg = hud_cap.fg.seen && hud_cap.fg.copy && (hud_mode == 1 || hud_mode == 2);
     const bool hud_captured = hud_fg || (hud_cap.result == nr::asi::hudcap::Result::kCaptured && hud_cap.hudless);
     ID3D12Resource* const hud_hudless = hud_fg ? hud_cap.fg.copy : hud_cap.hudless;
@@ -1796,7 +1872,8 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top) {
             double(g_present.cadence.cadence), what.c_str(),
             g_present.cadence.declared ? "DLSSG.MultiFrameCount"
             : g_present.cadence.source == nr::pe::present::FgSource::kLegacyTiming ? "legacy timing" : "stable timing",
-            top ? "at the game's own Present: once a game frame, frame generation made from their picture"
+            at  ? "at DLSS-G's evaluate: once a game frame, frame generation made from their picture"
+            : top ? "at the game's own Present: once a game frame, frame generation made from their picture"
             : first_renodx && first_renodx->layer->cfg.renodx.values.present_frames == 1
                 ? "on the first present after each game frame (NRPresentFrames=1)"
                 : m > 1 ? "on every present, motion scaled by 1/multiplier (NRPresentFrames=0)"
@@ -1808,7 +1885,7 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top) {
     // The ring's next slot, waited for (bounded) while a Present of eight ago still runs
     const uint32_t slot = uint32_t((g_present.submitted + 1) % kPresentRing);
     uint64_t done = g_present.fence->GetCompletedValue();
-    if (done < g_present.slot_value[slot]) {
+    if (!at && done < g_present.slot_value[slot]) {   // (at DLSS-G's evaluate the ring is not used)
         if (g_present.slot_wait_off) return;
         // the event may still hold an older wait's signal (one that timed out and completed later): the fence's own
         // value, read after the wake, is what says the slot is free
@@ -1836,12 +1913,12 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top) {
             return;
         }
     }
-    g_present.slot_wait_off = false;
+    if (!at) g_present.slot_wait_off = false;
     // Which guide sets this Present may read: submitted and ordered before it (on its queue, or complete on another)
-    bool ordered[kPresentGuideSets] = {};
+    bool ordered[kD12GuideSets] = {};
     {
         std::lock_guard<std::mutex> cg(g_capture_lock);
-        for (uint32_t k = 0; k < kPresentGuideSets; ++k) {
+        for (uint32_t k = 0; k < kD12GuideSets; ++k) {
             const GuideSet& gs = g_present.sets[k];
             ordered[k] = gs.serial && !gs.list && gs.queue &&
                          (gs.queue == queue || (gs.fence && gs.fence->GetCompletedValue() >= gs.value));
@@ -1849,22 +1926,30 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top) {
     }
     // RenoDX's guides: the newest fresh one of the back buffer's aspect
     GuideSet* guides = nullptr;
-    for (uint32_t k = 0; k < kPresentGuideSets; ++k) {
+    for (uint32_t k = 0; k < kD12GuideSets; ++k) {
         GuideSet& gs = g_present.sets[k];
         if (!ordered[k] || !fresh(gs) || (guides && gs.serial < guides->serial)) continue;
         guides = &gs;
     }
-    ID3D12GraphicsCommandList* l = g_present.list;
-    if (FAILED(g_present.allocators[slot]->Reset()) || FAILED(l->Reset(g_present.allocators[slot], nullptr))) return;
-    nr::gpu::reset(l);
+    ID3D12GraphicsCommandList* l = at ? at->list : g_present.list;
+    if (!at) {
+        if (FAILED(g_present.allocators[slot]->Reset()) || FAILED(l->Reset(g_present.allocators[slot], nullptr))) return;
+        nr::gpu::reset(l);
+    }
     nr::gpu::Scope recording(nr::asi::hudcap::d3d12_recording(l));
     g_d12_uses.touch();
-    transition(l, back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    transition(l, back, back_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
     transition(l, g_present.target, g_present.target_state, D3D12_RESOURCE_STATE_COPY_DEST);
     l->CopyResource(g_present.target, back);
     transition(l, g_present.target, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     PresentShot shot;   // F5: the frame as the game presents it
-    if (nr::pe::screenshot::wants_final() && shot.prepare(device, g_present.target)) shot.copy(l, g_present.target, 0);
+    if (nr::pe::screenshot::wants_final()) {
+        if (at)   // its pair needs our own submission's fence to read back
+            nr::pe::screenshot::fail("unsupported_present", "the Present layers run at DLSS-G's evaluate (DLSS-G through "
+                                     "NGX): the final picture's pair is not taken there");
+        else if (shot.prepare(device, g_present.target))
+            shot.copy(l, g_present.target, 0);
+    }
     // The guide sets read by this Present, shader-readable for it and back to COPY_DEST after
     std::vector<GuideSet*> readable;
     auto read = [&](GuideSet* gs) {
@@ -1925,6 +2010,63 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top) {
                 transition(l, hud_cap.fg.game, D3D12_RESOURCE_STATE_COPY_SOURCE, hud_cap.fg.state);
             }
             if (hud_captured) copy(hud_hudless, P.target);   // the layers run on the frame without its HUD
+        }
+    }
+    // Frame generation reads the game's HUD-less frame at the present: FSR and XeSS frame generation interpolate the
+    // HUD-less frames and take, as HUD, the pixels where the presented frame differs from it (FSR: by 10 % in a channel,
+    // ffx_frameinterpolation_inpainting.h). The layers change the presented frame only, so the generated frames were made
+    // from frames without NR and NR's change partly pasted on as HUD - each generated frame weaker than the real ones
+    // (FSR frame generation with the game's HUD-less frame: NR's strength alternating 9-7-9-7). Unless HUD FIX runs the
+    // layers on that frame itself (hud_fg, which hands NR's answer over), the HUD-less frame gets the layers' change:
+    //     HUD-less' = HUD-less + (presented - frame before the layers),
+    // so frame generation interpolates frames with NR and finds the same HUD as before (presented - HUD-less' = frame
+    // before the layers - HUD-less). The game's resource is written as hud_fg writes it (the substitute rule: only a
+    // hand-over frame generation reads at this present). The frame before: HUD FIX's copy of the back buffer, else ours.
+    bool fg_delta = hud_cap.fg.seen && hud_cap.fg.substitute && hud_cap.fg.copy && hud_cap.fg.game && !hud_fg;
+    if (fg_delta) {
+        const D3D12_RESOURCE_DESC gd = hud_cap.fg.game->GetDesc(), cd = hud_cap.fg.copy->GetDesc();
+        if (gd.Format != format || gd.Width != w || gd.Height != h || cd.Format != format || cd.Width != w || cd.Height != h) {
+            fg_delta = false;
+            static uint32_t said = ~0u;
+            if (said != uint32_t(gd.Format))
+                log("[nr] Present layers: %s's HUD-less frame (DXGI format %u, %llux%u) is not the swap chain's (%u, %ux%u): "
+                    "it keeps the frame without NR", hud_cap.fg.source, unsigned(gd.Format),
+                    static_cast<unsigned long long>(gd.Width), gd.Height, unsigned(format), w, h);
+            said = uint32_t(gd.Format);
+        }
+    }
+    ID3D12Resource* fg_before = nullptr;
+    if (fg_delta) {
+        PresentPath& P = g_present;
+        const bool ready = (hud || ensure_texture(device, P.fg_pre, P.fg_pre_state, format, w, h)) &&
+                           ensure_texture(device, P.fg_out, P.fg_out_state, format, w, h) &&
+                           ensure_texture(device, P.fg_zero, P.fg_zero_state, DXGI_FORMAT_R16G16B16A16_FLOAT, w, h) &&
+                           ensure_texture(device, P.hud_stats, P.hud_stats_state, DXGI_FORMAT_R32_UINT, hud_stats_w(w),
+                                          hud_stats_h(h));
+        if (!ready) {
+            if (!P.fg_said) {
+                P.fg_said = true;
+                log("[nr] Present layers: frame generation's HUD-less frame: textures could not be made; it keeps the "
+                    "frame without NR");
+            }
+        } else {
+            if (hud) {
+                fg_before = P.hud_back;   // (the pointer: hud_end swaps the two roles afterwards)
+            } else {
+                transition(l, P.target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                transition(l, P.fg_pre, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+                l->CopyResource(P.fg_pre, P.target);
+                transition(l, P.fg_pre, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                transition(l, P.target, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                fg_before = P.fg_pre;
+            }
+            if (!hud_cap.fg.copied) {   // the game's frame, valid until the present: copied now
+                transition(l, hud_cap.fg.game, hud_cap.fg.state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                transition(l, hud_cap.fg.copy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+                l->CopyResource(hud_cap.fg.copy, hud_cap.fg.game);
+                transition(l, hud_cap.fg.copy, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                transition(l, hud_cap.fg.game, D3D12_RESOURCE_STATE_COPY_SOURCE, hud_cap.fg.state);
+            }
         }
     }
     const auto hud_end = [&] {
@@ -2022,7 +2164,7 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top) {
             // then two presents old, so in such a game (3 runs in 11 s) the layer waited and the network was freed as
             // idle again and again.
             GuideSet* g = nullptr;
-            for (uint32_t k = 0; k < kPresentGuideSets; ++k) {
+            for (uint32_t k = 0; k < kD12GuideSets; ++k) {
                 GuideSet& gs = g_present.sets[k];
                 if (!ordered[k] || gs.serial <= pl.consumed || !fresh(gs) || (g && gs.serial < g->serial))
                     continue;
@@ -2152,18 +2294,43 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top) {
         transition(l, gs->depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
         transition(l, gs->motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     }
+    if (fg_before && ran) {   // the HUD-less frame + the layers' change, handed to frame generation in its place
+        PresentPath& P = g_present;
+        if (nr::asi::wilsjo2_fg_delta(l, device, hud_cap.fg.copy, fg_before, P.target, P.fg_zero, P.hud_stats, P.fg_out, w,
+                                      h)) {
+            transition(l, P.fg_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            transition(l, hud_cap.fg.game, hud_cap.fg.state, D3D12_RESOURCE_STATE_COPY_DEST);
+            l->CopyResource(hud_cap.fg.game, P.fg_out);
+            transition(l, hud_cap.fg.game, D3D12_RESOURCE_STATE_COPY_DEST, hud_cap.fg.state);
+            transition(l, P.fg_out, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            static bool said = false;
+            if (!said) {
+                said = true;
+                log("[nr] Present layers: %s's HUD-less frame gets NR's change (frame generation interpolates frames "
+                    "with NR)", hud_cap.fg.source);
+            }
+        } else if (!P.fg_said) {
+            P.fg_said = true;
+            log("[nr] Present layers: frame generation's HUD-less frame: the change could not be recorded; it keeps the "
+                "frame without NR");
+        }
+    }
     shot.copy(l, g_present.target, 1);   // F5: the final picture
     transition(l, g_present.target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    transition(l, back, D3D12_RESOURCE_STATE_COPY_SOURCE, ran ? D3D12_RESOURCE_STATE_COPY_DEST : D3D12_RESOURCE_STATE_PRESENT);
+    transition(l, back, D3D12_RESOURCE_STATE_COPY_SOURCE, ran ? D3D12_RESOURCE_STATE_COPY_DEST : back_state);
     if (ran) {
         l->CopyResource(back, g_present.target);
-        transition(l, back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
+        transition(l, back, D3D12_RESOURCE_STATE_COPY_DEST, back_state);
     }
     transition(l, g_present.target, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     g_present.target_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    if (at) {   // the evaluate's list: its owner closes and submits it; the guide sets wait for that recording
+        for (GuideSet* gs : readable) { gs->read_order = ++g_present.reads; gs->read_ticket = nr::gpu::current(); }
+        return;
+    }
     if (FAILED(l->Close())) return;
     const uint64_t value = ++g_present.submitted;
-    for (GuideSet* gs : readable) gs->read_value = value;
+    for (GuideSet* gs : readable) { gs->read_value = value; gs->read_order = ++g_present.reads; }
     guard.unlock();   // our own ExecuteCommandLists comes through on_execute
     ID3D12CommandList* lists[] = {l};
     queue->ExecuteCommandLists(1, lists);
@@ -2290,6 +2457,7 @@ bool read_small(const std::string& path, std::string* out) {
     std::fclose(f);
     return true;
 }
+std::string take_game_sources();   // below, beside the swap chains' detours
 void pacing_watch() {
     // the GPU: the card with the most VRAM (a processor's integrated GPU has its own card and a few hundred MB)
     std::string card;
@@ -2402,6 +2570,10 @@ void pacing_watch() {
                 static_cast<unsigned long long>(waits - waits_at), double(wait_us - wait_us_at) / 1000.0, clock,
                 memory.c_str());
         }
+        if (active) {
+            const std::string sources = take_game_sources();
+            if (!sources.empty()) log("[nr] pacing (10 s): the Presents taken as the game's: %s", sources.c_str());
+        }
         frames_at = frames; presents_at = presents; calls_at = calls; us_at = us; waits_at = waits; wait_us_at = wait_us;
     }
 }
@@ -2422,10 +2594,17 @@ void frame_generation_line() {
     const uint64_t frames = g_fg_frames.load() - frames_at;
     char line[160];
     const auto& decl = g_present.declaration;
-    if ((decl.multiplier > 1 && now - decl.ms < 2000) || (frames && presents >= frames * 13 / 10)) g_fg_on_ms = now;   // (frame generation capped by the display: under 2x)
+    // Frame generation seen on: the game's DLSS-G declaration, or more presents than game frames (capped by the display:
+    // under 2x) in two seconds in a row of real play - at least 10 game frames a second. A loading screen or a menu
+    // presents without upscaling (a few evaluates, many presents) and read as frame generation: one 120 ms pacing pause
+    // after an NR change, and "frame generation is likely on" in NR Control.
+    static int ratio_seconds = 0;
+    const bool playing = frames >= 10;
+    ratio_seconds = playing && presents >= frames * 13 / 10 ? ratio_seconds + 1 : 0;
+    if ((decl.multiplier > 1 && now - decl.ms < 2000) || ratio_seconds >= 2) g_fg_on_ms = now;
     if (decl.multiplier > 1 && now - decl.ms < 2000)
         std::snprintf(line, sizeof line, NR_N("Frame generation: the game's DLSS-G, %ux (its own word)"), decl.multiplier);
-    else if (!frames)
+    else if (!playing)
         std::snprintf(line, sizeof line, NR_N("Frame generation: not known (no game frame in the last second)"));
     else {
         const double r = double(presents) / double(frames);
@@ -2440,6 +2619,108 @@ void frame_generation_line() {
     frames_at = g_fg_frames.load();
 }
 
+// ---- DLSS-G through NGX: the Present layers at its evaluate ----------------------------------------------------------
+// With OptiScaler's "DLSSG via Nvngx" (and any DLSSG replacement behind NGX) Streamline's sl.dlss_g runs frame
+// generation inside the game's Present to Streamline's proxy: it evaluates the DLSSG feature on the finished frame
+// (DLSSG.Backbuffer, the swap chain's buffer), which makes the generated frame from it and copies it into the real one
+// (OptiScaler's Nvngx_FFX: OutputReal), and then presents both on the swap chain under the proxy - the one adopted here.
+// The layers at those presents ran after frame generation, on every present: the generated frames made without NR and
+// NR paid twice (0.0.8.2's known limitation). So they run at the first evaluate of a game frame instead, on its
+// command list, in place on its back buffer, before frame generation reads it - once a game frame, as at the game's own
+// Present of a frame generator's proxy; the presents of that frame are left alone (dlssg_present_taken).
+// A key of the swap chain the game's last Present came on (never called) and its queue (AddRef), for the layers at the
+// evaluate: the guides' order is told by it. g_lock.
+ID3D12CommandQueue* g_dlssg_queue = nullptr;
+void dlssg_note_present(IDXGISwapChain* sc, ID3D12CommandQueue* queue) {
+    if (g_present.dlssg_sc.load() == sc && g_dlssg_queue == queue) return;
+    g_present.dlssg_sc = sc;
+    if (queue) queue->AddRef();
+    if (g_dlssg_queue) g_dlssg_queue->Release();
+    g_dlssg_queue = queue;
+}
+// Whether this DLSS-G evaluate runs the Present layers: a frame-generation feature's (or one not known yet: it is taken
+// as frame generation by its back buffer), the chain has layers at Present, the evaluate is a game frame's first
+// (DLSSG.MultiFrameIndex 1: multi-frame generation evaluates once per generated frame), a Present of the game's was seen
+// (its queue, its screen). The queue (AddRef) or null.
+ID3D12CommandQueue* dlssg_layers_here(unsigned int id, NVSDK_NGX_Parameter* p) {
+    uint32_t index = 1;
+    if (p->Get("DLSSG.MultiFrameIndex", &index) != NVSDK_NGX_Result_Success) index = 1;
+    if (index > 1) return nullptr;
+    const std::shared_ptr<const Chain> chain = chain_now();
+    if (!chain || std::none_of(chain->layers.begin(), chain->layers.end(), [](const Layer& l) { return present_layer(l); }))
+        return nullptr;
+    std::lock_guard<std::mutex> guard(g_lock);
+    if (const auto it = g_features.find(id); it != g_features.end() && it->second.feature >= 0 &&
+                                             it->second.feature != kFeatureFrameGeneration)
+        return nullptr;
+    if (!g_dlssg_queue || !g_present.screen.known) return nullptr;
+    g_dlssg_queue->AddRef();
+    return g_dlssg_queue;
+}
+void dlssg_layers(ID3D12GraphicsCommandList* cmd, ID3D12Resource* back, ID3D12CommandQueue* queue, uint32_t generated) {
+    const ULONGLONG now = GetTickCount64();
+    {
+        std::lock_guard<std::mutex> guard(g_lock);
+        // this frame's presents (the generated ones and the real one) are added to those still to come - a frame's
+        // presents may come after the next frame's evaluate (a presenting thread a frame behind) - up to two frames' worth
+        // (a frame whose presents never all came does not keep the next ones from the layers)
+        g_present.dlssg_ms = now;
+        g_present.dlssg_left = std::min(g_present.dlssg_left.load() + generated + 1, 2 * (generated + 1));
+        g_present.dlssg_back = back;
+        g_present.dlssg_menu_frame = true;
+        if (!g_present.dlssg_said) {
+            g_present.dlssg_said = true;
+            log("[nr] Present layers: DLSS-G through NGX (Streamline's frame generation): they run at its evaluate, on its "
+                "back buffer before frame generation reads it - once a game frame; its presents are left alone");
+        }
+    }
+    // OptiScaler's own DLSSG replacements read the back buffer as a compute input (NON_PIXEL_SHADER_RESOURCE there,
+    // Nvngx_FFX / HudCopy_Dx12)
+    const DlssgAt at{cmd, back, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+    const uint64_t from = pacing_us();
+    present_layers(nullptr, queue, true, &at);
+    const uint64_t took = pacing_us() - from;
+    ++g_pacing.top_calls;
+    g_pacing.top_us += took;
+    for (uint64_t m = g_pacing.top_max_us.load(); took > m && !g_pacing.top_max_us.compare_exchange_weak(m, took);) {}
+}
+// A Present of the game's swap chain while the layers run at DLSS-G's evaluate: true when it belongs to a game frame
+// they already ran on (left alone): the presents its evaluates declared (DLSSG.MultiFrameCount + 1 each) are counted
+// down; once none is left (frame generation switched off: no evaluate) the presents take the layers again, from the
+// next one on (a time window as well cost the first frame after frame generation went off its NR in the stand-in).
+// A second without such an evaluate ends it whatever is left. Keeps the screen and the capture's back buffers current.
+// g_lock.
+bool dlssg_present_taken(IDXGISwapChain* sc) {
+    const ULONGLONG last = g_present.dlssg_ms.load();
+    if (!last) return false;
+    const uint32_t left = g_present.dlssg_left.load();
+    if (!left) return false;
+    g_present.dlssg_left = left - 1;
+    if (GetTickCount64() - last > 1000) { g_present.dlssg_left = 0; return false; }
+    screen_of(sc);
+    nr::asi::hudcap::d3d12_backs(sc);
+    if (!g_present.dlssg_back_said && g_present.dlssg_back) {   // what the evaluate's back buffer is (once, for the log)
+        g_present.dlssg_back_said = true;
+        int which = -1;
+        DXGI_SWAP_CHAIN_DESC d{};
+        if (SUCCEEDED(sc->GetDesc(&d)))
+            for (UINT i = 0; i < d.BufferCount && i < 8; ++i) {
+                ID3D12Resource* b = nullptr;
+                if (SUCCEEDED(sc->GetBuffer(i, IID_PPV_ARGS(&b))) && b) {
+                    if (b == g_present.dlssg_back) which = int(i);
+                    b->Release();
+                }
+            }
+        if (which >= 0)
+            log("[nr] Present layers: DLSS-G's back buffer is buffer %d of the game's swap chain %p", which,
+                static_cast<void*>(sc));
+        else
+            log("[nr] Present layers: DLSS-G's back buffer is not one of the buffers of the game's swap chain %p "
+                "(a copy): the real frame shown is its OutputReal", static_cast<void*>(sc));
+    }
+    return true;
+}
+
 // Whether this Present goes into present_layers: while the chain has Present layers, every one; else twice a second,
 // so a Present layer turned on in NR Control runs without waiting for a game evaluate (the game in its menus, an
 // upscaler not called yet: Present layers need none).
@@ -2451,13 +2732,36 @@ bool present_due() {
     return true;
 }
 
+// A game frame generation's proxy followed (adopt_fg_proxy): the layers run at its Present only. NR Control's Present
+// hook below sees frame generation's own presents of the swap chain under the proxy, on its own thread and queue;
+// running the layers there too (the second-long fallback: a slow first proxy frame, a loading pause) put two queues on
+// the same command list, images and fence ring without any order between them.
+std::atomic<bool> g_fg_proxy_active{false};
+bool fg_inner(IDXGISwapChain* sc);
+// The game's newest swap chain is a frame generator's own (adopt_swapchain: OptiScaler's XeFG or FSR FG output made it
+// inside the game's creation call, so no followed frame-generation call adopted it). Its Present is hooked and runs the
+// layers once a game frame; every other swap chain NR Control's hook sees then is presented by frame generation's own
+// threads. While the game is slow to present (loading at under one frame a second) the second-long fallback below would
+// run the layers there as well, on the presenting thread and its queue, at the same time as the game thread on its own:
+// two queues on one command list, images and fence ring without any order between them (as g_fg_proxy_active above).
+std::atomic<bool> g_fg_proxy_held{false};
+bool game_swapchain(IDXGISwapChain* sc);
 void on_present(IDXGISwapChain* sc, ID3D12CommandQueue* queue, int encoding) {
     nr::pe::watchdog::beat();
     nr::pe::watchdog::Phase phase("the system's Present (NR Control's hook)");
     frame_generation_line();
     const bool served_above = GetTickCount64() - g_present.top_ms.load() < 1000;
-    if (!served_above && (present_due() || g_present.held.load()))   // held: features to let go of
-        present_layers(sc, queue, false);
+    const bool fg_owned = g_fg_proxy_active.load() || fg_inner(sc) || (g_fg_proxy_held.load() && !game_swapchain(sc));
+    if (!served_above && !fg_owned) {
+        bool taken = false;   // a game frame whose layers ran at DLSS-G's evaluate (dlssg_layers)
+        {
+            std::lock_guard<std::mutex> guard(g_lock);
+            dlssg_note_present(sc, queue);
+            taken = dlssg_present_taken(sc);
+        }
+        if (!taken && (present_due() || g_present.held.load()))   // held: features to let go of
+            present_layers(sc, queue, false);
+    }
     if (!g_present.wanted.load()) late_present(sc, queue, encoding);
     debug_present_dump(sc, queue);   // what is shown, after whatever ran here
 }
@@ -2478,6 +2782,10 @@ void on_present(IDXGISwapChain* sc, ID3D12CommandQueue* queue, int encoding) {
 std::mutex g_sc_lock;
 std::unordered_map<IDXGISwapChain*, ID3D12CommandQueue*> g_game_swapchains;   // the game's, with its queue (AddRef)
 std::unordered_map<IDXGISwapChain*, ID3D11Device*> g_game_swapchains11;       // a D3D11 game's, with its device (AddRef)
+bool game_swapchain(IDXGISwapChain* sc) {
+    std::lock_guard<std::mutex> guard(g_sc_lock);
+    return g_game_swapchains.count(sc) != 0;
+}
 void d11_present_layers(IDXGISwapChain* sc, ID3D11Device* device);   // the D3D11 section
 bool d11_present_due();
 std::atomic<ULONGLONG> g_d11_top_ms{0};   // the game's own D3D11 swap chain served the layers then
@@ -2526,16 +2834,18 @@ void fg_pacing_restart() {
 }
 
 void game_present_before(IDXGISwapChain* sc) {
+    nr::pe::watchdog::game_beat();
     fg_pacing_restart();
     ID3D12CommandQueue* queue = nullptr;
     ID3D11Device* d11 = nullptr;
     {
         std::lock_guard<std::mutex> guard(g_sc_lock);
         const auto it = g_game_swapchains.find(sc);
-        if (it != g_game_swapchains.end()) queue = it->second;
+        if (it != g_game_swapchains.end() && it->second) { queue = it->second; queue->AddRef(); }   // (fg_forget may let it go)
         const auto it11 = g_game_swapchains11.find(sc);
         if (it11 != g_game_swapchains11.end()) { d11 = it11->second; d11->AddRef(); }
     }
+    struct Pin { ID3D12CommandQueue* q; ~Pin() { if (q) q->Release(); } } pin{queue};
     // NR_PRESENT_UNDER=1 (measurement only): leave the layers to NR Control's Present hook, under OptiScaler (and after
     // its frame generation), for comparing the two places
     static const bool under = [] { char b[8] = {}; return GetEnvironmentVariableA("NR_PRESENT_UNDER", b, 8) && b[0] == '1'; }();
@@ -2552,11 +2862,21 @@ void game_present_before(IDXGISwapChain* sc) {
     }
     if (!queue || under) return;
     const uint64_t from = pacing_us();
-    if (present_due()) {
+    bool taken = false;   // a game frame whose layers ran at DLSS-G's evaluate (dlssg_layers)
+    bool new_frame = true;   // for NR Control: the first present of that game frame
+    {
+        std::lock_guard<std::mutex> guard(g_lock);
+        dlssg_note_present(sc, queue);
+        taken = dlssg_present_taken(sc);
+        if (taken) new_frame = std::exchange(g_present.dlssg_menu_frame, false);
+    }
+    if (taken) {
+        g_present.top_ms = GetTickCount64();
+    } else if (present_due()) {
         present_layers(sc, queue, true);
         g_present.top_ms = GetTickCount64();
     }
-    nr::pe::menu::draw_game(sc, queue);
+    nr::pe::menu::draw_game(sc, queue, new_frame);
     const uint64_t took = pacing_us() - from;
     ++g_pacing.top_calls;
     g_pacing.top_us += took;
@@ -2565,6 +2885,135 @@ void game_present_before(IDXGISwapChain* sc) {
 
 void adopt_swapchain(IUnknown* device, IDXGISwapChain* sc);
 
+// A frame-generation library: its own thread presents the game's frames and the generated ones to the swap chain under
+// its proxy. Present calls made from inside one are frame generation's, not the game's.
+bool fg_library_name(std::wstring name) {
+    for (wchar_t& c : name) c = wchar_t(std::towlower(c));
+    return name.rfind(L"libxess_fg", 0) == 0 || name.find(L"framegeneration") != std::wstring::npos ||
+           name.rfind(L"amd_fidelityfx", 0) == 0 || name == L"sl.dlss_g.dll" || name == L"nvngx_dlssg.dll" ||
+           name.rfind(L"dlssg_to_fsr3", 0) == 0 || name.rfind(L"dlss-enabler", 0) == 0 ||
+           // FSR 3.0 / 3.1.0 as DLLs: the frame-generation swap chain lives in the DX12 backend
+           name.rfind(L"ffx_backend_dx12", 0) == 0 || name.rfind(L"ffx_frameinterpolation", 0) == 0 ||
+           name.rfind(L"ffx_fsr3", 0) == 0;
+}
+// The swap chains a frame-generation swap chain made under its proxy while the game's call creating it was followed
+// (FSR 3.0 below): their Presents are frame generation's, whichever module makes them - with FSR 3.0 linked into the
+// game's executable its presenting thread runs in the executable. g_sc_lock.
+std::unordered_set<IDXGISwapChain*> g_fg_inner;
+std::atomic<bool> g_fg_inner_any{false};
+thread_local std::vector<IDXGISwapChain*>* t_fg_inners = nullptr;   // set while a followed creation call runs
+bool fg_inner(IDXGISwapChain* sc) {
+    if (!g_fg_inner_any.load(std::memory_order_relaxed)) return false;
+    std::lock_guard<std::mutex> guard(g_sc_lock);
+    return g_fg_inner.count(sc) != 0;
+}
+// A swap chain the factory made: under a followed frame-generation call one of its inner ones; otherwise a new one of the
+// game's, never an inner one (an address freed and taken again).
+void note_created(IDXGISwapChain* sc) {
+    if (t_fg_inners) { t_fg_inners->push_back(sc); return; }
+    if (!g_fg_inner_any.load()) return;
+    std::lock_guard<std::mutex> guard(g_sc_lock);
+    g_fg_inner.erase(sc);
+}
+// Which module a caller is in, by address ranges kept from when the modules were loaded: never through the loader
+// (GetModuleHandleExW / GetModuleFileNameW take the loader lock). These questions are asked on every Present and in
+// frame generation's calls, also on its own threads: a thread loading a DLL that waits for one of them would wait for
+// ever.
+size_t image_size(HMODULE m) {
+    if (!m) return 0;
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(m);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(reinterpret_cast<const uint8_t*>(m) + dos->e_lfanew);
+    return nt->Signature == IMAGE_NT_SIGNATURE ? nt->OptionalHeader.SizeOfImage : 0;
+}
+struct ModuleRange { uintptr_t lo = 0, hi = 0; };
+ModuleRange range_of(HMODULE m) {
+    ModuleRange r;
+    if (const size_t n = image_size(m)) { r.lo = reinterpret_cast<uintptr_t>(m); r.hi = r.lo + n; }
+    return r;
+}
+bool in_range(const ModuleRange& r, const void* a) {
+    const auto v = reinterpret_cast<uintptr_t>(a);
+    return v >= r.lo && v < r.hi;
+}
+ModuleRange g_opti_range, g_self_range;   // InitializeASI
+// The frame-generation libraries' ranges (fg_library_name): added at their load, cleared at their unload.
+constexpr int kFgRanges = 64;
+std::atomic<uintptr_t> g_fg_lo[kFgRanges], g_fg_hi[kFgRanges];
+std::atomic<int> g_fg_ranges{0};
+std::mutex g_fg_range_lock;
+void fg_range_set(uintptr_t lo, uintptr_t hi) {   // hi 0: the module at lo went
+    if (!lo) return;
+    std::lock_guard<std::mutex> guard(g_fg_range_lock);
+    const int n = g_fg_ranges.load();
+    for (int i = 0; i < n; ++i)
+        if (g_fg_lo[i].load() == lo) { g_fg_hi[i].store(hi); return; }
+    if (!hi || n >= kFgRanges) return;
+    g_fg_lo[n].store(lo);
+    g_fg_hi[n].store(hi);
+    g_fg_ranges.store(n + 1, std::memory_order_release);
+}
+bool in_fg_library(const void* a) {
+    const auto v = reinterpret_cast<uintptr_t>(a);
+    const int n = g_fg_ranges.load(std::memory_order_acquire);
+    for (int i = 0; i < n; ++i)
+        if (v >= g_fg_lo[i].load(std::memory_order_relaxed) && v < g_fg_hi[i].load(std::memory_order_relaxed)) return true;
+    return false;
+}
+
+// The layers run at the game's own Present call only: the outermost hooked Present on its thread (a proxy whose Present
+// calls its own Present1 or the swap chain under it - XeSS frame generation's - runs them once), and not one a
+// frame-generation library makes from its own thread (the game's frames and the generated ones under its proxy: there
+// the layers ran on every present, generated ones too, at twice the cost - with NR's 12 ms at 4K frame generation then
+// gave no frame more). The proxy itself is adopted where the game gets it (adopt_fg_proxy below); a frame generator not
+// followed there leaves the layers to NR Control's Present hook, after frame generation, as before.
+thread_local int t_present_depth = 0;
+struct PresentDepth {
+    bool game;
+    PresentDepth(void* caller, IDXGISwapChain* sc)
+        : game(t_present_depth++ == 0 && !in_fg_library(caller) && !fg_inner(sc)) {}
+    ~PresentDepth() { --t_present_depth; }
+};
+
+// Which swap chain and which call site the Presents taken as the game's came from, for the pacing line: under a frame
+// generator they must be one a game frame; more means a generator's own presents are taken as the game's. Call sites
+// are kept as return addresses (no loader call on a Present) and named on the pacing thread.
+struct GamePresentSource { IDXGISwapChain* sc; void* caller; uint64_t n; };
+std::mutex g_game_sources_lock;
+GamePresentSource g_game_sources[16];
+int g_game_sources_n = 0;
+void note_game_present(IDXGISwapChain* sc, void* caller) {
+    std::lock_guard<std::mutex> guard(g_game_sources_lock);
+    for (int i = 0; i < g_game_sources_n; ++i)
+        if (g_game_sources[i].sc == sc && g_game_sources[i].caller == caller) { ++g_game_sources[i].n; return; }
+    if (g_game_sources_n < 16) g_game_sources[g_game_sources_n++] = {sc, caller, 1};
+}
+std::string take_game_sources() {   // the pacing thread: the last ten seconds' sources, named, and a fresh count
+    GamePresentSource copy[16];
+    int n = 0;
+    {
+        std::lock_guard<std::mutex> guard(g_game_sources_lock);
+        n = g_game_sources_n;
+        std::copy(g_game_sources, g_game_sources + n, copy);
+        g_game_sources_n = 0;
+    }
+    std::string text;
+    for (int i = 0; i < n; ++i) {
+        HMODULE m = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           static_cast<LPCWSTR>(copy[i].caller), &m);
+        std::string name = m ? nr::u8::module_file(m) : std::string("?");
+        if (const size_t cut = name.find_last_of("\\/"); cut != std::string::npos) name = name.substr(cut + 1);
+        char one[160];
+        std::snprintf(one, sizeof one, "%s%p from %s+0x%llx: %llu", text.empty() ? "" : "; ", static_cast<void*>(copy[i].sc),
+                      name.c_str(), static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(copy[i].caller) -
+                                                                    reinterpret_cast<uintptr_t>(m)),
+                      static_cast<unsigned long long>(copy[i].n));
+        text += one;
+    }
+    return text;
+}
+
 template <int K>
 struct ScDetours {
     template <class Fn>
@@ -2572,7 +3021,11 @@ struct ScDetours {
 
     static HRESULT STDMETHODCALLTYPE present(IDXGISwapChain* sc, UINT sync, UINT flags) {
         nr::pe::watchdog::beat();
-        if (!(flags & DXGI_PRESENT_TEST)) game_present_before(sc);
+        const PresentDepth depth(__builtin_return_address(0), sc);
+        if (!(flags & DXGI_PRESENT_TEST) && depth.game) {
+            note_game_present(sc, __builtin_return_address(0));
+            game_present_before(sc);
+        }
         using Fn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
         const nr::asi::hudcap::PresentCall call;   // frame generation's hand-overs now: OptiScaler's own
         return original<Fn>(kDetourPresent)(sc, sync, flags);
@@ -2580,7 +3033,11 @@ struct ScDetours {
     static HRESULT STDMETHODCALLTYPE present1(IDXGISwapChain1* sc, UINT sync, UINT flags,
                                               const DXGI_PRESENT_PARAMETERS* params) {
         nr::pe::watchdog::beat();
-        if (!(flags & DXGI_PRESENT_TEST)) game_present_before(sc);
+        const PresentDepth depth(__builtin_return_address(0), sc);
+        if (!(flags & DXGI_PRESENT_TEST) && depth.game) {
+            note_game_present(sc, __builtin_return_address(0));
+            game_present_before(sc);
+        }
         using Fn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*);
         const nr::asi::hudcap::PresentCall call;   // frame generation's hand-overs now: OptiScaler's own
         return original<Fn>(kDetourPresent1)(sc, sync, flags, params);
@@ -2591,7 +3048,7 @@ struct ScDetours {
         ++t_creating;
         const HRESULT hr = original<Fn>(kDetourCreate)(f, device, desc, out);
         --t_creating;
-        if (SUCCEEDED(hr) && out && !t_creating) adopt_swapchain(device, *out);
+        if (SUCCEEDED(hr) && out && !t_creating) { note_created(*out); adopt_swapchain(device, *out); }
         return hr;
     }
     static HRESULT STDMETHODCALLTYPE create_hwnd(IDXGIFactory2* f, IUnknown* device, HWND hwnd,
@@ -2602,7 +3059,7 @@ struct ScDetours {
         ++t_creating;
         const HRESULT hr = original<Fn>(kDetourCreateHwnd)(f, device, hwnd, desc, fs, output, out);
         --t_creating;
-        if (SUCCEEDED(hr) && out && !t_creating) adopt_swapchain(device, *out);
+        if (SUCCEEDED(hr) && out && !t_creating) { note_created(*out); adopt_swapchain(device, *out); }
         return hr;
     }
     static HRESULT STDMETHODCALLTYPE create_core(IDXGIFactory2* f, IUnknown* device, IUnknown* window,
@@ -2613,7 +3070,7 @@ struct ScDetours {
         ++t_creating;
         const HRESULT hr = original<Fn>(kDetourCreateCore)(f, device, window, desc, output, out);
         --t_creating;
-        if (SUCCEEDED(hr) && out && !t_creating) adopt_swapchain(device, *out);
+        if (SUCCEEDED(hr) && out && !t_creating) { note_created(*out); adopt_swapchain(device, *out); }
         return hr;
     }
     static HRESULT STDMETHODCALLTYPE create_comp(IDXGIFactory2* f, IUnknown* device, const DXGI_SWAP_CHAIN_DESC1* desc,
@@ -2623,7 +3080,7 @@ struct ScDetours {
         ++t_creating;
         const HRESULT hr = original<Fn>(kDetourCreateComp)(f, device, desc, output, out);
         --t_creating;
-        if (SUCCEEDED(hr) && out && !t_creating) adopt_swapchain(device, *out);
+        if (SUCCEEDED(hr) && out && !t_creating) { note_created(*out); adopt_swapchain(device, *out); }
         return hr;
     }
     static void* of(DetourKind kind) {
@@ -2790,6 +3247,22 @@ void adopt_swapchain(IUnknown* device, IDXGISwapChain* sc) {
         if (slot) slot->Release();
         slot = queue;
     }
+    {   // whose Present this is: a frame generator's (fg_library_name) or not; the game's newest chain decides
+        void* fn = (*reinterpret_cast<void***>(sc))[8];
+        HMODULE owner = nullptr;
+        wchar_t path[MAX_PATH] = {};
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               static_cast<LPCWSTR>(fn), &owner) && owner)
+            GetModuleFileNameW(owner, path, MAX_PATH);
+        std::wstring name = path;
+        if (const size_t cut = name.find_last_of(L"\\/"); cut != std::wstring::npos) name = name.substr(cut + 1);
+        const bool fg = owner && owner != g_opti && fg_library_name(name);
+        if (fg != g_fg_proxy_held.exchange(fg))
+            log("[nr] Present layers: the game's swap chain %p %s", static_cast<void*>(sc),
+                fg ? "is frame generation's own: the layers run at its Present only, not at the presents of the swap chain "
+                     "under it"
+                   : "is not frame generation's: the layers may also run at the system's Present again");
+    }
     bool hooked = hook_slot(sc, 8, kDetourPresent);
     IDXGISwapChain1* sc1 = nullptr;
     if (SUCCEEDED(sc->QueryInterface(IID_PPV_ARGS(&sc1))) && sc1) {
@@ -2859,6 +3332,399 @@ void hook_game_dxgi() {
     log("[nr] Present layers: %d of 3 DXGI factory entry points hooked in the game's dxgi.dll", hooked);
 }
 
+// ---- a game's own frame generation: the swap chain the game presents to is the frame-generation library's proxy ----
+// XeSS frame generation (libxess_fg, Intel's xefg_swapchain_d3d12.h) hands the proxy out through
+// xefgSwapChainD3D12GetSwapChainPtr, FSR frame generation through ffxCreateContext with a frame-generation swap chain
+// description (AMD's ffx_api_framegeneration_dx12.h); the proxy presents the game's frame and the generated ones from a
+// thread of its own to the swap chain under it, which the factory hooks above adopted. The proxy is adopted with the
+// queue the game gave the library, so the layers run at the game's Present to it: once a game frame, before frame
+// generation. Only the game's own calls: OptiScaler calls the same libraries for its own frame generation, whose swap
+// chain is OptiScaler's (adopted at its creation).
+// The proxy is kept by pointer only, never called here (the game holds it; present_layers works on it inside the game's
+// own Present call), and let go of when the library's context is destroyed.
+std::unordered_map<void*, ID3D12CommandQueue*> g_fg_queue;   // library context -> the game's queue (AddRef; g_sc_lock)
+std::unordered_map<void*, IDXGISwapChain*> g_fg_proxy;       // library context -> its proxy, adopted (g_sc_lock)
+
+bool game_fg_call(void* caller) {
+    return caller && !in_range(g_opti_range, caller) && !in_range(g_self_range, caller) && !in_fg_library(caller);
+}
+void fg_note_queue(void* context, ID3D12CommandQueue* queue) {
+    if (!context || !queue) return;
+    queue->AddRef();
+    std::lock_guard<std::mutex> guard(g_sc_lock);
+    ID3D12CommandQueue*& slot = g_fg_queue[context];
+    if (slot) slot->Release();
+    slot = queue;
+}
+void fg_forget(void* context) {
+    std::lock_guard<std::mutex> guard(g_sc_lock);
+    if (const auto it = g_fg_proxy.find(context); it != g_fg_proxy.end()) {
+        if (const auto sc = g_game_swapchains.find(it->second); sc != g_game_swapchains.end()) {
+            if (sc->second) sc->second->Release();
+            g_game_swapchains.erase(sc);
+        }
+        g_fg_proxy.erase(it);
+    }
+    g_fg_proxy_active = !g_fg_proxy.empty();
+    if (const auto it = g_fg_queue.find(context); it != g_fg_queue.end()) {
+        if (it->second) it->second->Release();
+        g_fg_queue.erase(it);
+    }
+}
+bool adopt_fg_proxy(void* context, IUnknown* proxy, ID3D12CommandQueue* queue, const char* who) {
+    if (!context || !proxy) return false;
+    IDXGISwapChain* sc = nullptr;
+    if (FAILED(proxy->QueryInterface(IID_PPV_ARGS(&sc))) || !sc) return false;
+    sc->Release();   // the game holds it
+    bool fresh = false;
+    {
+        std::lock_guard<std::mutex> guard(g_sc_lock);
+        if (!queue)
+            if (const auto it = g_fg_queue.find(context); it != g_fg_queue.end()) queue = it->second;
+        if (!queue) {
+            static int told = 0;
+            if (told++ < 4) log("[nr] Present layers: %s's swap chain %p came without the game's queue: not followed", who,
+                                static_cast<void*>(sc));
+            return false;
+        }
+        IDXGISwapChain*& was = g_fg_proxy[context];
+        if (was && was != sc)
+            if (const auto it = g_game_swapchains.find(was); it != g_game_swapchains.end()) {
+                if (it->second) it->second->Release();
+                g_game_swapchains.erase(it);
+            }
+        was = sc;
+        ID3D12CommandQueue*& slot = g_game_swapchains[sc];
+        fresh = slot != queue;
+        queue->AddRef();
+        if (slot) slot->Release();
+        slot = queue;
+    }
+    if (!fresh) return true;
+    ID3D12Device* d = nullptr;
+    if (SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(&d))) && d) {
+        menu_once(d);
+        d->Release();
+    }
+    bool hooked = hook_slot(sc, 8, kDetourPresent);
+    IDXGISwapChain1* sc1 = nullptr;
+    if (SUCCEEDED(sc->QueryInterface(IID_PPV_ARGS(&sc1))) && sc1) {
+        hooked = hook_slot(sc1, 22, kDetourPresent1) && hooked;
+        sc1->Release();
+    }
+    log("[nr] Present layers: the game's own frame generation (%s) presents through swap chain %p (queue %p)%s", who,
+        static_cast<void*>(sc), static_cast<void*>(queue),
+        hooked ? "; the layers run at its Present, once a game frame, before frame generation"
+               : ", but its Present is not hooked (above): not followed");
+    if (!hooked) {   // left as before: the swap chain under it serves the layers
+        ID3D12CommandQueue* drop = nullptr;
+        {
+            std::lock_guard<std::mutex> guard(g_sc_lock);
+            if (const auto it = g_game_swapchains.find(sc); it != g_game_swapchains.end()) { drop = it->second; g_game_swapchains.erase(it); }
+            g_fg_proxy.erase(context);
+            g_fg_proxy_active = !g_fg_proxy.empty();
+        }
+        if (drop) drop->Release();
+        return false;
+    }
+    g_fg_proxy_active = true;
+    return true;
+}
+
+using PFN_XefgInit = int32_t (*)(void*, ID3D12CommandQueue*, const void*);
+using PFN_XefgInitDesc = int32_t (*)(void*, HWND, const void*, const void*, ID3D12CommandQueue*, void*, const void*);
+using PFN_XefgGetPtr = int32_t (*)(void*, REFIID, void**);
+using PFN_XefgDestroy = int32_t (*)(void*);
+using PFN_FfxCreate = uint32_t (*)(void**, struct FfxHeader*, const void*);
+using PFN_FfxDestroy = uint32_t (*)(void**, const void*);
+// FSR 3.0 / 3.1.0 outside the FidelityFX API (ffx_frameinterpolation_dx12.h, AMD, MIT): FfxSwapchain& = IDXGISwapChain4*&,
+// FfxErrorCode 0 = FFX_OK
+using PFN_Fsr3Replace = int32_t (*)(ID3D12CommandQueue*, IDXGISwapChain4**);
+using PFN_Fsr3Create = int32_t (*)(DXGI_SWAP_CHAIN_DESC*, ID3D12CommandQueue*, IDXGIFactory*, IDXGISwapChain4**);
+using PFN_Fsr3CreateHwnd = int32_t (*)(HWND, DXGI_SWAP_CHAIN_DESC1*, DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, ID3D12CommandQueue*,
+                                       IDXGIFactory*, IDXGISwapChain4**);
+// Every loaded copy of these libraries gets detours of its own (a slot): a game that loads one by name after OptiScaler
+// loaded its copy from its own folder is handed OptiScaler's (the loader matches loaded modules by name), so the copy
+// does not tell the game's calls from OptiScaler's - the caller does (game_fg_call).
+constexpr int kFgSlots = 8;
+struct FgSlot {
+    PFN_XefgInit xefg_init; PFN_XefgInitDesc xefg_init_desc; PFN_XefgGetPtr xefg_get_ptr; PFN_XefgDestroy xefg_destroy;
+    PFN_FfxCreate ffx_create; PFN_FfxDestroy ffx_destroy;
+    PFN_Fsr3Replace fsr3_replace; PFN_Fsr3Create fsr3_create; PFN_Fsr3CreateHwnd fsr3_create_hwnd;
+};
+FgSlot g_fg_slot[kFgSlots];
+// The swap chains made through the factory while a followed creation call of the game's runs (t_fg_inners): the real
+// ones under frame generation's proxy. A call inside a followed one (FSR 3.0's Replace making its swap chain through
+// Create, a loader calling the frame-generation DLL) adds to the outer's list.
+struct Fsr3Call {
+    std::vector<IDXGISwapChain*> own;
+    const bool nested = t_fg_inners != nullptr;
+    std::vector<IDXGISwapChain*>& inners = nested ? *t_fg_inners : own;
+    Fsr3Call() { t_fg_inners = &inners; }
+    ~Fsr3Call() { if (!nested) t_fg_inners = nullptr; }
+};
+// Frame generation's inner swap chains (not its proxy): their Presents never run the layers, NR Control's fallback
+// included.
+void fg_inners_add(const std::vector<IDXGISwapChain*>& inners, const void* proxy) {
+    std::lock_guard<std::mutex> guard(g_sc_lock);
+    for (IDXGISwapChain* sc : inners)
+        if (sc && static_cast<const void*>(sc) != proxy) g_fg_inner.insert(sc);
+    g_fg_inner_any = !g_fg_inner.empty();
+}
+template <int S>
+int32_t hk_xefg_init(void* context, ID3D12CommandQueue* queue, const void* params) {
+    if (!game_fg_call(__builtin_return_address(0))) return g_fg_slot[S].xefg_init(context, queue, params);
+    fg_note_queue(context, queue);
+    // xefg_swapchain_d3d12_init_params_t starts with pApplicationSwapChain: the game's swap chain goes under the proxy
+    IDXGISwapChain* app = params ? *static_cast<IDXGISwapChain* const*>(params) : nullptr;
+    const int32_t rc = g_fg_slot[S].xefg_init(context, queue, params);
+    if (rc == 0 && app) fg_inners_add({app}, nullptr);
+    return rc;
+}
+template <int S>
+int32_t hk_xefg_init_desc(void* context, HWND hwnd, const void* desc, const void* fs, ID3D12CommandQueue* queue, void* factory,
+                          const void* params) {
+    if (!game_fg_call(__builtin_return_address(0)))
+        return g_fg_slot[S].xefg_init_desc(context, hwnd, desc, fs, queue, factory, params);
+    fg_note_queue(context, queue);
+    Fsr3Call call;
+    const int32_t rc = g_fg_slot[S].xefg_init_desc(context, hwnd, desc, fs, queue, factory, params);
+    if (rc == 0 && !call.nested) fg_inners_add(call.inners, nullptr);
+    return rc;
+}
+template <int S>
+int32_t hk_xefg_get_ptr(void* context, REFIID riid, void** out) {
+    const int32_t rc = g_fg_slot[S].xefg_get_ptr(context, riid, out);
+    if (rc == 0 && out && *out && game_fg_call(__builtin_return_address(0)))
+        adopt_fg_proxy(context, static_cast<IUnknown*>(*out), nullptr, "XeSS frame generation");
+    return rc;
+}
+template <int S>
+int32_t hk_xefg_destroy(void* context) {
+    if (game_fg_call(__builtin_return_address(0))) fg_forget(context);
+    return g_fg_slot[S].xefg_destroy(context);
+}
+
+struct FfxHeader { uint64_t type; FfxHeader* next; };
+struct FfxSwapChainWrap { FfxHeader header; IDXGISwapChain4** swapchain; ID3D12CommandQueue* queue; };
+struct FfxSwapChainNew { FfxHeader header; IDXGISwapChain4** swapchain; void* desc; void* factory; ID3D12CommandQueue* queue; };
+struct FfxSwapChainHwnd { FfxHeader header; IDXGISwapChain4** swapchain; HWND hwnd; void* desc; void* fs; void* factory;
+                          ID3D12CommandQueue* queue; };
+template <int S>
+uint32_t hk_ffx_create(void** context, FfxHeader* desc, const void* alloc) {
+    if (!game_fg_call(__builtin_return_address(0))) return g_fg_slot[S].ffx_create(context, desc, alloc);
+    IDXGISwapChain* wrapped = nullptr;   // WRAP: the game's swap chain goes under the proxy
+    for (FfxHeader* h = desc; h; h = h->next)
+        if (h->type == 0x30001u && reinterpret_cast<FfxSwapChainWrap*>(h)->swapchain)
+            wrapped = *reinterpret_cast<FfxSwapChainWrap*>(h)->swapchain;
+    Fsr3Call call;
+    const uint32_t rc = g_fg_slot[S].ffx_create(context, desc, alloc);
+    if (rc != 0 || !context || !*context) return rc;
+    for (FfxHeader* h = desc; h; h = h->next) {
+        IDXGISwapChain4** out = nullptr;
+        ID3D12CommandQueue* queue = nullptr;
+        if (h->type == 0x30001u) {   // FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_WRAP_DX12
+            out = reinterpret_cast<FfxSwapChainWrap*>(h)->swapchain;
+            queue = reinterpret_cast<FfxSwapChainWrap*>(h)->queue;
+        } else if (h->type == 0x30005u) {   // ..._NEW_DX12
+            out = reinterpret_cast<FfxSwapChainNew*>(h)->swapchain;
+            queue = reinterpret_cast<FfxSwapChainNew*>(h)->queue;
+        } else if (h->type == 0x30006u) {   // ..._FOR_HWND_DX12
+            out = reinterpret_cast<FfxSwapChainHwnd*>(h)->swapchain;
+            queue = reinterpret_cast<FfxSwapChainHwnd*>(h)->queue;
+        } else {
+            continue;
+        }
+        if (out && *out && queue && adopt_fg_proxy(*context, *out, queue, "FSR frame generation") && !call.nested) {
+            if (wrapped) call.inners.push_back(wrapped);
+            fg_inners_add(call.inners, *out);
+        }
+        break;
+    }
+    return rc;
+}
+template <int S>
+uint32_t hk_ffx_destroy(void** context, const void* alloc) {
+    if (context && *context && game_fg_call(__builtin_return_address(0))) fg_forget(*context);
+    return g_fg_slot[S].ffx_destroy(context, alloc);
+}
+// FSR 3.0's frame-generation swap chain, made by the game's call: the swap chains its factory calls made are inner ones
+// (their Presents frame generation's, also from a presenting thread inside the game's executable), the proxy the game's.
+// Only one at a time (the last made; a game has one). OptiScaler's own frame generation answering these calls (its
+// fsrfg30 input) hands out its own swap chain, already followed: left alone.
+void fsr3_adopt(Fsr3Call& call, int32_t rc, IDXGISwapChain4** out, ID3D12CommandQueue* queue) {
+    if (call.nested || rc != 0 || !out || !*out || !queue) return;
+    void* present = (*reinterpret_cast<void***>(*out))[8];
+    if (in_range(g_opti_range, present)) return;
+    static int key;   // one FSR 3.0 swap chain at a time
+    if (!adopt_fg_proxy(&key, *out, queue, "FSR 3 frame generation")) return;
+    std::lock_guard<std::mutex> guard(g_sc_lock);
+    g_fg_inner.clear();
+    for (IDXGISwapChain* sc : call.inners)
+        if (sc != static_cast<IDXGISwapChain*>(static_cast<void*>(*out))) g_fg_inner.insert(sc);
+    g_fg_inner_any = !g_fg_inner.empty();
+    static int told = 0;
+    if (told++ < 8) log("[nr] Present layers: FSR 3 frame generation presents to %zu swap chain(s) under its proxy; their "
+                        "Presents are frame generation's", g_fg_inner.size());
+}
+template <int S>
+int32_t hk_fsr3_replace(ID3D12CommandQueue* queue, IDXGISwapChain4** swapchain) {
+    if (!game_fg_call(__builtin_return_address(0))) return g_fg_slot[S].fsr3_replace(queue, swapchain);
+    Fsr3Call call;
+    const int32_t rc = g_fg_slot[S].fsr3_replace(queue, swapchain);
+    fsr3_adopt(call, rc, swapchain, queue);
+    return rc;
+}
+template <int S>
+int32_t hk_fsr3_create(DXGI_SWAP_CHAIN_DESC* desc, ID3D12CommandQueue* queue, IDXGIFactory* factory, IDXGISwapChain4** out) {
+    if (!game_fg_call(__builtin_return_address(0))) return g_fg_slot[S].fsr3_create(desc, queue, factory, out);
+    Fsr3Call call;
+    const int32_t rc = g_fg_slot[S].fsr3_create(desc, queue, factory, out);
+    fsr3_adopt(call, rc, out, queue);
+    return rc;
+}
+template <int S>
+int32_t hk_fsr3_create_hwnd(HWND hwnd, DXGI_SWAP_CHAIN_DESC1* desc, DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fs, ID3D12CommandQueue* queue,
+                            IDXGIFactory* factory, IDXGISwapChain4** out) {
+    if (!game_fg_call(__builtin_return_address(0))) return g_fg_slot[S].fsr3_create_hwnd(hwnd, desc, fs, queue, factory, out);
+    Fsr3Call call;
+    const int32_t rc = g_fg_slot[S].fsr3_create_hwnd(hwnd, desc, fs, queue, factory, out);
+    fsr3_adopt(call, rc, out, queue);
+    return rc;
+}
+template <int S>
+void* fg_detour(int which) {
+    switch (which) {
+        case 0: return reinterpret_cast<void*>(&hk_xefg_init<S>);
+        case 1: return reinterpret_cast<void*>(&hk_xefg_init_desc<S>);
+        case 2: return reinterpret_cast<void*>(&hk_xefg_get_ptr<S>);
+        case 3: return reinterpret_cast<void*>(&hk_xefg_destroy<S>);
+        case 4: return reinterpret_cast<void*>(&hk_ffx_create<S>);
+        case 5: return reinterpret_cast<void*>(&hk_ffx_destroy<S>);
+        case 6: return reinterpret_cast<void*>(&hk_fsr3_replace<S>);
+        case 7: return reinterpret_cast<void*>(&hk_fsr3_create<S>);
+        default: return reinterpret_cast<void*>(&hk_fsr3_create_hwnd<S>);
+    }
+}
+void* fg_detour_of(int slot, int which) {
+    switch (slot) {
+        case 0: return fg_detour<0>(which);
+        case 1: return fg_detour<1>(which);
+        case 2: return fg_detour<2>(which);
+        case 3: return fg_detour<3>(which);
+        case 4: return fg_detour<4>(which);
+        case 5: return fg_detour<5>(which);
+        case 6: return fg_detour<6>(which);
+        default: return fg_detour<7>(which);
+    }
+}
+static_assert(kFgSlots == 8, "fg_detour_of lists eight slots");
+
+// The frame-generation libraries in the process, each copy hooked once: those loaded now and, through the loader's
+// notification, those loaded later - before the game's first call into them.
+void hook_fg_library(HMODULE m) {
+    if (!m || m == g_self || m == g_opti) return;
+    wchar_t path[MAX_PATH] = {};
+    if (!GetModuleFileNameW(m, path, MAX_PATH)) return;
+    std::wstring name = path;
+    if (const size_t cut = name.find_last_of(L"\\/"); cut != std::wstring::npos) name = name.substr(cut + 1);
+    for (wchar_t& c : name) c = wchar_t(std::towlower(c));
+    const bool xefg = name == L"libxess_fg.dll";
+    const bool ffx = name == L"amd_fidelityfx_dx12.dll" || name == L"amd_fidelityfx_loader_dx12.dll" ||
+                     name == L"amd_fidelityfx_framegeneration_dx12.dll";
+    // FSR 3.0's swap chain functions: in its DX12 backend DLL, or exported by the game's executable
+    const bool fsr3 = GetProcAddress(m, "ffxCreateFrameinterpolationSwapchainForHwndDX12") ||
+                      GetProcAddress(m, "ffxReplaceSwapchainForFrameinterpolationDX12");
+    if (!ffx && !xefg && !fsr3) return;
+    static std::mutex lock;
+    static std::set<HMODULE> done;
+    static int used = 0;
+    std::lock_guard<std::mutex> guard(lock);
+    if (!done.insert(m).second) return;
+    if (used >= kFgSlots) {
+        log("[nr] Present layers: more than %d frame-generation libraries; %ls is not followed", kFgSlots, path);
+        return;
+    }
+    const int slot = used++;
+    FgSlot& f = g_fg_slot[slot];
+    const auto hook_one = [&](const char* fn, int which, void** real) {
+        void* target = reinterpret_cast<void*>(GetProcAddress(m, fn));
+        if (!target) return false;
+        MH_STATUS st = MH_CreateHook(target, fg_detour_of(slot, which), real);
+        if (st == MH_OK) st = MH_EnableHook(target);
+        if (st != MH_OK) log("[nr] Present layers: %s could not be hooked (%s)", fn, MH_StatusToString(st));
+        return st == MH_OK;
+    };
+    bool ok = false;
+    if (xefg) {
+        // the proxy is followed only when its context's creation and end are too
+        ok = hook_one("xefgSwapChainD3D12InitFromSwapChain", 0, reinterpret_cast<void**>(&f.xefg_init)) &&
+             hook_one("xefgSwapChainD3D12InitFromSwapChainDesc", 1, reinterpret_cast<void**>(&f.xefg_init_desc)) &&
+             hook_one("xefgSwapChainDestroy", 3, reinterpret_cast<void**>(&f.xefg_destroy)) &&
+             hook_one("xefgSwapChainD3D12GetSwapChainPtr", 2, reinterpret_cast<void**>(&f.xefg_get_ptr));
+    } else if (ffx) {
+        ok = hook_one("ffxDestroyContext", 5, reinterpret_cast<void**>(&f.ffx_destroy)) &&
+             hook_one("ffxCreateContext", 4, reinterpret_cast<void**>(&f.ffx_create));
+    } else {   // each that is there
+        const bool a = hook_one("ffxReplaceSwapchainForFrameinterpolationDX12", 6, reinterpret_cast<void**>(&f.fsr3_replace));
+        const bool b = hook_one("ffxCreateFrameinterpolationSwapchainDX12", 7, reinterpret_cast<void**>(&f.fsr3_create));
+        const bool c = hook_one("ffxCreateFrameinterpolationSwapchainForHwndDX12", 8, reinterpret_cast<void**>(&f.fsr3_create_hwnd));
+        ok = a || b || c;
+    }
+    log("[nr] Present layers: %ls (%s frame generation) %s", path, xefg ? "XeSS" : fsr3 && !ffx ? "FSR 3" : "FSR",
+        ok ? "followed: the game's calls adopt the swap chain it presents to" : "not followed");
+}
+struct LdrUnicode { USHORT length, maximum; PWSTR buffer; };
+struct LdrLoaded { ULONG flags; const LdrUnicode* full_name; const LdrUnicode* base_name; PVOID base; ULONG size; };
+VOID NTAPI fg_library_loaded(ULONG reason, const LdrLoaded* data, PVOID) {
+    if (!data || !data->base_name || !data->base_name->buffer) return;
+    if (!fg_library_name(std::wstring(data->base_name->buffer, data->base_name->length / sizeof(wchar_t)))) return;
+    const auto lo = reinterpret_cast<uintptr_t>(data->base);
+    if (reason == 2) { fg_range_set(lo, 0); return; }   // LDR_DLL_NOTIFICATION_REASON_UNLOADED
+    if (reason != 1) return;                            // ..._LOADED
+    fg_range_set(lo, lo + data->size);
+    hook_fg_library(static_cast<HMODULE>(data->base));
+}
+// From InitializeASI.
+void hook_fg_libraries() {
+    using PFN_LdrRegister = LONG(NTAPI*)(ULONG, VOID(NTAPI*)(ULONG, const LdrLoaded*, PVOID), PVOID, PVOID*);
+    const auto reg = reinterpret_cast<PFN_LdrRegister>(
+        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "LdrRegisterDllNotification")));
+    static PVOID cookie = nullptr;
+    if (!reg || reg(0, &fg_library_loaded, nullptr, &cookie) != 0)
+        log("[nr] Present layers: no loader notification; frame-generation libraries loaded later are not followed");
+    {   // the frame-generation libraries already loaded: their ranges
+        HMODULE mods[1024];
+        DWORD bytes = 0;
+        if (K32EnumProcessModules(GetCurrentProcess(), mods, sizeof mods, &bytes))
+            for (DWORD i = 0; i < bytes / sizeof(HMODULE) && i < 1024; ++i) {
+                wchar_t path[MAX_PATH] = {};
+                if (!GetModuleFileNameW(mods[i], path, MAX_PATH)) continue;
+                std::wstring base = path;
+                if (const size_t cut = base.find_last_of(L"\\/"); cut != std::wstring::npos) base = base.substr(cut + 1);
+                if (!fg_library_name(base)) continue;
+                const ModuleRange r = range_of(mods[i]);
+                fg_range_set(r.lo, r.hi);
+            }
+    }
+    hook_fg_library(GetModuleHandleW(nullptr));   // FSR 3.0 linked into the game's executable, its functions exported
+    for (const wchar_t* name : {L"libxess_fg.dll", L"amd_fidelityfx_dx12.dll", L"amd_fidelityfx_loader_dx12.dll",
+                                L"amd_fidelityfx_framegeneration_dx12.dll", L"ffx_backend_dx12_x64.dll",
+                                L"ffx_backend_dx12_x86.dll"}) {
+        // every loaded module of that name (the game's and OptiScaler's copies share it)
+        HMODULE mods[1024];
+        DWORD bytes = 0;
+        if (!K32EnumProcessModules(GetCurrentProcess(), mods, sizeof mods, &bytes)) break;
+        for (DWORD i = 0; i < bytes / sizeof(HMODULE) && i < 1024; ++i) {
+            wchar_t path[MAX_PATH] = {};
+            if (!GetModuleFileNameW(mods[i], path, MAX_PATH)) continue;
+            std::wstring base = path;
+            if (const size_t cut = base.find_last_of(L"\\/"); cut != std::wstring::npos) base = base.substr(cut + 1);
+            if (_wcsicmp(base.c_str(), name) == 0) hook_fg_library(mods[i]);
+        }
+    }
+}
+
 // ---- the wilsjo2 style (nr_asi_wilsjo2.hpp) ------------------------------------------------------------------------
 
 // Spec 4.5: `wanted` of an allocation from an origin, clipped to what the allocation has (0: all of it).
@@ -2919,10 +3785,13 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_evaluate(ID3D12GraphicsCommandList* cmd, const 
     struct Inside { Inside() { ++t_inside; } ~Inside() { --t_inside; } } inside;
     nr::gpu::Scope recording(nr::asi::hudcap::d3d12_recording(cmd));
     nr::pe::watchdog::Phase phase("OptiScaler's D3D12 evaluate (NR)");
+    ID3D12Resource* const dlssg_back = get_resource(p, "DLSSG.Backbuffer");
+    ID3D12CommandQueue* const dlssg_queue = dlssg_back ? dlssg_layers_here(h->Id, p) : nullptr;   // (AddRef)
+    struct Queue { ID3D12CommandQueue* q; ~Queue() { if (q) q->Release(); } } dlssg_pin{dlssg_queue};
     {   // HUD FIX: DLSS-G's HUD-less frame (its evaluate through NGX), for the frame-generation method
         ID3D12Resource* hudless = nullptr;
         if (p->Get("DLSSG.HUDLess", &hudless) == NVSDK_NGX_Result_Success && hudless)
-            nr::asi::hudcap::fg_note_dlssg(cmd, hudless);
+            nr::asi::hudcap::fg_note_dlssg(cmd, hudless, dlssg_queue != nullptr);
     }
 
     std::unique_lock<std::mutex> guard(g_lock);
@@ -2944,14 +3813,15 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_evaluate(ID3D12GraphicsCommandList* cmd, const 
     if (t.feature == kFeatureFrameGeneration) {
         // DLSS-G's declared rate for the Present layers (present_path.hpp ObservePresentFrameGeneration): NGX counts the
         // generated frames (1 = 2x); an absent key or paused rendering declares nothing
-        if (ID3D12Resource* back = get_resource(p, "DLSSG.Backbuffer")) {
-            const uint32_t generated = get_uint(p, "DLSSG.MultiFrameCount");
+        const uint32_t generated = get_uint(p, "DLSSG.MultiFrameCount");
+        if (dlssg_back) {
             if (generated >= 1 && generated < 8 && get_uint(p, "DLSSG.NotRenderingGameFrames") == 0) {
-                const D3D12_RESOURCE_DESC d = back->GetDesc();
+                const D3D12_RESOURCE_DESC d = dlssg_back->GetDesc();
                 g_present.declaration = {uint32_t(d.Width), d.Height, generated + 1, GetTickCount64(), g_present.presents};
             }
         }
         guard.unlock();
+        if (dlssg_queue) dlssg_layers(cmd, dlssg_back, dlssg_queue, generated >= 1 && generated < 8 ? generated : 1u);
         return real_evaluate(cmd, h, p, callback);
     }
     if (t.feature != kFeatureSuperSampling && t.feature != kFeatureRayReconstruction) {
@@ -5445,12 +6315,16 @@ std::atomic<ULONGLONG> g_game_present_ms{0}, g_wrapped_since_ms{0};
 std::mutex g_wrapper_lock;
 std::vector<HMODULE> g_wrappers;   // promoted (g_wrapper_lock)
 bool game_caller(void* address) {
-    HMODULE m = nullptr;
-    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                            static_cast<LPCWSTR>(address), &m) || !m)
-        return true;   // code outside any module (generated): the game's
+    // asked inside vkd3d-proton's / DXVK's present, under their queue lock: the loader (GetModuleHandleExW, the loader
+    // lock) only for a caller outside the module asked last
     static thread_local HMODULE last = nullptr;
+    static thread_local ModuleRange last_range;
     static thread_local bool last_game = false, last_wrapper = false;
+    HMODULE m = nullptr;
+    if (last && in_range(last_range, address)) m = last;
+    else if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                 static_cast<LPCWSTR>(address), &m) || !m)
+        return true;   // code outside any module (generated): the game's
     const ULONGLONG now = GetTickCount64();
     const auto served = [&](bool game, bool wrapper) {
         if (game) { g_game_present_ms = now; g_wrapped_since_ms = 0; return true; }
@@ -5494,6 +6368,7 @@ bool game_caller(void* address) {
         }
     }
     last = m;
+    last_range = range_of(m);
     last_game = game;
     last_wrapper = wrapper;
     return served(game, wrapper);
@@ -7409,6 +8284,10 @@ extern "C" __declspec(dllexport) void InitializeASI() {
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                        reinterpret_cast<LPCWSTR>(__builtin_return_address(0)), &g_opti);
     if (!g_opti) g_opti = GetModuleHandleW(nullptr);
+    g_opti_range = range_of(g_opti);
+    g_self_range = range_of(g_self);
+    // frame generation's HUD-less hand-overs: the game's own only (not OptiScaler's own frame generation's calls)
+    nr::asi::hudcap::set_game_caller(&game_fg_call);
     nr::pe::set_module(g_opti);   // dlssnr-amd.ini, dlssnr-amd\, the log and control.bin sit beside OptiScaler
     nr::pe::install_crash_watch();
     // an exception that leaves one of NR's threads ends the process through std::terminate: said in the log first
@@ -7468,6 +8347,7 @@ extern "C" __declspec(dllexport) void InitializeASI() {
     hook_device_creation();
     hook_present_beat();
     hook_game_dxgi();
+    hook_fg_libraries();
     log("[nr] %s (Unreal Engine by the executable: %s)", ok ? "NR runs in OptiScaler's D3D12 evaluate"
                                                              : "OptiScaler's D3D12 evaluate could not be hooked: NR does not run",
         g_unreal_by_exe ? "yes" : "no");

@@ -22,6 +22,7 @@ struct Entry {
     uint64_t bytes;
     uint32_t type;   // Vulkan memory type; ~0u: a D3D12 default-heap resource
     Tag tag;
+    uint64_t device = 0;   // a Vulkan allocation's VkDevice (forget_device)
 };
 std::mutex g_lock;
 std::unordered_map<uint64_t, Entry> g_vk;    // by VkDeviceMemory
@@ -37,7 +38,7 @@ VKAPI_ATTR VkResult VKAPI_CALL allocate(VkDevice device, const VkMemoryAllocateI
     const VkResult r = g_real_allocate(device, info, callbacks, memory);
     if (r == VK_SUCCESS && info && memory && *memory) {
         std::lock_guard<std::mutex> guard(g_lock);
-        g_vk[uint64_t(*memory)] = Entry{info->allocationSize, info->memoryTypeIndex, t_tag};
+        g_vk[uint64_t(*memory)] = Entry{info->allocationSize, info->memoryTypeIndex, t_tag, uint64_t(uintptr_t(device))};
     }
     return r;
 }
@@ -230,6 +231,12 @@ void add_external(uint64_t key, uint64_t bytes, Kind kind) {
 void forget_external(uint64_t key) {
     std::lock_guard<std::mutex> guard(g_lock);
     g_ext.erase(key);
+}
+
+void forget_device(uint64_t device) {
+    if (!device) return;
+    std::lock_guard<std::mutex> guard(g_lock);
+    for (auto i = g_vk.begin(); i != g_vk.end();) i = i->second.device == device ? g_vk.erase(i) : std::next(i);
 }
 
 void totals(uint64_t out[kOwners][kKinds]) {

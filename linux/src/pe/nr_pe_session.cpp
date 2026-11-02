@@ -2,6 +2,7 @@
 #include "nr_pe_session.hpp"
 #include "nr_pe_events.hpp"
 #include "nr_gpu_completion.hpp"
+#include "nrvk.hpp"   // nrvk::blit, compute_only_recording
 #include "nr_wilsjo2.hpp"
 #include "nr_wilsjo2_flow.hpp"
 #include "nr_vram_tag.hpp"
@@ -208,6 +209,29 @@ struct Session::Impl {
                std::chrono::steady_clock::now() - last_resize < kDrsActive;
     }
     void prefetch();
+    // prefetch() goes on this long after the last resize, not only kDrsActive: a game that resizes in short bursts (an
+    // aim's zoom: a few frames, then seconds at one size) gave it one or two plans a burst, the whole range never.
+    // Plans are CPU work and host memory only (no device memory), one at a time, within the sizes the game has used.
+    static constexpr std::chrono::seconds kDrsPrefetch{30};
+    bool drs_recent() const {
+        return last_resize != std::chrono::steady_clock::time_point{} &&
+               std::chrono::steady_clock::now() - last_resize < kDrsPrefetch;
+    }
+    // Frame sizes that passed through while the one build slot was busy with something else (another size's plan, a
+    // prefetch): planned next, the newest first, before prefetch() guesses. The sizes a game actually visits - an aim's
+    // zoom steps, which it visits again the next time - are the ones worth the slot (a plan takes ~1 s in a busy game
+    // on Windows, so a visit of a few tenths of a second never got its own). One entry per working extent and format.
+    struct Demand { uint32_t w{}, h{}, ww{}, wh{}; VkFormat format{}; int net{}; };
+    std::vector<Demand> demanded;
+    static constexpr size_t kMaxDemanded = 16;
+    uint64_t demand_planned{};
+    void note_demand(uint32_t w, uint32_t h, VkFormat f);
+    bool plan_demanded();
+    // The biggest frame each feature has asked for: prefetch() plans nothing bigger (or bigger than the game's guides),
+    // a plan above the game's render size is never used and takes the slot from one that is.
+    std::map<uint64_t, std::pair<uint32_t, uint32_t>> feature_max;
+    // Why frames passed through since the last 10 s line (the status of each), for that line.
+    std::map<std::string, uint64_t> pass_why;
     // A whole network while the size moves gets this much room by area (1.25 linear): the plans of a sweep up to that
     // run in it instead of each asking for a bigger network.
     static constexpr double kDrsCapacity = 1.5625;
@@ -1082,7 +1106,13 @@ struct Session::Impl {
         ID3D12Device* device = nullptr;
         ID3D12GraphicsCommandList* list = nullptr;
         bool interop = false;
-        ~Recording() { if (interop) end_interop_recording(device, list); }
+        // a COMPUTE list (its Vulkan command buffer runs on a compute queue): blits become compute passes while it is
+        // recorded into (nrvk::blit); the flag as it was before, put back at the end
+        bool compute_only_set = false, compute_only_was = false;
+        ~Recording() {
+            if (interop) end_interop_recording(device, list);
+            if (compute_only_set) nrvk::compute_only_recording() = compute_only_was;
+        }
     };
     VkCommandBuffer begin_recording(ID3D12Device* device, ID3D12GraphicsCommandList* list, Recording& rec);
     void leave_list(ID3D12Device* device, ID3D12GraphicsCommandList* list, const Recording& rec);
@@ -1773,26 +1803,42 @@ bool Session::Impl::make_room(uint32_t w, uint32_t h) {
 bool Session::Impl::ensure_runtime(const Controls& controls, uint32_t w, uint32_t h, VkFormat format) {
     const bool ok = ensure_runtime_(controls, w, h, format);
     ++(ok ? ran : passed);
+    if (!ok) ++pass_why[status.empty() ? std::string("no reason recorded") : status];
+    {
+        auto& m = feature_max[current_feature];
+        m.first = std::max(m.first, w); m.second = std::max(m.second, h);
+        if (feature_max.size() > 64) feature_max.erase(feature_max.begin());   // the oldest features (ids only grow)
+    }
     last_ok = ok;
     last_w = w; last_h = h; last_format = format;
     if (ok && runtime) {
         runtime->set_style_grade(net_switch.file().style_grade);   // [Network] Style Grade, live
+        runtime->set_history_f16(net_switch.file().history_f16);   // [Network] History Precision, live
         feature_slot[current_feature] = runtime->network_id();
         Runtime*& last = feature_runtime[current_feature];
         if (last != runtime) { feature_prev_runtime[current_feature] = last; last = runtime; }
     }
     heap_poll();
-    if (!building && drs_active()) prefetch();
+    if (!building && !plan_demanded() && drs_recent()) prefetch();
     {
         const auto now = std::chrono::steady_clock::now();
         if (pass_logged == std::chrono::steady_clock::time_point{}) pass_logged = now;
         if (now - pass_logged >= kPassLog) {
             // every 10 s with NR asked for: a log that shows NR running as well as not (the OptiScaler route has no
             // frame line of its own)
-            if (passed || ran)
-                log("[nr] last %.0f s: %llu evaluations ran the network, %llu passed the frame through (%s)",
+            if (passed || ran) {
+                // (ran = the network was ready for the evaluation; the passes by their reasons, most frequent first)
+                std::vector<std::pair<uint64_t, const std::string*>> why;
+                for (const auto& [text, n] : pass_why) why.push_back({n, &text});
+                std::sort(why.begin(), why.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+                std::string reasons;
+                for (size_t i = 0; i < why.size() && i < 4; ++i)
+                    reasons += (i ? "; " : "; passed: ") + std::to_string(why[i].first) + " x " + *why[i].second;
+                log("[nr] last %.0f s: %llu evaluations ran the network, %llu passed the frame through (%s)%s",
                     std::chrono::duration<double>(now - pass_logged).count(), (unsigned long long)ran,
-                    (unsigned long long)passed, ok ? "running now" : status.c_str());
+                    (unsigned long long)passed, ok ? "running now" : status.c_str(), reasons.c_str());
+            }
+            pass_why.clear();
             ran_total += ran; passed_total += passed; ran = passed = 0;
             pass_logged = now;
         }
@@ -1927,6 +1973,7 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
                            this->format == format;
     if (building) {
         if (net_only) { touch_running(); return true; }
+        note_demand(w, h, format);   // planned once the slot is free, before any guess (plan_demanded)
         status = "building the network in the background; frames pass through until it is ready";
         return false;
     }
@@ -2239,6 +2286,7 @@ bool Session::Impl::start_plan(uint32_t w, uint32_t h, VkFormat f) {
     build_net = net_want;
     build_started = std::chrono::steady_clock::now();
     build_thread = std::thread([this, host, config, temporal, model]() mutable {
+        test_plan_delay();   // NR_TEST_PLAN_DELAY_MS (tests only)
         const auto t0 = std::chrono::steady_clock::now();
         std::unique_ptr<Runtime> made;
         std::string error;
@@ -2257,6 +2305,41 @@ bool Session::Impl::start_plan(uint32_t w, uint32_t h, VkFormat f) {
         built = std::move(made); build_error = error; build_seconds = seconds; build_done = true; build_oom = false;
     });
     return true;
+}
+
+void Session::Impl::note_demand(uint32_t w, uint32_t h, VkFormat f) {
+    const Built* net = nullptr;
+    for (const auto& e : cache)
+        if (same_config(e, f) && !e.runtime->stale()) { net = &e; break; }
+    if (!net) return;   // no resident network yet: the network's own build is what the frames wait for
+    const NetworkModel model = net->runtime->network();
+    if (plan_for(w, h, f, model)) return;   // planned: what is missing is memory, not a plan
+    uint32_t ww = 0, wh = 0;
+    working_extent(model, 1.0f, w, h, &ww, &wh);
+    for (auto i = demanded.begin(); i != demanded.end(); ++i)
+        if (i->ww == ww && i->wh == wh && i->format == f && i->net == net_want) { demanded.erase(i); break; }
+    if (demanded.size() >= kMaxDemanded) demanded.erase(demanded.begin());
+    demanded.push_back(Demand{w, h, ww, wh, f, net_want});   // the newest last
+}
+
+// The slot is free: the newest frame size that passed through for want of its plan, planned now. False: none left.
+bool Session::Impl::plan_demanded() {
+    while (!demanded.empty()) {
+        const Demand d = demanded.back();
+        demanded.pop_back();
+        if (d.net != net_want) continue;
+        bool served = false;   // a resident network of this working extent runs it already (Runtime::share_for)
+        for (const auto& e : cache)
+            if (same_config(e, d.format) && !e.runtime->stale() && e.runtime->share_for(d.w, d.h)) { served = true; break; }
+        if (served) continue;
+        if (start_plan(d.w, d.h, d.format)) {
+            if (++demand_planned <= 8 || demand_planned % 50 == 0)
+                log("[nr] planning %ux%u (working extent %ux%u), a size frames passed through at while another was "
+                    "being built; %zu more waiting", d.w, d.h, d.ww, d.wh, demanded.size());
+            return true;
+        }
+    }
+    return false;
 }
 
 void Session::Impl::prefetch() {
@@ -2286,7 +2369,14 @@ void Session::Impl::prefetch() {
     build_net = net_want;
     build_started = std::chrono::steady_clock::now();
     const std::pair<uint32_t, uint32_t> around{last_w, last_h};
-    build_thread = std::thread([this, host, config, temporal, model, covered, around]() mutable {
+    // No bigger than the biggest frame this feature asked for, or the game's guides when they are bigger (allocated at
+    // its biggest render size): a plan above the game's render size is never run.
+    uint64_t limit_px = 0;
+    if (const auto m = feature_max.find(current_feature); m != feature_max.end())
+        limit_px = uint64_t(m->second.first) * m->second.second;
+    limit_px = std::max({limit_px, size_hint_px, uint64_t(last_w) * last_h});
+    build_thread = std::thread([this, host, config, temporal, model, covered, around, limit_px]() mutable {
+        test_plan_delay();   // NR_TEST_PLAN_DELAY_MS (tests only)
         const auto t0 = std::chrono::steady_clock::now();
         std::unique_ptr<Runtime> made;
         std::string error;
@@ -2299,6 +2389,7 @@ void Session::Impl::prefetch() {
                     const int64_t hh = int64_t(around.second) + sign * int64_t(step);
                     const uint32_t ch = uint32_t(hh), cw = uint32_t(std::lround(double(hh) * aspect));
                     if (hh < 64 || cw < 64) continue;
+                    if (uint64_t(cw) * ch > limit_px) continue;
                     uint32_t ww = 0, wh = 0;
                     working_extent(model, scale, cw, ch, &ww, &wh);
                     if (std::find(covered.begin(), covered.end(), std::make_pair(ww, wh)) != covered.end()) continue;
@@ -2664,6 +2755,17 @@ VkCommandBuffer Session::Impl::begin_recording(ID3D12Device* device, ID3D12Graph
                                                Recording& rec) {
     rec.device = device;
     rec.list = list;
+    rec.compute_only_was = nrvk::compute_only_recording();
+    rec.compute_only_set = true;
+    nrvk::compute_only_recording() = list->GetType() == D3D12_COMMAND_LIST_TYPE_COMPUTE;
+    if (nrvk::compute_only_recording()) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            log("[nr] a COMPUTE command list recorded into (its commands run on a compute queue): no graphics commands "
+                "go into it");
+        }
+    }
     if (keep_caller_state) {
         if (const VkCommandBuffer cmd = begin_interop_recording(device, list)) {
             rec.interop = true;
@@ -4020,7 +4122,9 @@ bool Session::Impl::record_wilsjo2(VkCommandBuffer cmd, const ColourFrame& colou
             VkImageBlit b{};
             b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
             b.srcOffsets[1] = b.dstOffsets[1] = {int32_t(colour.width), int32_t(colour.height), 1};
-            vkCmdBlitImage(cmd, from, from_layout, to, to_layout, 1, &b, VK_FILTER_NEAREST);
+            // (the frame in its format, our working copy in `twin`; nrvk::blit: a compute pass on a compute-only list)
+            nrvk::blit(handles.physical, handles.device, cmd, from, from == colour.image ? colour.format : twin, from_layout,
+                       to, to == colour.image ? colour.format : twin, to_layout, 1, &b, VK_FILTER_NEAREST);
             return;
         }
         VkImageCopy region{};

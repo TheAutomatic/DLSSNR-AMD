@@ -13,7 +13,7 @@
 #   vulkan/         the Khronos loader the Vulkan-layer routes put beside the game
 #   install.bat, install.ps1, README.txt
 #
-#   [NR_MODEL=dlssnr.bin [NR_MODEL_SMALL=dlssnr-small.bin]] [NR_INT4=0] [NR_LANG_EXTRA=<dir>] bash windows/build/build_package.sh [build dir]
+#   [NR_MODEL=dlssnr.bin [NR_MODEL_SMALL=dlssnr-small.bin]] [NR_INT4=0] [NR_LANG_EXTRA=<dir>] [NR_SIGN=1] bash windows/build/build_package.sh [build dir]
 #
 # The package carries no model: install.ps1 extracts it from the user's nvngx_dlssnr.dll on the first
 # install. NR_MODEL puts a dlssnr.bin you made yourself into the package (for your own use only), and with it
@@ -50,11 +50,11 @@ cc=x86_64-w64-mingw32-gcc
 command -v "$cxx" >/dev/null || { echo "no mingw cross compiler ($cxx)" >&2; exit 1; }
 minhook=artifacts/ref/DLSS5-Feeder/external/minhook
 reshade_inc=artifacts/ref/DLSS5-Feeder/external/reshade/include
-proton=${NR_PROTON:-toolchain/GE-Proton11-7-x86_64/files}
+dxvk=${NR_DXVK:-artifacts/ref/dxvk-ge11-7}   # GE-Proton 11-7's DXVK files (fetch_deps.sh --windows)
 opti_7z=${NR_OPTI_ARCHIVE:-artifacts/ref/downloads/OptiScaler_v10.0.0-pre1_20261030.7z}
 opti_license=${NR_OPTI_LICENSE:-artifacts/ref/optiscaler-nightly-20261030/LICENSE}
 for dir in "$minhook" "$reshade_inc" artifacts/ref/reshade-shaders artifacts/ref/vort_Shaders \
-           "$proton/lib/wine/dxvk/x86_64-windows"; do
+           "$dxvk/x86_64-windows"; do
     [[ -d "$dir" ]] || { echo "missing: $dir" >&2; exit 1; }
 done
 for f in "$opti_7z" "$opti_license" artifacts/ref/reshade-6.8.0/ReShade64.dll; do
@@ -190,8 +190,8 @@ cp -- "$out/extract/dlssnr_extract_model.exe" "$pkg/model-tools/"
 
 # dxvk/: D3D9 (and the DXGI it was installed with) for the DX9 route, as GE-Proton ships them.
 mkdir -p -- "$pkg/dxvk"
-for f in dxgi.dll d3d9.dll; do cp -- "$proton/lib/wine/dxvk/x86_64-windows/$f" "$pkg/dxvk/"; done
-cat "$proton/lib/wine/dxvk/version" > "$pkg/dxvk/version.txt"
+for f in dxgi.dll d3d9.dll; do cp -- "$dxvk/x86_64-windows/$f" "$pkg/dxvk/"; done
+cat "$dxvk/version" > "$pkg/dxvk/version.txt"
 cp -- artifacts/ref/dxvk/LICENSE "$pkg/dxvk/LICENSE.txt"
 
 # vulkan/: the Khronos loader the DX9 and Vulkan routes put beside the game (windows/build/build_vulkan_loader.sh):
@@ -299,6 +299,10 @@ for f in install.ps1 README.txt; do
         { echo "$pkg/$f: not exactly one UTF-8 BOM" >&2; exit 1; }
 done
 sed -i 's/$/\r/' "$pkg/install.bat"
+
+# NR_SIGN=1: every Windows binary without a signature of its own signed with a self-signed certificate made for this
+# build (windows/build/sign_pe.py; some games load only signed DLLs and do not ask by whom)
+[[ "${NR_SIGN:-0}" == 1 ]] && python3 windows/build/sign_pe.py "$pkg"
 
 # ---- archive ------------------------------------------------------------------------------------
 # A Windows-only release's version already says preview (v0.0.4-win-preview).

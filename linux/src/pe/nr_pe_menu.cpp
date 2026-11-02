@@ -272,6 +272,8 @@ const nr::control_ui::ChainRoute kAsiChain = [] {
 }();
 
 // ---- the menu's content: the same as the Linux layer's ----
+thread_local bool t_same_frame = false;   // draw_game: this present's game frame was drawn on already
+
 struct Menu {
     ImGuiContext* context{};
     std::chrono::steady_clock::time_point previous = std::chrono::steady_clock::now();
@@ -475,8 +477,10 @@ struct Menu {
         g_input.update(io, width, height);
         const bool osd = osd_due(now);   // also re-reads the file once a second (the marks with it)
         nr::lang::sync(lang_folder(), ini.get("NRControl", "Language", ""));   // (fonts_for makes the font for its letters)
-        nr::pe::control::present_layers();
-        nr::asi::wilsjo2_present_spatial();
+        if (!t_same_frame) {   // a new presented frame (draw_game)
+            nr::pe::control::present_layers();
+            nr::asi::wilsjo2_present_spatial();
+        }
         read_marks(width, height);
         if (std::getenv("NR_SPATIAL_TRACE")) {
             static int previous = -1;
@@ -1666,14 +1670,20 @@ void draw_on(IDXGISwapChain* sc, UINT flags, IUnknown* known = nullptr) {
     if (!known) ++g_presents;
     if (t_inside || (flags & DXGI_PRESENT_TEST)) return;
     t_inside = true;
-    std::lock_guard<std::mutex> lock(g_mutex);
+    // The system's Present never waits for the menu: under frame generation it is called on the generator's own
+    // presenting thread, while the game's thread may hold g_mutex drawing the menu at the game's Present (draw_game) and
+    // be waiting inside the generator's swap chain (its back buffer, its index) for that very thread to present - each
+    // waited for the other (FSR frame generation). Busy: the hooks still run, without the menu on this present.
+    std::unique_lock<std::mutex> lock(g_mutex, std::defer_lock);
+    if (known) lock.lock();
+    else (void)lock.try_lock();
     const auto now = std::chrono::steady_clock::now();
-    const bool menu_here = known || GetTickCount64() - g_game_drawn_ms.load() >= 1000;
+    const bool menu_here = lock.owns_lock() && (known || GetTickCount64() - g_game_drawn_ms.load() >= 1000);
     // Refresh the presenting device before reaping idle overlays. A slow first frame or a pause must not
-    // destroy its ImGui context on the very Present that is using it again.
-    struct Reap { std::chrono::steady_clock::time_point now; ~Reap() {
-        let_go_idle(g_d3d11, now); let_go_idle(g_d3d12, now);
-    } } reap{now};
+    // destroy its ImGui context on the very Present that is using it again. (Only under the lock: the overlays are its.)
+    struct Reap { std::chrono::steady_clock::time_point now; bool owned; ~Reap() {
+        if (owned) { let_go_idle(g_d3d11, now); let_go_idle(g_d3d12, now); }
+    } } reap{now, lock.owns_lock()};
     const auto said = [sc, known](const char* api) {
         DXGI_SWAP_CHAIN_DESC desc{};
         sc->GetDesc(&desc);
@@ -2007,8 +2017,11 @@ void watch_queues(ID3D12Device* device) {
 }
 
 void on_d3d12_present(D3D12PresentHook hook) { g_d3d12_hook.store(hook); }
-void draw_game(IDXGISwapChain* swap_chain, IUnknown* device) {
-    if (swap_chain && device) draw_on(swap_chain, 0, device);
+void draw_game(IDXGISwapChain* swap_chain, IUnknown* device, bool new_frame) {
+    if (!swap_chain || !device) return;
+    t_same_frame = !new_frame;
+    draw_on(swap_chain, 0, device);
+    t_same_frame = false;
 }
 void on_d3d11_present(D3D11PresentHook hook) { g_d3d11_hook.store(hook); }
 void on_execute(ExecuteObserver observer) { g_execute_observer.store(observer); }

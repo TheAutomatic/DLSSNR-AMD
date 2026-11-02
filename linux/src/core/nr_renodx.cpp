@@ -10,6 +10,7 @@
 // included as it is. The shaders are RenoDX's, compiled for Vulkan as RenoDX compiles them.
 #include "nr_path_u8.hpp"
 #include "nr_renodx.hpp"
+#include "nrvk.hpp"   // nrvk::blit
 #include "nr_gpu_completion.hpp"
 #include "nr_log.hpp"
 #include "nr_vram_tag.hpp"
@@ -2006,8 +2007,9 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
             m.dispatch(cmd, Impl::kDecodeL,
                        m.S(Impl::kDecodeL, {{0, ref.view}, {1, rp}, {2, rn}, {3, ref.view}, {4, write.view}}), &c, sizeof c,
                        gx, gy);
-            // RunBlackLevelRestore (D3D12 only in RenoDX, kept here on every route): the reduce on the pass's codec
-            // set at the network's extent, the unshaped one when the look shaped the answer, then the apply.
+            // RunBlackLevelRestore (in RenoDX on D3D12 and on D3D11 through its D3D12 bridge; its Vulkan path runs the
+            // legacy pair alone, no restore; kept here on every route): the reduce on the pass's codec set at the
+            // network's extent, the unshaped one when the look shaped the answer, then the apply.
             if (s.codec_mode != 0u) {
                 c.proxy_size[0] = c.neural_size[0] = NW; c.proxy_size[1] = c.neural_size[1] = NH;
                 const std::map<uint32_t, VkImageView> set{{0, ref.view}, {1, m.proxy.view}, {2, m.neural.view},
@@ -2090,8 +2092,10 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
         VkImageBlit blit{};
         blit.srcSubresource = blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         blit.srcOffsets[1] = blit.dstOffsets[1] = {int32_t(W), int32_t(H), 1};
-        vkCmdBlitImage(cmd, result->handle, VK_IMAGE_LAYOUT_GENERAL, fr.output.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                       1, &blit, VK_FILTER_NEAREST);
+        // (nrvk::blit: on a compute-only command list a compute pass - a format no storage image takes, the sRGB ones
+        // this branch is for, is left out there and said)
+        nrvk::blit(m.physical, m.device, cmd, result->handle, result->format, VK_IMAGE_LAYOUT_GENERAL, fr.output.image,
+                   fr.output.format, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
     }
     Impl::image_barrier(cmd, fr.output.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, fr.output.after,
                         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, fr.output.after_stage,

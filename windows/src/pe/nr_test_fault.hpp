@@ -7,6 +7,8 @@
 #include "nr_pe_log.hpp"
 
 #include <atomic>
+#include <chrono>
+#include <thread>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -69,6 +71,18 @@ inline bool test_fault(const char* site) {
         return true;
     }
     return false;
+}
+
+// NR_TEST_PLAN_DELAY_MS=<ms> (tests only): every background plan build (the resize path) waits this long first, so a
+// stand-in reproduces a slower machine's plan time (Windows in a busy game: ~1.1 s a plan against ~0.3 s here).
+inline void test_plan_delay() {
+    static const long ms = [] {
+        const char* e = std::getenv("NR_TEST_PLAN_DELAY_MS");
+        const long v = e ? std::strtol(e, nullptr, 10) : 0;
+        if (v > 0) log("[nr] test: every plan build waits %ld ms first (NR_TEST_PLAN_DELAY_MS)", v);
+        return v > 0 ? v : 0;
+    }();
+    if (ms) std::this_thread::sleep_for(std::chrono::milliseconds(ms));
 }
 
 }  // namespace nr::pe

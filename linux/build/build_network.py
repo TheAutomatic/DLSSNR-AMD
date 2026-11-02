@@ -28,8 +28,8 @@ from pathlib import Path
 
 R = Path(__file__).resolve().parents[2]
 # the runtime's own passes around the network (it runs the network only: the composition is RenoDX's stage's and the
-# wilsjo2 flow's): the alpha restore and the depth guide's copy
-RUNTIME = ['runtime_alpha', 'runtime_depth']
+# wilsjo2 flow's): the alpha restore, the depth guide's copy and the blit for compute-only command buffers
+RUNTIME = ['runtime_alpha', 'runtime_depth', 'runtime_blit']
 MOTION = ['motion_luma', 'motion_estimate']
 
 
@@ -69,6 +69,11 @@ def main():
     (out / 'temporal').mkdir()
 
     pipelines = table['pipelines']
+    # post_no_out1 in the manifest tells the host that the post kernels never write their second output (it makes
+    # that image 1x1): it has to say what they are built with.
+    consts = dict(r.split() for r in table['markers']['shader-constants.txt'][1:])
+    if consts.get('post_no_out1') == '1' and 'NR_POST_NO_OUT1=1' not in pipelines['fswinimagepost32']['defines']:
+        sys.exit('pipelines.json: post_no_out1 1, but fswinimagepost32 is built without NR_POST_NO_OUT1=1')
     for name, e in pipelines.items():
         glslang(a.arch, R / 'linux/shaders' / a.arch / e['source'], e['defines'], out / f'g_{name}.spv')
     for name, text in table['markers'].items():

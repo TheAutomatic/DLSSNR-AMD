@@ -281,6 +281,13 @@ bool draw_renodx(A& a, Route route, bool running, const std::function<void()>& s
             if (ImGui::RadioButton(tr("Passes (legacy)"), !fast)) { a.u(mode_key) = 0u; fast = false; changed = true; }
             ImGui::SameLine();
             if (ImGui::RadioButton(tr("Passes (fast)"), fast)) { a.u(mode_key) = 1u; fast = true; changed = true; }
+            // Passes strengthen NR's change frame by frame, and on some games it then flickers: the setting that smooths
+            // it over frames, named where it is, until it is on (NRDetailStability: 0 Auto, 1 Off, 2 Always)
+            const int ds_key = key_index("NRDetailStability");
+            if (ds_key >= 0 && on_route("NRDetailStability", route) && (!keep || keep("NRDetailStability")) &&
+                (fast || value_of("NRPasses") >= 2.f) && a.u(ds_key) == 1u)
+                ImGui::TextWrapped("%s", tr("If the picture flickers with passes, turn on Detail stability (Composition > "
+                                            "Detail stability: Auto or Always)."));
             // Only the chosen mode's settings, no sub-headers; the other mode's are hidden, their values kept
             if (!fast) {
                 changed |= draw_key(a, key_index("NRPasses"), value_of("NRUnlockPasses") ? 30.f : 4.f);

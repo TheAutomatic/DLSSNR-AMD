@@ -45,6 +45,7 @@ struct NetworkConfig {
     int osd = 1;   // OSD: 0 off, 1 after a switch, 2 always, 3 always with each layer's cost
     bool style_grade = true;   // Style Grade: Natural / Cinematic graded as NVIDIA's DLL (false: the older picture)
     bool memory_guard = true;  // Memory Guard: a network only where its video memory is free (false: no such check)
+    bool history_f16 = true;   // History Precision: 16 the history images RGBA16F (default), 32 RGBA32F
 };
 void write_network(FILE* f, const NetworkConfig& n);
 const char* residency_name(int r);   // auto, resident, offload, minimal
