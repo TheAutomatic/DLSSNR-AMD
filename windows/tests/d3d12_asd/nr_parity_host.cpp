@@ -9,6 +9,7 @@
 // format the D3D12 side dumps.
 #include "nr_renodx.hpp"
 #include "nr_runtime.hpp"
+#include "nr_d3d12_net_plan.hpp"
 #include "nr_pe_config.hpp"
 #include "nrvk.hpp"
 #include "nr_pipeline_binary.hpp"
@@ -105,6 +106,18 @@ int main(int argc, char** argv) {
     host.rdna3 = vkctx().rdna3;
     // The device-level answer, not the configuration's: ACO's records are used by a device marked enabled.
     std::printf("ACO records active on this device: %d\n", nr::binary::enabled(host.device) ? 1 : 0);
+    // NR_PLAN_DUMP=<path>: lower the D3D12 network for this extent and write its plan (NRPLAN02), the same entry the
+    // .asi's [D3D12ASD] PlanDump uses. Planning is CPU work (the graph's lowering), so it needs no D3D12 device and no
+    // ASD registration - only the model folder this host already uses.
+    if (const char* pd = std::getenv("NR_PLAN_DUMP"); pd && pd[0]) {
+        nr::set_plan_dump_path(pd);
+        nr::D3d12NetPlan plan;
+        std::string why;
+        const bool ok = nr::plan_d3d12_network(root, W, H, false, &plan, &why);
+        std::printf("plan dump %s: %ux%u, %s\n", ok ? "written" : "FAILED", plan.width, plan.height,
+                    ok ? (std::to_string(plan.disp.size()) + " dispatches").c_str() : why.c_str());
+        if (!ok) return 18;
+    }
     nr::RuntimeConfig cfg;
     cfg.root = root;
     cfg.width = W;

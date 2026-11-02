@@ -313,9 +313,12 @@ worst=0.314148121`(`wilsjo2_d3d12_test/run-fullsample.txt`,并保留 `run-pqwors
 作为诊断。复跑:`ALL PASSED: 22 dispatches, 0 failure(s)`(`run-cpucriterion.txt`)。未放宽为"凑 PASS":界限与 VK 参考
 逐字相同,且全样本 0 越界。
 
-**resize/换代边界的实际代价**:离线宿主只有 3840x2160 的 `plan.bin`;计划由运行时的 lowering 在真实安装里导出
-(`nr_d3d12_asd.cpp:1119-1124` 读 ini 的 `[D3D12ASD] PlanDump`,`nr_runtime.cpp:3390-3393` 写 NRPLAN02),离线没有
-可用的 lowering 入口,且它依赖当前被注册表事务故障阻塞的路径。因此一次**真** resize(新 extent + 匹配计划)本轮无法
-构造;已测到的是不匹配计划下的边界行为:明确拒绝、不录半帧、不退回桥(`boundary-1080.txt`)。更换 extent 时 stage 会
-按 key 重建、旧 stage 进入 `renodx_retired` 并按其录制票据释放——这段代码路径由 `-Wall` 全量编译覆盖,但没有 GPU 侧
-定向运行。
+**resize/换代边界(先前结论更正)**:上一版说"离线不能生成计划、受注册阻塞"是错的。`nr::plan_d3d12_network` 是
+plan-only lowering(`nr_d3d12_net_plan.hpp:63`;`nr_runtime.cpp:3195` 注释即 "no device"),只要有模型的
+`dlssnr-amd` 根目录即可在 CPU 上生成任意 extent 的计划,不碰 D3D12 设备、不碰 ASD 注册。
+
+已实测(`nr_parity_host` 加 `NR_PLAN_DUMP`,在任何设备/运行时创建之前调用 `set_plan_dump_path` + `plan_d3d12_network`):
+- 生成:`plan dump written: 1920x1080, 71 dispatches`(`asd-harness/plan1080.txt`,plan 134,662,038 B);
+- 用这个匹配计划跑 D3D12 路线 1920x1080 三帧(`boundary-1080-matching.txt`):网络按 1920x1080 构建,stage "1 pass",
+  三帧 `Close 0x0`,exit=0。这就是换 extent 的换代边界(新 stage、新网络、旧 stage 按其录制票据退休)。
+- 另保留不匹配计划的边界数据(`boundary-1080.txt`):明确拒绝、不录半帧、不退回桥。
