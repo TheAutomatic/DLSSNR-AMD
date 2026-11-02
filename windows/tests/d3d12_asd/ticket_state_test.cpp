@@ -39,6 +39,9 @@ int main() {
     // 3. The fence passes: finished.
     Fake::done()[kQ] = 1;
     expect("executed, fence completed", split::completed(t1), true);
+    expect("completed wait cleanup is not a dropped recording", t1->never_submitted(), false);
+    expect("repeated strict query preserves submission history", split::completed(t1), true);
+    expect("completed recording remains submitted", t1->never_submitted(), false);
 
     // 4. A new generation after a successful seal; the old ticket keeps its own answer.
     auto t2 = split::book(kL);
@@ -72,6 +75,15 @@ int main() {
     // 7. A submission carrying a list with no ticket touches nothing: no new generation, no receipt.
     ID3D12CommandList* const other = reinterpret_cast<ID3D12CommandList*>(uintptr_t(0x3000));
     split::note_execution(kQ, 1, &other);
+
+    auto never = split::book(other);
+    split::seal(never);
+    expect("sealed recording without execution is dropped", never->never_submitted(), true);
+    auto unknown = std::make_shared<nr::gpu::Recording>();
+    unknown->submitted(nullptr);
+    unknown->seal();
+    expect("unknown completion is still a submission", unknown->never_submitted(), false);
+    expect("unknown completion is not strict-ready", unknown->strict_ready(), false);
 
     std::printf("%d failure(s)\n", bad);
     return bad ? 1 : 0;

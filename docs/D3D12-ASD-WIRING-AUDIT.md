@@ -137,3 +137,10 @@ net定向MinGW -fsyntax-only退出0。本轮没有运行GPU，完整链接/实�
 ### 13:45 轮监督：丢弃初始化恢复修正
 
 8252c48仅在last_ticket被丢弃时清retargeted，会在wgt_upload已置nullptr且进入退休表后再次CopyBufferRegion空源；普通后续帧丢弃也会错误触发初始权重重拷贝。审查者直接改为只保存首次初始化Recording：若该录制未提交即终止，ready移除该Built全部缓存别名并按原异步build入口重建；旧Built仍受原Uses退休集合保护。不在未知资源状态上重置一个布尔值，不恢复已经转交所有权的upload。net定向MinGW语法检查退出0；尚未用新二进制验证，已要求执行者先完成当前619的真实链接和哈希核验。
+
+
+### 14:00 轮监督：新二进制失败的根因与直接修复
+
+新产物084f2434（13:48:37，5,269,715B）首帧执行成功，随后网络被误判初始化丢弃并重建，退出7，原日志保存在artifacts/d3d12-parity-review/build-logs/runcheck-084f2434.txt。独立阅读Recording查明：c824440的never_submitted用waits.empty判断“从未提交”，而strict_ready/ready会删除已完成wait，因此正常执行完成也被误认丢弃。这不是list指针不一致的已证事实，不需要先加大量指针日志。
+
+审查者直接在原Recording保留ever_submitted，submitted调用时永久置true；never_submitted只依据sealed和从未提交事实。扩展现有真实book/note_execution/seal/completed CPU用例，覆盖完成wait清理、重复查询、真正未执行丢弃及未知完成。完整编译、运行18项，0失败；原始结果：artifacts/d3d12-parity-review/build-logs/ticket-submission-history.txt。无GPU。需由执行者将新头编入619后重跑对应case，再继续codec/注册。

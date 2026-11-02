@@ -22,6 +22,7 @@ struct Recording {
     std::mutex mutex;
     bool sealed = false;
     bool unknown_submit = false;
+    bool ever_submitted = false;   // completed waits are removed; submission history must survive that cleanup
     std::chrono::steady_clock::time_point touched = std::chrono::steady_clock::now();
     uint64_t touched_at = submissions.load();
     bool fallback_due() const {
@@ -51,7 +52,7 @@ struct Recording {
     // executed - the original Runtime's "dropped recording", whose history can no longer be trusted.
     bool never_submitted() {
         std::lock_guard<std::mutex> guard(mutex);
-        return sealed && waits.empty() && !unknown_submit;
+        return sealed && !ever_submitted;
     }
     bool strict_ready() {
         std::lock_guard<std::mutex> guard(mutex);
@@ -64,6 +65,7 @@ struct Recording {
             std::lock_guard<std::mutex> guard(mutex);
             waits.erase(std::remove_if(waits.begin(), waits.end(), [](auto& f) { return f(); }), waits.end());
             kept = children;
+            ever_submitted = true;
             if (wait) waits.push_back(wait); else unknown_submit = true;
             touched = std::chrono::steady_clock::now();
             touched_at = ++submissions;
