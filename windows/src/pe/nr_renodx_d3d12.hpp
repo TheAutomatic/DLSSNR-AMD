@@ -64,6 +64,9 @@ struct Frame {
     // The network's answer straight from its linear buffer (NW*NH*16 bytes, float4): the raw value before the
     // stage copies it into a texture, so a zero can be told apart from a lost readback.
     ID3D12Resource* capture_raw = nullptr;
+    // The pre block's real input on this route: the linear float4 proxy (NW*NH*16), which the f16 texture dump
+    // cannot prove equal to the reference's decoded half image.
+    ID3D12Resource* capture_in_raw = nullptr;
     // The guides as the network reads them (the stage's own resampling), NW*NH*16 bytes each: a proxy match does not
     // prove the guides match.
     ID3D12Resource* capture_mv = nullptr;

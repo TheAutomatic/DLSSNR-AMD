@@ -129,6 +129,7 @@ struct D3d12BackendFrame {
     ID3D12Resource* capture_in;
     ID3D12Resource* capture_out;
     ID3D12Resource* capture_raw;
+    ID3D12Resource* capture_in_raw;
     int reset;
     unsigned long long feature;
     float history_strength;   // < 0: the session's

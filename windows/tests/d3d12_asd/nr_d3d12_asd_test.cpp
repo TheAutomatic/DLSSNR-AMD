@@ -818,6 +818,7 @@ int renodx_run(int argc, char** argv) {
     ID3D12Resource* cap_in = nullptr;
     ID3D12Resource* cap_out = nullptr;
     ID3D12Resource* cap_raw = nullptr;
+    ID3D12Resource* cap_in_raw = nullptr;
     const bool capture_boundaries = std::getenv("NR_TEST_STAGE_DUMP") != nullptr;
     if (capture_boundaries) {
         D3D12_HEAP_PROPERTIES hp{};
@@ -838,6 +839,11 @@ int renodx_run(int argc, char** argv) {
                                               IID_PPV_ARGS(&cap_raw)))) {
             log("[test] renodx: the raw capture buffer could not be made");
             return 4;
+        }
+        rd.Width = uint64_t(W) * H * 16;
+        if (SUCCEEDED(d->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                 IID_PPV_ARGS(&cap_in_raw))) && cap_in_raw) {
+            fr.capture_in_raw = cap_in_raw;
         }
         fr.capture_in = cap_in;
         fr.capture_out = cap_out;
@@ -948,6 +954,16 @@ int renodx_run(int argc, char** argv) {
                                 if (cap_in && SUCCEEDED(cap_in->Map(0, nullptr, &mi)) && mi &&
                                     cap_out && SUCCEEDED(cap_out->Map(0, nullptr, &mn)) && mn) {
                                     if (const char* sd = std::getenv("NR_TEST_STAGE_DUMP"); sd && sd[0]) {
+                                        void* mir = nullptr;
+                                        if (cap_in_raw && SUCCEEDED(cap_in_raw->Map(0, nullptr, &mir)) && mir) {
+                                            char p4[512];
+                                            std::snprintf(p4, sizeof p4, "%s\\in_raw_frame%d.bin", sd, fi);
+                                            if (FILE* f = std::fopen(p4, "wb")) {
+                                                std::fwrite(mir, 1, size_t(uint64_t(W) * H * 16), f);
+                                                std::fclose(f);
+                                            }
+                                            cap_in_raw->Unmap(0, nullptr);
+                                        }
                                         void* mr = nullptr;
                                         if (cap_raw && SUCCEEDED(cap_raw->Map(0, nullptr, &mr)) && mr) {
                                             char p3[512];

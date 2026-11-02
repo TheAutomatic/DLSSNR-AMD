@@ -2371,6 +2371,12 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
         ensure(cmd, lin_mv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         ensure(cmd, lin_depth, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         uav_barrier(cmd);   // the guides and lin_proxy are read by the net by raw address
+        if (f.capture_in_raw) {   // the float4 buffer the network actually reads
+            ensure(cmd, lin_proxy, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            cmd->CopyBufferRegion(f.capture_in_raw, 0, lin_proxy, 0, uint64_t(NW) * NH * 16);
+            ensure(cmd, lin_proxy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            uav_barrier(cmd);
+        }
         if (f.capture_in) {   // the proxy texture the network is fed from (RGBA16F, as the Vulkan stage's proxy)
             ensure(cmd, proxy.res, D3D12_RESOURCE_STATE_COPY_SOURCE);
             D3D12_TEXTURE_COPY_LOCATION di{}, si{};

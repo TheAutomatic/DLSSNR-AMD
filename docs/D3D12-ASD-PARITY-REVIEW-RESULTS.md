@@ -332,3 +332,16 @@ pre 的 27 字节落在 act 的 e4m3 区（`fswin_t.comp:3640`），不能按 f1
 - 当前 override 实测（只读）：`precompiled-db-path = ...\asd-harness\dlssnr-amd-asd\public-copy.psdb`，
   `apps` = `nr_619.exe`（由最近的 ASD 运行写入）。需要恢复时用 `d3dconfig apps --remove` + 清
   `D3DBehaviors.PrecompiledDatabasePath`，并在读回确认后再跑非 ASD 任务。
+
+## 首差异定位到 encode 输出的 1 ULP（实测）
+
+- `lin_proxy`（ASD 网络真正读的 float4）与本侧 `proxy` 的 f16 展开**完全相等**（33,177,600/33,177,600），
+  `tex_to_buf` 没有算术，转换无损。
+- 两侧 `proxy`（encode 输出，f16）现行差：**554 / 33,177,600 个值相差 1 个 f16 ULP**（0.0017%，max 4.88e-4），
+  其余完全相同。这与 pre 的 27 字节差、以及 neural 的 mean 0.0038 同源：RenoDX 的 encode/decode/look 在
+  ASD 路线是 HLSL（d3dcompiler_47），在参考路线是 SPIR-V（nr_renodx.cpp），两次编译必然有末位差；网络对输入
+  敏感，差被放大。
+- 逐 step push 对比：71 步序列与名字完全一致，51 步的 2 字节差异全部落在 act 地址字段（每进程 VA 不同），
+  不是参数差。
+- post 的 1 字节是 `PushImageTail.w_off` bit31 = `NR_POST_ALPHA`：参考（Vulkan）由 post 块恢复 alpha，D3D12 由
+  独立 alpha pass 恢复，按设计保留，不追求字节一致；比较 RGB 即可。
