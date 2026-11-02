@@ -34,6 +34,7 @@
 #include "nr_screenshot.hpp"
 #include "nr_pe_session.hpp"
 #include "nr_pe_vkdevice.hpp"
+#include "nr_d3d12_asd.hpp"
 #include "nr_d3d12_asd_backend.hpp"
 
 #include <algorithm>
@@ -1438,9 +1439,11 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
                         const D3D12_RESOURCE_DESC dd = depth->GetDesc();
                         render_w = uint32_t(dd.Width); render_h = dd.Height;
                     }
+                    // What the frame actually carried, not what the caller hoped: a copy-through frame is a success
+                    // (R05 - the panel used to claim NR ran on every recorded frame).
                     report_control(d3d12_session(), f, 1, width, height, nullptr, g_live_d3d12.size(), render_w, render_h,
                                    panel_guides_d3d12(color, motion, depth, motion_rect, reset != 0, mv_scale_x, mv_scale_y),
-                                   true, true);
+                                   nr::pe::asd::backend_produced(), true);
                 }
             }
             device->Release();

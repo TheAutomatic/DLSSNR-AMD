@@ -58,6 +58,10 @@ struct Status {
 };
 Status status();
 void note_backend(const char* line, bool ran);   // the backend's last state, in words
+// Whether the last frame the backend recorded actually carried NR (a copy-through frame carries none and is still a
+// success: the caller reports that as its own result instead of claiming the network ran).
+void note_backend_produced(bool produced);
+bool backend_produced();
 void note_network(const char* name);
 
 // The folder, the ini, the files (UTF-16, for the D3D12 APIs).

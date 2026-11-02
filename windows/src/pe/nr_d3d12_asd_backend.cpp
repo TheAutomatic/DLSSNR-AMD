@@ -17,6 +17,7 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -603,7 +604,9 @@ struct Backend {
     uint32_t prep_last_kind = 0;
     std::chrono::steady_clock::time_point prep_metered{};
     uint32_t w = 0, h = 0;
-    std::unique_ptr<D3d12AsdNetwork> network;
+    // A shared_ptr, not a unique_ptr: a reader off the game's thread (the heartbeat, NR Control's status) copies
+    //    the pointer under `owner_lock` and uses it outside the lock, so a device swap cannot free it under a reader.
+    std::shared_ptr<D3d12AsdNetwork> network;
     bool broken = false;   // something of the device's could not be made: the 0.0.8.1 path from now on
     // Set while a device generation is being dropped: a stage's destructor calls retire() for the surfaces it still
     // holds, and those must be released here, not queued into the next generation's list (their watermark is gone).
@@ -632,7 +635,26 @@ struct Backend {
         std::shared_ptr<nr::gpu::Recording> rec;
     };
     std::vector<FrameRecording> recordings;
-    std::vector<std::pair<int64_t, ID3D12Resource*>> token_retired;   // grown-away token buffers
+    // The evidence a retired object waits for: this generation's unfinished recordings at the moment it is retired,
+    // conservatively - the frame being recorded is not proof by itself, an earlier recording of the same generation may
+    // still be unsubmitted and run after a newer one finished (nr::gpu::Uses, the same owner-less use set the Vulkan
+    // path retires with).
+    nr::gpu::Uses uses_now() const {
+        nr::gpu::Uses u;
+        for (const auto& r : recordings)
+            if (r.rec && !nr::pe::split::completed(r.rec)) u.tickets.push_back(r.rec);
+        if (booking && std::find(u.tickets.begin(), u.tickets.end(), booking) == u.tickets.end())
+            u.tickets.push_back(booking);
+        return u;
+    }
+    // A grown-away token buffer, released by the recording of the frame that last read it (a predecessor of the token
+    // block is read by the same list that copies this frame's number, so the frame's own recording is the evidence).
+    struct RetiredToken {
+        int64_t frame;
+        nr::gpu::Uses uses;
+        ID3D12Resource* p;
+    };
+    std::vector<RetiredToken> token_retired;
     // A value the GPU has not written yet reads as ~0, and only a slot whose holder matches its own index is a
     // completion: a frame number ahead of the newest record is a torn read, not evidence.
     void refresh_executed() {
@@ -646,7 +668,7 @@ struct Backend {
     }
     struct Retired {
         int64_t frame;                                   // the backend's frame number that last used it
-        std::shared_ptr<nr::gpu::Recording> ticket;      // that frame's recording (null: none seen)
+        nr::gpu::Uses uses;                               // the recordings that may still run past it
         IUnknown* p;
     };
     std::vector<Retired> retired;
@@ -663,10 +685,21 @@ struct Backend {
         uint32_t applied_w = 0, applied_h = 0, pending_w = 0, pending_h = 0, pending_frames = 0;
     };
     std::map<uint64_t, RenodxEntry> renodx;
-    // A replaced stage (an extent change) is released once the frames in flight are past it, like `retired`.
-    std::vector<std::pair<int64_t, std::unique_ptr<renodx12::Stage>>> renodx_retired;
+    // A replaced stage (an extent change) is released once the recording of the frame that last used it is done - the
+    // same evidence as `retired`, not the backend's newest-frame watermark: a stack records many frames into one list
+    // that may still be unsubmitted, and a frame number says nothing about whether the GPU ran past that stage's work.
+    struct RetiredStage {
+        int64_t frame;
+        nr::gpu::Uses uses;
+        std::unique_ptr<renodx12::Stage> stage;
+    };
+    std::vector<RetiredStage> renodx_retired;
 };
 Backend g;
+// Guards `g.device` and `g.network` against a reader that does not run inside evaluate (the heartbeat's device-removed
+// poll, NR Control's status): the readers take a reference under it, the evaluate/drop_device path swaps them under it.
+// Recursive because the writers already call one another (release_generation -> drop_device).
+std::recursive_mutex g_owner_lock;
 // Device generations that were swapped while work of theirs could still be in flight. Each is released only when its
 // own completion evidence (its Recording/ticket, or its token watermark) says the GPU ran past its last frame.
 std::vector<std::unique_ptr<Backend>> g_old_generations;
@@ -689,7 +722,7 @@ ID3D12Resource* heap_buffer(ID3D12Device* device, D3D12_HEAP_TYPE type, uint64_t
 void retire(IUnknown* p) {
     if (!p) return;
     if (g.discarding) { p->Release(); return; }
-    g.retired.push_back({int64_t(g.frames), g.booking, p});
+    g.retired.push_back({int64_t(g.frames), g.uses_now(), p});
 }
 void release_generation(Backend& b);
 
@@ -735,8 +768,8 @@ void sweep() {
     auto it = std::remove_if(g.retired.begin(), g.retired.end(), [](const auto& r) {
         // An owner released by its own recording's ticket once that recording is sealed and its GPU work finished;
         // a resource retired without a ticket keeps the backend's own watermark.
-        if (r.ticket) {
-            if (!nr::pe::split::completed(r.ticket)) return false;
+        if (!r.uses.tickets.empty()) {
+            if (!r.uses.ready()) return false;
         } else if (g.executed < r.frame) {
             return false;
         }
@@ -744,13 +777,18 @@ void sweep() {
         return true;
     });
     g.retired.erase(it, g.retired.end());
-    auto rs = std::remove_if(g.renodx_retired.begin(), g.renodx_retired.end(), [](const auto& r) {
-        return g.executed >= r.first;
+    // The same evidence as `retired`: the frame's own recording when there is one, the watermark otherwise.
+    auto frame_evidence = [](int64_t frame, const nr::gpu::Uses& uses) {
+        if (!uses.tickets.empty()) return uses.ready();
+        return g.executed >= frame;
+    };
+    auto rs = std::remove_if(g.renodx_retired.begin(), g.renodx_retired.end(), [&](const auto& r) {
+        return frame_evidence(r.frame, r.uses);
     });
     g.renodx_retired.erase(rs, g.renodx_retired.end());
-    auto rt = std::remove_if(g.token_retired.begin(), g.token_retired.end(), [](const auto& r) {
-        if (g.executed < r.first) return false;
-        r.second->Release();
+    auto rt = std::remove_if(g.token_retired.begin(), g.token_retired.end(), [&](auto& r) {
+        if (!frame_evidence(r.frame, r.uses)) return false;
+        r.p->Release();
         return true;
     });
     g.token_retired.erase(rt, g.token_retired.end());
@@ -772,7 +810,7 @@ void mark_frame(ID3D12GraphicsCommandList* cmd) {
             release(grown);
             return;   // no completion signal this frame: retirement simply waits (never less safe)
         }
-        g.token_retired.emplace_back(int64_t(g.frames), g.token);   // the last record that reads the old block
+        g.token_retired.push_back({int64_t(g.frames), g.uses_now(), g.token});   // the last record that reads the old block
         g.token = grown;
         g.token_map = static_cast<uint64_t*>(tm);
         g.token_slots = uint32_t(slots);
@@ -848,8 +886,11 @@ bool build(ID3D12Device* device, std::string* why) {
     if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g.heap)))) { *why = "CreateDescriptorHeap failed"; return false; }
     g.increment = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     // The ACO network when the .asi has set its planner (nr_asi_main.cpp); a test without one keeps the placeholder.
-    if (net_planner()) g.network = make_aco_network(folder());
-    else g.network = std::make_unique<PlaceholderCopyNetwork>();
+    {
+        std::lock_guard<std::recursive_mutex> l(g_owner_lock);
+        if (net_planner()) g.network = make_aco_network(folder());
+        else g.network = std::make_unique<PlaceholderCopyNetwork>();
+    }
     const char* nwhy = "";
     if (!g.network->create(device, &nwhy)) { *why = std::string("the network: ") + nwhy; return false; }
     // The completion pair: a frame number the GPU echoes back once the commands that used a retired object have run.
@@ -932,6 +973,7 @@ void release_generation(Backend& b);
 void release_generation(Backend& b);
 
 void drop_device() {
+    std::lock_guard<std::recursive_mutex> owner(g_owner_lock);
     // A device is swapped while a frame of ours may still be queued: the whole generation is handed over and released
     // by its own evidence, never here (a pointer change is not proof that the GPU is idle).
     if (g.device && (g.frames > 0 || !g.recordings.empty()) && !generation_done(g)) {
@@ -950,7 +992,7 @@ void drop_device() {
     if (g.token_map) g.token->Unmap(0, nullptr);
     if (g.done_map) g.done->Unmap(0, nullptr);
     release(g.token); release(g.done);
-    for (auto& r : g.token_retired) r.second->Release();
+    for (auto& r : g.token_retired) r.p->Release();
     // The lists belong to this device: nothing of it is in flight once drop_device is called (the same reason the
     // resources above are released here), and a later device must not inherit watermarks from this one.
     for (auto& r : g.retired) r.p->Release();
@@ -985,6 +1027,7 @@ void drop_device() {
 
 // Releases everything of a generation whose work has finished: the immediate body above, run on that generation.
 void release_generation(Backend& b) {
+    std::lock_guard<std::recursive_mutex> owner(g_owner_lock);   // `g` itself is swapped here
     Backend keep = std::move(g);
     g = std::move(b);
     drop_device();          // the immediate-release body, on this generation
@@ -1109,7 +1152,7 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
         c.present = uint32_t(f.renodx_present);
         c.settings = s;
         c.feature = f.feature;
-        g.renodx_retired.emplace_back(int64_t(g.frames), std::move(e.stage));   // released once the GPU ran past this frame
+        g.renodx_retired.push_back({int64_t(g.frames), g.uses_now(), std::move(e.stage)});   // released once its frame's recording is done
         auto made = renodx12::Stage::make(c, &why);
         if (made) made->set_retire([](IUnknown* r) { retire(r); });   // released on the backend's watermark
         if (made) {
@@ -1124,7 +1167,7 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
     if (!e.stage->set(s)) {
         // Relative <-> absolute units (NRLinearUnitNits, NRSourceEncoding): a stage made with the new settings
         // takes the frame now (0.0.8.1 retires the old one and waits a frame; the bridge is never used here).
-        g.renodx_retired.emplace_back(int64_t(g.frames), std::move(e.stage));
+        g.renodx_retired.push_back({int64_t(g.frames), g.uses_now(), std::move(e.stage)});
         renodx12::Stage::Config c;
         c.device = f.device;
         c.shaders = widen(nr::pe::module_folder()) + L"\\dlssnr-amd\\shaders\\renodx";
@@ -1225,6 +1268,7 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
         std::snprintf(line, sizeof line,
                       "ran the RenoDX stage (D3D12) %ux%u, network %ux%u: %u pass%s, the network recorded nothing (%s)",
                       w, h, nw, nh, ran, ran == 1 ? "" : "es", nwhy);
+    note_backend_produced(ran > 0);   // what Stage::record returns, the same ran the Vulkan path reports
     note_backend(line, true);
     return true;
 }
@@ -1255,7 +1299,10 @@ bool wilsjo2_ready(ID3D12Device* device, ID3D12GraphicsCommandList* cmd, uint32_
     if (g.device != device) {
         drop_device();
         device->AddRef();
-        g.device = device;
+        {
+            std::lock_guard<std::recursive_mutex> l(g_owner_lock);
+            g.device = device;
+        }
         if (!build(device, &y)) { g.broken = true; g.broken_why = y; }
     }
     if (g.broken) { y = g.broken_why; return false; }
@@ -1298,7 +1345,10 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
     if (g.device != f.device) {
         drop_device();
         f.device->AddRef();
-        g.device = f.device;
+        {
+            std::lock_guard<std::recursive_mutex> l(g_owner_lock);
+            g.device = f.device;
+        }
         capture::adopt(f.device);
         if (!build(f.device, &why)) { g.broken = true; g.broken_why = why; }
     }
@@ -1724,12 +1774,13 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
     char line[200];
     std::snprintf(line, sizeof line, "ran %ux%u%s: %s", w, h, in_place ? " in place" : "",
                   net_ok ? g.network->name() : (std::string("the network recorded nothing (") + nwhy + "): input copied back").c_str());
+    note_backend_produced(net_ok);
     note_backend(line, true);
     return true;
 }
 void release_renodx_feature(uint64_t feature) {
     if (auto it = g.renodx.find(feature); it != g.renodx.end()) {
-        if (it->second.stage) g.renodx_retired.emplace_back(int64_t(g.frames), std::move(it->second.stage));
+        if (it->second.stage) g.renodx_retired.push_back({int64_t(g.frames), g.uses_now(), std::move(it->second.stage)});
         g.renodx.erase(it);
     }
     if (g.network) {
@@ -1742,16 +1793,34 @@ void release_renodx_feature(uint64_t feature) {
 }
 
 bool write_network_capture(const std::string& dir, std::string* why) {
-    if (!g.network) { *why = "no network"; return false; }
-    return g.network->write_capture(dir, why);
+    std::shared_ptr<D3d12AsdNetwork> n;
+    {
+        std::lock_guard<std::recursive_mutex> l(g_owner_lock);
+        n = g.network;
+    }
+    if (!n) { *why = "no network"; return false; }
+    return n->write_capture(dir, why);
 }
 
 HRESULT device_removed_reason() {
-    ID3D12Device* d = g.device;
-    return d ? d->GetDeviceRemovedReason() : S_OK;
+    ID3D12Device* d = nullptr;
+    {
+        std::lock_guard<std::recursive_mutex> l(g_owner_lock);
+        d = g.device;
+        if (d) d->AddRef();
+    }
+    if (!d) return S_OK;
+    const HRESULT hr = d->GetDeviceRemovedReason();
+    d->Release();
+    return hr;
 }
 AsdNetStatus backend_net_status() {
-    return g.network ? g.network->status() : AsdNetStatus{};
+    std::shared_ptr<D3d12AsdNetwork> n;
+    {
+        std::lock_guard<std::recursive_mutex> l(g_owner_lock);
+        n = g.network;
+    }
+    return n ? n->status() : AsdNetStatus{};
 }
 
 

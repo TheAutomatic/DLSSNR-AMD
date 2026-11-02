@@ -490,7 +490,12 @@ class AcoNetwork final : public D3d12AsdNetwork {
 public:
     explicit AcoNetwork(std::wstring folder) : folder_(std::move(folder)), shared_(std::make_shared<Shared>()) {}
     ~AcoNetwork() override {
-        nets_.clear();
+        {
+            std::lock_guard<std::recursive_mutex> l(state_m_);
+            current_shared_.reset();
+            current_ = nullptr;
+            nets_.clear();
+        }
         retired_.clear();
         for (auto& r : retire_upload_) if (r.upload) r.upload->Release();
         if (stamps_map_) stamps_->Unmap(0, nullptr);
@@ -642,14 +647,20 @@ public:
 
     bool ready(ID3D12Device*, uint32_t w, uint32_t h, std::string* why) override {
         sweep();
-        current_shared_.reset();
-        current_ = nullptr;
+        {
+            std::lock_guard<std::recursive_mutex> l(state_m_);
+            current_shared_.reset();
+            current_ = nullptr;
+        }
         building_ = false;
         if (w % 8) { *why = "width " + std::to_string(w) + " is not a multiple of 8 (the network's RGBA32F image rows)"; return false; }
         NetModelQuery query = g_model_query.load();
         const int q = query ? query() : -1;
         const int want = q >= 0 ? q : (last_want_ >= 0 ? last_want_ : nr::kSmallFp8);
-        last_want_ = want;
+        {
+            std::lock_guard<std::recursive_mutex> l(state_m_);
+            last_want_ = want;
+        }
         const auto key = std::make_tuple(w, h, want);
         if (auto it = nets_.find(key); it != nets_.end() && it->second->initialization &&
             it->second->initialization->never_submitted()) {
@@ -657,12 +668,16 @@ public:
             RetiredNet retired;
             retired.net = dropped;
             retired_.push_back(std::move(retired));
-            for (auto alias = nets_.begin(); alias != nets_.end();) {
-                if (alias->second == dropped) alias = nets_.erase(alias);
-                else ++alias;
+            {
+                std::lock_guard<std::recursive_mutex> l(state_m_);
+                for (auto alias = nets_.begin(); alias != nets_.end();) {
+                    if (alias->second == dropped) alias = nets_.erase(alias);
+                    else ++alias;
+                }
             }
         }
         if (auto it = nets_.find(key); it != nets_.end()) {
+            std::lock_guard<std::recursive_mutex> l(state_m_);
             current_shared_ = it->second;
             current_ = current_shared_.get();
             current_->used = tick_;
@@ -684,7 +699,10 @@ public:
                 RetiredNet rn;
                 rn.net = std::move(lru->second);
                 retired_.push_back(std::move(rn));
-                nets_.erase(lru);
+                {
+                    std::lock_guard<std::recursive_mutex> l(state_m_);
+                    nets_.erase(lru);
+                }
             }
             auto& b = nets_[done_key];
             b = std::move(done);
@@ -695,6 +713,7 @@ public:
                 alias->used = tick_;
             }
             if (done_key == key || ask_key == key) {
+                std::lock_guard<std::recursive_mutex> l(state_m_);
                 current_shared_ = b;
                 current_ = current_shared_.get();
                 name_ = "the ACO network, " + b->plan.model + ", " + std::to_string(b->plan.disp.size()) + " dispatches, temporal";
@@ -734,8 +753,11 @@ public:
     bool building() const override { return building_; }
     AsdNetStatus status() const override {
         AsdNetStatus s;
-        s.running_net = current_ ? current_->net : -1;
-        s.want_net = last_want_;
+        {
+            std::lock_guard<std::recursive_mutex> l(state_m_);
+            s.running_net = current_ ? current_->net : -1;
+            s.want_net = last_want_;
+        }
         std::lock_guard<std::mutex> l(shared_->m);
         s.building = shared_->building;
         s.building_net = shared_->building ? shared_->bnet : -1;
@@ -1334,6 +1356,9 @@ private:
     std::shared_ptr<Shared> shared_;
     std::map<std::tuple<uint32_t, uint32_t, int>, std::shared_ptr<Built>> nets_;
     std::shared_ptr<Built> current_shared_;
+    // `current_`/`last_want_`/`nets_` are written by the game's thread and read by the heartbeat's status line: a
+    // reader copies the small fields under this lock, so a network the game drops cannot be freed under it.
+    mutable std::recursive_mutex state_m_;
     Built* current_ = nullptr;                   // ready()'s answer for this evaluate
     bool building_ = false;                      // v2.6: ready() said no only because a network is building
     int last_want_ = -1;

@@ -38,6 +38,7 @@ std::atomic<bool> g_canary_started{false};
 std::atomic<bool> g_diag_done{false};
 std::string g_canary_line = "not run";
 std::atomic<uint64_t> g_runs{0}, g_fallbacks{0};
+std::atomic<bool> g_produced{false};   // the last recorded frame actually carried NR (not a copy-through)
 const wchar_t kInstallerName[] = L"DLSSNR-AMD-ASD";
 
 std::string utf8(const std::wstring& w) {
@@ -1294,6 +1295,8 @@ Status status() {
     s.fallbacks = g_fallbacks.load();
     return s;
 }
+bool backend_produced() { return g_produced.load(); }
+void note_backend_produced(bool produced) { g_produced = produced; }
 void note_backend(const char* line, bool ran) {
     (ran ? g_runs : g_fallbacks)++;
     std::lock_guard<std::mutex> g(g_lock);
