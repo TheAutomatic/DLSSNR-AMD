@@ -1,3 +1,4 @@
+#include "nr_path_u8.hpp"
 // The real network of the native D3D12 ASD backend (nr_d3d12_asd_net.hpp). Same steps, same order, same names as
 // nr::Runtime runs its network (nr_runtime.cpp; Mochi's linux/src/core/nr_runtime.cpp is the same file): build,
 // retarget, controls / patch_push, record. What differs is only what D3D12 and the ASD carriers need:
@@ -533,7 +534,7 @@ public:
                 if (SUCCEEDED(b->pre_dump->Map(0, nullptr, &pm)) && pm) {
                     const char* lo2 = std::getenv("NR_NET_PRE_OFF");
                     const std::string ppath = dir + "\\asd_pre" + (lo2 ? "_off" + std::string(lo2) : "") + ".bin";
-                    if (FILE* pf = std::fopen(ppath.c_str(), "wb")) {
+                    if (FILE* pf = nr::u8::fopen(ppath.c_str(), "wb")) {
                         std::fwrite(pm, 1, size_t(b->pre_dump_bytes), pf);
                         std::fclose(pf);
                         char msg[192];
@@ -548,7 +549,7 @@ public:
                 void* wm = nullptr;
                 if (SUCCEEDED(b->wgt_dump->Map(0, nullptr, &wm)) && wm) {
                     const std::string wpath = dir + "\\asd_wgt.bin";
-                    if (FILE* wf = std::fopen(wpath.c_str(), "wb")) {
+                    if (FILE* wf = nr::u8::fopen(wpath.c_str(), "wb")) {
                         std::fwrite(wm, 1, size_t(b->wgt_dump_bytes), wf);
                         std::fclose(wf);
                     }
@@ -559,7 +560,7 @@ public:
                 void* km = nullptr;
                 if (SUCCEEDED(b->kern_dump->Map(0, nullptr, &km)) && km) {
                     const std::string kpath = dir + "\\asd_kern.bin";
-                    if (FILE* kf = std::fopen(kpath.c_str(), "wb")) {
+                    if (FILE* kf = nr::u8::fopen(kpath.c_str(), "wb")) {
                         std::fwrite(km, 1, size_t(b->kern_dump_bytes), kf);
                         std::fclose(kf);
                     }
@@ -567,13 +568,13 @@ public:
                 }
             }
             const std::string path = dir + "\\asd_noise.bin";
-            FILE* f = std::fopen(path.c_str(), "wb");
+            FILE* f = nr::u8::fopen(path.c_str(), "wb");
             const bool ok = f && std::fwrite(m, 1, size_t(b->noise_dump_bytes), f) == size_t(b->noise_dump_bytes);
             if (f) std::fclose(f);
             b->noise_dump->Unmap(0, nullptr);
             if (!ok) { *why = "the noise capture could not be written"; return false; }
             const auto& j = b->plan.noise[0];
-            FILE* meta = std::fopen((dir + "\\asd_noise.txt").c_str(), "w");
+            FILE* meta = nr::u8::fopen((dir + "\\asd_noise.txt").c_str(), "w");
             if (meta) {
                 std::fprintf(meta, "file=%s\ndtype=f16x4\noff=%u\nsize=%llu\nwidth=%u\nheight=%u\nseed=%u\nnoise=%g\n"
                                    "weights_end=%llu\nact_total=%llu\n",

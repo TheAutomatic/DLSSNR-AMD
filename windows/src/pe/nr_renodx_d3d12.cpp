@@ -1,3 +1,4 @@
+#include "nr_path_u8.hpp"
 // The RenoDX stage on the native D3D12 ASD route (nr_renodx_d3d12.hpp). The host logic is nr_renodx.cpp's
 // (0.0.8.1, the Vulkan stage) line for line where it decides what the shaders are given; the shaders are RenoDX's
 // own D3D12 ones (windows/shaders/renodx *.cs_5_1.hlsl), compiled at runtime with d3dcompiler_47 as they are,
@@ -2476,7 +2477,7 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
             if (is_dir || !replay_buf_) {
                 const uint64_t bytes = uint64_t(NW) * NH * 8;
                 std::vector<uint8_t> f16(bytes);
-                std::ifstream in(replay_path, std::ios::binary);
+                std::ifstream in(nr::u8::path(replay_path), std::ios::binary);
                 if (in && in.read(reinterpret_cast<char*>(f16.data()), std::streamsize(bytes))) {
                     if (!replay_buf_) replay_buf_ = upload_buffer(device, uint64_t(NW) * NH * 16);
                     if (replay_buf_) {

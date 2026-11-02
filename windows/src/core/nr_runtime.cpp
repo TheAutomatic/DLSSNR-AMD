@@ -2152,7 +2152,7 @@ bool Runtime::write_weights_capture(const std::string& path, std::string* why) {
         *why = "the weights capture could not be mapped";
         return false;
     }
-    FILE* f = std::fopen(path.c_str(), "wb");
+    FILE* f = nr::u8::fopen(path.c_str(), "wb");
     const bool ok = f && std::fwrite(m, 1, size_t(impl_->wgt_cap_bytes), f) == size_t(impl_->wgt_cap_bytes);
     if (f) std::fclose(f);
     vkUnmapMemory(impl_->session.ctx.device, impl_->wgt_cap_mem);
@@ -2167,7 +2167,7 @@ bool Runtime::write_kernel_capture(const std::string& path, std::string* why) {
         *why = "the kernel capture could not be mapped";
         return false;
     }
-    FILE* f = std::fopen(path.c_str(), "wb");
+    FILE* f = nr::u8::fopen(path.c_str(), "wb");
     const bool ok = f && std::fwrite(m, 1, size_t(impl_->kern_cap_bytes), f) == size_t(impl_->kern_cap_bytes);
     if (f) std::fclose(f);
     vkUnmapMemory(impl_->session.ctx.device, impl_->kern_cap_mem);
@@ -2185,7 +2185,7 @@ bool Runtime::write_pre_capture(const std::string& path, std::string* why) {
         *why = "the pre capture could not be mapped";
         return false;
     }
-    FILE* f = std::fopen(path.c_str(), "wb");
+    FILE* f = nr::u8::fopen(path.c_str(), "wb");
     const bool ok = f && std::fwrite(m, 1, size_t(impl_->pre_cap_bytes), f) == size_t(impl_->pre_cap_bytes);
     if (f) std::fclose(f);
     vkUnmapMemory(impl_->session.ctx.device, impl_->pre_cap_mem);
@@ -2203,7 +2203,7 @@ bool Runtime::write_noise_capture(const std::string& path, std::string* why) {
         *why = "the noise capture could not be mapped";
         return false;
     }
-    FILE* f = std::fopen(path.c_str(), "wb");
+    FILE* f = nr::u8::fopen(path.c_str(), "wb");
     const bool ok = f && std::fwrite(m, 1, size_t(impl_->noise_cap_bytes), f) == size_t(impl_->noise_cap_bytes);
     if (f) std::fclose(f);
     vkUnmapMemory(impl_->session.ctx.device, impl_->noise_cap_mem);
@@ -3205,7 +3205,7 @@ void set_plan_dump_path(const char* path) { g_plan_dump = path ? path : ""; }
 
 // The plan in NRPLAN02, the layout nr_d3d12_asd_test's file_planner reads back.
 bool dump_d3d12_plan(const D3d12NetPlan& p, const char* path) {
-    FILE* f = path && *path ? std::fopen(path, "wb") : nullptr;
+    FILE* f = path && *path ? nr::u8::fopen(path, "wb") : nullptr;
     if (!f) return false;
     auto u32 = [&](uint32_t v) { std::fwrite(&v, 4, 1, f); };
     auto u64 = [&](uint64_t v) { std::fwrite(&v, 8, 1, f); };
