@@ -98,6 +98,12 @@ public:
     // The frame through the stack (nr_renodx.cpp Stage::record: the SDR legacy codec and the HDR v6 one). Returns
     // how many passes ran the network (0: NR off - the frame copied to the output as it is).
     uint32_t record(ID3D12GraphicsCommandList* cmd, const Frame& f, const Frame::Net& net);
+    // False when the last record() could not make a surface it needed: 0 passes then is not a copy-through.
+    bool record_ok() const;
+    // Answers whether the frame with this number has finished on the GPU; a descriptor slot is rewritten only then.
+    void set_completed(std::function<bool(uint64_t)> f);
+    // The caller's frame number for the next record: what its completed() predicate counts.
+    void set_frame(uint64_t f);
 
     // The last frame's decisions (nr_renodx.hpp Stage::Facts), for the panel's wording.
 

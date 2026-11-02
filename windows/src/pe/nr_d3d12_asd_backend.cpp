@@ -880,6 +880,9 @@ void drop_device() {
     g.retired.clear();
     g.token_retired.clear();
     g.token_map = nullptr; g.done_map = nullptr; g.token_slots = 0; g.frames = 0; g.executed = -1;
+    g.segments = Backend::kSlots / 4;
+    g.segment_owner.clear();
+    g.slot = 0;
     g.rs = nullptr; g.to_linear = g.from_linear = g.to_motion = g.to_depth = nullptr; g.heap = nullptr;
     g.lin_in = g.lin_out = g.lin_mv = g.lin_depth = nullptr;
     g.neutral_mv = nullptr;
@@ -1009,6 +1012,9 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
         g.renodx_retired.emplace_back(int64_t(g.frames), std::move(e.stage));   // released once the GPU ran past this frame
         auto made = renodx12::Stage::make(c, &why);
         if (made) made->set_retire([](ID3D12Resource* r) { retire(r); });   // released on the backend's watermark
+        if (made) {
+            made->set_completed([](uint64_t f) { g.refresh_executed(); return g.executed >= int64_t(f); });
+        }
         if (!made) return fallback("the RenoDX route: " + why);
         e.stage = std::move(made);
         e.w = w; e.h = h; e.nw = nw; e.nh = nh; e.format = sf;
@@ -1031,6 +1037,7 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
         c.feature = f.feature;
         e.stage = renodx12::Stage::make(c, &why);
         if (e.stage) e.stage->set_retire([](ID3D12Resource* r) { retire(r); });
+        if (e.stage) e.stage->set_completed([](uint64_t f) { g.refresh_executed(); return g.executed >= int64_t(f); });
         if (!e.stage) return fallback("the RenoDX route: " + why);
     }
 
@@ -1097,8 +1104,13 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
     };
     const auto state = nr::pe::split::snapshot(f.cmd);
     if (!state) return fallback("the RenoDX route: no snapshot of the command list's state");
+    e.stage->set_frame(g.frames);
     const uint32_t ran = e.stage->record(f.cmd, rf, net);
     nr::pe::split::restore(f.cmd, state);
+    // 0 passes is a legitimate copy-through only when the stage says it made everything it needed; otherwise the
+    // output may not have been written at all and the caller must take its own path.
+    if (!e.stage->record_ok())
+        return fallback("the RenoDX stage could not make a surface this frame needs");
     char line[160];
     std::snprintf(line, sizeof line, "ran the RenoDX stage (D3D12) %ux%u, network %ux%u: %u pass%s", w, h, nw, nh,
                   ran, ran == 1 ? "" : "es");

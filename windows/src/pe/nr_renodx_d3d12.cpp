@@ -1025,6 +1025,13 @@ struct Stage::Impl {
     ID3D12DescriptorHeap* clear_heap = nullptr;    // one descriptor, for the prep state's zeroing clear
     UINT inc = 0, slot = 0;
     static constexpr UINT kSlots = 4096;   // one dispatch a slot (20 descriptors); a frame uses tens
+    // Each slot carries the frame that last wrote it. A slot is rewritten only when the caller says that frame has
+    // finished on the GPU; otherwise the frame fails to the 0.0.8.1 path rather than overwriting descriptors a
+    // recorded dispatch still reads.
+    std::vector<uint64_t> slot_frame;
+    uint64_t frame_no = 0;
+    uint64_t pinned = 0;   // the caller's frame number for this record (its own completion watermark's unit)
+    std::function<bool(uint64_t)> completed;
 
     // The stage's own surfaces (nr_renodx.cpp's images; `decoded` in the frame's format when it takes a typed UAV
     // store, else RGBA16F stored through float - the Vulkan stage's blit fallback, as a shader store).
@@ -1171,7 +1178,11 @@ struct Stage::Impl {
     // A replaced surface may still be read by a recorded frame another list has not run yet, so the release goes
     // through the caller's completion watermark when it gave one; `states` forgets it either way.
     std::function<void(ID3D12Resource*)> retire;
+    // False when a surface this frame needed could not be made: the frame must not be reported as processed (its
+    // output may not have been written). A frame with NR off is a legitimate copy-through and stays true.
+    bool record_ok_ = true;
     ID3D12Resource* replay_buf_ = nullptr;   // test-only: the uploaded network input (NR_TEST_PROXY_REPLAY)
+    uint32_t replay_frame_ = 0;              // which frame's file the replay takes next
     void drop(Tex& t) {
         if (!t.res) return;
         states.erase(t.res);
@@ -1267,6 +1278,15 @@ struct Stage::Impl {
         D3D12_GPU_DESCRIPTOR_HANDLE gpu = heap->GetGPUDescriptorHandleForHeapStart();
         cpu.ptr += SIZE_T(slot) * 20 * inc;
         gpu.ptr += UINT64(slot) * 20 * inc;
+        const uint32_t take = slot % kSlots;
+        if (completed && !slot_frame.empty() && slot_frame[take] != 0 && !completed(slot_frame[take])) {
+            record_ok_ = false;
+            jlog("renodx dispatch slot %u still in use by frame %llu", take,
+                 static_cast<unsigned long long>(slot_frame[take]));
+            return;
+        }
+        if (slot_frame.size() != kSlots) slot_frame.assign(kSlots, 0);
+        slot_frame[take] = pinned ? pinned : frame_no;
         slot = (slot + 1) % kSlots;
         const auto fill = [&](View* views, UINT n, bool write) {
             View first{};
@@ -1772,6 +1792,8 @@ void Stage::Impl::copy_frame(ID3D12GraphicsCommandList* cmd, const Frame& f) {
 }
 
 uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, const Frame::Net& net) {
+    record_ok_ = true;
+    ++frame_no;
     const Settings& s = settings;
     const uint32_t W = cfg.width, H = cfg.height, NW = cfg.nr_width, NH = cfg.nr_height;
     const uint32_t gx = (W + 15) / 16, gy = (H + 15) / 16, nx = (NW + 15) / 16, ny = (NH + 15) / 16;
@@ -1810,12 +1832,12 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
     if (hdr && passes > 1 && !work_b.res) {
         std::string why;
         work_b = make_tex(W, H, DXGI_FORMAT_R16G16B16A16_FLOAT, true, &why);
-        if (!work_b.res) return 0;
+        if (!work_b.res) { record_ok_ = false; return 0; }
     }
     if (!hdr && passes > 1 && !decoded_alt.res) {
         std::string why;
         decoded_alt = make_tex(W, H, decoded.format, true, &why);
-        if (!decoded_alt.res) return 0;
+        if (!decoded_alt.res) { record_ok_ = false; return 0; }
     }
     while (looks.size() > passes) {
         drop_buf(looks.back().history[0]);
@@ -1856,14 +1878,14 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
         std::string why;
         if (hdr) {
             if (!work_p.res) work_p = make_tex(W, H, DXGI_FORMAT_R16G16B16A16_FLOAT, true, &why);
-            if (!work_p.res) return 0;
+            if (!work_p.res) { record_ok_ = false; return 0; }
         } else {
             if (!prep_keep.res) prep_keep = make_tex(NW, NH, DXGI_FORMAT_R16G16B16A16_FLOAT, true, &why);
-            if (!prep_keep.res) return 0;
+            if (!prep_keep.res) { record_ok_ = false; return 0; }
         }
         if (!prep_state) {
             prep_state = make_buffer(16, &why);
-            if (!prep_state) return 0;
+            if (!prep_state) { record_ok_ = false; return 0; }
             prep_state_fresh = true;
         }
         if (prep_state_fresh) {
@@ -1920,7 +1942,7 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
             const D3D12_RESOURCE_DESC md = f.motion->GetDesc();
             if (motion.res && (motion.w != f.motion_w || motion.h != f.motion_h || motion.format != md.Format)) drop(motion);
             if (!motion.res) motion = make_tex(f.motion_w, f.motion_h, md.Format, false, &why);
-            if (!motion.res) return 0;
+            if (!motion.res) { record_ok_ = false; return 0; }
         }
         if (hdr && f.exposure) {
             const DXGI_FORMAT ef = f.exposure->GetDesc().Format;
@@ -1930,7 +1952,7 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
                     drop(exposure_1x1);
                     exposure_1x1 = make_tex(1, 1, ef, false, &why);
                 }
-                if (!exposure_1x1.res) return 0;
+                if (!exposure_1x1.res) { record_ok_ = false; return 0; }
             }
         }
     }
@@ -2334,12 +2356,21 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
         // answer can be attributed to the codec or to the network. The file is the f16 proxy (W*H*8) another route
         // recorded; each value is widened to float exactly, which is what a reader of that image sees.
         if (const char* replay = std::getenv("NR_TEST_PROXY_REPLAY"); replay && replay[0]) {
-            if (!replay_buf_) {
+            // A directory replays a sequence: vulkan_proxy_f<N>.bin for the N-th recorded frame; a file replays that
+            // one proxy every frame.
+            std::string replay_path = replay;
+            const bool is_dir = replay_path.back() == '\\' || replay_path.back() == '/';
+            if (is_dir) {
+                char nm[64];
+                std::snprintf(nm, sizeof nm, "vulkan_proxy_f%u.bin", replay_frame_);
+                replay_path += nm;
+            }
+            if (is_dir || !replay_buf_) {
                 const uint64_t bytes = uint64_t(NW) * NH * 8;
                 std::vector<uint8_t> f16(bytes);
-                std::ifstream in(replay, std::ios::binary);
+                std::ifstream in(replay_path, std::ios::binary);
                 if (in && in.read(reinterpret_cast<char*>(f16.data()), std::streamsize(bytes))) {
-                    replay_buf_ = upload_buffer(device, uint64_t(NW) * NH * 16);
+                    if (!replay_buf_) replay_buf_ = upload_buffer(device, uint64_t(NW) * NH * 16);
                     if (replay_buf_) {
                         void* m = nullptr;
                         if (SUCCEEDED(replay_buf_->Map(0, nullptr, &m)) && m) {
@@ -2363,12 +2394,13 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
                                 dst[i] = v;
                             }
                             replay_buf_->Unmap(0, nullptr);
-                            jlog("renodx proxy replay: %s (%llu bytes f16)", replay,
+                            jlog("renodx proxy replay: %s (%llu bytes f16)", replay_path.c_str(),
                                  static_cast<unsigned long long>(bytes));
                         }
                     }
                 }
             }
+            ++replay_frame_;
             if (replay_buf_) {
                 ensure(cmd, lin_proxy, D3D12_RESOURCE_STATE_COPY_DEST);
                 cmd->CopyBufferRegion(lin_proxy, 0, replay_buf_, 0, uint64_t(NW) * NH * 16);
@@ -2750,6 +2782,10 @@ bool Stage::set(const Settings& s) {
     m.units = units;
     return true;
 }
+
+bool Stage::record_ok() const { return impl_ ? impl_->record_ok_ : false; }
+void Stage::set_completed(std::function<bool(uint64_t)> f) { impl_->completed = std::move(f); }
+void Stage::set_frame(uint64_t f) { impl_->pinned = f; }
 
 uint32_t Stage::record(ID3D12GraphicsCommandList* cmd, const Frame& f, const Frame::Net& net) {
     return impl_->record(cmd, f, net);
