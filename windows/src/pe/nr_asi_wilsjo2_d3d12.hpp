@@ -531,6 +531,7 @@ private:
         ID3D12Resource* upload = nullptr;
         uint8_t* mapped = nullptr;
         std::vector<nr::gpu::Ticket> slots;
+        std::vector<char> used;   // a slot that was handed out (its ticket may be null: then it is never reused)
         nr::gpu::Uses uses;
         uint32_t next = 0;
     };
@@ -577,6 +578,7 @@ private:
         if (FAILED(b_ptr->upload->Map(0, nullptr, &m)) || !m) { *why = "the constants' upload buffer could not be mapped"; return false; }
         b_ptr->mapped = static_cast<uint8_t*>(m);
         b_ptr->slots.assign(kSlots, nullptr);
+        b_ptr->used.assign(kSlots, 0);
         guard.ok = true;   // the block is handed over with its surfaces intact
         blocks_.insert(blocks_.begin(), std::move(owned));   // [0] is the current one
         return true;
@@ -590,10 +592,10 @@ private:
     // What a slot's last user was: the split's recording for this list when the product set the hooks, nothing in the
     // offline test (then no ticket is evidence and a slot is reused at once, as before).
     nr::gpu::Ticket ticket_here() const { return ticket_of_ ? ticket_of_(cmd_) : nr::gpu::current(); }
-    // No ticket is not proof that anything finished: without one a slot stays taken (the caller that has no split must
-    // say so through done_of_, as the offline test does).
+    // No ticket is not proof that anything finished: a slot that was used without one is never reused. `used` marks a
+    // slot that was handed out, so "never allocated" and "allocated with no evidence" stay different things.
     bool done(const nr::gpu::Ticket& t) const {
-        if (!t) return done_of_ ? done_of_(t) : false;
+        if (!t) return false;
         return done_of_ ? done_of_(t) : t->ready();
     }
     // The use sets keep only what has not finished, one entry per ticket (the Vulkan Uses::touch rule, with the strict
@@ -613,7 +615,8 @@ private:
         Block* b = blocks_.front().get();
         for (uint32_t n = 0; n < kSlots; ++n) {
             const uint32_t i = (b->next + n) % kSlots;
-            if (b->slots[i] && !done(b->slots[i])) continue;
+            if (b->used[i] && !done(b->slots[i])) continue;
+            b->used[i] = 1;
             b->slots[i] = ticket;
             prune(b->uses);
             prune(uses_);
@@ -626,6 +629,7 @@ private:
         std::string why;
         if (!make_block(&why)) throw std::runtime_error("wilsjo2 stage (D3D12): " + why);
         b = blocks_.front().get();
+        b->used[0] = 1;
         b->slots[0] = ticket;
         prune(b->uses);
         prune(uses_);

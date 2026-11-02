@@ -47,6 +47,9 @@ void transition(ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATE
     x.Transition.StateAfter = b;
     g_cmd->ResourceBarrier(1, &x);
 }
+// The recording the current commands belong to (the stage's ticket), answered by submit()'s fence wait.
+std::shared_ptr<nr::gpu::Recording> g_rec;
+std::atomic<bool> g_rec_submitted{false};
 bool submit() {
     g_cmd->Close();
     ID3D12CommandList* l[] = {g_cmd};
@@ -56,6 +59,11 @@ bool submit() {
     g_fence->SetEventOnCompletion(g_fv, e);
     const DWORD w = WaitForSingleObject(e, 20000);
     CloseHandle(e);
+    if (g_rec) {   // the GPU ran what this recording held: the slot's evidence
+        g_rec_submitted = true;
+        g_rec->seal();
+        g_rec.reset();
+    }
     const HRESULT removed = g_dev->GetDeviceRemovedReason();
     g_alloc->Reset();
     g_cmd->Reset(g_alloc, nullptr);
@@ -568,10 +576,16 @@ int main(int argc, char** argv) {
     for (const char* c = argv[1]; *c; ++c) folder += wchar_t(*c);
     auto impl = std::make_unique<Stage12>();
     Stage12* raw = impl.get();
-    // The same evidence the product uses, made explicit here: every dispatch this test submits, it waits for (submit()
-    // blocks on the fence), so a slot is free as soon as it returns. No ticket-less reuse.
-    raw->set_tickets([](ID3D12GraphicsCommandList*) { return nr::gpu::Ticket{}; },
-                     [](const nr::gpu::Ticket&) { return true; });
+    // The same evidence the product uses: a real recording per submit(), whose wait is answered when this test's fence
+    // has finished (strict_ready then answers, the way split::completed does in the .asi).
+    raw->set_tickets([](ID3D12GraphicsCommandList*) {
+        if (!g_rec) {
+            g_rec_submitted = false;   // this recording's own answer, not the previous one's
+            g_rec = std::make_shared<nr::gpu::Recording>();
+            g_rec->submitted([] { return g_rec_submitted.load(); });
+        }
+        return g_rec;
+    }, [](const nr::gpu::Ticket& t) { return t && t->strict_ready(); });
     std::string why;
     const bool made = raw->make(g_dev, folder, &why);
     check(made, ("the programs made as D3D12 compute pipelines" + (made ? std::string() : ": " + why)).c_str());
