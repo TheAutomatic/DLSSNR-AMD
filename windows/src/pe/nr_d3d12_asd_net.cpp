@@ -478,30 +478,20 @@ public:
     }
     const char* name() const override { return name_.c_str(); }
 
-    // model.cpp's release_feature: every stack pass of this feature loses its history, latch and seed here, not by
-    // an LRU guess later.
+    // Runtime::release_feature releases exactly this history id. The session/backend owns stack expansion.
     void release_feature(uint64_t feature) override {
-        // A feature the caller destroyed: its history is retired like the LRU's (the same RetiredUse, the same
-        // completion watermark), never released here - a recorded or in-flight frame may still read those images.
-        // Alias names of one network share its Built, so each Built is visited once.
-        // The id's seeds go whether or not any Built still holds the state: a rebuilt network starts clean.
-        for (uint32_t k = 0; k < 32; ++k)
-            plain_seeds_.erase(k == 0 ? feature : ((uint64_t(1) << 62) | (feature << 8) | k));
+        plain_seeds_.erase(feature);
         std::set<const Built*> seen;
         for (auto& [key, b] : nets_) {
             if (!b || !seen.insert(b.get()).second) continue;
-            for (uint32_t k = 0; k < 32; ++k) {
-                const uint64_t f = k == 0 ? feature : ((uint64_t(1) << 62) | (feature << 8) | k);
-                auto it = b->features.find(f);
-                if (it == b->features.end()) continue;
-                const int64_t last = it->second ? it->second->last_frame : -1;
-                RetiredUse r;
-                r.net = b;
-                r.hold = std::move(it->second);
-                r.frame = last;
-                retired_features_.push_back(std::move(r));
-                b->features.erase(it);
-            }
+            auto it = b->features.find(feature);
+            if (it == b->features.end()) continue;
+            RetiredUse r;
+            r.net = b;
+            r.frame = it->second ? it->second->last_frame : -1;
+            r.hold = std::move(it->second);
+            retired_features_.push_back(std::move(r));
+            b->features.erase(it);
         }
     }
 
