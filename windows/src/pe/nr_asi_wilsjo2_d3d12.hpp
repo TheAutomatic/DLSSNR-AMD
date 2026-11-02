@@ -295,6 +295,12 @@ public:
             }
         }
         std::map<std::string, ID3D12PipelineState*> made;
+        // Every pipeline this call made is released on the way out, including a required program failing halfway: the
+        // earlier return used to skip the release loop and keep the initial references.
+        struct MadeRelease {
+            std::map<std::string, ID3D12PipelineState*>* made;
+            ~MadeRelease() { for (auto& kv : *made) if (kv.second) kv.second->Release(); }
+        } made_release{&made};
         for (const ProgramFile& pf : kPrograms) {
             auto it = made.find(pf.name);
             if (it == made.end()) {
@@ -327,7 +333,6 @@ public:
                 pso_[pf.mode] = it->second;
             }
         }
-        for (auto& [name, pso] : made) if (pso) pso->Release();
         D3D12_DESCRIPTOR_HEAP_DESC hd{};
         hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         hd.NumDescriptors = kSlots * 16;
