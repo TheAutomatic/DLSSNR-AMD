@@ -236,3 +236,24 @@ a045405在同一shader/selector增加stage5直接Original.Load的源texel观测�
 `check_paths.sh` 既有失败(与本轮改动无关)。
 **仍开放**:R09(提交顺序契约)与 R10(W2 借用 NR Control 的颜色空间猜测)不盲改,需要原版 Job/Session 串行证据与
 真实交换链描述来源的定向验证。
+
+## 19:10 R09 / R10 证据(代码层,未新增运行)
+
+**R09 提交顺序契约。** 切点的顺序保证在 `nr_pe_d3d12split.hpp:85-97`:`Job::run` 在该队列的
+`ExecuteCommandLists` 内、前半段已交给队列之后调用,并规定它必须让队列在 GPU 上等待自己的工作或不做事;因此一个
+list 的两段在同一队列上按序执行,`cut()` 的续段继承同一次提交顺序。同一 `Built` 的 act/table/history 被多个录制
+共享时,现存完成证据(`Recording` 的封签+各次提交的 fence 回答)只回答"GPU 跑完了没有",不回答"录制之间的先后"。
+结论:单队列(list 内切分、同线程续段)的串行由 split 保证;跨队列(两个 DIRECT 队列交替提交同一 Built)没有证据,
+也没有复现,属未验证边界,不据此加用户准入限制。定向验证需要两个队列的离线案例,不在本轮。
+
+**R10 颜色空间来源。** W2 的输入空间取自 `nr::pe::menu::colour_space_guess`(`nr_pe_menu.cpp:2063`),调用点
+`nr_asi_main.cpp:1732` 与 `:7453`。该函数先取"上一次在任意交换链上设过的空间"(格式相容时),再对 10-bit 交换链
+每秒查询一次 `IDXGIOutput6::GetDesc1`。因此 W2 借用的是 NR Control 的猜测链,而不是调用者自己的
+`DXGI_SWAP_CHAIN_DESC1`/输出描述。这是有意的语义对齐(同一帧在两条路线上被判成同一空间),不是 D3D12 API 的必要
+条件;改为调用者来源会改变已发布行为,需真实交换链案例定向验证,本轮只记录来源,不改。
+
+**PQ CPU 参考定位数据**(现有测试一次运行,`artifacts/windows/wilsjo2_d3d12_test/run-pqworst.txt`):
+`PQ worst (79,253) ch0 input 0.154598832 GPU 0.216031283 CPU 7.3095589e-07 CPU-from-GPU-linear 0.21568051
+linear [-68.1875 131.375 -10.1484375]`。把 GPU 实际读回的线性图按 CPU 公式编码得到 0.21568,与 GPU 的 0.21603 一致,
+即 encode 段一致;偏差来自前段(解码 + 16F 存储),该点线性出现 -68/+131 的量级(近黑 PQ 码经宽色域矩阵放大)。
+容差与着色器均未改动。
