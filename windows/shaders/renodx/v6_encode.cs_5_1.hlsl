@@ -35,6 +35,11 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
       ? Divisor
       : max(OutputOriginal.Load(int3(0, 0, 0)).r, 1e-8);
   proxy = max(proxy, 0.0) / divisor;
+#if NR_ENCODE_PROBE_STAGE == 4
+  // The normalized value before either curve, and the actual branch selector used by this dispatch.
+  Output[pixel] = float4(proxy, float(Curve));
+  return;
+#endif
   // Hue-preserving shoulder: compress uniformly from the max channel instead
   // of per channel. Per-channel clipping skewed bright colored content
   // toward primaries ("oddly saturated").
