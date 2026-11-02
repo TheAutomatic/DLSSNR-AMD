@@ -45,6 +45,13 @@ struct Recording {
         return due || std::all_of(kept.begin(), kept.end(), [](const auto& p) { return p->ready(); });
     }
     void seal() { std::lock_guard<std::mutex> guard(mutex); sealed = true; }
+    // Strict form for a consumer that must never take the fallback as proof (the D3D12 ASD path): finished means
+    // sealed, and every submission's wait has answered. An unknown submission is never strict-ready.
+    bool strict_ready() {
+        std::lock_guard<std::mutex> guard(mutex);
+        waits.erase(std::remove_if(waits.begin(), waits.end(), [](auto& f) { return f(); }), waits.end());
+        return sealed && !unknown_submit && waits.empty();
+    }
     void submitted(std::function<bool()> wait) {
         std::vector<std::shared_ptr<Recording>> kept;
         {
