@@ -204,3 +204,12 @@ R01/R07/R09表明此前局部完成不能概括为整个生命周期闭环；R02
 stage2同文件独立复核：全图2501个bit差异；34个目标像素的原差异通道实际也是34个不同，并非代理此前报告的0。样本(293,95) R：ASD sum=0.0001765384222380817（bits960044332），VK=0.00017641922750044614（bits960036141），weight均1。统计在build-logs/encode-stage2-independent.json。必须据此先观测源work0，不再排除采样/求和而归因toe；host尺寸相等也不能替代运行时footprint观测。
 
 a045405在同一shader/selector增加stage5直接Original.Load的源texel观测，以及按需stage6的实际scale/coverage，不增加宿主框架、不改变产品公式。R08比较器已在e0a312c复用原compare_dumps.py支持rgba32f、精确16B像素长度和细微值显示，拒绝未知格式误当half。定向CPU已验证half/f32一ULP变化与未知格式，不启动GPU。探针由执行者串行运行，当前源差异仍未修复。
+
+## 18:02 正常注册阻塞：已定位注册表事务失败
+
+- 旧成功的官方SDK探针原二进制、原app-local619及等待6000ms条件，本轮仍返回E_HANDLE；已有installer可正常枚举/GetExePath，但新增独立应用也失败。
+- 独立无GPU探针观察D3D12Core公开API调用：NtCreateTransaction=STATUS_SUCCESS，有效transaction handle；RegCreateKeyTransactedW(app子键)=6801 / ERROR_RM_NOT_ACTIVE，随后RegisterApplication=0x80070006。不是SODB/PSDB加载阶段。
+- 不经D3D12，直接CreateTransaction + RegOpenKeyEx(HKCU Software)=成功，RegCreateKeyTransacted(唯一测试键)=6801，未提交事务、关闭回滚后persisted_key=False。执行身份NUC\Kenny，restricted=False、AppContainer=0。
+- 因而当前明确阻塞是本用户注册表事务不可用；不修改shader/权重/desc硬凑，不把手写注册表或诊断override冒充正常注册成功。本轮未执行系统事务修复、未清理任何已有installer。
+- 原始代码/日志：artifacts/d3d12-parity-review/registration-probe/{registration_trace.cpp,registry_iat_trace.hpp,register-transactions.txt,direct-registry-transaction.txt,execution-token.txt,original-success-probe-held-now.txt}。
+- 其他阶段一正确性/离线集成继续；阶段二仍延期。后续系统事务处理需单独确认作用范围，修复后复用同一无GPU注册probe复核。

@@ -25,3 +25,12 @@
 最近过度串行追逐HDR微差和probe，注册与确认的生产缺陷未同步推进，执行重心偏离。当前分工：主会话负责正常程序化注册首次失败定位；omp直接处理R01/R05/R07及生产可达W2必要修正。HDR源纹理一half ULP差异与探针证据保留，继续按实际需要分析，但不作为注册或其他独立工作先决条件，不增设逐位零差门槛、不改数学硬凑参考。阶段二继续延期。
 
 本轮真实无GPU注册定位：独立用户级installer身份，CoInitializeEx、factory、CreateInstaller及GetPrecompileTargets均S_OK（3目标）；builtin/实际exe两种desc的RegisterApplication均E_HANDLE，应用数始终0。尚未传入SODB/PSDB，因而此错误不在ACO对象加载阶段。原始日志与最小程序在artifacts/d3d12-parity-review/registration-probe/。不凭此直接宣称Windows或驱动故障；下一步针对该调用的注册后端定位，不重查shader/权重。自动审批拒绝的清理初始化验证没有执行，已采用不清理状态的目标枚举替代。
+
+## 18:02 正常注册阻塞：已定位注册表事务失败
+
+- 旧成功的官方SDK探针原二进制、原app-local619及等待6000ms条件，本轮仍返回E_HANDLE；已有installer可正常枚举/GetExePath，但新增独立应用也失败。
+- 独立无GPU探针观察D3D12Core公开API调用：NtCreateTransaction=STATUS_SUCCESS，有效transaction handle；RegCreateKeyTransactedW(app子键)=6801 / ERROR_RM_NOT_ACTIVE，随后RegisterApplication=0x80070006。不是SODB/PSDB加载阶段。
+- 不经D3D12，直接CreateTransaction + RegOpenKeyEx(HKCU Software)=成功，RegCreateKeyTransacted(唯一测试键)=6801，未提交事务、关闭回滚后persisted_key=False。执行身份NUC\Kenny，restricted=False、AppContainer=0。
+- 因而当前明确阻塞是本用户注册表事务不可用；不修改shader/权重/desc硬凑，不把手写注册表或诊断override冒充正常注册成功。本轮未执行系统事务修复、未清理任何已有installer。
+- 原始代码/日志：artifacts/d3d12-parity-review/registration-probe/{registration_trace.cpp,registry_iat_trace.hpp,register-transactions.txt,direct-registry-transaction.txt,execution-token.txt,original-success-probe-held-now.txt}。
+- 其他阶段一正确性/离线集成继续；阶段二仍延期。后续系统事务处理需单独确认作用范围，修复后复用同一无GPU注册probe复核。
