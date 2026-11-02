@@ -52,9 +52,8 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
   }
   [branch]
   if (m > 0.75) {
-    // `precise`: the shoulder as written, without the optimizer contracting or reassociating it. The SPIR-V build
-    // evaluates this expression in the written order; fxc is free to fold `0.75 + 0.25 * (1 - exp(x))` differently,
-    // which shows up as a one-ULP difference in the proxy's brightest pixels. No arithmetic is changed here.
+    // Candidate for the native D3D12 parity comparison: constrain reassociation of the shoulder expression.
+    // Its effect must be measured against the reference proxy; differences also exist below this branch's range.
     precise float shoulder = 0.75 + 0.25 * (1.0 - exp(-5.770780 * (m - 0.75)));
     proxy *= shoulder / max(m, 1e-6);
   }

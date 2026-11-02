@@ -144,3 +144,8 @@ net定向MinGW -fsyntax-only退出0。本轮没有运行GPU，完整链接/实�
 新产物084f2434（13:48:37，5,269,715B）首帧执行成功，随后网络被误判初始化丢弃并重建，退出7，原日志保存在artifacts/d3d12-parity-review/build-logs/runcheck-084f2434.txt。独立阅读Recording查明：c824440的never_submitted用waits.empty判断“从未提交”，而strict_ready/ready会删除已完成wait，因此正常执行完成也被误认丢弃。这不是list指针不一致的已证事实，不需要先加大量指针日志。
 
 审查者直接在原Recording保留ever_submitted，submitted调用时永久置true；never_submitted只依据sealed和从未提交事实。扩展现有真实book/note_execution/seal/completed CPU用例，覆盖完成wait清理、重复查询、真正未执行丢弃及未知完成。完整编译、运行18项，0失败；原始结果：artifacts/d3d12-parity-review/build-logs/ticket-submission-history.txt。无GPU。需由执行者将新头编入619后重跑对应case，再继续codec/注册。
+
+
+### 14:30 轮监督：codec候选的原始数据核对
+
+a24e8dd给v6_encode肩部加precise，尚未运行。独立复算既有kdump/proxy_frame0.bin与vkdump/vulkan_proxy_f0.bin：554个不同half值位于520个像素；34个差异像素两侧最大RGB均低于sRGB(0.75)-0.001，其中最小0.58203125。该肩部仅在m>0.75执行，输出最大值至少约0.880825，因此不能声称全部差异仅出现在肩部生效像素，也不能未经指令/中间值核实断定SPIR-V求值顺序或FXC重结合。保留precise为一次A/B候选，修正文中未证实因果描述。统计与样本坐标在artifacts/d3d12-parity-review/build-logs/codec-shoulder-hypothesis-audit.json。没有启动GPU或更改公式。
