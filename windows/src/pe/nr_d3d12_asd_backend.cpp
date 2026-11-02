@@ -1190,11 +1190,12 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
     rf.base_controls.noise_every_frame = f.noise_every_frame != 0;
 
     const uint64_t bytes = uint64_t(nw) * nh * 16;
+    const char* nwhy = "NR is disabled";
     const auto net = [&](uint32_t, uint64_t, const nr::D3d12NetControls& controls, const NetTemporal& nt,
                          ID3D12Resource* in, ID3D12Resource* out) {
         g.network->controls(controls);
         g.network->temporal(nt);
-        const char* nwhy = "";
+        nwhy = "";
         const LinearFrame lin{in, in->GetGPUVirtualAddress(), nw, nh, bytes};
         const LinearFrame lout{out, out->GetGPUVirtualAddress(), nw, nh, bytes};
         return g.network->record(f.cmd, lin, lout, &nwhy);
@@ -1206,8 +1207,12 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
     nr::pe::split::restore(f.cmd, state);
     // 0 passes is a legitimate copy-through only when the stage says it made everything it needed; otherwise the
     // output may not have been written at all and the caller must take its own path.
-    if (!e.stage->record_ok())
+    if (!e.stage->record_ok()) {
+        // The frame is dropped after part of it was recorded: its history can no longer be trusted (the original
+        // Runtime's rule for a dropped recording), so this feature's state goes rather than a stale latch surviving.
+        release_renodx_feature(f.feature);
         return fallback("the RenoDX stage could not make a surface this frame needs");
+    }
     char line[200];
     const bool net_ok = e.stage->net_ran();
     if (net_ok)
