@@ -244,6 +244,7 @@ struct Built {
         ID3D12Resource* buf = nullptr;
         uint8_t* map = nullptr;
         std::vector<uint64_t> owner;   // per slot: the frame that holds it, ~0ull = never used
+        nr::gpu::Ticket uses[kRing];   // each buffer owns its slots, including grown blocks and other extents
     };
     std::vector<Upload> upload;
     // The execution completion token: this record's frame number, copied back once the model's dispatches have
@@ -831,7 +832,7 @@ public:
         const nr::gpu::Ticket record_ticket = split::book(cmd);
         for (auto& u : b->upload) {
             for (uint32_t i = 0; i < kRing; ++i) {
-                const bool free = upload_uses_[i] ? split::completed(upload_uses_[i])
+                const bool free = u.uses[i] ? split::completed(u.uses[i])
                                                   : (u.owner[i] == ~uint64_t(0) ||
                                                      (b->copied >= 0 && u.owner[i] <= uint64_t(b->copied)));
                 if (free) { slot_buf = &u; slot_i = i; break; }
@@ -854,7 +855,7 @@ public:
                 }
             }
         }
-        if (slot_buf) upload_uses_[slot_i] = record_ticket;   // this slot's writer, for the next record's reuse
+        if (slot_buf) slot_buf->uses[slot_i] = record_ticket;   // this slot's writer, for the next record's reuse
 
         if (!slot_buf) {   // could not grow either (out of memory): no slot may be taken - reusing a held one
                            // would corrupt a copy the GPU has not read; this record declines, the frame passes
@@ -1328,9 +1329,6 @@ private:
     ID3D12Resource* stamps_ = nullptr;
     uint8_t* stamps_map_ = nullptr;
     nr::gpu::Ticket stamp_uses_[kRing];
-    // The upload slots' own recordings (the caller's split ticket for the list this record goes into): a slot is
-    // reused only when the recording that wrote it has finished every submission it was part of.
-    nr::gpu::Ticket upload_uses_[kRing];
     double hz_ = 0;
     uint64_t frames_ = 0, resets_ = 0, gpu_seen_ = 0;
     unsigned gpu_n_ = 0;
