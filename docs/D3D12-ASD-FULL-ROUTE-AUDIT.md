@@ -338,10 +338,10 @@ plan-only lowering(`nr_d3d12_net_plan.hpp:63`;`nr_runtime.cpp:3195` 注释即 "n
 - **更正(先前把丢弃录制当成"每帧重建")**:先前 `for(k<3){evaluate;Close;Reset;}` **录制后不提交**,split 判为
   never_submitted → 释放 feature → 必然重建,那是**丢弃录制边界**,不是生产在同 extent 的行为。该段已改为独立的
   `NR_TEST_DROP=1` 用例;resize 段改为每帧真实 `Close/Execute/Signal/fence` 并校验 HRESULT 与设备状态。
-  重跑后的实测(`resize-case.txt`):4K 阶段在 "retired at frame 5, **6 recording(s) done**" 时释放;1080 两帧各自
-  `Close/Signal/watch 0x0`、`completed 4 of 4` / `5 of 5`、device reason `0x0`;切换后另有**一次**替换
-  ("retired at frame 7, 2 recording(s) done"),之后稳定。这次额外替换的来源未定,另行定位;退休日志现在给出的是
-  录制张数(证据),不是"到第几帧"的计数。
+  重跑后的实测(`resize-case.txt`):初次 make 分支此前对 `!e.stage` 也入队 null,sweep 会对空条目打印"released";
+  已改为只在 `e.stage` 非空时入队,日志带上 stage 指针。修正后:1080 两帧各自 `Close/Signal/watch 0x0`、
+  `completed 4 of 4` / `5 of 5`、device reason `0x0`;切换后仍有**一次**真实替换
+  ("retired at frame 8, 2 recording(s) done, stage 000001c9…"),指针非空,即不是空条目;其成因仍未定。
 
 ### 包交接收尾
 
