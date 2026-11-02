@@ -312,13 +312,13 @@ PSDB 由实验室流程生成，尚未从运行时侧证明它装载的是哪一
 | `act[534,773,760,+64 MiB)`（pre 之后） | 73.91% 字节不同 | **27 字节不同** |
 | neural（RGBA16F 3840×2176） | mean 0.005–0.007，max 0.10 | mean 0.0038，max 0.097，p99 0.021 |
 
-新的结构事实（逐 step 抓取 push 后发现）：
+**撤回**上一版"43 vs 71 结构不同"的说法：那份 step 日志当时带 `step.push_bytes >= 96` 过滤，
+`fswin32nh`(84 B)、`vitattn`(28 B) 等都被滤掉，86 行只是两帧的长 push。日志已改为记录**每个 step**
+（index/name/grid/bytes/hex），序列对比要在该完整日志上重做。
 
-- 参考侧 `record_all` 的 step 序列每帧 **43 步**；ASD 的 `plan.disp` 每帧 **71 个 dispatch**。
-- 内核集合不同：参考侧没有 `vitattn / ffwd3w / attn / gemmpool / gemmnores / decups / fswinpup* / fswinpds*`，
-  而 `gemmvact/gemmprojw/gemmvqkvnorm` 各 8 次；ASD 侧这些各 8 次且另有上述内核各 1–4 次。
-- post 的 128 B push 仅差 1 字节（偏移 123，`PushUps` 内的一个 u32 高位），pre 的 27 字节也落在 act 的
-  e4m3 区（`fswin_t.comp:3640`），不能按 f16 解释。
+post 的 1 字节差异已定位：偏移 120..123 是 `PushImageTail.w_off`（不是 `PushUps`），bit31 =
+`NR_POST_ALPHA`（`fswin_t.comp:2652,3599` 的 `image_w_off` 标志）。参考侧 Vulkan 路线由 post 块恢复 alpha
+（`post_alpha=true`），D3D12 路线由单独的 alpha pass 恢复（`d3d12_net_controls` 传 `false`）。这是**按路线的设计差异**，
+不是参数错误；对照时应把参考宿主改为不设 `post_alpha`，或接受该 1 字节。
 
-因此：**两套 lowering 的 dispatch 结构本身不同**，"同 ELF、同 push" 只在共同的内核上成立；剩余的 pre 27 字节与
-neural 0.0038 需要在这一结构差之内解释，而不是继续当作移植误差。
+pre 的 27 字节落在 act 的 e4m3 区（`fswin_t.comp:3640`），不能按 f16 解释。

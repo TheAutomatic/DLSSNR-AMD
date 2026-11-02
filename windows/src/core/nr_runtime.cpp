@@ -2907,10 +2907,14 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
             }
             // Diagnostics: the block as it is dispatched (after the control and seed patches), whole - the fields
             // past byte 96 (tone/structure/skin/noise) are what a comparison of params needs.
-            if ((impl_->pre_cap_wanted || impl_->kern_cap_wanted) && step.push_bytes >= 96) {
+            // Every step, whatever its push size: a log filtered by size is not a sequence, and comparing one
+            // against another route's full list needs index, name and bytes for all of them.
+            if (impl_->pre_cap_wanted || impl_->kern_cap_wanted) {
                 const auto* pb = static_cast<const uint8_t*>(push);
-                std::fprintf(stderr, "step push: %s %zu bytes:", s.disp[i].kern.c_str(), step.push_bytes);
-                for (size_t q = 0; q < step.push_bytes; ++q) std::fprintf(stderr, "%02x", static_cast<unsigned>(pb[q]));
+                std::fprintf(stderr, "step push: index %zu name %s grid %ux%ux%u bytes %zu hex ",
+                             i, s.disp[i].kern.c_str(), step.gx, step.gy, step.gz, step.push_bytes);
+                for (size_t q = 0; q < step.push_bytes && q < 128; ++q)
+                    std::fprintf(stderr, "%02x", static_cast<unsigned>(pb[q]));
                 std::fprintf(stderr, "\n");
             }
             dispatch(cmd, *use, step.gx, step.gy, step.gz, push, step.push_bytes, set);
