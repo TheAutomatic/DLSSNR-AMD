@@ -160,8 +160,10 @@ if [[ $windows == 1 ]]; then
     # DXVK as GE-Proton 11-7 ships it (PE build, it runs on Windows): the DX9 route's d3d9.dll and dxgi.dll.
     ge=GE-Proton11-7-x86_64
     # The tarball only delivers two DLLs and a version file; already in place (e.g. taken from a release
-    # built from this same pinned GE-Proton), the 400 MB download is skipped.
-    if [[ ! -f "toolchain/$ge/files/lib/wine/dxvk/x86_64-windows/d3d9.dll" ]]; then
+    # built from this same pinned GE-Proton), the 400 MB download is skipped - but only when the whole set the package
+    # copies is there (d3d9.dll, dxgi.dll and the version file): one file present is not the set.
+    dvk="toolchain/$ge/files/lib/wine/dxvk"
+    if [[ ! -f "$dvk/x86_64-windows/d3d9.dll" || ! -f "$dvk/x86_64-windows/dxgi.dll" || ! -f "$dvk/version" ]]; then
         if [[ ! -f "artifacts/ref/downloads/$ge.tar.gz" ]]; then
             echo "fetch $ge.tar.gz"
             curl -fsSL --retry 3 -o "artifacts/ref/downloads/$ge.tar.gz.part" \
