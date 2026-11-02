@@ -356,3 +356,45 @@ plan-only lowering(`nr_d3d12_net_plan.hpp:63`;`nr_runtime.cpp:3195` 注释即 "n
 split 判为 never_submitted → 该 feature 的 stage 被释放(`retired at frame 7, 1 recording(s) done`),下一次 evaluate
 重建("the feature is rebuilt",1080/1 pass),exit=0。这正是模型在丢弃帧后释放状态的那条路径;它与 resize 的
 "正常提交后换代"分开记录,不互相冒充。
+
+## 重启检查点(oMP -c 恢复用)
+
+**代码状态**:工作区干净,HEAD = `c8bd2b1`(含位于其上的完整栈)。无我启动的构建/GPU 任务在跑(已停止 bg_132)。
+
+**恢复后的第一步(注册复核,不碰注册表)**:只跑既有独立 probe,不清理任何 installer/键:
+```
+cd artifacts/d3d12-parity-review/registration-probe
+original-success-probe-held-now.txt  ← 上次结果(E_HANDLE)
+```
+先用该目录内已有 probe 二进制与脚本重跑,记录 RegisterApplication 的 HRESULT 与下层 `RegCreateKeyTransactedW`
+(上次 6801 ERROR_RM_NOT_ACTIVE)。**不要**清注册表、不要重建 installer、不要改 desc。
+
+**构建命令(可复现,均从仓库根执行)**:
+```
+bash windows/build/build_d3d12_asd_test.sh          # 离线宿主(含 resize/drop 用例)
+bash windows/build/build_parity_host.sh             # Vulkan 参考 + NR_PLAN_DUMP(计划导出,无设备)
+bash windows/build/build_wilsjo2_d3d12_test.sh      # W2 离线测试
+bash windows/build/build_asi.sh                     # 产品 ASI(NR_INT4=1)
+bash windows/build/build_wilsjo2_d3d12.sh artifacts/parity-root/dlssnr-amd/shaders/wilsjo2 <out> \
+     /home/kenny/agent-tools/SPIRV-Cross/spirv-cross artifacts/windows/w2-tools/w2_hlsl_dxbc.exe
+```
+注意:这些脚本在工作区里是 CRLF,直接 `bash script.sh` 会因 shebang 的 `\r` 失败;用
+`tr -d "\r" < windows/build/<s>.sh > windows/build/.x.sh && bash windows/build/.x.sh`。
+
+**已实测边界(日志在 `artifacts/windows/asd-harness/`)**:
+`resize-case.txt`(同进程 4K→1080,旧 stage 按其录制集合释放,两帧 `Close/Signal/watch 0x0`)、
+`drop-case.txt`(录制不提交→feature 释放→重建)、`boundary-nroff.txt`(NR 关闭 copy-through)、
+`boundary-1080.txt`(误配 extent 明确拒绝)、`plan-only.txt`(纯 CPU 计划导出,无设备行)。
+
+**未完成**:
+1. 切换后那次**真实**替换的成因——日志现在带 `reason key|set|feature` 与 stage 指针,恢复后跑一次 `resize.bat`
+   即可定位(尚未跑带 reason 的版本)。
+2. 完整 OptiScaler 发布包:本机有 `C:\Users\Kenny\Downloads\OptiScaler_v10.0.0-pre1_4.1.2_Vulkan.7z`
+   (55,297,782 B),**不是** CI 的 nightly 文件名;可只读核清单后以 `NR_OPTI_ARCHIVE=<该文件>` 做本地验证,
+   但不得改名冒充 pin、也不得声称与官方 pin 一致。未验证前,"完整 OptiScaler 包未构建"是交接限制。
+3. 跨队列边界(游戏侧双 DIRECT 队列)——无复现,未测。
+4. R10:W2 的颜色空间来自 `menu::colour_space_guess`,非调用者交换链描述;改会变已发布行为,未改。
+
+**ASD 启用/注册状态(交接必须带上)**:注册在本机**未恢复**(`RegisterApplication` = E_HANDLE,下层
+`RegCreateKeyTransactedW` = 6801/ERROR_RM_NOT_ACTIVE,属当前用户 hive 事务故障)。因此产品路线在本机处于
+"未注册、不可验证 ACO 真实执行"的状态;所有离线证据来自 `NR_TEST_FORCE_CANARY`/诊断装载,**不能称为 release-ready**。
