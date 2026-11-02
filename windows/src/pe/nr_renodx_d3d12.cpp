@@ -1024,11 +1024,14 @@ struct Stage::Impl {
     ID3D12DescriptorHeap* heap = nullptr;          // shader-visible, the dispatches' views
     ID3D12DescriptorHeap* clear_heap = nullptr;    // one descriptor, for the prep state's zeroing clear
     UINT inc = 0, slot = 0;
-    static constexpr UINT kSlots = 4096;   // one dispatch a slot (20 descriptors); a frame uses tens
+    static constexpr UINT kSlots = 4096;   // the first heap: one dispatch a slot (20 descriptors); a frame uses tens
+    UINT slots = kSlots;                   // this heap's slots (grows when a frame would outrun completion)
+    UINT kClearSlot = kSlots * 20;          // the clear descriptors at the end of this heap
     // Each slot carries the frame that last wrote it. A slot is rewritten only when the caller says that frame has
     // finished on the GPU; otherwise the frame fails to the 0.0.8.1 path rather than overwriting descriptors a
     // recorded dispatch still reads.
     std::vector<uint64_t> slot_frame;
+    static constexpr uint64_t kNoFrame = ~uint64_t(0);   // a slot never written (frame 0 is a real frame)
     uint64_t frame_no = 0;
     uint64_t pinned = 0;   // the caller's frame number for this record (its own completion watermark's unit)
     std::function<bool(uint64_t)> completed;
@@ -1158,6 +1161,38 @@ struct Stage::Impl {
                                                 nullptr, IID_PPV_ARGS(&r)))) return nullptr;
         return r;
     }
+    // A new shader-visible heap of twice the slots, its clear descriptors made, the old one retired through the
+    // caller's watermark (a recorded dispatch may still read it).
+    bool grow_slots() {
+        const UINT grown = slots * 2;
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        hd.NumDescriptors = grown * 20 + 2;
+        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        ID3D12DescriptorHeap* nh = nullptr;
+        if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&nh))) || !nh) return false;
+        const UINT ni = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        ID3D12DescriptorHeap* old = heap;
+        const UINT old_slots = slots;
+        heap = nh;
+        inc = ni;
+        slots = grown;
+        kClearSlot = grown * 20;
+        // The prep state's clear descriptors of the new heap, as creation made them.
+        D3D12_UNORDERED_ACCESS_VIEW_DESC d{};
+        d.Format = DXGI_FORMAT_UNKNOWN;
+        d.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        d.Buffer.NumElements = 1;
+        d.Buffer.StructureByteStride = 16;
+        if (prep_state) device->CreateUnorderedAccessView(prep_state, nullptr, &d, main_cpu(kClearSlot));
+        slot_frame.assign(slots, kNoFrame);
+        slot = 0;
+        jlog("renodx descriptor heap grown: %u slots (old %u retired on completion)", grown, old_slots);
+        if (old) {
+            if (retire) retire(old);
+        }
+        return true;
+    }
     ID3D12Resource* make_buffer(uint64_t bytes, std::string* why) {
         D3D12_HEAP_PROPERTIES hp{};
         hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -1177,7 +1212,7 @@ struct Stage::Impl {
     }
     // A replaced surface may still be read by a recorded frame another list has not run yet, so the release goes
     // through the caller's completion watermark when it gave one; `states` forgets it either way.
-    std::function<void(ID3D12Resource*)> retire;
+    std::function<void(IUnknown*)> retire;
     // False when a surface this frame needed could not be made: the frame must not be reported as processed (its
     // output may not have been written). A frame with NR off is a legitimate copy-through and stays true.
     bool record_ok_ = true;
@@ -1219,7 +1254,7 @@ struct Stage::Impl {
     // ClearUnorderedAccessView* reads its GPU handle from the heap bound right now and its CPU handle from a heap the
     // driver reads beside it (D3D12's signature: ViewGPUHandleInCurrentHeap, ViewCPUHandle). The dispatch slots rotate,
     // so the clears get two slots of their own after them: a recorded clear must keep the view it was given.
-    static constexpr UINT kClearSlot = kSlots * 20;
+    // The prep state's clear descriptors sit after the dispatch slots of this heap (a member: a grown heap moves them).
     D3D12_CPU_DESCRIPTOR_HANDLE main_cpu(UINT i) const {
         D3D12_CPU_DESCRIPTOR_HANDLE h = heap->GetCPUDescriptorHandleForHeapStart();
         h.ptr += SIZE_T(i) * inc;
@@ -1278,16 +1313,21 @@ struct Stage::Impl {
         D3D12_GPU_DESCRIPTOR_HANDLE gpu = heap->GetGPUDescriptorHandleForHeapStart();
         cpu.ptr += SIZE_T(slot) * 20 * inc;
         gpu.ptr += UINT64(slot) * 20 * inc;
-        const uint32_t take = slot % kSlots;
-        if (completed && !slot_frame.empty() && slot_frame[take] != 0 && !completed(slot_frame[take])) {
-            record_ok_ = false;
-            jlog("renodx dispatch slot %u still in use by frame %llu", take,
-                 static_cast<unsigned long long>(slot_frame[take]));
-            return;
+        // A slot is taken only when its previous frame has finished. Out of finished slots: a new, larger heap is
+        // made and the old one retired (its own descriptors stay valid for the dispatches already recorded against
+        // it), so the frame is never recorded with a dispatch missing.
+        if (slot_frame.size() != slots) slot_frame.assign(slots, kNoFrame);
+        UINT take = slot % slots;
+        if (completed && slot_frame[take] != kNoFrame && !completed(slot_frame[take])) {
+            if (!grow_slots()) {
+                record_ok_ = false;
+                jlog("renodx dispatch slots exhausted and no larger heap could be made");
+                return;
+            }
+            take = slot % slots;
         }
-        if (slot_frame.size() != kSlots) slot_frame.assign(kSlots, 0);
-        slot_frame[take] = pinned ? pinned : frame_no;
-        slot = (slot + 1) % kSlots;
+        slot_frame[take] = pinned;
+        slot = (slot + 1) % slots;
         const auto fill = [&](View* views, UINT n, bool write) {
             View first{};
             for (UINT i = 0; i < n; ++i)
@@ -2794,7 +2834,7 @@ uint32_t Stage::record(ID3D12GraphicsCommandList* cmd, const Frame& f, const Fra
 uint8_t Stage::hdr_mode() const { return impl_->hdr; }
 Stage::Facts Stage::facts() const { return impl_->facts; }
 
-void Stage::set_retire(std::function<void(ID3D12Resource*)> f) {
+void Stage::set_retire(std::function<void(IUnknown*)> f) {
     if (impl_) impl_->retire = std::move(f);
 }
 

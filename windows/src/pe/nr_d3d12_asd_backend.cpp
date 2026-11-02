@@ -1011,7 +1011,7 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
         c.feature = f.feature;
         g.renodx_retired.emplace_back(int64_t(g.frames), std::move(e.stage));   // released once the GPU ran past this frame
         auto made = renodx12::Stage::make(c, &why);
-        if (made) made->set_retire([](ID3D12Resource* r) { retire(r); });   // released on the backend's watermark
+        if (made) made->set_retire([](IUnknown* r) { retire(r); });   // released on the backend's watermark
         if (made) {
             made->set_completed([](uint64_t f) { g.refresh_executed(); return g.executed >= int64_t(f); });
         }
@@ -1036,7 +1036,7 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
         c.settings = s;
         c.feature = f.feature;
         e.stage = renodx12::Stage::make(c, &why);
-        if (e.stage) e.stage->set_retire([](ID3D12Resource* r) { retire(r); });
+        if (e.stage) e.stage->set_retire([](IUnknown* r) { retire(r); });
         if (e.stage) e.stage->set_completed([](uint64_t f) { g.refresh_executed(); return g.executed >= int64_t(f); });
         if (!e.stage) return fallback("the RenoDX route: " + why);
     }
@@ -1198,7 +1198,9 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
 
     if (renodx) {
         const bool ran = renodx_frame(f, color_state, output_state);
-        if (ran) mark_frame(f.cmd);
+        // Marked even when the stage reports failure: a failed frame may have recorded some of its dispatches, and
+        // those commands still hold internal resources that must not be released until the GPU ran past them.
+        mark_frame(f.cmd);
         return ran;
     }
 
