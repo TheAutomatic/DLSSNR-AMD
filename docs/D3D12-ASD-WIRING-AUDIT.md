@@ -68,3 +68,13 @@ stage/net/runtime 各自添加多个环境变量、dump buffer、重放与跳过
 
 优先顺序：当前安全修复 → 实际feature释放接线 → 统一现有录制/提交完成凭据 → 诊断收敛。每次可审查增量修改；不同时另造一套完整框架。
 
+
+## 强制对照规则（2026-11-02，用户明确指令）
+
+严格对照 Mochi 0.0.8.1：Linux 原生 Vulkan 直通实现作为算法与运行语义参考，Windows Vulkan 桥接作为产品接入、所有权与生命周期参考。除 D3D12 特有 API/资源契约必需差异外，不自行更改语义或建立并列机制；类型、字段和变量名尽量与参考对应。
+
+此前审查只定位了成熟机制，没有把新类型与状态逐项映射，放任新增 Booking 框架，属于漏审。不能据已有局部审查声称其他部分没有遗漏。
+
+剩余必须核对的范围：Recording/Uses 与提交/Reset/Release；owner/device代及资源退休；descriptor/upload/timestamp分配回收；feature及stack历史销毁；模型选择与降级；controls/seed/reset/history；motion/depth/exposure的尺度和状态；codec/look/preprocess与多pass；失败/等待/passthrough；产品配置优先级与诊断开关。每项记录原版函数/类型、当前对应、实际差异、D3D12必要性及处理结果。
+
+不得用“API不同”解释非API行为改动，也不得以单一case通过推出全路径已审完。先复用原类型和结构，再补D3D12薄适配；不扩大为通用框架，不更改Linux参考本身，不扩DX9/11任务。保留已修安全性与全部证据。
