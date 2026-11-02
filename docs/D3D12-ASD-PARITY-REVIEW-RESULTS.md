@@ -372,3 +372,8 @@ pre 的 27 字节落在 act 的 e4m3 区（`fswin_t.comp:3640`），不能按 f1
 
 **范围**：以上只证明该 case（HDR10 absolute v6、第 0 帧、该 proxy/guide/push）。多帧序列、SDR legacy codec、
 其它 HDR 模式未验证。
+
+补充（codec 残差的形态）：554 个不同值全部是**相邻 f16 码**，方向两边都有（如 `0x1da9` vs `0x1daa`、
+`0x3070` vs `0x306f`），没有符号翻转、没有量级差。这正是"同一表达式、不同求值顺序跨过一次舍入边界"的形态，
+与优化器重排的结论一致；`SKIP_OPTIMIZATION` 反而把差扩大到 821 个并出现大 ULP 离群值，说明 level-3 已是最接近
+参考的构建。要再往下定位需要 encode 的 **f32 中间值**（当前 proxy 直接写 RGBA16F，没有 f32 落点）。
