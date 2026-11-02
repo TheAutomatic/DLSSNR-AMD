@@ -292,3 +292,15 @@ linear [-68.1875 131.375 -10.1484375]`。把 GPU 实际读回的线性图按 CPU
 无 `dlssnr-amd-asd.ini` 时 `start()` 直接返回(路线关闭,不写日志);有 ini 但缺 `wilsjo2-d3d12/` 时该路线报
 "its D3D12 programs: wilsjo2_encode.dxbc is missing" 并走桥。该布局已用 `artifacts/windows/pkg-check` 实测:离线宿主
 以 `dlssnr-amd-asd/wilsjo2-d3d12` 为参数,26/26 模式加载,22 dispatches 全通过。
+
+## 19:25 定向收尾数据
+
+**PQ worst 的独立定量**(`artifacts/windows/wilsjo2_d3d12_test/pq-worst-independent.txt`,他人复算):CPU half 线性
+[-68.25, 131.375, -10.15625] 对 GPU [-68.1875, 131.375, -10.1484375],R/B 各差 1 个 half 档;逆矩阵红通道 CPU
+-0.0006607 scRGB(钳 0)对 GPU +0.0388904 scRGB = 3.11 nits,G 约 9278 nits。0 对 0.216 由此产生:宽色域逆矩阵的抵消
+把 1 half 档放大到跨 0,再经 PQ 非线性放大。**不是解码坏了**;原码值差保留为诊断,不放宽码值容差凑 PASS,改用与
+VK 参考相同的判据(光域、按像素峰值相对误差)或把半精度/回编码分成两段判定。全样本尚未证明。
+
+**extent 变化(不匹配的 plan)**:`renodx 1920 1080` 3 帧(`asd-harness/boundary-1080.txt`)——网络计划只为
+3840x2160 构建,路线每次都报 "plan.bin is for 3840x2160" 并原样放过(host exit=7),没有崩溃、没有录制半帧、没有
+退回 Vulkan 桥。即 extent 与计划不匹配时的边界行为是明确的拒绝,不是隐式跑错网络。
