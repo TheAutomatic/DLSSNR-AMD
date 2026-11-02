@@ -213,3 +213,26 @@ a045405在同一shader/selector增加stage5直接Original.Load的源texel观测�
 - 因而当前明确阻塞是本用户注册表事务不可用；不修改shader/权重/desc硬凑，不把手写注册表或诊断override冒充正常注册成功。本轮未执行系统事务修复、未清理任何已有installer。
 - 原始代码/日志：artifacts/d3d12-parity-review/registration-probe/{registration_trace.cpp,registry_iat_trace.hpp,register-transactions.txt,direct-registry-transaction.txt,execution-token.txt,original-success-probe-held-now.txt}。
 - 其他阶段一正确性/离线集成继续；阶段二仍延期。后续系统事务处理需单独确认作用范围，修复后复用同一无GPU注册probe复核。
+
+## 18:15 生命周期与 W2 本轮处置(代码已提交,证据在本文件与提交信息里)
+
+| 项 | 处置 | 证据 |
+|---|---|---|
+| R01 | 退休证据改为本代未完成 recordings 的 `nr::gpu::Uses` 快照,逐票 `split::completed`(不用 `Uses::ready` 的 64 次/2 秒退让) | `13d5b44`,`95e4cd0`;无 GPU 原类回归 `build-logs/retirement-strict-regression.*` |
+| R05 | 面板的 "NR ran" 取 `Stage::record` 的 ran(与 Vulkan 路线 `run_renodx` 同源),copy-through 仍算成功路由 | `13d5b44` |
+| R07 | `g.device`/`g.network` 统一 owner 锁,读者取稳定引用;`AcoNetwork` 的 `ready()/status()` 与其 `nets_` 写点同锁 | `13d5b44` |
+| R02 | 槽按 `split::book` 的录制归属复用(严格完成),无票不复用;满块换新块,旧块 `end_recording()` 退休;两入口同路径;票据集合去重并按完成清除 | `a5e9df1`,`284c679`,`6012c73` |
+| R03 | 计时槽带解析它的录制,完成才取样;忙则不计样本;查询堆随设备换代 | `7d966da` |
+| R04 | 换设备的老 stage 按 stage 自身录制集合 + 注册表未完成票据退休,不跨锁 | `7d966da`,`284c679` |
+| R08 | 探针抓取行距按纹理格式(不再假定 RGBA32F) | `284c679` |
+| R11 | 包内 DXBC 落到 `dlssnr-amd-asd/wilsjo2-d3d12`(=`asd::folder()`),缺工具/预构建集则打包失败而非静默省略 | `1236de0`,`a236a2b` |
+| R12 | `make()` 失败路径的 pipeline 初始引用由作用域守卫释放 | `cbd5b66` |
+| R13 | GE-Proton 提取只在 d3d9.dll/dxgi.dll/version 齐全时跳过 | `a11f4e7` |
+| R06 | 核查:`FreshCanary` 未配置时默认 0,无需改动 | `nr_d3d12_asd.cpp:1077` |
+
+**已验证**:`build_wilsjo2_d3d12_test.sh` 与 `build_asi.sh`(NR_INT4=1)链接;离线 W2 宿主以包内路径
+`pkg-check/dlssnr-amd-asd/wilsjo2-d3d12`(21 个 .dxbc)加载,26/26 模式齐全,ALL PASSED,22 dispatches。
+**未验证**:槽复用/计时/退休边界的运行期语义仍无 GPU 侧定向案例;`build_package.sh` 在本工作区无法执行,其前置
+`check_paths.sh` 既有失败(与本轮改动无关)。
+**仍开放**:R09(提交顺序契约)与 R10(W2 借用 NR Control 的颜色空间猜测)不盲改,需要原版 Job/Session 串行证据与
+真实交换链描述来源的定向验证。
