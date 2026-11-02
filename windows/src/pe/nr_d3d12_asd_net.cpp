@@ -737,33 +737,9 @@ public:
         if (auto it = b->features.find(temporal_.feature); it != b->features.end() && it->second) {
             fs = it->second.get();
         } else {
-            // Evict inactive features only when at or above kMaxFeatures.
-            // A feature is active if used within recent evaluates (kActiveWindow): a multi-pass
-            // stack of up to 30 passes evaluates that many times per frame.
-            constexpr uint64_t kActiveWindow = 128;
-            if (b->features.size() >= kMaxFeatures) {
-                auto lru = b->features.end();
-                for (auto fit = b->features.begin(); fit != b->features.end(); ++fit) {
-                    if (!fit->second) continue;
-                    if (tick_ >= fit->second->used && (tick_ - fit->second->used) < kActiveWindow) continue;
-                    if (lru == b->features.end() || fit->second->used < lru->second->used) lru = fit;
-                }
-                if (lru == b->features.end() && b->features.size() >= kHardMaxFeatures) {
-                    for (auto fit = b->features.begin(); fit != b->features.end(); ++fit)
-                        if (fit->second && (lru == b->features.end() || fit->second->used < lru->second->used)) lru = fit;
-                }
-                if (lru != b->features.end()) {
-                    plain_seeds_.erase(lru->first);
-                    const int64_t f_last = lru->second ? lru->second->last_frame : -1;
-                    RetiredUse r;
-                    r.net = current_shared_;
-                    r.hold = std::move(lru->second);
-                    r.frame = f_last;
-                    retired_features_.push_back(std::move(r));
-                    b->features.erase(lru);
-                }
-            }
-
+            // No age-based eviction: a feature's history stays until the caller says that feature is gone
+            // (release_feature), as the session's entry.stack does - an "inactive" window would silently reset the
+            // history of a feature that still exists.
             auto fresh = std::make_shared<FeatureState>();
             for (auto& hh : fresh->hist)
                 hh = buffer(device_, D3D12_HEAP_TYPE_DEFAULT, uint64_t(b->w) * b->h * 16, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);

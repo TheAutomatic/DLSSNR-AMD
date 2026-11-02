@@ -658,6 +658,9 @@ struct Backend {
     std::vector<std::pair<int64_t, std::unique_ptr<renodx12::Stage>>> renodx_retired;
 };
 Backend g;
+// Device generations that were swapped while work of theirs could still be in flight. Each is released only when its
+// own completion evidence (its Recording/ticket, or its token watermark) says the GPU ran past its last frame.
+std::vector<std::unique_ptr<Backend>> g_old_generations;
 
 // An upload or readback buffer of `bytes` in `state` (the completion pair).
 ID3D12Resource* heap_buffer(ID3D12Device* device, D3D12_HEAP_TYPE type, uint64_t bytes, D3D12_RESOURCE_STATES state) {
@@ -679,8 +682,18 @@ void retire(IUnknown* p) {
     if (g.discarding) { p->Release(); return; }
     g.retired.push_back({int64_t(g.frames), g.booking, p});
 }
+void release_generation(Backend& b);   // (defined below drop_device)
+
 void sweep() {
     ++g.tick;
+    // Previous generations: released only when their own evidence has passed their last recorded frame.
+    for (size_t i = 0; i < g_old_generations.size();) {
+        Backend& b = *g_old_generations[i];
+        b.refresh_executed();
+        const bool done = b.frames == 0 || b.executed >= int64_t(b.frames) - 1;
+        if (done) { release_generation(b); g_old_generations.erase(g_old_generations.begin() + long(i)); }
+        else ++i;
+    }
     g.refresh_executed();
     auto it = std::remove_if(g.retired.begin(), g.retired.end(), [](const auto& r) {
         // An owner released by its own recording's ticket once that recording is sealed and its GPU work finished;
@@ -736,7 +749,9 @@ void mark_frame(ID3D12GraphicsCommandList* cmd) {
     ++g.frames;
 }
 
-ID3D12Resource* linear_buffer(ID3D12Device* device, uint64_t bytes);   // (defined below drop_device)
+ID3D12Resource* linear_buffer(ID3D12Device* device, uint64_t bytes);
+
+
 
 
 bool build(ID3D12Device* device, std::string* why) {
@@ -875,7 +890,18 @@ bool build(ID3D12Device* device, std::string* why) {
     return true;
 }
 
+void release_generation(Backend& b);
+
+void release_generation(Backend& b);
+
 void drop_device() {
+    // A device is swapped while a frame of ours may still be queued: the whole generation is handed over and released
+    // by its own evidence, never here (a pointer change is not proof that the GPU is idle).
+    if (g.device && g.frames > 0 && g.executed < int64_t(g.frames) - 1) {
+        g_old_generations.push_back(std::make_unique<Backend>(std::move(g)));
+        g = Backend{};
+        return;
+    }
     g.discarding = true;   // the destructors below release their own surfaces here, not into the next generation
     g.renodx.clear();
     g.renodx_retired.clear();
@@ -918,6 +944,15 @@ void drop_device() {
     if (g.device) g.device->Release();
     g.device = nullptr;
     g.broken = false;
+}
+
+// Releases everything of a generation whose work has finished: the immediate body above, run on that generation.
+void release_generation(Backend& b) {
+    Backend keep = std::move(g);
+    g = std::move(b);
+    drop_device();          // the immediate-release body, on this generation
+    g.discarding = false;
+    g = std::move(keep);
 }
 
 ID3D12Resource* linear_buffer(ID3D12Device* device, uint64_t bytes) {
