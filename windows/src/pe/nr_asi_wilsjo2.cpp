@@ -180,11 +180,20 @@ Programs g_programs;
 // The recordings a replaced stage's last frames belong to: the strict check (every ticket of the registry that has not
 // finished), so a stage of the previous device is freed once the GPU ran past its work instead of being leaked.
 nr::gpu::Uses pending_uses() {
+    std::vector<nr::gpu::Ticket> all;
+    {
+        std::lock_guard<std::mutex> g(nr::gpu::registry_mutex);   // the registry's lock only: completed() is asked after
+        for (auto& [key, t] : nr::gpu::recordings) all.push_back(t);
+    }
     nr::gpu::Uses u;
-    std::lock_guard<std::mutex> g(nr::gpu::registry_mutex);
-    for (auto& [key, t] : nr::gpu::recordings)
+    for (auto& t : all)
         if (t && !nr::pe::split::completed(t)) u.tickets.push_back(t);
     return u;
+}
+nr::gpu::Uses merged_uses(nr::gpu::Uses a, const nr::gpu::Uses& b) {
+    for (const auto& t : b.tickets)
+        if (t && std::find(a.tickets.begin(), a.tickets.end(), t) == a.tickets.end()) a.tickets.push_back(t);
+    return a;
 }
 struct RetiredStage {
     std::unique_ptr<w2::Stage> stage;
@@ -210,7 +219,13 @@ w2::Stage* programs(ID3D12Device* device, std::string* why) {
     if (g_programs.state == 1) { *why = "its D3D12 programs are being made"; return nullptr; }
     // first use, or another device: (re)made
     sweep_retired_stages();
-    if (g_programs.stage) g_retired_stages.push_back({std::move(g_programs.stage), pending_uses()});
+    if (g_programs.stage) {
+        // The stage's own recordings first: the registry only holds the recordings still registered, not every ticket a
+        // stage's slots were used by.
+        nr::gpu::Uses keep = pending_uses();
+        if (g_programs.impl) keep = merged_uses(std::move(keep), g_programs.impl->uses());
+        g_retired_stages.push_back({std::move(g_programs.stage), std::move(keep)});
+    }
     g_programs.impl = nullptr;
     if (g_programs.device) g_programs.device->Release();
     device->AddRef();
@@ -224,6 +239,10 @@ w2::Stage* programs(ID3D12Device* device, std::string* why) {
     device->AddRef();
     std::thread([device, folder] {
         auto s = std::make_unique<Stage12>();
+        // The stage's slots are reused only once the split says the recording that used them finished (the same strict
+        // answer every retirement path asks), instead of nothing knowing what a slot's last user was.
+        s->set_tickets([](ID3D12GraphicsCommandList* l) { return nr::pe::split::book(l); },
+                       [](const nr::gpu::Ticket& t) { return nr::pe::split::completed(t); });
         std::string e;
         const auto t0 = std::chrono::steady_clock::now();
         bool ok = false;

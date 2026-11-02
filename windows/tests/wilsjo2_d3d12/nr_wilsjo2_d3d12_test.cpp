@@ -568,6 +568,10 @@ int main(int argc, char** argv) {
     for (const char* c = argv[1]; *c; ++c) folder += wchar_t(*c);
     auto impl = std::make_unique<Stage12>();
     Stage12* raw = impl.get();
+    // The same evidence the product uses, made explicit here: every dispatch this test submits, it waits for (submit()
+    // blocks on the fence), so a slot is free as soon as it returns. No ticket-less reuse.
+    raw->set_tickets([](ID3D12GraphicsCommandList*) { return nr::gpu::Ticket{}; },
+                     [](const nr::gpu::Ticket&) { return true; });
     std::string why;
     const bool made = raw->make(g_dev, folder, &why);
     check(made, ("the programs made as D3D12 compute pipelines" + (made ? std::string() : ": " + why)).c_str());

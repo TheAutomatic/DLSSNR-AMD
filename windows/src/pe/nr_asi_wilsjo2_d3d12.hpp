@@ -533,19 +533,38 @@ private:
         std::vector<nr::gpu::Ticket> slots;
         nr::gpu::Uses uses;
         uint32_t next = 0;
-        bool busy() const { return !uses.ready(); }
     };
     struct SlotRef {
         Block* block;
         uint32_t index;
     };
+public:
+    using TicketOf = std::function<nr::gpu::Ticket(ID3D12GraphicsCommandList*)>;
+    using DoneOf = std::function<bool(const nr::gpu::Ticket&)>;
+    // The product's split: the recording a list is booked into, and its completion answer (strict, the same
+    // split::completed the retirement paths use). Without them the stage has no evidence and reuses slots as before.
+    void set_tickets(TicketOf t, DoneOf d) { ticket_of_ = std::move(t); done_of_ = std::move(d); }
+    const nr::gpu::Uses& uses() const { return uses_; }
+private:
     bool make_block(std::string* why) {
-        auto b = std::make_unique<Block>();
+        struct Cleanup {
+            Block& b;
+            bool ok = false;
+            ~Cleanup() {
+                if (ok) return;
+                if (b.mapped && b.upload) b.upload->Unmap(0, nullptr);
+                if (b.upload) b.upload->Release();
+                if (b.heap) b.heap->Release();
+            }
+        };
+        auto owned = std::make_unique<Block>();
+        Cleanup guard{*owned};
+        Block* const b_ptr = owned.get();
         D3D12_DESCRIPTOR_HEAP_DESC hd{};
         hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         hd.NumDescriptors = kSlots * 16;
         hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-        if (FAILED(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&b->heap)))) { *why = "CreateDescriptorHeap failed"; return false; }
+        if (FAILED(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&b_ptr->heap)))) { *why = "CreateDescriptorHeap failed"; return false; }
         D3D12_HEAP_PROPERTIES hp{};
         hp.Type = D3D12_HEAP_TYPE_UPLOAD;
         D3D12_RESOURCE_DESC bd{};
@@ -553,12 +572,13 @@ private:
         bd.Width = uint64_t(kSlots) * kStride; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
         bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         if (FAILED(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                                                    IID_PPV_ARGS(&b->upload)))) { *why = "the constants' upload buffer could not be made"; return false; }
+                                                    IID_PPV_ARGS(&b_ptr->upload)))) { *why = "the constants' upload buffer could not be made"; return false; }
         void* m = nullptr;
-        if (FAILED(b->upload->Map(0, nullptr, &m)) || !m) { *why = "the constants' upload buffer could not be mapped"; return false; }
-        b->mapped = static_cast<uint8_t*>(m);
-        b->slots.assign(kSlots, nullptr);
-        blocks_.insert(blocks_.begin(), std::move(b));   // [0] is the current one
+        if (FAILED(b_ptr->upload->Map(0, nullptr, &m)) || !m) { *why = "the constants' upload buffer could not be mapped"; return false; }
+        b_ptr->mapped = static_cast<uint8_t*>(m);
+        b_ptr->slots.assign(kSlots, nullptr);
+        guard.ok = true;   // the block is handed over with its surfaces intact
+        blocks_.insert(blocks_.begin(), std::move(owned));   // [0] is the current one
         return true;
     }
     void bind_block(Block* b) {
@@ -567,15 +587,38 @@ private:
         cmd_->SetDescriptorHeaps(1, heaps);
         bound_ = b;
     }
+    // What a slot's last user was: the split's recording for this list when the product set the hooks, nothing in the
+    // offline test (then no ticket is evidence and a slot is reused at once, as before).
+    nr::gpu::Ticket ticket_here() const { return ticket_of_ ? ticket_of_(cmd_) : nr::gpu::current(); }
+    // No ticket is not proof that anything finished: without one a slot stays taken (the caller that has no split must
+    // say so through done_of_, as the offline test does).
+    bool done(const nr::gpu::Ticket& t) const {
+        if (!t) return done_of_ ? done_of_(t) : false;
+        return done_of_ ? done_of_(t) : t->ready();
+    }
+    // The use sets keep only what has not finished, one entry per ticket (the Vulkan Uses::touch rule, with the strict
+    // answer): a game's slot sets otherwise grow by one entry per dispatch for the life of the process.
+    void prune(nr::gpu::Uses& u) const {
+        std::vector<nr::gpu::Ticket> keep;
+        keep.reserve(u.tickets.size());
+        for (auto& t : u.tickets) {
+            if (done(t)) continue;
+            if (std::find(keep.begin(), keep.end(), t) == keep.end()) keep.push_back(t);
+        }
+        u.tickets.swap(keep);
+    }
     SlotRef take_slot() {
         if (blocks_.empty()) throw std::runtime_error("wilsjo2 stage (D3D12): no descriptor block");
-        const nr::gpu::Ticket ticket = nr::gpu::current();
+        const nr::gpu::Ticket ticket = ticket_here();
         Block* b = blocks_.front().get();
         for (uint32_t n = 0; n < kSlots; ++n) {
             const uint32_t i = (b->next + n) % kSlots;
-            if (b->slots[i] && !b->slots[i]->ready()) continue;
+            if (b->slots[i] && !done(b->slots[i])) continue;
             b->slots[i] = ticket;
-            if (ticket) b->uses.tickets.push_back(ticket);
+            prune(b->uses);
+            prune(uses_);
+            b->uses.tickets.push_back(ticket);
+            uses_.tickets.push_back(ticket);
             b->next = (i + 1) % kSlots;
             return {b, i};
         }
@@ -584,14 +627,20 @@ private:
         if (!make_block(&why)) throw std::runtime_error("wilsjo2 stage (D3D12): " + why);
         b = blocks_.front().get();
         b->slots[0] = ticket;
-        if (ticket) b->uses.tickets.push_back(ticket);
+        prune(b->uses);
+        prune(uses_);
+        b->uses.tickets.push_back(ticket);
+        uses_.tickets.push_back(ticket);
         b->next = 1 % kSlots;
         return {b, 0};
     }
     // Blocks a later dispatch replaced are freed once nothing of theirs is in flight.
     void sweep_blocks() {
         for (size_t i = 1; i < blocks_.size();) {
-            if (blocks_[i]->busy()) { ++i; continue; }
+            bool busy = false;
+            for (const auto& t : blocks_[i]->uses.tickets)
+                if (!done(t)) { busy = true; break; }
+            if (busy) { ++i; continue; }
             Block& blk = *blocks_[i];
             if (blk.mapped) blk.upload->Unmap(0, nullptr);
             blk.upload->Release();
@@ -649,6 +698,9 @@ private:
     std::vector<std::unique_ptr<Block>> blocks_;   // [0] the block the next dispatch takes its slot from
     UINT inc_ = 0;
     Block* bound_ = nullptr;   // the heap this recording last bound
+    TicketOf ticket_of_;
+    DoneOf done_of_;
+    nr::gpu::Uses uses_;   // every recording this stage recorded into (its real use set)
     uint64_t dispatches_ = 0;
     ID3D12GraphicsCommandList* cmd_ = nullptr;
     Ensure ensure_;

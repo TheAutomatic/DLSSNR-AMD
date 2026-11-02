@@ -2390,7 +2390,8 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
                 ensure(cmd, proxy.res, D3D12_RESOURCE_STATE_COPY_SOURCE);
                 D3D12_TEXTURE_COPY_LOCATION di{}, si{};
                 di.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; di.pResource = f.capture_in;
-                di.PlacedFootprint.Footprint = {proxy.format, NW, NH, 1, NW * 16};
+                // the row pitch follows the texture's format, not the probe's assumption of RGBA32F
+                di.PlacedFootprint.Footprint = {proxy.format, NW, NH, 1, NW * (proxy.format == DXGI_FORMAT_R32G32B32A32_FLOAT ? 16u : 8u)};
                 si.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; si.pResource = proxy.res; si.SubresourceIndex = 0;
                 cmd->CopyTextureRegion(&di, 0, 0, 0, &si, nullptr);
                 ensure(cmd, proxy.res, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
