@@ -358,7 +358,8 @@ int main(int argc, char** argv) {
             controls.noise_every_frame =
                 [] { const char* n = std::getenv("NR_STAGE_NOISE_EVERY_FRAME"); return !(n && n[0] == '0'); }();
             controls.automatic_mask = false;
-            rt.record_engine(cmd, e, controls);
+            // The probe observes the actual pre-encode F32 store; the normal network keeps its half boundary.
+            if (!probe_f32) rt.record_engine(cmd, e, controls);
             // The network's input and answer, recorded in the same command buffer.
             const auto grab = [&](const nr::ColourFrame& src, VkBuffer dst) {
                 barrier(src.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -373,7 +374,7 @@ int main(int argc, char** argv) {
                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
             };
             grab(proxy, bproxy);
-            grab(neural, bneural);
+            if (!probe_f32) grab(neural, bneural);
         };
         // Two frames: the second one runs with history, so a first-frame noise initialisation can be told apart
         // from an arithmetic difference.
@@ -413,7 +414,7 @@ int main(int argc, char** argv) {
                 const VkBuffer bufs[2] = {bproxy, bneural};
                 const VkDeviceMemory mems[2] = {bproxy_mem, bneural_mem};
                 const char* names[] = {"vulkan_proxy", "vulkan_neural"};
-                for (int i = 0; i < 2; ++i) {
+                for (int i = 0; i < (probe_f32 ? 1 : 2); ++i) {
                     void* m = nullptr;
                     if (vkMapMemory(vkctx().device, mems[i], 0, bbytes, 0, &m) == VK_SUCCESS) {
                         char nm[64];

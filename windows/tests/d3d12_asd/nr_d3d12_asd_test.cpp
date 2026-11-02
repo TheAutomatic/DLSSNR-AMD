@@ -824,12 +824,14 @@ int renodx_run(int argc, char** argv) {
     ID3D12Resource* cap_raw = nullptr;
     ID3D12Resource* cap_in_raw = nullptr;
     const bool capture_boundaries = std::getenv("NR_TEST_STAGE_DUMP") != nullptr;
+    const bool probe_f32 = std::getenv("NR_ENCODE_PROBE_F32") != nullptr;
     if (capture_boundaries) {
         D3D12_HEAP_PROPERTIES hp{};
         hp.Type = D3D12_HEAP_TYPE_READBACK;
         D3D12_RESOURCE_DESC rd{};
         rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        rd.Width = uint64_t(W) * H * 8; rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+        rd.Width = uint64_t(W) * H * (probe_f32 ? 16 : 8);
+        rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
         rd.SampleDesc.Count = 1; rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         if (FAILED(d->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                               IID_PPV_ARGS(&cap_in))) ||
@@ -954,12 +956,12 @@ int renodx_run(int argc, char** argv) {
                             if (capture_boundaries) {
                                 void* mi = nullptr;
                                 void* mn = nullptr;
-                                const uint64_t cb = uint64_t(W) * H * (std::getenv("NR_ENCODE_PROBE_F32") ? 16 : 8);
+                                const uint64_t cb = uint64_t(W) * H * (probe_f32 ? 16 : 8);
                                 if (cap_in && SUCCEEDED(cap_in->Map(0, nullptr, &mi)) && mi &&
                                     cap_out && SUCCEEDED(cap_out->Map(0, nullptr, &mn)) && mn) {
                                     if (const char* sd = std::getenv("NR_TEST_STAGE_DUMP"); sd && sd[0]) {
                                         void* mir = nullptr;
-                                        if (cap_in_raw && SUCCEEDED(cap_in_raw->Map(0, nullptr, &mir)) && mir) {
+                                        if (!probe_f32 && cap_in_raw && SUCCEEDED(cap_in_raw->Map(0, nullptr, &mir)) && mir) {
                                             char p4[512];
                                             std::snprintf(p4, sizeof p4, "%s\\in_raw_frame%d.bin", sd, fi);
                                             if (FILE* f = std::fopen(p4, "wb")) {
@@ -969,7 +971,7 @@ int renodx_run(int argc, char** argv) {
                                             cap_in_raw->Unmap(0, nullptr);
                                         }
                                         void* mr = nullptr;
-                                        if (cap_raw && SUCCEEDED(cap_raw->Map(0, nullptr, &mr)) && mr) {
+                                        if (!probe_f32 && cap_raw && SUCCEEDED(cap_raw->Map(0, nullptr, &mr)) && mr) {
                                             char p3[512];
                                             std::snprintf(p3, sizeof p3, "%s\\raw_frame%d.bin", sd, fi);
                                             if (FILE* f = std::fopen(p3, "wb")) {
@@ -982,8 +984,10 @@ int renodx_run(int argc, char** argv) {
                                         std::snprintf(p1, sizeof p1, "%s\\proxy_frame%d.bin", sd, fi);
                                         std::snprintf(p2, sizeof p2, "%s\\neural_frame%d.bin", sd, fi);
                                         if (FILE* f = std::fopen(p1, "wb")) { std::fwrite(mi, 1, size_t(cb), f); std::fclose(f); }
-                                        if (FILE* f = std::fopen(p2, "wb")) { std::fwrite(mn, 1, size_t(cb), f); std::fclose(f); }
-                                        log("[test] renodx: boundary dumped (proxy %s, neural %s)", p1, p2);
+                                        if (!probe_f32) {
+                                            if (FILE* f = std::fopen(p2, "wb")) { std::fwrite(mn, 1, size_t(cb), f); std::fclose(f); }
+                                            log("[test] renodx: boundary dumped (proxy %s, neural %s)", p1, p2);
+                                        } else log("[test] renodx: F32 encode probe dumped (proxy %s; no network output)", p1);
                                     }
                                     cap_in->Unmap(0, nullptr);
                                     cap_out->Unmap(0, nullptr);
