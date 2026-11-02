@@ -828,10 +828,14 @@ public:
         }
         Built::Upload* slot_buf = nullptr;
         uint32_t slot_i = 0;
+        const nr::gpu::Ticket record_ticket = split::book(cmd);
         for (auto& u : b->upload) {
-            for (uint32_t i = 0; i < kRing; ++i)
-                if (u.owner[i] == ~uint64_t(0) ||
-                    (b->copied >= 0 && u.owner[i] <= uint64_t(b->copied))) { slot_buf = &u; slot_i = i; break; }
+            for (uint32_t i = 0; i < kRing; ++i) {
+                const bool free = upload_uses_[i] ? split::completed(upload_uses_[i])
+                                                  : (u.owner[i] == ~uint64_t(0) ||
+                                                     (b->copied >= 0 && u.owner[i] <= uint64_t(b->copied)));
+                if (free) { slot_buf = &u; slot_i = i; break; }
+            }
             if (slot_buf) break;
         }
         if (!slot_buf) {   // every slot still in flight: another buffer of them, however many it takes
@@ -850,6 +854,8 @@ public:
                 }
             }
         }
+        if (slot_buf) upload_uses_[slot_i] = record_ticket;   // this slot's writer, for the next record's reuse
+
         if (!slot_buf) {   // could not grow either (out of memory): no slot may be taken - reusing a held one
                            // would corrupt a copy the GPU has not read; this record declines, the frame passes
             static bool said = false;
@@ -1322,6 +1328,9 @@ private:
     ID3D12Resource* stamps_ = nullptr;
     uint8_t* stamps_map_ = nullptr;
     nr::gpu::Ticket stamp_uses_[kRing];
+    // The upload slots' own recordings (the caller's split ticket for the list this record goes into): a slot is
+    // reused only when the recording that wrote it has finished every submission it was part of.
+    nr::gpu::Ticket upload_uses_[kRing];
     double hz_ = 0;
     uint64_t frames_ = 0, resets_ = 0, gpu_seen_ = 0;
     unsigned gpu_n_ = 0;
