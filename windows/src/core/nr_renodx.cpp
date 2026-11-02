@@ -1205,7 +1205,10 @@ Stage::Stage(const HostDevice& host, const StageConfig& cfg) : impl_(std::make_u
     m.decoded_storage = m.storage_capable(frame);
     m.decoded = m.make_image(W, H, m.decoded_storage ? frame : VK_FORMAT_R16G16B16A16_SFLOAT, rw);
     // Proxy, neural and look output are RGBA16F (dlssnr.hpp 5866, 5885), as are the v6 work surfaces.
-    m.proxy = m.make_image(NW, NH, VK_FORMAT_R16G16B16A16_SFLOAT, rw);
+    // Probe only (NR_ENCODE_PROBE_F32, the test host's switch): the proxy in RGBA32F so the value entering the
+    // encode is read back without the half store. The shipping route keeps RGBA16F.
+    m.proxy = m.make_image(NW, NH, std::getenv("NR_ENCODE_PROBE_F32") ? VK_FORMAT_R32G32B32A32_SFLOAT
+                                                                    : VK_FORMAT_R16G16B16A16_SFLOAT, rw);
     m.neural = m.make_image(NW, NH, VK_FORMAT_R16G16B16A16_SFLOAT, rw);
     m.look_out = m.make_image(NW, NH, VK_FORMAT_R16G16B16A16_SFLOAT, rw);
     m.block_mean = m.make_image((W + 31) / 32, (H + 31) / 32, VK_FORMAT_R32G32B32A32_SFLOAT, rw);

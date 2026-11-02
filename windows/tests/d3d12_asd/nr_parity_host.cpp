@@ -299,7 +299,8 @@ int main(int argc, char** argv) {
         // The stage's own network boundary, for a comparison with the D3D12 route's capture (RGBA16F, W*H*8).
         VkBuffer bproxy{}, bneural{};
         VkDeviceMemory bproxy_mem{}, bneural_mem{};
-        const uint64_t bbytes = uint64_t(width) * height * 8;
+        const bool probe_f32 = std::getenv("NR_ENCODE_PROBE_F32") != nullptr;
+        const uint64_t bbytes = uint64_t(width) * height * (probe_f32 ? 16 : 8);
         if (!buffer(VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, bbytes, &bproxy, &bproxy_mem) ||
             !buffer(VK_BUFFER_USAGE_TRANSFER_DST_BIT,
