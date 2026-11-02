@@ -4,6 +4,11 @@
 void main(uint3 dispatch_id : SV_DispatchThreadID) {
   const uint2 pixel = dispatch_id.xy;
   if (any(pixel >= Size)) return;
+#if NR_ENCODE_PROBE_STAGE == 5
+  // Exact source texel in the same descriptor used by the encode (the work0 image on the first pass).
+  Output[pixel] = Original.Load(int3(pixel, 0));
+  return;
+#endif
   const uint2 source_size = max(SourceSize, uint2(1, 1));
   const float2 scale = float2(source_size) / float2(Size);
   const float2 center = (float2(pixel) + 0.5) * scale;
@@ -66,6 +71,9 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
   // Probe stage 2: the raw weighted sum and its weight, before the divisor and the curves - narrows the difference
   // to the sampling/summation or to what follows it.
   Output[pixel] = float4(sum, weight);
+#elif NR_ENCODE_PROBE_STAGE == 6
+  // Observe actual GPU scale and coverage instead of inferring exact arithmetic from equal host dimensions.
+  Output[pixel] = float4(scale, weight, float((last.x - first.x) + 4 * (last.y - first.y)));
 #elif NR_ENCODE_PROBE_STAGE == 3
   // Probe stage 3: the divisor the frame used (OutputOriginal's 1x1 read or the constant), in R.
   Output[pixel] = float4(divisor, 0.0, 0.0, 1.0);
