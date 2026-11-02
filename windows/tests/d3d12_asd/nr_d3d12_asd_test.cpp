@@ -64,6 +64,11 @@ bool disabled() { return false; }
 std::shared_ptr<Snapshot> snapshot(ID3D12GraphicsCommandList*) { return std::make_shared<Snapshot>(); }
 void restore(ID3D12GraphicsCommandList*, const std::shared_ptr<Snapshot>&) {}
 ID3D12CommandQueue* last_direct_queue() { return nullptr; }
+// The harness records into its own lists, not through the split hooks: no booking, so the backend keeps its token
+// completion path (the product links the real split and books there).
+uint64_t book(ID3D12CommandList*) { return 0; }
+bool completed(uint64_t) { return true; }
+void invalidate(uint64_t) {}
 }  // namespace split
 }  // namespace nr::pe
 

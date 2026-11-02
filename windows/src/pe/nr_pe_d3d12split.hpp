@@ -35,6 +35,13 @@ namespace nr::pe::split {
 uint64_t queue_value(ID3D12CommandQueue* queue);      // the last value signalled on that queue's fence (0: none)
 uint64_t queue_completed(ID3D12CommandQueue* queue);  // the value the GPU has finished (0: unknown)
 
+// A recording's ticket: booked when work is recorded into the list, stamped by every ExecuteCommandLists that runs
+// it (the plain path included), ended by the list's Reset. completed() is the GPU's answer for all the stamps; a
+// discarded (Reset without execution) recording invalidates its history instead. 0: booking failed.
+uint64_t book(ID3D12CommandList* list);
+bool completed(uint64_t booking);
+void invalidate(uint64_t booking);
+
 // Hooks the list's class (once per class) and its queues'. False when lists of this class cannot be
 // cut, or when this list's state since its last Reset is not known yet - the hooks were installed
 // after it was reset - in which case the frame passes through and the next one is cut.
