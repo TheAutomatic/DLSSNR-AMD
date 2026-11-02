@@ -1208,9 +1208,15 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
     // output may not have been written at all and the caller must take its own path.
     if (!e.stage->record_ok())
         return fallback("the RenoDX stage could not make a surface this frame needs");
-    char line[160];
-    std::snprintf(line, sizeof line, "ran the RenoDX stage (D3D12) %ux%u, network %ux%u: %u pass%s", w, h, nw, nh,
-                  ran, ran == 1 ? "" : "es");
+    char line[200];
+    const bool net_ok = e.stage->net_ran();
+    if (net_ok)
+        std::snprintf(line, sizeof line, "ran the RenoDX stage (D3D12) %ux%u, network %ux%u: %u pass%s", w, h, nw, nh,
+                      ran, ran == 1 ? "" : "es");
+    else
+        std::snprintf(line, sizeof line,
+                      "ran the RenoDX stage (D3D12) %ux%u, network %ux%u: %u pass%s, the network recorded nothing (%s)",
+                      w, h, nw, nh, ran, ran == 1 ? "" : "es", nwhy);
     note_backend(line, true);
     return true;
 }

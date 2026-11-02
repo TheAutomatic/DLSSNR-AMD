@@ -1236,6 +1236,7 @@ struct Stage::Impl {
     // False when a surface this frame needed could not be made: the frame must not be reported as processed (its
     // output may not have been written). A frame with NR off is a legitimate copy-through and stays true.
     bool record_ok_ = true;
+    bool net_ran_ = false;   // the network was actually called and answered for this frame
     ID3D12Resource* replay_buf_ = nullptr;   // test-only: the uploaded network input (NR_TEST_PROXY_REPLAY)
     uint32_t replay_frame_ = 0;              // which frame's file the replay takes next
     void drop(Tex& t) {
@@ -1854,6 +1855,7 @@ void Stage::Impl::copy_frame(ID3D12GraphicsCommandList* cmd, const Frame& f) {
 
 uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, const Frame::Net& net) {
     record_ok_ = true;
+    net_ran_ = false;
     ++frame_no;
     // Every slot this frame may use is made free before its first command: a frame that would outrun completion
     // grows the heap here, and a frame that cannot is not recorded at all (rather than losing a dispatch halfway).
@@ -2564,7 +2566,9 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
             ensure(cmd, proxy.res, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             uav_barrier(cmd);
         }
-        if (!net(k, nt.feature, ck, nt, lin_proxy, lin_neural)) {
+        const bool net_ok_here = net(k, nt.feature, ck, nt, lin_proxy, lin_neural);
+        net_ran_ = net_ran_ || net_ok_here;
+        if (!net_ok_here) {
             if (!net_failed_logged) {
                 net_failed_logged = true;
                 nr::pe::log("[nr] RenoDX stage (D3D12): the network recorded nothing; the frame as it came");
@@ -2863,6 +2867,7 @@ bool Stage::set(const Settings& s) {
 }
 
 bool Stage::record_ok() const { return impl_ ? impl_->record_ok_ : false; }
+bool Stage::net_ran() const { return impl_ ? impl_->net_ran_ : false; }
 void Stage::set_completed(std::function<bool(uint64_t)> f) { impl_->completed = std::move(f); }
 void Stage::set_frame(uint64_t f) { impl_->pinned = f; }
 
