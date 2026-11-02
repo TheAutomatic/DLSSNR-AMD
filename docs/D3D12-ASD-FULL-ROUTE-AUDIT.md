@@ -423,3 +423,25 @@ HKCU Software key 上 `CreateTransaction` 成功、`RegOpenKeyEx` = 0、`RegCrea
 `OptiScaler_v10.0.0-pre1_20261020\OptiScaler.dll`(26,734,080 B)等。**版本号相同、构建日期是 20261020,而 CI pin 是
 20261030** —— 不是同一个 nightly。因此:可只读用于本地树验证(须以 `NR_OPTI_ARCHIVE=` 显式指入并记录来源),但不能
 改名冒充 pin、也不能据它宣称官方 pin 一致;完整 OptiScaler 发布包在本机仍未构建。
+
+## 21:45 Godot 测试环境评估(只读,未启动)
+
+资产:`C:\Users\Kenny\Downloads\godot-testenv-20261031`(README.txt、`game/godotgame.exe` + `game/src/godotgame.cpp`、
+`godot/` patched Godot 4.7.2 ELF、`godot-patch/`、`project/`、`tools/`)。
+
+**结论:不需要 Godot 就能把它当"真实 D3D12 宿主"用。** `godotgame.exe` 自己不做渲染:它从文件 IPC 收一帧
+(颜色/运动矢量/深度/曝光/抖动),调 NGX `EvaluateFeature`(经 OptiScaler + 我们的 `.asi`),把放大结果写回 IPC,
+等 Godot 交回成品帧后 Present(我们的 Present 层在这里跑),并可按 `--dump` 存图。契约在 `godotgame.cpp`:
+- `in.bin`:256 B 头 + 负载。头 u32[2]=RW、[3]=RH、[4]=W、[5]=H;float[6]/[7]=jitter、[8]/[9]=MV scale、[10]=exposure、
+  [11]=frame delta;s32[15]=reset。负载:颜色 RGBA16F(RW·RH·8)、运动 RG16F(RW·RH·4)、深度 R32F(RW·RH·4)。
+- `sr.bin`:u32[0]=magic 0x52533444、[1]=frame、[2]/[3]=W/H + RGBA16F W·H·8(放大结果)。
+- `fin.bin`:magic 0x49463444(RGBA8)或 0x48463444(HDR,pq/scrgb 时 RGBA16F)+ W·H 像素 —— 这是被 Present 的成品帧。
+- 命令行:`--ipc DIR --dump DIR --hdr scrgb --frames N --hold LOG`,另有 `--rr`、`DUMP_SR/DUMP_IN` 等。
+
+**可复用的接入点**:写一个小生产者(几十行)按上述契约喂 `in.bin`(例如用 PBZ 的 scRGB 捕获缩放成 RW×RH),
+读 `sr.bin`,`fin.bin` 直接回填 `sr.bin` 的像素,即可在**真实 Windows 宿主**上跑通
+"NGX Evaluate → OptiScaler → 我们的 ASI → Present",拿 `p_NNNN.raw` 做数值对照。这条路径不需要 Linux Godot、
+不需要 GE-Proton/vkd3d,也不把 wine 结果当 AMD Windows ASD 验证。
+
+**注意**:`tools/` 的脚本路径写死(`/opt/DLSS-NR-on-AMD-project/...`、`/dev/shm/dri04_test`),`run.sh` 不能照抄;
+直接给 `godotgame.exe` 传 Windows 路径的 `--ipc/--dump` 就没有这些问题。尚未启动任何完整游戏矩阵,GPU 未动用。
