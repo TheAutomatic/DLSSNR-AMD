@@ -154,3 +154,17 @@ a24e8dd给v6_encode肩部加precise，尚未运行。独立复算既有kdump/pro
 ### 15:00 轮监督：失败候选已回退，逆变换归因被纠正
 
 b5a56a9恢复原肩部；独立读取kdump-prec确认869个差异，其中729个一码、28个两码，最大8128码，失败实验保留。代理随后对已量化proxy做逆sRGB并据此声称编码前线性值已不同、排除仅编码舍入，这一推论不成立：相同逆函数作用于不同输出自然得到不同结果，并没有观测编码前输入。34个像素的102通道中68相同也只是每像素一个通道不同。已要求取消该归因，使用真正的编码前F32、编码后F32与half store边界区别来源；不再调无依据的编译器开关。此轮没有新增GPU运行。
+
+
+## HDR10 与 F32 的原版复用边界（用户要求，2026-11-02）
+
+| 部分 | 现成来源与实际核实 | 执行方式 |
+|---|---|---|
+| HDR10/PQ、色域、linearize、v6编码/resolve/commit、sRGB与曝光数学 | Linux/Windows RenoDX的v6_linearize、v6_resolve、v6_commit、v6_common、codec_math、v6_exposure_scale逐文件规范化文本相同；v6_encode仅多94431c4测试分支 | 直接沿用同源HLSL、codec_gain.hpp和原Settings；先比输入常量/中间值，不为DX12另写公式或精度规则。 |
+| host决定与帧语义 | 原nr_renodx.cpp及Session::record_renodx：HDR模式/绝对单位、divisor/feed、曝光、reset、多pass及历史 | 沿用原字段/规则；资源类型判断从VkFormat映射DXGI_FORMAT，其余语义按原版对应。 |
+| GPU资源与录制 | 原shader的VK_BINDING宏已具备t/u/b寄存器形式；原capture宿主可复用 | D3D12必需的PSO/root signature/descriptor、state/barrier、caller绑定恢复、texture-buffer读写、CopyTextureRegion行距与fence等待；不搬入额外Vulkan设备。 |
+| F32定位 | 当前capture_in/raw等接口及离线两侧宿主已有读回；现有proxy是RGBA16F | 只增加测试用RGBA32F或float32 buffer观测，复用捕获/文件/等待逻辑；两侧相同表达式、常量、位置。产品proxy保持原FP16，网络精度与算法不变。 |
+
+当前94431c4的NR_ENCODE_PROBE_IMMEDIATE把编码前proxy写回原RGBA16F，因此它是“编码前half快照”，不是F32，不能靠两侧相等证明上游F32一致。真正F32需在half store之前保存32位结果；把half读成float或在CPU逆sRGB都不能替代该观测。
+
+还核实探针未生效的实际路径错误：runprobe.bat从localgame加载shader，但该副本没有新增宏分支；已仅同步该隔离文件，未修改游戏目录、未启动GPU。不需要为此猜PSO创建路径或增加无关日志。后续读回必须记录shader文件哈希/宏与目标格式；D3D12的row pitch需要正确处理，Vulkan用其原有copy/同步方式，两侧输出文件统一为实际f32。
