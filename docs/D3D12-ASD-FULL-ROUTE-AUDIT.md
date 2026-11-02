@@ -255,8 +255,9 @@ list 的两段在同一队列上按序执行,`cut()` 的续段继承同一次提
 **PQ CPU 参考定位数据**(现有测试一次运行,`artifacts/windows/wilsjo2_d3d12_test/run-pqworst.txt`):
 `PQ worst (79,253) ch0 input 0.154598832 GPU 0.216031283 CPU 7.3095589e-07 CPU-from-GPU-linear 0.21568051
 linear [-68.1875 131.375 -10.1484375]`。把 GPU 实际读回的线性图按 CPU 公式编码得到 0.21568,与 GPU 的 0.21603 一致,
-即 encode 段一致;偏差来自前段(解码 + 16F 存储),该点线性出现 -68/+131 的量级(近黑 PQ 码经宽色域矩阵放大)。
-容差与着色器均未改动。
+即 encode 段一致;偏差来自前段(解码 + 16F 存储)。该点 R 的 PQ 码低、G 接近满值(253/255):负 R 与高 G 是宽色域
+饱和绿经 BT.2020->709 的正常结果,不是"近黑放大"。待核方向:PQ pow 的末位微差落到不同 half 后,逆矩阵正负抵消使红
+通道跨 0,再被 PQ 非线性放大成 0 对 0.216。容差与着色器均未改动。
 
 ## 19:15 包交接(W2 DXBC)
 
@@ -267,3 +268,27 @@ linear [-68.1875 131.375 -10.1484375]`。把 GPU 实际读回的线性图按 CPU
 - CI 的 `windows` job 不设置 `NR_ASD_DIR`、`fetch_deps.sh` 也不取 `artifacts/ref/asd-data`,因此 CI 本身不打
   `dlssnr-amd-asd/`(没有该 ini 时该路线本就不启用),本轮改动不影响 CI;受影响的是"带 ASD 目录"的本地/Windows 打包。
 - 运行时缺该目录时的既有行为:该路线报 "its D3D12 programs: wilsjo2_encode.dxbc is missing",帧走桥,不崩。
+
+### R09 边界补证(代码层)
+
+- 我们自己的代码不建第二条 DIRECT 队列:W2/ASD 的录制全部进入游戏自己的 list,HUD 抓取也挂在游戏的 list/queue 上
+  (`nr_asi_hudcap.cpp:580-616`,`hook_lists` 只 hook 游戏的 `ExecuteCommandLists`)。唯一的自有队列是 canary 用的那条
+  (`nr_d3d12_asd.cpp:894`),它只跑 canary 管线、不碰 stage 的 `Built`。
+- 因此本轮可证的边界是:同一队列上,一个 list 的切分与续段按 split 的顺序保证执行;跨队列共享同一 `Built` 的情形只能
+  由**游戏自己**用多个 DIRECT 队列交错提交造成,我们既无复现也无证据,记录为未验证边界,不据此改变准入。
+
+### 安装树交接(布局即运行时)
+
+`asd::folder()` 取 **ASI 自身所在目录**(`nr_d3d12_asd.cpp:1109-1112`,`GetModuleFileNameW(self)`),`g_folder =
+<asi dir>\dlssnr-amd-asd`;RenoDX/网络着色器走 `module_folder()`(同一 ASI 目录)下的 `dlssnr-amd`。因此一个可用的树是:
+
+```
+<game>\<asi dir>\dlssnr-amd.asi
+<game>\<asi dir>\dlssnr-amd\shaders\{renodx,wilsjo2,rdna4,...}      Vulkan/运行时着色器与 W2 的 SPV
+<game>\<asi dir>\dlssnr-amd-asd\dlssnr-amd-asd.ini                  Enabled/Register 等
+<game>\<asi dir>\dlssnr-amd-asd\{*.sodb,*.psdb}                    ASD 的 SODB/PSDB
+<game>\<asi dir>\dlssnr-amd-asd\wilsjo2-d3d12\wilsjo2_*.dxbc       21 个,平铺
+```
+无 `dlssnr-amd-asd.ini` 时 `start()` 直接返回(路线关闭,不写日志);有 ini 但缺 `wilsjo2-d3d12/` 时该路线报
+"its D3D12 programs: wilsjo2_encode.dxbc is missing" 并走桥。该布局已用 `artifacts/windows/pkg-check` 实测:离线宿主
+以 `dlssnr-amd-asd/wilsjo2-d3d12` 为参数,26/26 模式加载,22 dispatches 全通过。
