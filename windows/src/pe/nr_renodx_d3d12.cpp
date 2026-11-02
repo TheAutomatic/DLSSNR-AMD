@@ -1161,6 +1161,23 @@ struct Stage::Impl {
                                                 nullptr, IID_PPV_ARGS(&r)))) return nullptr;
         return r;
     }
+    // The most slots one frame records (measured: a pass is tens of dispatches; the budget only has to be an upper
+    // bound, and growing happens here, before the frame's first command).
+    static constexpr UINT kFrameSlots = 128;
+    bool reserve_frame_slots() {
+        for (int tries = 0; tries < 12; ++tries) {
+            if (slot_frame.size() != slots) slot_frame.assign(slots, kNoFrame);
+            // The run must be within one wrap: a heap smaller than the budget cannot carry a frame.
+            bool free_run = slots >= kFrameSlots;
+            for (UINT i = 0; i < kFrameSlots && free_run; ++i) {
+                const UINT at = (slot + i) % slots;
+                if (slot_frame[at] != kNoFrame && !completed(slot_frame[at])) free_run = false;
+            }
+            if (free_run) return true;
+            if (!grow_slots()) return false;
+        }
+        return false;
+    }
     // A new shader-visible heap of twice the slots, its clear descriptors made, the old one retired through the
     // caller's watermark (a recorded dispatch may still read it).
     bool grow_slots() {
@@ -1187,7 +1204,8 @@ struct Stage::Impl {
         if (prep_state) device->CreateUnorderedAccessView(prep_state, nullptr, &d, main_cpu(kClearSlot));
         slot_frame.assign(slots, kNoFrame);
         slot = 0;
-        jlog("renodx descriptor heap grown: %u slots (old %u retired on completion)", grown, old_slots);
+        nr::pe::log("[nr] RenoDX stage: descriptor heap grown to %u slots (was %u; the old one retires on completion)",
+                    grown, old_slots);
         if (old) {
             if (retire) retire(old);
         }
@@ -1308,26 +1326,16 @@ struct Stage::Impl {
         ++dispatches_done;
         const bool codec = codec_sig(p);
         const UINT n_srv = codec ? 6 : 8, n_uav = codec ? 14 : 8;
+        // The slot first, on the heap record() reserved the frame's whole budget on: no growth happens here, so no
+        // dispatch can be dropped or written into a heap that was replaced after it was bound.
+        UINT take = slot % slots;
+        slot_frame[take] = pinned;
+        slot = (slot + 1) % slots;
         bind_heap(cmd);
         D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap->GetCPUDescriptorHandleForHeapStart();
         D3D12_GPU_DESCRIPTOR_HANDLE gpu = heap->GetGPUDescriptorHandleForHeapStart();
-        cpu.ptr += SIZE_T(slot) * 20 * inc;
-        gpu.ptr += UINT64(slot) * 20 * inc;
-        // A slot is taken only when its previous frame has finished. Out of finished slots: a new, larger heap is
-        // made and the old one retired (its own descriptors stay valid for the dispatches already recorded against
-        // it), so the frame is never recorded with a dispatch missing.
-        if (slot_frame.size() != slots) slot_frame.assign(slots, kNoFrame);
-        UINT take = slot % slots;
-        if (completed && slot_frame[take] != kNoFrame && !completed(slot_frame[take])) {
-            if (!grow_slots()) {
-                record_ok_ = false;
-                jlog("renodx dispatch slots exhausted and no larger heap could be made");
-                return;
-            }
-            take = slot % slots;
-        }
-        slot_frame[take] = pinned;
-        slot = (slot + 1) % slots;
+        cpu.ptr += SIZE_T(take) * 20 * inc;
+        gpu.ptr += UINT64(take) * 20 * inc;
         const auto fill = [&](View* views, UINT n, bool write) {
             View first{};
             for (UINT i = 0; i < n; ++i)
@@ -1629,7 +1637,13 @@ bool Stage::Impl::build(std::string* why) {
     }
     D3D12_DESCRIPTOR_HEAP_DESC hd{};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = kSlots * 20 + 2;   // + the two clear slots (kClearSlot)
+    // Test-only: a small first heap (NR_STAGE_SLOT_TEST=<n>) makes the completion-driven growth run in a short test;
+    // the product always starts at kSlots.
+    if (const char* ts = std::getenv("NR_STAGE_SLOT_TEST"); ts && ts[0]) {
+        const long n = std::strtol(ts, nullptr, 10);
+        if (n > 0 && n < 1 << 20) { slots = UINT(n); kClearSlot = slots * 20; }
+    }
+    hd.NumDescriptors = slots * 20 + 2;   // + the two clear slots (kClearSlot)
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)))) { *why = "renodx: the descriptor heap failed"; return false; }
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
@@ -1834,6 +1848,13 @@ void Stage::Impl::copy_frame(ID3D12GraphicsCommandList* cmd, const Frame& f) {
 uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, const Frame::Net& net) {
     record_ok_ = true;
     ++frame_no;
+    // Every slot this frame may use is made free before its first command: a frame that would outrun completion
+    // grows the heap here, and a frame that cannot is not recorded at all (rather than losing a dispatch halfway).
+    if (completed && !reserve_frame_slots()) {
+        record_ok_ = false;
+        nr::pe::log("[nr] RenoDX stage: no slot budget for this frame (fails before any command)");
+        return 0;
+    }
     const Settings& s = settings;
     const uint32_t W = cfg.width, H = cfg.height, NW = cfg.nr_width, NH = cfg.nr_height;
     const uint32_t gx = (W + 15) / 16, gy = (H + 15) / 16, nx = (NW + 15) / 16, ny = (NH + 15) / 16;

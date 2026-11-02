@@ -476,6 +476,18 @@ public:
     }
     const char* name() const override { return name_.c_str(); }
 
+    // model.cpp's release_feature: every stack pass of this feature loses its history, latch and seed here, not by
+    // an LRU guess later.
+    void release_feature(uint64_t feature) override {
+        for (auto& [key, b] : nets_) {
+            if (!b) continue;
+            for (uint32_t k = 0; k < 32; ++k) {
+                const uint64_t f = k == 0 ? feature : ((uint64_t(1) << 62) | (feature << 8) | k);
+                b->features.erase(f);
+            }
+        }
+    }
+
     bool write_capture(const std::string& dir, std::string* why) override {
         for (auto& [key, b] : nets_) {
             if (!b || !b->noise_dump || !b->noise_dump_written) continue;

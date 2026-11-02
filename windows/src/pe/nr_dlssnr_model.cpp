@@ -1700,6 +1700,9 @@ void release_d3d12(Feature* f) {
     // (DlssNr_Dx12.cpp ParkNrFeature) before releasing it, and the runtime retires the feature's
     // images for a further 64 recordings before destroying them.
     if (f && g_d3d12_session) g_d3d12_session->release_feature(f->id);
+    // The native ASD backend keeps its own stage and per-feature history: without this it learns of the feature's
+    // death only from an LRU budget guess.
+    if (f) nr::pe::asd::release_renodx_feature(f->id);
     g_live_d3d12.erase(std::remove(g_live_d3d12.begin(), g_live_d3d12.end(), f), g_live_d3d12.end());
     // The readback pair goes the same way and for the same reason: a copy into it may still be in a
     // list the GPU has not reached, so it is retired for 64 further evaluates rather than released
@@ -2180,6 +2183,9 @@ int evaluate_bridge12(void* cmd_buffer, Feature* f, const VkImageRef& colour, co
 void release_bridge12(Feature* f) {
     std::lock_guard<std::mutex> guard(g_lock);
     if (f && g_d3d12_session) g_d3d12_session->release_feature(f->id);
+    // The native ASD backend keeps its own stage and per-feature history: without this it learns of the feature's
+    // death only from an LRU budget guess.
+    if (f) nr::pe::asd::release_renodx_feature(f->id);
     g_live_d3d12.erase(std::remove(g_live_d3d12.begin(), g_live_d3d12.end(), f), g_live_d3d12.end());
     delete f;
 }

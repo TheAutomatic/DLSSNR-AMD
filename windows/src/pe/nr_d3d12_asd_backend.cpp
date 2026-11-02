@@ -1610,6 +1610,14 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
     note_backend(line, true);
     return true;
 }
+void release_renodx_feature(uint64_t feature) {
+    if (auto it = g.renodx.find(feature); it != g.renodx.end()) {
+        if (it->second.stage) g.renodx_retired.emplace_back(int64_t(g.frames), std::move(it->second.stage));
+        g.renodx.erase(it);
+    }
+    if (g.network) g.network->release_feature(feature);
+}
+
 bool write_network_capture(const std::string& dir, std::string* why) {
     if (!g.network) { *why = "no network"; return false; }
     return g.network->write_capture(dir, why);

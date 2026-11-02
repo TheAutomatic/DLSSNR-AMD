@@ -72,6 +72,8 @@ public:
     virtual bool record(ID3D12GraphicsCommandList* cmd, const LinearFrame& in, const LinearFrame& out, const char** why) = 0;
     // Debug: write the boundary capture recorded this frame (the precomputed noise field) with its metadata.
     virtual bool write_capture(const std::string& dir, std::string*) { return false; }
+    // The caller destroyed this feature (model.cpp's release_feature): its history, latch and seed must go now.
+    virtual void release_feature(uint64_t) {}
 };
 
 // An HLSL compute shader (cs_5_0) through d3dcompiler_47.dll; null and why when it does not compile.
@@ -93,6 +95,10 @@ AsdNetStatus backend_net_status();
 
 // Debug: write the boundary capture the network recorded this frame (the precomputed noise field) with metadata.
 bool write_network_capture(const std::string& dir, std::string* why);
+
+// A game feature the caller destroyed: its RenoDX stage and the network's per-feature state are retired (the stage
+// through the completion watermark), so a later feature that reuses the id starts clean.
+void release_renodx_feature(uint64_t feature);
 // The ASD backend's device as it stands (S_OK when there is none): a removed device is the one signal a game that dies
 // without an exception leaves behind, so a watchdog can poll it.
 HRESULT device_removed_reason();
