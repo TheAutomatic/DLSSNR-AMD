@@ -639,12 +639,22 @@ int renodx_run(int argc, char** argv) {
     }
     uint64_t fence_value = 0;   // one monotonic counter: upload, every frame, every readback
 
+    // NR_TEST_INPUT_F32=<raw f32 RGBA, W x H>: a real HDR frame instead of the pattern, as the linear scRGB a JPEG XR
+    // capture decodes to. The frame is RGBA16F then, which the stage reads as linear HDR (the format decides), so the
+    // capture's own range survives - a 10-bit UNORM frame would clamp everything above 1.0.
+    // NR_TEST_INPUT_HALF=<raw RGBA16F, W x H>: a real HDR frame instead of the pattern, as the linear scRGB a JPEG XR
+    // capture decodes to. The file is the shared decode (numpy astype('<f2') of one f32 decode) and is uploaded as it is,
+    // so both routes start from the same quantised pixels; the frame is RGBA16F then, which the stage reads as linear
+    // HDR (the format decides), and a 10-bit UNORM frame would have clamped everything above 1.0.
+    const char* input_half = std::getenv("NR_TEST_INPUT_HALF");
+    const bool half_input = input_half && input_half[0];
+    const DXGI_FORMAT frame_format = half_input ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R10G10B10A2_UNORM;
     // The frame: the game's format 24 (R10G10B10A2), in place, in UNORDERED_ACCESS both ways.
     D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC rd{};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     rd.Width = W; rd.Height = H; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
-    rd.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
+    rd.Format = frame_format;
     rd.SampleDesc.Count = 1;
     rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     ID3D12Resource* frame = nullptr;
@@ -658,25 +668,39 @@ int renodx_run(int argc, char** argv) {
     }
     nr::pe::set_module_folder(game);
     // A fixed pattern in the frame (x*13+y*7 etc. at 10 bits), so the run has a defined input and its output can be
-    // hashed and compared between runs and against another route later.
+    // hashed and compared between runs and against another route later; or the half file, byte for byte.
     {
-        const uint64_t pitch = uint64_t(W) * 4;
+        const uint64_t pitch = uint64_t(W) * (half_input ? 8 : 4);
         D3D12_TEXTURE_COPY_LOCATION dst_loc{}, src_loc{};
         dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         dst_loc.pResource = frame;
         dst_loc.SubresourceIndex = 0;
         src_loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         src_loc.pResource = nullptr;   // set below, once the upload buffer exists
-        src_loc.PlacedFootprint.Footprint = {DXGI_FORMAT_R10G10B10A2_UNORM, W, H, 1, UINT(pitch)};
+        src_loc.PlacedFootprint.Footprint = {frame_format, W, H, 1, UINT(pitch)};
         ID3D12Resource* up = buffer(d, D3D12_HEAP_TYPE_UPLOAD, pitch * H, D3D12_RESOURCE_STATE_GENERIC_READ);
         src_loc.pResource = up;
         void* m = nullptr;
         if (!up || FAILED(up->Map(0, nullptr, &m)) || !m) { log("[test] renodx: the input buffer failed"); return 4; }
-        auto* px = static_cast<uint32_t*>(m);
-        for (uint32_t y = 0; y < H; ++y)
-            for (uint32_t x = 0; x < W; ++x)
-                px[uint64_t(y) * W + x] = ((x * 13u + y * 7u) & 0x3FF) | (((x * 5u + y * 11u) & 0x3FF) << 10) |
-                                          (((x * 3u + y * 17u) & 0x3FF) << 20) | (0x3FFu << 30);
+        if (half_input) {
+            if (FILE* f = std::fopen(input_half, "rb")) {
+                const size_t got = std::fread(m, 1, size_t(pitch * H), f);
+                std::fclose(f);
+                if (got != size_t(pitch * H)) {
+                    log("[test] renodx: %s is %zu bytes, %ux%u RGBA16F is %zu", input_half, got, W, H, size_t(pitch * H));
+                    return 4;
+                }
+            } else {
+                log("[test] renodx: cannot read %s", input_half);
+                return 4;
+            }
+        } else {
+            auto* px = static_cast<uint32_t*>(m);
+            for (uint32_t y = 0; y < H; ++y)
+                for (uint32_t x = 0; x < W; ++x)
+                    px[uint64_t(y) * W + x] = ((x * 13u + y * 7u) & 0x3FF) | (((x * 5u + y * 11u) & 0x3FF) << 10) |
+                                              (((x * 3u + y * 17u) & 0x3FF) << 20) | (0x3FFu << 30);
+        }
         up->Unmap(0, nullptr);
         D3D12_RESOURCE_BARRIER tb{};
         tb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -855,7 +879,9 @@ int renodx_run(int argc, char** argv) {
         fr.capture_out = cap_out;
         fr.capture_raw = cap_raw;
     }
-    fr.renodx_present = 2;         // HDR10
+    // What the presented frame is: the 16-bit linear scRGB of a JPEG XR capture (3), else the 10-bit HDR10 (2). The
+    // stage reads a PQ frame as PQ and a linear one as linear; saying HDR10 for a linear capture would rescale it.
+    fr.renodx_present = half_input ? 3 : 2;
     fr.renodx_white_nits = 203.f;
     fr.renodx_hdr_flag = 1;
     const int frames = argc > 6 ? std::max(1, std::atoi(argv[6])) : 1;
@@ -912,11 +938,14 @@ int renodx_run(int argc, char** argv) {
         // What the frame became: the same input and route must give the same bytes run to run.
         {
             if (a->Reset() == S_OK && l->Reset(a, nullptr) == S_OK) {
-                const uint64_t pitch = uint64_t(W) * 4;
+                // The readback follows the output texture's own format: the frame a real HDR input goes through is
+                // RGBA16F (8 bytes a pixel), and a 10-bit footprint would copy neither its rows nor its byte count.
+                const DXGI_FORMAT out_format = out_tex->GetDesc().Format;
+                const uint64_t pitch = uint64_t(W) * (out_format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8 : 4);
                 ID3D12Resource* rb = buffer(d, D3D12_HEAP_TYPE_READBACK, pitch * H, D3D12_RESOURCE_STATE_COPY_DEST);
                 D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
                 dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst.pResource = rb;
-                dst.PlacedFootprint.Footprint = {DXGI_FORMAT_R10G10B10A2_UNORM, W, H, 1, UINT(pitch)};
+                dst.PlacedFootprint.Footprint = {out_format, W, H, 1, UINT(pitch)};
                 src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.pResource = out_tex; src.SubresourceIndex = 0;
                 D3D12_RESOURCE_BARRIER tb{};
                 tb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;

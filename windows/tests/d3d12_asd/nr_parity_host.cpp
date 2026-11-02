@@ -169,12 +169,16 @@ int main(int argc, char** argv) {
         };
         VkImage colour{}, output{}, motion{};
         VkDeviceMemory colour_mem{}, output_mem{}, motion_mem{};
-        if (!image(true, &colour, &colour_mem) || !image(true, &output, &output_mem)) {
+        // The same pattern the D3D12 test writes (x*13+y*7 etc. at 10 bits) through a staging buffer - or, with
+        // NR_TEST_INPUT_HALF, the very RGBA16F bytes that test uploads, so both routes start from one decode.
+        const char* input_half = std::getenv("NR_TEST_INPUT_HALF");
+        const bool half_input = input_half && input_half[0];
+        const VkFormat frame_fmt = half_input ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+        const uint64_t bytes = uint64_t(width) * height * (half_input ? 8 : 4);
+        if (!image(true, &colour, &colour_mem, frame_fmt) || !image(true, &output, &output_mem, frame_fmt)) {
             std::printf("images failed\n");
             return 7;
         }
-        // The same pattern the D3D12 test writes (x*13+y*7 etc. at 10 bits) through a staging buffer.
-        const uint64_t bytes = uint64_t(width) * height * 4;
         auto buffer = [&](VkBufferUsageFlags usage, VkMemoryPropertyFlags props, uint64_t size, VkBuffer* b, VkDeviceMemory* m) {
             VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
             bi.size = size; bi.usage = usage; bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
@@ -203,11 +207,22 @@ int main(int argc, char** argv) {
         {
             void* m = nullptr;
             vkMapMemory(vkctx().device, up_mem, 0, bytes, 0, &m);
-            auto* px = static_cast<uint32_t*>(m);
-            for (uint32_t y = 0; y < height; ++y)
-                for (uint32_t x = 0; x < width; ++x)
-                    px[uint64_t(y) * width + x] = ((x * 13u + y * 7u) & 0x3FF) | (((x * 5u + y * 11u) & 0x3FF) << 10) |
-                                                  (((x * 3u + y * 17u) & 0x3FF) << 20) | (0x3FFu << 30);
+            if (half_input) {
+                if (FILE* f = std::fopen(input_half, "rb")) {
+                    const size_t got = std::fread(m, 1, size_t(bytes), f);
+                    std::fclose(f);
+                    if (got != size_t(bytes)) { std::printf("%s is not %llu bytes\n", input_half, (unsigned long long)bytes); return 8; }
+                } else {
+                    std::printf("cannot read %s\n", input_half);
+                    return 8;
+                }
+            } else {
+                auto* px = static_cast<uint32_t*>(m);
+                for (uint32_t y = 0; y < height; ++y)
+                    for (uint32_t x = 0; x < width; ++x)
+                        px[uint64_t(y) * width + x] = ((x * 13u + y * 7u) & 0x3FF) | (((x * 5u + y * 11u) & 0x3FF) << 10) |
+                                                      (((x * 3u + y * 17u) & 0x3FF) << 20) | (0x3FFu << 30);
+            }
             vkUnmapMemory(vkctx().device, up_mem);
         }
         VkCommandBufferBeginInfo bi2{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -285,9 +300,9 @@ int main(int argc, char** argv) {
         sc.shaders = root + "\\dlssnr-amd\\shaders\\renodx";
         sc.width = width; sc.height = height;
         sc.nr_width = width; sc.nr_height = height;
-        sc.frame_format = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
-        sc.hdr_flag = true;    // the D3D12 test's frame: HDR10, present point 2
-        sc.present = 2;
+        sc.frame_format = frame_fmt;
+        sc.hdr_flag = true;             // the frame the route sees: linear HDR (16F) or HDR10 (10-bit)
+        sc.present = half_input ? 3 : 2;   // 3 the 16-bit linear scRGB of a JPEG XR capture, 2 HDR10
         nr::renodx::StageConfig& scc = sc;
         (void)scc;
         // The noise field the pre block reads, from the same region the D3D12 route dumps (wgt at noise[0].off*4).
@@ -310,7 +325,7 @@ int main(int argc, char** argv) {
         }
         nr::renodx::StageFrame sf;
         sf.colour.image = colour;
-        sf.colour.format = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+        sf.colour.format = frame_fmt;
         sf.colour.width = width; sf.colour.height = height;
         // The caller describes what the images are in and what they must be left in (nr_renodx.cpp's contract).
         sf.colour.before = sf.colour.after = VK_IMAGE_LAYOUT_GENERAL;
