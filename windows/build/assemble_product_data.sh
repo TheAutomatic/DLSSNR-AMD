@@ -35,6 +35,17 @@ cp -- windows/shaders/renodx/*.hlsl windows/shaders/renodx/*.hlsli "$dst/shaders
 mkdir -p "$dst/shaders/renodx/renodx-prep"
 cp -- windows/shaders/renodx-prep/*.hlsli windows/shaders/renodx-prep/*.hlsl "$dst/shaders/renodx/renodx-prep/"
 bash windows/build/build_wilsjo2.sh "$dst/shaders/wilsjo2" > /dev/null   # the wilsjo2 style, HUD FIX on every route
+# The same programs as DXBC for the native D3D12 route (nr_asi_wilsjo2.cpp reads dlssnr-amd/wilsjo2-d3d12): the last
+# step needs d3dcompiler_47, so a Windows host builds them when the two pinned tools are pointed at; without them the
+# folder is absent and that route's frames take the bridge rather than a stage without programs.
+# The stage reads dlssnr-amd\wilsjo2-d3d12\wilsjo2_<name>.dxbc flat, so only the .dxbc of the build are copied there
+# (its intermediate HLSL and SPIR-V stay out of the package).
+if [[ -n ${NR_SPIRV_CROSS:-} && -n ${NR_W2_DXBC:-} ]]; then
+    w2tmp=$(realpath -m artifacts/windows/wilsjo2-d3d12-package)
+    bash windows/build/build_wilsjo2_d3d12.sh "$dst/shaders/wilsjo2" "$w2tmp" "$NR_SPIRV_CROSS" "$NR_W2_DXBC" > /dev/null
+    mkdir -p "$dst/shaders/wilsjo2-d3d12"
+    cp -- "$w2tmp"/dxbc/*.dxbc "$dst/shaders/wilsjo2-d3d12/"
+fi
 # wilsjo2_classic.spv carries AMD FidelityFX Super Resolution 1 (MIT): its notice goes with it
 cp -- windows/shaders/passes/include/fsr1/LICENSE.txt "$dst/shaders/wilsjo2/FidelityFX-FSR1-LICENSE.txt"
 mkdir -p -- "$dst/lang"
