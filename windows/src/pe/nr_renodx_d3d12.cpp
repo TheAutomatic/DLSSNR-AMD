@@ -1590,9 +1590,13 @@ bool Stage::Impl::build(std::string* why) {
         const std::string text = read_text(cfg.shaders + L"\\" +
             std::wstring(f.name, f.name + std::strlen(f.name)) + (f.p == kPrepEncode ? L".hlsl" : L".cs_5_1.hlsl"));
         if (text.empty()) { *why = std::string("renodx: ") + f.name + " is missing"; return false; }
+        // Probe builds (both routes compile this same file): NR_ENCODE_PROBE_IMMEDIATE stores the value entering the
+        // encode rather than the encoded one, so the same boundary can be compared on both sides.
         const D3D_SHADER_MACRO macros[] = {{f.macro, "1"}, {nullptr, nullptr}};
+        const D3D_SHADER_MACRO probe[] = {{"NR_ENCODE_PROBE_IMMEDIATE", "1"}, {nullptr, nullptr}};
+        const bool probing = f.p == kEncode6 && std::getenv("NR_ENCODE_PROBE_IMMEDIATE") != nullptr;
         ID3DBlob* code = compile_hlsl(text.data(), text.size(), "main", why, &includer,
-                                      f.macro ? macros : nullptr);
+                                      probing ? probe : (f.macro ? macros : nullptr));
         if (!code) return false;
         D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
         pd.pRootSignature = rs_codec;
@@ -1664,7 +1668,10 @@ bool Stage::Impl::build(std::string* why) {
     original = make_tex(W, H, frame, false, why);
     decoded_storage = typed_uav(frame);
     decoded = make_tex(W, H, decoded_storage ? frame : DXGI_FORMAT_R16G16B16A16_FLOAT, true, why);
-    proxy = make_tex(NW, NH, DXGI_FORMAT_R16G16B16A16_FLOAT, true, why);
+    // Probe only (NR_ENCODE_PROBE_F32): the network's proxy in RGBA32F, so the value entering the encode is read
+    // back without the half store. The product keeps RGBA16F (this is a test switch, not a precision change).
+    const bool probe_f32 = std::getenv("NR_ENCODE_PROBE_F32") != nullptr;
+    proxy = make_tex(NW, NH, probe_f32 ? DXGI_FORMAT_R32G32B32A32_FLOAT : DXGI_FORMAT_R16G16B16A16_FLOAT, true, why);
     neural = make_tex(NW, NH, DXGI_FORMAT_R16G16B16A16_FLOAT, true, why);
     look_out = make_tex(NW, NH, DXGI_FORMAT_R16G16B16A16_FLOAT, true, why);
     block_mean = make_tex((W + 31) / 32, (H + 31) / 32, DXGI_FORMAT_R32G32B32A32_FLOAT, true, why);
@@ -2560,7 +2567,7 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
             ensure(cmd, proxy.res, D3D12_RESOURCE_STATE_COPY_SOURCE);
             D3D12_TEXTURE_COPY_LOCATION di{}, si{};
             di.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; di.pResource = f.capture_in;
-            di.PlacedFootprint.Footprint = {DXGI_FORMAT_R16G16B16A16_FLOAT, NW, NH, 1, NW * 8};
+            di.PlacedFootprint.Footprint = {proxy.format, NW, NH, 1, NW * (proxy.format == DXGI_FORMAT_R32G32B32A32_FLOAT ? 16u : 8u)};
             si.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; si.pResource = proxy.res; si.SubresourceIndex = 0;
             cmd->CopyTextureRegion(&di, 0, 0, 0, &si, nullptr);
             ensure(cmd, proxy.res, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -2596,7 +2603,7 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
                 ensure(cmd, neural.res, D3D12_RESOURCE_STATE_COPY_SOURCE);
                 D3D12_TEXTURE_COPY_LOCATION di{}, si{};
                 di.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; di.pResource = f.capture_out;
-                di.PlacedFootprint.Footprint = {DXGI_FORMAT_R16G16B16A16_FLOAT, NW, NH, 1, NW * 8};
+                di.PlacedFootprint.Footprint = {proxy.format, NW, NH, 1, NW * (proxy.format == DXGI_FORMAT_R32G32B32A32_FLOAT ? 16u : 8u)};
                 si.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; si.pResource = neural.res; si.SubresourceIndex = 0;
                 cmd->CopyTextureRegion(&di, 0, 0, 0, &si, nullptr);
                 ensure(cmd, neural.res, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);

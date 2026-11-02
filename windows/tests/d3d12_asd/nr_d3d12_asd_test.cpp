@@ -954,7 +954,7 @@ int renodx_run(int argc, char** argv) {
                             if (capture_boundaries) {
                                 void* mi = nullptr;
                                 void* mn = nullptr;
-                                const uint64_t cb = uint64_t(W) * H * 8;
+                                const uint64_t cb = uint64_t(W) * H * (std::getenv("NR_ENCODE_PROBE_F32") ? 16 : 8);
                                 if (cap_in && SUCCEEDED(cap_in->Map(0, nullptr, &mi)) && mi &&
                                     cap_out && SUCCEEDED(cap_out->Map(0, nullptr, &mn)) && mn) {
                                     if (const char* sd = std::getenv("NR_TEST_STAGE_DUMP"); sd && sd[0]) {
