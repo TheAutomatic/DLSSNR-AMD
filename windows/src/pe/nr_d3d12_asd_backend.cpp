@@ -621,17 +621,14 @@ struct Backend {
     uint64_t* done_map = nullptr;
     uint64_t frames = 0;                 // frames recorded by this backend
     int64_t executed = -1;               // newest frame the GPU finished
-    // The recording's ticket in the split layer (book(): stamped at Execute, ended at Reset). Its queue fence is
-    // the completion evidence this backend prefers; the token copy below stays for a list split did not see.
-    uint64_t booking = 0;
+    // The split recording ticket is not consumed yet: one global handle cannot stand for every frame's and every
+    // resource's recording (frames in different lists/queues would be assumed finished together). The token copy
+    // below stays the only completion evidence until each frame and resource owns its own ticket.
+    uint64_t booking_unused = 0;
     std::vector<std::pair<int64_t, ID3D12Resource*>> token_retired;   // grown-away token buffers
     // A value the GPU has not written yet reads as ~0, and only a slot whose holder matches its own index is a
     // completion: a frame number ahead of the newest record is a torn read, not evidence.
     void refresh_executed() {
-        if (booking) {
-            if (nr::pe::split::completed(booking)) executed = frames ? int64_t(frames) - 1 : -1;
-            return;
-        }
         if (!done_map) return;
         const uint64_t max_f = frames ? frames - 1 : 0;
         for (uint32_t s = 0; s < kDoneSlots; ++s) {
@@ -1204,7 +1201,6 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
     if (g.broken) return fallback(g.broken_why);
 
     if (renodx) {
-        g.booking = nr::pe::split::book(f.cmd);
         const bool ran = renodx_frame(f, color_state, output_state);
         // Marked even when the stage reports failure: a failed frame may have recorded some of its dispatches, and
         // those commands still hold internal resources that must not be released until the GPU ran past them.

@@ -564,7 +564,10 @@ ULONG STDMETHODCALLTYPE hk_Release(List* self) {
 struct Booking {
     ID3D12CommandList* list{};
     std::vector<std::pair<ID3D12CommandQueue*, uint64_t>> receipts;
-    bool dead{};
+    // sealed: the list was Reset successfully, so this recording is over and its receipts are the whole story.
+    // A live recording is never "complete": it may be executed again, and its resources must stay.
+    bool sealed{};
+    bool discarded{};   // invalidate(): never executed and thrown away
 };
 std::vector<Booking> g_bookings;   // g_mutex
 
@@ -588,13 +591,15 @@ HRESULT STDMETHODCALLTYPE hk_Reset(List* self, ID3D12CommandAllocator* allocator
             }
         }
     }
-    {
-        std::lock_guard<std::recursive_mutex> guard(g_mutex);
-        for (auto& b : g_bookings)
-            if (b.list == reinterpret_cast<ID3D12CommandList*>(self)) { b.dead = true; b.receipts.clear(); }
-    }
     const HRESULT hr = orig_fn<HRESULT(STDMETHODCALLTYPE*)(List*, ID3D12CommandAllocator*, ID3D12PipelineState*)>(
         self, kReset)(self, allocator, pso);
+    if (SUCCEEDED(hr)) {
+        // Only a successful Reset ends the recording: the ticket is sealed with every receipt it collected, and the
+        // next book() on this list opens a new generation. A failed Reset leaves the recording as it was.
+        std::lock_guard<std::recursive_mutex> guard(g_mutex);
+        for (auto& b : g_bookings)
+            if (b.list == reinterpret_cast<ID3D12CommandList*>(self)) b.sealed = true;
+    }
     if (SUCCEEDED(hr)) state_of(self)->reset(pso);
     return hr;
 }
@@ -1047,10 +1052,10 @@ void stamp_bookings_locked(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* con
     if (!f || !f->fence) return;
     if (FAILED(q->Signal(f->fence, f->value + 1))) return;
     ++f->value;
-    for (UINT i = 0; i < n; ++i) {
+    if (g_bookings.empty()) return;
+    for (UINT i = 0; i < n; ++i)
         for (auto& b : g_bookings)
-            if (b.list == lists[i] && !b.dead) b.receipts.emplace_back(q, f->value);
-    }
+            if (b.list == lists[i] && !b.sealed && !b.discarded) b.receipts.emplace_back(q, f->value);
 }
 
 void STDMETHODCALLTYPE hk_Execute(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists) {
@@ -1133,10 +1138,10 @@ void execute_cut(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists,
     QueueFence* f = completion_fence(q);
     const bool signalled = f && SUCCEEDED(q->Signal(f->fence, f->value + 1));
     if (signalled) ++f->value;
-    if (signalled) {
+    if (signalled && !g_bookings.empty()) {
         for (UINT i = 0; i < n; ++i)
             for (auto& b : g_bookings)
-                if (b.list == lists[i] && !b.dead) b.receipts.emplace_back(q, f->value);
+                if (b.list == lists[i] && !b.sealed && !b.discarded) b.receipts.emplace_back(q, f->value);
     }
     for (Cont* c : ran) {
         // Without a completion mark a continuation is never handed out again.
@@ -1559,8 +1564,12 @@ ID3D12CommandQueue* last_direct_queue() { return t_last_direct; }
 uint64_t book(ID3D12CommandList* list) {
     if (!list) return 0;
     std::lock_guard<std::recursive_mutex> guard(g_mutex);
-    for (size_t i = 0; i < g_bookings.size(); ++i)
-        if (g_bookings[i].list == list) return g_bookings[i].dead ? 0 : uint64_t(i + 1);
+    // A live (unsealed) recording keeps its ticket; a sealed or discarded one is finished, so a new generation is
+    // opened for this list - the old ticket stays for whoever still holds it.
+    for (size_t i = 0; i < g_bookings.size(); ++i) {
+        const Booking& b = g_bookings[i];
+        if (b.list == list && !b.sealed && !b.discarded) return uint64_t(i + 1);
+    }
     Booking b;
     b.list = list;
     g_bookings.push_back(std::move(b));
@@ -1569,12 +1578,14 @@ uint64_t book(ID3D12CommandList* list) {
 
 bool completed(uint64_t booking) {
     std::lock_guard<std::recursive_mutex> guard(g_mutex);
-    if (!booking || booking > g_bookings.size()) return true;
+    if (!booking || booking > g_bookings.size()) return false;   // unknown is not complete
     const Booking& b = g_bookings[booking - 1];
-    if (b.dead || b.receipts.empty()) return true;   // discarded, or never executed: nothing to wait for
+    if (b.discarded) return true;          // thrown away without ever running: nothing can read it
+    if (!b.sealed) return false;           // a live recording may still be executed: its resources stay
+    if (b.receipts.empty()) return false;  // sealed but never stamped: unknown, not done
     for (const auto& r : b.receipts) {
         QueueFence* f = completion_fence(r.first);
-        if (!f || !f->fence) continue;
+        if (!f || !f->fence) return false;  // no fence: unknown
         const uint64_t v = f->fence->GetCompletedValue();
         if (v == UINT64_MAX || v < r.second) return false;
     }
@@ -1584,8 +1595,7 @@ bool completed(uint64_t booking) {
 void invalidate(uint64_t booking) {
     std::lock_guard<std::recursive_mutex> guard(g_mutex);
     if (!booking || booking > g_bookings.size()) return;
-    g_bookings[booking - 1].dead = true;
-    g_bookings[booking - 1].receipts.clear();
+    g_bookings[booking - 1].discarded = true;   // receipts are kept: anything already executed still holds resources
 }
 
 }  // namespace nr::pe::split
