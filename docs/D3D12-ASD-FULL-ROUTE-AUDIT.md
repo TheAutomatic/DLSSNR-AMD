@@ -322,3 +322,17 @@ plan-only lowering(`nr_d3d12_net_plan.hpp:63`;`nr_runtime.cpp:3195` 注释即 "n
 - 用这个匹配计划跑 D3D12 路线 1920x1080 三帧(`boundary-1080-matching.txt`):网络按 1920x1080 构建,stage "1 pass",
   三帧 `Close 0x0`,exit=0。这就是换 extent 的换代边界(新 stage、新网络、旧 stage 按其录制票据退休)。
 - 另保留不匹配计划的边界数据(`boundary-1080.txt`):明确拒绝、不录半帧、不退回桥。
+
+### 最小生命周期/状态边界(现有开关,无新框架)
+
+- **copy-through 状态(R05 的输入)**:`NR_TEST_NR_OFF=1` 跑 3840x2160 两帧(`asd-harness/boundary-nroff.txt`)——stage
+  记录 0 pass、backend 仍成功返回、两帧 `Close 0x0`。此时 `note_backend_produced(ran > 0)` 为 false,即模型侧
+  `report_control(...)` 的 `ran` 为 false,面板不再把 copy-through 报成 NR。
+- **换 extent(换代)**:见上,1920x1080 匹配计划三帧 `Close 0x0`;旧 stage 走 `renodx_retired` 按其录制票据释放。
+
+### 包交接收尾
+
+- 树内容核对:`dlssnr-amd-asd/`(ini、carrier.sodb、public-copy.psdb、net-carriers.bin、`wilsjo2-d3d12/` 21 个
+  dxbc)、`dlssnr-amd/shaders/renodx/`(19 个 HLSL)、`dlssnr-amd/shaders/wilsjo2/`(26 个 SPV);
+- 计划可用 `nr_parity_host` 的 `NR_PLAN_DUMP` 在任意 extent 离线生成(plan-only lowering,无设备/无注册);
+- `build_package.sh` 在带 `dlssnr-amd-asd/` 的打包中缺 DXBC 工具即失败,C I 不打包该目录,故不受影响。
