@@ -47,6 +47,12 @@ struct Recording {
     void seal() { std::lock_guard<std::mutex> guard(mutex); sealed = true; }
     // Strict form for a consumer that must never take the fallback as proof (the D3D12 ASD path): finished means
     // sealed, and every submission's wait has answered. An unknown submission is never strict-ready.
+    // Sealed with no submission ever attached: the recording was closed and then Reset/Released without being
+    // executed - the original Runtime's "dropped recording", whose history can no longer be trusted.
+    bool never_submitted() {
+        std::lock_guard<std::mutex> guard(mutex);
+        return sealed && waits.empty() && !unknown_submit;
+    }
     bool strict_ready() {
         std::lock_guard<std::mutex> guard(mutex);
         waits.erase(std::remove_if(waits.begin(), waits.end(), [](auto& f) { return f(); }), waits.end());

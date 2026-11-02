@@ -628,6 +628,7 @@ struct Backend {
     // when all of them are strictly done - not by the newest one, and not by a token maximum.
     struct FrameRecording {
         int64_t frame;                                // the backend frame number this recording belongs to
+        uint64_t feature;                             // the game feature the frame belonged to
         std::shared_ptr<nr::gpu::Recording> rec;
     };
     std::vector<FrameRecording> recordings;
@@ -724,7 +725,9 @@ void sweep() {
     // A recording whose every submission answered no longer gates the generation: drop it, so the set does not
     // accumulate one entry per frame for the life of the device.
     for (size_t i = 0; i < g.recordings.size();) {
-        if (!g.recordings[i].rec || nr::pe::split::completed(g.recordings[i].rec))
+        const bool dropped = g.recordings[i].rec && g.recordings[i].rec->never_submitted();
+        if (dropped) release_renodx_feature(g.recordings[i].feature);   // closed, never executed: history ends
+        if (!g.recordings[i].rec || dropped || nr::pe::split::completed(g.recordings[i].rec))
             g.recordings.erase(g.recordings.begin() + long(i));
         else ++i;
     }
@@ -1306,7 +1309,7 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
 
     if (renodx) {
         g.booking = nr::pe::split::book(f.cmd);
-        if (g.booking) g.recordings.push_back({int64_t(g.frames), g.booking});
+        if (g.booking) g.recordings.push_back({int64_t(g.frames), f.feature, g.booking});
         const bool ran = renodx_frame(f, color_state, output_state);
         // Marked even when the stage reports failure: a failed frame may have recorded some of its dispatches, and
         // those commands still hold internal resources that must not be released until the GPU ran past them.
@@ -1716,7 +1719,7 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
     // The same recording evidence as the RenoDX route: a generation's completeness is every frame it recorded,
     // ordinary and RenoDX alike - one branch alone must not stand for the generation.
     g.booking = nr::pe::split::book(f.cmd);
-    if (g.booking) g.recordings.push_back({int64_t(g.frames), g.booking});
+    if (g.booking) g.recordings.push_back({int64_t(g.frames), f.feature, g.booking});
     mark_frame(f.cmd);
     char line[200];
     std::snprintf(line, sizeof line, "ran %ux%u%s: %s", w, h, in_place ? " in place" : "",
