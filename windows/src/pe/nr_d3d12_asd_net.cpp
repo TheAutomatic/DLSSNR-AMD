@@ -237,9 +237,9 @@ struct Built {
     std::map<std::string, Kern> kern;
     Kern t_pre, t_post, t_grade;                  // the temporal pre / post (t_grade.pso null: no Style grade)
     ID3D12Resource *act = nullptr, *wgt = nullptr, *wgt_upload = nullptr, *surf1 = nullptr, *depth = nullptr;
-    // The last record's recording: if it was closed and dropped before execution, the weights/noise it was meant to
-    // upload never ran, and the next frame has to record them again (the Runtime's dropped-recording rule).
-    nr::gpu::Ticket last_ticket;
+    // The recording that initialized this arena. If discarded, rebuild the Built: the original upload is already
+    // retired and the recorded table/weight states cannot be repaired by clearing retargeted alone.
+    nr::gpu::Ticket initialization;
     ID3D12Resource* table = nullptr;
     // Debug: the noise field the plan precomputes into wgt's tail (readback, filled on the first frame).
     ID3D12Resource* noise_dump = nullptr;
@@ -651,6 +651,17 @@ public:
         const int want = q >= 0 ? q : (last_want_ >= 0 ? last_want_ : nr::kSmallFp8);
         last_want_ = want;
         const auto key = std::make_tuple(w, h, want);
+        if (auto it = nets_.find(key); it != nets_.end() && it->second->initialization &&
+            it->second->initialization->never_submitted()) {
+            const auto dropped = it->second;
+            RetiredNet retired;
+            retired.net = dropped;
+            retired_.push_back(std::move(retired));
+            for (auto alias = nets_.begin(); alias != nets_.end();) {
+                if (alias->second == dropped) alias = nets_.erase(alias);
+                else ++alias;
+            }
+        }
         if (auto it = nets_.find(key); it != nets_.end()) {
             current_shared_ = it->second;
             current_ = current_shared_.get();
@@ -811,9 +822,6 @@ public:
         // retarget: the weights with their tail once, then the noise field's jobs (their tables first in the ring).
         // Recorded only after this record has a slot: a record that declines below must not leave the weight copy
         // in the list, or the next one would transition b->wgt from COPY_DEST when it is already UNORDERED_ACCESS.
-        // A dropped record leaves retargeted set even though its weight copy and noise jobs never executed; the
-        // next record must redo them rather than run the network on an empty weight arena.
-        if (b->retargeted && b->last_ticket && b->last_ticket->never_submitted()) b->retargeted = false;
         const bool first = !b->retargeted;
         // The tables of this frame: [noise jobs (first frame)] [every dispatch] [the params].
         const uint32_t n_noise = first ? uint32_t(b->plan.noise.size()) : 0;
@@ -896,7 +904,7 @@ public:
             return false;
         }
         b->last_frame = int64_t(frame);
-        b->last_ticket = record_ticket;
+        if (first) b->initialization = record_ticket;
         touch_recording(b->gpu, record_ticket);
         if (fs) {
             fs->last_frame = int64_t(frame);

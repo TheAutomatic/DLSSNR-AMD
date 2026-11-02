@@ -132,3 +132,8 @@ x86_64-w64-mingw32-g++ -std=c++17 -O0 -fsyntax-only -Iwindows/src -Iwindows/src/
 a7b7ac7新增RetiredUse::rec却没有在任一创建点赋值，RetiredNet创建点还调用book(nullptr)，因此原“RetiredUse已接完成”结论不成立。审查者本轮直接接管net退休段：复用原nr::gpu::Uses，在Built和FeatureState真正record、首条GPU命令前记录使用集合；feature释放、旧token块和权重upload退休分别快照实际资源的使用集合；RetiredNet直接检查Built的全部未完成使用，不要求ready/淘汰点凭空取得command list。所有退休判断逐个strict完成，不再以最新token代替其他队列的完成。集合及时去掉strict完成项并去重，不新增并列注册表。
 
 net定向MinGW -fsyntax-only退出0。本轮没有运行GPU，完整链接/实际验证仍由执行agent串行推进；不能将此语法检查写成设备切换或完整离线集成已通过。
+
+
+### 13:45 轮监督：丢弃初始化恢复修正
+
+8252c48仅在last_ticket被丢弃时清retargeted，会在wgt_upload已置nullptr且进入退休表后再次CopyBufferRegion空源；普通后续帧丢弃也会错误触发初始权重重拷贝。审查者直接改为只保存首次初始化Recording：若该录制未提交即终止，ready移除该Built全部缓存别名并按原异步build入口重建；旧Built仍受原Uses退休集合保护。不在未知资源状态上重置一个布尔值，不恢复已经转交所有权的upload。net定向MinGW语法检查退出0；尚未用新二进制验证，已要求执行者先完成当前619的真实链接和哈希核验。
