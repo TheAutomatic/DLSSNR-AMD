@@ -417,8 +417,22 @@ std::string register_one(api::PFN_GetInterface get, const wchar_t* installer_nam
         desc.pEngineName = id.engine.c_str();
         desc.EngineVersion.Version = id.engine_version;
         api::Application* app = nullptr;
-        HRESULT hr = installer->RegisterApplication(exe.c_str(), &desc, api::kIidApplication, reinterpret_cast<void**>(&app));
-        log("[asd] registration: RegisterApplication %s", hr_text(hr).c_str());
+        // Everything the driver is handed, and the store's size around the call: E_HANDLE has to be attributable to
+        // the arguments or to the store's state, and neither is visible from the HRESULT alone.
+        log("[asd] registration: RegisterApplication(exe \"%s\", desc{exe \"%s\", name \"%s\", version 0x%llX, "
+            "engine \"%s\", engine 0x%llX}, apps %u)",
+            utf8(exe).c_str(), utf8(desc.pExeFilename).c_str(), utf8(desc.pName).c_str(),
+            static_cast<unsigned long long>(desc.Version.Version), utf8(desc.pEngineName).c_str(),
+            static_cast<unsigned long long>(desc.EngineVersion.Version), before);
+        HRESULT hr = E_FAIL;
+        try {
+            hr = installer->RegisterApplication(exe.c_str(), &desc, api::kIidApplication, reinterpret_cast<void**>(&app));
+        } catch (...) {
+            log("[asd] registration: RegisterApplication threw (apps now %u)", installer->GetApplicationCount());
+            throw;
+        }
+        log("[asd] registration: RegisterApplication %s (apps now %u)", hr_text(hr).c_str(),
+            installer->GetApplicationCount());
         if (FAILED(hr) || !app) {
             result = "RegisterApplication failed " + hr_text(hr);
         } else {

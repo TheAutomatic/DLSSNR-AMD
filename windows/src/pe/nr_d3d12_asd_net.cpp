@@ -944,11 +944,12 @@ public:
                 capture::mark(cmd, mark);
             }
             if (sched) {
-                char push_hex[3 * 96 + 1] = {};
-                const size_t pn = std::min<size_t>(d.push.size(), 96);
+                // The whole block: 128 B carries the tone/structure/skin/noise fields past byte 96.
+                char push_hex[3 * 128 + 1] = {};
+                const size_t pn = std::min<size_t>(d.push.size(), 128);
                 for (size_t p = 0; p < pn; ++p)
                     std::snprintf(push_hex + p * 3, 4, "%02x ", static_cast<unsigned char>(d.push[p]));
-                char line[640];
+                char line[760];
                 std::snprintf(line, sizeof line,
                               "frame %llu dispatch %zu %s grid %ux%ux%u push[%zu] %s| in 0x%llX out 0x%llX act 0x%llX wgt 0x%llX",
                               static_cast<unsigned long long>(frame), i, d.kern.c_str(), d.gx, d.gy, d.gz, d.push.size(),

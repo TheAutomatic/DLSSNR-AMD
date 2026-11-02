@@ -2905,6 +2905,14 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
                 std::memcpy(pre_push + kPreNoiseFieldAt, &no_field, 4);
                 push = pre_push;
             }
+            // Diagnostics: the block as it is dispatched (after the control and seed patches), whole - the fields
+            // past byte 96 (tone/structure/skin/noise) are what a comparison of params needs.
+            if ((impl_->pre_cap_wanted || impl_->kern_cap_wanted) && step.push_bytes >= 96) {
+                const auto* pb = static_cast<const uint8_t*>(push);
+                std::fprintf(stderr, "step push: %s %zu bytes:", s.disp[i].kern.c_str(), step.push_bytes);
+                for (size_t q = 0; q < step.push_bytes; ++q) std::fprintf(stderr, "%02x", static_cast<unsigned>(pb[q]));
+                std::fprintf(stderr, "\n");
+            }
             dispatch(cmd, *use, step.gx, step.gy, step.gz, push, step.push_bytes, set);
             if (impl_->pre_cap_wanted && !impl_->pre_cap_done && temporal && step.k == t.original_pre && s.act.handle &&
                 i < s.disp.size() && s.disp[i].push.size() >= 8) {
