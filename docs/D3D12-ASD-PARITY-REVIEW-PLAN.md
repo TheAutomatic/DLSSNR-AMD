@@ -174,3 +174,8 @@ C:\Users\Kenny\Downloads\wt-d3d12-asd-wiring\docs\D3D12-ASD-PERFORMANCE-REVIEW-P
 3. 若现有机制确实接不上，写明具体缺口，只做最小实现，并保留可审查增量。
 4. 诊断开关收敛到统一入口/测试宿主，不并列扩散新环境变量。
 5. 不同编译产物的末位差（如 HLSL/fxc 与 Slang）只记录为现象，未定位到具体运算前不作"优化器重排"之类的归因。
+
+
+## 全路线统一审查入口（2026-11-02）
+
+已完成相对原版73文件的全分类核查，含已做/未做、必要适配与重复遗漏：`C:\Users\Kenny\Downloads\wt-d3d12-asd-wiring\docs\D3D12-ASD-FULL-ROUTE-AUDIT.md`。以模块表、R01–R13和已完成证据作为统一清单；旧局部结论不代表全路线完成。沿原P0–P5/Q0–Q6和当前codec目标继续，RenoDX/W2生产可达分支一起核实际使用/退休；不重复权重/71层，不造框架，不扩无关平台，不交给用户操作。
