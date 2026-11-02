@@ -24,6 +24,7 @@
 #include <d3d12.h>
 
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 #include <functional>
@@ -54,6 +55,12 @@ inline bool tickets_complete(bool sealed, bool discarded, const std::vector<bool
 uint64_t book(ID3D12CommandList* list);
 bool completed(uint64_t booking);
 void invalidate(uint64_t booking);
+// The step ExecuteCommandLists takes for the lists it runs (the hooks call this), and the one Reset takes when it
+// succeeded - public so a test can drive the same path without the hooks.
+void note_execution(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists);
+void seal(uint64_t booking);
+// Test only: the answer completed() asks of the GPU, injectable so pending/complete sequences need no device.
+void set_fence_query_for_test(std::function<bool(ID3D12CommandQueue*, uint64_t)> query);
 
 // Hooks the list's class (once per class) and its queues'. False when lists of this class cannot be
 // cut, or when this list's state since its last Reset is not known yet - the hooks were installed

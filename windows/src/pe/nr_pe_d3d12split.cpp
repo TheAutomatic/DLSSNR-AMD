@@ -9,6 +9,8 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <functional>
+#include <map>
 #include <mutex>
 #include <unordered_map>
 #include <utility>
@@ -552,24 +554,44 @@ bool patch_list_class(List* list, std::string* why);
 
 void forget_list(void* self);
 
-ULONG STDMETHODCALLTYPE hk_Release(List* self) {
-    const ULONG left = orig_fn<ULONG(STDMETHODCALLTYPE*)(List*)>(self, kRelease)(self);
-    // Gone: a new list may be created at this address, and must neither inherit this one's state nor
-    // be redirected into this one's continuation.
-    if (left == 0) forget_list(self);
-    return left;
-}
-
-// Booking tickets: one per recording (list), stamped at each execution on that queue's fence, ended by Reset.
+struct Receipt {
+    ID3D12Fence* fence{};   // held: the queue may go, the fence's completed value stays readable
+    uint64_t value{};
+    ~Receipt() { if (fence) fence->Release(); }
+    Receipt() = default;
+    Receipt(const Receipt&) = delete;
+    Receipt& operator=(const Receipt&) = delete;
+    Receipt(Receipt&& o) noexcept : fence(o.fence), value(o.value) { o.fence = nullptr; }
+    Receipt& operator=(Receipt&& o) noexcept {
+        if (this != &o) { if (fence) fence->Release(); fence = o.fence; value = o.value; o.fence = nullptr; }
+        return *this;
+    }
+};
 struct Booking {
     ID3D12CommandList* list{};
-    std::vector<std::pair<ID3D12CommandQueue*, uint64_t>> receipts;
+    std::vector<Receipt> receipts;
     // sealed: the list was Reset successfully, so this recording is over and its receipts are the whole story.
     // A live recording is never "complete": it may be executed again, and its resources must stay.
     bool sealed{};
     bool discarded{};   // invalidate(): never executed and thrown away
 };
 std::vector<Booking> g_bookings;   // g_mutex
+
+ULONG STDMETHODCALLTYPE hk_Release(List* self) {
+    const ULONG left = orig_fn<ULONG(STDMETHODCALLTYPE*)(List*)>(self, kRelease)(self);
+    // Gone: a new list may be created at this address, and must neither inherit this one's state nor
+    // be redirected into this one's continuation.
+    if (left == 0) {
+        forget_list(self);
+        std::lock_guard<std::recursive_mutex> guard(g_mutex);
+        for (auto& b : g_bookings)
+            if (b.list == reinterpret_cast<ID3D12CommandList*>(self)) b.sealed = true;
+    }
+    return left;
+}
+
+// Booking tickets: one per recording (list), stamped at each execution on that queue's fence, ended by Reset.
+
 
 HRESULT STDMETHODCALLTYPE hk_Reset(List* self, ID3D12CommandAllocator* allocator, ID3D12PipelineState* pso) {
     if (g_pending.load(std::memory_order_acquire) || g_held_count.load(std::memory_order_acquire)) {
@@ -594,11 +616,11 @@ HRESULT STDMETHODCALLTYPE hk_Reset(List* self, ID3D12CommandAllocator* allocator
     const HRESULT hr = orig_fn<HRESULT(STDMETHODCALLTYPE*)(List*, ID3D12CommandAllocator*, ID3D12PipelineState*)>(
         self, kReset)(self, allocator, pso);
     if (SUCCEEDED(hr)) {
-        // Only a successful Reset ends the recording: the ticket is sealed with every receipt it collected, and the
-        // next book() on this list opens a new generation. A failed Reset leaves the recording as it was.
+        // Only a successful Reset ends the recording, through the same seal() the tickets use everywhere; the next
+        // book() on this list opens a new generation. A failed Reset leaves the recording as it was.
         std::lock_guard<std::recursive_mutex> guard(g_mutex);
-        for (auto& b : g_bookings)
-            if (b.list == reinterpret_cast<ID3D12CommandList*>(self)) b.sealed = true;
+        for (size_t i = 0; i < g_bookings.size(); ++i)
+            if (g_bookings[i].list == reinterpret_cast<ID3D12CommandList*>(self)) g_bookings[i].sealed = true;
     }
     if (SUCCEEDED(hr)) state_of(self)->reset(pso);
     return hr;
@@ -1047,6 +1069,9 @@ void execute_cut(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists,
 
 // The signal a booking needs: the same per-queue fence the continuations wait on. Called after the execution of
 // these lists, under g_mutex, so each booked list carries one receipt per execution.
+// Test-injected answer to "has this queue reached that value?"; empty: the real fences.
+std::function<bool(ID3D12CommandQueue*, uint64_t)> g_fence_query;
+
 void stamp_bookings_locked(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists) {
     // Nothing to stamp for a submission that carries no live recording: no fence is created or signalled for it.
     bool any = false;
@@ -1054,14 +1079,26 @@ void stamp_bookings_locked(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* con
         for (const auto& b : g_bookings)
             if (b.list == lists[i] && !b.sealed && !b.discarded) { any = true; break; }
     if (!any) return;
+    if (g_fence_query) {   // test mode: no queue/fence is touched; values are counted per queue
+        static std::map<ID3D12CommandQueue*, uint64_t> fake;
+        const uint64_t v = ++fake[q];
+        for (UINT i = 0; i < n; ++i)
+            for (auto& b : g_bookings)
+                if (b.list == lists[i] && !b.sealed && !b.discarded) { Receipt r; r.value = v; b.receipts.push_back(std::move(r)); }
+        return;
+    }
     QueueFence* f = completion_fence(q);
     const bool signalled = f && f->fence && SUCCEEDED(q->Signal(f->fence, f->value + 1));
     if (signalled) ++f->value;
     for (UINT i = 0; i < n; ++i)
         for (auto& b : g_bookings)
-            if (b.list == lists[i] && !b.sealed && !b.discarded)
+            if (b.list == lists[i] && !b.sealed && !b.discarded) {
                 // A failed signal leaves an unknown receipt: completed() then never treats these as finished.
-                b.receipts.emplace_back(q, signalled ? f->value : ~uint64_t(0));
+                Receipt r;
+                r.value = signalled ? f->value : ~uint64_t(0);
+                if (signalled && f->fence) { f->fence->AddRef(); r.fence = f->fence; }
+                b.receipts.push_back(std::move(r));
+            }
 }
 
 void STDMETHODCALLTYPE hk_Execute(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists) {
@@ -1147,7 +1184,12 @@ void execute_cut(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists,
     if (signalled && !g_bookings.empty()) {
         for (UINT i = 0; i < n; ++i)
             for (auto& b : g_bookings)
-                if (b.list == lists[i] && !b.sealed && !b.discarded) b.receipts.emplace_back(q, f->value);
+                if (b.list == lists[i] && !b.sealed && !b.discarded) {
+                    Receipt r;
+                    r.value = f->value;
+                    if (f->fence) { f->fence->AddRef(); r.fence = f->fence; }
+                    b.receipts.push_back(std::move(r));
+                }
     }
     for (Cont* c : ran) {
         // Without a completion mark a continuation is never handed out again.
@@ -1590,13 +1632,28 @@ bool completed(uint64_t booking) {
     std::vector<bool> done;
     done.reserve(b.receipts.size());
     for (const auto& r : b.receipts) {
-        // An unknown receipt (a failed Signal, or a queue whose fence is gone) is never done.
-        const QueueFence* f = r.second == ~uint64_t(0) ? nullptr : completion_fence(r.first);
-        if (!f || !f->fence) { done.push_back(false); continue; }
-        const uint64_t v = f->fence->GetCompletedValue();
-        done.push_back(v != UINT64_MAX && v >= r.second);
+        if (g_fence_query) { done.push_back(r.value != ~uint64_t(0) && g_fence_query(nullptr, r.value)); continue; }
+        if (!r.fence || r.value == ~uint64_t(0)) { done.push_back(false); continue; }
+        const uint64_t v = r.fence->GetCompletedValue();
+        done.push_back(v != UINT64_MAX && v >= r.value);
     }
     return tickets_complete(b.sealed, b.discarded, done);
+}
+
+void note_execution(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists) {
+    std::lock_guard<std::recursive_mutex> guard(g_mutex);
+    stamp_bookings_locked(queue, count, lists);
+}
+
+void seal(uint64_t booking) {
+    std::lock_guard<std::recursive_mutex> guard(g_mutex);
+    if (!booking || booking > g_bookings.size()) return;
+    g_bookings[booking - 1].sealed = true;
+}
+
+void set_fence_query_for_test(std::function<bool(ID3D12CommandQueue*, uint64_t)> query) {
+    std::lock_guard<std::recursive_mutex> guard(g_mutex);
+    g_fence_query = std::move(query);
 }
 
 void invalidate(uint64_t booking) {
