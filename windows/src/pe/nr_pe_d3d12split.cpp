@@ -1048,14 +1048,20 @@ void execute_cut(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists,
 // The signal a booking needs: the same per-queue fence the continuations wait on. Called after the execution of
 // these lists, under g_mutex, so each booked list carries one receipt per execution.
 void stamp_bookings_locked(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists) {
+    // Nothing to stamp for a submission that carries no live recording: no fence is created or signalled for it.
+    bool any = false;
+    for (UINT i = 0; i < n && !any; ++i)
+        for (const auto& b : g_bookings)
+            if (b.list == lists[i] && !b.sealed && !b.discarded) { any = true; break; }
+    if (!any) return;
     QueueFence* f = completion_fence(q);
-    if (!f || !f->fence) return;
-    if (FAILED(q->Signal(f->fence, f->value + 1))) return;
-    ++f->value;
-    if (g_bookings.empty()) return;
+    const bool signalled = f && f->fence && SUCCEEDED(q->Signal(f->fence, f->value + 1));
+    if (signalled) ++f->value;
     for (UINT i = 0; i < n; ++i)
         for (auto& b : g_bookings)
-            if (b.list == lists[i] && !b.sealed && !b.discarded) b.receipts.emplace_back(q, f->value);
+            if (b.list == lists[i] && !b.sealed && !b.discarded)
+                // A failed signal leaves an unknown receipt: completed() then never treats these as finished.
+                b.receipts.emplace_back(q, signalled ? f->value : ~uint64_t(0));
 }
 
 void STDMETHODCALLTYPE hk_Execute(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists) {
@@ -1580,16 +1586,17 @@ bool completed(uint64_t booking) {
     std::lock_guard<std::recursive_mutex> guard(g_mutex);
     if (!booking || booking > g_bookings.size()) return false;   // unknown is not complete
     const Booking& b = g_bookings[booking - 1];
-    if (b.discarded) return true;          // thrown away without ever running: nothing can read it
-    if (!b.sealed) return false;           // a live recording may still be executed: its resources stay
-    if (b.receipts.empty()) return false;  // sealed but never stamped: unknown, not done
+    if (!b.sealed && !b.discarded) return false;   // a live recording may still be executed: its resources stay
+    std::vector<bool> done;
+    done.reserve(b.receipts.size());
     for (const auto& r : b.receipts) {
-        QueueFence* f = completion_fence(r.first);
-        if (!f || !f->fence) return false;  // no fence: unknown
+        // An unknown receipt (a failed Signal, or a queue whose fence is gone) is never done.
+        const QueueFence* f = r.second == ~uint64_t(0) ? nullptr : completion_fence(r.first);
+        if (!f || !f->fence) { done.push_back(false); continue; }
         const uint64_t v = f->fence->GetCompletedValue();
-        if (v == UINT64_MAX || v < r.second) return false;
+        done.push_back(v != UINT64_MAX && v >= r.second);
     }
-    return true;
+    return tickets_complete(b.sealed, b.discarded, done);
 }
 
 void invalidate(uint64_t booking) {

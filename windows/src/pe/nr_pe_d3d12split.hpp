@@ -23,6 +23,9 @@
 // x86-64 only.
 #include <d3d12.h>
 
+#include <cstdint>
+#include <vector>
+
 #include <functional>
 #include <memory>
 #include <string>
@@ -38,6 +41,16 @@ uint64_t queue_completed(ID3D12CommandQueue* queue);  // the value the GPU has f
 // A recording's ticket: booked when work is recorded into the list, stamped by every ExecuteCommandLists that runs
 // it (the plain path included), ended by the list's Reset. completed() is the GPU's answer for all the stamps; a
 // discarded (Reset without execution) recording invalidates its history instead. 0: booking failed.
+// The rule completed() applies, as its own function so the sequences (never submitted, Reset failed, sealed with a
+// pending fence, executed twice, discarded after execution) can be checked without a device. `receipt_done` holds one
+// entry per receipt: whether that execution has finished.
+inline bool tickets_complete(bool sealed, bool discarded, const std::vector<bool>& receipt_done) {
+    // Nothing was ever submitted: the recording is finished once it is over (a successful Reset or a discard).
+    if (receipt_done.empty()) return sealed || discarded;
+    for (bool d : receipt_done) if (!d) return false;   // discarded stops future submissions, not these waits
+    return true;
+}
+
 uint64_t book(ID3D12CommandList* list);
 bool completed(uint64_t booking);
 void invalidate(uint64_t booking);
