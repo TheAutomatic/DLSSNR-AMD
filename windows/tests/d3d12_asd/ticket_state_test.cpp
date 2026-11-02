@@ -27,7 +27,7 @@ int main() {
     split::set_fence_query_for_test([](ID3D12CommandQueue*, uint64_t v) { return Fake::done()[kQ] >= v; });
 
     // 1. A live recording that never ran is not finished.
-    const uint64_t t1 = split::book(kL);
+    auto t1 = split::book(kL);
     expect("booked, never executed", split::completed(t1), false);
 
     // 2. Executed, the GPU has not reached it: still not finished; sealed or not.
@@ -41,8 +41,8 @@ int main() {
     expect("executed, fence completed", split::completed(t1), true);
 
     // 4. A new generation after a successful seal; the old ticket keeps its own answer.
-    const uint64_t t2 = split::book(kL);
-    expect("new generation is a different ticket", t2 != t1 && t2 != 0, true);
+    auto t2 = split::book(kL);
+    expect("new generation is a different ticket", t2 && t2 != t1, true);
     expect("new generation, never executed", split::completed(t2), false);
     split::note_execution(kQ, 1, &kL);
     expect("new generation, fence pending", split::completed(t2), false);
@@ -51,7 +51,7 @@ int main() {
     expect("new generation, fence completed + sealed", split::completed(t2), true);
 
     // 5. Executed twice: the later execution must finish before the recording counts as done.
-    const uint64_t t3 = split::book(kL);
+    auto t3 = split::book(kL);
     split::note_execution(kQ, 1, &kL);   // value 3
     split::note_execution(kQ, 1, &kL);   // value 4
     split::seal(t3);
@@ -61,7 +61,7 @@ int main() {
     expect("two executions, both done", split::completed(t3), true);
 
     // 6. Discarded after execution: the submitted work still holds its resources.
-    const uint64_t t4 = split::book(kL);
+    auto t4 = split::book(kL);
     split::note_execution(kQ, 1, &kL);   // value 5
     split::invalidate(t4);
     Fake::done()[kQ] = 4;

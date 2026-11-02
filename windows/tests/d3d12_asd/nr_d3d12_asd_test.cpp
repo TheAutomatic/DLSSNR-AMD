@@ -66,9 +66,10 @@ void restore(ID3D12GraphicsCommandList*, const std::shared_ptr<Snapshot>&) {}
 ID3D12CommandQueue* last_direct_queue() { return nullptr; }
 // The harness records into its own lists, not through the split hooks: no booking, so the backend keeps its token
 // completion path (the product links the real split and books there).
-uint64_t book(ID3D12CommandList*) { return 0; }
-bool completed(uint64_t) { return true; }
-void invalidate(uint64_t) {}
+std::shared_ptr<nr::gpu::Recording> book(ID3D12CommandList*) { return nullptr; }
+bool completed(const std::shared_ptr<nr::gpu::Recording>&) { return true; }
+void seal(const std::shared_ptr<nr::gpu::Recording>&) {}
+void invalidate(const std::shared_ptr<nr::gpu::Recording>&) {}
 }  // namespace split
 }  // namespace nr::pe
 

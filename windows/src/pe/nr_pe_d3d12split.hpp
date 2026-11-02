@@ -23,6 +23,10 @@
 // x86-64 only.
 #include <d3d12.h>
 
+#include "nr_gpu_completion.hpp"
+
+#include <memory>
+
 #include <cstdint>
 #include <functional>
 #include <vector>
@@ -52,13 +56,13 @@ inline bool tickets_complete(bool sealed, bool discarded, const std::vector<bool
     return true;
 }
 
-uint64_t book(ID3D12CommandList* list);
-bool completed(uint64_t booking);
-void invalidate(uint64_t booking);
+std::shared_ptr<nr::gpu::Recording> book(ID3D12CommandList* list);
+bool completed(const std::shared_ptr<nr::gpu::Recording>& rec);
+void invalidate(const std::shared_ptr<nr::gpu::Recording>& rec);
 // The step ExecuteCommandLists takes for the lists it runs (the hooks call this), and the one Reset takes when it
 // succeeded - public so a test can drive the same path without the hooks.
 void note_execution(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists);
-void seal(uint64_t booking);
+void seal(const std::shared_ptr<nr::gpu::Recording>& rec);
 // Test only: the answer completed() asks of the GPU, injectable so pending/complete sequences need no device.
 void set_fence_query_for_test(std::function<bool(ID3D12CommandQueue*, uint64_t)> query);
 

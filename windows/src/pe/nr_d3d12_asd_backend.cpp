@@ -623,7 +623,7 @@ struct Backend {
     int64_t executed = -1;               // newest frame the GPU finished
     // The recording ticket of the frame being recorded: every resource that frame makes is retired by it, so the
     // resource's own recording is its completion evidence (not a global "newest frame finished" assumption).
-    uint64_t booking = 0;
+    std::shared_ptr<nr::gpu::Recording> booking;
     std::vector<std::pair<int64_t, ID3D12Resource*>> token_retired;   // grown-away token buffers
     // A value the GPU has not written yet reads as ~0, and only a slot whose holder matches its own index is a
     // completion: a frame number ahead of the newest record is a torn read, not evidence.
@@ -637,8 +637,8 @@ struct Backend {
         }
     }
     struct Retired {
-        int64_t frame;     // the backend's frame number that last used it
-        uint64_t ticket;   // the split recording ticket of that frame (0: none seen)
+        int64_t frame;                                   // the backend's frame number that last used it
+        std::shared_ptr<nr::gpu::Recording> ticket;      // that frame's recording (null: none seen)
         IUnknown* p;
     };
     std::vector<Retired> retired;
