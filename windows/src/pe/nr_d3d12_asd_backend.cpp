@@ -698,6 +698,7 @@ struct Backend {
     struct RetiredStage {
         int64_t frame;
         nr::gpu::Uses uses;
+        const char* why;   // why it was replaced: a key change, a failed set(), or the feature being released
         std::unique_ptr<renodx12::Stage> stage;
     };
     std::vector<RetiredStage> renodx_retired;
@@ -795,8 +796,9 @@ void sweep() {
         // than merely producing output for the new one.
         // The evidence, not the frame number: how many recordings the retirement waited on and that all of them are
         // done (each is sealed and every submission has answered).
-        nr::pe::log("[asd] a replaced RenoDX stage was released (retired at frame %lld, %zu recording(s) done, stage %p)",
-                    (long long)r.frame, r.uses.tickets.size(), static_cast<void*>(r.stage.get()));
+        nr::pe::log("[asd] a replaced RenoDX stage was released (retired at frame %lld, reason %s, %zu recording(s) done, "
+                    "stage %p)", (long long)r.frame, r.why ? r.why : "?", r.uses.tickets.size(),
+                    static_cast<void*>(r.stage.get()));
         return true;
     });
     g.renodx_retired.erase(rs, g.renodx_retired.end());
@@ -1168,7 +1170,7 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
         c.feature = f.feature;
         // Only an object that existed: on the first make there is nothing to retire, and a null entry would be logged
         // as a replaced stage later.
-        if (e.stage) g.renodx_retired.push_back({int64_t(g.frames), g.uses_now(), std::move(e.stage)});   // released once its frame's recording is done
+        if (e.stage) g.renodx_retired.push_back({int64_t(g.frames), g.uses_now(), "key", std::move(e.stage)});   // released once its frame's recording is done
         auto made = renodx12::Stage::make(c, &why);
         if (made) made->set_retire([](IUnknown* r) { retire(r); });   // released on the backend's watermark
         if (made) {
@@ -1183,7 +1185,7 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
     if (!e.stage->set(s)) {
         // Relative <-> absolute units (NRLinearUnitNits, NRSourceEncoding): a stage made with the new settings
         // takes the frame now (0.0.8.1 retires the old one and waits a frame; the bridge is never used here).
-        if (e.stage) g.renodx_retired.push_back({int64_t(g.frames), g.uses_now(), std::move(e.stage)});
+        if (e.stage) g.renodx_retired.push_back({int64_t(g.frames), g.uses_now(), "set", std::move(e.stage)});
         renodx12::Stage::Config c;
         c.device = f.device;
         c.shaders = widen(nr::pe::module_folder()) + L"\\dlssnr-amd\\shaders\\renodx";
@@ -1796,7 +1798,7 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
 }
 void release_renodx_feature(uint64_t feature) {
     if (auto it = g.renodx.find(feature); it != g.renodx.end()) {
-        if (it->second.stage) g.renodx_retired.push_back({int64_t(g.frames), g.uses_now(), std::move(it->second.stage)});
+        if (it->second.stage) g.renodx_retired.push_back({int64_t(g.frames), g.uses_now(), "feature", std::move(it->second.stage)});
         g.renodx.erase(it);
     }
     if (g.network) {
