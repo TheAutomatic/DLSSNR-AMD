@@ -18,3 +18,10 @@
 ## 全路线统一审查入口（2026-11-02）
 
 已完成相对原版73文件的全分类核查，含已做/未做、必要适配与重复遗漏：`C:\Users\Kenny\Downloads\wt-d3d12-asd-wiring\docs\D3D12-ASD-FULL-ROUTE-AUDIT.md`。以模块表、R01–R13和已完成证据作为统一清单；旧局部结论不代表全路线完成。沿原P0–P5/Q0–Q6和当前codec目标继续，RenoDX/W2生产可达分支一起核实际使用/退休；不重复权重/71层，不造框架，不扩无关平台，不交给用户操作。
+
+
+## 执行重心纠正（用户质疑耗时，2026-11-02）
+
+最近过度串行追逐HDR微差和probe，注册与确认的生产缺陷未同步推进，执行重心偏离。当前分工：主会话负责正常程序化注册首次失败定位；omp直接处理R01/R05/R07及生产可达W2必要修正。HDR源纹理一half ULP差异与探针证据保留，继续按实际需要分析，但不作为注册或其他独立工作先决条件，不增设逐位零差门槛、不改数学硬凑参考。阶段二继续延期。
+
+本轮真实无GPU注册定位：独立用户级installer身份，CoInitializeEx、factory、CreateInstaller及GetPrecompileTargets均S_OK（3目标）；builtin/实际exe两种desc的RegisterApplication均E_HANDLE，应用数始终0。尚未传入SODB/PSDB，因而此错误不在ACO对象加载阶段。原始日志与最小程序在artifacts/d3d12-parity-review/registration-probe/。不凭此直接宣称Windows或驱动故障；下一步针对该调用的注册后端定位，不重查shader/权重。自动审批拒绝的清理初始化验证没有执行，已采用不清理状态的目标枚举替代。
