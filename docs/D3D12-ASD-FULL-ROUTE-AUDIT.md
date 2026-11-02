@@ -319,8 +319,10 @@ plan-only lowering(`nr_d3d12_net_plan.hpp:63`;`nr_runtime.cpp:3195` 注释即 "n
 
 已实测(`nr_parity_host` 加 `NR_PLAN_DUMP`,在任何设备/运行时创建之前调用 `set_plan_dump_path` + `plan_d3d12_network`):
 - 生成:`plan dump written: 1920x1080, 71 dispatches`(`asd-harness/plan1080.txt`,plan 134,662,038 B);
-- 用这个匹配计划跑 D3D12 路线 1920x1080 三帧(`boundary-1080-matching.txt`):网络按 1920x1080 构建,stage "1 pass",
-  三帧 `Close 0x0`,exit=0。这就是换 extent 的换代边界(新 stage、新网络、旧 stage 按其录制票据退休)。
+- **仅证明另一 extent 在新进程里能正常启动**:`boundary-1080-matching.txt`(1920x1080、匹配计划、三帧 `Close 0x0`,
+  网络按 1920x1080 构建、stage "1 pass")。这不是 resize/换代:进程一次只有一种 extent,旧 stage 从未存在,
+  因此**没有**证明旧 stage 进入 `renodx_retired`、更没有证明它按录制票据被释放。换代仍需同一进程、同一 feature、
+  同一设备上先录一种 extent 再切另一种并分别提交完成的用例,该用例尚未运行。
 - 另保留不匹配计划的边界数据(`boundary-1080.txt`):明确拒绝、不录半帧、不退回桥。
 
 ### 最小生命周期/状态边界(现有开关,无新框架)
@@ -328,7 +330,8 @@ plan-only lowering(`nr_d3d12_net_plan.hpp:63`;`nr_runtime.cpp:3195` 注释即 "n
 - **copy-through 状态(R05 的输入)**:`NR_TEST_NR_OFF=1` 跑 3840x2160 两帧(`asd-harness/boundary-nroff.txt`)——stage
   记录 0 pass、backend 仍成功返回、两帧 `Close 0x0`。此时 `note_backend_produced(ran > 0)` 为 false,即模型侧
   `report_control(...)` 的 `ran` 为 false,面板不再把 copy-through 报成 NR。
-- **换 extent(换代)**:见上,1920x1080 匹配计划三帧 `Close 0x0`;旧 stage 走 `renodx_retired` 按其录制票据释放。
+- **换 extent(换代)**:未运行。上面两段只是两种 extent 各自在新进程里启动;旧 stage 进 `renodx_retired` 并按其录制
+  票据释放这条路径目前只有编译覆盖,没有同进程切换的实际提交证据。
 
 ### 包交接收尾
 
