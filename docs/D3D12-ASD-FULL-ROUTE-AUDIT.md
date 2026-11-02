@@ -197,3 +197,10 @@ R01/R07/R09表明此前局部完成不能概括为整个生命周期闭环；R02
 双侧真实RGBA32F已跑通，文件均132710400B。审查者独立复核295429个f32数值/bit不同、全部有限，最大绝对差0.0005024075508117676。原554个half差异全部位于f32已不同的相同位置；34个肩部以下差异像素的34个对应通道也已不同。原始交叉统计为artifacts/d3d12-parity-review/build-logs/encode-f32-independent-crosscheck.json。
 
 准确边界为v6_encode内部、SrgbEncode之前（probe位于toe/shoulder之后），不能写成v6_encode之前或排除肩部全部计算；不能仅由f32不同就证明SrgbEncode绝无附加差异。下一步优先取34个无肩部干扰的位置分离实际source/sum/weight/divisor。当前是定位进展，不是554值已经修复。阶段二仍延期。
+
+
+## 16:45阶段一实际增量
+
+stage2同文件独立复核：全图2501个bit差异；34个目标像素的原差异通道实际也是34个不同，并非代理此前报告的0。样本(293,95) R：ASD sum=0.0001765384222380817（bits960044332），VK=0.00017641922750044614（bits960036141），weight均1。统计在build-logs/encode-stage2-independent.json。必须据此先观测源work0，不再排除采样/求和而归因toe；host尺寸相等也不能替代运行时footprint观测。
+
+a045405在同一shader/selector增加stage5直接Original.Load的源texel观测，以及按需stage6的实际scale/coverage，不增加宿主框架、不改变产品公式。R08比较器已在e0a312c复用原compare_dumps.py支持rgba32f、精确16B像素长度和细微值显示，拒绝未知格式误当half。定向CPU已验证half/f32一ULP变化与未知格式，不启动GPU。探针由执行者串行运行，当前源差异仍未修复。

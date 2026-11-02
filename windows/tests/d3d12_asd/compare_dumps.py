@@ -54,7 +54,7 @@ def main():
     if full:
         print(f"  worst channel max {worst:.3f} of full scale {full:.0f} = {100.0 * worst / full:.2f}%")
     else:
-        print(f"  worst channel max {worst:.6f} (float dump: absolute units; "
+        print(f"  worst channel max {worst:.8g} (float dump: absolute units; "
               f"range {float(ca['R'].min()):.4f}..{float(ca['R'].max()):.4f})")
 
 if __name__ == "__main__":
