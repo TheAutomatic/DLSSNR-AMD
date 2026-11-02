@@ -51,22 +51,28 @@ void transition(ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATE
 std::shared_ptr<nr::gpu::Recording> g_rec;
 std::atomic<bool> g_rec_submitted{false};
 bool submit() {
-    g_cmd->Close();
+    const HRESULT closed = g_cmd->Close();
     ID3D12CommandList* l[] = {g_cmd};
     g_queue->ExecuteCommandLists(1, l);
-    g_queue->Signal(g_fence, ++g_fv);
+    const HRESULT signalled = g_queue->Signal(g_fence, ++g_fv);
     HANDLE e = CreateEventA(nullptr, FALSE, FALSE, nullptr);
-    g_fence->SetEventOnCompletion(g_fv, e);
-    const DWORD w = WaitForSingleObject(e, 20000);
-    CloseHandle(e);
-    if (g_rec) {   // the GPU ran what this recording held: the slot's evidence
+    const HRESULT watch = e ? g_fence->SetEventOnCompletion(g_fv, e) : E_OUTOFMEMORY;
+    const DWORD w = e ? WaitForSingleObject(e, 20000) : WAIT_FAILED;
+    if (e) CloseHandle(e);
+    // The recording is published as finished only after the fence says this submission completed and the device is
+    // still there: a timeout is not evidence, and the allocator must not be reused for work that may still run.
+    const HRESULT removed = g_dev->GetDeviceRemovedReason();
+    const bool ran = SUCCEEDED(closed) && SUCCEEDED(signalled) && SUCCEEDED(watch) && w == WAIT_OBJECT_0 &&
+                     g_fence->GetCompletedValue() >= g_fv && SUCCEEDED(removed);
+    if (ran && g_rec) {
         g_rec_submitted = true;
         g_rec->seal();
         g_rec.reset();
     }
-    const HRESULT removed = g_dev->GetDeviceRemovedReason();
-    g_alloc->Reset();
-    g_cmd->Reset(g_alloc, nullptr);
+    if (ran) {
+        g_alloc->Reset();
+        g_cmd->Reset(g_alloc, nullptr);
+    }
     if (w != WAIT_OBJECT_0 || FAILED(removed)) {
         std::printf("the GPU work did not finish (wait %lu, removed 0x%08lX)\n", w, removed);
         return false;

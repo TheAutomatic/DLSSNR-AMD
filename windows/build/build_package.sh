@@ -304,6 +304,24 @@ if [[ -d "$asd_dir" ]]; then
     else
         echo "dlssnr-amd-asd: packaged (without reprofile tools; set NR_ASD_TOOLS to include them)"
     fi
+    # The wilsjo2 programs as DXBC, where the native stage reads them (nr_asi_wilsjo2.cpp: asd::folder()\wilsjo2-d3d12).
+    # Built from the packaged SPV with the two pinned tools, or taken from a prebuilt set; with neither the package
+    # build stops: a package that ships the route without its programs runs every one of its frames on the bridge.
+    if [[ -n ${NR_SPIRV_CROSS:-} && -n ${NR_W2_DXBC:-} ]]; then
+        bash windows/build/build_wilsjo2_d3d12.sh "$pkg/dlssnr-amd/shaders/wilsjo2" "$out/w2-d3d12" \
+            "$NR_SPIRV_CROSS" "$NR_W2_DXBC" > /dev/null
+        mkdir -p -- "$asd_pkg/wilsjo2-d3d12"
+        cp -- "$out/w2-d3d12"/dxbc/*.dxbc "$asd_pkg/wilsjo2-d3d12/"
+        echo "dlssnr-amd-asd: wilsjo2 D3D12 programs built from the packaged SPIR-V"
+    elif [[ -n ${NR_W2_DXBC_DIR:-} && -d ${NR_W2_DXBC_DIR:-} ]]; then
+        mkdir -p -- "$asd_pkg/wilsjo2-d3d12"
+        cp -- "$NR_W2_DXBC_DIR"/*.dxbc "$asd_pkg/wilsjo2-d3d12/"
+        echo "dlssnr-amd-asd: wilsjo2 D3D12 programs from $NR_W2_DXBC_DIR"
+    else
+        echo "dlssnr-amd-asd: the wilsjo2 D3D12 programs are missing: set NR_SPIRV_CROSS and NR_W2_DXBC (a Windows host" \
+             "builds them) or NR_W2_DXBC_DIR (a prebuilt set of wilsjo2_*.dxbc)" >&2
+        exit 1
+    fi
 fi
 
 # experimental/: what install.ps1 makes CC_SMALL_FP8_EXPERIMENTAL's weights with - the difference of its fitted weights
