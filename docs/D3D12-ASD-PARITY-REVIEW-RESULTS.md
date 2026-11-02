@@ -322,3 +322,13 @@ post 的 1 字节差异已定位：偏移 120..123 是 `PushImageTail.w_off`（�
 不是参数错误；对照时应把参考宿主改为不设 `post_alpha`，或接受该 1 字节。
 
 pre 的 27 字节落在 act 的 e4m3 区（`fswin_t.comp:3640`），不能按 f16 解释。
+
+## 工具使用更正（2026-11-01 20:42）
+
+- 20:42:06 与 20:42:11 两次 `cmd.exe /c regfix.ps1` 属于**通过 ShellExecute 打开 .ps1 文件**，只会弹出"打开方式"
+  窗口，脚本**没有执行**；不能把等待窗口当作计算失败。
+- 20:42:25 的 `powershell -NoProfile -ExecutionPolicy Bypass -File regfix.ps1` 才是真正执行的那次。
+- 今后所有 .ps1 一律 `pwsh -NoProfile -File <绝对路径>`（或 `powershell -NoProfile -File`），不通过 `cmd /c <file>.ps1`。
+- 当前 override 实测（只读）：`precompiled-db-path = ...\asd-harness\dlssnr-amd-asd\public-copy.psdb`，
+  `apps` = `nr_619.exe`（由最近的 ASD 运行写入）。需要恢复时用 `d3dconfig apps --remove` + 清
+  `D3DBehaviors.PrecompiledDatabasePath`，并在读回确认后再跑非 ASD 任务。
