@@ -360,3 +360,15 @@ pre 的 27 字节落在 act 的 e4m3 区（`fswin_t.comp:3640`），不能按 f1
 - 修复目标明确落在 **encode 的 HLSL（d3dcompiler_47）与参考 SPIR-V 实现**之间，而不是网络或接线。
 - `in_raw_frame0.bin` 本轮与参考 proxy 仍不一致，属抓取时机（重放后 neural 一致已证明重放输入生效）；
   下一次重放时先修这个抓取点，再用它做输入侧的逐值证据。
+
+## codec 首轮定位（HDR10 absolute v6，`v6_encode`）
+
+- 两侧用的是**同一份** `windows/shaders/renodx/v6_encode.cs_5_1.hlsl`；差别只在编译器：D3D12 用
+  `D3DCompile(cs_5_1, OPTIMIZATION_LEVEL3)`，参考用 `slangc -O2 → SPIR-V`（`windows/build/build_renodx.sh`）。
+- 实验（测试专用 `NR_TEST_CODEC_NOOPT=1`，改用 `D3DCOMPILE_SKIP_OPTIMIZATION`）：差从 554 个值劣化到 **821** 个，
+  且出现最高 8128 ULP 的离群值 → 说明差来自**优化器的重排**，不是某个运算写错；当前 level-3 已是最接近的构建。
+- 因此这个 case 的残差（encode 554 个 1–2 ULP）是两次编译的固有差，不是可"修"的代码错误；若要逐位一致，只能让
+  两侧用同一编译器（D3D12 上不可能），或在该 kernel 上放弃优化（更差）。
+
+**范围**：以上只证明该 case（HDR10 absolute v6、第 0 帧、该 proxy/guide/push）。多帧序列、SDR legacy codec、
+其它 HDR 模式未验证。

@@ -517,7 +517,10 @@ ID3DBlob* compile_hlsl(const char* source, size_t bytes, const char* entry, std:
     }();
     if (!fn) { *why = "d3dcompiler_47.dll (D3DCompile) is not available"; return nullptr; }
     ID3DBlob *code = nullptr, *errors = nullptr;
-    const HRESULT hr = fn(source, bytes, entry, macros, inc, entry, "cs_5_1", 1u << 15, 0, &code, &errors);
+    // Test-only: D3DCOMPILE_SKIP_OPTIMIZATION (bit 2) instead of level-3, to see whether the codec's ULP differences
+    // against the SPIR-V build come from the optimizer's reassociation. The product compiles at level 3.
+    const UINT flags = (std::getenv("NR_TEST_CODEC_NOOPT") ? (1u << 2) : 0u) | (1u << 15);
+    const HRESULT hr = fn(source, bytes, entry, macros, inc, entry, "cs_5_1", flags, 0, &code, &errors);
     if (FAILED(hr) || !code) {
         *why = std::string("the ") + entry + " shader did not compile";
         if (errors) { *why += ": "; *why += static_cast<const char*>(errors->GetBufferPointer()); }
