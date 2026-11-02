@@ -337,7 +337,7 @@ pre 的 27 字节落在 act 的 e4m3 区（`fswin_t.comp:3640`），不能按 f1
 
 - `lin_proxy`（ASD 网络真正读的 float4）与本侧 `proxy` 的 f16 展开**完全相等**（33,177,600/33,177,600），
   `tex_to_buf` 没有算术，转换无损。
-- 两侧 `proxy`（encode 输出，f16）现行差：**554 / 33,177,600 个值相差 1 个 f16 ULP**（0.0017%，max 4.88e-4），
+- 两侧 `proxy`（encode 输出，f16）现行差：**554 / 33,177,600 个值不同**，ULP 分布 548 个差 1、6 个差 2（max 4.88e-4），
   其余完全相同。这与 pre 的 27 字节差、以及 neural 的 mean 0.0038 同源：RenoDX 的 encode/decode/look 在
   ASD 路线是 HLSL（d3dcompiler_47），在参考路线是 SPIR-V（nr_renodx.cpp），两次编译必然有末位差；网络对输入
   敏感，差被放大。
@@ -345,3 +345,18 @@ pre 的 27 字节落在 act 的 e4m3 区（`fswin_t.comp:3640`），不能按 f1
   不是参数差。
 - post 的 1 字节是 `PushImageTail.w_off` bit31 = `NR_POST_ALPHA`：参考（Vulkan）由 post 块恢复 alpha，D3D12 由
   独立 alpha pass 恢复，按设计保留，不追求字节一致；比较 RGB 即可。
+
+## 决定性重放：同一输入下两侧网络输出逐位相同
+
+`NR_TEST_PROXY_REPLAY=<f16 proxy dump>`（测试专用，产品不改算术）：把参考侧录到的 proxy 直接作为 D3D12 ASD
+网络的输入（逐值精确展宽为 float4），绕过本侧 encode，guide/push/seed 不变。
+
+结果：**neural 与参考逐位相同——33,177,600 个值中 0 个不同（max 0，mean 0）。**
+
+因此：
+
+- 网络、push、参数、ABI 在两侧是一致的（同一输入下无可测量的差）；
+- 之前的 neural mean 0.0038 与 pre 的 27 字节，全部来自 encode 输出的 554 个 1–2 ULP 差异；
+- 修复目标明确落在 **encode 的 HLSL（d3dcompiler_47）与参考 SPIR-V 实现**之间，而不是网络或接线。
+- `in_raw_frame0.bin` 本轮与参考 proxy 仍不一致，属抓取时机（重放后 neural 一致已证明重放输入生效）；
+  下一次重放时先修这个抓取点，再用它做输入侧的逐值证据。

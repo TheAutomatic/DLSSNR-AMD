@@ -14,6 +14,9 @@ namespace nr::asi::native {
 #include "nr_pe_log.hpp"
 #include "nr_d3d12_capture.hpp"
 #include <cstdarg>
+#include <cmath>
+#include <fstream>
+#include <iterator>
 
 #include <d3dcompiler.h>
 #include <windows.h>
@@ -1132,6 +1135,19 @@ struct Stage::Impl {
         states[t.res] = D3D12_RESOURCE_STATE_COMMON;
         return t;
     }
+    // A host-visible buffer for a test upload (the proxy replay): mapped by the caller, never read on the GPU.
+    ID3D12Resource* upload_buffer(ID3D12Device* dev, uint64_t bytes) {
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = bytes; rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1; rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        ID3D12Resource* r = nullptr;
+        if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                                nullptr, IID_PPV_ARGS(&r)))) return nullptr;
+        return r;
+    }
     ID3D12Resource* make_buffer(uint64_t bytes, std::string* why) {
         D3D12_HEAP_PROPERTIES hp{};
         hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -1152,6 +1168,7 @@ struct Stage::Impl {
     // A replaced surface may still be read by a recorded frame another list has not run yet, so the release goes
     // through the caller's completion watermark when it gave one; `states` forgets it either way.
     std::function<void(ID3D12Resource*)> retire;
+    ID3D12Resource* replay_buf_ = nullptr;   // test-only: the uploaded network input (NR_TEST_PROXY_REPLAY)
     void drop(Tex& t) {
         if (!t.res) return;
         states.erase(t.res);
@@ -2309,6 +2326,52 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
             View uav[14] = {};
             uav[0] = bv(lin_proxy, uint64_t(NW) * NH * 16, false, true);
             dispatch(cmd, kTexToBuf, srv, uav, &c, 8, (NW + 7) / 8, (NH + 7) / 8);
+        }
+        // Test-only: replay another route's network input instead of this route's encode, so a difference in the
+        // answer can be attributed to the codec or to the network. The file is the f16 proxy (W*H*8) another route
+        // recorded; each value is widened to float exactly, which is what a reader of that image sees.
+        if (const char* replay = std::getenv("NR_TEST_PROXY_REPLAY"); replay && replay[0]) {
+            if (!replay_buf_) {
+                const uint64_t bytes = uint64_t(NW) * NH * 8;
+                std::vector<uint8_t> f16(bytes);
+                std::ifstream in(replay, std::ios::binary);
+                if (in && in.read(reinterpret_cast<char*>(f16.data()), std::streamsize(bytes))) {
+                    replay_buf_ = upload_buffer(device, uint64_t(NW) * NH * 16);
+                    if (replay_buf_) {
+                        void* m = nullptr;
+                        if (SUCCEEDED(replay_buf_->Map(0, nullptr, &m)) && m) {
+                            auto* dst = static_cast<float*>(m);
+                            const auto* src = reinterpret_cast<const uint16_t*>(f16.data());
+                            for (size_t i = 0; i < size_t(NW) * NH * 4; ++i) {
+                                const uint16_t h = src[i];
+                                const uint32_t sign = (h & 0x8000u) ? 0x80000000u : 0u;
+                                const uint32_t e = (h >> 10) & 0x1Fu, f = h & 0x3FFu;
+                                float v;
+                                if (e == 0) {
+                                    v = std::ldexp(float(f), -24);          // 0 or subnormal, |v| < 2^-14
+                                    if (sign) v = -v;
+                                } else if (e == 31) {
+                                    const uint32_t bits = sign | 0x7F800000u | (f << 13);
+                                    std::memcpy(&v, &bits, 4);
+                                } else {
+                                    const uint32_t bits = sign | ((e + 112u) << 23) | (f << 13);
+                                    std::memcpy(&v, &bits, 4);
+                                }
+                                dst[i] = v;
+                            }
+                            replay_buf_->Unmap(0, nullptr);
+                            jlog("renodx proxy replay: %s (%llu bytes f16)", replay,
+                                 static_cast<unsigned long long>(bytes));
+                        }
+                    }
+                }
+            }
+            if (replay_buf_) {
+                ensure(cmd, lin_proxy, D3D12_RESOURCE_STATE_COPY_DEST);
+                cmd->CopyBufferRegion(lin_proxy, 0, replay_buf_, 0, uint64_t(NW) * NH * 16);
+                ensure(cmd, lin_proxy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                uav_barrier(cmd);
+            }
         }
         // Pass k's controls, RenoDX's (record_renodx.cpp's pass_controls): pass 1's, or pass k's once its
         // "Same as pass 1" is off; with NRSkinIndependent and the Character mask on, Structure at most 1 and a
