@@ -177,6 +177,31 @@ struct Programs {
 };
 Programs g_programs;
 
+// The recordings a replaced stage's last frames belong to: the strict check (every ticket of the registry that has not
+// finished), so a stage of the previous device is freed once the GPU ran past its work instead of being leaked.
+nr::gpu::Uses pending_uses() {
+    nr::gpu::Uses u;
+    std::lock_guard<std::mutex> g(nr::gpu::registry_mutex);
+    for (auto& [key, t] : nr::gpu::recordings)
+        if (t && !nr::pe::split::completed(t)) u.tickets.push_back(t);
+    return u;
+}
+struct RetiredStage {
+    std::unique_ptr<w2::Stage> stage;
+    nr::gpu::Uses uses;
+};
+std::vector<RetiredStage> g_retired_stages;
+
+void sweep_retired_stages() {
+    for (size_t i = 0; i < g_retired_stages.size();) {
+        bool done = true;
+        for (const auto& t : g_retired_stages[i].uses.tickets)
+            if (t && !nr::pe::split::completed(t)) { done = false; break; }
+        if (done) g_retired_stages.erase(g_retired_stages.begin() + long(i));
+        else ++i;
+    }
+}
+
 // Ready on `device`: the stage; else null and why (making them is started on the first call).
 w2::Stage* programs(ID3D12Device* device, std::string* why) {
     std::lock_guard<std::mutex> l(g_programs.m);
@@ -184,7 +209,8 @@ w2::Stage* programs(ID3D12Device* device, std::string* why) {
     if (g_programs.state == 3 && g_programs.device == device) { *why = "its D3D12 programs: " + g_programs.why; return nullptr; }
     if (g_programs.state == 1) { *why = "its D3D12 programs are being made"; return nullptr; }
     // first use, or another device: (re)made
-    if (g_programs.stage) (void)g_programs.stage.release();   // the GPU may still run the old device's (never freed)
+    sweep_retired_stages();
+    if (g_programs.stage) g_retired_stages.push_back({std::move(g_programs.stage), pending_uses()});
     g_programs.impl = nullptr;
     if (g_programs.device) g_programs.device->Release();
     device->AddRef();
@@ -246,6 +272,8 @@ void say_route(const std::string& line) {
 class Timing {
 public:
     void begin(ID3D12Device* device, ID3D12GraphicsCommandList* cmd, uint32_t w, uint32_t h) {
+        if (device_ != device) release();   // the queries and the readback belong to the device that made them
+        device_ = device;
         if (!made_) make(device);
         if (!map_) return;
         slot_ = uint32_t(runs_ % kRing);
@@ -258,6 +286,9 @@ public:
         if (!map_) return;
         cmd->EndQuery(heap_, D3D12_QUERY_TYPE_TIMESTAMP, slot_ * 2 + 1);
         cmd->ResolveQueryData(heap_, D3D12_QUERY_TYPE_TIMESTAMP, slot_ * 2, 2, buf_, uint64_t(slot_) * 16);
+        // The pair is the CPU's to read only once the recording that resolved it finished (the run itself may still be
+        // queued, and reading a slot's old contents would be a sample of another run).
+        ticket_[slot_] = nr::gpu::current();
     }
 
 private:
@@ -286,6 +317,7 @@ private:
         if (!map_) nr::pe::log("[asd] wilsjo2 on D3D12: its GPU time cannot be measured (no timestamp queries)");
     }
     void read(uint32_t slot) {
+        if (ticket_[slot] && !nr::pe::split::completed(ticket_[slot])) return;   // not written yet: no sample, not a guess
         uint64_t t[2];
         std::memcpy(t, map_ + uint64_t(slot) * 16, 16);
         if (!t[0] || t[1] <= t[0]) return;
@@ -305,12 +337,22 @@ private:
             sum_ = 0; min_ = 0; max_ = 0; n_base_ = n_;
         }
     }
+    void release() {
+        made_ = false;
+        map_ = nullptr;
+        if (buf_) { buf_->Unmap(0, nullptr); buf_->Release(); buf_ = nullptr; }
+        if (heap_) { heap_->Release(); heap_ = nullptr; }
+        for (auto& t : ticket_) t.reset();
+        runs_ = 0; slot_ = 0;
+    }
     bool made_ = false;
+    ID3D12Device* device_ = nullptr;   // the device that made the queries (a swap drops them)
     ID3D12QueryHeap* heap_ = nullptr;
     ID3D12Resource* buf_ = nullptr;
     uint8_t* map_ = nullptr;
     double hz_ = 0;
     uint64_t runs_ = 0, n_ = 0, n_base_ = 0;
+    nr::gpu::Ticket ticket_[kRing];   // the recording that resolved each slot (null: not resolved by us)
     uint32_t slot_ = 0, w_ = 0, h_ = 0;
     double sum_ = 0, min_ = 0, max_ = 0;
 };
