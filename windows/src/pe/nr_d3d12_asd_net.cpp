@@ -648,7 +648,11 @@ public:
             if (nets_.size() >= kMaxExtents) {
                 auto lru = nets_.begin();
                 for (auto it = nets_.begin(); it != nets_.end(); ++it) if (it->second->used < lru->second->used) lru = it;
-                retired_.push_back({std::move(lru->second)});
+                RetiredNet rn;
+                rn.net = std::move(lru->second);
+                // Its last frame is the current one: the caller's recording for this list proves when it is done.
+                rn.rec = split::book(nullptr);   // no list here: keep the watermark for this one
+                retired_.push_back(std::move(rn));
                 nets_.erase(lru);
             }
             auto& b = nets_[done_key];
@@ -1299,8 +1303,10 @@ private:
     // has passed the frame that last used the resource (a stack of many passes records that many evaluates
     // into one still-unsubmitted command list; a tick_ counter would release under it).
     struct RetiredNet {
-        std::shared_ptr<Built> net;   // kept alive: its watermark is what releases it
+        std::shared_ptr<Built> net;   // kept alive
+        nr::gpu::Ticket rec;          // the last recording that used it (empty: the watermark below)
         bool done() {
+            if (rec) return split::completed(rec);
             if (!net || net->last_frame < 0) return true;
             net->refresh_executed(uint64_t(net->last_frame));
             return net->executed >= net->last_frame;
@@ -1311,7 +1317,11 @@ private:
         std::shared_ptr<void> hold;          // the resource itself (FeatureState)
         ID3D12Resource* upload = nullptr;   // set when this entry owns a raw upload buffer to Release()
         int64_t frame = -1;                 // the last frame whose commands use it (-1: none recorded)
+        // The recording that framed it: released only when every submission it was part of has finished, not when
+        // some later frame's watermark passes.
+        nr::gpu::Ticket rec;
         bool done() {
+            if (rec) return split::completed(rec);
             if (!net || net->last_frame < 0 || frame < 0) return true;
             net->refresh_executed(net->last_frame >= 0 ? uint64_t(net->last_frame) : 0);
             return net->executed >= frame;
