@@ -395,6 +395,14 @@ bash windows/build/build_wilsjo2_d3d12.sh artifacts/parity-root/dlssnr-amd/shade
 3. 跨队列边界(游戏侧双 DIRECT 队列)——无复现,未测。
 4. R10:W2 的颜色空间来自 `menu::colour_space_guess`,非调用者交换链描述;改会变已发布行为,未改。
 
-**ASD 启用/注册状态(交接必须带上)**:注册在本机**未恢复**(`RegisterApplication` = E_HANDLE,下层
-`RegCreateKeyTransactedW` = 6801/ERROR_RM_NOT_ACTIVE,属当前用户 hive 事务故障)。因此产品路线在本机处于
-"未注册、不可验证 ACO 真实执行"的状态;所有离线证据来自 `NR_TEST_FORCE_CANARY`/诊断装载,**不能称为 release-ready**。
+**ASD 启用/注册状态(交接必须带上)**:我们的工具环境里 `RegisterApplication` 仍返回 E_HANDLE,下层
+`RegCreateKeyTransactedW` 仍 6801/ERROR_RM_NOT_ACTIVE(`registration-probe/*after-reboot.txt`,证据保留)。
+
+**更正(系统 hive 归因撤回)**:同一台机器、同一份 `registry_standalone.exe`,在普通 PowerShell 里由用户亲自运行,
+**CreateTransaction = STATUS_SUCCESS、RegOpenKeyEx(HKCU\Software) = 0、RegCreateKeyTransacted = 0**(实际 Software
+key、同一 HKCU SID)。因此"当前用户 hive 事务服务坏了"是错的:失败局限于我们这个工具的执行环境(降权/作业/容器化
+方式等),不是 Windows 本身,也不是产品注册逻辑。未做任何事务重置、未修 Windows、未清注册表。
+
+下一步(外部普通终端,不是本工具环境):先跑 `registration_agility.exe` 确认官方 ASD 注册是否 `S_OK`,再让产品注册
+在真实宿主里完成;随后才能谈 ACO 真实执行。在此之前产品仍谈不上 release-ready,但阻塞点已改写为"工具执行环境",
+不是"系统事务故障"。
