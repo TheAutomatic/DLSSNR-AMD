@@ -29,6 +29,12 @@
 
 namespace nr::pe::split {
 
+// The completion evidence this layer already keeps: the per-queue fence signalled after each expansion the hooks
+// execute, and how far the GPU has got through it. A recording made into a list of this queue may be released once
+// the value it was booked at has completed - the same watermark the continuations are reused by, not another one.
+uint64_t queue_value(ID3D12CommandQueue* queue);      // the last value signalled on that queue's fence (0: none)
+uint64_t queue_completed(ID3D12CommandQueue* queue);  // the value the GPU has finished (0: unknown)
+
 // Hooks the list's class (once per class) and its queues'. False when lists of this class cannot be
 // cut, or when this list's state since its last Reset is not known yet - the hooks were installed
 // after it was reset - in which case the frame passes through and the next one is cut.

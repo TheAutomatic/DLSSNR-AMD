@@ -991,6 +991,21 @@ PFN_Execute execute_of(ID3D12CommandQueue* q) {
     return n ? reinterpret_cast<PFN_Execute>(g_queue_classes[n - 1].execute) : nullptr;
 }
 
+QueueFence* completion_fence(ID3D12CommandQueue* q);
+
+uint64_t queue_value(ID3D12CommandQueue* queue) {
+    std::lock_guard<std::recursive_mutex> guard(g_mutex);
+    QueueFence* f = completion_fence(queue);
+    return f ? f->value : 0;
+}
+uint64_t queue_completed(ID3D12CommandQueue* queue) {
+    std::lock_guard<std::recursive_mutex> guard(g_mutex);
+    QueueFence* f = completion_fence(queue);
+    if (!f || !f->fence) return 0;
+    const uint64_t v = f->fence->GetCompletedValue();
+    return v == UINT64_MAX ? 0 : v;
+}
+
 QueueFence* completion_fence(ID3D12CommandQueue* q) {
     for (auto& f : g_queue_fences) if (f.queue == q) return &f;
     ID3D12Device* device = nullptr;
