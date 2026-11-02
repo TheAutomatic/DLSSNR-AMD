@@ -1073,7 +1073,7 @@ DWORD WINAPI canary_thread(void* p) {
     const Canary result = run_canary(device, job.queue, &line);
     job.queue->Release();
     finish_canary(result, line);
-    if (GetPrivateProfileIntW(L"D3D12ASD", L"FreshCanary", 1, g_ini.c_str()) != 0) fresh_canaries(device);
+    if (GetPrivateProfileIntW(L"D3D12ASD", L"FreshCanary", 0, g_ini.c_str()) != 0) fresh_canaries(device);
     device->Release();
     g_diag_done = true;
     return 0;
