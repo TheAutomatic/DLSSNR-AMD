@@ -125,3 +125,10 @@ x86_64-w64-mingw32-g++ -std=c++17 -O0 -fsyntax-only -Iwindows/src -Iwindows/src/
 独立检查发现6951761在backend第1219行引用lambda内部的nwhy，当前源码编译失败。执行者此前报告的三帧结果实际来自12:37:50构建：源exe与13:07复制的宿主exe SHA256相同（524D33C3开头）。因此该次运行不能验证366b3e0/44a67c8/6951761的改动，不作为新版本通过证据。审查者已直接把nwhy移至外层，backend/net最终定向MinGW编译检查退出0；执行者随后在a36c3e7中一并提交该修正。完整链接及重跑须保留真实编译退出码、exe时间与哈希，编译失败不能继续复制旧文件。
 
 另发现44a67c8把所有Built及各扩容Upload块的凭据放在一个16项全局数组，切换extent或增长buffer会覆盖另一槽的凭据。本轮审查者直接改为Built::Upload自身持有uses[kRing]，读写对应实际buffer的槽；最终backend/net定向编译退出0。未启动GPU。网络资源RetiredNet/RetiredUse仍有token水位消费者，不能仅凭upload修复声称全生命周期闭环。
+
+
+### 13:30 轮监督：网络退休消费者实际接通
+
+a7b7ac7新增RetiredUse::rec却没有在任一创建点赋值，RetiredNet创建点还调用book(nullptr)，因此原“RetiredUse已接完成”结论不成立。审查者本轮直接接管net退休段：复用原nr::gpu::Uses，在Built和FeatureState真正record、首条GPU命令前记录使用集合；feature释放、旧token块和权重upload退休分别快照实际资源的使用集合；RetiredNet直接检查Built的全部未完成使用，不要求ready/淘汰点凭空取得command list。所有退休判断逐个strict完成，不再以最新token代替其他队列的完成。集合及时去掉strict完成项并去重，不新增并列注册表。
+
+net定向MinGW -fsyntax-only退出0。本轮没有运行GPU，完整链接/实际验证仍由执行agent串行推进；不能将此语法检查写成设备切换或完整离线集成已通过。

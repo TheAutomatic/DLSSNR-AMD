@@ -20,6 +20,7 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -37,6 +38,21 @@ namespace nr::pe::asd {
 namespace {
 
 template <class T> void release(T*& p) { if (p) { p->Release(); p = nullptr; } }
+
+// Reuse the runtime's use set, with the strict D3D12 completion query instead of its timed fallback.
+void touch_recording(nr::gpu::Uses& uses, const nr::gpu::Ticket& rec) {
+    auto& tickets = uses.tickets;
+    tickets.erase(std::remove_if(tickets.begin(), tickets.end(), [](const auto& t) {
+        return split::completed(t);
+    }), tickets.end());
+    if (rec && std::find(tickets.begin(), tickets.end(), rec) == tickets.end()) tickets.push_back(rec);
+}
+bool recordings_done(const nr::gpu::Uses& uses) {
+    return std::all_of(uses.tickets.begin(), uses.tickets.end(), [](const auto& t) {
+        return split::completed(t);
+    });
+}
+
 
 std::atomic<NetPlanner> g_planner{nullptr};
 std::atomic<NetControlsPatch> g_patch{nullptr};
@@ -209,6 +225,7 @@ struct FeatureState {
     uint32_t domain = 0;
     uint64_t used = 0;
     int64_t last_frame = -1;
+    nr::gpu::Uses gpu;
     ~FeatureState() { release(hist[0]); release(hist[1]); }
 };
 
@@ -260,6 +277,7 @@ struct Built {
     int64_t copied = -1;                  // newest frame where parameter copy to GPU has finished (upload slots recyclable)
     int64_t executed = -1;                // newest frame where all model dispatches have finished on GPU (resources releasable)
     int64_t last_frame = -1;              // newest frame recorded into this Built; -1: none
+    nr::gpu::Uses gpu;
     void refresh_copied(uint64_t max_f) {
         if (!copy_map) return;
         for (uint32_t s = 0; s < kDoneSlots; ++s) {
@@ -490,6 +508,7 @@ public:
             RetiredUse r;
             r.net = b;
             r.frame = it->second ? it->second->last_frame : -1;
+            if (it->second) r.uses = it->second->gpu;
             r.hold = std::move(it->second);
             retired_features_.push_back(std::move(r));
             b->features.erase(it);
@@ -650,8 +669,6 @@ public:
                 for (auto it = nets_.begin(); it != nets_.end(); ++it) if (it->second->used < lru->second->used) lru = it;
                 RetiredNet rn;
                 rn.net = std::move(lru->second);
-                // Its last frame is the current one: the caller's recording for this list proves when it is done.
-                rn.rec = split::book(nullptr);   // no list here: keep the watermark for this one
                 retired_.push_back(std::move(rn));
                 nets_.erase(lru);
             }
@@ -825,6 +842,7 @@ public:
             RetiredUse rt;
             rt.net = current_shared_;
             rt.upload = b->exec_token;
+            rt.uses = b->gpu;
             rt.frame = b->last_frame;   // the last record that reads the old block (-1: none did)
             retire_upload_.push_back(std::move(rt));
             b->exec_token = grown;
@@ -872,7 +890,11 @@ public:
             return false;
         }
         b->last_frame = int64_t(frame);
-        if (fs) fs->last_frame = int64_t(frame);
+        touch_recording(b->gpu, record_ticket);
+        if (fs) {
+            fs->last_frame = int64_t(frame);
+            touch_recording(fs->gpu, record_ticket);
+        }
         slot_buf->owner[slot_i] = frame;
         if (first) {
             cmd->CopyBufferRegion(b->wgt, 0, b->wgt_upload, 0, b->wgt->GetDesc().Width);
@@ -1195,6 +1217,7 @@ public:
             RetiredUse r;
             r.net = current_shared_;
             r.upload = b->wgt_upload;
+            r.uses = b->gpu;
             r.frame = int64_t(frame);
             retire_upload_.push_back(std::move(r));
             b->wgt_upload = nullptr;
@@ -1299,33 +1322,19 @@ private:
     Built* current_ = nullptr;                   // ready()'s answer for this evaluate
     bool building_ = false;                      // v2.6: ready() said no only because a network is building
     int last_want_ = -1;
-    // Retirement waits for the GPU, not a call count: an entry goes only when its Built's completion watermark
-    // has passed the frame that last used the resource (a stack of many passes records that many evaluates
-    // into one still-unsubmitted command list; a tick_ counter would release under it).
+    // Each resource keeps all recordings that used it. A later queue's completion cannot retire an earlier
+    // recording that remains executable or whose submissions have not all finished.
     struct RetiredNet {
-        std::shared_ptr<Built> net;   // kept alive
-        nr::gpu::Ticket rec;          // the last recording that used it (empty: the watermark below)
-        bool done() {
-            if (rec) return split::completed(rec);
-            if (!net || net->last_frame < 0) return true;
-            net->refresh_executed(uint64_t(net->last_frame));
-            return net->executed >= net->last_frame;
-        }
+        std::shared_ptr<Built> net;
+        bool done() { return !net || recordings_done(net->gpu); }
     };
     struct RetiredUse {
-        std::shared_ptr<Built> net;          // keeps the Built (and its mapped completion buffers) alive
-        std::shared_ptr<void> hold;          // the resource itself (FeatureState)
-        ID3D12Resource* upload = nullptr;   // set when this entry owns a raw upload buffer to Release()
-        int64_t frame = -1;                 // the last frame whose commands use it (-1: none recorded)
-        // The recording that framed it: released only when every submission it was part of has finished, not when
-        // some later frame's watermark passes.
-        nr::gpu::Ticket rec;
-        bool done() {
-            if (rec) return split::completed(rec);
-            if (!net || net->last_frame < 0 || frame < 0) return true;
-            net->refresh_executed(net->last_frame >= 0 ? uint64_t(net->last_frame) : 0);
-            return net->executed >= frame;
-        }
+        std::shared_ptr<Built> net;
+        std::shared_ptr<void> hold;
+        ID3D12Resource* upload = nullptr;
+        int64_t frame = -1;
+        nr::gpu::Uses uses;   // snapshot of every recording that used this actual resource
+        bool done() { return recordings_done(uses); }
     };
     std::vector<RetiredNet> retired_;
     std::vector<RetiredUse> retired_features_;
