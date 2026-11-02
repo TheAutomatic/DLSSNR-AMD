@@ -621,10 +621,9 @@ struct Backend {
     uint64_t* done_map = nullptr;
     uint64_t frames = 0;                 // frames recorded by this backend
     int64_t executed = -1;               // newest frame the GPU finished
-    // The split recording ticket is not consumed yet: one global handle cannot stand for every frame's and every
-    // resource's recording (frames in different lists/queues would be assumed finished together). The token copy
-    // below stays the only completion evidence until each frame and resource owns its own ticket.
-    uint64_t booking_unused = 0;
+    // The recording ticket of the frame being recorded: every resource that frame makes is retired by it, so the
+    // resource's own recording is its completion evidence (not a global "newest frame finished" assumption).
+    uint64_t booking = 0;
     std::vector<std::pair<int64_t, ID3D12Resource*>> token_retired;   // grown-away token buffers
     // A value the GPU has not written yet reads as ~0, and only a slot whose holder matches its own index is a
     // completion: a frame number ahead of the newest record is a torn read, not evidence.
@@ -637,7 +636,12 @@ struct Backend {
                 executed = int64_t(v);
         }
     }
-    std::vector<std::pair<int64_t, IUnknown*>> retired;   // frame that last used it
+    struct Retired {
+        int64_t frame;     // the backend's frame number that last used it
+        uint64_t ticket;   // the split recording ticket of that frame (0: none seen)
+        IUnknown* p;
+    };
+    std::vector<Retired> retired;
     // The RenoDX route's stages, one a feature (nr_pe_session.cpp's RenoDXEntry: its working resolution's debounce
     // and its stage, keyed by everything a change of takes a new one).
     struct RenodxEntry {
@@ -673,14 +677,20 @@ ID3D12Resource* heap_buffer(ID3D12Device* device, D3D12_HEAP_TYPE type, uint64_t
 void retire(IUnknown* p) {
     if (!p) return;
     if (g.discarding) { p->Release(); return; }
-    g.retired.emplace_back(int64_t(g.frames), p);
+    g.retired.push_back({int64_t(g.frames), g.booking, p});
 }
 void sweep() {
     ++g.tick;
     g.refresh_executed();
     auto it = std::remove_if(g.retired.begin(), g.retired.end(), [](const auto& r) {
-        if (g.executed < r.first) return false;
-        r.second->Release();
+        // An owner released by its own recording's ticket once that recording is sealed and its GPU work finished;
+        // a resource retired without a ticket keeps the backend's own watermark.
+        if (r.ticket) {
+            if (!nr::pe::split::completed(r.ticket)) return false;
+        } else if (g.executed < r.frame) {
+            return false;
+        }
+        r.p->Release();
         return true;
     });
     g.retired.erase(it, g.retired.end());
@@ -880,7 +890,7 @@ void drop_device() {
     for (auto& r : g.token_retired) r.second->Release();
     // The lists belong to this device: nothing of it is in flight once drop_device is called (the same reason the
     // resources above are released here), and a later device must not inherit watermarks from this one.
-    for (auto& r : g.retired) r.second->Release();
+    for (auto& r : g.retired) r.p->Release();
     g.retired.clear();
     g.token_retired.clear();
     g.token_map = nullptr; g.done_map = nullptr; g.token_slots = 0; g.frames = 0; g.executed = -1;
@@ -1201,6 +1211,7 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
     if (g.broken) return fallback(g.broken_why);
 
     if (renodx) {
+        g.booking = nr::pe::split::book(f.cmd);
         const bool ran = renodx_frame(f, color_state, output_state);
         // Marked even when the stage reports failure: a failed frame may have recorded some of its dispatches, and
         // those commands still hold internal resources that must not be released until the GPU ran past them.
