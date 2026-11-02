@@ -1858,8 +1858,14 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
     // Every slot this frame may use is made free before its first command: a frame that would outrun completion
     // grows the heap here, and a frame that cannot is not recorded at all (rather than losing a dispatch halfway).
     {
-        const uint32_t passes = std::max(1u, std::min<uint32_t>(cfg.settings.passes, nr::renodx::kMaxUnlockedPasses));
-        frame_budget = 64 + 32 * passes;   // per pass: encode/decode, the look programs, the fast ones
+        // The frame's own stack (Stage::set updates `settings`, not the construction snapshot): the passes it runs,
+        // and per pass the most dispatches any branch of this stage issues: encode (1), tex_to_buf (1), buf_to_tex
+        // (1), decode (legacy 1 + black-level 2 | v6 1 + resolve 1), look (compose 1, upsample 1 when it upsamples,
+        // band 2 when it bands), preprocess (forward 1, inverse 1, meter 1), fast (prep 1, fb_in 1, apply 1) - 16 at
+        // the most in the current code, so 32 is a factor-two margin; plus the fixed per-frame programs (copy_in,
+        // copy_out, commit, pedestal, the clears) counted in the 64.
+        const uint32_t passes = std::max(1u, std::min<uint32_t>(stack_passes(settings), nr::renodx::kMaxUnlockedPasses));
+        frame_budget = 64 + 32 * passes;
         frame_used = 0;
     }
     if (completed && !reserve_frame_slots()) {

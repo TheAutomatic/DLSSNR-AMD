@@ -483,6 +483,9 @@ public:
         // A feature the caller destroyed: its history is retired like the LRU's (the same RetiredUse, the same
         // completion watermark), never released here - a recorded or in-flight frame may still read those images.
         // Alias names of one network share its Built, so each Built is visited once.
+        // The id's seeds go whether or not any Built still holds the state: a rebuilt network starts clean.
+        for (uint32_t k = 0; k < 32; ++k)
+            plain_seeds_.erase(k == 0 ? feature : ((uint64_t(1) << 62) | (feature << 8) | k));
         std::set<const Built*> seen;
         for (auto& [key, b] : nets_) {
             if (!b || !seen.insert(b.get()).second) continue;
@@ -490,7 +493,6 @@ public:
                 const uint64_t f = k == 0 ? feature : ((uint64_t(1) << 62) | (feature << 8) | k);
                 auto it = b->features.find(f);
                 if (it == b->features.end()) continue;
-                plain_seeds_.erase(f);
                 const int64_t last = it->second ? it->second->last_frame : -1;
                 RetiredUse r;
                 r.net = b;

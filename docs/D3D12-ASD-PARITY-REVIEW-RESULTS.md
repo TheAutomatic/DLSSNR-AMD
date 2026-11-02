@@ -377,3 +377,20 @@ pre 的 27 字节落在 act 的 e4m3 区（`fswin_t.comp:3640`），不能按 f1
 `0x3070` vs `0x306f`），没有符号翻转、没有量级差。这正是"同一表达式、不同求值顺序跨过一次舍入边界"的形态，
 与优化器重排的结论一致；`SKIP_OPTIMIZATION` 反而把差扩大到 821 个并出现大 ULP 离群值，说明 level-3 已是最接近
 参考的构建。要再往下定位需要 encode 的 **f32 中间值**（当前 proxy 直接写 RGBA16F，没有 f32 落点）。
+
+## 当前实际进度（截至 0f61eb8 之后）
+
+| 事项 | 状态 |
+|---|---|
+| 计划 1：首差异定位 | 完成到"encode 输出 554 个 1–2 ULP"，同输入重放 neural 逐位相同（`2853eb01…`） |
+| codec 修复 | **未完成**：HLSL(fxc) vs Slang 的优化器重排；`SKIP_OPTIMIZATION` 更差；尚无有效路径定位到具体表达式 |
+| 计划 1 其余边界 | **未完成**：多帧同输入序列（当前只证明 frame 0）、SDR legacy、其它 HDR 模式 |
+| 计划 2（性能） | **未开始** |
+| 描述符生命周期 | 扩容路径已定向验证（8→128）；4096 环回绕、换 device 未验证 |
+| 失败状态 | stage 分配失败不再折叠为成功；部分录制帧仍标记完成 |
+| feature 销毁 | 已按 LRU 方式退休（UAF 已修）并接入 model 通知 |
+| 设备代际主体 / split recording ticket | **未开始** |
+
+槽预算是按**本帧** `stack_passes(settings)` 推导的 `64 + 32×passes`，32 的依据是每个分支最多的 dispatch 数
+（encode 1、tex_to_buf 1、buf_to_tex 1、decode 1+black-level 2 或 1+resolve 1、look compose 1/upsample 1/band 2、
+preprocess 3、fast 3），实际最多 16，取两倍余量。
