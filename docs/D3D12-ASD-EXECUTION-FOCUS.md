@@ -26,7 +26,18 @@
 
 本轮真实无GPU注册定位：独立用户级installer身份，CoInitializeEx、factory、CreateInstaller及GetPrecompileTargets均S_OK（3目标）；builtin/实际exe两种desc的RegisterApplication均E_HANDLE，应用数始终0。尚未传入SODB/PSDB，因而此错误不在ACO对象加载阶段。原始日志与最小程序在artifacts/d3d12-parity-review/registration-probe/。不凭此直接宣称Windows或驱动故障；下一步针对该调用的注册后端定位，不重查shader/权重。自动审批拒绝的清理初始化验证没有执行，已采用不清理状态的目标枚举替代。
 
-## 18:02 正常注册阻塞：已定位注册表事务失败
+## 21:50 更正(覆盖 18:02 段):系统事务故障结论已撤回,不要按"等重启/修 hive"执行
+
+外部普通 PowerShell 在同一台机器、同一用户、真实 HKCU Software key 上实测:`registry_standalone.exe` 的
+CreateTransaction/RegOpenKeyEx/RegCreateKeyTransacted 全部成功;`registration_agility.exe` 的 factory/CreateInstaller/
+GetPrecompileTargets 全 S_OK,variant0 与 variant1 的 `RegisterApplication` 均 `0x00000000`(count 1),
+`RemoveOwnProbe` `0x00000000`(证据 `artifacts/d3d12-parity-review/registration-probe/external-powershell-registration-success.txt`)。
+
+因此:没有 Windows/hive 故障,产品注册逻辑也没问题;18:02 段里的 6801/E_HANDLE **只发生在本工具执行环境**。
+不需要重启、不需要修系统事务、不需要清注册表或 installer。仍然成立的部分:这些只证明官方应用注册调用正常,
+**游戏宿主的 SODB/PSDB 注册与 ACO 真实执行尚未复核**。旧段保留在下方作为工具环境的证据。
+
+## 18:02 正常注册阻塞：已定位注册表事务失败(结论已撤回,见上)
 
 - 旧成功的官方SDK探针原二进制、原app-local619及等待6000ms条件，本轮仍返回E_HANDLE；已有installer可正常枚举/GetExePath，但新增独立应用也失败。
 - 独立无GPU探针观察D3D12Core公开API调用：NtCreateTransaction=STATUS_SUCCESS，有效transaction handle；RegCreateKeyTransactedW(app子键)=6801 / ERROR_RM_NOT_ACTIVE，随后RegisterApplication=0x80070006。不是SODB/PSDB加载阶段。
