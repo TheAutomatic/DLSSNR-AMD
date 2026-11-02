@@ -304,3 +304,18 @@ VK 参考相同的判据(光域、按像素峰值相对误差)或把半精度/�
 **extent 变化(不匹配的 plan)**:`renodx 1920 1080` 3 帧(`asd-harness/boundary-1080.txt`)——网络计划只为
 3840x2160 构建,路线每次都报 "plan.bin is for 3840x2160" 并原样放过(host exit=7),没有崩溃、没有录制半帧、没有
 退回 Vulkan 桥。即 extent 与计划不匹配时的边界行为是明确的拒绝,不是隐式跑错网络。
+
+## 19:40 收尾:全样本判据与 resize 代价
+
+**W2 PQ CPU 参考**:全样本诊断 `CPU full-sample existing-VK bounds: linear bad=0 worst=0.94025825; light bad=0
+worst=0.314148121`(`wilsjo2_d3d12_test/run-fullsample.txt`,并保留 `run-pqworst.txt` 的原码值诊断)。按此把该断言
+改为 VK oracle 已有的两段界限(线性 1 个 16F 步 + peak/16384;显示光 0.2%·peak_n + 0.05 nits),原码值最大值继续打印
+作为诊断。复跑:`ALL PASSED: 22 dispatches, 0 failure(s)`(`run-cpucriterion.txt`)。未放宽为"凑 PASS":界限与 VK 参考
+逐字相同,且全样本 0 越界。
+
+**resize/换代边界的实际代价**:离线宿主只有 3840x2160 的 `plan.bin`;计划由运行时的 lowering 在真实安装里导出
+(`nr_d3d12_asd.cpp:1119-1124` 读 ini 的 `[D3D12ASD] PlanDump`,`nr_runtime.cpp:3390-3393` 写 NRPLAN02),离线没有
+可用的 lowering 入口,且它依赖当前被注册表事务故障阻塞的路径。因此一次**真** resize(新 extent + 匹配计划)本轮无法
+构造;已测到的是不匹配计划下的边界行为:明确拒绝、不录半帧、不退回桥(`boundary-1080.txt`)。更换 extent 时 stage 会
+按 key 重建、旧 stage 进入 `renodx_retired` 并按其录制票据释放——这段代码路径由 `-Wall` 全量编译覆盖,但没有 GPU 侧
+定向运行。
