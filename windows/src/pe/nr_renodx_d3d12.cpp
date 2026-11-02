@@ -2378,6 +2378,21 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
                 uav[0] = tv(proxy, true);
                 dispatch(cmd, kEncode6, srv, uav, &enc, sizeof enc / 4, nx, ny);
             }
+            // Probe (NR_ENCODE_PROBE_F32): the value entering the encode is this run's only output. Capture it and
+            // stop here, so the RGBA32F proxy never enters the f16 network path (which would record an invalid
+            // descriptor) - the frame takes the not-run path and is copied through by the caller.
+            if (std::getenv("NR_ENCODE_PROBE_F32") && f.capture_in) {
+                uav_barrier(cmd);   // the encode's UAV writes, visible before the copy reads them
+                ensure(cmd, proxy.res, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                D3D12_TEXTURE_COPY_LOCATION di{}, si{};
+                di.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; di.pResource = f.capture_in;
+                di.PlacedFootprint.Footprint = {proxy.format, NW, NH, 1, NW * 16};
+                si.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; si.pResource = proxy.res; si.SubresourceIndex = 0;
+                cmd->CopyTextureRegion(&di, 0, 0, 0, &si, nullptr);
+                ensure(cmd, proxy.res, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                uav_barrier(cmd);
+            }
+            if (std::getenv("NR_ENCODE_PROBE_F32")) return 0;   // not run: the caller copies the frame through
         } else {
             LegacyConstants c{};
             c.size[0] = NW; c.size[1] = NH; c.source_size[0] = W; c.source_size[1] = H;

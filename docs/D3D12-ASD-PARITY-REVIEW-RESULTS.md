@@ -394,3 +394,19 @@ pre 的 27 字节落在 act 的 e4m3 区（`fswin_t.comp:3640`），不能按 f1
 槽预算是按**本帧** `stack_passes(settings)` 推导的 `64 + 32×passes`，32 的依据是每个分支最多的 dispatch 数
 （encode 1、tex_to_buf 1、buf_to_tex 1、decode 1+black-level 2 或 1+resolve 1、look compose 1/upsample 1/band 2、
 preprocess 3、fast 3），实际最多 16，取两倍余量。
+
+## 编码前 F32 观测（两侧真实值，首个不同边界）
+
+`NR_ENCODE_PROBE_F32=1` + `NR_ENCODE_PROBE_IMMEDIATE=1`，两侧都只走到 `v6_encode` 的输入边界（D3D12 在 encode 后
+早退，参考在 Network 回调处跳过），各自读回 RGBA32F，文件均 132,710,400 B（3840×2160×4×4）：
+
+| 量 | 数值 |
+|---|---|
+| 两侧不同的 f32 值 | **295,429 / 33,177,600（0.8904%）** |
+| 绝对差 | max 5.024e-4、mean 2.785e-7 |
+| 相对差 | max 8.453e-4、mean 1.868e-6 |
+
+结论：**首个不同边界在 encode 之前**（`v6_encode` 的采样/求和/除数），不是 `SrgbEncode`、也不是 half store。
+此前 554 个 f16 码差异是这 0.89% 的值跨过编码/半精度边界的放大结果。
+
+D3D12 侧探针必须加 `uav_barrier` 再转 `COPY_SOURCE`，否则 `Close` 返回 `E_INVALIDARG`（已在 `nr_renodx_d3d12.cpp` 修正）。
