@@ -168,3 +168,19 @@ b5a56a9恢复原肩部；独立读取kdump-prec确认869个差异，其中729个
 当前94431c4的NR_ENCODE_PROBE_IMMEDIATE把编码前proxy写回原RGBA16F，因此它是“编码前half快照”，不是F32，不能靠两侧相等证明上游F32一致。真正F32需在half store之前保存32位结果；把half读成float或在CPU逆sRGB都不能替代该观测。
 
 还核实探针未生效的实际路径错误：runprobe.bat从localgame加载shader，但该副本没有新增宏分支；已仅同步该隔离文件，未修改游戏目录、未启动GPU。不需要为此猜PSO创建路径或增加无关日志。后续读回必须记录shader文件哈希/宏与目标格式；D3D12的row pitch需要正确处理，Vulkan用其原有copy/同步方式，两侧输出文件统一为实际f32。
+
+
+## HDR10/F32 整段核对完成后的实施约束（用户再次纠正，2026-11-02）
+
+本次核对覆盖源代码→编译→安装副本→host常量/分支→目标资源→绑定→拷贝→等待→文件解析，不能只核当前编辑的函数。已实际读到的原版可复用实现：
+
+- `nr_pe_session.cpp::shot_prepare/shot_copy/shot_recorded/shot_poll` 已提供按格式计算容量、前后图像格式、row_pitch、拷贝前后layout恢复和完成后读回的完整捕获流程；`nr_screenshot.cpp::bytes_per_pixel` 已支持 `VK_FORMAT_R32G32B32A32_SFLOAT`（16B/pixel）。F32观测不需要新capture框架，D3D12只替换资源/footprint/fence API。
+- `nr_parity_host.cpp` 已有两侧对照所需Stage::Network边界grab、提交并等待fence和二进制落盘；当前容量固定W*H*8，是该离线宿主的half假设，应复用原版格式驱动的思路，而非新建另一套宿主。
+- D3D12宿主同样固定proxy/neural捕获W*H*8，raw通道W*H*16；stage捕获footprint固定RGBA16F。必须让真实源格式、容量、footprint、rowpitch和解析类型对应。现有raw输入只是half纹理展开，不能冒充编码前F32。
+- `build_renodx.sh` 已有Slang2026.19、RENODX_VULKAN、绑定宏和-O2固定流程；D3D12已有`compile_hlsl`和同源hlsli。探针编译沿这些现成入口，仅改变测试输出；不重写shader数学，不误把生产编译产物当探针。
+- HDR10 case已走make_v6/constants→kEncode6；若Preprocess curve启用则走kPrepEncode，需要记录实际分支。frame格式、present、source units/divisor、source/proxy extent和pass控制均用既有规则，不凭文件名猜执行路径。
+- 真实加载链已核：宿主game参数→module_folder→Stage::Config::shaders→隔离localgame的HLSL；参考SPV有独立构建/安装路径。运行前比较实际副本哈希和宏、对应产物，不只检查仓库文件。
+
+因此实施采用：原版HDR数学和host语义 + 既有格式驱动捕获/宿主 + 必要D3D12资源与同步适配。测试在半精度store前保留F32观测，产品half边界保持不变。当前仅输出half的探针不足以确定F32首个差异；未建立双侧真实F32观测前不新增试算归因，不通过添加泛化接口解决单个观测需求。
+
+本轮先暂停探针新增/试跑完成上述整段核对，随后将具体来源和缺口交还执行者继续最小实现；不是把未完成工作再次只列待办。既有有效基线与失败候选原始数据均保留。
