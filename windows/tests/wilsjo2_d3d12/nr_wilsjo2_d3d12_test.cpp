@@ -109,7 +109,8 @@ uint16_t half_of(float f) {
     uint32_t m = x & 0x7fffff;
     if (e <= 0) return uint16_t(s);
     if (e >= 31) return uint16_t(s | 0x7c00);
-    return uint16_t(s | (e << 10) | ((m + 0x1000) >> 13));
+    // Round ties to even and ADD the mantissa carry into the exponent.
+    return uint16_t(s | ((uint32_t(e) << 10) + ((m + 0xfffu + ((m >> 13) & 1u)) >> 13)));
 }
 float float_of(uint16_t h) {
     const uint32_t s = (h & 0x8000u) << 16, e = (h >> 10) & 0x1f, m = h & 0x3ff;
