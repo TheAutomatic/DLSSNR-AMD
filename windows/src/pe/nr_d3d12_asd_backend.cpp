@@ -605,6 +605,9 @@ struct Backend {
     uint32_t w = 0, h = 0;
     std::unique_ptr<D3d12AsdNetwork> network;
     bool broken = false;   // something of the device's could not be made: the 0.0.8.1 path from now on
+    // Set while a device generation is being dropped: a stage's destructor calls retire() for the surfaces it still
+    // holds, and those must be released here, not queued into the next generation's list (their watermark is gone).
+    bool discarding = false;
     std::string broken_why;
     uint64_t tick = 0;
     // The backend's own completion signal: a frame number copied into a readback buffer by the same command list that
@@ -663,7 +666,11 @@ ID3D12Resource* heap_buffer(ID3D12Device* device, D3D12_HEAP_TYPE type, uint64_t
 
 // The frame the object was last used in: the one about to be recorded (a replaced stage was used by the frame before,
 // so this is one frame of margin, never less).
-void retire(IUnknown* p) { if (p) g.retired.emplace_back(int64_t(g.frames), p); }
+void retire(IUnknown* p) {
+    if (!p) return;
+    if (g.discarding) { p->Release(); return; }
+    g.retired.emplace_back(int64_t(g.frames), p);
+}
 void sweep() {
     ++g.tick;
     g.refresh_executed();
@@ -855,6 +862,9 @@ bool build(ID3D12Device* device, std::string* why) {
 }
 
 void drop_device() {
+    g.discarding = true;   // the destructors below release their own surfaces here, not into the next generation
+    g.renodx.clear();
+    g.renodx_retired.clear();
     retire(g.rs); retire(g.to_linear); retire(g.from_linear); retire(g.to_motion); retire(g.to_depth); retire(g.heap);
     retire(g.lin_in); retire(g.lin_out); retire(g.lin_mv); retire(g.lin_depth);
     retire(g.neutral_mv);
@@ -868,7 +878,6 @@ void drop_device() {
     // resources above are released here), and a later device must not inherit watermarks from this one.
     for (auto& r : g.retired) r.second->Release();
     g.retired.clear();
-    g.renodx_retired.clear();
     g.token_retired.clear();
     g.token_map = nullptr; g.done_map = nullptr; g.token_slots = 0; g.frames = 0; g.executed = -1;
     g.rs = nullptr; g.to_linear = g.from_linear = g.to_motion = g.to_depth = nullptr; g.heap = nullptr;
@@ -876,6 +885,7 @@ void drop_device() {
     g.neutral_mv = nullptr;
     g.rs_prep = nullptr; g.prep_meter = g.prep_forward = g.prep_back = nullptr;
     g.lin_prep_p = g.prep_state = nullptr;
+    g.discarding = false;
     g.prep_was_on = false;
     g.prep_last_curve = 0;
     g.prep_last_exposure = 0;
