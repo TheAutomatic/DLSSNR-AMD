@@ -790,7 +790,11 @@ void sweep() {
         return g.executed >= frame;
     };
     auto rs = std::remove_if(g.renodx_retired.begin(), g.renodx_retired.end(), [&](const auto& r) {
-        return frame_evidence(r.frame, r.uses);
+        if (!frame_evidence(r.frame, r.uses)) return false;
+        // A replaced stage's own destruction: one line, so an extent change can be seen to retire the old stage rather
+        // than merely producing output for the new one.
+        nr::pe::log("[asd] a replaced RenoDX stage was released (retired at frame %lld)", (long long)r.frame);
+        return true;
     });
     g.renodx_retired.erase(rs, g.renodx_retired.end());
     auto rt = std::remove_if(g.token_retired.begin(), g.token_retired.end(), [&](auto& r) {

@@ -330,8 +330,13 @@ plan-only lowering(`nr_d3d12_net_plan.hpp:63`;`nr_runtime.cpp:3195` 注释即 "n
 - **copy-through 状态(R05 的输入)**:`NR_TEST_NR_OFF=1` 跑 3840x2160 两帧(`asd-harness/boundary-nroff.txt`)——stage
   记录 0 pass、backend 仍成功返回、两帧 `Close 0x0`。此时 `note_backend_produced(ran > 0)` 为 false,即模型侧
   `report_control(...)` 的 `ran` 为 false,面板不再把 copy-through 报成 NR。
-- **换 extent(换代)**:未运行。上面两段只是两种 extent 各自在新进程里启动;旧 stage 进 `renodx_retired` 并按其录制
-  票据释放这条路径目前只有编译覆盖,没有同进程切换的实际提交证据。
+- **换 extent(换代)**:已实际运行(同进程、同设备、同 feature):`NR_TEST_RESIZE=1920x1080` +
+  `NR_TEST_RESIZE_PLAN=<1080 plan>`(`asd-harness/resize-case.txt`)。4K 帧 0 先录制并提交完成,随后切换资源与计划,
+  1080 两帧各自 `evaluate → 提交 → fence 完成`,device reason 全程 `0x0`,exit=0。backend 的 "a replaced RenoDX stage
+  was released" 行出现在每次换代之后(如 retired at frame 5),即旧 stage 确实进入 `renodx_retired` 并在其录制完成后
+  被释放——不是只有输出 hash。
+- **待查(来自同一日志)**:切换后**每次 evaluate 都替换一次 stage**(retired at 5、7、10、10、11),说明 extent 相同、
+  设置相同时 stage key 仍在变。退休与释放本身正确,但每帧重建 stage 不合理,需要单独定位(不是本 case 的通过条件)。
 
 ### 包交接收尾
 

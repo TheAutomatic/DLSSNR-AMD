@@ -1050,6 +1050,105 @@ int renodx_run(int argc, char** argv) {
         }
     }
     log("[test] renodx: %d frame(s) completed with no device error", frames);
+
+    // NR_TEST_RESIZE_PLAN=<plan for a second extent> + NR_TEST_RESIZE=WxH: the same device, the same list and the same
+    // feature record a second extent after the first one's frames finished. The stage's key changes, so the backend makes
+    // a new stage for the new extent and retires the old one; its release is logged by the backend's sweep once the
+    // recording that used it is done. This is the in-process extent-change case, not a second process.
+    if (const char* rp = std::getenv("NR_TEST_RESIZE_PLAN"); rp && rp[0]) {
+        const char* rs = std::getenv("NR_TEST_RESIZE");
+        if (!rs || !rs[0]) { log("[test] resize: NR_TEST_RESIZE is not set"); return 4; }
+        const char* x = std::strchr(rs, 'x');
+        const uint32_t W2 = x ? uint32_t(std::atoi(std::string(rs, x - rs).c_str())) : 0;
+        const uint32_t H2 = x ? uint32_t(std::atoi(x + 1)) : 0;
+        if (!W2 || !H2) { log("[test] resize: NR_TEST_RESIZE is not WxH"); return 4; }
+        // The frames of the first extent are submitted and finished; the list is closed. Reset both for the new frame.
+        if (FAILED(a->Reset()) || FAILED(l->Reset(a, nullptr))) { log("[test] resize: allocator/list Reset failed"); return 8; }
+        D3D12_HEAP_PROPERTIES hp2{}; hp2.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC rd2{};
+        rd2.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rd2.Width = W2; rd2.Height = H2; rd2.DepthOrArraySize = 1; rd2.MipLevels = 1;
+        rd2.Format = frame_format; rd2.SampleDesc.Count = 1;
+        rd2.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        ID3D12Resource* frame2 = nullptr, *out2 = nullptr;
+        if (FAILED(d->CreateCommittedResource(&hp2, D3D12_HEAP_FLAG_NONE, &rd2, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                              nullptr, IID_PPV_ARGS(&frame2))) || !frame2) {
+            log("[test] resize: the new extent's frame could not be made"); return 4;
+        }
+        if (FAILED(d->CreateCommittedResource(&hp2, D3D12_HEAP_FLAG_NONE, &rd2, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                              nullptr, IID_PPV_ARGS(&out2))) || !out2) {
+            log("[test] resize: the new extent's output could not be made"); return 4;
+        }
+        if (const char* ih = std::getenv("NR_TEST_INPUT_HALF"); ih && ih[0]) {
+            const uint64_t pitch2 = uint64_t(W2) * 8;
+            D3D12_TEXTURE_COPY_LOCATION dst2{}, src2{};
+            dst2.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dst2.pResource = frame2; dst2.SubresourceIndex = 0;
+            src2.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; src2.PlacedFootprint.Footprint = {frame_format, W2, H2, 1, UINT(pitch2)};
+            ID3D12Resource* up2 = buffer(d, D3D12_HEAP_TYPE_UPLOAD, pitch2 * H2, D3D12_RESOURCE_STATE_GENERIC_READ);
+            src2.pResource = up2;
+            void* m2 = nullptr;
+            if (!up2 || FAILED(up2->Map(0, nullptr, &m2)) || !m2) { log("[test] resize: upload failed"); return 4; }
+            // The first W2*8*H2 bytes of the same decode: one source, the extent's own rows.
+            if (FILE* f = std::fopen(ih, "rb")) { std::fread(m2, 1, size_t(pitch2 * H2), f); std::fclose(f); }
+            up2->Unmap(0, nullptr);
+            D3D12_RESOURCE_BARRIER tb2{};
+            tb2.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            tb2.Transition.pResource = frame2;
+            tb2.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            tb2.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            tb2.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+            l->ResourceBarrier(1, &tb2);
+            l->CopyTextureRegion(&dst2, 0, 0, 0, &src2, nullptr);
+            tb2.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            tb2.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            l->ResourceBarrier(1, &tb2);
+            l->Close();
+            ID3D12CommandList* ls2[] = {l};
+            q->ExecuteCommandLists(1, ls2);
+            q->Signal(f, ++fence_value);
+            HANDLE ev2 = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            f->SetEventOnCompletion(fence_value, ev2);
+            const bool up_ok = WaitForSingleObject(ev2, 60000) == WAIT_OBJECT_0;
+            CloseHandle(ev2);
+            up2->Release();
+            if (!up_ok || f->GetCompletedValue() < fence_value) { log("[test] resize: the new input did not finish"); return 4; }
+            a->Reset();
+            l->Reset(a, nullptr);
+        }
+        g_plan = rp;   // the planner reads it on every call: the new extent's own plan
+        fr.color = frame2; fr.color_state = int(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        fr.output = out2; fr.output_state = int(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        fr.reset = true;
+        for (int fi2 = 0; fi2 < 2; ++fi2) {
+            ran = false;
+            for (int attempt2 = 0; attempt2 < 600 && !ran; ++attempt2) {
+                ran = asd::evaluate_backend(fr);
+                if (!ran) Sleep(200);
+            }
+            log("[test] resize: frame %d at %ux%u -> %d (%s)", fi2, W2, H2, ran ? 1 : 0, asd::status().backend.c_str());
+            if (!ran) { frame2->Release(); out2->Release(); return 7; }
+            l->Close();
+            ID3D12CommandList* ls3[] = {l};
+            q->ExecuteCommandLists(1, ls3);
+            q->Signal(f, ++fence_value);
+            HANDLE ev3 = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            f->SetEventOnCompletion(fence_value, ev3);
+            const bool ok3 = WaitForSingleObject(ev3, 60000) == WAIT_OBJECT_0 && f->GetCompletedValue() >= fence_value;
+            CloseHandle(ev3);
+            log("[test] resize: frame %d submitted %s, device reason 0x%08lX", fi2, ok3 ? "and finished" : "TIMED OUT",
+                static_cast<unsigned long>(d->GetDeviceRemovedReason()));
+            if (!ok3) { frame2->Release(); out2->Release(); return 9; }
+            a->Reset();
+            l->Reset(a, nullptr);
+            fr.reset = false;
+        }
+        // The sweep that releases the first extent's stage runs on a later evaluate's path: one more frame gives it the
+        // chance, and the backend's own line says whether the retired stage was released.
+        for (int k = 0; k < 3; ++k) { asd::evaluate_backend(fr); l->Close(); a->Reset(); l->Reset(a, nullptr); }
+        log("[test] resize: backend state after the extent change: %s", asd::status().backend.c_str());
+        frame2->Release();
+        out2->Release();
+    }
     return 0;
 }
 
