@@ -2502,7 +2502,7 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
             ck.local_structure = own ? s.pass_local_structure[ki - 1] : s.local_structure;
             ck.skin_structure = own ? s.pass_skin_structure[ki - 1] : s.skin_structure;
             ck.automatic_mask = own ? s.pass_auto_mask[ki - 1] : s.auto_mask;
-            ck.noise_every_frame = s.noise_every_frame;
+            ck.seed_fixed = !s.noise_every_frame;
             if (s.skin_independent && ck.automatic_mask) {
                 ck.local_structure = std::min(ck.local_structure, 1.0f);
                 if (ck.skin_structure < 0.0f) ck.skin_structure = 1.0f;

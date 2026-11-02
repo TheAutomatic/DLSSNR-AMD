@@ -16,6 +16,7 @@
 #include "nr_d3d12_asd.hpp"
 #include "nr_ini_network.hpp"
 #include "nr_pe_log.hpp"
+#include "nr_pe_d3d12split.hpp"
 
 #include <windows.h>
 
@@ -604,7 +605,7 @@ public:
         const HRESULT hr3 = device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&alpha_pso_));
         release(code);
         if (FAILED(hr3)) { *why = "the alpha pass's pipeline could not be made"; return false; }
-        // The network's GPU time: two timestamps a frame (a ring of kRing frames), read back kRing frames later. The
+        // The network's GPU time: two timestamps per measured recording, read back after its completion. The
         // tick rate from a queue of our own (the device's timestamp frequency; nothing is submitted to it).
         D3D12_QUERY_HEAP_DESC qh{};
         qh.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
@@ -784,10 +785,11 @@ public:
             if (!fs->latch || temporal_.reset || domain_changed) fs->seed = 0;
             fs->domain = controls_.reversible;
             pre_seed = fs->seed++;
+            if (controls_.seed_fixed) pre_seed = 0;
         } else {
             uint32_t& seed = temporal_.feature ? plain_seeds_[temporal_.feature] : plain_seed_;
             if (temporal_.reset) seed = 0;
-            if (controls_.noise_every_frame) pre_seed = seed++;
+            if (controls_.noise_every_frame && !controls_.seed_fixed) pre_seed = seed++;
             else seed = 0;
         }
         // [D3D12ASD] NetTemporal / NetNoiseEveryFrame (dlssnr-amd-asd.ini, read once; v2.4: default 1 = the runtime's
@@ -1023,14 +1025,28 @@ public:
         // The slot's frame number back where the CPU can see it: once it lands, this record's copy has run.
         cmd->CopyBufferRegion(b->done, uint64_t(frame % kDoneSlots) * 8, slot_buf->buf, slot_off + b->slot_bytes, 8);
 
-        // The GPU time of the frame kRing frames ago in this timestamp slot, then this frame's.
-        const uint32_t ts = uint32_t(frames_ % kRing);
-        if (stamps_map_ && frames_ >= kRing) {
-            uint64_t t2[2];
-            std::memcpy(t2, stamps_map_ + ts * 16, 16);
-            if (t2[1] > t2[0]) note_gpu(double(t2[1] - t2[0]) * 1000.0 / hz_);
+        // A CPU call count cannot prove that ResolveQueryData has run. Keep the same Recording that protects
+        // the frame's resources; read and reuse a query pair only after all of that recording's submissions finish.
+        uint32_t ts = kRing;
+        if (stamps_map_ && !limit) {
+            for (uint32_t i = 0; i < kRing; ++i) {
+                if (stamp_uses_[i] && split::completed(stamp_uses_[i])) {
+                    uint64_t t2[2];
+                    std::memcpy(t2, stamps_map_ + i * 16, 16);
+                    if (t2[1] > t2[0]) note_gpu(double(t2[1] - t2[0]) * 1000.0 / hz_);
+                    stamp_uses_[i].reset();
+                }
+                if (!stamp_uses_[i] && ts == kRing) ts = i;
+            }
         }
-        if (stamps_map_) cmd->EndQuery(queries_, D3D12_QUERY_TYPE_TIMESTAMP, ts * 2);
+        const auto recording = ts < kRing ? split::book(cmd) : nr::gpu::Ticket{};
+        const bool timed = bool(recording);
+        if (timed) {
+            stamp_uses_[ts] = recording;
+            // A recording reset without execution has no timestamp result. Do not count a previous use's pair.
+            std::memset(stamps_map_ + ts * 16, 0, 16);
+            cmd->EndQuery(queries_, D3D12_QUERY_TYPE_TIMESTAMP, ts * 2);
+        }
 
         // record: every dispatch in plan order, a barrier after each.
         if (diag) capture::mark(cmd, L"NR: ACO network");
@@ -1229,7 +1245,7 @@ public:
         cmd->SetComputeRootUnorderedAccessView(2, in.va);
         cmd->Dispatch((b->w + 7) / 8, (b->h + 7) / 8, 1);
         uav_barrier(cmd);
-        if (stamps_map_) {
+        if (timed) {
             cmd->EndQuery(queries_, D3D12_QUERY_TYPE_TIMESTAMP, ts * 2 + 1);
             cmd->ResolveQueryData(queries_, D3D12_QUERY_TYPE_TIMESTAMP, ts * 2, 2, stamps_, uint64_t(ts) * 16);
         }
@@ -1339,6 +1355,7 @@ private:
     ID3D12QueryHeap* queries_ = nullptr;
     ID3D12Resource* stamps_ = nullptr;
     uint8_t* stamps_map_ = nullptr;
+    nr::gpu::Ticket stamp_uses_[kRing];
     double hz_ = 0;
     uint64_t frames_ = 0, resets_ = 0, gpu_seen_ = 0;
     unsigned gpu_n_ = 0;

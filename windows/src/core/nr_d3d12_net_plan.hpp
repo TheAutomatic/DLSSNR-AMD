@@ -48,6 +48,7 @@ struct D3d12NetControls {
     uint32_t reversible = 0;       // reversible_of(Controls): part of the input domain a history was made under
     float history_strength = -1.0f;   // Controls::history_strength (< 0: the session's, 1)
     bool noise_every_frame = false;
+    bool seed_fixed = false;       // Controls::seed_fixed, including temporal frames
 };
 
 // nr_runtime.cpp. The network for a `width` x `height` frame of the installation at `root` (the folder with
