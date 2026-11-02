@@ -403,9 +403,13 @@ bash windows/build/build_wilsjo2_d3d12.sh artifacts/parity-root/dlssnr-amd/shade
 key、同一 HKCU SID)。因此"当前用户 hive 事务服务坏了"是错的:失败局限于我们这个工具的执行环境(降权/作业/容器化
 方式等),不是 Windows 本身,也不是产品注册逻辑。未做任何事务重置、未修 Windows、未清注册表。
 
-下一步(外部普通终端,不是本工具环境):先跑 `registration_agility.exe` 确认官方 ASD 注册是否 `S_OK`,再让产品注册
-在真实宿主里完成;随后才能谈 ACO 真实执行。在此之前产品仍谈不上 release-ready,但阻塞点已改写为"工具执行环境",
-不是"系统事务故障"。
+**外部终端已确认(证据 `registration-probe/external-powershell-registration-success.txt`)**:用户自己的普通 PowerShell
+里 `registration_agility.exe` 的 factory / CreateInstaller / GetPrecompileTargets 全 `S_OK`,variant0 与 variant1 的
+`RegisterApplication` 均 `0x00000000`、count 1,`RemoveOwnProbe` `0x00000000`;`registry_standalone.exe` 在同一真实
+HKCU Software key 上 `CreateTransaction` 成功、`RegOpenKeyEx` = 0、`RegCreateKeyTransacted` = 0。
+
+因此:Windows/hive 无故障,产品注册逻辑无故障,6801 只出现在本工具执行环境。**但这只证明官方注册调用在真实终端正常,
+不等于游戏宿主的 SODB/PSDB 注册+执行已复核**——那仍需要在真实宿主的运行里观察。不重启、不修系统、不清注册表。
 
 ## 21:30 那次真实替换已定位 + 归档身份
 
