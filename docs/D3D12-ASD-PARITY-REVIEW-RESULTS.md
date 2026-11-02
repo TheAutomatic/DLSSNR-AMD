@@ -406,7 +406,9 @@ preprocess 3、fast 3），实际最多 16，取两倍余量。
 | 绝对差 | max 5.024e-4、mean 2.785e-7 |
 | 相对差 | max 8.453e-4、mean 1.868e-6 |
 
-结论：**首个不同边界在 encode 之前**（`v6_encode` 的采样/求和/除数），不是 `SrgbEncode`、也不是 half store。
+结论（按独立复核更正）：**`SrgbEncode` 之前已经存在差异**。探针位于 toe/shoulder 之后，所以这两段仍是候选，不能据此排除肩部；
+同理，两侧 F32 不同也不能单独排除额外的 `SrgbEncode` 差异——只能确定差异在编码函数之前就存在。
+下一步用 34 个低于肩部阈值的坐标定位 source/sum/weight/divisor（探针阶段 2/3），绕开肩部干扰。
 此前 554 个 f16 码差异是这 0.89% 的值跨过编码/半精度边界的放大结果。
 
 D3D12 侧探针必须加 `uav_barrier` 再转 `COPY_SOURCE`，否则 `Close` 返回 `E_INVALIDARG`（已在 `nr_renodx_d3d12.cpp` 修正）。

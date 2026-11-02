@@ -1593,8 +1593,12 @@ bool Stage::Impl::build(std::string* why) {
         // Probe builds (both routes compile this same file): NR_ENCODE_PROBE_IMMEDIATE stores the value entering the
         // encode rather than the encoded one, so the same boundary can be compared on both sides.
         const D3D_SHADER_MACRO macros[] = {{f.macro, "1"}, {nullptr, nullptr}};
-        const D3D_SHADER_MACRO probe[] = {{"NR_ENCODE_PROBE_IMMEDIATE", "1"}, {nullptr, nullptr}};
-        const bool probing = f.p == kEncode6 && std::getenv("NR_ENCODE_PROBE_IMMEDIATE") != nullptr;
+        // The probe's stage (1 after the curves, 2 the raw sum/weight, 3 the divisor); IMMEDIATE is stage 1.
+        static char probe_stage[8] = "1";
+        const bool probing = f.p == kEncode6 &&
+            (std::getenv("NR_ENCODE_PROBE_IMMEDIATE") || std::getenv("NR_ENCODE_PROBE_STAGE"));
+        if (const char* st = std::getenv("NR_ENCODE_PROBE_STAGE"); st && st[0]) std::snprintf(probe_stage, sizeof probe_stage, "%d", std::atoi(st));
+        const D3D_SHADER_MACRO probe[] = {{"NR_ENCODE_PROBE_STAGE", probe_stage}, {nullptr, nullptr}};
         ID3DBlob* code = compile_hlsl(text.data(), text.size(), "main", why, &includer,
                                       probing ? probe : (f.macro ? macros : nullptr));
         if (!code) return false;
