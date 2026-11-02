@@ -300,3 +300,25 @@ PSDB 由实验室流程生成，尚未从运行时侧证明它装载的是哪一
 所以 ASD 与 0081 参考运行的是**同一份 pre 机器码**；上一节"不同源所以不是 port bug"作废（先前对裸文件做
 `find` 失败，是因为 SQLite 的页分裂，不能作为不存在的证据）。pre 输出 73.9% 的差异因此是**真实的路线差异**，
 应继续在 ABI 层查：carrier tag → PSDB key 的对应、push/params、采样输入（proxy/flow/history/depth）与 extent/format/sampler。
+
+## 接线修复后的实测与新的结构事实
+
+修复：离线测试的 `file_planner` 路径原来 `set_net_planner(&file_planner, nullptr)`，漏装产品的
+`&nr::d3d12_net_controls`（`nr_asi_main.cpp` 装了）。补上后：
+
+| 项目 | 修复前 | 修复后 |
+|---|---|---|
+| pre push（128 B） | 108/112 两个 float（skin/other）+1 vs −1 | **0 字节不同** |
+| `act[534,773,760,+64 MiB)`（pre 之后） | 73.91% 字节不同 | **27 字节不同** |
+| neural（RGBA16F 3840×2176） | mean 0.005–0.007，max 0.10 | mean 0.0038，max 0.097，p99 0.021 |
+
+新的结构事实（逐 step 抓取 push 后发现）：
+
+- 参考侧 `record_all` 的 step 序列每帧 **43 步**；ASD 的 `plan.disp` 每帧 **71 个 dispatch**。
+- 内核集合不同：参考侧没有 `vitattn / ffwd3w / attn / gemmpool / gemmnores / decups / fswinpup* / fswinpds*`，
+  而 `gemmvact/gemmprojw/gemmvqkvnorm` 各 8 次；ASD 侧这些各 8 次且另有上述内核各 1–4 次。
+- post 的 128 B push 仅差 1 字节（偏移 123，`PushUps` 内的一个 u32 高位），pre 的 27 字节也落在 act 的
+  e4m3 区（`fswin_t.comp:3640`），不能按 f16 解释。
+
+因此：**两套 lowering 的 dispatch 结构本身不同**，"同 ELF、同 push" 只在共同的内核上成立；剩余的 pre 27 字节与
+neural 0.0038 需要在这一结构差之内解释，而不是继续当作移植误差。
