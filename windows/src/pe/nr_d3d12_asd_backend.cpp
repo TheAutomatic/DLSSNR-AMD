@@ -26,6 +26,13 @@ namespace nr::pe::asd {
 namespace {
 
 template <class T> void release(T*& p) { if (p) { p->Release(); p = nullptr; } }
+// Uses retains the original recording set; D3D12 retirement requires actual completion,
+// rather than Recording::ready()'s time/submission fallback for the bridge.
+bool recordings_done(const nr::gpu::Uses& uses) {
+    return std::all_of(uses.tickets.begin(), uses.tickets.end(), [](const auto& t) {
+        return nr::pe::split::completed(t);
+    });
+}
 
 // The network until M4's drops in: the output is the input.
 class PlaceholderCopyNetwork final : public D3d12AsdNetwork {
@@ -769,7 +776,7 @@ void sweep() {
         // An owner released by its own recording's ticket once that recording is sealed and its GPU work finished;
         // a resource retired without a ticket keeps the backend's own watermark.
         if (!r.uses.tickets.empty()) {
-            if (!r.uses.ready()) return false;
+            if (!recordings_done(r.uses)) return false;
         } else if (g.executed < r.frame) {
             return false;
         }
@@ -779,7 +786,7 @@ void sweep() {
     g.retired.erase(it, g.retired.end());
     // The same evidence as `retired`: the frame's own recording when there is one, the watermark otherwise.
     auto frame_evidence = [](int64_t frame, const nr::gpu::Uses& uses) {
-        if (!uses.tickets.empty()) return uses.ready();
+        if (!uses.tickets.empty()) return recordings_done(uses);
         return g.executed >= frame;
     };
     auto rs = std::remove_if(g.renodx_retired.begin(), g.renodx_retired.end(), [&](const auto& r) {
