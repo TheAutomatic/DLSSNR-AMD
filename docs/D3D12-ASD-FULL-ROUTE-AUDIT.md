@@ -406,3 +406,16 @@ key、同一 HKCU SID)。因此"当前用户 hive 事务服务坏了"是错的:�
 下一步(外部普通终端,不是本工具环境):先跑 `registration_agility.exe` 确认官方 ASD 注册是否 `S_OK`,再让产品注册
 在真实宿主里完成;随后才能谈 ACO 真实执行。在此之前产品仍谈不上 release-ready,但阻塞点已改写为"工具执行环境",
 不是"系统事务故障"。
+
+## 21:30 那次真实替换已定位 + 归档身份
+
+**替换原因(实测,`asd-harness/resize-case.txt`)**:`retired at frame 6, reason key, 3 recording(s) done, stage
+00000124e8086e90`。即不是 `set()` 失败、也不是 feature 释放,而是**stage key 变了**一次。key 由
+`w/h/nw/nh/format/hdr/present` 组成;尺寸与格式在切换后恒定,剩下会变的是工作分辨率 `nw/nh`
+(`renodx::working_resolution`,受 `resolution_scale`/`follow_input_res` 与其 debounce 影响)。1080 第 0 帧后 key 落定,
+第 1 帧起不再替换。这是"切换后一次性重建",不是每帧重建;debounce 的具体字段未再细分(不影响本 case 的通过条件)。
+
+**本机 OptiScaler 归档身份**:`OptiScaler_v10.0.0-pre1_4.1.2_Vulkan.7z`,55,297,782 B,内含
+`OptiScaler_v10.0.0-pre1_20261020\OptiScaler.dll`(26,734,080 B)等。**版本号相同、构建日期是 20261020,而 CI pin 是
+20261030** —— 不是同一个 nightly。因此:可只读用于本地树验证(须以 `NR_OPTI_ARCHIVE=` 显式指入并记录来源),但不能
+改名冒充 pin、也不能据它宣称官方 pin 一致;完整 OptiScaler 发布包在本机仍未构建。
