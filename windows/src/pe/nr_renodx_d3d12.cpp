@@ -1161,15 +1161,17 @@ struct Stage::Impl {
                                                 nullptr, IID_PPV_ARGS(&r)))) return nullptr;
         return r;
     }
-    // The most slots one frame records (measured: a pass is tens of dispatches; the budget only has to be an upper
-    // bound, and growing happens here, before the frame's first command).
-    static constexpr UINT kFrameSlots = 128;
+    // This frame's slot budget, from its configuration (a pass is tens of dispatches: the stage's encode/decode,
+    // look and fast programs), grown here before the frame's first command. Not an admission cap: the heap simply
+    // keeps the frames' slots larger than any one frame needs.
+    UINT frame_budget = 128;
+    UINT frame_used = 0;
     bool reserve_frame_slots() {
         for (int tries = 0; tries < 12; ++tries) {
             if (slot_frame.size() != slots) slot_frame.assign(slots, kNoFrame);
             // The run must be within one wrap: a heap smaller than the budget cannot carry a frame.
-            bool free_run = slots >= kFrameSlots;
-            for (UINT i = 0; i < kFrameSlots && free_run; ++i) {
+            bool free_run = slots >= frame_budget;
+            for (UINT i = 0; i < frame_budget && free_run; ++i) {
                 const UINT at = (slot + i) % slots;
                 if (slot_frame[at] != kNoFrame && !completed(slot_frame[at])) free_run = false;
             }
@@ -1328,6 +1330,11 @@ struct Stage::Impl {
         const UINT n_srv = codec ? 6 : 8, n_uav = codec ? 14 : 8;
         // The slot first, on the heap record() reserved the frame's whole budget on: no growth happens here, so no
         // dispatch can be dropped or written into a heap that was replaced after it was bound.
+        if (frame_used++ >= frame_budget) {
+            record_ok_ = false;
+            nr::pe::log("[nr] RenoDX stage: a frame needs more than its %u-slot budget; failing it", frame_budget);
+            return;
+        }
         UINT take = slot % slots;
         slot_frame[take] = pinned;
         slot = (slot + 1) % slots;
@@ -1850,6 +1857,11 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
     ++frame_no;
     // Every slot this frame may use is made free before its first command: a frame that would outrun completion
     // grows the heap here, and a frame that cannot is not recorded at all (rather than losing a dispatch halfway).
+    {
+        const uint32_t passes = std::max(1u, std::min<uint32_t>(cfg.settings.passes, nr::renodx::kMaxUnlockedPasses));
+        frame_budget = 64 + 32 * passes;   // per pass: encode/decode, the look programs, the fast ones
+        frame_used = 0;
+    }
     if (completed && !reserve_frame_slots()) {
         record_ok_ = false;
         nr::pe::log("[nr] RenoDX stage: no slot budget for this frame (fails before any command)");

@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <set>
 #include <mutex>
 #include <thread>
 #include <tuple>
@@ -479,11 +480,24 @@ public:
     // model.cpp's release_feature: every stack pass of this feature loses its history, latch and seed here, not by
     // an LRU guess later.
     void release_feature(uint64_t feature) override {
+        // A feature the caller destroyed: its history is retired like the LRU's (the same RetiredUse, the same
+        // completion watermark), never released here - a recorded or in-flight frame may still read those images.
+        // Alias names of one network share its Built, so each Built is visited once.
+        std::set<const Built*> seen;
         for (auto& [key, b] : nets_) {
-            if (!b) continue;
+            if (!b || !seen.insert(b.get()).second) continue;
             for (uint32_t k = 0; k < 32; ++k) {
                 const uint64_t f = k == 0 ? feature : ((uint64_t(1) << 62) | (feature << 8) | k);
-                b->features.erase(f);
+                auto it = b->features.find(f);
+                if (it == b->features.end()) continue;
+                plain_seeds_.erase(f);
+                const int64_t last = it->second ? it->second->last_frame : -1;
+                RetiredUse r;
+                r.net = b;
+                r.hold = std::move(it->second);
+                r.frame = last;
+                retired_features_.push_back(std::move(r));
+                b->features.erase(it);
             }
         }
     }
