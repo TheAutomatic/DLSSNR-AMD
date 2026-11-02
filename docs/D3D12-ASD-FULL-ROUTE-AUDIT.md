@@ -190,3 +190,10 @@ R01/R07/R09表明此前局部完成不能概括为整个生命周期闭环；R02
 - `windows/src/pe/nr_pe_menu.hpp`
 - `windows/src/pe/reshade_compat/Windows.h`
 - `windows/src/ui/nr_control_pages.hpp`
+
+
+## 16:00阶段一实际增量
+
+双侧真实RGBA32F已跑通，文件均132710400B。审查者独立复核295429个f32数值/bit不同、全部有限，最大绝对差0.0005024075508117676。原554个half差异全部位于f32已不同的相同位置；34个肩部以下差异像素的34个对应通道也已不同。原始交叉统计为artifacts/d3d12-parity-review/build-logs/encode-f32-independent-crosscheck.json。
+
+准确边界为v6_encode内部、SrgbEncode之前（probe位于toe/shoulder之后），不能写成v6_encode之前或排除肩部全部计算；不能仅由f32不同就证明SrgbEncode绝无附加差异。下一步优先取34个无肩部干扰的位置分离实际source/sum/weight/divisor。当前是定位进展，不是554值已经修复。阶段二仍延期。
