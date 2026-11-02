@@ -118,3 +118,10 @@ x86_64-w64-mingw32-g++ -std=c++17 -O0 -fsyntax-only -Iwindows/src -Iwindows/src/
 - `366b3e0`：stage 两处 slot 完成回调和 backend segment 改问该帧 Recording。该提交同时带入本轮审查者写入的 stack 缩减调用方：沿 Session::record_renodx 的 entry.stack / stack_feature / kUnnamedStack，缩短只释放消失的pass；匿名stack退单pass时释放命名首pass。
 - `77a549e`：配套 network::release_feature 只释放传入的单个历史id，父feature销毁由backend展开全部pass。避免缩短一个pass时重复展开另一套层级。backend/net定向MinGW语法检查退出0；未额外启动GPU。
 - 未完成消费者仍是 net upload/网络资源退休、取消录制历史处理和准确的passthrough状态；执行者继续处理，随后回到codec/注册和原定性能计划。不得将本节已提交项扩大为计划1通过。
+
+
+### 13:15 轮监督：撤回旧二进制验证并直接修正
+
+独立检查发现6951761在backend第1219行引用lambda内部的nwhy，当前源码编译失败。执行者此前报告的三帧结果实际来自12:37:50构建：源exe与13:07复制的宿主exe SHA256相同（524D33C3开头）。因此该次运行不能验证366b3e0/44a67c8/6951761的改动，不作为新版本通过证据。审查者已直接把nwhy移至外层，backend/net最终定向MinGW编译检查退出0；执行者随后在a36c3e7中一并提交该修正。完整链接及重跑须保留真实编译退出码、exe时间与哈希，编译失败不能继续复制旧文件。
+
+另发现44a67c8把所有Built及各扩容Upload块的凭据放在一个16项全局数组，切换extent或增长buffer会覆盖另一槽的凭据。本轮审查者直接改为Built::Upload自身持有uses[kRing]，读写对应实际buffer的槽；最终backend/net定向编译退出0。未启动GPU。网络资源RetiredNet/RetiredUse仍有token水位消费者，不能仅凭upload修复声称全生命周期闭环。
