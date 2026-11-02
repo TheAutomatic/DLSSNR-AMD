@@ -583,7 +583,12 @@ struct Backend {
     ID3D12PipelineState *to_linear = nullptr, *from_linear = nullptr, *to_motion = nullptr, *to_depth = nullptr;
     ID3D12DescriptorHeap* heap = nullptr;
     UINT increment = 0, slot = 0;
-    static constexpr UINT kSlots = 2048;   // four a frame: 512 evaluates before one is reused
+    static constexpr UINT kSlots = 2048;   // the first heap: four descriptors a frame, 512 segments
+    // A segment is rewritten only when the GPU has finished the frame that last used it (the net's completion
+    // watermark, refresh_executed). Running out of finished segments grows the heap - it never overwrites one still
+    // in flight, which would make a recorded dispatch read descriptors another frame wrote.
+    UINT segments = kSlots / 4;
+    std::vector<int64_t> segment_owner;    // per segment: the frame that last used it (-1: never)
     ID3D12Resource *lin_in = nullptr, *lin_out = nullptr, *lin_mv = nullptr, *lin_depth = nullptr;
     ID3D12Resource* neutral_mv = nullptr;
     ID3D12RootSignature* rs_prep = nullptr;
@@ -1343,9 +1348,33 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
     const auto state = nr::pe::split::snapshot(f.cmd);
     if (!state) return fallback("no snapshot of the command list's state");
 
-    // The descriptors: the colour's SRV, the output's UAV.
-    const UINT slot = g.slot;
-    g.slot = (g.slot + 4) % Backend::kSlots;
+    // The descriptors: the colour's SRV, the output's UAV. A segment whose previous frame has not finished is not
+    // rewritten: the heap grows instead (D3D12 does not keep a descriptor's resource alive for its GPU use).
+    g.refresh_executed();
+    if (g.segment_owner.empty()) g.segment_owner.assign(g.segments, -1);
+    UINT seg = g.slot / 4;
+    if (g.segment_owner[seg] >= 0 && g.segment_owner[seg] > g.executed) {
+        const UINT grown = g.segments * 2;
+        ID3D12DescriptorHeap* nh = nullptr;
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        hd.NumDescriptors = grown * 4;   // the SRV and UAV of each segment, as the first heap laid them out
+        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        if (FAILED(f.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&nh))) || !nh)
+            return fallback("no descriptor segment whose GPU use has finished");
+        retire(g.heap);
+        g.heap = nh;
+        g.segments = grown;
+        g.segment_owner.assign(g.segments, -1);
+        g.slot = 0;
+        seg = 0;
+        char msg[160];
+        std::snprintf(msg, sizeof msg, "descriptor heap grown to %u segments (completion protection)", grown);
+        nr::pe::log("[asd] %s", msg);
+    }
+    g.segment_owner[seg] = int64_t(g.frames);
+    const UINT slot = seg * 4;
+    g.slot = (seg + 1) * 4 % (g.segments * 4);
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = g.heap->GetCPUDescriptorHandleForHeapStart();
     D3D12_GPU_DESCRIPTOR_HANDLE gpu = g.heap->GetGPUDescriptorHandleForHeapStart();
     cpu.ptr += SIZE_T(slot) * g.increment;
