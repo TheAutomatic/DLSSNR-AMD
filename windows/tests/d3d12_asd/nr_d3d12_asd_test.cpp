@@ -579,7 +579,9 @@ int renodx_run(int argc, char** argv) {
     if (argc > 5) {   // a plan the game lowered (NR_DUMP_PLAN): no Vulkan session needed here
         g_plan = argv[5];
         g_m4 = argc > 6 ? argv[6] : "";
-        asd::set_net_planner(&file_planner, nullptr);
+        // The same controls patch the product installs (nr_asi_main.cpp): the plan stays this file's, only the
+        // menu's controls are applied to each push block. Without it the plan's defaults run (skin/other = +1).
+        asd::set_net_planner(&file_planner, &nr::d3d12_net_controls, nullptr);
         log("[test] renodx: plan %s", g_plan.c_str());
     } else {
         auto planner = +[](uint32_t w, uint32_t h, int model, bool experimental, nr::D3d12NetPlan* p, std::string* why) {

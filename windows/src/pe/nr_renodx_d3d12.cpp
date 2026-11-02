@@ -2331,6 +2331,14 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
                 if (ck.skin_structure < 0.0f) ck.skin_structure = 1.0f;
             }
         }
+        if (f.capture_in || f.capture_out || std::getenv("NR_NET_PRE_DUMP") || std::getenv("NR_NET_KERN_DUMP")) {
+            // debug: the model controls this pass sends
+            nr::pe::log("[nr] stage controls: pass %u intensity %g style %d tone %g structure %g skin %g mask %d "
+                        "(settings auto_mask %d skin_independent %d)",
+                        k, double(ck.intensity), ck.style, double(ck.local_tone), double(ck.local_structure),
+                        double(ck.skin_structure), ck.automatic_mask ? 1 : 0, s.auto_mask ? 1 : 0,
+                        s.skin_independent ? 1 : 0);
+        }
         // RenoDX's guides: NRDepthMode overrides the game's depth direction, NRMVecScaleX / Y scale its motion
         // vectors (the network's and the look's).
         NetTemporal nt;

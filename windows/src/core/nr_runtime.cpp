@@ -3395,6 +3395,11 @@ bool plan_d3d12_network(const std::string& root_in, uint32_t mw, uint32_t mh, bo
 }
 
 void d3d12_net_controls(D3d12NetPlan::Dispatch& d, const D3d12NetControls& c, bool grade) {
+    if (std::getenv("NR_NET_PRE_DUMP") && d.kern.rfind("fswinimagepreds32", 0) == 0) {
+        std::fprintf(stderr, "d3d12 controls: style %d intensity %g tone %g structure %g skin %g mask %d\n", c.style,
+                     double(c.intensity), double(c.local_tone), double(c.local_structure), double(c.skin_structure),
+                     c.automatic_mask ? 1 : 0);
+    }
     // NR_POST_ALPHA is 0 in the product: the alpha pass, not the post block, restores the alpha (and the rounding).
     patch_push_controls(d.push, d.kern, c.style, c.intensity, c.local_tone, c.local_structure, c.skin_structure,
                         c.automatic_mask, false, false, grade);
