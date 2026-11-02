@@ -3,6 +3,7 @@
 // nr_asi_wilsjo2.cpp's route; a header so the offline test (nr_wilsjo2_d3d12_test.cpp) runs the very same class.
 #pragma once
 
+#include "nr_gpu_completion.hpp"
 #include "nr_wilsjo2.hpp"
 
 #include <windows.h>
@@ -155,8 +156,12 @@ public:
         if (rs_fast_) rs_fast_->Release();
         for (auto* p : pso_) if (p) p->Release();
         for (auto* c : copies_) c->Release();
-        if (upload_) upload_->Release();
-        if (heap_) heap_->Release();
+        for (auto& b : blocks_) {
+            if (b->mapped) b->upload->Unmap(0, nullptr);
+            if (b->upload) b->upload->Release();
+            if (b->heap) b->heap->Release();
+        }
+        blocks_.clear();
         if (rs_) rs_->Release();
     }
     // On a thread of ours: the programs of `folder` (wilsjo2_<name>.dxbc). False: why.
@@ -333,35 +338,24 @@ public:
                 pso_[pf.mode] = it->second;
             }
         }
-        D3D12_DESCRIPTOR_HEAP_DESC hd{};
-        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        hd.NumDescriptors = kSlots * 16;
-        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-        if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap_)))) { *why = "CreateDescriptorHeap failed"; return false; }
         inc_ = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-        D3D12_HEAP_PROPERTIES hp{};
-        hp.Type = D3D12_HEAP_TYPE_UPLOAD;
-        D3D12_RESOURCE_DESC bd{};
-        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        bd.Width = uint64_t(kSlots) * kStride; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
-        bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                                                   IID_PPV_ARGS(&upload_)))) { *why = "the constants' upload buffer could not be made"; return false; }
-        void* m = nullptr;
-        if (FAILED(upload_->Map(0, nullptr, &m)) || !m) { *why = "the constants' upload buffer could not be mapped"; return false; }
-        mapped_ = static_cast<uint8_t*>(m);
-        return true;
+        device_ = device;
+        return make_block(why);
     }
     // A recording on `cmd` (its state saved by the caller): our heap and root signature bound; `ensure` puts a resource
     // in a state (the route's tracking).
     void begin(ID3D12GraphicsCommandList* cmd, Ensure ensure) {
         cmd_ = cmd;
         ensure_ = std::move(ensure);
-        ID3D12DescriptorHeap* heaps[] = {heap_};
-        cmd_->SetDescriptorHeaps(1, heaps);
+        bound_ = nullptr;   // a recording's first dispatch binds its block's heap
+        if (!blocks_.empty()) {
+            ID3D12DescriptorHeap* heaps[] = {blocks_.front()->heap};
+            cmd_->SetDescriptorHeaps(1, heaps);
+        }
         cmd_->SetComputeRootSignature(rs_);
     }
-    void end() { cmd_ = nullptr; ensure_ = nullptr; }
+    void end() { cmd_ = nullptr; ensure_ = nullptr; bound_ = nullptr; }
+    void end_recording() override { sweep_blocks(); }
     bool has_fast() const override {
         return fast_pso_[0] && fast_pso_[1] && fast_pso_[2] && fast_pso_[3] && pso_[w2::kHalfCopy];
     }
@@ -389,10 +383,11 @@ public:
         for (const w2::Image* wi : writes) ensure_(resource(*wi), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         for (const w2::Image* ri : reads)
             if (!is_copy(resource(*ri))) ensure_(resource(*ri), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        const UINT slot = slot_;
-        slot_ = (slot_ + 1) % kSlots;
-        D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap_->GetCPUDescriptorHandleForHeapStart();
-        D3D12_GPU_DESCRIPTOR_HANDLE gpu = heap_->GetGPUDescriptorHandleForHeapStart();
+        const SlotRef sr = take_slot();
+        const UINT slot = sr.index;
+        bind_block(sr.block);
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu = sr.block->heap->GetCPUDescriptorHandleForHeapStart();
+        D3D12_GPU_DESCRIPTOR_HANDLE gpu = sr.block->heap->GetGPUDescriptorHandleForHeapStart();
         cpu.ptr += SIZE_T(slot) * 16 * inc_;
         gpu.ptr += UINT64(slot) * 16 * inc_;
         for (UINT i = 0; i < 4; ++i) {
@@ -425,14 +420,14 @@ public:
             h.ptr += SIZE_T(4 + i) * inc_;
             device_->CreateUnorderedAccessView(r, nullptr, &v, h);
         }
-        std::memcpy(mapped_ + uint64_t(slot) * kStride, &d.constants, sizeof(w2::Constants));
+        std::memcpy(sr.block->mapped + uint64_t(slot) * kStride, &d.constants, sizeof(w2::Constants));
         D3D12_GPU_DESCRIPTOR_HANDLE gpu_uav = gpu;
         gpu_uav.ptr += UINT64(4) * inc_;
         cmd_->SetComputeRootSignature(rs_);
         cmd_->SetPipelineState(pso_[mode]);
         cmd_->SetComputeRootDescriptorTable(0, gpu);
         cmd_->SetComputeRootDescriptorTable(1, gpu_uav);
-        cmd_->SetComputeRootShaderResourceView(2, upload_->GetGPUVirtualAddress() + uint64_t(slot) * kStride);
+        cmd_->SetComputeRootShaderResourceView(2, sr.block->upload->GetGPUVirtualAddress() + uint64_t(slot) * kStride);
         // Spec 6.4: 8x8 groups over Width x Height; the meter one group a tile, Width x Height groups.
         if (mode == w2::kMeter) cmd_->Dispatch(d.constants.width, d.constants.height, 1);
         else if (mode == w2::kPrepMeter) cmd_->Dispatch(1, 1, 1);   // one 16 x 16 group over the whole image
@@ -466,10 +461,11 @@ public:
             else ensure_(r, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         }
 
-        const UINT slot = slot_;
-        slot_ = (slot_ + 1) % kSlots;
-        D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap_->GetCPUDescriptorHandleForHeapStart();
-        D3D12_GPU_DESCRIPTOR_HANDLE gpu = heap_->GetGPUDescriptorHandleForHeapStart();
+        const SlotRef sr = take_slot();
+        const UINT slot = sr.index;
+        bind_block(sr.block);
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu = sr.block->heap->GetCPUDescriptorHandleForHeapStart();
+        D3D12_GPU_DESCRIPTOR_HANDLE gpu = sr.block->heap->GetGPUDescriptorHandleForHeapStart();
         cpu.ptr += SIZE_T(slot) * 16 * inc_;
         gpu.ptr += UINT64(slot) * 16 * inc_;
         D3D12_CPU_DESCRIPTOR_HANDLE cpu_srv = cpu;
@@ -527,6 +523,82 @@ public:
     }
 
 private:
+    // One descriptor range and constants block (kSlots of each), with the recording each slot last belonged to. A slot is
+    // reused only when that recording finished - the Vulkan stage's `slot()` rule - and a block whose slots are all still
+    // in flight is replaced by a new one rather than written over (the dispatches already recorded read the old block).
+    struct Block {
+        ID3D12DescriptorHeap* heap = nullptr;
+        ID3D12Resource* upload = nullptr;
+        uint8_t* mapped = nullptr;
+        std::vector<nr::gpu::Ticket> slots;
+        nr::gpu::Uses uses;
+        uint32_t next = 0;
+        bool busy() const { return !uses.ready(); }
+    };
+    struct SlotRef {
+        Block* block;
+        uint32_t index;
+    };
+    bool make_block(std::string* why) {
+        auto b = std::make_unique<Block>();
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        hd.NumDescriptors = kSlots * 16;
+        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        if (FAILED(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&b->heap)))) { *why = "CreateDescriptorHeap failed"; return false; }
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC bd{};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = uint64_t(kSlots) * kStride; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                    IID_PPV_ARGS(&b->upload)))) { *why = "the constants' upload buffer could not be made"; return false; }
+        void* m = nullptr;
+        if (FAILED(b->upload->Map(0, nullptr, &m)) || !m) { *why = "the constants' upload buffer could not be mapped"; return false; }
+        b->mapped = static_cast<uint8_t*>(m);
+        b->slots.assign(kSlots, nullptr);
+        blocks_.insert(blocks_.begin(), std::move(b));   // [0] is the current one
+        return true;
+    }
+    void bind_block(Block* b) {
+        if (bound_ == b) return;
+        ID3D12DescriptorHeap* heaps[] = {b->heap};
+        cmd_->SetDescriptorHeaps(1, heaps);
+        bound_ = b;
+    }
+    SlotRef take_slot() {
+        if (blocks_.empty()) throw std::runtime_error("wilsjo2 stage (D3D12): no descriptor block");
+        const nr::gpu::Ticket ticket = nr::gpu::current();
+        Block* b = blocks_.front().get();
+        for (uint32_t n = 0; n < kSlots; ++n) {
+            const uint32_t i = (b->next + n) % kSlots;
+            if (b->slots[i] && !b->slots[i]->ready()) continue;
+            b->slots[i] = ticket;
+            if (ticket) b->uses.tickets.push_back(ticket);
+            b->next = (i + 1) % kSlots;
+            return {b, i};
+        }
+        // Every slot of this block is still in flight: the next dispatch gets a block of its own.
+        std::string why;
+        if (!make_block(&why)) throw std::runtime_error("wilsjo2 stage (D3D12): " + why);
+        b = blocks_.front().get();
+        b->slots[0] = ticket;
+        if (ticket) b->uses.tickets.push_back(ticket);
+        b->next = 1 % kSlots;
+        return {b, 0};
+    }
+    // Blocks a later dispatch replaced are freed once nothing of theirs is in flight.
+    void sweep_blocks() {
+        for (size_t i = 1; i < blocks_.size();) {
+            if (blocks_[i]->busy()) { ++i; continue; }
+            Block& blk = *blocks_[i];
+            if (blk.mapped) blk.upload->Unmap(0, nullptr);
+            blk.upload->Release();
+            blk.heap->Release();
+            blocks_.erase(blocks_.begin() + long(i));
+        }
+    }
     // The copy of `r` this dispatch reads (one per resource description, kept; left in NON_PIXEL_SHADER_RESOURCE).
     ID3D12Resource* copy_of(ID3D12Resource* r) {
         D3D12_RESOURCE_DESC rd = r->GetDesc();
@@ -574,10 +646,9 @@ private:
     ID3D12PipelineState* pso_[kModes]{};
     ID3D12RootSignature* rs_fast_ = nullptr;
     ID3D12PipelineState* fast_pso_[nr::fast::kProgramCount]{};
-    ID3D12DescriptorHeap* heap_ = nullptr;
-    ID3D12Resource* upload_ = nullptr;
-    uint8_t* mapped_ = nullptr;
-    UINT inc_ = 0, slot_ = 0;
+    std::vector<std::unique_ptr<Block>> blocks_;   // [0] the block the next dispatch takes its slot from
+    UINT inc_ = 0;
+    Block* bound_ = nullptr;   // the heap this recording last bound
     uint64_t dispatches_ = 0;
     ID3D12GraphicsCommandList* cmd_ = nullptr;
     Ensure ensure_;
