@@ -12,13 +12,13 @@
 
 ## 构建产物(本机实测,绝对路径)
 
-| 产物 | 路径 | sha256(前 16 位) | 时间 |
+| 产物 | 路径 | sha256 | 时间 |
 |---|---|---|---|
-| 产品 ASI(`NR_INT4=1`) | `artifacts/windows/asi/dlssnr-amd.asi` | `e9025503b94483e2` | 21:35 |
-| 离线 D3D12 宿主(含 resize/drop 用例) | `artifacts/windows/d3d12_asd_test/nr_d3d12_asd_test_619.exe` | `f1e7b0710056f480` | 21:22 |
-| Vulkan 参考宿主(含 `NR_PLAN_DUMP`) | `artifacts/windows/d3d12_asd_test/nr_parity_host.exe` | `ab44d907b6bd3d40` | 21:2x |
-| W2 离线测试 | `artifacts/windows/wilsjo2_d3d12_test/nr_wilsjo2_d3d12_test.exe` | `ec760dfe89ae9c75` | 21:0x |
-| 共享 HDR 解码(RGBA16F) | `artifacts/windows/jxr-probe/pbz_rgba16f.bin` | `e900a596460d4e88` | — |
+| 产品 ASI(`NR_INT4=1`) | `C:/Users/Kenny/Downloads/wt-d3d12-asd-wiring/artifacts/windows/asi/dlssnr-amd.asi` | `e9025503b94483e29ef3c8c1a1c07dd6553e0a430a93c9acfbe61f390ebbb512` | 21:35 |
+| 离线 D3D12 宿主(含 resize/drop 用例) | `C:/Users/Kenny/Downloads/wt-d3d12-asd-wiring/artifacts/windows/d3d12_asd_test/nr_d3d12_asd_test_619.exe` | `f1e7b0710056f48009927dfab5141f2042905d3c54864bad7c75d8c98ad6b29d` | 21:22 |
+| Vulkan 参考宿主(含 `NR_PLAN_DUMP`) | `C:/Users/Kenny/Downloads/wt-d3d12-asd-wiring/artifacts/windows/d3d12_asd_test/nr_parity_host.exe` | `ab44d907b6bd3d403bcbaf6a5d773283f008b8f6a3e9ff0dc45ffebc022d5668` | 见文件时间及原始构建日志 |
+| W2 离线测试 | `C:/Users/Kenny/Downloads/wt-d3d12-asd-wiring/artifacts/windows/wilsjo2_d3d12_test/nr_wilsjo2_d3d12_test.exe` | `ec760dfe89ae9c75d218bd2ebcdd4610ac89da751735d148f799772d9dca4812` | 见文件时间及原始构建日志 |
+| 共享 HDR 解码(RGBA16F) | `C:/Users/Kenny/Downloads/wt-d3d12-asd-wiring/artifacts/windows/jxr-probe/pbz_rgba16f.bin` | `e900a596460d4e88a4b1f88f960da72d2aa6460a6a4842e2655b2a8c036b079b` | — |
 
 构建命令(仓库根;脚本在工作区是 CRLF,必须 `tr -d '\r'` 后执行):
 
@@ -33,10 +33,10 @@ tr -d '\r' < windows/build/build_wilsjo2_d3d12_test.sh > windows/build/.x.sh && 
 
 - HDR 实图输入:`C:\Users\Kenny\OneDrive\视频\Captures\Phantom Blade Zero   2026_10_31 18_16_18.jxr`
   (JPEG XR,3840x2160,coded 64bppRGBAHalf/no colour context/线性 scRGB,RGB −0.180908..7.796875)。
-  解码工具 `artifacts/windows/jxr-probe/jxr_probe.exe`(WIC),f32 → `numpy astype('<f2')` → 上表的共享 half 文件。
+  解码工具 `C:/Users/Kenny/Downloads/wt-d3d12-asd-wiring/artifacts/windows/jxr-probe/jxr_probe.exe`(WIC),f32 → `numpy astype('<f2')` → 上表的共享 half 文件。
 - 两侧宿主均以 `NR_TEST_INPUT_HALF=<共享 half 文件>` 上传同一份字节;帧为 RGBA16F、present=scRGB(3)。
-- 实图运行脚本:`artifacts/windows/asd-harness/hdr12.bat`(D3D12)、`hdrvk.bat`(Vulkan 参考);对照报告
-  `artifacts/windows/hdr-compare/REPORT.md`,成图 `view_d3d12.png` / `view_vk.png` / `view_diff.png`。
+- 实图运行脚本:`C:/Users/Kenny/Downloads/wt-d3d12-asd-wiring/artifacts/windows/asd-harness/hdr12.bat`(D3D12)、`hdrvk.bat`(Vulkan 参考);对照报告
+  `C:/Users/Kenny/Downloads/wt-d3d12-asd-wiring/artifacts/windows/hdr-compare/REPORT.md`,成图 `view_d3d12.png` / `view_vk.png` / `view_diff.png`。
 - 计划导出(任意 extent,纯 CPU):`nr_parity_host.exe <root> W H <dir>` + `NR_PLAN_DUMP=<plan>`,
   日志 `asd-harness/plan-only.txt`(无设备行)。
 
@@ -52,7 +52,7 @@ tr -d '\r' < windows/build/build_wilsjo2_d3d12_test.sh > windows/build/.x.sh && 
    (`retired at frame 6, reason key, 3 recording(s) done`),两帧 `Close/Signal/watch 0x0`、device reason 0x0、exit 0。
 4. **丢弃录制**(`asd-harness/drop-case.txt`):录而不提 → never_submitted → feature 释放 → 下一帧重建。
 5. **NR 关闭 copy-through**(`boundary-nroff.txt`):0 pass、成功返回、`Close 0x0`;面板 `ran` 为 false。
-6. 安装树:`artifacts/windows/pkg-check/`(`dlssnr-amd-asd/` 含 ini/SODB/PSDB + `wilsjo2-d3d12/` 21 个 dxbc;
+6. 安装树:`C:/Users/Kenny/Downloads/wt-d3d12-asd-wiring/artifacts/windows/pkg-check/`(`dlssnr-amd-asd/` 含 ini/SODB/PSDB + `wilsjo2-d3d12/` 21 个 dxbc;
    `dlssnr-amd/shaders/renodx` 19 个 HLSL;`shaders/wilsjo2` 26 个 SPV),离线宿主从该路径加载通过。
 
 ## 未证明 / 限制
