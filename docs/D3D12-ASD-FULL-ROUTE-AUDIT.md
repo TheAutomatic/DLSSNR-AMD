@@ -349,3 +349,10 @@ plan-only lowering(`nr_d3d12_net_plan.hpp:63`;`nr_runtime.cpp:3195` 注释即 "n
   dxbc)、`dlssnr-amd/shaders/renodx/`(19 个 HLSL)、`dlssnr-amd/shaders/wilsjo2/`(26 个 SPV);
 - 计划可用 `nr_parity_host` 的 `NR_PLAN_DUMP` 在任意 extent 离线生成(plan-only lowering,无设备/无注册);
 - `build_package.sh` 在带 `dlssnr-amd-asd/` 的打包中缺 DXBC 工具即失败,C I 不打包该目录,故不受影响。
+
+### 丢弃录制 / feature 释放边界(已实际运行)
+
+`NR_TEST_DROP=1`(`asd-harness/drop-case.txt`,同进程、同设备、同 feature,先做 extent 切换):一帧被录制但**不提交**,
+split 判为 never_submitted → 该 feature 的 stage 被释放(`retired at frame 7, 1 recording(s) done`),下一次 evaluate
+重建("the feature is rebuilt",1080/1 pass),exit=0。这正是模型在丢弃帧后释放状态的那条路径;它与 resize 的
+"正常提交后换代"分开记录,不互相冒充。
