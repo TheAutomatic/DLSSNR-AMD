@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
-"""Strict comparison of two raw frame dumps (R10G10B10A2 OR RGBA16F, width*height*4 bytes each).
+"""Compare two complete raw frame dumps (R10G10B10A2, RGBA16F or RGBA32F).
 
-Both files must be exactly width*height*4 bytes: a short file is a failure, never a truncation to the shorter one
+Both files must have exactly the byte count for the selected format: a short file is a failure, never a truncation to the shorter one
 (a missing half of a frame would otherwise read as agreement). Reports per channel max/mean/RMSE/quantiles, the
 share of differing pixels, and rejects non-finite values in float dumps.
 
-  compare_dumps.py A.bin B.bin <width> <height> [r10g10b10a2|rgba16f]
+  compare_dumps.py A.bin B.bin <width> <height> [r10g10b10a2|rgba16f|rgba32f]
 """
 import sys
 import numpy as np
 
 def channels(path, w, h, kind):
     raw = np.fromfile(path, dtype=np.uint8)
-    per_px = 4 if kind == "r10g10b10a2" else 8   # R10G10B10A2 is 4 bytes; RGBA16F is 8
+    sizes = {"r10g10b10a2": 4, "rgba16f": 8, "rgba32f": 16}
+    if kind not in sizes:
+        sys.exit(f"FAIL: unknown format {kind!r}; expected one of {', '.join(sizes)}")
+    per_px = sizes[kind]
     want = w * h * per_px
     if raw.size != want:
         sys.exit(f"FAIL {path}: {raw.size} bytes, expected exactly {want} ({w}x{h}x{per_px})")
@@ -20,9 +23,9 @@ def channels(path, w, h, kind):
         v = raw.view(np.uint32)
         return {n: ((v >> s) & ((1 << b) - 1)).astype(np.float64) for n, s, b in
                 (("R", 0, 10), ("G", 10, 10), ("B", 20, 10), ("A", 30, 2))}, 1023.0, False
-    a = raw.view(np.float16)
+    a = raw.view(np.dtype("<f4" if kind == "rgba32f" else "<f2"))
     if a.size != w * h * 4:
-        sys.exit(f"FAIL {path}: {a.size} halves, expected {w*h*4} (= {w}x{h}x4 channels)")
+        sys.exit(f"FAIL {path}: {a.size} values, expected {w*h*4} (= {w}x{h}x4 channels)")
     a = a.reshape(-1, 4).astype(np.float32)
     if not np.isfinite(a).all():
         sys.exit(f"FAIL {path}: {np.count_nonzero(~np.isfinite(a))} non-finite values")
@@ -44,8 +47,8 @@ def main():
         ad = np.abs(d)
         rms = float(np.sqrt(np.mean(d * d)))
         q = np.percentile(ad, [50, 90, 99])
-        print(f"  {name}: max {ad.max():8.3f} mean {ad.mean():8.4f} rmse {rms:8.4f} "
-              f"p50 {q[0]:7.3f} p90 {q[1]:7.3f} p99 {q[2]:7.3f} diff {(ad > 0).mean()*100:6.2f}%")
+        print(f"  {name}: max {ad.max():.8g} mean {ad.mean():.8g} rmse {rms:.8g} "
+              f"p50 {q[0]:.8g} p90 {q[1]:.8g} p99 {q[2]:.8g} diff {(ad > 0).mean()*100:6.2f}%")
     # One number for "how different", in units of the format's full scale.
     worst = max(float(np.abs(ca[k] - cb[k]).max()) for k in "RGB")
     if full:
