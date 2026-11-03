@@ -87,6 +87,7 @@ HMODULE dllModule = nullptr;
 
 namespace nr::pe::menu {
 namespace {
+std::atomic<void (*)()> g_extra_diagnostics{nullptr};   // set_extra_diagnostics
 using nr::lang::tr;
 using nr::lang::tr_text;
 
@@ -744,6 +745,7 @@ struct Menu {
         nr::control_ui::draw_diag_package([s] { return diag_request(s); });
         ImGui::Separator();
         nr::control_ui::draw_session_stats();
+        if (auto draw = g_extra_diagnostics.load()) draw();
     }
     // The diagnostic package's request (Diagnostics' button; tests: NR_CONTROL_DIAG_AT)
     static nr::pe::diag::Request diag_request(const nr::control::Shared* s) {
@@ -2025,6 +2027,8 @@ void install_now() {
 }
 
 }  // namespace
+
+void set_extra_diagnostics(void (*draw)()) { g_extra_diagnostics = draw; }
 
 void abandon_at_exit() {
     for (auto& [k, v] : g_vulkan) (void)v.release();

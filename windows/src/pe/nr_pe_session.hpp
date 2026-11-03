@@ -27,6 +27,10 @@
 
 namespace nr::pe {
 
+// The .asi's native D3D12 ASD backend is on for this process (nr_d3d12_asd.hpp): the network availability no longer
+// depends on the bridge's Vulkan device alone, and the int4 network is not offered (the backend has no int4 build).
+void set_d3d12_native(bool on);
+
 class Session {
   public:
     // `root` is the directory holding build/ and artifacts/; empty means "next
@@ -513,6 +517,11 @@ class Session {
     State state() const;
     // [Network] Model from the host's UI, as the hotkey does (the switch writes Model to the ini).
     void set_network(int n);
+    // The network wanted now: steps NetworkSwitch (hotkey, dlssnr-amd.ini).
+    int frame_network();
+    void set_running_network(int net);
+    // [Network] History Precision as dlssnr-amd.ini says it now (true: 16, the default), for a backend of its own.
+    bool history_f16() const;
     // Between evaluations, from the host's own clock (with whatever lock its evaluations hold): after a while with no
     // evaluation (NR off), [Network] Residency frees what it would free of an inactive network, the running one included,
     // and networks retired since are freed (their frames are long done).

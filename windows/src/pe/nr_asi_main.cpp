@@ -32,6 +32,10 @@
 #include "nr_path_win.hpp"
 #include "MinHook.h"
 #include "nr_asi_wilsjo2.hpp"
+#include "nr_d3d12_asd.hpp"
+#include "nr_d3d12_asd_backend.hpp"
+#include "nr_d3d12_asd_net.hpp"
+#include "nr_d3d12_net_plan.hpp"
 #include "nr_device_features.hpp"
 #include "nr_dlssnr_model.hpp"
 #include "nr_pe_session.hpp"
@@ -3629,6 +3633,21 @@ bool adopt_fg_proxy(void* context, IUnknown* proxy, ID3D12CommandQueue* queue, c
         static_cast<void*>(sc), static_cast<void*>(queue),
         hooked ? "; the layers run at its Present, once a game frame, before frame generation"
                : ", but its Present is not hooked (above): not followed");
+    {   // its buffers, beside what frame generation is handed (nr_asi_hudcap.cpp: presentColor) in the log
+        std::string buffers;
+        DXGI_SWAP_CHAIN_DESC d{};
+        if (SUCCEEDED(sc->GetDesc(&d)))
+            for (UINT i = 0; i < d.BufferCount && i < 8; ++i) {
+                ID3D12Resource* b = nullptr;
+                if (SUCCEEDED(sc->GetBuffer(i, IID_PPV_ARGS(&b))) && b) {
+                    char t[24];
+                    std::snprintf(t, sizeof t, "%s%p", buffers.empty() ? "" : " ", static_cast<void*>(b));
+                    buffers += t;
+                    b->Release();
+                }
+            }
+        log("[nr] Present layers: %s's swap chain %p: buffers %s", who, static_cast<void*>(sc), buffers.c_str());
+    }
     if (!hooked) {   // left as before: the swap chain under it serves the layers
         ID3D12CommandQueue* drop = nullptr;
         {
@@ -8635,6 +8654,19 @@ extern "C" __declspec(dllexport) void InitializeASI() {
     nr::pe::configure_network(nr::pe::module_folder());
     nr::pe::control::asi_facts(NR_BUILD_STAMP, nullptr);
     nr::pe::watchdog::start();   // its thread runs once OptiScaler's DllMain has returned
+    // The native D3D12 ASD backend (nr_d3d12_asd.hpp): off unless dlssnr-amd-asd\dlssnr-amd-asd.ini beside this .asi
+    // says Enabled = 1. On: its registration starts (a thread), and the D3D12 evaluate offers it each frame first.
+    nr::pe::asd::start(g_self);
+    if (nr::pe::asd::enabled()) {
+        nr::pe::asd::set_net_planner(
+            [](uint32_t w, uint32_t h, int model, bool experimental, nr::D3d12NetPlan* out, std::string* why) {
+                return nr::plan_d3d12_network(nr::pe::module_folder(), w, h, experimental, out, why, model);
+            },
+            &nr::d3d12_net_controls, &nr::dlssnr::frame_network);
+        nr::dlssnr::set_d3d12_backend(&nr::pe::asd::evaluate_backend);
+        nr::pe::set_d3d12_native(true);
+    }
+    nr::pe::menu::set_extra_diagnostics(&nr::pe::asd::draw_panel);
     judge_executable();
     read_ini_barriers();
     nr::dlssnr::keep_caller_state();   // the RenoDX style is said per evaluate (renodx_route::CallStyle), not set here

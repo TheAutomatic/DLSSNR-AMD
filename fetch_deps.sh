@@ -200,5 +200,31 @@ EOF
     get artifacts/ref/dxvk/LICENSE \
         https://raw.githubusercontent.com/doitsujin/dxvk/601930949d111edbbcf9dd463948426d9f8f6ddd/LICENSE \
         a5cb1a6ded7d2d7e92d550ba28edd21be2d1d4044662b399887351023e30ce64
+    # SPIRV-Cross: the D3D12 route's own programs (NR's Preprocess, Passes (fast), debug views and the wilsjo2 style)
+    # are this package's SPIR-V turned into HLSL (windows/build/build_d3d12_hlsl.sh), which the plugin compiles in the
+    # game - one source for both routes.
+    repo toolchain/SPIRV-Cross https://github.com/KhronosGroup/SPIRV-Cross.git \
+         6c09849fe88c48eaed08413aa022aaa136a3a057                                  # vulkan-sdk-1.4.357.0
+    if [[ ! -x toolchain/SPIRV-Cross/build/spirv-cross ]]; then
+        cmake -S toolchain/SPIRV-Cross -B toolchain/SPIRV-Cross/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DSPIRV_CROSS_SHARED=OFF -DSPIRV_CROSS_STATIC=ON -DSPIRV_CROSS_CLI=ON -DSPIRV_CROSS_ENABLE_TESTS=OFF > /dev/null
+        cmake --build toolchain/SPIRV-Cross/build --target spirv-cross > /dev/null
+    fi
+    # The D3D12 ASD backend's databases (dlssnr-amd-asd/): the SODB, the carriers and one PSDB an adapter family, made
+    # by TheAutomatic's PSDB generator (Windows only: Microsoft's and AMD's ASD compilers) from this release's ACO
+    # records and network SPIR-V. manifest.tsv lists the records they were made from; build_package.sh checks it
+    # against the package's own records, so databases of another release are never shipped with these shaders.
+    asd=https://raw.githubusercontent.com/TheAutomatic/DLSSNR-AMD/cf99879571213f7c218d945b6785ee6ccf60ea22/windows/tools/asd-psdb-generator/artifacts
+    mkdir -p artifacts/ref/asd
+    get artifacts/ref/asd/carrier.sodb "$asd/0082/carrier.sodb" \
+        949dbd9e541b6099dff2379345c31d25130f61986bdca64d54ff632069637554
+    get artifacts/ref/asd/net-carriers.bin "$asd/0082/net-carriers.bin" \
+        bb270cfc2133333532d2430ddae27cdb431c253642d0bfcc913d8bbea57a7bb9
+    get artifacts/ref/asd/manifest.tsv "$asd/0082/manifest.tsv" \
+        5f514bf284d037caa485a361c8977ebdc35a5d9856c9a49cd9612df94c41c21d
+    get artifacts/ref/asd/gfx1201.psdb "$asd/0082/public-copy.psdb" \
+        f5772df6cb3b9aa907405a6dcfcc69505df7b92ed814346df91c19568b02925a
+    get artifacts/ref/asd/gfx1200.psdb "$asd/0082-gfx1200/public-copy.psdb" \
+        c5719cee9e55d89988c69db7e21e24733d5f3296f9a7680e68e18b53925503ff
 fi
 echo "dependencies ready"
