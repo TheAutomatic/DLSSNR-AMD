@@ -147,3 +147,7 @@ key and carrier DXIL). Mixing files from two releases breaks lookups.
   `--app-engine-version`) is stored in the SODB and the cache sessions. Defaults
   reproduce the lab probe identity; they must match the registration the ASI
   performs if the runtime compares them (M1 hit with matching identity).
+
+## gfx1200 data
+
+The separate `artifacts/0082-gfx1200/` set targets `AMD_NAVI44:gfx1200`. Generate with `-Family gfx1200`; see [the target report](docs/0082-GFX1200-REPORT.md). `--verify` checks ELF machine flags for both gfx1200 and gfx1201, including the canary. The original `artifacts/0082/` set remains gfx1201 and is unchanged.

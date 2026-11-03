@@ -110,6 +110,17 @@ inline int run(const Args& args, const std::string& repo, const std::string& out
                     hr_name(probe));
     }
 
+    const uint32_t expected_mach = selected.family.find("gfx1200") != std::string::npos ? 0x48u :
+                                   selected.family.find("gfx1201") != std::string::npos ? 0x4eu : 0u;
+    size_t machine_checked = 0;
+    auto check_machine = [&](const void* data, size_t size) {
+        require(size >= 64 && std::memcmp(data, "\x7f" "ELF", 4) == 0, "object code is not an ELF");
+        const auto* bytes = static_cast<const uint8_t*>(data);
+        require(bytes[4] == 2 && bytes[5] == 1, "object code is not little-endian ELF64");
+        uint32_t flags = 0; std::memcpy(&flags, bytes + 48, sizeof flags);
+        if (expected_mach) require((flags & 0xffu) == expected_mach, "ELF machine does not match compiler target family");
+        ++machine_checked;
+    };
     auto entries = m2::load_manifest_tsv(args.get("manifest"));
     auto carriers = read_carriers(read_file(args.get("carriers")));
     require(carriers.size() == entries.size(), "carrier entry count != manifest records");
@@ -142,9 +153,10 @@ inline int run(const Args& args, const std::string& repo, const std::string& out
             for (auto& v : values) {
                 if (!v.Value.pValue || !v.Value.ValueSize) continue;
                 value_bytes += v.Value.ValueSize;
-                if (v.Type == D3D12_COMPILER_VALUE_TYPE_OBJECT_CODE)
+                if (v.Type == D3D12_COMPILER_VALUE_TYPE_OBJECT_CODE) {
+                    check_machine(v.Value.pValue, v.Value.ValueSize);
                     codesha = sha256_hex(v.Value.pValue, v.Value.ValueSize);
-                else
+                } else
                     metasha = sha256_hex(v.Value.pValue, v.Value.ValueSize);
                 free(v.Value.pValue);
             }
@@ -189,8 +201,10 @@ inline int run(const Args& args, const std::string& repo, const std::string& out
             values[1].Type = D3D12_COMPILER_VALUE_TYPE_METADATA;
             if (FAILED(psdb->FindValue(&key, values, 2, allocate_value, nullptr))) continue;
             for (auto& v : values) {
-                if (v.Value.pValue && v.Type == D3D12_COMPILER_VALUE_TYPE_OBJECT_CODE)
+                if (v.Value.pValue && v.Type == D3D12_COMPILER_VALUE_TYPE_OBJECT_CODE) {
+                    check_machine(v.Value.pValue, v.Value.ValueSize);
                     codesha = sha256_hex(v.Value.pValue, v.Value.ValueSize);
+                }
                 if (v.Value.pValue) free(v.Value.pValue);
             }
         }
@@ -205,6 +219,8 @@ inline int run(const Args& args, const std::string& repo, const std::string& out
         if (!dc.called || captured.keys.empty() || codesha.empty()) ++groups_bad;
     }
     write_file(out + "/canonical.jsonl", canonical);
+    j.u("elf_machine_expected", expected_mach);
+    j.u("elf_objects_checked", machine_checked);
     j.u("groups_ok", groups_ok);
     j.u("groups_bad", groups_bad);
     j.s("canonical_sha256", sha256_hex(canonical.data(), canonical.size()));
