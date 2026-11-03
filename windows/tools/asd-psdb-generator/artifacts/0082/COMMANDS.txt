@@ -1,0 +1,36 @@
+Generation commands for this artifact set (Windows x64, CPU only)
+
+Build (from <package>):
+  set ASD_SDK_DIR=C:\...\microsoft.direct3d.d3d12.1.619.5\build\native
+  set ASD_PLUGIN_DIR=C:\...\amd.asdcompilerplugin.32.0.32015.7029\build\native\bin\x64
+  scripts\build.cmd
+
+Generate (scripts\generate.ps1 runs these four steps and exits on the first failure):
+  build\bin\asd_psdb_gen.exe --root <package> --out <out> --m2-manifest ^
+      --aco-root <release>\dlssnr-amd\aco --release-root <release>\dlssnr-amd ^
+      --compiler-dir <sdk>\bin\x64 --plugin <plugin>\amdxc_compiler.dll
+  build\bin\asd_psdb_gen.exe --root <package> --out <out>\canary --canary-seed ^
+      --compiler-dir <sdk>\bin\x64 --plugin <plugin>\amdxc_compiler.dll
+  build\bin\asd_psdb_gen.exe --root <package> --out <out> --m5-build ^
+      --manifest <out>\manifest.tsv --aco-root <release>\dlssnr-amd\aco --release-root <release>\dlssnr-amd ^
+      --canary-sodb <out>\canary\canary.sodb --canary-psdb <out>\canary\canary.psdb ^
+      --compiler-dir <sdk>\bin\x64 --plugin <plugin>\amdxc_compiler.dll
+  build\bin\asd_psdb_gen.exe --root <package> --out <out>\verify --verify ^
+      --manifest <out>\manifest.tsv --sodb <out>\carrier.sodb --psdb <out>\public-copy.psdb ^
+      --carriers <out>\net-carriers.bin ^
+      --compiler-dir <sdk>\bin\x64 --plugin <plugin>\amdxc_compiler.dll
+
+Actual paths for the 0.0.8.2 run:
+  package        <local-workspace>\dlssnr_on_amd_setup\dist\mochi-0082-psdb-generator
+  release        <local-workspace>\dlssnr_on_amd_setup\exports\0082-psdb-generator\inputs\pkg-0082\dlssnr-amd
+  sdk            <local-workspace>\amd-d3d12-aco-lab\exports\inputs\asd-public\microsoft.direct3d.d3d12.1.619.5\build\native\bin\x64
+  plugin         <local-workspace>\amd-d3d12-aco-lab\exports\inputs\asd-public\amd.asdcompilerplugin.32.0.32015.7029\build\native\bin\x64\amdxc_compiler.dll
+  dxc            C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\dxc.exe
+  out            <local-workspace>\dlssnr_on_amd_setup\exports\0082-psdb-generator\final
+
+Toolchain reported by the run (m5-build.json):
+  family AMD_NAVI48:gfx1201, ABI 9007201352883061
+  D3D12StateObjectCompiler.dll 5ca0591e4a20b27d69734940fb61f61307a3cf5c4dbfdfca3d8545005a57a6a6
+  D3D12Core.dll                eddf4cff4eda8162624b88694ad2adf4b09bc5aee6339191f39adf8ae48b41e7
+  amdxc_compiler.dll           d2c3f76277bab61ffc26ad1583695c6ed1c6500d8b93b9ab2750bb0c347f5555
+  dxc.exe                      854d5f29dbbe25b584942855e65d673db3164f7f68e20fb784be9cd747d14814

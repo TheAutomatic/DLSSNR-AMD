@@ -1,0 +1,170 @@
+{
+ "compared": "amd-d3d12-aco-lab exports/runs/20261031-m2-build/manifest.tsv (0.0.8.1) vs final/manifest.tsv (0.0.8.2)",
+ "records_0081": 176,
+ "records_0082": 176,
+ "root_0082": 101,
+ "int4_0082": 75,
+ "shells_0081": 76,
+ "shells_0082": 76,
+ "shell_name_sets_equal": true,
+ "records_removed": [
+  {
+   "src": "int4",
+   "record": "0ce5f9fec200145d",
+   "shell": "g_fswinimagepreds32nh.spv",
+   "dims": "32x1x1"
+  },
+  {
+   "src": "int4",
+   "record": "1c8ae32a756aed98",
+   "shell": "temporal_pre_fp32.spv",
+   "dims": "32x1x1"
+  },
+  {
+   "src": "int4",
+   "record": "38a4fa7be1135f89",
+   "shell": "g_fswinimagepreds32.spv",
+   "dims": "32x1x1"
+  },
+  {
+   "src": "int4",
+   "record": "6291e9c7853dae3f",
+   "shell": "temporal_pre_fp32nh.spv",
+   "dims": "32x1x1"
+  },
+  {
+   "src": "int4",
+   "record": "97174de7ced214b0",
+   "shell": "temporal_pre_fp32nhhp.spv",
+   "dims": "32x1x1"
+  },
+  {
+   "src": "root",
+   "record": "07facbe44b53609a",
+   "shell": "temporal_pre_fp32.spv",
+   "dims": "32x1x1"
+  },
+  {
+   "src": "root",
+   "record": "3ccbc35ad9ececb3",
+   "shell": "temporal_pre_fp32nh.spv",
+   "dims": "32x1x1"
+  },
+  {
+   "src": "root",
+   "record": "48d26770c4227eeb",
+   "shell": "g_fswinimagepreds32.spv",
+   "dims": "32x1x1"
+  },
+  {
+   "src": "root",
+   "record": "bf0a7579978f2676",
+   "shell": "temporal_pre_fp32nhhp.spv",
+   "dims": "32x1x1"
+  },
+  {
+   "src": "root",
+   "record": "d2f616b174edf24d",
+   "shell": "g_fswinimagepreds32.spv",
+   "dims": "32x1x1"
+  },
+  {
+   "src": "root",
+   "record": "dfe6cfe562db9ccd",
+   "shell": "g_fswinimagepreds32nh.spv",
+   "dims": "32x1x1"
+  },
+  {
+   "src": "root",
+   "record": "eae2df7e8feaaea4",
+   "shell": "temporal_pre_fp32.spv",
+   "dims": "32x1x1"
+  }
+ ],
+ "records_added": [
+  {
+   "src": "int4",
+   "record": "106dc1366e886e0a",
+   "shell": "temporal_pre_fp32nh.spv",
+   "dims": "32x1x1"
+  },
+  {
+   "src": "int4",
+   "record": "2c90955eb36d7506",
+   "shell": "g_fswinimagepreds32.spv",
+   "dims": "32x1x1"
+  },
+  {
+   "src": "int4",
+   "record": "5f8c32411b60d2b2",
+   "shell": "g_fswinimagepreds32nh.spv",
+   "dims": "32x1x1"
+  },
+  {
+   "src": "int4",
+   "record": "92dab52df669cc25",
+   "shell": "temporal_pre_fp32.spv",
+   "dims": "32x1x1"
+  },
+  {
+   "src": "int4",
+   "record": "e9899cd274d87575",
+   "shell": "temporal_pre_fp32nhhp.spv",
+   "dims": "32x1x1"
+  },
+  {
+   "src": "root",
+   "record": "0b00f51288a3422b",
+   "shell": "temporal_pre_fp32.spv",
+   "dims": "32x1x1"
+  },
+  {
+   "src": "root",
+   "record": "3523d3c6a20b3fb2",
+   "shell": "g_fswinimagepreds32.spv",
+   "dims": "32x1x1"
+  },
+  {
+   "src": "root",
+   "record": "4771c7a24f8a8189",
+   "shell": "temporal_pre_fp32nhhp.spv",
+   "dims": "32x1x1"
+  },
+  {
+   "src": "root",
+   "record": "5014dc43f9ab9639",
+   "shell": "temporal_pre_fp32.spv",
+   "dims": "32x1x1"
+  },
+  {
+   "src": "root",
+   "record": "8c6dd80c36b05e48",
+   "shell": "g_fswinimagepreds32.spv",
+   "dims": "32x1x1"
+  },
+  {
+   "src": "root",
+   "record": "c9a2e1260c29dc78",
+   "shell": "g_fswinimagepreds32nh.spv",
+   "dims": "32x1x1"
+  },
+  {
+   "src": "root",
+   "record": "e4245373fb83c6bc",
+   "shell": "temporal_pre_fp32nh.spv",
+   "dims": "32x1x1"
+  }
+ ],
+ "common_records": 164,
+ "common_records_with_changed_shell": 0,
+ "common_records_with_changed_dims": 0,
+ "common_records_with_changed_tag": 114,
+ "records_with_no_shell_in_0082": [],
+ "usable_0082": 176,
+ "src_values": [
+  "int4",
+  "root"
+ ],
+ "gfx1103_or_rdna3_included": false,
+ "note": "12 records were replaced (the five temporal_pre_* shells and g_fswinimagepreds32[nh] in both root and int4 variants; root has two distinct records for each of g_fswinimagepreds32 and temporal_pre_fp32); no record is missing. Tags are positional over the sorted record set, so 114 of the 164 common records moved to a new tag: their carrier DXIL, PSDB group key and wrapped ELF differ even though the ACO body is unchanged. Use the 0082 SODB/PSDB/net-carriers.bin as one set."
+}
