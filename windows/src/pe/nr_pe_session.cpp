@@ -43,6 +43,15 @@
 #include <vector>
 
 namespace nr::pe {
+
+// The .asi's native D3D12 ASD backend is on for this process (set_d3d12_native): what can run is then not decided by
+// the bridge's Vulkan device alone. Turned off again when its canary does not hit (the bridge runs every frame): each
+// session then checks what can run once more (g_native_epoch).
+std::atomic<bool> g_d3d12_native{false};
+std::atomic<uint32_t> g_native_epoch{0};
+void set_d3d12_native(bool on) {
+    if (g_d3d12_native.exchange(on) && !on) ++g_native_epoch;
+}
 namespace {
 
 using nr::pe::log;
@@ -1169,7 +1178,9 @@ struct Session::Impl {
     std::set<int> said_unavailable;
     // What can run in this run, checked once the game's device is known (NetworkSwitch::unavailable).
     bool availability_checked{};
+    uint32_t native_epoch{};   // g_native_epoch when availability was last checked
     void check_availability();
+    void recheck_availability();
     uint32_t build_w{}, build_h{};
     VkFormat build_format{VK_FORMAT_UNDEFINED};
     std::unique_ptr<Runtime> built;
@@ -2134,6 +2145,7 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
     if (last_call - residency_checked >= kResidencyCheck) residency(false, false);
     if (!retired.empty()) free_retired();
     if (cache.size() > kMaxResident) trim_cache();
+    recheck_availability();
     if (!availability_checked) check_availability();
     net_want = wanted_network();
     // Adopt a finished background build first.
@@ -2793,10 +2805,18 @@ bool Session::Impl::carry(VkCommandBuffer cmd, uint64_t feature) {
     return ok;
 }
 
+// The D3D12 ASD backend is off again (its canary did not hit): what it ruled out is decided as on the bridge.
+void Session::Impl::recheck_availability() {
+    if (native_epoch == g_native_epoch.load()) return;
+    if (net_switch.reason(nr::kSilverAardwoldInt4) == "not on the D3D12 route (ASD)") net_switch.unavailable(nr::kSilverAardwoldInt4, "");
+    availability_checked = false;
+}
+
 // What can run in this run, from the files installed, this build and the game's device; a UI shows the reason
 // beside a network that cannot, and the hotkey skips it. A build that falls back later says more (network_note).
 void Session::Impl::check_availability() {
-    if (!handles.device) return;
+    native_epoch = g_native_epoch.load();
+    if (!handles.device && !g_d3d12_native.load()) return;
     availability_checked = true;
     auto exists = [&](const char* rel) {
         const DWORD a = nr::u8::attributes((root + "\\" + rel).c_str());
@@ -2810,16 +2830,19 @@ void Session::Impl::check_availability() {
         net_switch.unavailable(nr::kSmallFp8Experimental, "not installed (run install.bat again)");
     else if (!exists("dlssnr-amd\\dlssnr-small-experimental.bin"))
         net_switch.unavailable(nr::kSmallFp8Experimental, "needs the model of the 310.9.16 nvngx_dlssnr.dll (install.ps1 -Dll)");
-    else if (make_host().rdna3)
+    else if (!g_d3d12_native.load() && make_host().rdna3)
         net_switch.unavailable(nr::kSmallFp8Experimental, "not on RDNA3 GPUs (RX 7000, Radeon 700M / 800M / 8000S)");
-    else if (nr::binary::directory().empty())
+    else if (!g_d3d12_native.load() && nr::binary::directory().empty())
         net_switch.unavailable(nr::kSmallFp8Experimental, nr::binary::disabled_why().empty()
             ? std::string("needs ACO Mode, which is off for this run")
             : "needs ACO Mode, which is off for this run: " + nr::binary::disabled_why());
-    else if (!nr::binary::enabled(handles.device))
+    else if (!g_d3d12_native.load() && !nr::binary::enabled(handles.device))
         net_switch.unavailable(nr::kSmallFp8Experimental, "the game's device has no pipeline binaries (ACO Mode)");
+    if (g_d3d12_native.load()) {
+        net_switch.unavailable(nr::kSilverAardwoldInt4, "not on the D3D12 route (ASD)");   // recheck_availability: same text
+    }
 #if NR_INT4
-    if (!exists("dlssnr-amd\\dlssnr.bin"))
+    else if (!exists("dlssnr-amd\\dlssnr.bin"))
         net_switch.unavailable(nr::kSilverAardwoldInt4, "the model file is missing (run install.bat again)");
     else if (!exists("dlssnr-amd\\int4\\settings.txt"))
         net_switch.unavailable(nr::kSilverAardwoldInt4, "not installed (run install.bat again)");
@@ -2834,7 +2857,8 @@ void Session::Impl::check_availability() {
     else if (!nr::binary::enabled(handles.device))
         net_switch.unavailable(nr::kSilverAardwoldInt4, "the game's device has no pipeline binaries (ACO Mode)");
 #else
-    net_switch.unavailable(nr::kSilverAardwoldInt4, "not in this build");
+    else
+        net_switch.unavailable(nr::kSilverAardwoldInt4, "not in this build");
 #endif
 }
 
@@ -3790,6 +3814,18 @@ Session::State Session::state() const {
 }
 
 void Session::set_network(int n) { impl_->net_switch.set(n); }
+int Session::frame_network() {
+    auto& m = *impl_;
+    m.recheck_availability();
+    if (!m.availability_checked) m.check_availability();
+    m.net_want = m.wanted_network();
+    return m.net_want;
+}
+
+void Session::set_running_network(int net) {
+    impl_->running_net = net;
+}
+bool Session::history_f16() const { return impl_->net_switch.file().history_f16; }
 
 void Session::idle() {
     auto& m = *impl_;

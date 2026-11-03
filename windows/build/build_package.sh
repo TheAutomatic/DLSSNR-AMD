@@ -276,6 +276,23 @@ cp -- "${NR_IMGUI_ROOT:-toolchain/imgui-nr}/LICENSE.txt" "$op/asi/DearImGui-LICE
 cmp -s <(cd artifacts/windows/asi/shaders/wilsjo2 && sha256sum -- *.spv) <(cd "$pkg/dlssnr-amd/shaders/wilsjo2" && sha256sum -- *.spv) ||
     { echo "the plugin's wilsjo2 shaders are not dlssnr-amd/shaders/wilsjo2's" >&2; exit 1; }
 
+# optiscaler/asi/dlssnr-amd-asd/: the plugin's native D3D12 ASD backend (on as its ini is shipped, Enabled = 1; installed
+# into OptiScaler\plugins\dlssnr-amd-asd): the SODB, the network's carriers and one PSDB an adapter family
+# (fetch_deps.sh --windows). They hold machine code for exactly the records they were made from: the manifest's records
+# must be this package's, every one, or the package build stops.
+asd=${NR_ASD_DIR:-artifacts/ref/asd}
+cmp -s <(awk -F'\t' 'NR > 1 { print $3 "/" $2 }' "$asd/manifest.tsv" | sort) \
+       <({ cd "$pkg/dlssnr-amd/aco" && ls records | sed 's#^#root/#' && ls int4/records | sed 's#^#int4/#'; } | sed 's/\.nrp$//' | sort) ||
+    { echo "$asd: the ASD databases were made from other ACO records than this package's" >&2; exit 1; }
+mkdir -p -- "$op/asi/dlssnr-amd-asd"
+cp -- "$asd/carrier.sodb" "$op/asi/dlssnr-amd-asd/dlssnr-amd-asd.sodb"
+cp -- "$asd/net-carriers.bin" "$op/asi/dlssnr-amd-asd/"
+cp -- "$asd/gfx1201.psdb" "$op/asi/dlssnr-amd-asd/dlssnr-amd-asd-gfx1201.psdb"
+cp -- "$asd/gfx1200.psdb" "$op/asi/dlssnr-amd-asd/dlssnr-amd-asd-gfx1200.psdb"
+cp -- windows/package/dlssnr-amd-asd.ini "$op/asi/dlssnr-amd-asd/"
+cp -- artifacts/windows/asi/dlssnr-amd-asd-unregister.exe "$op/asi/dlssnr-amd-asd/"
+sed -i 's/$/\r/' "$op/asi/dlssnr-amd-asd/dlssnr-amd-asd.ini"
+
 # experimental/: what install.ps1 makes CC_SMALL_FP8_EXPERIMENTAL's weights with - the difference of its fitted weights
 # from the small model's (linux/data/experimental: each changed entry XOR the small model's, so it holds none of NVIDIA's
 # weights) and the SHA-256 of the result.

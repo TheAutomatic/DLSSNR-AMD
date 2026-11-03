@@ -67,6 +67,12 @@ glslang=${NR_GLSLANG:-toolchain/glslang/bin/glslang}
 "$glslang" -V --target-env vulkan1.0 --vn kMenuComposeVert windows/shaders/control/menu_compose.vert -o "$out/menu_compose_vert.h" > /dev/null
 "$glslang" -V --target-env vulkan1.0 --vn kMenuComposeFrag windows/shaders/control/menu_compose.frag -o "$out/menu_compose_frag.h" > /dev/null
 "$cxx" "${common[@]}" -I"$minhook/include" -I"$imgui" -Iwindows/src/ui -c windows/src/pe/nr_pe_menu.cpp -o "$out/menu.o"
+# the native D3D12 ASD backend (off unless dlssnr-amd-asd.ini says Enabled = 1)
+"$cxx" "${common[@]}" -c windows/src/pe/nr_d3d12_asd.cpp -o "$out/d3d12_asd.o"
+"$cxx" "${common[@]}" -c windows/src/pe/nr_d3d12_asd_backend.cpp -o "$out/d3d12_asd_backend.o"
+"$cxx" "${common[@]}" -c windows/src/pe/nr_d3d12_asd_net.cpp -o "$out/d3d12_asd_net.o"
+"$cxx" "${common[@]}" -c windows/src/pe/nr_renodx_d3d12.cpp -o "$out/renodx_d3d12.o"
+"$cxx" "${common[@]}" -I"$imgui" -Iwindows/src/ui -c windows/src/pe/nr_d3d12_asd_panel.cpp -o "$out/d3d12_asd_panel.o"
 for unit in imgui imgui_draw imgui_tables imgui_widgets imgui_impl_dx11 imgui_impl_vulkan; do
     "$cxx" -std=c++17 -O2 -DNDEBUG -Itoolchain/Vulkan-Headers/include -I"$imgui" -c "$imgui/$unit.cpp" -o "$out/im_$unit.o"
 done
@@ -76,11 +82,16 @@ for unit in hook buffer trampoline; do
     "$cc" -O2 -I"$minhook/include" -I"$minhook/src" -c "$minhook/src/$unit.c" -o "$out/mh_$unit.o"
 done
 "$cc" -O2 -I"$minhook/include" -I"$minhook/src" -c "$minhook/src/hde/hde64.c" -o "$out/mh_hde.o"
+# dlssnr-amd-asd-unregister.exe (OptiScaler\plugins\dlssnr-amd-asd\): install.ps1's uninstall removes the D3D12
+# passthrough's shader cache registrations of the game with it.
+"$cxx" -std=c++17 -O2 -DNDEBUG -municode -Iwindows/src/pe windows/src/pe/nr_d3d12_asd_unregister.cpp \
+    -o "$out/dlssnr-amd-asd-unregister.exe" -static -static-libgcc -static-libstdc++
 # nr_present_probe.exe (dlssnr-amd\): finds DXGI's swap-chain methods for NR Control in a process of its own.
 "$cxx" -std=c++17 -O2 -DNDEBUG -municode windows/src/pe/nr_present_probe.cpp -o "$out/nr_present_probe.exe" \
     -ldxgi -static -static-libgcc -static-libstdc++
 
-objs=("$out/asi_main.o" "$out/asi_wilsjo2.o" "$out/asi_wilsjo2_vk.o" "$out/nr_wilsjo2.o" "$out/asi_hudcap.o" "$out/menu.o"
+objs=("$out/asi_main.o" "$out/d3d12_asd.o" "$out/d3d12_asd_backend.o" "$out/d3d12_asd_net.o" "$out/renodx_d3d12.o"
+      "$out/d3d12_asd_panel.o" "$out/asi_wilsjo2.o" "$out/asi_wilsjo2_vk.o" "$out/nr_wilsjo2.o" "$out/asi_hudcap.o" "$out/menu.o"
       "$out"/im_*.o "$out/model.o" "$out/session.o" "$out/bridge.o" "$out/d3d12split.o" "$out/config.o" "$out/interop.o"
       "$out/vram_ledger.o" "$out/log.o" "$out/crash.o" "$out/vkdevice.o" "$out/nr_runtime.o" "$out/nr_native_plan.o"
       "$out/nr_renodx.o" "$out/renodx_route.o" "$out/control.o" "$out/screenshot.o" "$out"/mh_*.o)

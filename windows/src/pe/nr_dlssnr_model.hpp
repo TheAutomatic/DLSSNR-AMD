@@ -29,6 +29,7 @@ struct ID3D12GraphicsCommandList;
 struct ID3D12Resource;
 
 namespace nr::pe { class Session; }
+namespace nr::renodx { struct Settings; }   // D3d12BackendFrame::renodx_settings (defined in nr_renodx.hpp)
 namespace nr { struct Preprocess; }
 
 namespace nr::dlssnr {
@@ -97,6 +98,70 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* feature, void* param
 
 void release_d3d12(Feature* feature);
 
+// A backend that can take the evaluate's frame instead of everything evaluate_d3d12 does after NR Control is installed
+// (the .asi's native D3D12 ASD backend, nr_d3d12_asd_backend.cpp; no other build sets one). True: it recorded the frame
+// (colour -> output); false: nothing was recorded and evaluate_d3d12 goes on as without it (the Vulkan bridge). Colour and output are the
+// same resource (in UNORDERED_ACCESS) on the RenoDX route's direct frame.
+struct D3d12BackendFrame {
+    ID3D12Device* device;
+    ID3D12GraphicsCommandList* cmd;
+    ID3D12Resource* color;
+    int color_state;    // D3D12_RESOURCE_STATES (this header has no d3d12.h)
+    ID3D12Resource* output;
+    int output_state;   // D3D12_RESOURCE_STATES
+    unsigned int width, height;
+    // The frame's model controls (nr::Controls of the evaluate's Controls6: controls_from).
+    int style;
+    float intensity, local_tone, local_structure, skin_structure;
+    int automatic_mask;
+    int reversible_mode;   // Controls::reversible_mode (proxy_curve)
+    int noise_every_frame;
+    int history_f16;       // [Network] History Precision 16 (else 32), as the session reads dlssnr-amd.ini
+    // The temporal inputs, as the session's EngineResources takes them (evaluate_d3d12): the motion guide in
+    // NON_PIXEL_SHADER_RESOURCE, its subrect (0 extent: the whole texture), MVecScale over the region's extent
+    // (normalized_mv_scale), DLSSNR.Reset, the feature (its history).
+    ID3D12Resource* motion;
+    unsigned int motion_x, motion_y, motion_w, motion_h;
+    float motion_scale_x, motion_scale_y;
+    ID3D12Resource* depth;
+    unsigned int depth_x, depth_y, depth_w, depth_h;
+    int depth_inverted;
+    int reset;
+    unsigned long long feature;
+    float history_strength;   // < 0: the session's
+    // The RenoDX route installed (OptiScaler's encode / resolve skipped: nr_pe_optifix.cpp).
+    int renodx_route;
+    // The RenoDX route's own frame, as evaluate_d3d12 builds it for the bridge (nr_pe_session.hpp RenoDXFrame)
+    // - the backend runs the RenoDX stage on the ASD route from these. Null settings: not the RenoDX route.
+    const nr::renodx::Settings* renodx_settings;
+    int renodx_present;            // 0 the DLSS-output path, 2 HDR10, 3 scRGB (the .asi's Present layer)
+    float renodx_white_nits;
+    int renodx_hdr_flag;           // the game's colour is HDR (OptiScaler's judgement)
+    int renodx_after_upscale;      // NR runs on the upscaler's output
+    int renodx_fast_motion;        // a bound neutral texture is not a provider for temporal fast passes
+    ID3D12Resource* exposure;      // the game's exposure texture, as DLSS got it
+    int exposure_state;
+    float pre_exposure, exposure_scale;
+    int auto_exposure, create_flags_known;
+    // [Preprocess] settings (nr::Preprocess)
+    int preprocess;
+    int prep_exposure;
+    float prep_bias_ev;
+    int prep_curve;
+    float prep_contrast;
+    float prep_saturation;
+    int prep_inverse;
+    // (out, may be null): set to 1 by a backend that returns false only because its network for this extent is still
+    // being made - it will take such frames; evaluate_d3d12 then passes the frame through (output := colour) with no NR
+    // and does not start the Vulkan bridge's network for them.
+    int* waiting;
+};
+using D3d12Backend = bool (*)(const D3d12BackendFrame& frame);
+void set_d3d12_backend(D3d12Backend backend);
+// This thread's evaluates are the network calls of the wilsjo2 processing's D3D12 flow (nr_asi_wilsjo2.cpp, around
+// them): the backend takes them too, not only the RenoDX processing's frames.
+void set_d3d12_native_call(bool on);
+
 // The frame's keys, once a frame: [RenoDX] NRToggleKey (NR on / off for this run) and the screenshot keys. True while NR
 // is on. The OptiScaler route's evaluate does it itself; the .asi's NR chain calls it once before its layers.
 bool frame_keys();
@@ -110,6 +175,8 @@ void keep_caller_state();
 // The .asi's wilsjo2 style (nr_asi_wilsjo2.cpp): its own passes around the model's evaluate are recorded through the
 // D3D12 session (Session::record_raw), under the lock every evaluate holds.
 void with_d3d12_session(const std::function<void(nr::pe::Session&)>& fn);
+// The wanted network (stepped by evaluate_d3d12 from dlssnr-amd.ini and the hotkey; -1 before the first evaluate).
+int frame_network();
 // [Preprocess] as this frame has it (dlssnr-amd.ini, re-read at most once a second, and its hotkey) - for a wilsjo2
 // layer that runs it itself (it then sets Wilsjo2Facts::prep_outside, and the network's runtime does not run it).
 nr::Preprocess preprocess_settings();
@@ -186,5 +253,7 @@ void discard_vk_timing();
 // A layer of the .asi's chain changed (processing, placement, network) or went: Session::reset_layer_timing on every
 // session there is (none is made for it).
 void layer_changed(int layer);
+// The wilsjo2 native route's GPU time of one run (its programs + the ASD network), for NR Control's line.
+void note_native_ms(float ms);
 
 }  // namespace nr::dlssnr

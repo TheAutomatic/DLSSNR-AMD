@@ -209,6 +209,9 @@ function Put-Tree([string]$src, [string]$rel) {
 
 function Remove-Installed {
     if (-not (Test-Path -LiteralPath $manifest)) { Say 'No installation record found, nothing to uninstall.'; return }
+    # The D3D12 passthrough's shader cache registrations of this game (made by the plugin when it was on).
+    $unreg = Join-Path $game 'OptiScaler\plugins\dlssnr-amd-asd\dlssnr-amd-asd-unregister.exe'
+    if (Test-Path -LiteralPath $unreg) { & $unreg $game | ForEach-Object { Say "  $_" } }
     $lines = @(Get-Content -LiteralPath $manifest -Encoding UTF8)
     [array]::Reverse($lines)
     foreach ($line in $lines) {
@@ -650,6 +653,8 @@ if ($Route -eq 'optiscaler') {
     New-Item -ItemType Directory -Force -Path (Join-Path $game 'OptiScaler\plugins') | Out-Null
     Copy-Item -LiteralPath (Join-Path $here 'optiscaler\asi\dlssnr-amd.asi') -Destination (Join-Path $game 'OptiScaler\plugins\dlssnr-amd.asi') -Force
     Copy-Item -LiteralPath (Join-Path $here 'optiscaler\asi\nr_present_probe.exe') -Destination (Join-Path $game 'dlssnr-amd') -Force
+    # The plugin's native D3D12 route (dlssnr-amd-asd.ini: Enabled = 1 as installed, 0 turns it off).
+    Put-Tree (Join-Path $here 'optiscaler\asi\dlssnr-amd-asd') 'OptiScaler\plugins\dlssnr-amd-asd'
     Record-Logs @('OptiScaler.log')
 
     # OptiScaler loads the .asi plugins in OptiScaler\plugins only when asked to; its own log (OptiScaler.log, which the

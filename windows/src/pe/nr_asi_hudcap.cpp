@@ -19,6 +19,7 @@
 #include "nr_asi_hudcap.hpp"
 #include "nr_hud_capture.hpp"
 #include "nr_pe_log.hpp"
+#include "nr_path_u8.hpp"
 
 #include <MinHook.h>
 
@@ -26,6 +27,7 @@
 #include <cstdlib>
 #include <atomic>
 #include <cstring>
+#include <cwchar>
 #include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
@@ -782,16 +784,59 @@ void fg_note(void* caller, ID3D12Resource* r, D3D12_RESOURCE_STATES state, ID3D1
 
 using PFN_FfxConfigure = int32_t (*)(void*, const FfxHeader*);
 PFN_FfxConfigure real_ffx_configure[3];
+// The caller's module, for the frame-generation lines below.
+std::string module_of(void* address) {
+    HMODULE m = nullptr;
+    wchar_t path[MAX_PATH] = {};
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            static_cast<LPCWSTR>(address), &m) || !m || !GetModuleFileNameW(m, path, MAX_PATH))
+        return "?";
+    const wchar_t* base = std::wcsrchr(path, L'\\');
+    return nr::u8::narrow(base ? base + 1 : path);
+}
+const char* const kFfxLibrary[3] = {"amd_fidelityfx_dx12.dll", "amd_fidelityfx_loader_dx12.dll",
+                                    "amd_fidelityfx_framegeneration_dx12.dll"};
 template <int I> int32_t ffx_configure(void* ctx, const FfxHeader* desc) {
     for (const FfxHeader* h = desc; h; h = h->next)
         if (h->type == kFfxConfigureFg) {
             const auto* c = reinterpret_cast<const FfxConfigureFg*>(h);
+            static std::atomic<int> told{0};
+            if (told.fetch_add(1) < 3)   // what the game hands frame generation (how its generated frames are made)
+                log("[nr] frame generation (FSR, %s from %s): configure enabled %d, async %d, swap chain %p, present "
+                    "callback %p, frame-generation callback %p, HUD-less %p (format %u, %ux%u)", kFfxLibrary[I],
+                    module_of(__builtin_return_address(0)).c_str(), c->enabled ? 1 : 0, c->async ? 1 : 0, c->swap_chain,
+                    c->present_callback, c->fg_callback, c->hudless.resource, c->hudless.format, c->hudless.width,
+                    c->hudless.height);
             if (c->enabled && c->hudless.resource)
                 fg_note(__builtin_return_address(0), static_cast<ID3D12Resource*>(c->hudless.resource),
                         d3d12_state_of_ffx(c->hudless.state), nullptr, true, true, "FSR frame generation");
             break;
         }
     return real_ffx_configure[I](ctx, desc);
+}
+// ffxDispatchDescFrameGeneration (ffx_framegeneration.h): a game that runs frame generation itself (no
+// frame-generation callback) records it on the swap chain's interpolation command list, from presentColor
+struct FfxDispatchFg {
+    FfxHeader header;
+    void* command_list;
+    FfxResource present_color;
+    FfxResource outputs[4];
+    uint32_t generated;
+};
+constexpr uint64_t kFfxDispatchFg = 0x00020003u;   // FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION
+using PFN_FfxDispatch = int32_t (*)(void*, const FfxHeader*);
+PFN_FfxDispatch real_ffx_dispatch[3];
+template <int I> int32_t ffx_dispatch(void* ctx, const FfxHeader* desc) {
+    if (desc && desc->type == kFfxDispatchFg) {
+        const auto* d = reinterpret_cast<const FfxDispatchFg*>(desc);
+        static std::atomic<int> told{0};
+        if (told.fetch_add(1) < 3)
+            log("[nr] frame generation (FSR, %s from %s): dispatched by the game on list %p from presentColor %p (format %u, "
+                "%ux%u, state 0x%x) into %p, %u generated", kFfxLibrary[I], module_of(__builtin_return_address(0)).c_str(),
+                d->command_list, d->present_color.resource, d->present_color.format, d->present_color.width,
+                d->present_color.height, d->present_color.state, d->outputs[0].resource, d->generated);
+    }
+    return real_ffx_dispatch[I](ctx, desc);
 }
 using PFN_XefgTag = int32_t (*)(void*, ID3D12CommandList*, uint32_t, const XefgResource*);
 PFN_XefgTag real_xefg_tag;
@@ -845,12 +890,15 @@ void fg_hook_libraries() {
     static const wchar_t* const ffx[3] = {L"amd_fidelityfx_dx12.dll", L"amd_fidelityfx_loader_dx12.dll",
                                           L"amd_fidelityfx_framegeneration_dx12.dll"};
     static void* const ffx_detour[3] = {as(&ffx_configure<0>), as(&ffx_configure<1>), as(&ffx_configure<2>)};
+    static void* const ffx_dispatch_detour[3] = {as(&ffx_dispatch<0>), as(&ffx_dispatch<1>), as(&ffx_dispatch<2>)};
     for (int i = 0; i < 3; ++i)
         if (!gf.hooked_ffx[i])
             if (HMODULE m = GetModuleHandleW(ffx[i])) {
                 gf.hooked_ffx[i] = true;
                 if (hook_export(m, "ffxConfigure", ffx_detour[i], reinterpret_cast<void**>(&real_ffx_configure[i])))
                     log("[nr] HUD FIX (frame generation): %ls's ffxConfigure followed", ffx[i]);
+                if (hook_export(m, "ffxDispatch", ffx_dispatch_detour[i], reinterpret_cast<void**>(&real_ffx_dispatch[i])))
+                    log("[nr] frame generation: %ls's ffxDispatch followed", ffx[i]);
             }
     if (!gf.hooked_xefg)
         if (HMODULE m = GetModuleHandleW(L"libxess_fg.dll")) {
