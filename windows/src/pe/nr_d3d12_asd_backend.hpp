@@ -24,6 +24,10 @@ struct AsdNetStatus {
     int building_net = -1;
     float building_seconds = 0.f;
     float gpu_ms = 0.f;
+    float stage_ms = 0.f;
+    uint32_t nr_w = 0, nr_h = 0;
+    float fast_passes = 0.f;
+    bool fast_fallback = false;
 };
 
 struct LinearFrame {
@@ -45,6 +49,7 @@ struct NetTemporal {
     bool reset = false;
     uint64_t feature = 0;
     bool have_motion = true;
+    bool motion_f16 = false;
 };
 
 // What the ACO network becomes on this side: records into the game's list. Both buffers arrive in UNORDERED_ACCESS

@@ -2838,23 +2838,20 @@ void Session::Impl::check_availability() {
             : "needs ACO Mode, which is off for this run: " + nr::binary::disabled_why());
     else if (!g_d3d12_native.load() && !nr::binary::enabled(handles.device))
         net_switch.unavailable(nr::kSmallFp8Experimental, "the game's device has no pipeline binaries (ACO Mode)");
-    if (g_d3d12_native.load()) {
-        net_switch.unavailable(nr::kSilverAardwoldInt4, "not on the D3D12 route (ASD)");   // recheck_availability: same text
-    }
 #if NR_INT4
-    else if (!exists("dlssnr-amd\\dlssnr.bin"))
+    if (!exists("dlssnr-amd\\dlssnr.bin"))
         net_switch.unavailable(nr::kSilverAardwoldInt4, "the model file is missing (run install.bat again)");
     else if (!exists("dlssnr-amd\\int4\\settings.txt"))
         net_switch.unavailable(nr::kSilverAardwoldInt4, "not installed (run install.bat again)");
     else if (!exists("dlssnr-amd\\dlssnr-int4.bin"))
         net_switch.unavailable(nr::kSilverAardwoldInt4, "its weights were not made at install (run install.bat again)");
-    else if (make_host().rdna3)
+    else if (!g_d3d12_native.load() && make_host().rdna3)
         net_switch.unavailable(nr::kSilverAardwoldInt4, "not on RDNA3 GPUs (RX 7000, Radeon 700M / 800M / 8000S)");
-    else if (nr::binary::directory().empty())
+    else if (!g_d3d12_native.load() && nr::binary::directory().empty())
         net_switch.unavailable(nr::kSilverAardwoldInt4, nr::binary::disabled_why().empty()
             ? std::string("needs ACO Mode, which is off for this run")
             : "needs ACO Mode, which is off for this run: " + nr::binary::disabled_why());
-    else if (!nr::binary::enabled(handles.device))
+    else if (!g_d3d12_native.load() && !nr::binary::enabled(handles.device))
         net_switch.unavailable(nr::kSilverAardwoldInt4, "the game's device has no pipeline binaries (ACO Mode)");
 #else
     else

@@ -6,6 +6,8 @@
 #include "nr_pe_d3d12split.hpp"
 #include "nr_pe_log.hpp"
 #include "nr_pe_session.hpp"
+#include "nr_pe_vkdevice.hpp"
+#include <dxgi1_4.h>
 
 
 #include <atomic>
@@ -690,6 +692,31 @@ void start(HMODULE self) {
 
 void on_device(ID3D12Device* device) {
     if (!g_enabled || !device || g_canary_started.load()) return;
+    {
+        IDXGIFactory4* fac = nullptr;
+        IDXGIAdapter1* ad = nullptr;
+        DXGI_ADAPTER_DESC1 desc{};
+        if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&fac))) && fac) {
+            if (SUCCEEDED(fac->EnumAdapterByLuid(device->GetAdapterLuid(), IID_PPV_ARGS(&ad))) && ad) {
+                if (SUCCEEDED(ad->GetDesc1(&desc))) {
+                    std::string nm = utf8(desc.Description);
+                    if (nm.find("NVIDIA") != std::string::npos && desc.VendorId != 0x1002) {
+                        // Spoofed by OptiScaler: check if another adapter in the system is AMD RDNA4
+                        for (UINT i = 0; ; ++i) {
+                            IDXGIAdapter1* a2 = nullptr;
+                            if (fac->EnumAdapters1(i, &a2) != S_OK) break;
+                            DXGI_ADAPTER_DESC1 d2{};
+                            if (SUCCEEDED(a2->GetDesc1(&d2)) && d2.VendorId == 0x1002) { nm = utf8(d2.Description); a2->Release(); break; }
+                            a2->Release();
+                        }
+                    }
+                    nr::pe::vkdevice::note_d3d12_gpu_name(nm);
+                }
+                ad->Release();
+            }
+            fac->Release();
+        }
+    }
     // The game's direct queue when this thread has handed it frames (as NR's Present layers find it); otherwise a
     // compute queue of ours on the game's device. Never a device of ours.
     ID3D12CommandQueue* queue = nr::pe::split::last_direct_queue();

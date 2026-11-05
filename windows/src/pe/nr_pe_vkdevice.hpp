@@ -79,6 +79,7 @@ void forget_device(VkDevice device);
 // The GPU NR runs on, as its Vulkan driver names it ("AMD Radeon RX 9070 XT (RADV GFX1201)"); empty before NR has seen
 // a device. For NR Control's header.
 std::string gpu_name();
+void note_d3d12_gpu_name(const std::string& name);
 // The physical device a network is built on (every route: a D3D game's comes through its translator's interop, not a
 // device seen being made)
 void note_gpu(VkPhysicalDevice physical);
