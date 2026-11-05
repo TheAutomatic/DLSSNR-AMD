@@ -3168,8 +3168,10 @@ bool plan_d3d12_network(const std::string& root_in, uint32_t mw, uint32_t mh, bo
         const auto network_shaders = std::filesystem::path(aco) / "shaders";
         // The model, as the constructor picks it: DLSSNR_MODEL over dlssnr-amd.ini [Network] Model; none: the small one.
         NetworkModel network = NetworkModel::Small;
-        bool experimental = false;
+        bool experimental = false, int4 = false;
         const std::filesystem::path xroot = data / "experimental";
+        const std::filesystem::path i4root = data / "int4";
+        std::map<std::string, std::string> int4_cfg;
         std::string from;
         {
             std::string env;
@@ -3180,10 +3182,34 @@ bool plan_d3d12_network(const std::string& root_in, uint32_t mw, uint32_t mh, bo
             const int ev = env.empty() ? -1 : nr::network_value(env);
             const int iv = model_choice >= 0 || ev >= 0 ? -1 : nr::ini_network(ini);
             from = model_choice >= 0 ? "caller" : ev >= 0 ? "DLSSNR_MODEL" : iv >= 0 ? "dlssnr-amd.ini" : "default";
-            int v = model_choice >= 0 ? (model_choice == nr::kSmallFp8 ? 1 : model_choice == nr::kSmallFp8Experimental ? 2 : 0)
+            int v = model_choice >= 0 ? (model_choice == nr::kSmallFp8 ? 1 : model_choice == nr::kSmallFp8Experimental ? 2 : model_choice == nr::kSilverAardwoldInt4 ? 3 : 0)
                                       : (ev >= 0 ? ev : iv);
-            if (v == 0) network = NetworkModel::Original;
+            if (v == 0 && model_choice < 0) {
+                const int ec = env.empty() ? -1 : nr::network_choice(env);
+                if (ec == nr::kSilverAardwoldInt4 || (ec < 0 && nr::ini_int4(ini).enabled == 1)) v = 3;
+            }
+            if (v == 0 || v == 3) network = NetworkModel::Original;
             std::error_code ec;
+#if NR_INT4
+            if (v == 3) {
+                const char* missing = !std::filesystem::is_directory(i4root / "shaders" / "temporal", ec) || !std::filesystem::is_directory(i4root / "vit", ec) ||
+                                      !std::filesystem::is_regular_file(i4root / "settings.txt", ec) ? "dlssnr-amd/int4/ is incomplete"
+                    : !std::filesystem::is_regular_file(data / "dlssnr-int4.bin", ec) ? "dlssnr-amd/dlssnr-int4.bin is missing"
+                    : !std::filesystem::is_directory(std::filesystem::path(aco) / "int4/records", ec) ? "the ACO INT4 records are missing"
+                    : nullptr;
+                if (missing) {
+                    out->note = std::string("CC_SILVER_AARDWOLD_INT4_MIXED, but ") + missing + ": CC_SILVER_AARDWOLD";
+                    v = 0;
+                } else {
+                    int4 = true;
+                    int4_cfg["NR_I4_DIR"] = (i4root / "vit").string();
+                    if (std::filesystem::is_directory(i4root / "swin", ec)) int4_cfg["NR_SWI4_DIR"] = (i4root / "swin").string();
+                    int4_cfg["NR_I4_WEIGHTS"] = (data / "dlssnr-int4.bin").string();
+                    const auto t = slurp((i4root / "settings.txt").string());
+                    nr::int4_settings(std::string(t.begin(), t.end()), int4_cfg);
+                }
+            }
+#endif
             if (v == 2) {
                 const char* missing = !allow_experimental ? "its kernels are not in the PSDB"
                     : !std::filesystem::is_regular_file(xroot / "shaders" / "fixed-attention.txt", ec) ||
@@ -3204,7 +3230,8 @@ bool plan_d3d12_network(const std::string& root_in, uint32_t mw, uint32_t mh, bo
                 network = NetworkModel::Original;
             }
         }
-        out->model = network == NetworkModel::Small ? experimental ? "CC_SMALL_FP8_EXPERIMENTAL" : "CC_SMALL_FP8" : "original";
+        out->model = int4 ? "CC_SILVER_AARDWOLD_INT4_MIXED"
+                          : network == NetworkModel::Small ? (experimental ? "CC_SMALL_FP8_EXPERIMENTAL" : "CC_SMALL_FP8") : "original";
         out->model += " (" + from + ")";
         auto ini_on = [&](const char* key) {
             std::string v = nr::ini_network_key(ini, key);
@@ -3234,6 +3261,12 @@ bool plan_d3d12_network(const std::string& root_in, uint32_t mw, uint32_t mh, bo
             }
             arguments.push_back("--spv-dir-aco");
         }
+        if (int4) {
+            for (size_t i = 0; i + 1 < arguments.size(); ++i) {
+                if (arguments[i] == "--spv-dir") arguments[i + 1] = (i4root / "shaders").string();
+                if (arguments[i] == "--pipeline-cache") arguments[i + 1] = (i4root / "pipeline.cache").string();
+            }
+        }
         {
             const auto pack = data / (experimental ? "dlssnr-small-experimental.bin"
                                       : network == NetworkModel::Small ? "dlssnr-small.bin" : "dlssnr.bin");
@@ -3244,7 +3277,6 @@ bool plan_d3d12_network(const std::string& root_in, uint32_t mw, uint32_t mh, bo
         for (auto& a : arguments) argv.push_back(a.data());
         std::lock_guard<std::mutex> lock(build_mutex);
 #if NR_INT4
-        std::map<std::string, std::string> int4_cfg;   // empty: the default network, nothing from the environment
         const nr::BuildCfgScope cfg_scope(&int4_cfg);
 #endif
         NrSession s;
@@ -3264,7 +3296,9 @@ bool plan_d3d12_network(const std::string& root_in, uint32_t mw, uint32_t mh, bo
             x.kern = d.kern; x.gx = d.gx; x.gy = d.gy; x.gz = d.gz; x.push = d.push;
             x.no_barrier_after = i + 1 < c.disp.size() && i < c.no_barrier_after.size() && c.no_barrier_after[i] != 0;
             // put_act_address: the arena's address at act_lo (PushVAttn for vitattn, PushGemm for the GEMMs)
-            if (d.kern == "vitattn" && d.push.size() >= sizeof(PushVAttn)) x.act_at = int(offsetof(PushVAttn, act_lo));
+            const size_t gap = int4 ? (d.kern == "vitattn" ? offsetof(PushVAttn, act_lo) : gemm_push_kern(d.kern) ? offsetof(PushGemm, act_lo) : 0) : 0;
+            if (gap && x.push.size() >= gap + 8) { std::memmove(x.push.data() + gap, x.push.data() + gap + 8, x.push.size() - gap - 8); std::memset(x.push.data() + x.push.size() - 8, 0, 8); }
+            else if (d.kern == "vitattn" && d.push.size() >= sizeof(PushVAttn)) x.act_at = int(offsetof(PushVAttn, act_lo));
             else if (gemm_push_kern(d.kern) && d.push.size() >= sizeof(PushGemm)) x.act_at = int(offsetof(PushGemm, act_lo));
             out->disp.push_back(std::move(x));
         }
@@ -3282,7 +3316,7 @@ bool plan_d3d12_network(const std::string& root_in, uint32_t mw, uint32_t mh, bo
             }
             if (t.pre < 0 || t.post < 0) { *why = "the temporal path requires the fused FP32 image kernels"; return false; }
             if (c.disp[size_t(t.pre)].push.size() != kPrePushBytes) { *why = "temporal pre block: unexpected push size"; return false; }
-            const auto shaders = experimental ? xroot / "shaders" / "temporal" : network_shaders / "temporal";
+            const auto shaders = int4 ? i4root / "shaders" / "temporal" : experimental ? xroot / "shaders" / "temporal" : network_shaders / "temporal";
             std::error_code ec;
             auto have = [&](const char* name) { return std::filesystem::is_regular_file(shaders / name, ec); };
             const bool tp_nh = pre_nh && have("temporal_pre_fp32nh.spv");

@@ -410,7 +410,10 @@ void report_control(nr::pe::Session& session, const Feature* f, uint32_t route, 
             st.build_phase.clear();
         }
         st.network_ms = ran ? as.gpu_ms * float(std::max(st.passes, 1u)) : 0.f;
-        st.gpu_ms = ran ? std::max(g_native_ms.load(), st.network_ms) : 0.f;
+        if (as.nr_w && as.nr_h) { st.nr_width = as.nr_w; st.nr_height = as.nr_h; }
+        if (rs && ran && as.fast_passes > 0.f) { st.fast_passes = as.fast_passes; st.fast_fallback = as.fast_fallback; }
+        const float total_ms = (rs && as.stage_ms > 0.f) ? as.stage_ms : g_native_ms.load();
+        st.gpu_ms = ran ? std::max(total_ms, st.network_ms) : 0.f;
         st.aco = 1;
         st.aco_rdna3 = false;
         st.aco_why = "via ASD: the network runs as ACO machine code (a precompiled shader database) on the game's D3D12 device";
@@ -1409,7 +1412,7 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
                         render_w = uint32_t(dd.Width); render_h = dd.Height;
                     }
                     // What the frame actually carried, not what the caller hoped: a copy-through frame is a success.
-                    report_control(d3d12_session(), f, 1, width, height, nullptr, g_live_d3d12.size(), render_w, render_h,
+                    report_control(d3d12_session(), f, 1, width, height, frame.renodx_settings, g_live_d3d12.size(), render_w, render_h,
                                    panel_guides_d3d12(color, motion, depth, motion_rect, reset != 0, mv_scale_x, mv_scale_y),
                                    nr::pe::asd::backend_produced(), true);
                 }
@@ -1432,7 +1435,7 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
                     const D3D12_RESOURCE_DESC dd = depth->GetDesc();
                     render_w = uint32_t(dd.Width); render_h = dd.Height;
                 }
-                report_control(d3d12_session(), f, 1, width, height, nullptr, g_live_d3d12.size(), render_w, render_h,
+                report_control(d3d12_session(), f, 1, width, height, frame.renodx_settings, g_live_d3d12.size(), render_w, render_h,
                                panel_guides_d3d12(color, motion, depth, motion_rect, reset != 0, mv_scale_x, mv_scale_y),
                                false, true);
             }
@@ -2181,8 +2184,15 @@ int frame_network() {
 
 
 void note_native_ms(float ms) {
-    const float old = g_native_ms.load();
-    g_native_ms = old > 0.f ? old * 0.9f + ms * 0.1f : ms;   // smoothed for NR Control's line
+
+    static float ring[32] = {};
+    static size_t at = 0;
+    ring[at % 32] = ms;
+    ++at;
+    const size_t n = std::min<size_t>(at, 32);
+    double s = 0.0;
+    for (size_t i = 0; i < n; ++i) s += ring[i];
+    g_native_ms = float(s / double(n));   // smoothed for NR Control's line
 }
 
 }  // namespace nr::dlssnr

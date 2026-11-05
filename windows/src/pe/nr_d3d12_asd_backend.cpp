@@ -156,7 +156,14 @@ struct Backend {
     // The backend's own completion signal: a frame number copied into a readback buffer by the same command list that
     // used the objects, so a retired stage or buffer is released only after the GPU ran past it. An evaluate count is
     // not evidence: a stack records many frames into one list that may still be unsubmitted.
-    static constexpr uint32_t kDoneSlots = 128;
+    static constexpr uint32_t kDoneSlots = 128, kTimeRing = 16;
+    ID3D12QueryHeap* queries = nullptr;
+    ID3D12Resource* stamps = nullptr;
+    uint8_t* stamps_map = nullptr;
+    double hz = 0.0;
+    nr::gpu::Ticket stamp_uses[kTimeRing] = {};
+    float stage_ring[32] = {};
+    size_t stage_ring_at = 0;
     ID3D12Resource* token = nullptr;     // upload: the frame numbers to echo
     uint64_t* token_map = nullptr;
     uint32_t token_slots = 0;            // growable: a slot is rewritten only after its holder executed
@@ -237,6 +244,19 @@ struct Backend {
     std::vector<RetiredStage> renodx_retired;
 };
 Backend g;
+std::atomic<float> g_stage_avg_ms{0.f}, g_last_fast_passes{0.f};
+std::atomic<uint32_t> g_last_nr_w{0}, g_last_nr_h{0};
+std::atomic<bool> g_last_fast_fallback{false};
+void note_stage_gpu(double ms) {
+    g.stage_ring[g.stage_ring_at % 32] = float(ms);
+    ++g.stage_ring_at;
+    const size_t n = std::min<size_t>(g.stage_ring_at, 32);
+    double s = 0.0;
+    for (size_t i = 0; i < n; ++i) s += g.stage_ring[i];
+    const float avg = float(s / double(n));
+    g_stage_avg_ms.store(avg);
+
+}
 // Guards `g.device` and `g.network` against a reader that does not run inside evaluate (the heartbeat's device-removed
 // poll, NR Control's status): the readers take a reference under it, the evaluate/drop_device path swaps them under it.
 // Recursive because the writers already call one another (release_generation -> drop_device).
@@ -455,6 +475,16 @@ bool build(ID3D12Device* device, std::string* why) {
         if (FAILED(g.done->Map(0, nullptr, &m)) || !m) { *why = "the backend's readback could not be mapped"; return false; }
         g.done_map = static_cast<uint64_t*>(m);
         std::memset(g.done_map, 0xFF, Backend::kDoneSlots * 8);
+        D3D12_QUERY_HEAP_DESC qh{}; qh.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP; qh.Count = 2 * Backend::kTimeRing;
+        ID3D12CommandQueue* q = nullptr; D3D12_COMMAND_QUEUE_DESC qd{}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT; UINT64 hz = 0;
+        if (SUCCEEDED(device->CreateCommandQueue(&qd, IID_PPV_ARGS(&q))) && q) { q->GetTimestampFrequency(&hz); q->Release(); }
+        if (hz && SUCCEEDED(device->CreateQueryHeap(&qh, IID_PPV_ARGS(&g.queries)))) {
+            g.stamps = heap_buffer(device, D3D12_HEAP_TYPE_READBACK, 16 * Backend::kTimeRing, D3D12_RESOURCE_STATE_COPY_DEST);
+            void* sm = nullptr;
+            if (g.stamps && SUCCEEDED(g.stamps->Map(0, nullptr, &sm)) && sm) {
+                g.stamps_map = static_cast<uint8_t*>(sm); g.hz = double(hz); std::memset(g.stamps_map, 0, 16 * Backend::kTimeRing);
+            }
+        }
     }
     note_network(g.network->name());
     D3D12_HEAP_PROPERTIES hp{};
@@ -494,6 +524,9 @@ void drop_device() {
     if (g.token_map) g.token->Unmap(0, nullptr);
     if (g.done_map) g.done->Unmap(0, nullptr);
     release(g.token); release(g.done);
+    if (g.stamps_map) g.stamps->Unmap(0, nullptr);
+    release(g.stamps); release(g.queries); g.stamps_map = nullptr; g.hz = 0.0;
+    for (auto& u : g.stamp_uses) u.reset();
     for (auto& r : g.token_retired) r.p->Release();
     // The lists belong to this device: nothing of it is in flight once drop_device is called (the same reason the
     // resources above are released here), and a later device must not inherit watermarks from this one.
@@ -723,10 +756,11 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
     rf.base_controls.history_strength = f.history_strength;
     rf.base_controls.noise_every_frame = f.noise_every_frame != 0;
 
-    const uint64_t bytes = uint64_t(nw) * nh * 16;
+    const uint64_t bytes = uint64_t(nw) * nh * 8;
     const char* nwhy = "NR is disabled";
-    const auto net = [&](uint32_t, uint64_t, const nr::D3d12NetControls& controls, const NetTemporal& nt,
+    const auto net = [&](uint32_t, uint64_t, const nr::D3d12NetControls& controls, NetTemporal nt,
                          ID3D12Resource* in, ID3D12Resource* out) {
+        nt.motion_f16 = true;
         g.network->controls(controls);
         g.network->temporal(nt);
         nwhy = "";
@@ -737,7 +771,33 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
     const auto state = nr::pe::split::snapshot(f.cmd);
     if (!state) return fallback("the RenoDX route: no snapshot of the command list's state");
     e.stage->set_frame(g.frames);
+    uint32_t ts = Backend::kTimeRing;
+    if (g.stamps_map) {
+        for (uint32_t i = 0; i < Backend::kTimeRing; ++i) {
+            if (g.stamp_uses[i] && nr::pe::split::completed(g.stamp_uses[i])) {
+                uint64_t t2[2];
+                std::memcpy(t2, g.stamps_map + i * 16, 16);
+                if (t2[0] && t2[1] > t2[0]) note_stage_gpu(double(t2[1] - t2[0]) * 1000.0 / g.hz);
+                g.stamp_uses[i].reset();
+            }
+            if (!g.stamp_uses[i] && ts == Backend::kTimeRing) ts = i;
+        }
+    }
+    const bool timed = ts < Backend::kTimeRing && bool(g.booking);
+    if (timed) {
+        g.stamp_uses[ts] = g.booking;
+        std::memset(g.stamps_map + ts * 16, 0, 16);
+        f.cmd->EndQuery(g.queries, D3D12_QUERY_TYPE_TIMESTAMP, ts * 2);
+    }
     const uint32_t ran = e.stage->record(f.cmd, rf, net);
+    if (timed) {
+        f.cmd->EndQuery(g.queries, D3D12_QUERY_TYPE_TIMESTAMP, ts * 2 + 1);
+        f.cmd->ResolveQueryData(g.queries, D3D12_QUERY_TYPE_TIMESTAMP, ts * 2, 2, g.stamps, uint64_t(ts) * 16);
+    }
+    g_last_nr_w.store(nw); g_last_nr_h.store(nh);
+    const auto facts = e.stage->facts();
+    g_last_fast_passes.store(facts.fast_passes);
+    g_last_fast_fallback.store(facts.fast_fallback);
     nr::pe::split::restore(f.cmd, state);
     // 0 passes is a legitimate copy-through only when the stage says it made everything it needed; otherwise the
     // output may not have been written at all and the caller must take its own path.
@@ -1183,7 +1243,13 @@ AsdNetStatus backend_net_status() {
         std::lock_guard<std::recursive_mutex> l(g_owner_lock);
         n = g.network;
     }
-    return n ? n->status() : AsdNetStatus{};
+    AsdNetStatus s = n ? n->status() : AsdNetStatus{};
+    s.stage_ms = g_stage_avg_ms.load();
+    s.nr_w = g_last_nr_w.load();
+    s.nr_h = g_last_nr_h.load();
+    s.fast_passes = g_last_fast_passes.load();
+    s.fast_fallback = g_last_fast_fallback.load();
+    return s;
 }
 
 

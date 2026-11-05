@@ -10,6 +10,7 @@
 #include "renodx/codec_gain.hpp"   // the codec's divisors and anchors (dlssnr.hpp's, as nr_renodx.cpp includes it)
 #include "nr_d3d12_asd.hpp"
 #include "nr_pe_log.hpp"
+#include "nr_vram_ledger.hpp"
 #include <cstdarg>
 #include <cmath>
 #include <fstream>
@@ -51,19 +52,28 @@ cbuffer AuxC : register(b0) {
 
 Texture2D<float4> aux_tex : register(t0);
 SamplerState aux_linear_clamp : register(s0);
-StructuredBuffer<float4> aux_buf : register(t0);
+ByteAddressBuffer aux_raw_in : register(t0);
+RWByteAddressBuffer aux_raw_out : register(u0);
 RWStructuredBuffer<float4> aux_out : register(u0);
 RWTexture2D<float4> aux_dst : register(u0);
 
+uint2 pack_f16x4(float4 v) {
+    uint4 h = f32tof16(v);
+    return uint2(h.x | (h.y << 16), h.z | (h.w << 16));
+}
+float4 unpack_f16x4(uint2 p) {
+    return f16tof32(uint4(p.x & 0xffffu, p.x >> 16, p.y & 0xffffu, p.y >> 16));
+}
+
 [numthreads(8, 8, 1)]
 void tex_to_buf(uint3 id : SV_DispatchThreadID) {
-    if (id.x < a_w && id.y < a_h) aux_out[id.y * a_w + id.x] = aux_tex.Load(int3(id.xy, 0));
+    if (id.x < a_w && id.y < a_h) aux_raw_out.Store2((id.y * a_w + id.x) * 8, pack_f16x4(aux_tex.Load(int3(id.xy, 0))));
 }
 
 [numthreads(8, 8, 1)]
 void buf_to_tex(uint3 id : SV_DispatchThreadID) {
     if (id.x >= a_w || id.y >= a_h) return;
-    aux_dst[id.xy] = aux_buf[id.y * a_w + id.x];
+    aux_dst[id.xy] = unpack_f16x4(aux_raw_in.Load2((id.y * a_w + id.x) * 8));
 }
 
 [numthreads(8, 8, 1)]
@@ -76,7 +86,9 @@ void copy_out(uint3 id : SV_DispatchThreadID) {
 void to_motion(uint3 id : SV_DispatchThreadID) {
     if (id.x >= a_w || id.y >= a_h) return;
     const float2 uv = (float2(id.xy) + 0.5f) / float2(a_w, a_h);
-    aux_out[id.y * a_w + id.x] = float4(aux_tex.SampleLevel(aux_linear_clamp, uv * a_region.xy + a_region.zw, 0).xy, 0, 0);
+    const float2 mv = aux_tex.SampleLevel(aux_linear_clamp, uv * a_region.xy + a_region.zw, 0).xy;
+    const uint2 h = f32tof16(mv);
+    aux_raw_out.Store2((id.y * a_w + id.x) * 8, uint2(h.x | (h.y << 16), 0u));
 }
 
 [numthreads(8, 8, 1)]
@@ -687,6 +699,7 @@ struct Stage::Impl {
     ID3D12Resource* prep_state = nullptr;
     bool prep_state_fresh = false;
     ID3D12Resource* lin_proxy = nullptr, * lin_neural = nullptr, * lin_mv = nullptr, * lin_depth = nullptr;
+    bool lin_mv_dirty = false;
     bool decoded_storage = false;
     bool prep_was_on = false;
     Preprocess prep_last{};
@@ -767,6 +780,7 @@ struct Stage::Impl {
         }
         t.w = w; t.h = h; t.format = f;
         states[t.res] = D3D12_RESOURCE_STATE_COMMON;
+        nr::vram::track_d3d12(device, t.res, nr::vram::kRenoDX);
         return t;
     }
     // This frame's slot budget, from its configuration (a pass is tens of dispatches: the stage's encode/decode,
@@ -836,6 +850,7 @@ struct Stage::Impl {
             return nullptr;
         }
         states[r] = D3D12_RESOURCE_STATE_COMMON;
+        nr::vram::track_d3d12(device, r, nr::vram::kRenoDX);
         return r;
     }
     // A replaced surface may still be read by a recorded frame another list has not run yet, so the release goes
@@ -965,6 +980,7 @@ struct Stage::Impl {
                         d.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
                         if (v.raw) {
                             d.Buffer.NumElements = UINT(v.bytes / 4);
+                            d.Format = DXGI_FORMAT_R32_TYPELESS;
                             d.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
                         } else {
                             d.Buffer.NumElements = UINT(v.bytes / 16);
@@ -979,6 +995,7 @@ struct Stage::Impl {
                         d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
                         if (v.raw) {
                             d.Buffer.NumElements = UINT(v.bytes / 4);
+                            d.Format = DXGI_FORMAT_R32_TYPELESS;
                             d.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
                         } else {
                             d.Buffer.NumElements = UINT(v.bytes / 16);
@@ -1257,10 +1274,10 @@ bool Stage::Impl::build(std::string* why) {
         return false;
     }
     trace = make_buffer(16 * 1024, why);
-    lin_proxy = make_buffer(uint64_t(NW) * NH * 16, why);
-    lin_neural = make_buffer(uint64_t(NW) * NH * 16, why);
-    lin_mv = make_buffer(uint64_t(NW) * NH * 16, why);
-    lin_depth = make_buffer(uint64_t(NW) * NH * 16, why);
+    lin_proxy = make_buffer(uint64_t(NW) * NH * 8, why);
+    lin_neural = make_buffer(uint64_t(NW) * NH * 8, why);
+    lin_mv = make_buffer(uint64_t(NW) * NH * 8, why);
+    lin_depth = make_buffer(256, why);
     if (!trace || !lin_proxy || !lin_neural || !lin_mv || !lin_depth) return false;
     neutral_mv = make_tex(1, 1, DXGI_FORMAT_R16G16_FLOAT, false, why);   // zero: the heap guarantees it
     if (!neutral_mv.res) return false;
@@ -1714,23 +1731,29 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
             srv[0].fmt = srv_format_of(md.Format);
             srv[0].write = false;
             View uav[14] = {};
-            uav[0] = bv(lin_mv, uint64_t(NW) * NH * 16, false, true);
-            // the guide is an external resource: its state around the dispatch, by hand
+            uav[0] = bv(lin_mv, uint64_t(NW) * NH * 8, true, true);
             transition(cmd, f.motion, f.motion_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-            states[f.motion] = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;   // (what the dispatch's ensure holds)
+            states[f.motion] = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
             dispatch(cmd, kToMotion, srv, uav, &c, 4, (NW + 7) / 8, (NH + 7) / 8);
             transition(cmd, f.motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, f.motion_state);
             states[f.motion] = f.motion_state;
-        } else {
+            lin_mv_dirty = true;
+        } else if (lin_mv_dirty) {
             View srv[8] = {};
             srv[0] = tv(neutral_mv, false);
             View uav[14] = {};
-            uav[0] = bv(lin_mv, uint64_t(NW) * NH * 16, false, true);
+            uav[0] = bv(lin_mv, uint64_t(NW) * NH * 8, true, true);
             dispatch(cmd, kToMotion, srv, uav, &c, 4, (NW + 7) / 8, (NH + 7) / 8);
+            lin_mv_dirty = false;
         }
     }
     const bool net_wants_depth = have_motion && f.depth && !f.motion_without_depth;
-    if (net_wants_depth) {
+    if (net_wants_depth && lin_depth->GetDesc().Width < uint64_t(NW) * NH * 16) {
+
+        if (ID3D12Resource* nd = make_buffer(uint64_t(NW) * NH * 16, nullptr)) { drop_buf(lin_depth); lin_depth = nd; }
+    }
+    const bool have_depth = net_wants_depth && lin_depth && lin_depth->GetDesc().Width >= uint64_t(NW) * NH * 16;
+    if (have_depth) {
         struct { uint32_t w, h, what, pad; float region[4]; } c{NW, NH, 0, 0, {1.f, 1.f, 0.f, 0.f}};
         const D3D12_RESOURCE_DESC dd = f.depth->GetDesc();
         if (f.depth_x >= dd.Width || f.depth_y >= dd.Height) {
@@ -1985,7 +2008,7 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
             View srv[8] = {};
             srv[0] = tv(fast_input, false);
             View uav[14] = {};
-            uav[0] = bv(lin_proxy, uint64_t(NW) * NH * 16, false, true);
+            uav[0] = bv(lin_proxy, uint64_t(NW) * NH * 8, true, true);
             dispatch(cmd, kTexToBuf, srv, uav, &c, 8, (NW + 7) / 8, (NH + 7) / 8);
         }
         // Pass k's controls, RenoDX's (record_renodx.cpp's pass_controls): pass 1's, or pass k's once its
@@ -2015,8 +2038,8 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
         nt.motion_va = lin_mv->GetGPUVirtualAddress();
         nt.motion_scale_x = f.motion_scale_x * s.mvec_scale_x;
         nt.motion_scale_y = f.motion_scale_y * s.mvec_scale_y;
-        nt.depth_va = net_wants_depth ? lin_depth->GetGPUVirtualAddress() : 0;
-        nt.have_depth = net_wants_depth;
+        nt.depth_va = have_depth ? lin_depth->GetGPUVirtualAddress() : 0;
+        nt.have_depth = have_depth;
         nt.depth_inverted = f.depth_inverted;
         if (s.depth_mode == 1u) nt.depth_inverted = false;
         if (s.depth_mode == 2u) nt.depth_inverted = true;
@@ -2046,7 +2069,7 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
             ensure(cmd, lin_neural, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             struct { uint32_t w, h, what, pad; float region[4]; } c{NW, NH, 0, 0, {1.f, 1.f, 0.f, 0.f}};
             View srv[8] = {};
-            srv[0] = bv(lin_neural, uint64_t(NW) * NH * 16, false, false);
+            srv[0] = bv(lin_neural, uint64_t(NW) * NH * 8, true, false);
             View uav[14] = {};
             uav[0] = tv(neural, true);
             dispatch(cmd, kBufToTex, srv, uav, &c, 8, (NW + 7) / 8, (NH + 7) / 8);

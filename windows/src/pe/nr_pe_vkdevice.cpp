@@ -354,6 +354,11 @@ std::string driver_name() {
     }
     return name;
 }
+static std::string g_d3d12_gpu_name;
+void note_d3d12_gpu_name(const std::string& n) {
+    std::lock_guard<std::mutex> guard(lock);
+    if (!n.empty()) g_d3d12_gpu_name = n;
+}
 std::string gpu_name() {
     static std::string name;
     static VkPhysicalDevice named = VK_NULL_HANDLE;
@@ -365,7 +370,7 @@ std::string gpu_name() {
         name = props.deviceName;
         named = p;
     }
-    return name;
+    return !name.empty() ? name : g_d3d12_gpu_name;
 }
 
 void forget_device(VkDevice device) {

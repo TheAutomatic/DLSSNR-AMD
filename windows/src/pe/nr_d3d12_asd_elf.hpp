@@ -927,6 +927,7 @@ inline bool load_kernel_elf(const std::string& spv_dir, const std::wstring& asd_
     std::vector<std::wstring> roots;
     if (!w_spv.empty()) {
         roots.push_back(w_spv + L"/..");
+        roots.push_back(w_spv + L"/../..");
         roots.push_back(w_spv + L"/../../aco");
         roots.push_back(w_spv + L"/../../../windows/data/aco");
         roots.push_back(w_spv + L"/../../windows/data/aco");
