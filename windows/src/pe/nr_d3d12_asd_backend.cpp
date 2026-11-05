@@ -394,6 +394,7 @@ void mark_frame(ID3D12GraphicsCommandList* cmd) {
 }
 
 ID3D12Resource* linear_buffer(ID3D12Device* device, uint64_t bytes);
+std::wstring widen(const char* u8);
 
 
 
@@ -487,6 +488,7 @@ bool build(ID3D12Device* device, std::string* why) {
         }
     }
     note_network(g.network->name());
+    renodx12::prewarm_shaders(widen(nr::pe::module_folder()) + L"\\dlssnr-amd\\shaders\\renodx");
     D3D12_HEAP_PROPERTIES hp{};
     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC rd_mv{};
