@@ -15,7 +15,8 @@ struct D3d12NetPlan {
         std::string kern;          // the graph's kernel name (g_<kern>.spv in spv_dir)
         uint32_t gx = 0, gy = 0, gz = 0;
         std::vector<uint8_t> push;
-        int act_at = -1;           // where the push block takes the activation arena's address (put_act_address); -1: none
+        int act_at = -1;
+        bool no_barrier_after = false;           // where the push block takes the activation arena's address (put_act_address); -1: none
     };
     struct Noise { uint32_t off, width, height, seed; float noise; };   // NoiseJob (nr_graph.cpp)
     std::vector<Dispatch> disp;
