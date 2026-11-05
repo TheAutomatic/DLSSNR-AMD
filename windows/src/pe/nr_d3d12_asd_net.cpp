@@ -1020,7 +1020,8 @@ public:
             cmd->SetComputeRoot32BitConstants(0, 1, &tag, 0);
             cmd->SetComputeRootUnorderedAccessView(1, table_va + uint64_t(i) * kTableBytes);
             cmd->Dispatch(grid[0], grid[1], grid[2]);
-            uav_barrier(cmd);
+            const bool nobar = i >= base && (i - base) < b->plan.disp.size() && b->plan.disp[i - base].no_barrier_after;
+            if (!nobar) uav_barrier(cmd);
         }
         if (first) {
             b->retargeted = true;
@@ -1032,14 +1033,16 @@ public:
             retire_upload_.push_back(std::move(r));
             b->wgt_upload = nullptr;
         }
-        const UINT c[4] = {b->w, b->h, controls_.round_u8 ? 1u : 0u, 0u};
-        cmd->SetComputeRootSignature(alpha_rs_);
-        cmd->SetPipelineState(alpha_pso_);
-        cmd->SetComputeRoot32BitConstants(0, 4, c, 0);
-        cmd->SetComputeRootUnorderedAccessView(1, out.va);
-        cmd->SetComputeRootUnorderedAccessView(2, in.va);
-        cmd->Dispatch((b->w + 7) / 8, (b->h + 7) / 8, 1);
-        uav_barrier(cmd);
+        if (controls_.automatic_mask) {
+            const UINT c[4] = {b->w, b->h, controls_.round_u8 ? 1u : 0u, 0u};
+            cmd->SetComputeRootSignature(alpha_rs_);
+            cmd->SetPipelineState(alpha_pso_);
+            cmd->SetComputeRoot32BitConstants(0, 4, c, 0);
+            cmd->SetComputeRootUnorderedAccessView(1, out.va);
+            cmd->SetComputeRootUnorderedAccessView(2, in.va);
+            cmd->Dispatch((b->w + 7) / 8, (b->h + 7) / 8, 1);
+            uav_barrier(cmd);
+        }
         if (timed) {
             cmd->EndQuery(queries_, D3D12_QUERY_TYPE_TIMESTAMP, ts * 2 + 1);
             cmd->ResolveQueryData(queries_, D3D12_QUERY_TYPE_TIMESTAMP, ts * 2, 2, stamps_, uint64_t(ts) * 16);

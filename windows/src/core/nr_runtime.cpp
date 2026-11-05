@@ -3212,9 +3212,11 @@ bool plan_d3d12_network(const std::string& root_in, uint32_t mw, uint32_t mh, bo
         }
         const GraphCore& c = *s.core;
         out->disp.reserve(c.disp.size());
-        for (const Disp& d : c.disp) {
+        for (size_t i = 0; i < c.disp.size(); ++i) {
+            const Disp& d = c.disp[i];
             D3d12NetPlan::Dispatch x;
             x.kern = d.kern; x.gx = d.gx; x.gy = d.gy; x.gz = d.gz; x.push = d.push;
+            x.no_barrier_after = i + 1 < c.disp.size() && i < c.no_barrier_after.size() && c.no_barrier_after[i] != 0;
             // put_act_address: the arena's address at act_lo (PushVAttn for vitattn, PushGemm for the GEMMs)
             if (d.kern == "vitattn" && d.push.size() >= sizeof(PushVAttn)) x.act_at = int(offsetof(PushVAttn, act_lo));
             else if (gemm_push_kern(d.kern) && d.push.size() >= sizeof(PushGemm)) x.act_at = int(offsetof(PushGemm, act_lo));
@@ -3286,9 +3288,10 @@ bool plan_d3d12_network(const std::string& root_in, uint32_t mw, uint32_t mh, bo
 }
 
 void d3d12_net_controls(D3d12NetPlan::Dispatch& d, const D3d12NetControls& c, bool grade) {
-    // The alpha pass, not the post block, restores the alpha (and the rounding) on this route.
+    // Like Vulkan (Runtime::record_all): the post block itself restores the alpha (and the 8-bit rounding) unless the
+    // automatic character mask is on (which writes the mask in .a for the alpha pass).
     patch_push_controls(d.push, d.kern, c.style, c.intensity, c.local_tone, c.local_structure, c.skin_structure,
-                        c.automatic_mask, false, false, grade);
+                        c.automatic_mask, !c.automatic_mask, c.round_u8, grade);
 }
 }  // namespace nr
 
