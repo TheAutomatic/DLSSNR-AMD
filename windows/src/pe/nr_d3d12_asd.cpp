@@ -674,8 +674,8 @@ void start(HMODULE self) {
     here = slash == std::wstring::npos ? L"." : here.substr(0, slash);
     g_folder = here + L"\\dlssnr-amd-asd";
     g_ini = g_folder + L"\\dlssnr-amd-asd.ini";
-    if (!exists(g_ini)) return;   // no folder, no ini: off, and not a line in the log
-    g_enabled = GetPrivateProfileIntW(L"D3D12ASD", L"Enabled", 0, g_ini.c_str()) == 1;
+    if (!exists(g_ini)) { CreateDirectoryW(g_folder.c_str(), nullptr); WritePrivateProfileStringW(L"D3D12ASD", L"Enabled", L"1", g_ini.c_str()); }
+    g_enabled = GetPrivateProfileIntW(L"D3D12ASD", L"Enabled", 1, g_ini.c_str()) != 0;
     g_register = GetPrivateProfileIntW(L"D3D12ASD", L"Register", 1, g_ini.c_str()) != 0;
     log("[asd] D3D12 ASD backend %s (%s: Enabled %d, Register %d)", g_enabled ? "on" : "off", utf8(g_ini).c_str(),
         g_enabled ? 1 : 0, g_register ? 1 : 0);
