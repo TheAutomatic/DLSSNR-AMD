@@ -214,7 +214,7 @@ EOF
     # by TheAutomatic's PSDB generator (Windows only: Microsoft's and AMD's ASD compilers) from this release's ACO
     # records and network SPIR-V. manifest.tsv lists the records they were made from; build_package.sh checks it
     # against the package's own records, so databases of another release are never shipped with these shaders.
-    asd=https://raw.githubusercontent.com/TheAutomatic/DLSSNR-AMD/cf99879571213f7c218d945b6785ee6ccf60ea22/windows/tools/asd-psdb-generator/artifacts
+    asd=https://raw.githubusercontent.com/TheAutomatic/DLSSNR-AMD/efaa074197752f452fd0850cfc4232a748b3cc11/windows/tools/asd-psdb-generator/artifacts
     mkdir -p artifacts/ref/asd
     get artifacts/ref/asd/carrier.sodb "$asd/0082/carrier.sodb" \
         949dbd9e541b6099dff2379345c31d25130f61986bdca64d54ff632069637554
@@ -223,8 +223,8 @@ EOF
     get artifacts/ref/asd/manifest.tsv "$asd/0082/manifest.tsv" \
         5f514bf284d037caa485a361c8977ebdc35a5d9856c9a49cd9612df94c41c21d
     get artifacts/ref/asd/gfx1201.psdb "$asd/0082/public-copy.psdb" \
-        f5772df6cb3b9aa907405a6dcfcc69505df7b92ed814346df91c19568b02925a
+        83dc77f6bf8f37fd86f0c58a41508f60a4d67953a28038918ccf32be0d1b3575
     get artifacts/ref/asd/gfx1200.psdb "$asd/0082-gfx1200/public-copy.psdb" \
-        c5719cee9e55d89988c69db7e21e24733d5f3296f9a7680e68e18b53925503ff
+        4fa801316b888647284005f3e1416d11c776018694283622e68d33deb91ebedf
 fi
 echo "dependencies ready"

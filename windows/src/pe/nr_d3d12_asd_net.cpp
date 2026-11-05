@@ -696,6 +696,7 @@ public:
         if (shared_->building) {
             s.building_seconds = std::chrono::duration<float>(std::chrono::steady_clock::now() - shared_->build_started).count();
         }
+        s.gpu_ms = gpu_avg_ms_.load();
         return s;
     }
     void controls(const nr::D3d12NetControls& c) override { controls_ = c; }
@@ -1071,6 +1072,8 @@ public:
 
 private:
     void note_gpu(double ms) {
+        const float prev = gpu_avg_ms_.load();
+        gpu_avg_ms_.store(prev > 0.f ? float(prev * 0.9 + ms * 0.1) : float(ms));
         ++gpu_n_; gpu_sum_ += ms;
         gpu_min_ = gpu_n_ == 1 ? ms : std::min(gpu_min_, ms);
         gpu_max_ = std::max(gpu_max_, ms);
@@ -1142,6 +1145,7 @@ private:
     double hz_ = 0;
     uint64_t frames_ = 0, resets_ = 0, gpu_seen_ = 0;
     unsigned gpu_n_ = 0;
+    std::atomic<float> gpu_avg_ms_{0.f};
     double gpu_sum_ = 0, gpu_min_ = 0, gpu_max_ = 0, cpu_sum_ = 0;
 };
 
