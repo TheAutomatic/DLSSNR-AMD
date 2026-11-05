@@ -10,8 +10,11 @@
 #include "nr_control_shared.hpp"
 #include "nr_control_ui.hpp"
 #include "nr_ini_edit.hpp"
+#include "nr_ini_int4.hpp"
 #include "nr_ini_network.hpp"
 #include "nr_pe_events.hpp"
+#include "nr_pe_diag.hpp"
+#include "nr_pe_stats.hpp"
 
 #include <windows.h>
 
@@ -28,6 +31,17 @@
 #include <vector>
 
 namespace nr::control_ui {
+
+// A network's name as the menus show it: its codename (nr::network_label) through the language file, so a language can
+// name the networks its own way (the ini file, the log and the bug report keep the codenames).
+inline const char* const kNetworkNames[] = {NR_N("CC_SMALL_FP8"), NR_N("CC_SMALL_FP8_EXPERIMENTAL"),
+    NR_N("CC_SILVER_AARDWOLD"), NR_N("CC_SILVER_AARDWOLD_OPTIMIZED"), NR_N("CC_SILVER_AARDWOLD_OPTIMIZED (layers: quality)"),
+    NR_N("CC_SILVER_AARDWOLD_OPTIMIZED (layers: balanced)"), NR_N("CC_SILVER_AARDWOLD_OPTIMIZED (layers: performance)"),
+    NR_N("CC_SILVER_AARDWOLD_OPTIMIZED (layers: ultra performance)")};
+inline const char* net_name(int n) { return tr(nr::network_label(n)); }
+// A network as the lists offer it (a choice, not what runs): CC_SILVER_AARDWOLD_OPTIMIZED without its level - that is
+// the Optimized layers combo's, not the list's.
+inline const char* net_choice_name(int n) { return tr(nr::network_codename(n)); }
 
 // A text's size, the room left on the line, the cursor on the screen. ReShade's ImGui (the add-on's page) is a function
 // table built by MSVC, which returns an ImVec2 through a hidden pointer, where mingw's g++ expects it in a register
@@ -116,7 +130,7 @@ inline void draw_vram(const nr::control::Shared* s) {
     // as wide as its columns need: with a larger Text size the page scrolls sideways rather than the columns running
     // into each other
     float label_w = text_width(tr("NR in all"));
-    for (int n : nr::kNetworkOrder) label_w = std::max(label_w, text_width(nr::network_codename(n)));
+    for (int n : nr::kNetworkOrder) label_w = std::max(label_w, text_width(net_name(n)));
     for (const char* l : {NR_N("RenoDX layers"), NR_N("NR route"), NR_N("Frame copies"), NR_N("wilsjo2 layers"),
                           NR_N("NR Control"), NR_N("Other"), NR_N("The game and others")})
         label_w = std::max(label_w, text_width(tr(l)));
@@ -155,7 +169,7 @@ inline void draw_vram(const nr::control::Shared* s) {
             const uint32_t parts[3] = {k[nr::vram::kWeights], k[nr::vram::kActivations],
                                        k[nr::vram::kUnset] + k[nr::vram::kCopies] + k[nr::vram::kWilsjo2] +
                                            k[nr::vram::kMenu] + k[nr::vram::kRenoDX]};
-            row(nr::network_codename(n), nullptr, parts, 3);
+            row(net_name(n), nullptr, parts, 3);
         }
         uint32_t by_kind[nr::vram::kKinds] = {};
         for (int k = 0; k < nr::vram::kKinds; ++k) by_kind[k] = s->vram_kib[nr::control::kNoNet][k];
@@ -224,7 +238,7 @@ inline void draw_residency() {
     static const char* const kState[] = {NR_N("not loaded"), NR_N("serving"), NR_N("kept in video memory"), NR_N("moving to RAM"),
                                          NR_N("in RAM")};
     for (const auto& n : r.nets)
-        ImGui::BulletText(tr("%s at %ux%u: %s"), n.net >= 0 ? nr::network_codename(n.net) : "?", n.width, n.height,
+        ImGui::BulletText(tr("%s at %ux%u: %s"), n.net >= 0 ? net_name(n.net) : "?", n.width, n.height,
                           tr(kState[std::clamp(n.state, 0, 4)]));
     if (!r.status.empty()) ImGui::TextWrapped(tr("Now: %s%s%s"), r.status.c_str(), r.reason.empty() ? "" : " - ", r.reason.c_str());
     else text_dim_wrapped("Now: nothing to do%s%s", r.reason.empty() ? "" : " - ", r.reason.c_str());
@@ -282,6 +296,89 @@ inline void draw_events() {
     ImGui::EndChild();
 }
 
+// The session's run statistics (nr_pe_stats.hpp): per layer how often NR ran and why frames passed through, faults in
+// red, video memory in yellow, the expected waits dimmed; a reset.
+inline void draw_session_stats() {
+    const nr::pe::stats::Snapshot st = nr::pe::stats::snapshot();
+    ImGui::TextUnformatted(tr("This session:"));
+    ImGui::SameLine();
+    ImGui::TextDisabled(tr("%.0f s"), double(st.now_ms - st.since_ms) / 1000.0);
+    ImGui::SameLine();
+    if (ImGui::SmallButton(tr("Reset##stats"))) nr::pe::stats::reset();
+    help("How often each layer was asked to run and ran, and why frames passed through without NR: in red what went "
+         "wrong, in yellow what video memory stopped, dimmed what is part of normal running (a network being built, a "
+         "frame size settling). The longest stretch without NR and how it began. Kept since the game started or the "
+         "reset; also in the report and the diagnostic package.");
+    if (st.presents.game || st.presents.shown)
+        text_dim_wrapped(tr("Presents: %llu of the game's own, %llu frames shown (frame generation's too), %llu game frames "
+                            "run at DLSS-G's evaluate"),
+                         (unsigned long long)st.presents.game, (unsigned long long)st.presents.shown,
+                         (unsigned long long)st.presents.dlssg);
+    bool any = false;
+    for (int i = 0; i < nr::pe::stats::kLayers; ++i) {
+        const nr::pe::stats::Layer& l = st.layers[i];
+        if (!l.asked) continue;
+        any = true;
+        ImGui::PushID(i);
+        char head[160];
+        if (i) std::snprintf(head, sizeof head, tr("Layer %d: ran %.1f %% (%llu of %llu)"), i,
+                             100.0 * double(l.ran) / double(l.asked), (unsigned long long)l.ran, (unsigned long long)l.asked);
+        else std::snprintf(head, sizeof head, tr("NR: ran %.1f %% (%llu of %llu)"),
+                           100.0 * double(l.ran) / double(l.asked), (unsigned long long)l.ran, (unsigned long long)l.asked);
+        bool fault = false;
+        for (const auto& r : l.reasons) fault |= r.kind == nr::pe::stats::kFault;
+        if (fault) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.f, 0.45f, 0.4f, 1.f));
+        const bool open = ImGui::TreeNode("layer", "%s", head);
+        if (fault) ImGui::PopStyleColor();
+        if (open) {
+            const uint64_t streak = l.streak_ms ? st.now_ms - l.streak_ms : 0;
+            if (l.longest_ms || streak) {
+                const bool now_longer = streak > l.longest_ms;
+                text_dim_wrapped(tr("Longest without NR: %.1f s%s, began with: %s"),
+                                 double(now_longer ? streak : l.longest_ms) / 1000.0, now_longer ? tr(" (still going)") : "",
+                                 (now_longer ? l.streak_why : l.longest_why).c_str());
+            }
+            std::vector<const nr::pe::stats::Reason*> order;
+            for (const auto& r : l.reasons) order.push_back(&r);
+            std::sort(order.begin(), order.end(), [](auto* a, auto* b) { return a->count > b->count; });
+            for (const auto* r : order) {
+                const ImVec4 colour = r->kind == nr::pe::stats::kFault    ? ImVec4(1.f, 0.45f, 0.4f, 1.f)
+                                      : r->kind == nr::pe::stats::kMemory ? ImVec4(1.f, 0.8f, 0.3f, 1.f)
+                                                                          : ImGui::GetStyle().Colors[ImGuiCol_TextDisabled];
+                ImGui::PushStyleColor(ImGuiCol_Text, colour);
+                ImGui::TextWrapped(tr("%8llu x  %s (last %.0f s ago)"), (unsigned long long)r->count, r->example.c_str(),
+                                   double(st.now_ms - r->last_ms) / 1000.0);
+                ImGui::PopStyleColor();
+            }
+            if (order.empty()) ImGui::TextDisabled(tr("never passed a frame through"));
+            ImGui::TreePop();
+        }
+        ImGui::PopID();
+    }
+    if (!any) ImGui::TextDisabled(tr("No layer was asked to run yet."));
+}
+
+// Diagnostics > Save a diagnostic package (nr_pe_diag.hpp): the request is made by `make` when the button is pressed.
+inline void draw_diag_package(const std::function<nr::pe::diag::Request()>& make) {
+    static bool shots = false;   // (off by default: a frame of the game may show more than a bug report needs)
+    ImGui::BeginDisabled(nr::pe::diag::busy());
+    if (ImGui::Button(tr("Save a diagnostic package"))) {
+        nr::pe::diag::Request r = make();
+        r.shots = shots;
+        nr::pe::diag::start(std::move(r));
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::Checkbox(tr("with a screenshot pair"), &shots);
+    help("One zip in the game's folder (dlssnr-amd-diag-<date>-<time>.zip) to attach to a bug report: the report "
+         "below with this session's run statistics, the versions and checksums of the installed programs, the system "
+         "(Windows or Wine, the GPU and its driver), every log and settings file in the game's folder and a crash "
+         "dump if there is one. Ticked: also the before / after screenshot pair of the current frame. It holds the "
+         "game's folder path and the system's description; it stays on this computer, nothing is sent anywhere.");
+    const std::string said = nr::pe::diag::said();
+    if (!said.empty()) text_dim_wrapped("%s", tr_text(said).c_str());
+}
+
 // The layers as they last ran: a row each (Shared::layers), and the sum.
 inline void draw_layer_status(const nr::control::Shared* s) {
     std::vector<const nr::control::LayerStatus*> rows;
@@ -315,7 +412,7 @@ inline void draw_layer_status(const nr::control::Shared* s) {
         float c2 = text_width(tr(kHead[2])), c3 = std::max(text_width(tr(kHead[3])), text_width("7680x4320"));
         for (const char* w : kWhere) c1 = std::max(c1, text_width(tr(w)));
         for (const nr::control::LayerStatus* r : rows) {
-            if (r->net < nr::control::kNoNet) c2 = std::max(c2, text_width(nr::network_codename(int(r->net))));
+            if (r->net < nr::control::kNoNet) c2 = std::max(c2, text_width(net_name(int(r->net))));
             if (r->nr_width) c3 = std::max(c3, text_width(tr("network %ux%u")) + text_width("0000"));
         }
         need += c0 + c1 + c2 + c3;
@@ -348,7 +445,7 @@ inline void draw_layer_status(const nr::control::Shared* s) {
         ImGui::TableNextColumn();
         ImGui::TextUnformatted(r->state == 0 ? "-" : tr(kWhere[std::min(r->placement, 2u)]));
         ImGui::TableNextColumn();
-        ImGui::TextUnformatted(r->net < nr::control::kNoNet ? nr::network_codename(int(r->net)) : "-");
+        ImGui::TextUnformatted(r->net < nr::control::kNoNet ? net_name(int(r->net)) : "-");
         ImGui::TableNextColumn();
         if (!r->width) ImGui::TextUnformatted(tr("-"));
         else if (r->nr_width && (r->nr_width != r->width || r->nr_height != r->height)) {
@@ -441,7 +538,7 @@ inline void osd_window(const char* id, int slot, const std::function<void()>& bo
 inline void draw_osd_lines(const nr::control::Shared* s, int mode) {
     if (osd_switching(s)) {   // the build's progress as a bar, its stage written on it
         ImGui::Text(tr(s->net_running < nr::control::kNoNet ? "NR: switching to %s ... %.0f%%" : "NR: building %s ... %.0f%%"),
-                    nr::network_codename(int(s->building_net)), double(s->build_progress) * 100.0);
+                    net_name(int(s->building_net)), double(s->build_progress) * 100.0);
         char phase[sizeof s->build_phase + 1] = {};
         std::memcpy(phase, s->build_phase, sizeof s->build_phase);   // (the page may not end it)
         ImGui::ProgressBar(std::clamp(s->build_progress, 0.f, 1.f), ImVec2(ImGui::GetFontSize() * 18.f, 0.f), phase);
@@ -458,22 +555,22 @@ inline void draw_osd_lines(const nr::control::Shared* s, int mode) {
         for (const nr::control::LayerStatus* r : rows) {
             const bool ran = r->state == 1 && now - r->updated < 1500 && r->gpu_ms > 0.f;
             if (mode == 3 && ran) {
-                ImGui::Text(tr("NR layer %u: %s%s"), r->number, nr::network_codename(int(r->net)),
+                ImGui::Text(tr("NR layer %u: %s%s"), r->number, net_name(int(r->net)),
                             osd_cost(r->gpu_ms, r->network_ms).c_str());
                 total += r->gpu_ms;
                 network += r->network_ms;
                 split = split && r->network_ms > 0.f;
             } else {
-                ImGui::Text(tr("NR layer %u: %s"), r->number, nr::network_codename(int(r->net)));
+                ImGui::Text(tr("NR layer %u: %s"), r->number, net_name(int(r->net)));
             }
         }
         if (mode == 3 && rows.size() > 1) ImGui::Text(tr("NR in all: %s"), osd_cost(total, split ? network : 0.f).c_str() + 2);   // (its two leading spaces)
     } else if (s->net_running >= nr::control::kNoNet) {   // nothing runs (the .asi: no layer on)
         ImGui::TextUnformatted(tr("NR: not running"));
     } else if (mode == 3 && s->gpu_ms > 0.f) {
-        ImGui::Text(tr("NR: %s%s"), nr::network_codename(int(s->net_running)), osd_cost(s->gpu_ms, s->network_ms).c_str());
+        ImGui::Text(tr("NR: %s%s"), net_name(int(s->net_running)), osd_cost(s->gpu_ms, s->network_ms).c_str());
     } else {
-        ImGui::Text(tr("NR: %s"), nr::network_codename(int(s->net_running)));
+        ImGui::Text(tr("NR: %s"), net_name(int(s->net_running)));
     }
 }
 
@@ -502,7 +599,7 @@ inline std::vector<std::string> ran_networks(const nr::control::Shared* s, uint3
     std::vector<std::string> nets;
     const auto add = [&](uint32_t n) {
         if (n >= nr::control::kNoNet) return;
-        const std::string name = nr::network_codename(int(n));
+        const std::string name = net_name(int(n));
         if (std::find(nets.begin(), nets.end(), name) == nets.end()) nets.push_back(name);
     };
     if (s) {
@@ -515,7 +612,7 @@ inline std::vector<std::string> ran_networks(const nr::control::Shared* s, uint3
     return nets;
 }
 // The sidebar's foot (OptiScaler's menu has its own words in the same place): short rows, then "Net" and the networks,
-// broken after an underscore where one is wider than the sidebar (CC_SILVER_AARDWOLD_INT4_MIXED) - beside "Net" when it
+// broken after an underscore where one is wider than the sidebar (CC_SILVER_AARDWOLD_OPTIMIZED) - beside "Net" when it
 // fits there, else below. Drawn at the bottom of the current child when there is room.
 struct FootRow { const char* label; std::string value; bool lit = false; };
 inline void nav_foot(const std::vector<FootRow>& rows, const std::vector<std::string>& nets) {
@@ -685,7 +782,7 @@ inline std::string report_text(const nr::control::Shared* s, const char* module,
             else std::snprintf(pass_text, sizeof pass_text, "%u (legacy)", r.passes);
             add("  %u %s | %s | %s | %ux%u | %ux%u | %s | %.2f | %.2f | %.2f | %s%s%.*s", r.number,
                 r.processing == 1 ? "wilsjo2" : "RenoDX", r.state ? kWhere[std::min(r.placement, 2u)] : "-",
-                r.net < nr::control::kNoNet ? nr::network_codename(int(r.net)) : "-", r.width, r.height, r.nr_width, r.nr_height,
+                r.net < nr::control::kNoNet ? nr::network_label(int(r.net)) : "-", r.width, r.height, r.nr_width, r.nr_height,
                 pass_text,
                 double(r.network_ms), double(std::max(0.f, r.gpu_ms - r.network_ms)), double(r.gpu_ms),
                 r.state == 1 ? "running" : r.state == 2 ? "building" : r.state == 3 ? "not running" : "waiting",
@@ -710,7 +807,7 @@ inline std::string report_text(const nr::control::Shared* s, const char* module,
         for (int o = 0; o < nr::kNetworkChoices + 1; ++o)   // the networks (nr::NetworkChoice), then none (vram::kOwners)
             for (int k = 0; k < nr::vram::kKinds; ++k)
                 if (s->vram_kib[o][k])
-                    add("  %s, %s: %.1f", o < nr::kNetworkChoices ? nr::network_codename(o) : "not a network's", kKind[k],
+                    add("  %s, %s: %.1f", o < nr::kNetworkChoices ? nr::network_label(o) : "not a network's", kKind[k],
                         double(s->vram_kib[o][k]) / 1024.0);
         add("  this process: %.0f, budget %.0f, heap %.0f", double(s->vram_process_kib) / 1024.0,
             double(s->vram_budget_kib) / 1024.0, double(s->vram_heap_kib) / 1024.0);
@@ -746,7 +843,7 @@ inline std::string report_text(const nr::control::Shared* s, const char* module,
                 double(r.budget) / (1 << 20), double(r.usage) / (1 << 20), double(r.reserve) / (1 << 20),
                 r.status.empty() ? "" : "; now: ", r.status.c_str());
             for (const auto& n : r.nets)
-                add("  %s at %ux%u: %s", n.net >= 0 ? nr::network_codename(n.net) : "?", n.width, n.height,
+                add("  %s at %ux%u: %s", n.net >= 0 ? nr::network_label(n.net) : "?", n.width, n.height,
                     kState[std::clamp(n.state, 0, 4)]);
         }
         const nr::pe::events::LastStop stop = nr::pe::events::last_stop();
@@ -756,6 +853,7 @@ inline std::string report_text(const nr::control::Shared* s, const char* module,
             add("  %8.1f %-8s %s%s", double(now_ms - e.ms) / 1000.0, nr::pe::events::category_name(e.category), e.text,
                 e.count > 1 ? (" (x" + std::to_string(e.count) + ")").c_str() : "");
     }
+    t += "\n" + nr::pe::stats::text();
     t += "\ndlssnr-amd.ini:\n" + file_text(ini, 0);
     t += "\ndlssnr-amd.log (last lines):\n" + file_text(log, 80);
     return t;
@@ -1050,12 +1148,31 @@ inline void draw_network_options(nr::ini_edit::Ini& ini, const nr::control::Shar
     if (const char* e = std::getenv("NR_CONTROL_GLOBAL_OPEN")) ImGui::SetNextItemOpen(e[0] != '0');   // tests
     if (!section("Network model and options", ImGuiTreeNodeFlags_DefaultOpen)) return;
     const int file_model = std::max(0, nr::network_choice(ini.get("Network", "Model", "CC_SMALL_FP8")));
-    const int shown = s && s->net_known && s->net_want < nr::control::kNoNet ? int(s->net_want) : file_model;
-    if (ImGui::BeginCombo(tr("Network##model"), nr::network_codename(shown))) {
-        for (int n : nr::kNetworkOrder) {
-            const char* why = s && s->net_known ? tr_text(s->net_why[n]) : "";
+    // the list has CC_SILVER_AARDWOLD_OPTIMIZED once (kSilverAardwoldOptimized); whether it can run at all is its
+    // Quality level's (the other levels have reasons of their own, under the Optimized layers combo)
+    auto listed = [](int n) { return nr::network_optimized(n) ? int(nr::kSilverAardwoldOptimized) : n; };
+    auto why_of = [&](int n) {
+        return s && s->net_known ? tr_text(s->net_why[nr::network_optimized(n) ? nr::kSilverAardwoldOptimizedFp8 : n]) : "";
+    };
+    // The box is [Network] Model, the setting; the networks running are named beside it. A layer with a network of its
+    // own ([LayerN] Network) is not reached by [Network] Model: the box showed the network running, the layer's, and
+    // looked stuck (user 11-06)
+    std::vector<std::pair<int, int>> own;   // the layer's number, its network
+    for (const std::string& sec : ini.sections()) {
+        const int n = layer_section_number(sec);
+        if (n < 1 || !layer_shown(ini, n)) continue;
+        const int net = nr::network_choice(ini.get(sec, "Network", ""));
+        if (net >= 0 && std::none_of(own.begin(), own.end(), [n](const std::pair<int, int>& o) { return o.first == n; }))
+            own.push_back({n, net});
+    }
+    std::sort(own.begin(), own.end());
+    const bool one = !layers_on(ini);   // Layers off: the one NR
+    const int shown = listed(file_model);
+    if (ImGui::BeginCombo(tr("Network##model"), net_choice_name(shown))) {
+        for (int n : nr::kNetworkList) {
+            const char* why = why_of(n);
             const bool ok = !why[0];
-            if (ImGui::Selectable(nr::network_codename(n), n == shown, ok ? 0 : ImGuiSelectableFlags_Disabled))
+            if (ImGui::Selectable(net_choice_name(n), n == shown, ok ? 0 : ImGuiSelectableFlags_Disabled))
                 ini.set("Network", "Model", nr::network_codename(n));
             if (!ok) {   // the reason under it, wrapped (a popup grows with its widest line)
                 ImGui::Indent();
@@ -1069,11 +1186,56 @@ inline void draw_network_options(nr::ini_edit::Ini& ini, const nr::control::Shar
     }
     help("[Network] Model. CC_SMALL_FP8: 310.9.16's default network. CC_SMALL_FP8_EXPERIMENTAL: ours, "
          "CC_SMALL_FP8 made faster. CC_SILVER_AARDWOLD: "
-         "310.8.0's network (310.9.16's preset 1). CC_SILVER_AARDWOLD_INT4_MIXED: that network with part "
-         "of its arithmetic in int4, faster, a slightly different picture. Switching builds the new network in "
-         "the background; the running one serves until it is ready.");
-    for (int n : nr::kNetworkOrder)
-        if (s && s->net_known && s->net_why[n][0]) text_dim_wrapped("%s: %s", nr::network_codename(n), tr_text(s->net_why[n]));
+         "310.8.0's network (310.9.16's preset 1). CC_SILVER_AARDWOLD_OPTIMIZED: ours, CC_SILVER_AARDWOLD made "
+         "faster, its picture very close to it. Switching builds the new network in the background; the running one "
+         "serves until it is ready.");
+    for (int n : nr::kNetworkList)
+        if (why_of(n)[0]) text_dim_wrapped("%s: %s", net_choice_name(n), why_of(n));
+    {   // [Network] OptimizedLayers: CC_SILVER_AARDWOLD_OPTIMIZED's only
+        static const char* const levels[] = {NR_N("Quality"), NR_N("Balanced"), NR_N("Performance"), NR_N("Ultra Performance")};
+        const bool opt = shown == nr::kSilverAardwoldOptimized;
+        int level = nr::optimized_layers_value(ini.get("Network", "OptimizedLayers", "3"));
+        if (level < 0) level = nr::kLayersDefault;
+        ImGui::BeginDisabled(!opt);
+        if (ImGui::BeginCombo(tr("Optimized layers"), tr(levels[level]))) {
+            for (int l = 0; l < nr::kLayersCount; ++l) {
+                // a level that cannot run here: greyed, its reason under it (Quality's is the network's, above)
+                const char* why = l && s && s->net_known ? tr_text(s->net_why[nr::network_with_layers(nr::kSilverAardwoldOptimized, l)]) : "";
+                if (ImGui::Selectable(tr(levels[l]), l == level, why[0] ? ImGuiSelectableFlags_Disabled : 0))
+                    ini.set("Network", "OptimizedLayers", std::to_string(l));
+                if (why[0]) {
+                    ImGui::Indent();
+                    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 26.f * ImGui::GetFontSize());
+                    ImGui::TextDisabled("%s", why);
+                    ImGui::PopTextWrapPos();
+                    ImGui::Unindent();
+                }
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::EndDisabled();
+        help("[Network] OptimizedLayers, CC_SILVER_AARDWOLD_OPTIMIZED only: how many of its layers run in a faster "
+             "form. It changes only how the network computes, not the resolution; every level's picture stays very close "
+             "to CC_SILVER_AARDWOLD's. Quality: none of them in int4. Balanced: some of them in int4. Performance: also fixed "
+             "attention on the first full-resolution layers. Ultra Performance (default): also more int4 layers, the "
+             "fastest. Switching builds the network again in the background.");
+        const char* why = level && s && s->net_known ? tr_text(s->net_why[nr::network_with_layers(nr::kSilverAardwoldOptimized, level)]) : "";
+        if (opt && why[0] && !why_of(nr::kSilverAardwoldOptimized)[0]) text_dim_wrapped("%s", why);
+    }
+    // What runs now (the layers' last runs, else the network asked for), on a line of its own under the two boxes (the
+    // settings): beside the Network box it ran off the window's edge (a long name, ReShade's narrower page) and split
+    // the model from its Optimized layers level (user 11-06)
+    if (s && s->net_known) {
+        std::string running;
+        for (const std::string& n : ran_networks(s, s->net_want)) running += (running.empty() ? "" : ", ") + n;
+        if (!running.empty()) text_dim_wrapped(tr("Running: %s"), running.c_str());
+    }
+    for (const auto& o : own) {
+        if (one) text_dim_wrapped(tr("NR settings runs a network of its own (%s); the model here is for NR set to "
+                                     "[Global]."), net_choice_name(o.second));
+        else text_dim_wrapped(tr("Layer %d runs a network of its own (%s); the model here is for the layers set to "
+                                 "[Global]."), o.first, net_choice_name(o.second));
+    }
     {
         const std::string k = ini.get("Network", "Hotkey", "Ctrl+F11");
         ImGui::TextDisabled(tr("Next network: %s (see Hotkeys)"), k.empty() ? tr("no key") : k.c_str());
@@ -1081,7 +1243,7 @@ inline void draw_network_options(nr::ini_edit::Ini& ini, const nr::control::Shar
     ini_flag(ini, "Sound##net", "Network", "Sound", "1",
              "[Network] Sound. A cue on every switch: one note CC_SMALL_FP8, a higher one "
              "CC_SMALL_FP8_EXPERIMENTAL, two going down CC_SILVER_AARDWOLD, two going up "
-             "CC_SILVER_AARDWOLD_INT4_MIXED.");
+             "CC_SILVER_AARDWOLD_OPTIMIZED.");
     static const char* const residencies[] = {NR_N("auto"), NR_N("resident"), NR_N("offload"), NR_N("minimal")};
     const std::string r = ini.get("Network", "Residency", "auto");
     int ri = 0;
@@ -1129,10 +1291,10 @@ inline void draw_network_options(nr::ini_edit::Ini& ini, const nr::control::Shar
              "Off: with depth, the vector of the nearest of the pixel and its four diagonal neighbours.\n"
              "Only moving edges between frames with motion vectors and depth differ. Takes effect after a restart.");
     ini_flag(ini, "Resize history", "Network", "Resize History", "0", o.resize_help);
-    ini_flag(ini, "Memory guard", "Network", "Memory Guard", "1",
-             "[Network] Memory Guard. On (default): a network is built only while the video memory it needs is free. "
-             "Off: no such check - NR builds in whatever video memory is left; a game left short of it may stutter or "
-             "fail to load its own data. Applied at once.");
+    ini_flag(ini, "Memory guard", "Network", "Memory Guard", "0",
+             "[Network] Memory Guard. On: a network is built only while the video memory it needs is free (measured on "
+             "your GPU when the network is first built). Off (default): no such check - NR builds in whatever video "
+             "memory is left; a game left short of it may stutter or fail to load its own data. Applied at once.");
 }
 
 // [Inspect]: NR Control's comparison for the whole NR chain. `where`: what the
@@ -1549,10 +1711,10 @@ struct ChainEditor {
     bool many() const { return layers_on(ini); }
     // The network's entry: its own, or [Network] Model's by name ("[Global] CC_SMALL_FP8")
     std::string network_label(int net) const {
-        if (net >= 0) return nr::network_codename(net);
+        if (net >= 0) return net_choice_name(net);
         char t[96];
         std::snprintf(t, sizeof t, tr("[Global] %s"),
-                      nr::network_codename(std::max(0, nr::network_choice(ini.get("Network", "Model", "CC_SMALL_FP8")))));
+                      net_choice_name(std::max(0, nr::network_choice(ini.get("Network", "Model", "CC_SMALL_FP8")))));
         return t;
     }
     // On in this run: the file's box, turned round by the layer's ToggleKey
@@ -1593,8 +1755,8 @@ struct ChainEditor {
         const int net = row.network.empty() ? -1 : nr::network_choice(row.network);
         if (ImGui::BeginCombo(place("##network", NR_N("Network")).c_str(), network_label(net).c_str())) {
             if (ImGui::Selectable(network_label(-1).c_str(), net < 0)) { materialize(); ini.set(sec, "Network", ""); }
-            for (int n : nr::kNetworkOrder)
-                if (ImGui::Selectable(nr::network_codename(n), n == net)) { materialize(); ini.set(sec, "Network", nr::network_codename(n)); }
+            for (int n : nr::kNetworkList)
+                if (ImGui::Selectable(net_choice_name(n), n == net)) { materialize(); ini.set(sec, "Network", nr::network_codename(n)); }
             ImGui::EndCombo();
         }
         if (!cells) help("Network. [Global]: the Network page's model ([Network] Model, also switched by its hotkey); or "
@@ -1655,7 +1817,7 @@ struct ChainEditor {
                                "key): no layer runs. The boxes below are what the file says."));
         if (ImGui::BeginTable("chain", many ? 5 : 4, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg)) {
             // the page's width shared out (the combos fill their columns): the network's names are the longest
-            // (CC_SILVER_AARDWOLD_INT4_MIXED whole at the default size), then the places'; the layer's name as wide as
+            // (CC_SILVER_AARDWOLD_OPTIMIZED whole at the default size), then the places'; the layer's name as wide as
             // it is ("Layer 2 (off now)")
             ImGui::TableSetupColumn("##layer", ImGuiTableColumnFlags_WidthFixed);
             ImGui::TableSetupColumn("##processing", ImGuiTableColumnFlags_WidthStretch, 0.8f);

@@ -35,6 +35,7 @@
 #include "nr_device_features.hpp"
 #include "nr_dlssnr_model.hpp"
 #include "nr_pe_session.hpp"
+#include "nr_pe_stats.hpp"
 #include "nr_ini_network.hpp"
 #include "nr_ngx_abi.hpp"
 #include "nr_pe_config.hpp"
@@ -1171,6 +1172,12 @@ constexpr DWORD kPresentSlotWaitMs = 100;            // kPresentSlotWaitMs
 // and their waits for a ring slot (a Present of eight ago still on the GPU), in microseconds
 struct PacingStats {
     std::atomic<uint64_t> top_calls{0}, top_us{0}, top_max_us{0}, waits{0}, wait_us{0};
+    // DLSS-G through NGX: evaluates that ran the layers; the game's presents left to them (counted down / held by the
+    // last evaluate's time); presents that ran the layers themselves while DLSS-G evaluated (none expected)
+    std::atomic<uint64_t> dlssg_evals{0}, dlssg_taken{0}, dlssg_held{0}, dlssg_at_present{0};
+    // at those evaluates, frame generation's HUD-less frame given NR's change: DLSS-G's own (its evaluate's), another
+    // hand-over's, none
+    std::atomic<uint64_t> dlssg_hud_own{0}, dlssg_hud_other{0}, dlssg_hud_none{0};
 };
 PacingStats g_pacing;
 uint64_t pacing_us() {
@@ -2294,6 +2301,7 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
         transition(l, gs->depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
         transition(l, gs->motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     }
+    int hud_given = 0;   // (counted at DLSS-G's evaluate) 1: DLSS-G's own HUD-less frame got NR's change, 2: another
     if (fg_before && ran) {   // the HUD-less frame + the layers' change, handed to frame generation in its place
         PresentPath& P = g_present;
         if (nr::asi::wilsjo2_fg_delta(l, device, hud_cap.fg.copy, fg_before, P.target, P.fg_zero, P.hud_stats, P.fg_out, w,
@@ -2301,6 +2309,7 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
             transition(l, P.fg_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
             transition(l, hud_cap.fg.game, hud_cap.fg.state, D3D12_RESOURCE_STATE_COPY_DEST);
             l->CopyResource(hud_cap.fg.game, P.fg_out);
+            hud_given = std::strcmp(hud_cap.fg.source, "DLSS frame generation (NGX)") == 0 ? 1 : 2;
             transition(l, hud_cap.fg.game, D3D12_RESOURCE_STATE_COPY_DEST, hud_cap.fg.state);
             transition(l, P.fg_out, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             static bool said = false;
@@ -2315,6 +2324,7 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
                 "frame without NR");
         }
     }
+    if (at) ++(hud_given == 1 ? g_pacing.dlssg_hud_own : hud_given == 2 ? g_pacing.dlssg_hud_other : g_pacing.dlssg_hud_none);
     shot.copy(l, g_present.target, 1);   // F5: the final picture
     transition(l, g_present.target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     transition(l, back, D3D12_RESOURCE_STATE_COPY_SOURCE, ran ? D3D12_RESOURCE_STATE_COPY_DEST : back_state);
@@ -2573,6 +2583,20 @@ void pacing_watch() {
         if (active) {
             const std::string sources = take_game_sources();
             if (!sources.empty()) log("[nr] pacing (10 s): the Presents taken as the game's: %s", sources.c_str());
+            const uint64_t ev = g_pacing.dlssg_evals.exchange(0), tk = g_pacing.dlssg_taken.exchange(0),
+                           hd = g_pacing.dlssg_held.exchange(0), ap = g_pacing.dlssg_at_present.exchange(0),
+                           ho = g_pacing.dlssg_hud_own.exchange(0),
+                           hx = g_pacing.dlssg_hud_other.exchange(0), hn = g_pacing.dlssg_hud_none.exchange(0);
+            if (ev || tk || hd || ap)
+                log("[nr] pacing (10 s): DLSS-G: %llu evaluates ran the layers; the game's presents left to them: %llu "
+                    "counted, %llu held by the last evaluate; %llu presents ran the layers themselves while DLSS-G was "
+                    "active",
+                    static_cast<unsigned long long>(ev), static_cast<unsigned long long>(tk), static_cast<unsigned long long>(hd),
+                    static_cast<unsigned long long>(ap));
+            if (ho || hx || hn)
+                log("[nr] pacing (10 s): DLSS-G: its HUD-less frame given NR's change at %llu evaluates, another "
+                    "hand-over's at %llu, none at %llu", static_cast<unsigned long long>(ho),
+                    static_cast<unsigned long long>(hx), static_cast<unsigned long long>(hn));
         }
         frames_at = frames; presents_at = presents; calls_at = calls; us_at = us; waits_at = waits; wait_us_at = wait_us;
     }
@@ -2658,6 +2682,8 @@ ID3D12CommandQueue* dlssg_layers_here(unsigned int id, NVSDK_NGX_Parameter* p) {
     return g_dlssg_queue;
 }
 void dlssg_layers(ID3D12GraphicsCommandList* cmd, ID3D12Resource* back, ID3D12CommandQueue* queue, uint32_t generated) {
+    nr::pe::stats::dlssg_frame();
+    ++g_pacing.dlssg_evals;
     const ULONGLONG now = GetTickCount64();
     {
         std::lock_guard<std::mutex> guard(g_lock);
@@ -2689,14 +2715,24 @@ void dlssg_layers(ID3D12GraphicsCommandList* cmd, ID3D12Resource* back, ID3D12Co
 // down; once none is left (frame generation switched off: no evaluate) the presents take the layers again, from the
 // next one on (a time window as well cost the first frame after frame generation went off its NR in the stand-in).
 // A second without such an evaluate ends it whatever is left. Keeps the screen and the capture's back buffers current.
+// With none left but an evaluate within kDlssgHoldMs the Present is still its frame's: the declared presents can run
+// short of those that come (RE Requiem demo under GE-Proton 11-12: the layers then ran at the Present as well -
+// after frame generation, on some frames only - and the picture flickered between NR and none; NR off was steady).
 // g_lock.
+constexpr ULONGLONG kDlssgHoldMs = 200;
 bool dlssg_present_taken(IDXGISwapChain* sc) {
     const ULONGLONG last = g_present.dlssg_ms.load();
     if (!last) return false;
+    const ULONGLONG since = GetTickCount64() - last;
     const uint32_t left = g_present.dlssg_left.load();
-    if (!left) return false;
-    g_present.dlssg_left = left - 1;
-    if (GetTickCount64() - last > 1000) { g_present.dlssg_left = 0; return false; }
+    if (!left) {
+        if (since > kDlssgHoldMs) return false;
+        ++g_pacing.dlssg_held;
+    } else {
+        g_present.dlssg_left = left - 1;
+        if (since > 1000) { g_present.dlssg_left = 0; return false; }
+        ++g_pacing.dlssg_taken;
+    }
     screen_of(sc);
     nr::asi::hudcap::d3d12_backs(sc);
     if (!g_present.dlssg_back_said && g_present.dlssg_back) {   // what the evaluate's back buffer is (once, for the log)
@@ -2748,6 +2784,7 @@ std::atomic<bool> g_fg_proxy_held{false};
 bool game_swapchain(IDXGISwapChain* sc);
 void on_present(IDXGISwapChain* sc, ID3D12CommandQueue* queue, int encoding) {
     nr::pe::watchdog::beat();
+    nr::pe::stats::shown_present();
     nr::pe::watchdog::Phase phase("the system's Present (NR Control's hook)");
     frame_generation_line();
     const bool served_above = GetTickCount64() - g_present.top_ms.load() < 1000;
@@ -2763,7 +2800,10 @@ void on_present(IDXGISwapChain* sc, ID3D12CommandQueue* queue, int encoding) {
             present_layers(sc, queue, false);
     }
     if (!g_present.wanted.load()) late_present(sc, queue, encoding);
-    debug_present_dump(sc, queue);   // what is shown, after whatever ran here
+}
+// After NR Control at the system's Present (drawn there on every frame shown): what is shown.
+void on_shown(IDXGISwapChain* sc, ID3D12CommandQueue* queue) {
+    debug_present_dump(sc, queue);   // what is shown, after whatever ran here and NR Control
 }
 
 // ---- the Present layers before frame generation: the swap chain the game itself holds ------------------------------
@@ -2835,6 +2875,7 @@ void fg_pacing_restart() {
 
 void game_present_before(IDXGISwapChain* sc) {
     nr::pe::watchdog::game_beat();
+    nr::pe::stats::game_present();
     fg_pacing_restart();
     ID3D12CommandQueue* queue = nullptr;
     ID3D11Device* d11 = nullptr;
@@ -2849,8 +2890,9 @@ void game_present_before(IDXGISwapChain* sc) {
     // NR_PRESENT_UNDER=1 (measurement only): leave the layers to NR Control's Present hook, under OptiScaler (and after
     // its frame generation), for comparing the two places
     static const bool under = [] { char b[8] = {}; return GetEnvironmentVariableA("NR_PRESENT_UNDER", b, 8) && b[0] == '1'; }();
-    // NR Control after the layers, here too (nr_pe_menu.hpp draw_game): as OptiScaler's menu, before frame generation,
-    // once a game frame - drawn below it, on the frames frame generation presents from a thread of its own, it flickered
+    // NR Control (nr_pe_menu.hpp draw_game): a game frame for its bookkeeping - the menu itself is drawn at the system's
+    // Present, on every frame shown (frame generation's too), as OptiScaler draws its own; here only while that has not
+    // drawn it for a second
     if (d11) {
         if (!under && d11_present_due()) {
             d11_present_layers(sc, d11);
@@ -2873,6 +2915,7 @@ void game_present_before(IDXGISwapChain* sc) {
     if (taken) {
         g_present.top_ms = GetTickCount64();
     } else if (present_due()) {
+        if (g_present.dlssg_ms.load() && GetTickCount64() - g_present.dlssg_ms.load() <= 1000) ++g_pacing.dlssg_at_present;
         present_layers(sc, queue, true);
         g_present.top_ms = GetTickCount64();
     }
@@ -2906,6 +2949,16 @@ bool fg_inner(IDXGISwapChain* sc) {
     if (!g_fg_inner_any.load(std::memory_order_relaxed)) return false;
     std::lock_guard<std::mutex> guard(g_sc_lock);
     return g_fg_inner.count(sc) != 0;
+}
+// Every D3D12 swap chain a hooked factory made, the game's or one frame generation made under its proxy: the queue it was
+// made with, for NR Control at the system's Present (nr_pe_menu.hpp note_swapchain_queue).
+void note_queue(IUnknown* device, IDXGISwapChain* sc) {
+    if (!device || !sc) return;
+    ID3D12CommandQueue* queue = nullptr;
+    if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&queue))) && queue) {
+        nr::pe::menu::note_swapchain_queue(sc, queue);
+        queue->Release();
+    }
 }
 // A swap chain the factory made: under a followed frame-generation call one of its inner ones; otherwise a new one of the
 // game's, never an inner one (an address freed and taken again).
@@ -3048,6 +3101,7 @@ struct ScDetours {
         ++t_creating;
         const HRESULT hr = original<Fn>(kDetourCreate)(f, device, desc, out);
         --t_creating;
+        if (SUCCEEDED(hr) && out) note_queue(device, *out);
         if (SUCCEEDED(hr) && out && !t_creating) { note_created(*out); adopt_swapchain(device, *out); }
         return hr;
     }
@@ -3059,6 +3113,7 @@ struct ScDetours {
         ++t_creating;
         const HRESULT hr = original<Fn>(kDetourCreateHwnd)(f, device, hwnd, desc, fs, output, out);
         --t_creating;
+        if (SUCCEEDED(hr) && out) note_queue(device, *out);
         if (SUCCEEDED(hr) && out && !t_creating) { note_created(*out); adopt_swapchain(device, *out); }
         return hr;
     }
@@ -3070,6 +3125,7 @@ struct ScDetours {
         ++t_creating;
         const HRESULT hr = original<Fn>(kDetourCreateCore)(f, device, window, desc, output, out);
         --t_creating;
+        if (SUCCEEDED(hr) && out) note_queue(device, *out);
         if (SUCCEEDED(hr) && out && !t_creating) { note_created(*out); adopt_swapchain(device, *out); }
         return hr;
     }
@@ -3080,6 +3136,7 @@ struct ScDetours {
         ++t_creating;
         const HRESULT hr = original<Fn>(kDetourCreateComp)(f, device, desc, output, out);
         --t_creating;
+        if (SUCCEEDED(hr) && out) note_queue(device, *out);
         if (SUCCEEDED(hr) && out && !t_creating) { note_created(*out); adopt_swapchain(device, *out); }
         return hr;
     }
@@ -3181,6 +3238,7 @@ void menu_once(ID3D12Device* device) {
     std::call_once(menu, [device] {
         nr::pe::menu::watch_queues(device);
         nr::pe::menu::on_d3d12_present(&on_present);
+        nr::pe::menu::on_d3d12_shown(&on_shown);
         nr::pe::menu::on_execute(&on_execute);
         nr::pe::menu::install();
     });
@@ -3198,6 +3256,7 @@ void menu_once11() {
 }
 void on_present11(IDXGISwapChain* sc, ID3D11Device* device) {
     nr::pe::watchdog::beat();
+    nr::pe::stats::shown_present();
     frame_generation_line();
     if (GetTickCount64() - g_d11_top_ms.load() < 1000) return;   // served at the game's own call
     {   // a swap chain of the game's (adopt_swapchain), not one OptiScaler or an overlay made; while none was seen

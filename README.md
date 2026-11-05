@@ -9,10 +9,10 @@ graphics cards.
   of 310.8.0, so from 310.9.16 alone the installer installs both. Since 0.0.6-linux-preview (Linux) and
   0.0.6-win-preview-alpha (Windows) `CC_SMALL_FP8` runs by default; `CC_SILVER_AARDWOLD` stays selectable
   (see [The model](#the-model)). Since 0.0.7 the networks carry the names in NVIDIA's DLL -
-  `CC_SMALL_FP8`, `CC_SILVER_AARDWOLD` and `CC_SILVER_AARDWOLD_INT4_MIXED` ([int4 mixed](#int4-mixed-optional)) -
-  and all of them can be switched in game.
+  `CC_SMALL_FP8` and `CC_SILVER_AARDWOLD` - and all of them can be switched in game.
   Since 0.0.8 (Linux) and 0.0.8.1 (Windows) `CC_SMALL_FP8_EXPERIMENTAL` can be chosen as well
-  ([CC_SMALL_FP8_EXPERIMENTAL](#cc_small_fp8_experimental-optional)).
+  ([CC_SMALL_FP8_EXPERIMENTAL](#cc_small_fp8_experimental-optional)), and since 0.0.8.3 `CC_SILVER_AARDWOLD_OPTIMIZED`
+  ([CC_SILVER_AARDWOLD_OPTIMIZED](#cc_silver_aardwold_optimized-optional)), which replaces int4 mixed.
 - The Linux build with `CC_SMALL_FP8`, on an RX 9070 XT, checked against NVIDIA's own `nvngx_dlssnr.dll`
   310.9.16 run on an RTX 5090 through NGX, the same way as below. Single frames: PSNR 49.15 dB at 1080p,
   49.40 dB at 1440p and 50.59 dB at 4K, SSIM 0.997. Moving sequences: PSNR 50.6-52.3 dB at 1080p,
@@ -98,23 +98,20 @@ same machine code as Linux):
 | Windows, `CC_SMALL_FP8`, [ACO's machine code](#windows) (the default) | about the same as Linux | about the same as Linux | about the same as Linux |
 | Windows, [`CC_SMALL_FP8_EXPERIMENTAL`](#cc_small_fp8_experimental-optional), [ACO's machine code](#windows) | about the same as Linux | about the same as Linux | about the same as Linux |
 
-`CC_SILVER_AARDWOLD` (310.8.0), GPU time of the network per frame on an RX 9070 XT, **offline benchmark** (network
-only), measured with v0.0.3 (the `CC_SILVER_AARDWOLD_INT4_MIXED` row with v0.0.4, the Windows ACO Mode row with v0.0.4-win-preview
-on AMD Software 26.9.2). In games, the network-only time the log shows is lower than in this offline
-benchmark:
+`CC_SILVER_AARDWOLD` (310.8.0), GPU time of the network per frame on an RX 9070 XT (network only), **measured in
+game** as the log shows it: Linux `CC_SILVER_AARDWOLD` with v0.0.3, [`CC_SILVER_AARDWOLD_OPTIMIZED`](#cc_silver_aardwold_optimized-optional) with 0.0.8.3 (its Optimized
+layers levels); Windows with v0.0.4-win-preview on AMD Software 26.9.2:
 
 | | 1080p | 1440p | 4K |
 | --- | --- | --- | --- |
 | Linux | 5.60 ms | 9.70 ms | 21.89 ms |
-| Linux, [`CC_SILVER_AARDWOLD_INT4_MIXED`](#int4-mixed-optional) | 4.99 ms | 8.69 ms | 19.64 ms |
+| Linux, [`CC_SILVER_AARDWOLD_OPTIMIZED`](#cc_silver_aardwold_optimized-optional), Quality | 4.89 ms | 8.44 ms | 18.77 ms |
+| Linux, [`CC_SILVER_AARDWOLD_OPTIMIZED`](#cc_silver_aardwold_optimized-optional), Balanced | 4.55 ms | 8.08 ms | 18.21 ms |
+| Linux, [`CC_SILVER_AARDWOLD_OPTIMIZED`](#cc_silver_aardwold_optimized-optional), Performance | 4.40 ms | 7.70 ms | 17.32 ms |
+| Linux, [`CC_SILVER_AARDWOLD_OPTIMIZED`](#cc_silver_aardwold_optimized-optional), Ultra Performance (the default) | 4.20 ms | 7.55 ms | 16.90 ms |
 | Windows, the driver's own compiler | 7.21 ms | 12.59 ms | 27.32 ms |
-| Windows, [ACO's machine code](#windows) (the default) | 5.70 ms | 9.96 ms | 22.49 ms |
-| Windows, [ACO's machine code](#windows), [`CC_SILVER_AARDWOLD_INT4_MIXED`](#int4-mixed-optional) | about the same as Linux | about the same as Linux | about the same as Linux |
-
-Running the model below the output resolution about doubles the frame rate: the resolution setting (model
-resolution in the [wilsjo2 style](#wilsjo2-style), the network's resolution in the [RenoDX style](#renodx-style))
-on any route, or on the OptiScaler route NR placed before the upscaler, which runs the model on the game's
-render-resolution frame.
+| Windows, [ACO's machine code](#windows) (the default) | about the same as Linux | about the same as Linux | about the same as Linux |
+| Windows, [ACO's machine code](#windows), [`CC_SILVER_AARDWOLD_OPTIMIZED`](#cc_silver_aardwold_optimized-optional) | about the same as Linux | about the same as Linux | about the same as Linux |
 
 ## Supported games
 
@@ -251,33 +248,44 @@ look; it may be better or worse.
 The first time the preprocess is turned on, NR rebuilds; a second or two of frames go without NR.
 The file itself explains every setting.
 
+<a id="cc_silver_aardwold_optimized-optional"></a>
 <a id="int4-mixed-optional"></a>
 
-## CC_SILVER_AARDWOLD_INT4_MIXED (optional)
+## CC_SILVER_AARDWOLD_OPTIMIZED (optional)
 
-`CC_SILVER_AARDWOLD` with part of its computation in int4, faster (see Performance): int4 is a lower precision
-than the original network uses, so its picture differs somewhat from `CC_SILVER_AARDWOLD`'s. It exists for
-`CC_SILVER_AARDWOLD` only. Both Linux packages and the Windows package have it, and
-since 0.0.7 it is always installed as the network `CC_SILVER_AARDWOLD_INT4_MIXED`.
+`CC_SILVER_AARDWOLD` made faster by this project. Since 0.0.8.3 it replaces `CC_SILVER_AARDWOLD_INT4_MIXED`
+(a `dlssnr-amd.ini`, `--model` or `-Model` that still names that one gets `CC_SILVER_AARDWOLD_OPTIMIZED`); its picture
+is very close to `CC_SILVER_AARDWOLD`'s - much closer than int4 mixed's was - and it is faster. RX 9000 only; on Windows it runs as
+[ACO's machine code](#windows) only.
 
-On Windows it runs as [ACO's machine code](#windows) only, on RX 9000: the AMD driver's own
-compiler makes slow code for the int4 kernels, so when ACO's machine code cannot be used it is greyed out. It
-needs no layer or launch options on Windows. The rest of this section is about
-Linux; choosing it, the weights and their check work the same way on Windows (`-Model
-CC_SILVER_AARDWOLD_INT4_MIXED` in the Windows installer).
+How it is made faster, at every level:
+- the Swin blocks' MLPs (all but the first block) use ReLU, their weights fitted to the original network's outputs;
+- three window-attention layers of the decoder use one fixed attention table each (no QK^T, no softmax), and in
+  those and two more one-head decoder layers the V and output projections are merged into one matrix;
+- C=512 attention heads whose attention is the same for every input skip their Q/K work (the same result bit for bit).
 
-- It is one of the networks: choose it as the one a game starts with at install (`--model
-  CC_SILVER_AARDWOLD_INT4_MIXED`, or `--int4` as before), or switch to it in game (the drop-down in NR
-  Control or on the Add-ons page, or Ctrl+F11 to cycle the networks).
-- On the ReShade routes it needs a Vulkan layer in the game folder: besides the main Steam launch options the
-  installer always prints a second line with `VK_ADD_LAYER_PATH` and `VK_INSTANCE_LAYERS` for it; use that line to
-  use it, and copy the whole line. The OptiScaler route needs no layer since 0.0.8 (the NR plugin adds the device
-  extensions it needs).
-- The first time it is used its network takes longer to build; until then the picture goes without NR.
-- Its weights are made during installation from your model and the tables in the package, and checked
-  against a known SHA-256. The tables (`linux/data/int4/`) come from this project's own calibration on
-  1,112 game frames and darkened copies of some of them. int4 mixed is the network these tables define;
-  another calibration would give a different network.
+**Optimized layers** (under the network in NR Control and on the Add-ons page, `[Network] OptimizedLayers`) adds
+more on top. It changes only how the network computes, not the resolution, and every level's picture stays very close
+to `CC_SILVER_AARDWOLD`'s; switching in game builds the network again in the background.
+- Quality: only the optimizations above; every layer keeps `CC_SILVER_AARDWOLD`'s original precision (FP8 and higher).
+- Balanced: int4 on the C=256 Swin encoder's expansions (their input Hadamard-rotated), the C=512 attention's QKV
+  projections and part of the ViT's feed-forward layers.
+- Performance: also a fitted fixed attention table in the first full-resolution layers (the pre block and three of
+  the four encoder blocks before the first downsample).
+- Ultra Performance (the default, the fastest): also int4 on the C=256 encoder's QKV projections, the C=256 decoder's
+  expansions and more of the ViT's feed-forward layers.
+
+- It is chosen like the others: as the network a game starts with at install (`--model
+  CC_SILVER_AARDWOLD_OPTIMIZED`, or `--int4` as before), or in game (the drop-down in NR Control or on the Add-ons
+  page, or Ctrl+F11 to cycle the networks).
+- On the Linux ReShade routes the int4 layers need a Vulkan layer in the game folder: besides the main Steam launch
+  options the installer prints a second line with `VK_ADD_LAYER_PATH` and `VK_INSTANCE_LAYERS` for it; use that
+  line, and copy the whole line. Without it the network runs at Quality. The OptiScaler route needs no layer (the NR
+  plugin adds the device extensions they need), nor does Windows.
+- The first time a level is used the network takes longer to build; until then the picture goes without NR.
+- Its weights are made during installation from your `CC_SILVER_AARDWOLD` model and a difference file in the
+  package (each changed entry XOR the original, so it holds none of NVIDIA's weights), and checked against a known
+  SHA-256; the int4 layers' weights are made the same way from this project's own calibration tables in the package.
 
 <a id="cc_small_fp8_experimental-linux-optional"></a>
 
@@ -351,8 +359,8 @@ model, so with it both models are extracted and installed; 310.8.0 gives `CC_SIL
 
 | File | Model |
 | --- | --- |
-| `dlssnr-amd/dlssnr-small.bin` | `CC_SMALL_FP8` (310.9.16's default, faster); the default |
-| `dlssnr-amd/dlssnr.bin` | `CC_SILVER_AARDWOLD` (the model of 310.8.0; 310.9.16 has it too) |
+| `dlssnr-amd/CC_SMALL_FP8.bin` | `CC_SMALL_FP8` (310.9.16's default, faster); the default |
+| `dlssnr-amd/CC_SILVER_AARDWOLD.bin` | `CC_SILVER_AARDWOLD` (the model of 310.8.0; 310.9.16 has it too) |
 
 - Input: the DLL itself, or a zip that contains exactly one `nvngx_dlssnr.dll` (it may be in a
   subfolder).
@@ -366,7 +374,7 @@ model, so with it both models are extracted and installed; 310.8.0 gives `CC_SIL
   package. With a new package, use `--dll` once more or copy those files over.
 - Every model the package has is installed. Which network runs is `[Network] Model` in `dlssnr-amd.ini`:
   `CC_SMALL_FP8`, `CC_SMALL_FP8_EXPERIMENTAL`, `CC_SILVER_AARDWOLD` or
-  `CC_SILVER_AARDWOLD_INT4_MIXED`, set at install (`--model` on Linux, `-Model` on Windows, or the installer's
+  `CC_SILVER_AARDWOLD_OPTIMIZED`, set at install (`--model` on Linux, `-Model` on Windows, or the installer's
   question) and switchable in game; a network without its model (`CC_SMALL_FP8` from a 310.8.0 DLL) is greyed
   out in the menus with the reason.
 
@@ -380,8 +388,8 @@ bash install.sh "<game folder>" --dll nvngx_dlssnr_2026_10_16.zip
 bash model-tools/extract_model.sh nvngx_dlssnr_2026_10_16.zip <folder>
 ```
 
-On success it prints `599 entries, 140.9 MiB` for `dlssnr.bin` (147,756,560 bytes) and
-`255 entries, 108.6 MiB` for `dlssnr-small.bin` (113,917,248 bytes). Put the files in
+On success it prints `599 entries, 140.9 MiB` for `CC_SILVER_AARDWOLD.bin` (147,756,560 bytes) and
+`255 entries, 108.6 MiB` for `CC_SMALL_FP8.bin` (113,917,248 bytes). Put the files in
 `<game folder>/dlssnr-amd/`, or pass them to a package build with `NR_MODEL=` and `NR_MODEL_SMALL=`.
 
 On Windows, `install.bat` extracts the model by itself; to run the tool on its own:
@@ -390,8 +398,8 @@ On Windows, `install.bat` extracts the model by itself; to run the tool on its o
 model-tools\dlssnr_extract_model.exe nvngx_dlssnr.dll <folder>
 ```
 
-It takes the DLL itself (unpack it from the zip first) and writes `dlssnr.bin`, and from 310.9.16 also
-`dlssnr-small.bin`, into the folder.
+It takes the DLL itself (unpack it from the zip first) and writes `CC_SILVER_AARDWOLD.bin`, and from 310.9.16 also
+`CC_SMALL_FP8.bin`, into the folder.
 
 <a id="windows-experimental-preview"></a>
 
@@ -410,7 +418,7 @@ ACO compiler (the Linux driver's compiler), and the AMD driver loads that code i
 it runs faster than the AMD driver's own compile (see Performance). Since 0.0.8.1 this is not a setting: it is
 always tried first. When the driver cannot take it, NR Control and `dlssnr-amd.log` say why, and an RX 9000 runs
 the network compiled by the AMD driver instead (without `CC_SMALL_FP8_EXPERIMENTAL` and
-[`CC_SILVER_AARDWOLD_INT4_MIXED`](#int4-mixed-optional)); RX 7000 and Radeon 700M / 800M / 8000S graphics have no
+[`CC_SILVER_AARDWOLD_OPTIMIZED`](#cc_silver_aardwold_optimized-optional)); RX 7000 and Radeon 700M / 800M / 8000S graphics have no
 NR then. The imported machine code is kept in `dlssnr-amd\aco-cache` in the game's folder, so later starts are
 quicker.
 
@@ -455,8 +463,8 @@ NR_ARCH=i686   bash linux/build/build_package.sh
 ```
 
 The packages land in `linux/package/`. They contain no model; `install.sh --dll` extracts it. To put
-models you extracted yourself into a package for your own use, set `NR_MODEL=/path/to/dlssnr.bin` (and
-`NR_MODEL_SMALL=/path/to/dlssnr-small.bin` for `CC_SMALL_FP8`).
+models you extracted yourself into a package for your own use, set `NR_MODEL=/path/to/CC_SILVER_AARDWOLD.bin` (and
+`NR_MODEL_SMALL=/path/to/CC_SMALL_FP8.bin` for `CC_SMALL_FP8`).
 Do not share packages that contain the model.
 
 ### Windows package
@@ -467,8 +475,8 @@ bash windows/build/build_package.sh
 ```
 
 The result is `windows/package/DLSSNR-AMD-Vulkan-Windows-*-preview-x86_64.zip`; on Windows, run `install.bat` from it.
-It contains no model; the installer extracts it on the first install. `NR_MODEL=/path/to/dlssnr.bin`
-(and `NR_MODEL_SMALL=/path/to/dlssnr-small.bin` for `CC_SMALL_FP8`) puts them into the package
+It contains no model; the installer extracts it on the first install. `NR_MODEL=/path/to/CC_SILVER_AARDWOLD.bin`
+(and `NR_MODEL_SMALL=/path/to/CC_SMALL_FP8.bin` for `CC_SMALL_FP8`) puts them into the package
 for your own use. Do not share packages that contain the model.
 
 ## Licence

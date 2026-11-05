@@ -36,4 +36,8 @@ void forget_device(uint64_t device);
 // Device-local bytes now, by owner (the network, nr::NetworkChoice; the last: none) and kind.
 static constexpr int kOwners = nr::kNetworkChoices + 1;
 void totals(uint64_t out[kOwners][kKinds]);
+// Device-local bytes now of the allocations network build `build` made (BuildScope), by kind: what the build took on
+// this GPU, whatever its driver and network path (RDNA3's FP16 twins included). All 0 when our allocations are not
+// wrapped (install_vulkan not called in this process).
+void build_totals(uint32_t build, uint64_t out[kKinds]);
 }  // namespace nr::vram

@@ -722,12 +722,22 @@ struct FgState {
     std::atomic<uint64_t> offered_ms{0};
     bool hooked_ffx[3] = {}, hooked_xefg = false, hooked_sl = false;
     uint64_t looked = 0;
+    std::atomic<uint64_t> dlssg_ms{0};   // the last DLSS-G evaluate (through NGX) the Present layers ran at
 } gf;
 
 // A hand-over of `r` (in `state`; `list`: the game's command list it was made on, null none) by `source`.
 void fg_note(void* caller, ID3D12Resource* r, D3D12_RESOURCE_STATES state, ID3D12GraphicsCommandList* list, bool until_present,
              bool substitute, const char* source) {
     if (!r || t_own) return;
+    // While the Present layers run at DLSS-G's evaluate (DLSS-G through NGX) the HUD-less frame frame generation reads
+    // is the one that evaluate hands over (Streamline's copy, fg_note_dlssg): the game's own hand-overs (its Streamline
+    // tag) are not taken. Made on the game's threads, one could land between that evaluate's hand-over and the layers,
+    // which then wrote NR's change into the game's next HUD-less frame instead: one generated frame without NR, the
+    // next with it twice.
+    if (caller) {
+        const uint64_t d = gf.dlssg_ms.load();
+        if (d && GetTickCount64() - d < 1000) return;
+    }
     // OptiScaler's own frame generation's (its lists, its threads): not taken (caller null: NGX's DLSS-G evaluate, the game's)
     if (caller && g_game_caller && !g_game_caller(caller)) {
         static std::atomic<int> told{0};
@@ -741,7 +751,11 @@ void fg_note(void* caller, ID3D12Resource* r, D3D12_RESOURCE_STATES state, ID3D1
         return;
     }
     std::lock_guard<std::mutex> lk(gf.m);
-    if (gf.in_present.load()) { gf.refused = std::string(source) + "'s is handed over during the Present (OptiScaler's own frame generation): the capture serves it"; return; }
+    // During a Present the hand-overs are OptiScaler's own frame generation's - but not DLSS-G's own (caller null: its
+    // evaluate through NGX). The count is the process's: Streamline's presenting thread sits in its Present most of the
+    // time while DLSS-G evaluates on another, and most of its HUD-less frames went without NR's change (the generated
+    // frames weaker than the real ones: the picture flickered).
+    if (caller && gf.in_present.load()) { gf.refused = std::string(source) + "'s is handed over during the Present (OptiScaler's own frame generation): the capture serves it"; return; }
     const D3D12_RESOURCE_DESC d = r->GetDesc();
     ID3D12Device* rd = nullptr, *cd = nullptr;
     if (gf.copy) { r->GetDevice(IID_PPV_ARGS(&rd)); gf.copy->GetDevice(IID_PPV_ARGS(&cd)); }
@@ -903,6 +917,7 @@ PresentCall::~PresentCall() { --gf.in_present; }
 void fg_note_dlssg(ID3D12GraphicsCommandList* list, ID3D12Resource* hudless, bool layers_here) {
     // layers_here: the Present layers run in this evaluate, on its list, before frame generation reads the frame - it is
     // read (and may be substituted) as one valid until the present
+    if (layers_here) gf.dlssg_ms.store(GetTickCount64());
     if (hudless && list)
         fg_note(nullptr, hudless, D3D12_RESOURCE_STATE_COPY_DEST, list, layers_here, layers_here, "DLSS frame generation (NGX)");
 }

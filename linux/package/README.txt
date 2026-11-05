@@ -30,6 +30,9 @@ the routes; you can also name one after the folder:
     reshade-feeder-vulkan  Vulkan games, or D3D9 games (under Proton, DXVK turns D3D9 into Vulkan).
     reshade-feeder-dx9     as reshade-feeder-vulkan, plus the depth direction for old D3D9 games.
     remove                 uninstall.
+    logs                   when something goes wrong: packs the logs, the settings and a description of the
+                           system into ~/dlssnr-amd-logs-<date>-<time>.tar.gz to attach to a bug report.
+                           In game, NR Control's Diagnostics has "Save a diagnostic package" for the same.
 
 The earlier route names reshade, vulkan and dx9 are now reshade-feeder, reshade-feeder-vulkan and
 reshade-feeder-dx9.
@@ -43,25 +46,34 @@ Control itself).
 
 Use the i686 package for 32-bit games and the x86_64 package for 64-bit games.
 
-Networks: all four are installed, named as in NVIDIA's DLL (CC_SMALL_FP8_EXPERIMENTAL is this project's):
+Networks: all four are installed, named as in NVIDIA's DLL (CC_SMALL_FP8_EXPERIMENTAL and
+CC_SILVER_AARDWOLD_OPTIMIZED are this project's):
     CC_SMALL_FP8                   the default network of 310.9.16 (default)
     CC_SMALL_FP8_EXPERIMENTAL      experimental: CC_SMALL_FP8 made faster
     CC_SILVER_AARDWOLD             the network of 310.8.0 (also preset 1 of 310.9.16)
-    CC_SILVER_AARDWOLD_INT4_MIXED  CC_SILVER_AARDWOLD with part of the work in int4 and other lower
-                                   precisions; faster, the picture differs somewhat
+    CC_SILVER_AARDWOLD_OPTIMIZED   CC_SILVER_AARDWOLD made faster (RX 9000), its picture very close to it
 The installer asks once which one a game starts with (Enter = CC_SMALL_FP8; not asked when not run in
 a terminal), or give --model <name> (the earlier --new-model, --old-model and --int4 still work;
 --no-int4 is no longer needed). This only sets [Network] Model in dlssnr-amd.ini; the network can be
 switched in game at any time: the drop-down in NR Control (End) or on the Add-ons page, or Ctrl+F11 to
 cycle. The new network is prepared in the background, and the current one keeps running until it is
 ready. A network that cannot run is greyed out in the drop-down with the reason.
-CC_SILVER_AARDWOLD_INT4_MIXED needs a Vulkan layer on the reshade-feeder routes: besides the main
-launch line the installer always prints a second one with that layer (VK_ADD_LAYER_PATH and
-VK_INSTANCE_LAYERS added); use that line to use it, and copy the whole line. When games start with it,
-the main line is that one. The optiscaler route needs no layer (the NR plugin adds the device
-extensions it needs). Its weights are made at install; if that fails the other networks are installed
-and it is greyed out in the menus. The first time it is used its network takes longer to build, and
-until then the picture goes without NR.
+CC_SILVER_AARDWOLD_OPTIMIZED replaces CC_SILVER_AARDWOLD_INT4_MIXED of earlier versions (a
+dlssnr-amd.ini that names that one gets CC_SILVER_AARDWOLD_OPTIMIZED). Optimized layers (in NR
+Control under the network, [Network] OptimizedLayers) sets how many of its layers run in a faster form;
+it changes only how the network computes, not the resolution, and every level's picture stays very
+close to CC_SILVER_AARDWOLD's. Quality: none of them in int4, a little slower. Balanced: some of them
+in int4. Performance: also fixed attention on the first full-resolution layers. Ultra Performance
+(default): also more int4 layers, the fastest. Its weights are made at install (from
+CC_SILVER_AARDWOLD's model); if that fails the other networks are installed and it is greyed out in
+the menus.
+Balanced, Performance and Ultra Performance (the levels with int4 layers) need a Vulkan layer on the
+reshade-feeder routes: besides the main launch line the installer prints a second one with that layer
+(VK_ADD_LAYER_PATH and VK_INSTANCE_LAYERS added); use that line for them, and copy the whole line.
+When games start with CC_SILVER_AARDWOLD_OPTIMIZED, the main line is that one. Without the layer it
+runs at Quality. The optiscaler route needs no layer (the NR plugin adds the device extensions they
+need). The first time a level is used the network takes longer to build, and until then the picture
+goes without NR.
 CC_SMALL_FP8_EXPERIMENTAL's weights are made at install too (from CC_SMALL_FP8's model), so it also
 needs the 310.9.16 nvngx_dlssnr.dll; without it, it is greyed out in the menus.
 
@@ -84,10 +96,10 @@ The model
 The weights are NVIDIA's and are not distributed with this project. They are extracted from your
 own copy of nvngx_dlssnr.dll, version 310.9.16 or 310.8.0:
 
-    dlssnr-amd/dlssnr-small.bin  CC_SMALL_FP8 (the default network of 310.9.16), also the source of
-                                 CC_SMALL_FP8_EXPERIMENTAL
-    dlssnr-amd/dlssnr.bin        CC_SILVER_AARDWOLD (the network of 310.8.0; 310.9.16 has it too), also
-                                 the source of CC_SILVER_AARDWOLD_INT4_MIXED
+    dlssnr-amd/CC_SMALL_FP8.bin        CC_SMALL_FP8 (the default network of 310.9.16), also the source
+                                       of CC_SMALL_FP8_EXPERIMENTAL
+    dlssnr-amd/CC_SILVER_AARDWOLD.bin  CC_SILVER_AARDWOLD (the network of 310.8.0; 310.9.16 has it too),
+                                       also the source of CC_SILVER_AARDWOLD_OPTIMIZED
 
 - use 310.9.16 when you can: it already contains the 310.8.0 network, so with it both models are
   extracted and installed; 310.8.0 gives CC_SILVER_AARDWOLD only (CC_SMALL_FP8 and
@@ -99,7 +111,7 @@ own copy of nvngx_dlssnr.dll, version 310.9.16 or 310.8.0:
   hashes, and a model file is written only if all of them match. This takes about 40 seconds for
   310.9.16 and 20 seconds for 310.8.0.
 
-The result is dlssnr-amd/dlssnr-small.bin (113,917,248 bytes) and dlssnr-amd/dlssnr.bin
+The result is dlssnr-amd/CC_SMALL_FP8.bin (113,917,248 bytes) and dlssnr-amd/CC_SILVER_AARDWOLD.bin
 (147,756,560 bytes) in the game folder.
 
 This is needed only once: the extracted models are also kept in this package's dlssnr-amd/,
@@ -110,8 +122,8 @@ To make the model files without installing anything (into an existing folder):
 
     bash model-tools/extract_model.sh /path/to/nvngx_dlssnr_2026_10_16.zip <folder>
 
-It prints "599 entries, 140.9 MiB" for dlssnr.bin and "255 entries, 108.6 MiB" for
-dlssnr-small.bin when it succeeds. The files can then be copied to <game folder>/dlssnr-amd/ by hand.
+It prints "599 entries, 140.9 MiB" for CC_SILVER_AARDWOLD.bin and "255 entries, 108.6 MiB" for
+CC_SMALL_FP8.bin when it succeeds. The files can then be copied to <game folder>/dlssnr-amd/ by hand.
 
 After installation the game folder has
 --------------------------------------
@@ -257,10 +269,16 @@ Network model and options):
     motion vector, depth not used, as NVIDIA's DLL does; 0 = with depth, the motion vector of whichever
     of the pixel and its four diagonal neighbours is nearest the camera. Only the edges of moving
     objects change; applied after a game restart.
+  - OptimizedLayers (default 3): CC_SILVER_AARDWOLD_OPTIMIZED's level, 0 = Quality, 1 = Balanced,
+    2 = Performance, 3 = Ultra Performance (see the networks above).
+  - History Precision (default 16): the images NR keeps its previous result in. 16 = 16-bit, as
+    NVIDIA's DLL keeps it, half the memory; 32 = 32-bit, as up to 0.0.8.1. With several passes the two
+    can differ in fine detail. Applied at once (the previous result starts afresh).
   - Hotkey, Sound: the hotkey that cycles the networks (default Ctrl+F11) and its sound.
-  - Memory Guard (default 1): a network is built only while the video memory it needs is free. 0 = no
-    such check: NR builds in whatever video memory is left (a game left short of video memory may
-    stutter or fail to load its own data). Applied at once.
+  - Memory Guard (default 0): 1 = a network is built only while the video memory it needs is free
+    (measured on your GPU when the network is first built).
+    0 = no such check: NR builds in whatever video memory is left (a game left short of video memory
+    may stutter or fail to load its own data). Applied at once.
   - [Log]: whether dlssnr-amd.log is written and whether it is cleared at every start; applied after a
     game restart.
 Dynamic resolution: with NR before the upscaler and a render size that keeps changing, every new

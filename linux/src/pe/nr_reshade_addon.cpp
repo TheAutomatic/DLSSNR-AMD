@@ -3425,7 +3425,7 @@ void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
 // chain and the selected layer's page, then the keys for every layer. Every change is written into dlssnr-amd.ini in
 // place (nr_ini_edit.hpp: comments and the other sections stay) and the frames take it from the file (settings(), the
 // session's network switch), as on the .asi route.
-const char* network_name(int n) { return n >= 0 ? nr::network_codename(n) : "?"; }
+const char* network_name(int n) { return n >= 0 ? nr::control_ui::net_name(n) : "?"; }
 
 // The build's progress as a fraction and a phrase (nr::g_build_stage).
 float build_fraction(const nr::pe::Session::State& st, char* text, size_t n) { return nr::pe::build_progress(st, text, n); }
@@ -3862,6 +3862,18 @@ void draw_page() {
                                      "Copied to the clipboard and saved as dlssnr-amd\\nr-report.txt next to the game. Nothing "
                                      "is sent anywhere.");
                 if (!report_said.empty()) { ImGui::SameLine(); ImGui::TextDisabled("%s", tr(report_said.c_str())); }
+                nr::control_ui::draw_diag_package([&] {
+                    nr::pe::diag::Request r;
+                    r.game = nr::u8::path(nr::pe::module_folder());
+                    r.log = nr::u8::path(nr::pe::log_path());
+                    r.report = nr::control_ui::report_text(&view, "dlssnr_amd.addon", config_path, nr::pe::log_path());
+                    r.gpu = nr::pe::vkdevice::gpu_name();
+                    r.driver = nr::pe::vkdevice::driver_name();
+                    r.request_shot = [] { nr::pe::screenshot::request(); };
+                    return r;
+                });
+                ImGui::Separator();
+                nr::control_ui::draw_session_stats();
             }
             nr::control_ui::draw_log(*page_ini);
             page_trace("Diagnostics");

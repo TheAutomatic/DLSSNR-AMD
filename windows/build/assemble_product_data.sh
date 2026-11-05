@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Lay out dlssnr-amd/, the folder the installed DLLs load everything from:
 #
-#   dlssnr-amd/dlssnr.bin             the old model's weights (only with --model)
-#   dlssnr-amd/dlssnr-small.bin       the new model's weights (only with --small-model)
+#   dlssnr-amd/CC_SILVER_AARDWOLD.bin             the old model's weights (only with --model)
+#   dlssnr-amd/CC_SMALL_FP8.bin       the new model's weights (only with --small-model)
 #   dlssnr-amd/shaders/               the network (windows/build/arch/rdna4.sh)
 #   dlssnr-amd/shaders/runtime/       the passes around it
 #   dlssnr-amd/shaders/temporal/      the temporal variants and motion estimator
@@ -11,11 +11,11 @@
 #   dlssnr-amd/lang/                  the menus' texts: English.txt from the code (windows/build/make_lang.py) and
 #                                     README.txt, how to make another language
 #
-#   assemble_product_data.sh <parent dir> [--model dlssnr.bin [--small-model dlssnr-small.bin]]
+#   assemble_product_data.sh <parent dir> [--model CC_SILVER_AARDWOLD.bin [--small-model CC_SMALL_FP8.bin]]
 set -euo pipefail
 start=$PWD
 cd -- "$(dirname -- "$0")/../.."
-parent=${1:?usage: assemble_product_data.sh <parent dir> [--model dlssnr.bin [--small-model dlssnr-small.bin]]}
+parent=${1:?usage: assemble_product_data.sh <parent dir> [--model CC_SILVER_AARDWOLD.bin [--small-model CC_SMALL_FP8.bin]]}
 source windows/build/arch/rdna4.sh
 dst="$parent/dlssnr-amd"
 rm -rf -- "$dst"; mkdir -p -- "$dst/shaders/runtime" "$dst/shaders/temporal"
@@ -42,17 +42,17 @@ python3 windows/build/make_lang.py "$dst/lang/English.txt" windows/src/pe/nr_pe_
     windows/src/pe/nr_reshade_addon.cpp windows/src/pe/nr_pe_bridge.cpp windows/src/pe/nr_pe_d3d12split.cpp > /dev/null
 cp -- windows/package/lang/README.txt "$dst/lang/README.txt"
 
-# The weights are NVIDIA's and are never part of this repository: --model takes a dlssnr.bin made
+# The weights are NVIDIA's and are never part of this repository: --model takes a CC_SILVER_AARDWOLD.bin made
 # from your own nvngx_dlssnr.dll by linux/package/model-tools/extract_model.sh, --small-model a
-# dlssnr-small.bin made the same way from the 310.9.16 DLL.
+# CC_SMALL_FP8.bin made the same way from the 310.9.16 DLL.
 if [[ "${2:-}" == --model ]]; then
-    model=$(cd -- "$start" && realpath -- "${3:?--model needs a dlssnr.bin}")
+    model=$(cd -- "$start" && realpath -- "${3:?--model needs a CC_SILVER_AARDWOLD.bin}")
     [[ -f "$model" ]] || { echo "no model file: $model" >&2; exit 1; }
     cp -- "$model" "$dst/$NR_MODEL_NAME"
     if [[ "${4:-}" == --small-model ]]; then
-        small=$(cd -- "$start" && realpath -- "${5:?--small-model needs a dlssnr-small.bin}")
+        small=$(cd -- "$start" && realpath -- "${5:?--small-model needs a CC_SMALL_FP8.bin}")
         [[ -f "$small" ]] || { echo "no model file: $small" >&2; exit 1; }
-        cp -- "$small" "$dst/dlssnr-small.bin"
+        cp -- "$small" "$dst/CC_SMALL_FP8.bin"
     fi
 fi
 echo "$dst: $(find "$dst/shaders" -name '*.spv' | wc -l) shaders$([[ -f "$dst/$NR_MODEL_NAME" ]] && echo ", model included")"

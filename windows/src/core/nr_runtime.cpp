@@ -664,9 +664,11 @@ struct Runtime::Impl {
     // for *_SRGB) and a plain copy fills it; see the graph's --tex-in-format.
     bool direct_in{};
 #if NR_INT4
-    bool int4_mixed{};   // the int4 mixed network (Runtime::int4_mixed)
+    bool int4{};   // CC_SILVER_AARDWOLD_OPTIMIZED's int4 layers (Runtime::int4)
+    int layers{};  // and its level (Runtime::layers)
 #endif
     bool experimental{};   // CC_SMALL_FP8_EXPERIMENTAL (Runtime::experimental)
+    bool optimized{};   // CC_SILVER_AARDWOLD_OPTIMIZED (Runtime::optimized)
     // The post block stores into an image in the frame's (UNORM) format and the
     // write-back is a copy; see the graph's --out0-format.
     bool direct_out{};
@@ -1229,15 +1231,15 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     const uint32_t mw = config.width, mh = config.height;
     impl_->mw = mw; impl_->mh = mh;
     // The model: the caller's choice over DLSSNR_MODEL over dlssnr-amd.ini [Network] Model; none of them: the
-    // small model. Its weights (dlssnr-small.bin, made by install.ps1 from the 310.9 DLL) are only in an installed
+    // small model. Its weights (CC_SMALL_FP8.bin, made by install.ps1 from the 310.9 DLL) are only in an installed
     // tree; missing: the original model, and the log says why.
     NetworkModel network = NetworkModel::Small;
-    bool experimental = false;
-    const std::filesystem::path xroot = data / "experimental";
+    bool experimental = false, optimized = false;
+    const std::filesystem::path xroot = data / "experimental", oroot = data / "optimized";
     {
         std::string env;
 #ifdef _WIN32
-        { char b[16] = {}; const unsigned long n = GetEnvironmentVariableA("DLSSNR_MODEL", b, sizeof b); if (n && n < sizeof b) env = b; }
+        { char b[64] = {}; const unsigned long n = GetEnvironmentVariableA("DLSSNR_MODEL", b, sizeof b); if (n && n < sizeof b) env = b; }
 #endif
         if (env.empty()) if (const char* e = std::getenv("DLSSNR_MODEL")) env = e;
         const int ev = env.empty() ? -1 : nr::network_value(env);
@@ -1247,7 +1249,7 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         const int v = config.network >= 0 ? config.network : ev >= 0 ? ev : iv;
         if (v == 0) network = NetworkModel::Original;
         std::error_code ec;
-        // CC_SMALL_FP8_EXPERIMENTAL: the small model with its own weights (dlssnr-small-experimental.bin, made by
+        // CC_SMALL_FP8_EXPERIMENTAL: the small model with its own weights (CC_SMALL_FP8_EXPERIMENTAL.bin, made by
         // install.ps1 from the small model) and shaders (experimental/shaders: the Linux network's, run as ACO's machine
         // code - ACO Mode only, as int4 mixed); anything missing: the small model.
         if (v == 2) {
@@ -1255,8 +1257,8 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
                 : aco.empty() ? "it needs ACO Mode (a driver with pipeline binaries)"
                 : !std::filesystem::is_regular_file(xroot / "shaders" / "fixed-attention.txt", ec) ||
                           !std::filesystem::is_directory(xroot / "shaders" / "temporal", ec) ? "dlssnr-amd/experimental/ is incomplete"
-                : !std::filesystem::is_regular_file(data / "dlssnr-small-experimental.bin", ec)
-                          ? "dlssnr-amd/dlssnr-small-experimental.bin is missing (run install.ps1 with the 310.9.16 nvngx_dlssnr.dll)"
+                : !std::filesystem::is_regular_file(data / "CC_SMALL_FP8_EXPERIMENTAL.bin", ec)
+                          ? "dlssnr-amd/CC_SMALL_FP8_EXPERIMENTAL.bin is missing (run install.ps1 with the 310.9.16 nvngx_dlssnr.dll)"
                 : nullptr;
             if (missing) {
                 nr::logf("[nr] CC_SMALL_FP8_EXPERIMENTAL (%s) but %s: CC_SMALL_FP8", from, missing);
@@ -1265,9 +1267,28 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
                 experimental = true;
             }
         }
+        // CC_SILVER_AARDWOLD_OPTIMIZED: the 310.8 model with its own weights (CC_SILVER_AARDWOLD_OPTIMIZED.bin, made by install.ps1
+        // from CC_SILVER_AARDWOLD.bin) and shaders (optimized/shaders: the Linux network's, run as ACO's machine code - ACO Mode
+        // only; with its int4 layers int4/, below); anything missing: the 310.8 model as it is.
+        if (v == 3) {
+            network = NetworkModel::Original;
+            const char* missing = !installed ? "not an installed tree"
+                : aco.empty() ? "it needs ACO Mode (a driver with pipeline binaries)"
+                : !std::filesystem::is_regular_file(oroot / "shaders" / "fixed-attention.txt", ec) ||
+                          !std::filesystem::is_directory(oroot / "shaders" / "temporal", ec) ? "dlssnr-amd/optimized/ is incomplete"
+                : !std::filesystem::is_regular_file(data / "CC_SILVER_AARDWOLD_OPTIMIZED.bin", ec)
+                          ? "dlssnr-amd/CC_SILVER_AARDWOLD_OPTIMIZED.bin is missing (run install.ps1 again)"
+                : nullptr;
+            if (missing) {
+                nr::logf("[nr] CC_SILVER_AARDWOLD_OPTIMIZED (%s) but %s: CC_SILVER_AARDWOLD", from, missing);
+                impl_->network_note = missing;
+            } else {
+                optimized = true;
+            }
+        }
         const char* missing = network != NetworkModel::Small || experimental ? nullptr
             : !installed ? "not an installed tree"
-            : !std::filesystem::is_regular_file(data / "dlssnr-small.bin", ec) ? "dlssnr-amd/dlssnr-small.bin is missing (run install.ps1 with the 310.9.16 nvngx_dlssnr.dll)"
+            : !std::filesystem::is_regular_file(data / "CC_SMALL_FP8.bin", ec) ? "dlssnr-amd/CC_SMALL_FP8.bin is missing (run install.ps1 with the 310.9.16 nvngx_dlssnr.dll)"
             : nullptr;
         if (missing) {
             nr::logf("[nr] small model (%s) but %s: original model", from, missing);
@@ -1275,12 +1296,13 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
             network = NetworkModel::Original;
         } else {
             nr::logf("[nr] %s model (%s)", network == NetworkModel::Small ? experimental ? "small experimental" : "small"
-                                                                         : "original", from);
+                                                                         : optimized ? "original optimized" : "original", from);
         }
         if (network != NetworkModel::Small) experimental = false;
     }
     impl_->network = network;
     impl_->experimental = experimental;
+    impl_->optimized = optimized;
     impl_->post_blend_scale = network == NetworkModel::Small ? kPostBlendScaleSmall : kPostBlendScale;
     // [Network] Motion Without Depth = 1, the default: the pre block reads each pixel's own motion vector, as NVIDIA's
     // DLLs (310.8, 310.9) do - their host never binds the depth, so the kernel's nearest-of-five depth pick never runs
@@ -1367,38 +1389,48 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     }
     s.ctx.require_matrix_config();
 #if NR_INT4
-    // int4_mixed ([Int4Mixed] in dlssnr-amd.ini; DLSSNR_INT4 wins over the ini, the caller's choice - the in-game
-    // switch - over both). Installed, it needs dlssnr-amd/int4/ (shaders, quantisers, settings.txt), the weights the
-    // installer made (dlssnr-amd/dlssnr-int4.bin) and ACO Mode enabled on a device supporting VK_KHR_pipeline_binary;
-    // anything missing: the default network, and the log says why.
+    // CC_SILVER_AARDWOLD_OPTIMIZED's level of optimized layers (the caller's choice - the in-game switch - over
+    // DLSSNR_INT4 over dlssnr-amd.ini [Network] OptimizedLayers; none of them: Ultra Performance). Balanced, Performance and Ultra
+    // Performance run int4 layers; installed, they need their data directory (int4/, int4-performance/, int4-ultra/:
+    // shaders, quantisers, settings.txt), the int4 weights the installer made (CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin, one file for the three:
+    // their int4 layers' FP8 weights are the same; Ultra Performance's tables cover the others'), Performance and Ultra
+    // Performance their own FP8 weights for some layers (the "performance/" entries of the optimized pack) and ACO Mode
+    // enabled on a device supporting VK_KHR_pipeline_binary; anything missing: Quality, and the log says why.
     bool int4 = false;
     std::string int4_env;
 #ifdef _WIN32
     { char b[16] = {}; const unsigned long n = GetEnvironmentVariableA("DLSSNR_INT4", b, sizeof b); if (n && n < sizeof b) int4_env = b; }
 #endif
     if (int4_env.empty()) if (const char* e = std::getenv("DLSSNR_INT4")) int4_env = e;
-    if (config.int4_mixed >= 0) int4_env = config.int4_mixed ? "1" : "0";
-    const char* int4_from = config.int4_mixed >= 0 ? "switch" : int4_env.empty() ? "dlssnr-amd.ini" : "DLSSNR_INT4";
-    if (int4_env.empty()) {
-        // no Enabled: on (nr_ini_int4.hpp) - but only an installed tree has int4 data; a development tree stays off
-        const int iv = nr::ini_int4((data.parent_path() / "dlssnr-amd.ini").string()).enabled;
-        int4_env = iv == 0 ? "0" : iv == 1 || installed ? "1" : "";
+    const char* int4_from = config.layers >= 0 ? "switch" : int4_env.empty() ? "dlssnr-amd.ini" : "DLSSNR_INT4";
+    int level = config.layers >= 0 ? config.layers : nr::optimized_layers_value(int4_env);
+    if (config.layers < 0 && int4_env.empty()) {
+        // no OptimizedLayers: Ultra Performance (nr_ini_int4.hpp) - but only an installed tree has int4 data; a development
+        // tree stays at Quality
+        const int iv = nr::ini_optimized_layers((data.parent_path() / "dlssnr-amd.ini").string());
+        level = iv >= 0 ? iv : installed ? nr::kLayersDefault : nr::kLayersQuality;
     }
-    // What the build reads for int4 (nr_build_cfg.hpp): installed, only this map - empty for the default network, so
+    if (level < 0) level = nr::kLayersQuality;   // DLSSNR_INT4 neither a level nor a level's word
+    // What the build reads for int4 (nr_build_cfg.hpp): installed, only this map - empty without int4 layers, so
     // nothing in the environment reaches it; a development tree keeps reading the environment.
     std::map<std::string, std::string> int4_cfg;
-    const std::filesystem::path i4root = data / "int4";
-    if (int4_env == "1") {
+    const std::filesystem::path i4root = data / (level == nr::kLayersPerformance ? "int4-performance"
+                                                 : level == nr::kLayersUltra ? "int4-ultra" : "int4");
+    const std::filesystem::path i4weights = data / "CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin";
+    if (level >= nr::kLayersBalanced && (optimized || !installed)) {
         std::error_code ec;
-        const char* missing = network == NetworkModel::Small ? "the small model has no int4 network"
+        const std::string incomplete = "dlssnr-amd/" + i4root.filename().string() + "/ is incomplete";
+        const std::string no_weights = "dlssnr-amd/" + i4weights.filename().string() + " is missing (run install.ps1 again)";
+        const char* missing = network == NetworkModel::Small ? "the small model has no int4 layers"
             : !installed ? "not an installed tree"
             : !std::filesystem::is_directory(i4root / "shaders" / "temporal", ec) || !std::filesystem::is_directory(i4root / "vit", ec) ||
-                      !std::filesystem::is_regular_file(i4root / "settings.txt", ec) ? "dlssnr-amd/int4/ is incomplete"
-            : !std::filesystem::is_regular_file(data / "dlssnr-int4.bin", ec) ? "dlssnr-amd/dlssnr-int4.bin is missing (run install.ps1 again)"
+                      !std::filesystem::is_regular_file(i4root / "settings.txt", ec) ? incomplete.c_str()
+            : !std::filesystem::is_regular_file(i4weights, ec) ? no_weights.c_str()
             : nr::binary::directory().empty() || !nr::binary::enabled(host.device) ? "ACO Mode is off or pipeline binaries are unavailable"
             : nullptr;
         if (missing) {
-            nr::logf("[nr] int4_mixed requested (%s) but %s: default network", int4_from, missing);
+            nr::logf("[nr] optimized layers %s requested (%s) but %s: CC_SILVER_AARDWOLD_OPTIMIZED at quality",
+                     nr::layers_word(level), int4_from, missing);
             impl_->network_note = missing;
         } else {
             if (!std::filesystem::is_directory(std::filesystem::path(aco) / "int4/records", ec))
@@ -1406,16 +1438,17 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
             int4 = true;
             int4_cfg["NR_I4_DIR"] = (i4root / "vit").string();
             if (std::filesystem::is_directory(i4root / "swin", ec)) int4_cfg["NR_SWI4_DIR"] = (i4root / "swin").string();
-            int4_cfg["NR_I4_WEIGHTS"] = (data / "dlssnr-int4.bin").string();
+            int4_cfg["NR_I4_WEIGHTS"] = i4weights.string();
             // the rewritten pipeline binaries (nrvk.hpp create_iu4), keyed by driver like pipeline.cache
             std::filesystem::create_directories(i4root / "pipeline-binaries", ec);
             if (!ec) int4_cfg["NR_I4_CACHE"] = (i4root / "pipeline-binaries").string();
             const auto t = slurp((i4root / "settings.txt").string());
             nr::int4_settings(std::string(t.begin(), t.end()), int4_cfg);
-            nr::logf("[nr] int4_mixed network (%s)", int4_from);
+            nr::logf("[nr] CC_SILVER_AARDWOLD_OPTIMIZED (layers: %s) (%s)", nr::layers_word(level), int4_from);
         }
     }
-    impl_->int4_mixed = int4;
+    impl_->int4 = int4;
+    impl_->layers = int4 ? level : nr::kLayersQuality;
 #endif
     // Where the pass's own cost is measured. Two queries per ring slot. A queue
     // family is allowed to report no timestamp bits - then there is no pool, and
@@ -1445,15 +1478,15 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         "--source-height", std::to_string(mh), "--accumulation", config.accumulation,
         "--pipeline-cache", (installed ? data / "pipeline.cache" : root / "dlssnr-amd.pipelinecache").string(),
         "--lazy-images"};
-    if (experimental) {   // CC_SMALL_FP8_EXPERIMENTAL: its own shaders (ACO SPIR-V: kept with ACO Mode on) and pipeline cache
+    if (experimental || optimized) {   // CC_SMALL_FP8_EXPERIMENTAL, CC_SILVER_AARDWOLD_OPTIMIZED: their own shaders (ACO SPIR-V: kept with ACO Mode on) and pipeline caches
         for (size_t i = 0; i + 1 < arguments.size(); ++i) {
-            if (arguments[i] == "--spv-dir") arguments[i + 1] = (xroot / "shaders").string();
-            if (arguments[i] == "--pipeline-cache") arguments[i + 1] = (xroot / "pipeline.cache").string();
+            if (arguments[i] == "--spv-dir") arguments[i + 1] = ((experimental ? xroot : oroot) / "shaders").string();
+            if (arguments[i] == "--pipeline-cache") arguments[i + 1] = ((experimental ? xroot : oroot) / "pipeline.cache").string();
         }
         arguments.push_back("--spv-dir-aco");
     }
 #if NR_INT4
-    if (int4)   // the int4 network: its own shaders and its own pipeline cache
+    if (int4)   // with the int4 layers: their own shaders and pipeline cache
         for (size_t i = 0; i + 1 < arguments.size(); ++i) {
             if (arguments[i] == "--spv-dir") arguments[i + 1] = (i4root / "shaders").string();
             if (arguments[i] == "--pipeline-cache") arguments[i + 1] = (i4root / "pipeline.cache").string();
@@ -1461,12 +1494,20 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
 #endif
     // The weights as one file (windows/build/pack_model.py); the names inside are
     // the relative paths the graph asks for under --unpacked.
+#if NR_INT4
+    const bool perf_pack = int4 && impl_->layers >= nr::kLayersPerformance;   // Performance / Ultra Performance: the
+                                                                              // pack's "performance/" entries
+#else
+    const bool perf_pack = false;
+#endif
     if (installed) {
-        const auto pack = data / (experimental ? "dlssnr-small-experimental.bin"
-                                  : network == NetworkModel::Small ? "dlssnr-small.bin" : "dlssnr.bin");
+        const auto pack = data / (experimental ? "CC_SMALL_FP8_EXPERIMENTAL.bin"
+                                  : optimized ? "CC_SILVER_AARDWOLD_OPTIMIZED.bin"
+                                  : network == NetworkModel::Small ? "CC_SMALL_FP8.bin" : "CC_SILVER_AARDWOLD.bin");
         if (!std::filesystem::is_regular_file(pack))
             throw std::runtime_error("missing " + pack.string() + " (run install.ps1 again)");
         arguments.push_back("--model-pack"); arguments.push_back(pack.string());
+        if (optimized && perf_pack) { arguments.push_back("--model-pack-variant"); arguments.push_back("performance"); }
     }
     // One pass at the frame's own extent, not linear: every kernel only samples
     // the input image, so it can be the frame's own format filled by a copy.
@@ -1635,9 +1676,9 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
                : installed ? data / "shaders/temporal" : root / "build/windows/rdna4/network/temporal")
             : std::filesystem::path(temporal_config.shaders));
         if (experimental) shaders = std::filesystem::canonical(xroot / "shaders" / "temporal");
+        if (optimized) shaders = std::filesystem::canonical(oroot / "shaders" / "temporal");
 #if NR_INT4
-        // The int4 network's temporal pre/post variants are built with its defines (hard-swish, whose scale
-        // NR_HS_FOLDPP folds into the pre/post weights): int4/shaders/temporal, never the default ones.
+        // with the int4 layers, the temporal pre/post variants built with their network's defines: int4/shaders/temporal
         if (int4) shaders = std::filesystem::canonical(i4root / "shaders" / "temporal");
 #endif
         require_variant_profile(shaders);
@@ -2206,8 +2247,10 @@ uint32_t Runtime::model_width() const { return impl_->mw; }
 uint32_t Runtime::model_height() const { return impl_->mh; }
 NetworkModel Runtime::network() const { return impl_->network; }
 bool Runtime::experimental() const { return impl_->experimental; }
+bool Runtime::optimized() const { return impl_->optimized; }
 #if NR_INT4
-bool Runtime::int4_mixed() const { return impl_->int4_mixed; }
+bool Runtime::int4() const { return impl_->int4; }
+int Runtime::layers() const { return impl_->layers; }
 #endif
 
 void Runtime::set_style_grade(bool on) { impl_->style_grade_on = on; }
@@ -2334,11 +2377,14 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
     if (stale()) throw std::logic_error("a runtime whose images another one has taken over (Runtime::stale)");
     // images made while recording (a feature's history) are this network's (NR Control's VRAM breakdown)
 #if NR_INT4
-    const bool int4 = impl_->int4_mixed;
+    const bool int4 = impl_->int4;
+    const int layers = impl_->layers;
 #else
     const bool int4 = false;
+    const int layers = 0;
 #endif
-    nr::vram::Scope owner(nr::vram::kUnset, impl_->experimental ? 3 : impl_->network == NetworkModel::Small ? 0 : int4 ? 2 : 1);
+    nr::vram::Scope owner(nr::vram::kUnset, impl_->experimental ? 3 : impl_->network == NetworkModel::Small ? 0
+                                            : impl_->optimized ? nr::network_with_layers(2, int4 ? layers : 0) : 1);
     validate(c);
     if (!cmd || !frame.image || frame.format != impl_->colour_format ||
         frame.width != impl_->width || frame.height != impl_->height ||

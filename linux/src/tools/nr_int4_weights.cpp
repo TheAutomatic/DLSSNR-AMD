@@ -1,15 +1,15 @@
-// dlssnr-int4-weights: makes dlssnr-amd/dlssnr-int4.bin at install time (package/install.sh, int4_mixed chosen).
-// The int4 weights are not shipped: they are rebuilt from the model's own weights (dlssnr.bin) and the package's
+// dlssnr-int4-weights: makes dlssnr-amd/CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin at install time (package/install.sh).
+// The int4 weights are not shipped: they are rebuilt from CC_SILVER_AARDWOLD_OPTIMIZED's weights (CC_SILVER_AARDWOLD_OPTIMIZED.bin) and the package's
 // recovery tables (int4/vit, int4/swin: *.fix.bin, *.mu.bin) by the graph builder's own decoder, run here exactly as
 // the runtime's int4 build runs it (same plan, same settings), stopping before any GPU work.
-//   dlssnr-int4-weights <dlssnr.bin> <int4 data: vit/, swin/, settings.txt, shaders/> <output file>
+//   dlssnr-int4-weights <CC_SILVER_AARDWOLD_OPTIMIZED.bin> <int4 data: vit/, swin/, settings.txt, shaders/> <output file>
 #define NR_NO_MAIN
 #include "nr_graph.cpp"
 #include "nr_native_plan.hpp"
 #include <sstream>
 
 int main(int argc, char** argv) try {
-    if (argc != 4) { std::fprintf(stderr, "usage: %s <dlssnr.bin> <int4 data dir> <output file>\n", argv[0]); return 2; }
+    if (argc != 4) { std::fprintf(stderr, "usage: %s <CC_SILVER_AARDWOLD_OPTIMIZED.bin> <int4 data dir> <output file>\n", argv[0]); return 2; }
     const std::filesystem::path pack = std::filesystem::absolute(argv[1]), i4 = std::filesystem::absolute(argv[2]);
     std::map<std::string, std::string> cfg;
     cfg["NR_I4_DIR"] = (i4 / "vit").string();

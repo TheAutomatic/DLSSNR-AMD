@@ -35,7 +35,7 @@ games it is under Binaries\Win64, not the launcher outside), then pick a route:
   4) reshade-feeder-vulkan  Vulkan games (ReShade)
   5) Uninstall
   6) Collect logs           when something goes wrong: writes a zip to the desktop to attach to an
-                            issue
+                            issue (in game, NR Control's Diagnostics has "Save a diagnostic package")
 
 You can also drag the game's exe onto install.bat. Games under Program Files ask for
 administrator rights. On the command line: install.bat <game exe or folder> <route> [-Dll <path>]
@@ -50,24 +50,31 @@ The processing before and after NR (the NR network itself is the same; -RenoDX o
   2) wilsjo2 style           the processing of OptiScaler-NR (wilsjo2), ported (see "wilsjo2 style")
 In game NR Control (End) or ReShade's Add-ons page switches it at any time.
 
-Networks: all four are installed, named as in NVIDIA's DLL (CC_SMALL_FP8_EXPERIMENTAL is this
-project's). The installer asks which one a game starts with (Enter = CC_SMALL_FP8; -Model <name>):
+Networks: all four are installed, named as in NVIDIA's DLL (CC_SMALL_FP8_EXPERIMENTAL and
+CC_SILVER_AARDWOLD_OPTIMIZED are this project's). The installer asks which one a game starts with
+(Enter = CC_SMALL_FP8; -Model <name>):
 
     CC_SMALL_FP8                   the default network of 310.9.16 (default)
     CC_SMALL_FP8_EXPERIMENTAL      experimental: CC_SMALL_FP8 made faster; its picture differs
                                    somewhat. RX 9000 only, with ACO Mode
     CC_SILVER_AARDWOLD             the network of 310.8.0 (also preset 1 of 310.9.16)
-    CC_SILVER_AARDWOLD_INT4_MIXED  CC_SILVER_AARDWOLD with part of the work in int4 and other lower
-                                   precisions; faster, the picture differs somewhat. RX 9000 only,
-                                   with ACO Mode
+    CC_SILVER_AARDWOLD_OPTIMIZED   CC_SILVER_AARDWOLD made faster, its picture very close to it.
+                                   RX 9000 only, with ACO Mode
 
 This only sets [Network] Model in dlssnr-amd.ini; the network can be switched in game at any time:
 the drop-down in NR Control (End) or on ReShade's Add-ons page, or Ctrl+F11 to cycle. The new network
 is prepared in the background, and the current one keeps running until it is ready. A network that
 cannot run is greyed out in the drop-down with the reason (on an RX 7000, for example, the two that
-need an RX 9000). The weights of CC_SMALL_FP8_EXPERIMENTAL and CC_SILVER_AARDWOLD_INT4_MIXED are made
+need an RX 9000). The weights of CC_SMALL_FP8_EXPERIMENTAL and CC_SILVER_AARDWOLD_OPTIMIZED are made
 at install from your models; if that fails the other networks are installed and the one that failed
 is greyed out.
+CC_SILVER_AARDWOLD_OPTIMIZED replaces CC_SILVER_AARDWOLD_INT4_MIXED of earlier versions (a
+dlssnr-amd.ini that names that one gets CC_SILVER_AARDWOLD_OPTIMIZED). Optimized layers (in NR
+Control under the network, [Network] OptimizedLayers) sets how many of its layers run in a faster form;
+it changes only how the network computes, not the resolution, and every level's picture stays very
+close to CC_SILVER_AARDWOLD's. Quality: none of them in int4, a little slower. Balanced: some of them
+in int4. Performance: also fixed attention on the first full-resolution layers. Ultra Performance
+(default): also more int4 layers, the fastest.
 
 LumeniteFX (optional, reshade-feeder routes only): motion vectors from LumeniteFX Kernel (by Afzaal
 (Kaidō), https://github.com/umar-afzaal/LumeniteFX, AGNYA licence). It is not part of this project and
@@ -87,19 +94,20 @@ Model
 The package does not contain NVIDIA's model. The first install asks for nvngx_dlssnr.dll, version
 310.9.16 or 310.8.0, or a zip that contains it (on the command line: -Dll):
 
-    dlssnr-amd\dlssnr-small.bin  CC_SMALL_FP8 (the default network of 310.9.16), also the source of
-                                 CC_SMALL_FP8_EXPERIMENTAL
-    dlssnr-amd\dlssnr.bin        CC_SILVER_AARDWOLD (the network of 310.8.0; 310.9.16 has it too), also
-                                 the source of CC_SILVER_AARDWOLD_INT4_MIXED
+    dlssnr-amd\CC_SMALL_FP8.bin        CC_SMALL_FP8 (the default network of 310.9.16), also the source
+                                       of CC_SMALL_FP8_EXPERIMENTAL
+    dlssnr-amd\CC_SILVER_AARDWOLD.bin  CC_SILVER_AARDWOLD (the network of 310.8.0; 310.9.16 has it too),
+                                       also the source of CC_SILVER_AARDWOLD_OPTIMIZED
 
 Use 310.9.16 when you can: it already contains the 310.8.0 network, so with it both models are
-extracted and installed; 310.8.0 gives CC_SILVER_AARDWOLD and its int4 mixed only (CC_SMALL_FP8 and
-CC_SMALL_FP8_EXPERIMENTAL are then greyed out in the menus). The installer extracts the models with
-model-tools\dlssnr_extract_model.exe (it only reads the weight data; the DLL is never loaded or run),
-checks every entry against known hashes and writes a model file only if all of them match. The models
-stay in this package, so later installs from it (into other games too) do not ask again; to add
-CC_SMALL_FP8 to a package that has only CC_SILVER_AARDWOLD, install again with -Dll pointing at the
-310.9.16 DLL. With a newer package, choose the DLL once more or copy those files over.
+extracted and installed; 310.8.0 gives CC_SILVER_AARDWOLD and CC_SILVER_AARDWOLD_OPTIMIZED only
+(CC_SMALL_FP8 and CC_SMALL_FP8_EXPERIMENTAL are then greyed out in the menus). The installer
+extracts the models with model-tools\dlssnr_extract_model.exe (it only reads the weight data; the
+DLL is never loaded or run), checks every entry against known hashes and writes a model file only if
+all of them match. The models stay in this package, so later installs from it (into other games too)
+do not ask again; to add CC_SMALL_FP8 to a package that has only CC_SILVER_AARDWOLD, install again
+with -Dll pointing at the 310.9.16 DLL. With a newer package, choose the DLL once more or copy those
+files over.
 
 ACO Mode
 --------
@@ -109,7 +117,7 @@ faster than the driver's own compile. This is not a setting: it is always tried 
 cannot take it (a driver without pipeline binaries, for example), the reason is shown under "Network model
 and options" in NR Control and on the Add-ons page and written to dlssnr-amd.log, and:
   - an RX 9000 runs the network compiled by the AMD driver instead (CC_SMALL_FP8_EXPERIMENTAL and
-    CC_SILVER_AARDWOLD_INT4_MIXED are greyed out then);
+    CC_SILVER_AARDWOLD_OPTIMIZED are greyed out then);
   - an RX 7000 / Radeon 700M - 8000S has no NR (their network exists as ACO's machine code only).
 The same place shows "ACO Mode: on in this run" and for which graphics while it is in use. A failure that
 is not ACO's own (video memory running short, for example) does not turn it off. The RDNA3 machine code was made
@@ -223,10 +231,16 @@ Network model and options):
   - Motion Without Depth (default 1): 1 = the network fetches the previous frame with the pixel's own
     motion vector, depth not used, as NVIDIA's DLL does; 0 = with depth, the motion vector of whichever
     of the pixel and its four diagonal neighbours is nearest the camera. Applied after a game restart.
+  - OptimizedLayers (default 3): CC_SILVER_AARDWOLD_OPTIMIZED's level, 0 = Quality, 1 = Balanced,
+    2 = Performance, 3 = Ultra Performance (see the networks above).
+  - History Precision (default 16): the images NR keeps its previous result in. 16 = 16-bit, as
+    NVIDIA's DLL keeps it, half the memory; 32 = 32-bit, as up to 0.0.8.1. With several passes the two
+    can differ in fine detail. Applied at once (the previous result starts afresh).
   - Hotkey, Sound: the hotkey that cycles the networks (default Ctrl+F11) and its sound.
-  - Memory Guard (default 1): a network is built only while 1 GB of video memory stays free for the game, and the
-    running one steps aside while video memory runs out. 0 = no such check: NR builds and runs in whatever video
-    memory is left; a game left short of it may stutter or fail to load its own data. Applied at once.
+  - Memory Guard (default 0): 1 = a network is built only while the video memory it needs is free (measured on
+    your GPU when the network is first built), and the running one steps aside once video memory has run out.
+    0 = no such check: NR builds and runs in whatever video memory is left; a game left short of it may stutter or
+    fail to load its own data. Applied at once.
   - [Log]: whether dlssnr-amd.log is written and whether it is cleared at every start; applied after a
     game restart.
 Dynamic resolution: with NR before the upscaler and a render size that keeps changing, every new
@@ -315,8 +329,8 @@ Known limits
 - In DX10 games the game's depth buffer is not passed to NR yet (not implemented).
 - Games whose FSR runs in their own shaders never hand it to OptiScaler: pick the game's DLSS
   option instead, which OptiScaler offers.
-- When video memory runs short, the network pauses by itself and the picture returns to normal until memory frees
-  up (Memory Guard, see "Networks and other settings").
+- With Memory Guard on ([Network] Memory Guard = 1), the network pauses by itself when video memory runs short and
+  the picture returns to normal until memory frees up (see "Networks and other settings").
 - 007 First Light (optiscaler route, NR before or after the upscaler): the picture turns green and
   grainy, since the game hands the upscaler a picture that is not yet tone mapped and no exposure.
   Turn on Preprocess with Exposure = auto.

@@ -7,8 +7,8 @@ u64 offset, u64 size; then the data, each entry 256-byte aligned. The bytes
 are the files' bytes, unchanged; linux/src/core/nr_graph.cpp reads entries on
 demand (slurp).
 
-    pack_model.py --root artifacts --list model-files.txt --out dlssnr.bin
-    pack_model.py --root DIR --list LIST --out dlssnr.bin --verify model-files.sha256
+    pack_model.py --root artifacts --list model-files.txt --out CC_SILVER_AARDWOLD.bin
+    pack_model.py --root DIR --list LIST --out CC_SILVER_AARDWOLD.bin --verify model-files.sha256
 
 --verify checks every entry against a "sha256  name" list and fails on any
 difference, which is how install-time extraction proves it rebuilt the same

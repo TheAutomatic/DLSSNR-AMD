@@ -204,19 +204,23 @@ struct RuntimeConfig {
     std::string adapter_shaders;  // empty: ROOT/build/runtime
     uint32_t width{}, height{};
     VkFormat colour_format = VK_FORMAT_R32G32B32A32_SFLOAT;
-    // The network: the 310.8 model (dlssnr.bin) or the 310.9 small model
-    // (dlssnr-small.bin). Same shaders; the plan and the weights differ.
+    // The network: the 310.8 model (CC_SILVER_AARDWOLD.bin) or the 310.9 small model
+    // (CC_SMALL_FP8.bin). Same shaders; the plan and the weights differ.
     // -1 = as DLSSNR_MODEL / dlssnr-amd.ini [Network] Model say (small or original;
     // neither: small), 0 = the original model, 1 = the small model, 2 = the small
     // model's faster variant CC_SMALL_FP8_EXPERIMENTAL (its own weights and shaders,
-    // dlssnr-small-experimental.bin and experimental/; without them, the small model).
-    // The small model needs an installed tree with dlssnr-small.bin; without it, the
+    // CC_SMALL_FP8_EXPERIMENTAL.bin and experimental/; without them, the small model),
+    // 3 = the original model's CC_SILVER_AARDWOLD_OPTIMIZED (CC_SILVER_AARDWOLD_OPTIMIZED.bin and
+    // optimized/; without them, the original model).
+    // The small model needs an installed tree with CC_SMALL_FP8.bin; without it, the
     // original model.
     int network = -1;
 #if NR_INT4
-    // The int4 mixed network: -1 = as DLSSNR_INT4 / dlssnr-amd.ini [Int4Mixed] Enabled say (start), 0 = the original
-    // network, 1 = int4 mixed when installed and the device has VK_KHR_pipeline_binary ([Int4Mixed] Hotkey switches).
-    int int4_mixed = -1;
+    // CC_SILVER_AARDWOLD_OPTIMIZED's level of optimized layers (network 3 only, nr_ini_network.hpp): -1 = as
+    // DLSSNR_INT4 / dlssnr-amd.ini [Network] OptimizedLayers say (neither: Ultra Performance), 0 = Quality (no int4 layers),
+    // 1 = Balanced (int4/), 2 = Performance (int4-performance/); 1 and 2 when installed and the device has
+    // VK_KHR_pipeline_binary.
+    int layers = -1;
 #endif
     // The game's motion vectors read with point sampling at the colour's coordinate, as NVIDIA's DLL binds them
     // (MIN_MAG_MIP_POINT, the colour's own sampler; launch capture 2026-10-18). Bilinear blends two surfaces'
@@ -482,6 +486,8 @@ public:
     NetworkModel network() const;
     // Whether it runs CC_SMALL_FP8_EXPERIMENTAL (network() is then NetworkModel::Small).
     bool experimental() const;
+    // Whether it runs CC_SILVER_AARDWOLD_OPTIMIZED (network() is then NetworkModel::Original; int4() says how).
+    bool optimized() const;
     // What a runtime at width x height (the frame's extent, as RuntimeConfig::width/height) with this one's
     // configuration otherwise can take over from this one (RuntimeConfig::share): null when its working extent
     // differs, or the frame is taller than this one's network was built for.
@@ -521,8 +527,10 @@ public:
     std::shared_ptr<const RuntimeCore> with_slot_of(const std::shared_ptr<const RuntimeCore>& plan) const;
 
 #if NR_INT4
-    // Whether this runtime runs the int4 mixed network (asked for and everything it needs present).
-    bool int4_mixed() const;
+    // Whether this runtime runs CC_SILVER_AARDWOLD_OPTIMIZED with int4 layers (asked for and everything they need
+    // present), and its level (0 Quality - also when the int4 layers could not run -, 1 Balanced, 2 Performance).
+    bool int4() const;
+    int layers() const;
 #endif
     // Change the post block's history strength (TemporalConfig::history_strength)
     // between frames. Takes effect on the next recording; no-op without a

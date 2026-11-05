@@ -1,13 +1,12 @@
-// The int4 mixed network's Linux Vulkan layer (installed only with int4 mixed): adds VK_KHR_pipeline_binary and
+// The Linux Vulkan layer of CC_SILVER_AARDWOLD_OPTIMIZED's int4 layers: adds VK_KHR_pipeline_binary and
 // VK_KHR_maintenance5 (with their features) to the game's device when the driver offers them - the int4 pipelines
 // rewrite their own binaries (nrvk.hpp create_iu4). It exists because on the OptiScaler route our PE runtime is loaded
 // after the game (vkd3d/DXVK under Proton) has created its device; this layer sits under winevulkan and is in place
 // from the start, and winevulkan asks the host device which functions exist, so the extensions reach the Windows side
 // too. Lives in <game>/dlssnr-amd/int4/layer and is enabled from the launch options (VK_ADD_LAYER_PATH +
 // VK_INSTANCE_LAYERS): nothing is installed outside the game.
-// It only adds them when the int4 network may be used in this run: DLSSNR_INT4=1, or no DLSSNR_INT4 and, in the game's
-// dlssnr-amd.ini, [Int4Mixed] Enabled = 1 or a Hotkey to switch to it in game; otherwise every device is created
-// exactly as asked and every call passes straight to the next layer.
+// It adds them unless DLSSNR_INT4=0 (int4_wanted); then every device is created exactly as asked and every call
+// passes straight to the next layer.
 #include <cstdlib>
 #include <dlfcn.h>
 #include <filesystem>
@@ -52,8 +51,8 @@ VKAPI_ATTR void VKAPI_CALL DestroyInstance(VkInstance i, const VkAllocationCallb
     reinterpret_cast<PFN_vkDestroyInstance>(gipa(i, "vkDestroyInstance"))(i, a);
 }
 
-// The layer is in the launch options exactly when the game should be able to run CC_SILVER_AARDWOLD_INT4_MIXED
-// (install.sh prints that launch line apart, 0.0.7): it always readies the device for it then, whichever network
+// The layer is in the launch options exactly when the game should be able to run the int4 layers (install.sh prints
+// that launch line apart): it always readies the device for them then, whichever network
 // dlssnr-amd.ini starts with - the networks are switched in game. DLSSNR_INT4=0 leaves the device as it is.
 bool int4_wanted() {
     const char* e = std::getenv("DLSSNR_INT4");

@@ -272,7 +272,12 @@ const nr::control_ui::ChainRoute kAsiChain = [] {
 }();
 
 // ---- the menu's content: the same as the Linux layer's ----
-thread_local bool t_same_frame = false;   // draw_game: this present's game frame was drawn on already
+thread_local bool t_same_frame = false;   // this present's game frame had the per-frame bookkeeping already
+// The game's own Present (draw_game) last seen, and whether a game frame began there since NR Control was last drawn at
+// the system's Present: frame generation shows two or more frames a game frame, and the bookkeeping (layers not run on
+// this presented frame, the spatial outlines) is done once a game frame - else the layer rows flicker.
+std::atomic<ULONGLONG> g_game_present_ms{0};
+std::atomic<bool> g_game_frame_new{false};
 
 struct Menu {
     ImGuiContext* context{};
@@ -477,7 +482,7 @@ struct Menu {
         g_input.update(io, width, height);
         const bool osd = osd_due(now);   // also re-reads the file once a second (the marks with it)
         nr::lang::sync(lang_folder(), ini.get("NRControl", "Language", ""));   // (fonts_for makes the font for its letters)
-        if (!t_same_frame) {   // a new presented frame (draw_game)
+        if (!t_same_frame) {   // a new game frame (g_game_frame_new)
             nr::pe::control::present_layers();
             nr::asi::wilsjo2_present_spatial();
         }
@@ -736,6 +741,21 @@ struct Menu {
                              "Copied to the clipboard and saved as dlssnr-amd\\nr-report.txt next to the game. Nothing "
                              "is sent anywhere.");
         if (!report_said.empty()) nr::control_ui::text_dim_wrapped("%s", report_said.c_str());
+        nr::control_ui::draw_diag_package([s] { return diag_request(s); });
+        ImGui::Separator();
+        nr::control_ui::draw_session_stats();
+    }
+    // The diagnostic package's request (Diagnostics' button; tests: NR_CONTROL_DIAG_AT)
+    static nr::pe::diag::Request diag_request(const nr::control::Shared* s) {
+        nr::pe::diag::Request r;
+        r.game = nr::u8::path(nr::pe::module_folder());
+        r.log = nr::u8::path(nr::pe::log_path());
+        r.report = nr::control_ui::report_text(s, "dlssnr-amd.asi", std::string(nr::pe::module_folder()) + "\\dlssnr-amd.ini",
+                                               nr::pe::log_path());
+        r.gpu = nr::pe::vkdevice::gpu_name();
+        r.driver = nr::pe::vkdevice::driver_name();
+        r.request_shot = [s] { if (s) ++const_cast<nr::control::Shared*>(s)->screenshot_request; };
+        return r;
     }
 
     void draw_menu_settings() {
@@ -801,9 +821,9 @@ struct Menu {
         }
         else ImGui::TextDisabled(tr(chain.many() ? "No layer is on (the NR chain page): NR does not run."
                                                  : "NR is off (Enabled on the NR settings page): NR does not run."));
-        if (s->net_running < nr::control::kNoNet && !chain_rows(s)) ImGui::Text(tr("Network: %s"), nr::network_codename(int(s->net_running)));
+        if (s->net_running < nr::control::kNoNet && !chain_rows(s)) ImGui::Text(tr("Network: %s"), nr::control_ui::net_name(int(s->net_running)));
         if (s->building) {   // the build's progress, as the OSD and the ReShade route's page show it
-            ImGui::Text(tr("Building %s"), s->building_net < nr::control::kNoNet ? nr::network_codename(int(s->building_net)) : tr("the network"));
+            ImGui::Text(tr("Building %s"), s->building_net < nr::control::kNoNet ? nr::control_ui::net_name(int(s->building_net)) : tr("the network"));
             char phase[sizeof s->build_phase + 1] = {};
             std::memcpy(phase, s->build_phase, sizeof s->build_phase);   // (the page may not end it)
             ImGui::ProgressBar(std::clamp(s->build_progress, 0.f, 1.f), ImVec2(-1.0f, 0.0f), phase);
@@ -962,6 +982,14 @@ struct Menu {
         // tests (NR_CONTROL_REPORT_AT=<draws>): the report made once, as its button would
         static int report_at = [] { const char* e = std::getenv("NR_CONTROL_REPORT_AT"); return e ? std::atoi(e) : 0; }();
         if (report_at > 0 && --report_at == 0) copy_report(s);
+        // tests (NR_CONTROL_DIAG_AT=<draws>[,shots]): the diagnostic package written once, as its button would
+        static int diag_at = [] { const char* e = std::getenv("NR_CONTROL_DIAG_AT"); return e ? std::atoi(e) : 0; }();
+        if (diag_at > 0 && --diag_at == 0) {
+            nr::pe::diag::Request r = diag_request(s);
+            const char* e = std::getenv("NR_CONTROL_DIAG_AT");
+            r.shots = e && std::strstr(e, "shots");
+            nr::pe::diag::start(std::move(r));
+        }
         // tests (NR_CONTROL_REPORT_EVERY=<draws>): the report appended to nr-report-series.txt beside dlssnr-amd.ini that often
         static const int report_every = [] { const char* e = std::getenv("NR_CONTROL_REPORT_EVERY"); return e ? std::atoi(e) : 0; }();
         static int draws = 0;
@@ -1315,7 +1343,9 @@ struct D3D11Overlay {
 
 // ---- D3D12 ----
 struct D3D12Overlay {
-    static constexpr uint32_t kFrames = 3, kSrvs = 64;
+    // Six slots: drawn at the system's Present on every frame shown, frame generation's two or more a game frame - a slot
+    // still on the GPU makes the presenting thread wait (wait() below), so there are enough for the GPU to be behind.
+    static constexpr uint32_t kFrames = 6, kSrvs = 64;
     ID3D12Device* device{};
     ID3D12CommandQueue* queue{};   // the swap chain's: the menu goes in after the game's frame, before the Present
     ID3D12CommandAllocator* allocators[kFrames]{};
@@ -1641,6 +1671,7 @@ void STDMETHODCALLTYPE execute_hook(ID3D12CommandQueue* q, UINT n, ID3D12Command
 ID3D12CommandQueue* last_direct_queue() { return t_last_direct; }
 std::atomic<D3D12PresentHook> g_d3d12_hook{nullptr};   // on_d3d12_present
 std::atomic<D3D11PresentHook> g_d3d11_hook{nullptr};   // on_d3d11_present
+std::atomic<D3D12ShownHook> g_d3d12_shown{nullptr};    // on_d3d12_shown
 
 // ---- the hooks ----
 std::mutex g_mutex;   // one Present at a time draws the menu
@@ -1662,23 +1693,64 @@ template <class T> void let_go_idle(std::map<void*, Kept<T>>& m, std::chrono::st
 
 #include "nr_pe_menu_vk.inl"
 
+// The queue a D3D12 swap chain was made with, as the .asi saw it made (note_swapchain_queue), in a table of our own:
+// not in the swap chain's private data - set on OptiScaler's XeFG output's swap chain, that changed the frames XeFG
+// generated (1/255 on every generated frame with NR at Present, stand-in, 11-05). Each entry holds a reference to its
+// queue. Not let go by time: a swap chain that stops presenting (a minimised game) and presents again from a thread
+// that executed nothing would have no other way to its queue. Let go when a swap chain is made again at the same
+// address, when its queue's device is removed, and the oldest beyond kCreatedKept (a game making chain after chain).
+struct CreatedQueue { IDXGISwapChain* sc; ID3D12CommandQueue* queue; };
+std::mutex g_created_mutex;
+std::vector<CreatedQueue> g_created;   // oldest first
+constexpr size_t kCreatedKept = 8;
+bool queue_removed(ID3D12CommandQueue* q) {
+    ID3D12Device* d = nullptr;
+    const bool removed = SUCCEEDED(q->GetDevice(IID_PPV_ARGS(&d))) && d && d->GetDeviceRemovedReason() != S_OK;
+    release(d);
+    return removed;
+}
+ID3D12CommandQueue* created_queue(IDXGISwapChain* sc) {   // AddRef'd; null: not seen made
+    std::lock_guard<std::mutex> g(g_created_mutex);
+    for (auto it = g_created.begin(); it != g_created.end(); ++it) {
+        if (it->sc != sc) continue;
+        if (queue_removed(it->queue)) { it->queue->Release(); g_created.erase(it); return nullptr; }
+        it->queue->AddRef();
+        return it->queue;
+    }
+    return nullptr;
+}
+
 // The menu over this swap chain's back buffer, before its Present. Never throws.
-std::atomic<ULONGLONG> g_game_drawn_ms{0};   // NR Control drawn at the game's own Present then (draw_game)
-// `known`: the game's own swap chain's queue (D3D12) or device (D3D11), given by draw_game - the menu drawn there, no
-// hooks run; null: the system's Present - the hooks run, and the menu is drawn unless draw_game drew it in the last second.
+// NR Control is drawn as OptiScaler draws its own menu (its wrapper of the real swap chain, under every proxy): at the
+// system's Present, on every frame shown - the game's, and every one frame generation makes, whichever generator and
+// however it makes them - on the queue the swap chain presents on, after the layers that run there. Frame generation
+// never sees the menu. Drawn at the game's own Present instead (before frame generation), it was on the generated
+// frames only where the generator made them from the back buffer at that Present; a generator that takes the game's
+// frame earlier (a game dispatching FSR frame generation itself, DLSS-G through NGX) showed it on every other frame.
+std::atomic<ULONGLONG> g_system_drawn_ms{0};   // NR Control drawn at the system's Present then
+// `known`: the game's own swap chain's queue (D3D12) or device (D3D11), given by draw_game while the system's Present
+// has not drawn the menu for a second (it is not hooked, or sees no presents) - the menu drawn there, no hooks run;
+// null: the system's Present - the hooks run, and the menu is drawn.
 void draw_on(IDXGISwapChain* sc, UINT flags, IUnknown* known = nullptr) {
     if (!known) ++g_presents;
     if (t_inside || (flags & DXGI_PRESENT_TEST)) return;
     t_inside = true;
-    // The system's Present never waits for the menu: under frame generation it is called on the generator's own
-    // presenting thread, while the game's thread may hold g_mutex drawing the menu at the game's Present (draw_game) and
-    // be waiting inside the generator's swap chain (its back buffer, its index) for that very thread to present - each
-    // waited for the other (FSR frame generation). Busy: the hooks still run, without the menu on this present.
+    // The system's Present never waits for the menu's lock: under frame generation it is called on the generator's own
+    // presenting thread, while the game's thread may hold g_mutex drawing the menu at the game's Present (draw_game, the
+    // fallback) and be waiting inside the generator's swap chain (its back buffer, its index) for that very thread to
+    // present - each waited for the other (FSR frame generation). Busy: the hooks still run, without the menu on this
+    // present.
     std::unique_lock<std::mutex> lock(g_mutex, std::defer_lock);
     if (known) lock.lock();
     else (void)lock.try_lock();
     const auto now = std::chrono::steady_clock::now();
-    const bool menu_here = lock.owns_lock() && (known || GetTickCount64() - g_game_drawn_ms.load() >= 1000);
+    const bool menu_here = lock.owns_lock();
+    // the system's Present while the game's own is seen: a new game frame's first presented frame does the bookkeeping
+    struct SameFrame { bool was; bool on; ~SameFrame() { if (on) t_same_frame = was; } } same{t_same_frame, false};
+    if (!known && menu_here && GetTickCount64() - g_game_present_ms.load() < 1000) {
+        same.on = true;
+        t_same_frame = !g_game_frame_new.exchange(false);
+    }
     // Refresh the presenting device before reaping idle overlays. A slow first frame or a pause must not
     // destroy its ImGui context on the very Present that is using it again. (Only under the lock: the overlays are its.)
     struct Reap { std::chrono::steady_clock::time_point now; bool owned; ~Reap() {
@@ -1697,7 +1769,8 @@ void draw_on(IDXGISwapChain* sc, UINT flags, IUnknown* known = nullptr) {
         ID3D12Device* d12dev = nullptr;
         // A D3D12 swap chain's device is the queue it presents on where DXGI hands that out; else (DXVK's DXGI) the
         // D3D12 device, and the queue is the direct queue this thread has just executed the frame on (watch_queues).
-        // At the game's own Present (draw_game) the queue or device it was made with.
+        // Where the .asi saw the swap chain made, the queue it was made with (note_swapchain_queue). At the game's own
+        // Present (draw_game, the fallback) the queue or device it was made with.
         if (known) {
             if (FAILED(known->QueryInterface(IID_PPV_ARGS(&d11))) || !d11) {
                 release(d11);
@@ -1709,7 +1782,14 @@ void draw_on(IDXGISwapChain* sc, UINT flags, IUnknown* known = nullptr) {
             if ((FAILED(sc->GetDevice(IID_PPV_ARGS(&q12))) || !q12) && SUCCEEDED(sc->GetDevice(IID_PPV_ARGS(&d12dev))) &&
                 d12dev) {
                 release(q12);
-                if (ID3D12CommandQueue* last = last_direct_queue()) {
+                // the queue it was made with (frame generation's presenting thread may execute nothing), else the
+                // direct queue this thread executed on last
+                if ((q12 = created_queue(sc))) {
+                    ID3D12Device* owner = nullptr;
+                    if (FAILED(q12->GetDevice(IID_PPV_ARGS(&owner))) || owner != d12dev) release(q12);
+                    release(owner);
+                }
+                if (ID3D12CommandQueue* last = q12 ? nullptr : last_direct_queue()) {
                     ID3D12Device* owner = nullptr;
                     if (SUCCEEDED(last->GetDevice(IID_PPV_ARGS(&owner))) && owner == d12dev) { q12 = last; q12->AddRef(); }
                     release(owner);
@@ -1728,7 +1808,7 @@ void draw_on(IDXGISwapChain* sc, UINT flags, IUnknown* known = nullptr) {
                 }
             }
         }
-        if (d11 && !menu_here) {   // drawn at the game's own Present: the hook only
+        if (d11 && !menu_here) {   // another Present is drawing the menu now: the hook only
             if (const D3D11PresentHook hook = g_d3d11_hook.load()) hook(sc, d11);
             d11->Release();
         } else if (q12 && !menu_here) {
@@ -1736,6 +1816,7 @@ void draw_on(IDXGISwapChain* sc, UINT flags, IUnknown* known = nullptr) {
                 DXGI_SWAP_CHAIN_DESC d{};
                 if (SUCCEEDED(sc->GetDesc(&d))) hook(sc, q12, int(encoding_of(sc, d.BufferDesc.Format).mode));
             }
+            if (const D3D12ShownHook shown = g_d3d12_shown.load()) shown(sc, q12);
             q12->Release();
         } else if (d11) {
             auto& k = g_d3d11[d11];
@@ -1754,7 +1835,7 @@ void draw_on(IDXGISwapChain* sc, UINT flags, IUnknown* known = nullptr) {
             d11->Release();
             g_api_name = "D3D11";
             k.overlay->present(sc);
-            if (known) g_game_drawn_ms = GetTickCount64();
+            if (!known) g_system_drawn_ms = GetTickCount64();
         } else if (q12) {
             auto& k = g_d3d12[q12];
             k.used = now;
@@ -1773,14 +1854,19 @@ void draw_on(IDXGISwapChain* sc, UINT flags, IUnknown* known = nullptr) {
                 d12->Release();
                 said("D3D12");
             }
-            q12->Release();
-            if (const D3D12PresentHook hook = known ? nullptr : g_d3d12_hook.load()) {
-                DXGI_SWAP_CHAIN_DESC d{};
-                if (SUCCEEDED(sc->GetDesc(&d))) hook(sc, q12, int(encoding_of(sc, d.BufferDesc.Format).mode));
+            {   // the shown hook after the menu, whether or not it was drawn (it reads what is shown); the queue let go
+                struct Shown { IDXGISwapChain* sc; ID3D12CommandQueue* q; bool on; ~Shown() {
+                    if (on) try { if (const D3D12ShownHook shown = g_d3d12_shown.load()) shown(sc, q); } catch (...) {}
+                    q->Release();
+                } } shown{sc, q12, !known};
+                if (const D3D12PresentHook hook = known ? nullptr : g_d3d12_hook.load()) {
+                    DXGI_SWAP_CHAIN_DESC d{};
+                    if (SUCCEEDED(sc->GetDesc(&d))) hook(sc, q12, int(encoding_of(sc, d.BufferDesc.Format).mode));
+                }
+                g_api_name = "D3D12";
+                k.overlay->present(sc);
             }
-            g_api_name = "D3D12";
-            k.overlay->present(sc);
-            if (known) g_game_drawn_ms = GetTickCount64();
+            if (!known) g_system_drawn_ms = GetTickCount64();
         } else if (g_failed_for != sc) {
             g_failed_for = sc;
             IUnknown* u = nullptr;
@@ -1921,6 +2007,13 @@ void abandon_at_exit() {
 }
 
 
+// The swap chains with a Vulkan overlay (g_vulkan's keys), under their own lock: vulkan_forget is called from inside
+// vkd3d-proton's / DXVK's vkDestroySwapchainKHR on their queue thread, and must not wait for g_mutex there - the game's
+// thread may hold it drawing the menu over a D3D12 swap chain while ImGui's texture upload waits for that very queue
+// (the game hung at a resize, RE Requiem demo, 11-06). Their swap chains never have a Vulkan overlay.
+std::mutex g_vulkan_keys_mutex;
+std::vector<std::pair<VkDevice, VkSwapchainKHR>> g_vulkan_keys;
+
 const VkPresentInfoKHR* vulkan_present(VkInstance instance, VkPhysicalDevice physical, VkDevice device,
         VkQueue queue, uint32_t family, VkSwapchainKHR sc, VkFormat format, VkColorSpaceKHR space,
         VkExtent2D extent, const std::vector<VkImage>& images, const VkPresentInfoKHR* info) {
@@ -1932,6 +2025,10 @@ const VkPresentInfoKHR* vulkan_present(VkInstance instance, VkPhysicalDevice phy
     try {
         nr::pe::control::start_input();
         if (!o) {
+            {
+                std::lock_guard<std::mutex> keys(g_vulkan_keys_mutex);
+                g_vulkan_keys.emplace_back(device, sc);
+            }
             o = std::make_unique<VulkanOverlay>();
             o->init(instance,physical,device,queue,family,format,space,extent,images);
             say("drawn over a Vulkan swap chain, " + std::to_string(extent.width) + "x" + std::to_string(extent.height) +
@@ -1977,6 +2074,15 @@ const VkPresentInfoKHR* vulkan_present(VkInstance instance, VkPhysicalDevice phy
 }
 
 void vulkan_forget(VkDevice device, VkSwapchainKHR sc) {
+    {   // nothing of ours on it (vkd3d-proton's, DXVK's swap chains): g_mutex not waited for (above)
+        std::lock_guard<std::mutex> keys(g_vulkan_keys_mutex);
+        const auto mine = [&](const std::pair<VkDevice, VkSwapchainKHR>& k) { return k.first == device && (!sc || k.second == sc); };
+        if (std::none_of(g_vulkan_keys.begin(), g_vulkan_keys.end(), mine)) {
+            nr::pe::receipts::collect();
+            return;
+        }
+        g_vulkan_keys.erase(std::remove_if(g_vulkan_keys.begin(), g_vulkan_keys.end(), mine), g_vulkan_keys.end());
+    }
     std::lock_guard<std::mutex> lock(g_mutex);
     for(auto it=g_vulkan.begin();it!=g_vulkan.end();) {
         auto& o=it->second;
@@ -2017,8 +2123,34 @@ void watch_queues(ID3D12Device* device) {
 }
 
 void on_d3d12_present(D3D12PresentHook hook) { g_d3d12_hook.store(hook); }
+void on_d3d12_shown(D3D12ShownHook hook) { g_d3d12_shown.store(hook); }
+void note_swapchain_queue(IDXGISwapChain* swap_chain, ID3D12CommandQueue* queue) {
+    if (!swap_chain || !queue) return;
+    {   // where DXGI hands out the swap chain's queue (Windows' own DXGI) no record is needed
+        ID3D12CommandQueue* own = nullptr;
+        const bool handed = SUCCEEDED(swap_chain->GetDevice(IID_PPV_ARGS(&own))) && own;
+        release(own);
+        if (handed) return;
+    }
+    std::lock_guard<std::mutex> g(g_created_mutex);
+    for (auto it = g_created.begin(); it != g_created.end();)
+        if (it->sc == swap_chain || queue_removed(it->queue)) { it->queue->Release(); it = g_created.erase(it); }
+        else ++it;
+    while (g_created.size() >= kCreatedKept) { g_created.front().queue->Release(); g_created.erase(g_created.begin()); }
+    queue->AddRef();
+    g_created.push_back({swap_chain, queue});
+}
 void draw_game(IDXGISwapChain* swap_chain, IUnknown* device, bool new_frame) {
     if (!swap_chain || !device) return;
+    const ULONGLONG now = GetTickCount64();
+    g_game_present_ms = now;
+    if (now - g_system_drawn_ms.load() < 1000) {   // drawn at the system's Present, on every frame shown
+        if (new_frame) g_game_frame_new = true;     // (its first one after this does the frame's bookkeeping)
+        return;
+    }
+    // the fallback: drawn here, and this game frame's bookkeeping done here - not again at the system's Present when it
+    // takes over (the layer rows would read "not run" for a frame)
+    g_game_frame_new = false;
     t_same_frame = !new_frame;
     draw_on(swap_chain, 0, device);
     t_same_frame = false;

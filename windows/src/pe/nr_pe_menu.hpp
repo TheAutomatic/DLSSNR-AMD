@@ -4,8 +4,9 @@
 // NR Control, the OptiScaler route's own NR menu (End), drawn by our DLL over the game's DXGI swap chain (the .asi route,
 // nr_asi_main.cpp; ported from windows/src/pe/nr_pe_menu.cpp without its native-D3D12 parts): DXGI's
 // Present is hooked in the system's dxgi.dll (below OptiScaler's own swap chain, after its menu and frame
-// generation) - where the .asi hooks the game's own swap chain the menu is drawn at that one's Present instead
-// (draw_game) - and while the menu is open it is drawn with ImGui into an 8-bit image of its own and laid over the
+// generation) and the menu is drawn there, on every frame shown - frame generation's too - as OptiScaler draws its own
+// (draw_game only marks the game's frames there, and draws while the system's Present does not) - and while the menu
+// is open it is drawn with ImGui into an 8-bit image of its own and laid over the
 // back buffer in the swap chain's encoding (SDR, scRGB, HDR10), on D3D11 and D3D12 swap chains. It edits the game's
 // dlssnr-amd.ini - [RenoDX] (every NR setting with the RenoDX-style option on), [Preprocess], [Network] - which
 // the DLL takes at once (nr_pe_config.hpp touch_config), and shows what NR is doing (nr_control_shared.hpp). Vulkan
@@ -37,6 +38,15 @@ void watch_queues(ID3D12Device* device);
 // The .asi's final-picture screenshot runs NR on the back buffer there.
 using D3D12PresentHook = void (*)(IDXGISwapChain* swap_chain, ID3D12CommandQueue* queue, int encoding);
 void on_d3d12_present(D3D12PresentHook hook);
+// Called on every Present of a D3D12 swap chain the system's Present sees, after the menu (drawn or not): what is shown
+// (the .asi's debug dump of the presented pictures).
+using D3D12ShownHook = void (*)(IDXGISwapChain* swap_chain, ID3D12CommandQueue* queue);
+void on_d3d12_shown(D3D12ShownHook hook);
+// A D3D12 swap chain made on `queue` (the .asi's hooks of the factories' CreateSwapChain*, every one they see - also
+// the ones frame generation makes under its proxy): where DXGI does not hand out a swap chain's queue (Proton's DXGI)
+// and the thread presenting it executed nothing (frame generation's presenting thread), the menu is drawn on that
+// queue. Kept in a table of the menu's (a reference to the queue), the eight newest swap chains.
+void note_swapchain_queue(IDXGISwapChain* swap_chain, ID3D12CommandQueue* queue);
 // The same for a D3D11 swap chain (its device): the .asi's D3D11 Present layers run there when the game's own Present
 // call was not reached.
 using D3D11PresentHook = void (*)(IDXGISwapChain* swap_chain, ID3D11Device* device);
@@ -45,14 +55,13 @@ void on_d3d11_present(D3D11PresentHook hook);
 // the lists it was handed. The .asi's Present layers learn there where their guide copies were submitted.
 using ExecuteObserver = void (*)(ID3D12CommandQueue* queue, unsigned count, ID3D12CommandList* const* lists);
 void on_execute(ExecuteObserver observer);
-// NR Control at the Present of the game's own swap chain (the .asi's hook of it, after its Present layers), as
-// OptiScaler draws its menu in its own swap chain's Present: once a game frame, before frame generation, on the queue
-// (D3D12) or device (D3D11) the swap chain was made with - frame generation makes its frames from the picture with the
-// menu. While it is drawn there the system's Present only runs the hooks (on_d3d12_present / on_d3d11_present).
-// `new_frame` false: a present of a game frame the menu was already drawn on (DLSS-G through NGX presents the generated
-// frame and the real one, both the game's swap chain's, while the layers ran once at its evaluate): drawn, but NR
-// Control's per-presented-frame bookkeeping (layers not run on it, the spatial outlines) is left as the first present of
-// that frame set it - else the layer rows flicker between running and "not run on this presented frame".
+// The Present of the game's own swap chain (the .asi's hook of it, after its Present layers): a game frame. NR Control's
+// per-presented-frame bookkeeping (layers not run on it, the spatial outlines) is done once a game frame, at the first
+// frame the system's Present shows after it - frame generation shows two or more - else the layer rows flicker between
+// running and "not run on this presented frame". `new_frame` false: a present of a game frame already marked (DLSS-G
+// through NGX presents the generated frame and the real one, both the game's swap chain's, while the layers ran once
+// at its evaluate). While the system's Present has not drawn the menu for a second (not hooked, or it sees no
+// presents) the menu is drawn here instead, on the queue (D3D12) or device (D3D11) the swap chain was made with.
 void draw_game(IDXGISwapChain* swap_chain, IUnknown* device, bool new_frame = true);
 // The colour space the game set on `swap_chain` (IDXGISwapChain3::SetColorSpace1, a DXGI_COLOR_SPACE_TYPE); false when
 // it never set one.

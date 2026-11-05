@@ -82,7 +82,7 @@ windows:
       python3 - windows/package/*.zip <<'PY'
       import sys, zipfile
       for f in sys.argv[1:]:
-          if any(n.endswith(('dlssnr.bin', 'dlssnr-small.bin')) for n in zipfile.ZipFile(f).namelist()):
+          if any(n.endswith(('CC_SILVER_AARDWOLD.bin', 'CC_SMALL_FP8.bin', 'dlssnr.bin', 'dlssnr-small.bin')) for n in zipfile.ZipFile(f).namelist()):
               sys.exit(f'model found in {f}')
       PY
   artifacts:

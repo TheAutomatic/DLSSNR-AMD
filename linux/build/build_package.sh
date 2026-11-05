@@ -6,20 +6,21 @@
 #   optiscaler/          OptiScaler (the official nightly, unmodified) and our NR plugin for it (x86_64 only)
 #   model-tools/         rebuilds the model from nvngx_dlssnr.dll at install time
 #   experimental/        makes CC_SMALL_FP8_EXPERIMENTAL's weights from the small model at install time
+#   optimized/           makes CC_SILVER_AARDWOLD_OPTIMIZED's weights from the 310.8 model at install time
 #   install.sh, README.txt
 #
 #   NR_ARCH=x86_64|i686 bash linux/build/build_package.sh [build dir]
-#   NR_MODEL=dlssnr.bin put this model in the package (made from your own DLL by
+#   NR_MODEL=CC_SILVER_AARDWOLD.bin put this model in the package (made from your own DLL by
 #                       linux/package/model-tools/extract_model.sh); without it
 #                       install.sh needs --dll
-#   NR_MODEL_SMALL=dlssnr-small.bin  with NR_MODEL: the new model too (from the 310.9.16 DLL)
+#   NR_MODEL_SMALL=CC_SMALL_FP8.bin  with NR_MODEL: the new model too (from the 310.9.16 DLL)
 #   NR_VERSION=...      override the version (default: from the git tags, linux/build/version.sh)
 #   NR_LANG_EXTRA=<dir> test packages only: extra language files (and fonts/) into dlssnr-amd/lang
 #   NR_SIGN=1           the package's Windows binaries signed (self-signed, linux/build/sign_pe.py)
 #
-# Packages also carry int4/, the int4 mixed option install.sh adds when asked for: the ReShade add-on built again
-# with NR_INT4=1 (this script with NR_INT4=1 NR_PROGRAMS_ONLY=1), the int4 network, its data, the Vulkan layer and the
-# install-time weights generator (build_int4.sh), and its dlssnr-amd.ini.
+# Packages also carry int4/, CC_SILVER_AARDWOLD_OPTIMIZED's int4 layers, which install.sh adds: the ReShade add-on
+# built again with NR_INT4=1 (this script with NR_INT4=1 NR_PROGRAMS_ONLY=1), the network with them, their data, the
+# Vulkan layer and the install-time weights generator (build_int4.sh).
 set -euo pipefail
 model=${NR_MODEL:+$(realpath -- "$NR_MODEL")}
 small=${NR_MODEL_SMALL:+$(realpath -- "$NR_MODEL_SMALL")}
@@ -45,7 +46,7 @@ source linux/build/arch/rdna4.sh
 
 # ---- compile ----------------------------------------------------------------
 common=(-std=c++17 -O2 -DNDEBUG -Itoolchain/Vulkan-Headers/include -Ilinux/src -Ilinux/src/core -Ilinux/src/layer -Ilinux/src/pe -I"$out")
-[[ "${NR_INT4:-0}" == 1 ]] && common+=(-DNR_INT4=1)   # the int4 mixed build of the programs (int4/ below)
+[[ "${NR_INT4:-0}" == 1 ]] && common+=(-DNR_INT4=1)   # the build of the programs with the int4 layers (int4/ below)
 "$cxx" "${common[@]}" "${NR_PRODUCT_DEFINES[@]}" -c linux/src/core/nr_runtime.cpp -o "$out/nr_runtime.o"
 "$cxx" "${common[@]}" -c linux/src/core/nr_native_plan.cpp -o "$out/nr_native_plan.o"
 "$cxx" "${common[@]}" -c linux/src/core/nr_renodx.cpp -o "$out/nr_renodx.o"
@@ -307,7 +308,7 @@ sed 's/^PreprocessorDefinitions=.*/&,RESHADE_DEPTH_INPUT_IS_REVERSED=0/' "$rs/Re
 # and our NR as an OptiScaler plugin (optiscaler/asi): dlssnr-amd.asi, installed into OptiScaler\plugins, which runs NR
 # on the game's own upscaler call and draws NR Control, and NR Control's swap-chain probe (into dlssnr-amd\; the
 # wilsjo2 processing's shaders are in dlssnr-amd\shaders\wilsjo2 for every route, assemble_product_data.sh). The plugin
-# is built with the int4 mixed network (it adds that network's device extensions itself: no Vulkan layer on this route).
+# is built with the int4 layers (it adds the device extensions they need itself: no Vulkan layer on this route).
 if [[ "$arch" == x86_64 ]]; then
     opti_7z=${NR_OPTI_ARCHIVE:-artifacts/ref/downloads/OptiScaler_v10.0.0-pre1_20261030.7z}
     opti_license=${NR_OPTI_LICENSE:-artifacts/ref/optiscaler-nightly-20261030/LICENSE}
@@ -340,9 +341,9 @@ fi
 # dlssnr-amd.ini, put in place at install (the text the programs write themselves, linux/package/make_ini.py)
 python3 linux/package/make_ini.py linux/src/pe/nr_pe_config.cpp "$pkg/ini" > /dev/null
 
-# int4/: the int4 mixed option. The int4 build of the programs that differ, dlssnr-amd/int4 (network,
-# quantisers, recovery tables, settings, layer), the weights generator and the SHA-256 of what it must make from the
-# model (linux/data/int4/<arch>/dlssnr-int4.sha256, checked by install.sh).
+# int4/: CC_SILVER_AARDWOLD_OPTIMIZED's int4 layers. The int4 build of the programs that differ, dlssnr-amd/int4
+# (network, quantisers, recovery tables, settings, layer), the weights generator and the SHA-256 of what it must make
+# from CC_SILVER_AARDWOLD_OPTIMIZED's weights (linux/data/int4/<arch>/dlssnr-int4.sha256, checked by install.sh).
 # i686: no OptiScaler route, so only the add-on; the layer comes in both widths (build_int4.sh NR_LAYER32).
 if [[ "$arch" == x86_64 || "$arch" == i686 ]]; then
     i4="$pkg/int4"
@@ -352,8 +353,10 @@ if [[ "$arch" == x86_64 || "$arch" == i686 ]]; then
     mkdir -p -- "$i4/reshade" "$i4/dlssnr-amd"
     cp -- "$out/int4/dlssnr_amd.addon$bits" "$i4/reshade/"
     cp -r -- "$out/int4/parts/data" "$i4/dlssnr-amd/int4"
+    cp -r -- "$out/int4/parts/data-performance" "$i4/dlssnr-amd/int4-performance"
+    cp -r -- "$out/int4/parts/data-ultra" "$i4/dlssnr-amd/int4-ultra"
     cp -- "$out/int4/parts/dlssnr-int4-weights" "$i4/"
-    cp -- "linux/data/int4/$NR_GPU_ARCH/dlssnr-int4.sha256" "$i4/dlssnr-int4.bin.sha256"
+    cp -- "linux/data/int4/$NR_GPU_ARCH/dlssnr-int4.sha256" "$i4/CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin.sha256"
 fi
 # experimental/: what install.sh makes CC_SMALL_FP8_EXPERIMENTAL's weights with - the difference of its fitted weights
 # from the small model's (linux/data/experimental: each changed entry XOR the small model's, so it holds none of
@@ -362,7 +365,12 @@ fi
 mkdir -p -- "$pkg/experimental"
 cp -- linux/data/experimental/dlssnr-small-experimental.delta "$pkg/experimental/"
 cp -- linux/build/experimental_weights.py "$pkg/experimental/"
-cp -- linux/data/experimental/dlssnr-small-experimental.sha256 "$pkg/experimental/dlssnr-small-experimental.bin.sha256"
+cp -- linux/data/experimental/dlssnr-small-experimental.sha256 "$pkg/experimental/CC_SMALL_FP8_EXPERIMENTAL.bin.sha256"
+# optimized/: the same for CC_SILVER_AARDWOLD_OPTIMIZED, from the 310.8 model's weights (linux/data/optimized). Its shaders
+# are in dlssnr-amd/optimized/; its int4 layers' weights are made from the result (int4/ above).
+mkdir -p -- "$pkg/optimized"
+cp -- linux/data/optimized/dlssnr-optimized.delta linux/build/experimental_weights.py "$pkg/optimized/"
+cp -- linux/data/optimized/dlssnr-optimized.sha256 "$pkg/optimized/CC_SILVER_AARDWOLD_OPTIMIZED.bin.sha256"
 cp -- linux/package/install.sh linux/package/README.txt linux/package/lumenite.py "$pkg/"
 chmod +x "$pkg/install.sh" "$mt/extract_model.sh"
 

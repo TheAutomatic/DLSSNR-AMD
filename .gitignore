@@ -12,6 +12,8 @@ dlssnr-amd.pipelinecache
 # Never commit NVIDIA's files or anything made from them
 *.dll
 *.bin
-# except the int4 mixed tables: per-matrix corrections and calibration means, no weight values
+# except the int4 tables (CC_SILVER_AARDWOLD_OPTIMIZED's int4 layers): per-matrix corrections and calibration means, no
+# weight values
 !/linux/data/int4/**/*.bin
+!/linux/data/int4-ultra/**/*.bin
 nvngx*

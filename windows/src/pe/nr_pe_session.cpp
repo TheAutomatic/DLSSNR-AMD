@@ -3,6 +3,7 @@
 #include "nr_pe_bridge.hpp"
 #include "nr_pe_d3d12split.hpp"
 #include "nr_pe_events.hpp"
+#include "nr_pe_stats.hpp"
 #include "nr_gpu_completion.hpp"
 #include "nrvk.hpp"   // nrvk::blit, compute_only_recording
 #include "nr_wilsjo2.hpp"
@@ -164,19 +165,21 @@ MemoryState read_memory(VkPhysicalDevice physical) {
 
 double mb(uint64_t bytes) { return double(bytes) / (1 << 20); }
 
-// Headroom of video memory left for the game after a build, and the level at which a running network steps aside.
-// The gap between the two is the hysteresis that keeps a build from being made and dropped on alternate seconds.
-// ([Network] Memory Guard = 0: neither.) System memory is not checked: the free commit the system reports is today's
-// limit, not what a system-managed page file grows to, and it held NR back on 32 GB machines with room to spare.
-constexpr uint64_t kVramReserve = 1024ull << 20;
-constexpr uint64_t kVramLow = 384ull << 20;
+// Memory Guard is as loose as it can be (user 11-06: too many players were held back by it): a build is refused only
+// when its own measurement is more than the free video memory (no headroom kept for the game), and a running network
+// steps aside only once the process is over its video memory budget. The hold after a step-aside (10 s, doubling) keeps
+// a build from being made and dropped on alternate seconds. ([Network] Memory Guard = 0: neither.) System memory is not
+// checked: the free commit the system reports is today's limit, not what a system-managed page file grows to, and it
+// held NR back on 32 GB machines with room to spare.
 
 }  // namespace
 
-// The network a runtime config builds (RuntimeConfig::network / int4_mixed), as nr::NetworkChoice.
+// The network a runtime config builds (RuntimeConfig::network / layers), as nr::NetworkChoice.
 static int config_net(const RuntimeConfig& c) {
 #if NR_INT4
-    if (c.network != 1 && c.int4_mixed == 1) return nr::kSilverAardwoldInt4;
+    if (c.network == 3) return nr::network_with_layers(nr::kSilverAardwoldOptimized, std::max(c.layers, 0));
+#else
+    if (c.network == 3) return nr::kSilverAardwoldOptimizedFp8;
 #endif
     return c.network == 2 ? nr::kSmallFp8Experimental : c.network == 1 ? nr::kSmallFp8 : nr::kSilverAardwold;
 }
@@ -265,8 +268,9 @@ struct Session::Impl {
     // The network a runtime runs (nr::NetworkChoice).
     static int net_of(const Runtime& r) {
 #if NR_INT4
-        if (r.int4_mixed()) return nr::kSilverAardwoldInt4;
+        if (r.optimized()) return nr::network_with_layers(nr::kSilverAardwoldOptimized, r.layers());
 #endif
+        if (r.optimized()) return nr::kSilverAardwoldOptimizedFp8;
         if (r.experimental()) return nr::kSmallFp8Experimental;
         return r.network() == NetworkModel::Small ? nr::kSmallFp8 : nr::kSilverAardwold;
     }
@@ -1140,6 +1144,19 @@ struct Session::Impl {
         }
     }
     bool building{}, build_done{};
+    bool build_whole{};          // the build in the background is a whole one (not from a parked network's memory)
+    // Memory Guard's estimate, measured on this GPU (need_for): what the last whole build of each network took - its
+    // own device-local allocations (nr_vram_ledger.hpp build_totals) - per padded pixel of what it was built for.
+    struct Measured { bool valid{}; double weights{}, act_per_px{}, rest_per_px{}; };
+    Measured measured[nr::kNetworkChoices];
+    double table_scale = 1.0;    // measured / the RDNA4 table, the last build measured: shown for a network not built here yet
+    uint32_t build_tag{};   // the build's id in the ledger (nr::vram::BuildScope); 0: not measured (Memory Guard off)
+    uint64_t build_bytes[nr::vram::kKinds]{};   // its own allocations still held when it ended (set by the build thread)
+    double build_px{};           // padded pixels x capacity the build was made for
+    double guess_px(uint32_t w, uint32_t h) const;
+    uint64_t need_for(int net, uint32_t w, uint32_t h, bool* on_this_gpu = nullptr) const;
+    void measure_build(int net, uint32_t w, uint32_t h);
+    uint64_t build_usage0{};     // the process's video memory when it started (0: not known)
     int build_layer{};   // the NR-chain layer whose call started the build
     std::chrono::steady_clock::time_point build_started{};
     // [Network] Model: the network the switch asks for, the one being built, and the one running (Built::net).
@@ -1158,12 +1175,17 @@ struct Session::Impl {
     // shared one is zero-filled at every turn).
     std::map<int, std::map<int, std::chrono::steady_clock::time_point>> net_users;
     int wanted_network_(int model) {
-        const int layer = call_net;
+        // a layer's CC_SILVER_AARDWOLD_OPTIMIZED: at the level [Network] OptimizedLayers says (lower when it cannot run)
+        int layer = call_net < 0 || call_net >= nr::kNetworkChoices ? call_net
+                  : nr::network_with_layers(call_net, net_switch.file().optimized_layers);
+        if (layer == nr::kSilverAardwoldOptimizedUltra && !net_switch.available(layer)) layer = nr::kSilverAardwoldOptimizedPerformance;
+        if (layer == nr::kSilverAardwoldOptimizedPerformance && !net_switch.available(layer)) layer = nr::kSilverAardwoldOptimized;
+        if (layer == nr::kSilverAardwoldOptimized && !net_switch.available(layer)) layer = nr::kSilverAardwoldOptimizedFp8;
         if (layer < 0 || layer >= nr::kNetworkChoices || layer == model) return model;
         if (net_switch.available(layer)) return layer;
         if (said_unavailable.insert(layer).second)
-            log("[nr] a layer's network %s cannot run here (%s); it runs %s", nr::network_codename(layer),
-                net_switch.reason(layer).c_str(), nr::network_codename(model));
+            log("[nr] a layer's network %s cannot run here (%s); it runs %s", nr::network_label(layer),
+                net_switch.reason(layer).c_str(), nr::network_label(model));
         return model;
     }
     std::set<int> said_unavailable;
@@ -1572,43 +1594,127 @@ bool Session::Impl::ensure_slots(uint32_t count) {
 // The activation arena scales with the working extent and it is not small: 1.05
 // GB at 1920x1088 and 4.07 GB at 3840x2176 with every value in its own bytes,
 // about 500 bytes per pixel; 384 MB and 1.53 GB since values share memory by
-// lifetime (nr_graph.cpp `reuse`), about 185 bytes per pixel (200 below, for
-// the small extents' fixed part). NR_ARENA_REUSE=0 turns sharing off. A game at 4K has already taken most of a 16 GB card, so the
+// lifetime (nr_graph.cpp `reuse`), about 185 bytes per pixel - and less again
+// since 0.0.8.2 (below). NR_ARENA_REUSE=0 turns sharing off. A game at 4K has already taken most of a 16 GB card, so the
 // fallback - which runs at output resolution, because it works on the finished
 // frame - asks for four gigabytes that are not there. Allocation then fails
 // somewhere inside the graph build, or succeeds by evicting the game's own
 // resources, and what the player sees is a black frame and a crash.
 //
 // Refusing with a number in the log is strictly better than either.
-static uint64_t arena_bytes_per_pixel() {
+//
+// The estimate is measured on the player's GPU (need_for, measure_build): each whole build's own allocations, so any
+// GPU, driver and network path counts as it is (RDNA3 took more than twice RDNA4's); in this session only (no file).
+// The table below is only shown before that; Memory Guard never refuses on it.
+// The table (11-05): what one whole build of the network asked for takes - its weights, activation arena, images and
+// history - as device memory measured around one build of each network at 1920x1080, 2560x1440 and 3840x2160
+// (RX 9070 XT): MiB = fixed + per megapixel of the padded working extent, the line through
+// the three, plus a quarter. It was 200 bytes a pixel + 300 MB for every network, from before the 0.0.8.2 memory work
+// halved a network's memory: about twice what a build takes now (4K: 1894 MB against 0.8 - 1.0 GB measured), and
+// switches were refused while the network left still held its memory. A build from a parked network (its weights
+// kept) is not checked here (Runtime::share_for); one whose weights went to RAM is, as a whole build (an upper bound).
+// NR_ARENA_REUSE=0 (no sharing in the arena): the old 520 bytes a pixel + 300 MB.
+// {fixed MiB, MiB per padded megapixel}: measured on an RX 9070 XT (Mesa 26.2.6, cold builds), MiB at
+// 1920x1080 / 2560x1440 / 3840x2160: CC_SMALL_FP8 and _EXPERIMENTAL 320 / 461 / 806, CC_SILVER_AARDWOLD and OPTIMIZED
+// Quality 397 / 569 / 934, OPTIMIZED Balanced 421 / 598 / 978; the least-squares line raised to the highest point.
+// Performance and Ultra Performance: Balanced's (the biggest measured). Other GPUs can need much more (RDNA3); the
+// first build measured on the GPU takes over.
+#define NR_MEM_SMALL 171, 78
+#define NR_MEM_ORIGINAL 251, 85
+#define NR_MEM_OPT_QUALITY 251, 85
+#define NR_MEM_OPT_BALANCED 268, 88
+#define NR_MEM_OPT_PERFORMANCE 268, 88
+#define NR_MEM_OPT_ULTRA 268, 88
+#define NR_MEM_LARGEST 268, 88
+struct BuildMemory { double fixed_mib, mib_per_mpx; };
+static BuildMemory build_memory(int net) {
+    switch (net) {
+        case nr::kSmallFp8: case nr::kSmallFp8Experimental: return {NR_MEM_SMALL};
+        case nr::kSilverAardwold: return {NR_MEM_ORIGINAL};
+        case nr::kSilverAardwoldOptimizedFp8: return {NR_MEM_OPT_QUALITY};
+        case nr::kSilverAardwoldOptimized: return {NR_MEM_OPT_BALANCED};
+        case nr::kSilverAardwoldOptimizedPerformance: return {NR_MEM_OPT_PERFORMANCE};
+        case nr::kSilverAardwoldOptimizedUltra: return {NR_MEM_OPT_ULTRA};
+        default: return {NR_MEM_LARGEST};
+    }
+}
+static uint64_t table_need(int net, uint32_t w, uint32_t h) {
+    const double px = double((w + 63) / 64 * 64) * double((h + 63) / 64 * 64);
     const char* e = std::getenv("NR_ARENA_REUSE");
-    return e && *e && std::atoi(e) == 0 ? 520 : 200;
+    if (e && *e && std::atoi(e) == 0) return uint64_t(px * 520) + (300ull << 20);
+    const BuildMemory m = build_memory(net);
+    return uint64_t((m.fixed_mib + m.mib_per_mpx * px / 1e6) * 1.25 * double(1 << 20));
+}
+
+// The padded pixels a whole build at w x h is made for, with the room the build will add (start_build's capacity:
+// the game's guides' size, or kDrsCapacity while the size moves).
+double Session::Impl::guess_px(uint32_t w, uint32_t h) const {
+    const double px = double(w) * double(h);
+    double capacity = 1.0;
+    if (size_hint_px > uint64_t(px * 1.02)) capacity = std::min(4.0, double(size_hint_px) / px * 1.02);
+    else if (drs_active()) capacity = kDrsCapacity;
+    return double((w + 63) / 64 * 64) * double((h + 63) / 64 * 64) * capacity;
+}
+
+// What a whole build of `net` at w x h will take. Measured on this GPU once a build of that network was in this session
+// (measure_build): its weights, plus its arena and images per padded pixel (an arena another network already
+// holds and lends it is not counted again) - no margin on top (user 11-06: as loose as it can be). Before that: the
+// RDNA4 table above, scaled by how far the last build measured on this GPU was from it - shown, never refused on
+// (fits_in_memory). `on_this_gpu`: this network's own measurement on this GPU was used.
+uint64_t Session::Impl::need_for(int net, uint32_t w, uint32_t h, bool* on_this_gpu) const {
+    if (on_this_gpu) *on_this_gpu = false;
+    const char* e = std::getenv("NR_ARENA_REUSE");
+    if (e && *e && std::atoi(e) == 0) return table_need(net, w, h);
+    const bool known = net >= 0 && net < nr::kNetworkChoices && measured[net].valid;
+    if (!known) return uint64_t(double(table_need(net, w, h)) * table_scale);
+    if (on_this_gpu) *on_this_gpu = true;
+    const Measured& m = measured[net];
+    const double px = guess_px(w, h);
+    double act = m.act_per_px * px;
+    if (act_for(net)) act = 0;   // another network's arena is lent to it (loose: its size is not compared)
+    return uint64_t(m.weights + act + m.rest_per_px * px);
+}
+
+// A whole build adopted: what it took on this GPU becomes `net`'s estimate (need_for).
+void Session::Impl::measure_build(int net, uint32_t w, uint32_t h) {
+    uint64_t total = 0;
+    for (uint64_t b : build_bytes) total += b;
+    if (!total || build_px <= 0 || net < 0 || net >= nr::kNetworkChoices) return;
+    const double weights = double(build_bytes[nr::vram::kWeights]);
+    const double act = double(build_bytes[nr::vram::kActivations]);
+    if (weights <= 0) return;   // not a whole build's (the weights came from a parked network)
+    Measured& m = measured[net];
+    m.weights = weights;
+    // an arena of its own (none when another network's was lent to it: then the last one measured, or the biggest rate
+    // of another network)
+    if (act > 0) m.act_per_px = act / build_px;
+    else if (!m.valid)
+        for (const auto& o : measured) m.act_per_px = std::max(m.act_per_px, o.act_per_px);
+    m.rest_per_px = (double(total) - weights - act) / build_px;
+    m.valid = true;
+    if (act > 0) {   // a whole build with its own arena, as the table's
+        table_scale = std::clamp(double(total) / double(table_need(net, w, h)) * 1.25, 0.5, 4.0);
+    }
 }
 
 bool Session::Impl::fits_in_memory(uint32_t w, uint32_t h, bool quiet) {
-    // The arena is sized from the padded working extent, the frame-sized images from the frame; plus weights and
-    // scratch.
-    const uint64_t pixels = uint64_t((w + 63) / 64 * 64) * ((h + 63) / 64 * 64);
-    // RDNA3 keeps an FP16 twin of the arena and of the weights beside them (nr_graph.cpp): three times both.
-    const uint64_t twins = (bdev ? bdev->rdna3() : vkdevice::runs_rdna3(handles.device)) ? 3 : 1;
-    const uint64_t need = (pixels * arena_bytes_per_pixel() + (300ull << 20)) * twins + uint64_t(w) * h * 48;
+    if (!net_switch.file().memory_guard) return true;   // [Network] Memory Guard = 0: nothing of it runs
+    // A whole build of the network asked for (need_for: measured on this GPU - RDNA3's FP16 twins of the arena and the
+    // weights included). A network never built on this GPU is built and measured: no refusal on a guess.
+    bool here = false;
+    const uint64_t need = need_for(net_want, w, h, &here);
+    const char* source = here ? "measured on this GPU" : "not measured on this GPU yet: built, then measured";
 
     const MemoryState m = read_memory(handles.physical);
-    if (!net_switch.file().memory_guard) {   // [Network] Memory Guard = 0
-        if (!quiet)
-            log("[nr] %ux%u needs about %.0f MB; free: VRAM %.0f MB, commit %.0f MB (Memory Guard off: not checked)", w, h,
-                mb(need), mb(m.vram_free), mb(m.commit_free));
-        return true;
-    }
-    const bool short_of = m.vram_known && need + kVramReserve > m.vram_free;
+    const bool short_of = here && m.vram_known && need > m.vram_free;
     if (quiet) return !short_of;
     if (short_of) {
         char message[320];
         std::snprintf(message, sizeof message,
-                      "the network needs about %.0f MB at %ux%u and %.0f MB of video memory is free, %.0f MB of which "
-                      "stays with the game; not building it. Running the network before the upscaler (a smaller "
-                      "extent) makes room; Memory Guard off builds it anyway.",
-                      mb(need), w, h, mb(m.vram_free), mb(kVramReserve));
+                      "the network needs about %.0f MB at %ux%u (measured on this GPU) and only %.0f MB of video memory "
+                      "is free; not building it. Running the network before the upscaler (a smaller extent) makes "
+                      "room; Memory Guard off builds it anyway.",
+                      mb(need), w, h, mb(m.vram_free));
         status = message;
         const auto now = std::chrono::steady_clock::now();
         auto& said = vram_said[uint64_t(w) << 32 | h];
@@ -1619,8 +1725,8 @@ bool Session::Impl::fits_in_memory(uint32_t w, uint32_t h, bool quiet) {
         return false;
     }
     vram_said.erase(uint64_t(w) << 32 | h);   // (a later refusal is noted at once)
-    log("[nr] %ux%u needs about %.0f MB; free: VRAM %.0f MB, commit %.0f MB", w, h, mb(need), mb(m.vram_free),
-        mb(m.commit_free));
+    log("[nr] %ux%u needs about %.0f MB (%s); free: VRAM %.0f MB, commit %.0f MB", w, h, mb(need), source,
+        mb(m.vram_free), mb(m.commit_free));
     return true;
 }
 
@@ -1628,7 +1734,7 @@ bool Session::Impl::fits_in_memory(uint32_t w, uint32_t h, bool quiet) {
 // **The running network steps aside when the machine runs short.** Checked at
 // most twice a second. The game grows after the build was admitted - loading a
 // zone, a resize, another program - and at the limit it is the game that gets
-// the failed allocation. So below kVramLow every resident network
+// the failed allocation. So once the process is over its budget every resident network
 // is retired: taken out of use at once (frames pass through) and destroyed a
 // few frames later, when nothing the GPU still has in flight can reference it
 // (on the paths that record into the game's command list there is no fence of
@@ -1649,12 +1755,15 @@ bool Session::Impl::memory_guard() {
             ++it;
         }
     }
+    if (!net_switch.file().memory_guard) {   // [Network] Memory Guard = 0: nothing of it, a hold from when it was on ends
+        hold_until = {}; guard_trips = 0;
+        return true;
+    }
     if (now < guard_next) return now >= hold_until;
     guard_next = now + std::chrono::milliseconds(500);
     if (cache.empty() && parked.empty()) return now >= hold_until;
-    if (!net_switch.file().memory_guard) return now >= hold_until;   // [Network] Memory Guard = 0
     const MemoryState m = read_memory(handles.physical);
-    if (!(m.vram_known && m.vram_free < kVramLow)) return now >= hold_until;
+    if (!(m.vram_known && m.vram_free == 0)) return now >= hold_until;   // at or over its budget only
 
     const unsigned hold = std::min(10u << std::min(guard_trips, 4u), 160u);
     ++guard_trips;
@@ -1767,7 +1876,7 @@ void Session::Impl::park(size_t index, const char* why) {
             p.core = std::move(core);
             p.format = e.format; p.net = e.net; p.width = e.width; p.height = e.height; p.last = e.last;
             parked.push_back(std::move(p));
-            events::note(events::kResidency, "%s at %ux%u parked: its weights stay, its runtimes and images go %s", nr::network_codename(e.net),
+            events::note(events::kResidency, "%s at %ux%u parked: its weights stay, its runtimes and images go %s", nr::network_label(e.net),
                 e.width, e.height, why);
         }
     }
@@ -1817,7 +1926,7 @@ void Session::Impl::poll_offload() {
     offload_weights.clear();
     for (const auto& p : parked)
         if (p.core == offloading)
-            events::note(events::kResidency, "%s at %ux%u: %s", nr::network_codename(p.net), p.width, p.height,
+            events::note(events::kResidency, "%s at %ux%u: %s", nr::network_label(p.net), p.width, p.height,
                 offload_ok ? "its weights moved to RAM, its video memory freed" : "its weights could not be moved to RAM");
     if (!offload_ok)   // not tried again: freed instead
         for (size_t i = parked.size(); i-- > 0;)
@@ -1839,14 +1948,14 @@ void Session::Impl::publish_residency(int mode, bool nr_off) {
         r.nets.push_back({p.net, p.core == offloading ? 3 : network_offloaded(*p.core) ? 4 : 2, p.width, p.height});
     if (offloading) {
         for (const auto& p : parked)
-            if (p.core == offloading) r.status = std::string("moving ") + nr::network_codename(p.net) + "'s weights to RAM";
+            if (p.core == offloading) r.status = std::string("moving ") + nr::network_label(p.net) + "'s weights to RAM";
     } else if (building) {
-        r.status = std::string("building ") + (build_net >= 0 ? nr::network_codename(build_net) : "a network");
+        r.status = std::string("building ") + (build_net >= 0 ? nr::network_label(build_net) : "a network");
     }
     r.reason = residency_why;
-    if (width && height) {   // fits_in_memory's estimate at the serving extent
+    if (width && height && net_switch.file().memory_guard) {   // fits_in_memory's estimate (Memory Guard on only)
         r.need_w = width; r.need_h = height;
-        r.need = uint64_t((width + 63) / 64 * 64) * ((height + 63) / 64 * 64) * arena_bytes_per_pixel() + (300ull << 20);
+        r.need = need_for(net_want, width, height);
     }
     events::publish(std::move(r));
 }
@@ -1880,7 +1989,7 @@ void Session::Impl::residency(bool switched, bool nr_off) {
         if (ram_short() && !parked.empty() && !offloading) {
             size_t lru = 0;
             for (size_t i = 1; i < parked.size(); ++i) if (parked[i].last < parked[lru].last) lru = i;
-            events::note(events::kResidency, "parked %s freed (RAM is short)", nr::network_codename(parked[lru].net));
+            events::note(events::kResidency, "parked %s freed (RAM is short)", nr::network_label(parked[lru].net));
             parked.erase(parked.begin() + long(lru));
         }
         return;
@@ -1910,7 +2019,7 @@ void Session::Impl::residency(bool switched, bool nr_off) {
         for (size_t i = 0; i < parked.size(); ++i)
             if (!reloading(parked[i]) && network_offloaded(*parked[i].core) && (lru == parked.size() || parked[i].last < parked[lru].last)) lru = i;
         if (lru < parked.size()) {
-            events::note(events::kResidency, "%s freed from RAM (RAM is short)", nr::network_codename(parked[lru].net));
+            events::note(events::kResidency, "%s freed from RAM (RAM is short)", nr::network_label(parked[lru].net));
             parked.erase(parked.begin() + long(lru));
         }
     }
@@ -1926,12 +2035,12 @@ void Session::Impl::residency(bool switched, bool nr_off) {
     if (!short_now && !old) return;
     if (ram_short()) {
         log_state();
-        events::note(events::kResidency, "parked %s at %ux%u freed (%s; RAM is short too)", nr::network_codename(parked[lru].net),
+        events::note(events::kResidency, "parked %s at %ux%u freed (%s; RAM is short too)", nr::network_label(parked[lru].net),
             parked[lru].width, parked[lru].height, short_now ? "video memory is short" : "video memory is getting full");
         parked.erase(parked.begin() + long(lru));
     } else if (start_offload(parked[lru])) {
         log_state();
-        events::note(events::kResidency, "parked %s at %ux%u: moving its weights to RAM (%s)", nr::network_codename(parked[lru].net),
+        events::note(events::kResidency, "parked %s at %ux%u: moving its weights to RAM (%s)", nr::network_label(parked[lru].net),
             parked[lru].width, parked[lru].height, short_now ? "video memory is short" : "video memory is getting full");
     } else {
         return;   // still in flight: next check
@@ -2078,6 +2187,7 @@ bool Session::Impl::ensure_runtime(const Controls& controls, uint32_t w, uint32_
     const bool ok = ensure_runtime_(controls, w, h, format);
     ++(ok ? ran : passed);
     if (!ok) ++pass_why[status.empty() ? std::string("no reason recorded") : status];
+    nr::pe::stats::evaluate(call_layer, ok, ok ? std::string() : status);   // the whole session's (NR Control, the report)
     {
         auto& m = feature_max[current_feature];
         m.first = std::max(m.first, w); m.second = std::max(m.second, h);
@@ -2120,6 +2230,7 @@ bool Session::Impl::ensure_runtime(const Controls& controls, uint32_t w, uint32_
             }
             pass_why.clear();
             ran_total += ran; passed_total += passed; ran = passed = 0;
+            if (nr::pe::stats::log_due()) nr::pe::stats::log_text(4);   // every 5 minutes: the whole session's, short
             pass_logged = now;
         }
     }
@@ -2195,11 +2306,29 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
                 runtime = adopted.runtime.get();
                 width = adopted.width; height = adopted.height; this->format = adopted.format;
                 running_net = adopted.net;
+                // Memory Guard's estimate against the build, before the networks left are let go (the game's own
+                // allocations meanwhile count in too)
+                if (build_whole && build_tag && net_switch.file().memory_guard) {
+                    bool here = false;
+                    const double before = double(need_for(adopted.net, adopted.width, adopted.height, &here)) / (1 << 20);
+                    measure_build(adopted.net, adopted.width, adopted.height);
+                    const double took = double(build_bytes[nr::vram::kWeights] + build_bytes[nr::vram::kActivations] +
+                                               build_bytes[nr::vram::kUnset]) / (1 << 20);
+                    double grew = -1;
+                    if (Vram v0; build_usage0 && vram(v0)) grew = (double(v0.usage) - double(build_usage0)) / (1 << 20);
+                    log("[nr] Memory Guard: %s at %ux%u took %.0f MiB of video memory (weights %.0f, activations %.0f, "
+                        "images and buffers %.0f; the process grew %.0f MiB meanwhile); estimated %.0f MB before (%s)",
+                        nr::network_label(adopted.net), adopted.width, adopted.height, took,
+                        double(build_bytes[nr::vram::kWeights]) / (1 << 20),
+                        double(build_bytes[nr::vram::kActivations]) / (1 << 20),
+                        double(build_bytes[nr::vram::kUnset]) / (1 << 20), grew, before,
+                        here ? "from this GPU" : "from the table");
+                }
                 // A network switch: what happens to the networks it left ([Network] Residency)
                 residency(true, false);
                 if (Vram v; vram(v))
                     log("[nr] %s serving; %zu runtimes, %zu parked; this process's video memory %.0f MiB (budget %.0f MiB)",
-                        nr::network_codename(running_net), cache.size(), parked.size(), double(v.usage) / (1 << 20),
+                        nr::network_label(running_net), cache.size(), parked.size(), double(v.usage) / (1 << 20),
                         double(v.budget) / (1 << 20));
                 oom_failures = 0;
                 retry_at = {};
@@ -2292,6 +2421,7 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
     // A parked network of this configuration (Residency auto): its memory is still there, only a runtime is made. The
     // runtime checks the core fits this extent and makes a whole network when it does not (the log says so).
     poll_offload();
+    int parked_from = -1;
     for (const auto& p : parked) {
         if (share) break;
         if (p.net != net_want || p.format != format || !core_runs(*p.core, w, h))
@@ -2302,7 +2432,7 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
             return false;
         }
         share = p.core;
-        log("[nr] %ux%u: %s is parked (its weights kept): a runtime is made from it", w, h, nr::network_codename(p.net));
+        parked_from = p.net;   // said once the build starts (below): not on every frame it waits for room
     }
     // A frame size of a working extent no plan covers yet, with a resident network of this configuration: the plan in
     // the background (no device memory, ~0.15 s), then its runtimes inside the frames (inframe).
@@ -2331,6 +2461,8 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
     }
     // a parked network whose weights are in RAM needs room too (the weights, perhaps an arena)
     if ((!share || network_offloaded(*share)) && !make_room(w, h)) return false;
+    if (parked_from >= 0)
+        log("[nr] %ux%u: %s is parked (its weights kept): a runtime is made from it", w, h, nr::network_label(parked_from));
     RuntimeConfig config = make_config(w, h, format);
     config.share = share;
     // the activation arena: a whole build's own or another kind's; a parked network moved to RAM gets one back too
@@ -2355,12 +2487,15 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
     build_share.reset();
     for (const auto& p : parked) if (p.core == share) build_share = share;
     building = true; build_w = w; build_h = h; build_format = format;
+    build_whole = !share || network_offloaded(*share);   // Memory Guard's estimate against what the build took (adoption)
+    build_usage0 = 0;
+    if (Vram v; build_whole && vram(v)) build_usage0 = v.usage;
     build_started = std::chrono::steady_clock::now();
     nr::g_build_stage = 1; nr::g_build_pipes_done = 0; nr::g_build_pipes_total = 0;
     build_layer = call_layer;
     build_net = net_want;
     status = "building the network in the background; frames pass through until it is ready";
-    events::note(events::kNetwork, "network asked for: %s", nr::network_codename(net_want));
+    events::note(events::kNetwork, "network asked for: %s", nr::network_label(net_want));
     {
         VkPhysicalDeviceProperties gpu{};
         vkGetPhysicalDeviceProperties(handles.physical, &gpu);
@@ -2370,8 +2505,15 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
         const std::string why = nr::binary::disabled_why();
         if (!why.empty() && why != said) { said = why; log("[nr] ACO Mode is off for this run: %s", why.c_str()); }
     }
-    build_thread = std::thread([this, host, config, temporal, access_copy] {
+    // Measured only with Memory Guard on; ids unique in the process (the ledger is one for every session).
+    static std::atomic<uint32_t> build_ids{0};
+    build_tag = 0;
+    if (net_switch.file().memory_guard) do build_tag = ++build_ids; while (!build_tag);
+    std::fill(std::begin(build_bytes), std::end(build_bytes), 0);
+    build_px = double((w + 63) / 64 * 64) * double((h + 63) / 64 * 64) * config.capacity;
+    build_thread = std::thread([this, host, config, temporal, access_copy, tag = build_tag] {
         nr::pe::watchdog::Phase phase("building the network (background)");
+        nr::vram::BuildScope measured_as(tag);   // its allocations, for Memory Guard's estimate (measure_build; 0: none)
         const auto t0 = std::chrono::steady_clock::now();
         std::unique_ptr<Runtime> made;
         std::string error;
@@ -2426,11 +2568,11 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
                 throw;   // host memory: the whole build is retried later
             } catch (const std::exception& e) {
 #if NR_INT4
-                // an int4 mixed build that fails (its weights file damaged, from other data...) gives the default one
-                if (config.int4_mixed == 1) {
-                    log("[nr] int4 mixed network failed: %s; building the default network", e.what());
+                // a build with int4 layers (Balanced, Performance) that fails (their weights file damaged, ...) gives Quality
+                if (config.network == 3 && config.layers >= nr::kLayersBalanced) {
+                    log("[nr] %s failed: %s; building it at Quality (no int4 layers)", nr::network_label(config_net(config)), e.what());
                     RuntimeConfig fallback = config;
-                    fallback.int4_mixed = 0;
+                    fallback.layers = nr::kLayersQuality;
                     // A driver that takes no ACO machine code fails the int4 network and then this one as well.
                     try {
                         build(fallback);
@@ -2457,7 +2599,10 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
             error = std::string("neural rendering unavailable: ") + e.what();
         }
         const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        uint64_t bytes[nr::vram::kKinds]{};
+        if (made && tag) nr::vram::build_totals(tag, bytes);
         std::lock_guard<std::mutex> guard(build_lock);
+        std::copy(std::begin(bytes), std::end(bytes), build_bytes);
         built = std::move(made); build_error = error; build_seconds = seconds; build_done = true;
         build_oom = oom;
     });
@@ -2469,10 +2614,12 @@ RuntimeConfig Session::Impl::make_config(uint32_t w, uint32_t h, VkFormat f) con
     RuntimeConfig config;
     config.root = root; config.width = w; config.height = h; config.colour_format = f;
     config.motion_point = motion_point;
-    // RuntimeConfig::network: 1 the small model, 2 CC_SMALL_FP8_EXPERIMENTAL, 0 the 310.8 one
-    config.network = net_want == nr::kSmallFp8 ? 1 : net_want == nr::kSmallFp8Experimental ? 2 : 0;
+    // RuntimeConfig::network: 1 the small model, 2 CC_SMALL_FP8_EXPERIMENTAL, 3 CC_SILVER_AARDWOLD_OPTIMIZED, 0 the
+    // 310.8 one
+    config.network = net_want == nr::kSmallFp8 ? 1 : net_want == nr::kSmallFp8Experimental ? 2
+                   : nr::network_optimized(net_want) ? 3 : 0;
 #if NR_INT4
-    config.int4_mixed = net_want == nr::kSilverAardwoldInt4 ? 1 : 0;
+    config.layers = nr::network_optimized(net_want) ? nr::network_layers(net_want) : nr::kLayersQuality;
 #endif
     return config;
 }
@@ -2802,13 +2949,13 @@ void Session::Impl::check_availability() {
         const DWORD a = nr::u8::attributes((root + "\\" + rel).c_str());
         return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
     };
-    if (!exists("dlssnr-amd\\dlssnr-small.bin"))
+    if (!exists("dlssnr-amd\\CC_SMALL_FP8.bin"))
         net_switch.unavailable(nr::kSmallFp8, "needs the model of the 310.9.16 nvngx_dlssnr.dll (install.ps1 -Dll)");
-    if (!exists("dlssnr-amd\\dlssnr.bin"))
+    if (!exists("dlssnr-amd\\CC_SILVER_AARDWOLD.bin"))
         net_switch.unavailable(nr::kSilverAardwold, "the model file is missing (run install.bat again)");
     if (!exists("dlssnr-amd\\experimental\\shaders\\fixed-attention.txt"))
         net_switch.unavailable(nr::kSmallFp8Experimental, "not installed (run install.bat again)");
-    else if (!exists("dlssnr-amd\\dlssnr-small-experimental.bin"))
+    else if (!exists("dlssnr-amd\\CC_SMALL_FP8_EXPERIMENTAL.bin"))
         net_switch.unavailable(nr::kSmallFp8Experimental, "needs the model of the 310.9.16 nvngx_dlssnr.dll (install.ps1 -Dll)");
     else if (make_host().rdna3)
         net_switch.unavailable(nr::kSmallFp8Experimental, "not on RDNA3 GPUs (RX 7000, Radeon 700M / 800M / 8000S)");
@@ -2818,24 +2965,42 @@ void Session::Impl::check_availability() {
             : "needs ACO Mode, which is off for this run: " + nr::binary::disabled_why());
     else if (!nr::binary::enabled(handles.device))
         net_switch.unavailable(nr::kSmallFp8Experimental, "the game's device has no pipeline binaries (ACO Mode)");
-#if NR_INT4
-    if (!exists("dlssnr-amd\\dlssnr.bin"))
-        net_switch.unavailable(nr::kSilverAardwoldInt4, "the model file is missing (run install.bat again)");
-    else if (!exists("dlssnr-amd\\int4\\settings.txt"))
-        net_switch.unavailable(nr::kSilverAardwoldInt4, "not installed (run install.bat again)");
-    else if (!exists("dlssnr-amd\\dlssnr-int4.bin"))
-        net_switch.unavailable(nr::kSilverAardwoldInt4, "its weights were not made at install (run install.bat again)");
+    // CC_SILVER_AARDWOLD_OPTIMIZED (Quality; ACO Mode only, as CC_SMALL_FP8_EXPERIMENTAL), then its int4 layers on top
+    // (Balanced, then Performance, Ultra Performance)
+    if (!exists("dlssnr-amd\\CC_SILVER_AARDWOLD.bin"))
+        net_switch.unavailable(nr::kSilverAardwoldOptimizedFp8, "the model file is missing (run install.bat again)");
+    else if (!exists("dlssnr-amd\\optimized\\shaders\\fixed-attention.txt"))
+        net_switch.unavailable(nr::kSilverAardwoldOptimizedFp8, "not installed (run install.bat again)");
+    else if (!exists("dlssnr-amd\\CC_SILVER_AARDWOLD_OPTIMIZED.bin"))
+        net_switch.unavailable(nr::kSilverAardwoldOptimizedFp8, "its weights were not made at install (run install.bat again)");
     else if (make_host().rdna3)
-        net_switch.unavailable(nr::kSilverAardwoldInt4, "not on RDNA3 GPUs (RX 7000, Radeon 700M / 800M / 8000S)");
+        net_switch.unavailable(nr::kSilverAardwoldOptimizedFp8, "not on RDNA3 GPUs (RX 7000, Radeon 700M / 800M / 8000S)");
     else if (nr::binary::directory().empty())
-        net_switch.unavailable(nr::kSilverAardwoldInt4, nr::binary::disabled_why().empty()
+        net_switch.unavailable(nr::kSilverAardwoldOptimizedFp8, nr::binary::disabled_why().empty()
             ? std::string("needs ACO Mode, which is off for this run")
             : "needs ACO Mode, which is off for this run: " + nr::binary::disabled_why());
     else if (!nr::binary::enabled(handles.device))
-        net_switch.unavailable(nr::kSilverAardwoldInt4, "the game's device has no pipeline binaries (ACO Mode)");
+        net_switch.unavailable(nr::kSilverAardwoldOptimizedFp8, "the game's device has no pipeline binaries (ACO Mode)");
+    if (!net_switch.reason(nr::kSilverAardwoldOptimizedFp8).empty())
+        net_switch.unavailable(nr::kSilverAardwoldOptimized, net_switch.reason(nr::kSilverAardwoldOptimizedFp8));
+#if NR_INT4
+    else if (!exists("dlssnr-amd\\int4\\settings.txt"))
+        net_switch.unavailable(nr::kSilverAardwoldOptimized, "its int4 layers are not installed (run install.bat again)");
+    else if (!exists("dlssnr-amd\\CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin"))
+        net_switch.unavailable(nr::kSilverAardwoldOptimized, "its int4 weights were not made at install (run install.bat again)");
 #else
-    net_switch.unavailable(nr::kSilverAardwoldInt4, "not in this build");
+    else
+        net_switch.unavailable(nr::kSilverAardwoldOptimized, "its int4 layers are not in this build");
 #endif
+    // Performance and Ultra Performance: Balanced's needs (the int4 weights are one file, their FP8 weights in the
+    // optimized pack) and their own data
+    for (const auto& [lv, dir] : {std::pair<int, const char*>{nr::kSilverAardwoldOptimizedPerformance, "dlssnr-amd\\int4-performance\\settings.txt"},
+                                  std::pair<int, const char*>{nr::kSilverAardwoldOptimizedUltra, "dlssnr-amd\\int4-ultra\\settings.txt"}}) {
+        if (!net_switch.reason(nr::kSilverAardwoldOptimized).empty())
+            net_switch.unavailable(lv, net_switch.reason(nr::kSilverAardwoldOptimized));
+        else if (!exists(dir))
+            net_switch.unavailable(lv, "not installed (run install.bat again)");
+    }
 }
 
 void Session::Impl::release_output() {
@@ -3543,6 +3708,7 @@ void Session::log_totals() {
     if (r + p)
         log("[nr] session: %llu evaluations ran the network, %llu passed the frame through", (unsigned long long)r,
             (unsigned long long)p);
+    if (r + p) nr::pe::stats::log_text(12);
 }
 
 Session::~Session() {

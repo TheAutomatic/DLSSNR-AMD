@@ -13,7 +13,7 @@ Notes for contributors and coding assistants. README.md covers what the project 
 
 ## Things that must stay true
 
-- **No NVIDIA files.** Never commit `nvngx_dlssnr.dll`, the weights, `dlssnr.bin`, `dlssnr-small.bin`, tensors extracted
+- **No NVIDIA files.** Never commit `nvngx_dlssnr.dll`, the weights, `CC_SILVER_AARDWOLD.bin`, `CC_SMALL_FP8.bin` (before 0.0.8.3 `dlssnr.bin`, `dlssnr-small.bin`), tensors extracted
   from the DLL, or packages that contain them. The model reaches users only through
   `linux/package/model-tools/extract_model.sh` run on their own DLL. CI checks that packages carry no model.
 - **Host and shaders agree.** The C++ host is compiled with the defines in `*/build/arch/rdna4.sh`,
@@ -23,16 +23,17 @@ Notes for contributors and coding assistants. README.md covers what the project 
   where the original uses FP8, FP16/FP32 elsewhere. No new lower-precision boundary, no truncated
   inputs or lookup tables. Changing the order of a reduction changes the picture too - it is not a free
   reordering.
-  The optional int4 mixed network (`NR_INT4=1`, `linux/shaders/rdna4/pipelines-int4.json`) is the one
-  exception: it trades precision for speed by design and is installed only when asked for.
+  The int4 layers of `CC_SILVER_AARDWOLD_OPTIMIZED` (`NR_INT4=1`, `linux/shaders/rdna4/pipelines-int4.json`,
+  `[Network] OptimizedLayers`) are the one exception: they trade precision for speed by design, and switch off.
 - **RenoDX's shaders stay RenoDX's.** `linux/shaders/renodx/` is RenoDX's code under its MIT licence; changes
   there are speed changes that leave every output bit as it was, each listed in the README in that folder.
 - **Windows ACO Mode has a record for every network SPIR-V.** ACO Mode (the Windows default) runs the Linux
-  network shaders (`linux/build/build_network.py rdna4`, int4 mixed's with `--int4`) as machine code from
+  network shaders (`linux/build/build_network.py rdna4`, also `--experimental`, `--optimized`, `--int4`, `--performance` and `--ultra`) as machine code from
   `windows/data/aco/records` and `windows/data/aco/int4/records`, found by the SPIR-V's hash. A new or changed
   Linux network shader needs new records in both (a missing one turns ACO Mode off for the run), and a new
   pipeline whose name has no native Windows shader needs a template alias in `shell-aliases.txt`.
-  Windows int4 mixed runs with ACO Mode only.
+  `CC_SMALL_FP8_EXPERIMENTAL` and `CC_SILVER_AARDWOLD_OPTIMIZED` (with or without its int4 layers) run with ACO
+  Mode only.
 - **No D3D device or swap chain inside the game's process** on Windows (NR Control): OptiScaler's hooks
   take them for the game's. `nr_present_probe.exe` finds DXGI's methods in a process of its own.
 - **Weight packing.** A new kernel that reads weights must be added to the host's weight packing

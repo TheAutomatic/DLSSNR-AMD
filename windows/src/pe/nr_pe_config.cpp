@@ -5,9 +5,7 @@
 #include "nr_number.hpp"
 #include "nr_pe_config.hpp"
 #include "nr_pe_events.hpp"
-#if NR_INT4
 #include "nr_ini_int4.hpp"
-#endif
 #include "nr_ini_network.hpp"
 #include "nr_pe_log.hpp"
 #include "nr_pipeline_binary.hpp"
@@ -379,6 +377,7 @@ bool parse(const std::string& path, Config& c, bool& legacy) {
             else if (key == "resize history") { if (auto b = parse_bool(value)) n.resize_history = *b; }
             else if (key == "style grade") { if (auto b = parse_bool(value)) n.style_grade = *b; }
             else if (key == "memory guard") { if (auto b = parse_bool(value)) n.memory_guard = *b; }
+            else if (key == "optimizedlayers") { if (const int v = nr::optimized_layers_value(value); v >= 0) n.optimized_layers = v; }
             else if (key == "history precision") {
                 const std::string v = lower(value);
                 if (v == "16" || v == "fp16" || v == "half" || v == "rgba16f") n.history_f16 = true;
@@ -396,7 +395,8 @@ bool parse(const std::string& path, Config& c, bool& legacy) {
             else if (key == "sound") { if (auto b = parse_bool(value)) old_sound = *b; }
             continue;
         }
-        if (value.empty()) continue;
+        // "auto" (every [wilsjo2] key a new file writes): the key's default, as layer_config takes it - not a bad number
+        if (value.empty() || lower(value) == "auto") continue;
         // Anything else (the old module's placement/overlay/hooks/intercept/
         // menu_key/toggle_key/spoof_nvidia) is ignored and dropped on save.
         dlssnr_key(c, passes, key, value, false);
@@ -405,8 +405,9 @@ bool parse(const std::string& path, Config& c, bool& legacy) {
     legacy = !section;
     if (legacy && passes > 3) c.unlock_passes = true;   // the old file allowed up to 16
     finish(c, passes);
-    // An old file: int4 mixed was its own section on top of the original model.
-    if (model_old_word && c.network.model == nr::kSilverAardwold && old_int4 == 1) c.network.model = nr::kSilverAardwoldInt4;
+    // An old file: int4 mixed (now CC_SILVER_AARDWOLD_OPTIMIZED) was its own section on top of the original model.
+    if (model_old_word && c.network.model == nr::kSilverAardwold && old_int4 == 1) c.network.model = nr::kSilverAardwoldOptimized;
+    c.network.model = nr::network_with_layers(c.network.model, c.network.optimized_layers);
     if (!have_hotkey && !old_hotkey.empty()) c.network.hotkey = old_hotkey;
     if (!have_sound) c.network.sound = old_sound;
     return true;
@@ -680,8 +681,8 @@ bool parse_renodx_key(RenoDXConfig& r, const std::string& key, const std::string
     else if (key == "nrlookstabilize") v.look_stabilize = renodx_enum(value, d.look_stabilize, 0, 2);
     else if (key == "nrlookstabilizems") v.look_stabilize_ms = renodx_float(value, d.look_stabilize_ms, 10.0f, 250.0f);
     else if (key == "nrlookstabilizedetail") { if (auto b = parse_bool(value)) v.look_stabilize_detail = *b; }
-    else if (key == "nrsdrblackrestore") v.sdr_black_restore = renodx_enum(value, d.sdr_black_restore, 0, 2);
-    else if (key == "nrdisplaypedestal") v.display_pedestal = renodx_enum(value, d.display_pedestal, 0, 2);
+    else if (key == "nrsdrblackrestore") v.sdr_black_restore = renodx_enum(value, d.sdr_black_restore, 0, 3);
+    else if (key == "nrdisplaypedestal") v.display_pedestal = renodx_enum(value, d.display_pedestal, 0, 3);
     else if (key == "nrcodecmode") v.codec_mode = renodx_enum(value, d.codec_mode, 0, 3);
     else if (key == "nrneuralfloorguard") { if (auto b = parse_bool(value)) v.neural_floor_guard = *b; }
     else if (key == "nrsourceencoding") v.source_encoding = renodx_enum(value, d.source_encoding, 0, 3);
@@ -1551,10 +1552,18 @@ void write_network(FILE* f, const NetworkConfig& n) {
         "; CC_SMALL_FP8_EXPERIMENTAL     = this project's experimental network: CC_SMALL_FP8 made faster; its weights are\n"
         ";                                 made from CC_SMALL_FP8's model at install; RX 9000 with ACO Mode only (below)\n"
         "; CC_SILVER_AARDWOLD            = the network of 310.8.0 (also preset 1 of 310.9.16)\n"
-        "; CC_SILVER_AARDWOLD_INT4_MIXED = CC_SILVER_AARDWOLD with part of the work in int4 and other lower precisions;\n"
-        ";                                 faster, the picture differs somewhat; RX 9000 with ACO Mode only (below)\n"
+        "; CC_SILVER_AARDWOLD_OPTIMIZED  = this project's faster CC_SILVER_AARDWOLD, its picture very close to it; its weights\n"
+        ";                                 are made from CC_SILVER_AARDWOLD's model at install; RX 9000 with ACO Mode only (below)\n"
         "; A network that cannot run (e.g. no 310.9.16 model file) is greyed out in the menus with the reason, and the\n"
         "; hotkey skips it.\n"
+        "\n"
+        "OptimizedLayers = %d\n"
+        "; CC_SILVER_AARDWOLD_OPTIMIZED only: how many of its layers run in a faster form. It changes only how the network\n"
+        "; computes, not the resolution; every level's picture stays very close to CC_SILVER_AARDWOLD's. 0 = Quality: none\n"
+        "; in int4, every layer at CC_SILVER_AARDWOLD's precision;\n"
+        "; 1 = Balanced: some of them in int4; 2 = Performance: also fixed attention on the first full-resolution\n"
+        "; layers; 3 = Ultra Performance (default): also more int4 layers, the fastest.\n"
+        "; Changed in game, the network is built again\n"
         "\n"
         "Hotkey = %s\n"
         "; Cycles through the networks that can run, to compare them on the same picture. Empty = no hotkey. Ctrl,\n"
@@ -1562,7 +1571,7 @@ void write_network(FILE* f, const NetworkConfig& n) {
         "\n"
         "Sound = %d\n"
         "; A sound when the network changes (hotkey, menu or this file): one note = CC_SMALL_FP8, two notes going down = CC_SILVER_AARDWOLD,\n"
-        "; two notes going up = CC_SILVER_AARDWOLD_INT4_MIXED, one high note = CC_SMALL_FP8_EXPERIMENTAL. 0 = silent\n"
+        "; two notes going up = CC_SILVER_AARDWOLD_OPTIMIZED, one high note = CC_SMALL_FP8_EXPERIMENTAL. 0 = silent\n"
         "\n"
         "Residency = %s\n"
         "; What is kept of a network that is no longer running. The networks share one activation memory, so what is kept is mainly the weights.\n"
@@ -1602,10 +1611,10 @@ void write_network(FILE* f, const NetworkConfig& n) {
         "; off    = never\n"
         "\n"
         "Memory Guard = %d\n"
-        "; 1 = a network is built only while 1 GB of video memory stays free for the game, and the running one steps\n"
-        ";     aside while video memory runs out (default)\n"
-        "; 0 = no such check: NR builds and runs in whatever video memory is left. A game left short of video memory\n"
-        ";     may stutter or fail to load its own data. Applied at once\n"
+        "; 1 = a network is built only while the video memory it needs is free (what it needs: measured on your GPU\n"
+        ";     at its first build), and the running one steps aside once video memory has run out\n"
+        "; 0 = no such check: NR builds and runs in whatever video memory is left (default). A game left short of video\n"
+        ";     memory may stutter or fail to load its own data. Applied at once\n"
         "\n"
         "History Precision = %d\n"
         "; The precision of the images NR keeps its previous result in:\n"
@@ -1616,8 +1625,8 @@ void write_network(FILE* f, const NetworkConfig& n) {
         "; ACO Mode is not a setting: the network always runs as machine code made in advance by the ACO compiler (the\n"
         "; one the Linux version uses), loaded by the AMD driver. When that cannot be used, NR Control and dlssnr-amd.log\n"
         "; say why, and an RX 9000 runs the network compiled by the AMD driver instead (without CC_SMALL_FP8_EXPERIMENTAL\n"
-        "; and CC_SILVER_AARDWOLD_INT4_MIXED); RX 7000 and the Radeon 700M / 800M / 8000S graphics have no NR then.\n"
-        "\n", nr::network_codename(n.model), n.hotkey.c_str(), n.sound ? 1 : 0, residency_name(n.residency),
+        "; and CC_SILVER_AARDWOLD_OPTIMIZED); RX 7000 and the Radeon 700M / 800M / 8000S graphics have no NR then.\n"
+        "\n", nr::network_codename(n.model), n.optimized_layers, n.hotkey.c_str(), n.sound ? 1 : 0, residency_name(n.residency),
         n.motion_without_depth ? 1 : 0, n.resize_history ? 1 : 0, n.style_grade ? 1 : 0, osd_name(n.osd),
         n.memory_guard ? 1 : 0, n.history_f16 ? 16 : 32);
 }
@@ -1920,28 +1929,41 @@ Preprocess PreprocessSwitch::frame(const PreprocessConfig& file) {
 }
 
 // The network switch's cue: one note for CC_SMALL_FP8 (a higher one for CC_SMALL_FP8_EXPERIMENTAL), two going down
-// for CC_SILVER_AARDWOLD, two going up for CC_SILVER_AARDWOLD_INT4_MIXED (the int4 mixed cue as before).
+// for CC_SILVER_AARDWOLD, two going up for CC_SILVER_AARDWOLD_OPTIMIZED (int4 mixed's cue before it).
 void play_network_cue(int n) {
-    if (n == nr::kSilverAardwoldInt4) play_cue(true);
+    if (nr::network_optimized(n)) play_cue(true);
     else if (n == nr::kSilverAardwold) play_cue(false);
     else play_note(n == nr::kSmallFp8Experimental ? 1320.0f : 880.0f);
 }
 
-// What runs instead of a network that cannot: the same model's other network first (int4 mixed -> CC_SILVER_AARDWOLD),
-// else the other model.
+// What runs instead of a network that cannot: the same model's other network first (CC_SILVER_AARDWOLD_OPTIMIZED at
+// a lower level - Ultra Performance, Performance, Balanced, Quality - before CC_SILVER_AARDWOLD), else the other model.
 int NetworkSwitch::fallback(int n) const {
-    static const int order[nr::kNetworkChoices][2] = {{nr::kSilverAardwold, nr::kSilverAardwoldInt4},
-                                                      {nr::kSmallFp8, nr::kSilverAardwoldInt4},
-                                                      {nr::kSilverAardwold, nr::kSmallFp8},
-                                                      {nr::kSmallFp8, nr::kSilverAardwold}};
+    static const int order[nr::kNetworkChoices][4] = {
+        {nr::kSilverAardwold, nr::kSilverAardwoldOptimizedFp8, nr::kSilverAardwoldOptimized, nr::kSilverAardwoldOptimizedFp8},  // kSmallFp8
+        {nr::kSmallFp8, nr::kSilverAardwoldOptimizedFp8, nr::kSilverAardwoldOptimized, nr::kSmallFp8},          // kSilverAardwold
+        {nr::kSilverAardwoldOptimizedFp8, nr::kSilverAardwold, nr::kSmallFp8, nr::kSmallFp8},                  // kSilverAardwoldOptimized
+        {nr::kSmallFp8, nr::kSilverAardwold, nr::kSilverAardwoldOptimizedFp8, nr::kSilverAardwoldOptimized},   // kSmallFp8Experimental
+        {nr::kSilverAardwold, nr::kSmallFp8, nr::kSmallFp8, nr::kSmallFp8},                                    // kSilverAardwoldOptimizedFp8
+        {nr::kSilverAardwoldOptimized, nr::kSilverAardwoldOptimizedFp8, nr::kSilverAardwold, nr::kSmallFp8},   // kSilverAardwoldOptimizedPerformance
+        {nr::kSilverAardwoldOptimizedPerformance, nr::kSilverAardwoldOptimized, nr::kSilverAardwoldOptimizedFp8, nr::kSilverAardwold}};  // kSilverAardwoldOptimizedUltra
     for (int c : order[n]) if (available(c)) return c;
     return n;
 }
 
-int NetworkSwitch::next_available(int from) const {   // in the order they are listed (nr::kNetworkOrder)
+// A list entry as it runs now: CC_SILVER_AARDWOLD_OPTIMIZED as OptimizedLayers picks it (a lower level when that one
+// cannot run here).
+int NetworkSwitch::listed(int c) const {
+    int n = nr::network_with_layers(c, file_.optimized_layers);
+    if (n == nr::kSilverAardwoldOptimizedUltra && !available(n)) n = nr::kSilverAardwoldOptimizedPerformance;
+    if (n == nr::kSilverAardwoldOptimizedPerformance && !available(n)) n = nr::kSilverAardwoldOptimized;
+    return n == nr::kSilverAardwoldOptimized && !available(n) ? nr::kSilverAardwoldOptimizedFp8 : n;
+}
+
+int NetworkSwitch::next_available(int from) const {   // in the order they are listed (nr::kNetworkList)
     const int at = nr::network_rank(from);
-    for (int k = 1; k <= nr::kNetworkChoices; ++k) {
-        const int c = nr::kNetworkOrder[(at + k) % nr::kNetworkChoices];
+    for (int k = 1; k <= nr::kNetworkListed; ++k) {
+        const int c = listed(nr::kNetworkList[(at + k) % nr::kNetworkListed]);
         if (available(c)) return c;
     }
     return from;
@@ -1951,16 +1973,16 @@ void NetworkSwitch::unavailable(int n, const std::string& why) {
     if (n < 0 || n >= nr::kNetworkChoices || reason_[n] == why) return;
     reason_[n] = why;
     if (!why.empty()) {
-        log("[nr] %s is not available in this run: %s", nr::network_codename(n), why.c_str());
+        log("[nr] %s is not available in this run: %s", nr::network_label(n), why.c_str());
         if (want_ == n) {
             want_ = fallback(n);
-            log("[nr] running %s instead", nr::network_codename(want_));
+            log("[nr] running %s instead", nr::network_label(want_));
         }
     }
 }
 
-// Model in the file, everything else as it was (the line rewritten in place, or added to [Network]).
-void NetworkSwitch::write(int n) {
+// One [Network] key in the file, everything else as it was (the line rewritten in place, or added to [Network]).
+void NetworkSwitch::write_key(const char* key, const std::string& value) {
     if (ini_.empty()) return;
     std::string text;
     if (FILE* f = nr::u8::fopen(ini_.c_str(), "rb")) {
@@ -1968,7 +1990,7 @@ void NetworkSwitch::write(int n) {
         while ((got = std::fread(buf, 1, sizeof buf, f)) > 0) text.append(buf, got);
         std::fclose(f);
     }
-    const std::string value = nr::network_codename(n);
+    const std::string lkey = lower(key);
     std::string out, section;
     bool done = false;
     size_t at = 0;
@@ -1978,25 +2000,34 @@ void NetworkSwitch::write(int n) {
         at = eol == std::string::npos ? text.size() : eol + 1;
         std::string t = trim(line.substr(0, line.find_first_of(";#")));
         if (!t.empty() && t.front() == '[') {
-            if (!done && lower(section) == "network") { out += "Model = " + value + "\n"; done = true; }
+            if (!done && lower(section) == "network") { out += std::string(key) + " = " + value + "\n"; done = true; }
             const auto e = t.find(']');
             section = trim(t.substr(1, e == std::string::npos ? std::string::npos : e - 1));
         } else if (!done && lower(section) == "network") {
             const auto eq = t.find('=');
-            if (eq != std::string::npos && lower(trim(t.substr(0, eq))) == "model") {
-                out += "Model = " + value + (line.size() && line.back() == '\n' ? "\n" : "");
+            if (eq != std::string::npos && lower(trim(t.substr(0, eq))) == lkey) {
+                out += std::string(key) + " = " + value + (line.size() && line.back() == '\n' ? "\n" : "");
                 done = true;
                 continue;
             }
         }
         out += line;
     }
-    if (!done) out += (lower(section) == "network" ? "" : "\n[Network]\n") + std::string("Model = ") + value + "\n";
+    if (!done) out += (lower(section) == "network" ? "" : "\n[Network]\n") + std::string(key) + " = " + value + "\n";
     if (FILE* f = nr::u8::fopen(ini_.c_str(), "wb")) {
         std::fwrite(out.data(), 1, out.size(), f);
         std::fclose(f);
     }
     stamp_ = stamp_of(ini_);
+}
+
+// Model in the file (and OptimizedLayers for CC_SILVER_AARDWOLD_OPTIMIZED).
+void NetworkSwitch::write(int n) {
+    write_key("Model", nr::network_codename(n));
+    if (nr::network_optimized(n)) {
+        write_key("OptimizedLayers", std::to_string(nr::network_layers(n)));
+        file_.optimized_layers = nr::network_layers(n);
+    }
     file_.model = n;
 }
 
@@ -2005,7 +2036,7 @@ void NetworkSwitch::set(int n) {
     write(n);
     if (want_ == n) return;
     want_ = n;
-    log("[nr] network %s (menu)", nr::network_codename(n));
+    log("[nr] network %s (menu)", nr::network_label(n));
     if (file_.sound) play_network_cue(n);
 }
 
@@ -2021,24 +2052,24 @@ int NetworkSwitch::frame(const std::string& ini) {
         Config c;
         bool legacy = false;
         parse(ini, c, legacy);
-        const bool changed = c.network.model != file_.model;
+        const bool changed = c.network.model != file_.model;   // (OptimizedLayers included: it picks the optimized one)
         file_ = c.network;
         if (want_ < 0) {
             char e[48] = {};
             const unsigned long n = GetEnvironmentVariableA("DLSSNR_MODEL", e, sizeof e);
-            const int env = n && n < sizeof e ? nr::network_choice(e) : -1;
+            const int env = n && n < sizeof e ? nr::network_with_layers(nr::network_choice(e), file_.optimized_layers) : -1;
             want_ = env >= 0 ? env : file_.model;
             if (!available(want_)) want_ = fallback(want_);
-            log("[nr] network %s at start (%s)%s", nr::network_codename(want_), env >= 0 ? "DLSSNR_MODEL" : "dlssnr-amd.ini",
+            log("[nr] network %s at start (%s)%s", nr::network_label(want_), env >= 0 ? "DLSSNR_MODEL" : "dlssnr-amd.ini",
                 file_.hotkey.empty() ? "" : (", Hotkey " + file_.hotkey + " cycles through the networks").c_str());
         } else if (changed && file_.model != want_) {
             // Model changed in the file while the game runs (NR Control, or edited): switch as the hotkey does
             if (available(file_.model)) {
                 want_ = file_.model;
-                log("[nr] network %s (dlssnr-amd.ini)", nr::network_codename(want_));
+                log("[nr] network %s (dlssnr-amd.ini)", nr::network_label(want_));
                 if (file_.sound) play_network_cue(want_);
             } else {
-                log("[nr] dlssnr-amd.ini asks for %s, not available in this run: %s", nr::network_codename(file_.model),
+                log("[nr] dlssnr-amd.ini asks for %s, not available in this run: %s", nr::network_label(file_.model),
                     reason_[file_.model].c_str());
             }
         }
@@ -2060,7 +2091,7 @@ int NetworkSwitch::frame(const std::string& ini) {
             if (n != want_) {
                 want_ = n;
                 write(n);
-                log("[nr] network %s (hotkey)", nr::network_codename(n));
+                log("[nr] network %s (hotkey)", nr::network_label(n));
                 if (file_.sound) play_network_cue(n);
             }
         }

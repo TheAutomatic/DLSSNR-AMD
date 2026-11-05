@@ -1,6 +1,6 @@
 // dlssnr_extract_model: make the model files from NVIDIA's nvngx_dlssnr.dll, written into <output folder>:
-//   310.9.16: dlssnr.bin (the old model, the DLL's preset 1) and dlssnr-small.bin (the new model, the DLL's default)
-//   310.8.0:  dlssnr.bin only
+//   310.9.16: CC_SILVER_AARDWOLD.bin (the old model, the DLL's preset 1) and CC_SMALL_FP8.bin (the new model, the DLL's default)
+//   310.8.0:  CC_SILVER_AARDWOLD.bin only
 //
 //   dlssnr_extract_model <nvngx_dlssnr.dll> <output folder>
 //
@@ -855,8 +855,8 @@ static void extract(const std::vector<u8>& dll, const fs::path& src, bool small,
     std::printf("%s: %u entries, %.1f MiB\n", out.u8string().c_str(), count, double(file_size) / 1048576.0);
 }
 
-// 310.9.16: dlssnr.bin (the old model, the DLL's preset 1) and dlssnr-small.bin (the new model, its default);
-// 310.8.0: dlssnr.bin only. As extract_model.sh.
+// 310.9.16: CC_SILVER_AARDWOLD.bin (the old model, the DLL's preset 1) and CC_SMALL_FP8.bin (the new model, its default);
+// 310.8.0: CC_SILVER_AARDWOLD.bin only. As extract_model.sh.
 static int run(const fs::path& src, const fs::path& out) {
     std::error_code ec;
     if (!fs::is_directory(out, ec)) throw Failure("no such output folder: " + out.u8string());
@@ -868,8 +868,8 @@ static int run(const fs::path& src, const fs::path& out) {
                           : "This is not nvngx_dlssnr 310.9.16 or 310.8.0 (SHA256 " + got +
                                 "). One of these two DLL versions is required.");
     }
-    extract(dll, src, false, out / "dlssnr.bin");
-    if (got == kSmallDllSha256) extract(dll, src, true, out / "dlssnr-small.bin");
+    extract(dll, src, false, out / "CC_SILVER_AARDWOLD.bin");
+    if (got == kSmallDllSha256) extract(dll, src, true, out / "CC_SMALL_FP8.bin");
     return 0;
 }
 

@@ -12,10 +12,13 @@
 #   -Model CC_SMALL_FP8_EXPERIMENTAL      this project's experimental network: CC_SMALL_FP8 made faster; its weights
 #                                         are made from CC_SMALL_FP8's model at install; RX 9000 only
 #   -Model CC_SILVER_AARDWOLD             the network of 310.8.0 (also preset 1 of 310.9.16)
-#   -Model CC_SILVER_AARDWOLD_INT4_MIXED  CC_SILVER_AARDWOLD with part of the work in int4 and other lower precisions;
-#                                         faster, the picture differs somewhat; RX 9000 only
+#   -Model CC_SILVER_AARDWOLD_OPTIMIZED   this project's faster CC_SILVER_AARDWOLD; its weights are made from
+#                                         CC_SILVER_AARDWOLD's model at install; RX 9000 only. Optimized layers: Quality /
+#                                         Balanced / Performance / Ultra Performance (default) ([Network] OptimizedLayers
+#                                         in dlssnr-amd.ini; a switch in game)
 # Without it, the installer asks once; Enter = CC_SMALL_FP8. The earlier choices still work: -Model new = CC_SMALL_FP8,
-# -Model old = CC_SILVER_AARDWOLD, -Network aco-int4-mixed = CC_SILVER_AARDWOLD_INT4_MIXED.
+# -Model old = CC_SILVER_AARDWOLD; -Model CC_SILVER_AARDWOLD_INT4_MIXED and -Network aco-int4-mixed (the network
+# CC_SILVER_AARDWOLD_OPTIMIZED replaced) = CC_SILVER_AARDWOLD_OPTIMIZED.
 #
 # ACO Mode is not a setting (-AcoMode and -Network default / aco of older packages are accepted and do nothing): the
 # network always runs as machine code made in advance by the ACO compiler, loaded by the AMD driver. When the driver
@@ -37,8 +40,8 @@
 #
 # The package carries no model: on the first install the user gives NVIDIA's nvngx_dlssnr.dll (310.9.16 or
 # 310.8.0) or a zip that contains it, and model-tools\dlssnr_extract_model.exe makes the model files from it:
-# from 310.9.16 dlssnr.bin (CC_SILVER_AARDWOLD, which 310.9.16 also holds) and dlssnr-small.bin (CC_SMALL_FP8), from
-# 310.8.0 dlssnr.bin only. It only reads the weight data; the DLL is never loaded or run. The models are kept in
+# from 310.9.16 CC_SILVER_AARDWOLD.bin (CC_SILVER_AARDWOLD, which 310.9.16 also holds) and CC_SMALL_FP8.bin (CC_SMALL_FP8), from
+# 310.8.0 CC_SILVER_AARDWOLD.bin only. It only reads the weight data; the DLL is never loaded or run. The models are kept in
 # the package's dlssnr-amd\, so later installs from this package need no DLL.
 #
 # Every file put into the game folder is listed in dlssnr-amd-install.txt; existing files it would
@@ -114,18 +117,20 @@ if ('optiscaler', 'reshade-feeder', 'reshade-feeder-dx9', 'reshade-feeder-vulkan
 }
 
 # ---- the network a game starts with (asked after the model files are known) -----------------------------------
-$Networks = @('CC_SMALL_FP8', 'CC_SMALL_FP8_EXPERIMENTAL', 'CC_SILVER_AARDWOLD', 'CC_SILVER_AARDWOLD_INT4_MIXED')
-switch ($Model) { 'new' { $Model = 'CC_SMALL_FP8' } 'old' { $Model = 'CC_SILVER_AARDWOLD' } }
+$Networks = @('CC_SMALL_FP8', 'CC_SMALL_FP8_EXPERIMENTAL', 'CC_SILVER_AARDWOLD', 'CC_SILVER_AARDWOLD_OPTIMIZED')
+switch ($Model) { 'new' { $Model = 'CC_SMALL_FP8' } 'old' { $Model = 'CC_SILVER_AARDWOLD' }
+                  'CC_SILVER_AARDWOLD_INT4_MIXED' { $Model = 'CC_SILVER_AARDWOLD_OPTIMIZED' } }
 if ($Model -and $Networks -notcontains $Model) {
-    Fail "Unknown network: $Model (CC_SMALL_FP8, CC_SMALL_FP8_EXPERIMENTAL, CC_SILVER_AARDWOLD or CC_SILVER_AARDWOLD_INT4_MIXED)"
+    Fail "Unknown network: $Model (CC_SMALL_FP8, CC_SMALL_FP8_EXPERIMENTAL, CC_SILVER_AARDWOLD or CC_SILVER_AARDWOLD_OPTIMIZED)"
 }
 if ($Network -and 'default', 'aco', 'aco-int4-mixed' -notcontains $Network) { Fail "Unknown network choice: $Network" }
 if ($Network -eq 'aco-int4-mixed') {
-    if ($Model -and $Model -ne 'CC_SILVER_AARDWOLD_INT4_MIXED') { Fail "-Network aco-int4-mixed and -Model $Model cannot be used together." }
-    $Model = 'CC_SILVER_AARDWOLD_INT4_MIXED'
+    if ($Model -and $Model -ne 'CC_SILVER_AARDWOLD_OPTIMIZED') { Fail "-Network aco-int4-mixed and -Model $Model cannot be used together." }
+    $Model = 'CC_SILVER_AARDWOLD_OPTIMIZED'
 }
 $haveInt4 = Test-Path -LiteralPath (Join-Path $here 'dlssnr-amd\int4') -PathType Container
 $haveExperimental = Test-Path -LiteralPath (Join-Path $here 'experimental\dlssnr-small-experimental.delta') -PathType Leaf
+$haveOptimized = Test-Path -LiteralPath (Join-Path $here 'optimized\dlssnr-optimized.delta') -PathType Leaf
 
 # ---- the processing before and after NR --------------------------------------------------------
 if ($Route -ne 'remove' -and $Route -ne 'logs' -and -not $RenoDX) {
@@ -392,14 +397,14 @@ $bits = Get-ExeBits $exe
 if ($bits -eq 32) { Fail "This is a 32-bit game ($exe); this package supports 64-bit games only." }
 # ---- model -----------------------------------------------------------------------------------
 # The package's models, or ones extracted now from the user's nvngx_dlssnr.dll; checked by SHA256.
-# dlssnr.bin = CC_SILVER_AARDWOLD (310.8.0, also preset 1 of 310.9.16), dlssnr-small.bin = CC_SMALL_FP8 (310.9.16's default).
+# CC_SILVER_AARDWOLD.bin = CC_SILVER_AARDWOLD (310.8.0, also preset 1 of 310.9.16), CC_SMALL_FP8.bin = CC_SMALL_FP8 (310.9.16's default).
 $ModelSha = '2B41C888CF4155B8958C665BA64018AB0BD25C85FC71A2B6DB86D0D04D1F7FBD'
 $SmallSha = '7E966E2639DBEC6596AA0BAC3B8761137D2C40CA8CB4ACA30DF7CA10043C6E33'
 function Test-Sha([string]$path, [string]$sha) {
     (Test-Path -LiteralPath $path -PathType Leaf) -and (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -eq $sha
 }
-$modelPath = Join-Path $here 'dlssnr-amd\dlssnr.bin'
-$smallPath = Join-Path $here 'dlssnr-amd\dlssnr-small.bin'
+$modelPath = Join-Path $here 'dlssnr-amd\CC_SILVER_AARDWOLD.bin'
+$smallPath = Join-Path $here 'dlssnr-amd\CC_SMALL_FP8.bin'
 $modelFrom = $modelPath; $smallFrom = $smallPath
 if (($Dll -and -not ((Test-Sha $modelPath $ModelSha) -and (Test-Sha $smallPath $SmallSha))) -or -not (Test-Path -LiteralPath $modelPath)) {
     if (-not $Dll) {
@@ -430,7 +435,7 @@ if (($Dll -and -not ((Test-Sha $modelPath $ModelSha) -and (Test-Sha $smallPath $
         $out = Join-Path $work 'out'
         New-Item -ItemType Directory -Path $out | Out-Null
         & (Join-Path $here 'model-tools\dlssnr_extract_model.exe') $src $out
-        $tmpModel = Join-Path $out 'dlssnr.bin'; $tmpSmall = Join-Path $out 'dlssnr-small.bin'
+        $tmpModel = Join-Path $out 'CC_SILVER_AARDWOLD.bin'; $tmpSmall = Join-Path $out 'CC_SMALL_FP8.bin'
         if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $tmpModel)) { Fail 'Extracting the model failed (see above).' }
         if (-not (Test-Sha $tmpModel $ModelSha)) { Fail 'The extracted model has the wrong checksum; nothing was installed.' }
         $pairs = @(,@($tmpModel, $modelPath))
@@ -464,7 +469,7 @@ if ((Test-Path -LiteralPath $smallPath) -and -not (Test-Sha $smallPath $SmallSha
 }
 $haveSmall = Test-Sha $smallFrom $SmallSha
 if (-not $haveSmall) {
-    Say 'Note: the package has no model for CC_SMALL_FP8 (dlssnr-small.bin, in the 310.9.16 nvngx_dlssnr.dll); it is greyed out in game.'
+    Say 'Note: the package has no model for CC_SMALL_FP8 (CC_SMALL_FP8.bin, in the 310.9.16 nvngx_dlssnr.dll); it is greyed out in game.'
     Say 'To add it, install again with -Dll pointing at the 310.9.16 nvngx_dlssnr.dll or its zip.'
 }
 # The network a game starts with: all four are installed, this only sets [Network] Model in dlssnr-amd.ini.
@@ -479,80 +484,102 @@ if (-not $Model) {
     elseif (-not $haveExperimental) { Say '  2) CC_SMALL_FP8_EXPERIMENTAL       not available: this package does not have it' }
     else { Say '  2) CC_SMALL_FP8_EXPERIMENTAL       this project''s experimental network: 1) made faster (RX 9000)' }
     Say '  3) CC_SILVER_AARDWOLD              the network of 310.8.0 (also preset 1 of 310.9.16)'
-    if ($haveInt4) { Say '  4) CC_SILVER_AARDWOLD_INT4_MIXED   3) with part of the work in int4; faster, the picture differs somewhat (RX 9000)' }
-    else { Say '  4) CC_SILVER_AARDWOLD_INT4_MIXED   not available: this package has no int4 mixed' }
+    if ($haveOptimized) { Say '  4) CC_SILVER_AARDWOLD_OPTIMIZED    this project''s network: 3) made faster (RX 9000)' }
+    else { Say '  4) CC_SILVER_AARDWOLD_OPTIMIZED    not available: this package does not have it' }
     Say 'RX 7000 and the Radeon 700M / 800M / 8000S graphics run 1) and 3).'
     Say 'Later: [Network] Model in dlssnr-amd.ini.'
     $pick = Read-Host "Start with which one? [1/2/3/4, Enter = $default]"
     if ($pick -eq '') { $pick = "$default" }
     switch ($pick) {
         '1' { $Model = 'CC_SMALL_FP8' } '2' { $Model = 'CC_SMALL_FP8_EXPERIMENTAL' } '3' { $Model = 'CC_SILVER_AARDWOLD' }
-        '4' { $Model = 'CC_SILVER_AARDWOLD_INT4_MIXED' }
+        '4' { $Model = 'CC_SILVER_AARDWOLD_OPTIMIZED' }
         default { Say "Invalid choice, using $default."; $Model = $Networks[$default - 1] }
     }
 }
 if (($Model -eq 'CC_SMALL_FP8' -or $Model -eq 'CC_SMALL_FP8_EXPERIMENTAL') -and -not $haveSmall) {
     Say "$Model is not available (no CC_SMALL_FP8 model); games start with CC_SILVER_AARDWOLD."; $Model = 'CC_SILVER_AARDWOLD'
 }
-if ($Model -eq 'CC_SILVER_AARDWOLD_INT4_MIXED' -and -not $haveInt4) {
-    Say 'This package has no int4 mixed; games start with CC_SILVER_AARDWOLD.'; $Model = 'CC_SILVER_AARDWOLD'
-}
-# int4 mixed's weights: made from this model with the package's data, checked against the tested result. If that
-# fails, the other two networks are installed and int4 mixed is greyed out in game (with the reason).
-$int4ModelFrom = $null
-$int4Data = Join-Path $here 'dlssnr-amd\int4'
-if ($haveInt4) {
-    $generator = Join-Path $here 'model-tools\dlssnr-int4-weights.exe'
-    $hashFile = Join-Path $here 'model-tools\dlssnr-int4.sha256'
-    if (-not (Test-Path -LiteralPath $generator) -or -not (Test-Path -LiteralPath $hashFile)) {
-        Fail 'The int4 mixed files of the package are incomplete; unpack the package again.'
-    }
-    $int4Sha = ((Get-Content -LiteralPath $hashFile -Raw).Trim() -split '\s+')[0]
-    $int4ModelFrom = Join-Path ([System.IO.Path]::GetTempPath()) ("dlssnr-int4-$([guid]::NewGuid().ToString('N')).bin")
-    Say 'Making the CC_SILVER_AARDWOLD_INT4_MIXED weights from the model ...'
-    & $generator $modelFrom $int4Data $int4ModelFrom
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $int4ModelFrom) -or
-        (Get-FileHash -LiteralPath $int4ModelFrom -Algorithm SHA256).Hash -ne $int4Sha) {
-        Remove-Item -LiteralPath $int4ModelFrom -Force -ErrorAction SilentlyContinue
-        $int4ModelFrom = $null
-        Say 'Note: making or checking the int4 mixed weights failed; it is not available in game. The other two networks are installed.'
-        if ($Model -eq 'CC_SILVER_AARDWOLD_INT4_MIXED') { Say 'Games start with CC_SILVER_AARDWOLD.'; $Model = 'CC_SILVER_AARDWOLD' }
-    }
+if ($Model -eq 'CC_SILVER_AARDWOLD_OPTIMIZED' -and -not $haveOptimized) {
+    Say 'This package has no CC_SILVER_AARDWOLD_OPTIMIZED; games start with CC_SILVER_AARDWOLD.'; $Model = 'CC_SILVER_AARDWOLD'
 }
 # CC_SMALL_FP8_EXPERIMENTAL's weights are not in the package: made here from CC_SMALL_FP8's model and the package's
 # difference file (each changed entry XOR the small model's, so it holds none of NVIDIA's weights), installed only when
 # their SHA-256 matches. When that fails the other networks are installed as usual and it is greyed out in game.
 function New-ExperimentalWeights([string]$small, [string]$delta, [string]$out) {
+    # An entry the pack does not have is ADDED (CC_SILVER_AARDWOLD_OPTIMIZED's levels in one pack: "performance/<name>"):
+    # its bytes XOR the pack's entry named by the rest after the first "/", as the pack was; the result has the added
+    # entries after the pack's own (index and data; the pack's own entries move by the added index lines).
+    # (experimental_weights.py apply, the same.)
     $pack = [System.IO.File]::ReadAllBytes($small)
     if ([System.Text.Encoding]::ASCII.GetString($pack, 0, 8) -ne 'NRMODEL1') { throw "$small is not a model pack" }
-    $count = [BitConverter]::ToUInt32($pack, 8)
+    $countPack = [BitConverter]::ToUInt32($pack, 8)
     $index = @{}; $at = 16
-    for ($k = 0; $k -lt $count; $k++) {
+    for ($k = 0; $k -lt $countPack; $k++) {
         $n = [BitConverter]::ToUInt32($pack, $at)
         $name = [System.Text.Encoding]::UTF8.GetString($pack, $at + 4, $n)
         $index[$name] = @([BitConverter]::ToUInt64($pack, $at + 4 + $n), [BitConverter]::ToUInt64($pack, $at + 12 + $n))
         $at += 4 + $n + 16
     }
+    $indexEnd = $at
     $d = [System.IO.File]::ReadAllBytes($delta)
     if ([System.Text.Encoding]::ASCII.GetString($d, 0, 8) -ne 'NRXDIFF1') { throw "$delta is not a weights difference" }
-    $count = [BitConverter]::ToUInt32($d, 8); $at = 12
+    $count = [BitConverter]::ToUInt32($d, 8)
+    $orig = $null; $at = 12   # the pack as it was, kept only when the difference adds entries
+    for ($k = 0; $k -lt $count; $k++) {
+        $n = [BitConverter]::ToUInt32($d, $at)
+        if (-not $index.ContainsKey([System.Text.Encoding]::UTF8.GetString($d, $at + 4, $n))) { $orig = [byte[]]$pack.Clone(); break }
+        $at += 4 + $n + 8 + [int64][BitConverter]::ToUInt64($d, $at + 4 + $n)
+    }
+    $added = New-Object System.Collections.Generic.List[object]
+    $at = 12
     for ($k = 0; $k -lt $count; $k++) {
         $n = [BitConverter]::ToUInt32($d, $at)
         $name = [System.Text.Encoding]::UTF8.GetString($d, $at + 4, $n)
         $size = [BitConverter]::ToUInt64($d, $at + 4 + $n)
         $at += 4 + $n + 8
-        if (-not $index.ContainsKey($name) -or $index[$name][1] -ne $size) { throw "${name}: not in $small with $size bytes" }
-        $off = [int64]$index[$name][0]
-        for ($i = 0; $i -lt $size; $i++) { $pack[$off + $i] = $pack[$off + $i] -bxor $d[$at + $i] }
+        if (-not $index.ContainsKey($name)) {
+            $slash = $name.IndexOf('/')
+            $base = if ($slash -ge 0) { $name.Substring($slash + 1) } else { '' }
+            if (-not $index.ContainsKey($base) -or $index[$base][1] -ne $size) { throw "${name}: an added entry without $base of $size bytes in $small" }
+            $boff = [int64]$index[$base][0]
+            $bytes = New-Object byte[] $size
+            for ($i = 0; $i -lt $size; $i++) { $bytes[$i] = $orig[$boff + $i] -bxor $d[$at + $i] }
+            $added.Add(@($name, $bytes))
+        } else {
+            if ($index[$name][1] -ne $size) { throw "${name}: not in $small with $size bytes" }
+            $off = [int64]$index[$name][0]
+            for ($i = 0; $i -lt $size; $i++) { $pack[$off + $i] = $pack[$off + $i] -bxor $d[$at + $i] }
+        }
         $at += [int64]$size
     }
     if ($at -ne $d.Length) { throw "${delta}: $($d.Length - $at) bytes left over" }
+    if ($added.Count -gt 0) {
+        $grow = 0; foreach ($e in $added) { $grow += 4 + [System.Text.Encoding]::UTF8.GetByteCount($e[0]) + 16 }
+        $ms = New-Object System.IO.MemoryStream; $bw = New-Object System.IO.BinaryWriter($ms)
+        $bw.Write($pack, 0, 8); $bw.Write([uint32]($countPack + $added.Count)); $bw.Write($pack, 12, 4)
+        $at = 16
+        for ($k = 0; $k -lt $countPack; $k++) {
+            $n = [BitConverter]::ToUInt32($pack, $at)
+            $bw.Write($pack, $at, 4 + $n)
+            $bw.Write([uint64]([BitConverter]::ToUInt64($pack, $at + 4 + $n) + $grow))
+            $bw.Write([uint64]([BitConverter]::ToUInt64($pack, $at + 12 + $n)))
+            $at += 4 + $n + 16
+        }
+        $end = [uint64]($pack.Length + $grow)
+        foreach ($e in $added) {
+            $nb = [System.Text.Encoding]::UTF8.GetBytes($e[0])
+            $bw.Write([uint32]$nb.Length); $bw.Write($nb); $bw.Write([uint64]$end); $bw.Write([uint64]$e[1].Length); $end += [uint64]$e[1].Length
+        }
+        $bw.Write($pack, $indexEnd, $pack.Length - $indexEnd)
+        foreach ($e in $added) { $bw.Write([byte[]]$e[1]) }
+        $bw.Flush(); $pack = $ms.ToArray()
+    }
     [System.IO.File]::WriteAllBytes($out, $pack)
 }
 $expModelFrom = $null
 if ($haveExperimental -and $haveSmall) {
     Say 'Making CC_SMALL_FP8_EXPERIMENTAL''s weights ...'
-    $expSha = ((Get-Content -LiteralPath (Join-Path $here 'experimental\dlssnr-small-experimental.bin.sha256') -Raw).Trim() -split '\s+')[0]
+    $expSha = ((Get-Content -LiteralPath (Join-Path $here 'experimental\CC_SMALL_FP8_EXPERIMENTAL.bin.sha256') -Raw).Trim() -split '\s+')[0]
     $expModelFrom = Join-Path ([System.IO.Path]::GetTempPath()) ("dlssnr-small-experimental-$([guid]::NewGuid().ToString('N')).bin")
     try {
         New-ExperimentalWeights $smallFrom (Join-Path $here 'experimental\dlssnr-small-experimental.delta') $expModelFrom
@@ -564,6 +591,45 @@ if ($haveExperimental -and $haveSmall) {
     }
 }
 if (-not $expModelFrom -and $Model -eq 'CC_SMALL_FP8_EXPERIMENTAL') { Say 'Games start with CC_SMALL_FP8 instead.'; $Model = 'CC_SMALL_FP8' }
+# CC_SILVER_AARDWOLD_OPTIMIZED's weights the same way, from CC_SILVER_AARDWOLD's model and the package's difference file.
+$optModelFrom = $null
+if ($haveOptimized) {
+    Say 'Making CC_SILVER_AARDWOLD_OPTIMIZED''s weights ...'
+    $optSha = ((Get-Content -LiteralPath (Join-Path $here 'optimized\CC_SILVER_AARDWOLD_OPTIMIZED.bin.sha256') -Raw).Trim() -split '\s+')[0]
+    $optModelFrom = Join-Path ([System.IO.Path]::GetTempPath()) ("dlssnr-optimized-$([guid]::NewGuid().ToString('N')).bin")
+    try {
+        New-ExperimentalWeights $modelFrom (Join-Path $here 'optimized\dlssnr-optimized.delta') $optModelFrom
+        if ((Get-FileHash -LiteralPath $optModelFrom -Algorithm SHA256).Hash -ne $optSha) { throw 'the weights have the wrong checksum (model or package incomplete?)' }
+    } catch {
+        Remove-Item -LiteralPath $optModelFrom -Force -ErrorAction SilentlyContinue
+        $optModelFrom = $null
+        Say "Note: CC_SILVER_AARDWOLD_OPTIMIZED's weights could not be made ($($_.Exception.Message)); it is not available in game. The other networks are installed as usual."
+    }
+}
+if (-not $optModelFrom -and $Model -eq 'CC_SILVER_AARDWOLD_OPTIMIZED') { Say 'Games start with CC_SILVER_AARDWOLD.'; $Model = 'CC_SILVER_AARDWOLD' }
+# Its int4 layers' weights: made from CC_SILVER_AARDWOLD_OPTIMIZED's weights (just made) with the package's data, checked
+# against the tested result. One file for its three levels with int4 layers (Balanced, Performance, Ultra Performance),
+# made with Ultra Performance's tables (dlssnr-amd\int4-ultra), which cover the others'. If that fails, it runs at Quality
+# (the other levels greyed out in game, with the reason).
+$int4ModelFrom = $null
+$int4Data = Join-Path $here 'dlssnr-amd\int4-ultra'
+if ($haveInt4 -and $optModelFrom) {
+    $generator = Join-Path $here 'model-tools\dlssnr-int4-weights.exe'
+    $hashFile = Join-Path $here 'model-tools\dlssnr-int4.sha256'
+    if (-not (Test-Path -LiteralPath $generator) -or -not (Test-Path -LiteralPath $hashFile)) {
+        Fail 'The int4 files of the package are incomplete; unpack the package again.'
+    }
+    $int4Sha = ((Get-Content -LiteralPath $hashFile -Raw).Trim() -split '\s+')[0]
+    $int4ModelFrom = Join-Path ([System.IO.Path]::GetTempPath()) ("dlssnr-int4-$([guid]::NewGuid().ToString('N')).bin")
+    Say 'Making the weights of CC_SILVER_AARDWOLD_OPTIMIZED''s int4 layers ...'
+    & $generator $optModelFrom $int4Data $int4ModelFrom
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $int4ModelFrom) -or
+        (Get-FileHash -LiteralPath $int4ModelFrom -Algorithm SHA256).Hash -ne $int4Sha) {
+        Remove-Item -LiteralPath $int4ModelFrom -Force -ErrorAction SilentlyContinue
+        $int4ModelFrom = $null
+        Say 'Note: making or checking the int4 layers'' weights failed; CC_SILVER_AARDWOLD_OPTIMIZED runs at Quality only.'
+    }
+}
 
 # LumeniteFX is fetched and its interface checked before anything is installed: if anything is wrong, nothing is.
 $lumeniteFx = $null
@@ -602,15 +668,19 @@ if (Test-Path -LiteralPath $manifest) { Say 'Found a previous installation, remo
 
 Set-Content -LiteralPath $manifest -Value "F $ManifestName" -Encoding UTF8
 Put-Tree (Join-Path $here 'dlssnr-amd') 'dlssnr-amd'
-if ($modelFrom -ne $modelPath) { Copy-Item -LiteralPath $modelFrom -Destination (Join-Path $game 'dlssnr-amd\dlssnr.bin') -Force }
-if ($haveSmall -and $smallFrom -ne $smallPath) { Copy-Item -LiteralPath $smallFrom -Destination (Join-Path $game 'dlssnr-amd\dlssnr-small.bin') -Force }
+if ($modelFrom -ne $modelPath) { Copy-Item -LiteralPath $modelFrom -Destination (Join-Path $game 'dlssnr-amd\CC_SILVER_AARDWOLD.bin') -Force }
+if ($haveSmall -and $smallFrom -ne $smallPath) { Copy-Item -LiteralPath $smallFrom -Destination (Join-Path $game 'dlssnr-amd\CC_SMALL_FP8.bin') -Force }
 if ($int4ModelFrom) {
-    try { Put-File $int4ModelFrom 'dlssnr-amd\dlssnr-int4.bin' }
+    try { Put-File $int4ModelFrom 'dlssnr-amd\CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin' }
     finally { Remove-Item -LiteralPath $int4ModelFrom -Force -ErrorAction SilentlyContinue }
 }
 if ($expModelFrom) {
-    try { Put-File $expModelFrom 'dlssnr-amd\dlssnr-small-experimental.bin' }
+    try { Put-File $expModelFrom 'dlssnr-amd\CC_SMALL_FP8_EXPERIMENTAL.bin' }
     finally { Remove-Item -LiteralPath $expModelFrom -Force -ErrorAction SilentlyContinue }
+}
+if ($optModelFrom) {
+    try { Put-File $optModelFrom 'dlssnr-amd\CC_SILVER_AARDWOLD_OPTIMIZED.bin' }
+    finally { Remove-Item -LiteralPath $optModelFrom -Force -ErrorAction SilentlyContinue }
 }
 $exeName = [System.IO.Path]::GetFileNameWithoutExtension($exe)
 Record-Logs @('dlssnr-amd.log', 'dlssnr-amd-crash.dmp')
@@ -744,11 +814,11 @@ Record-Logs @('dlssnr-amd.ini')
 Say ''
 $style = if ($RenoDX -eq 'on') { 'RenoDX style' } else { 'wilsjo2 style' }
 Say "Installed the $Route route into: $game ($style)"
-Say "Networks installed: $(if ($haveSmall) { 'CC_SMALL_FP8, ' })$(if ($expModelFrom) { 'CC_SMALL_FP8_EXPERIMENTAL, ' })CC_SILVER_AARDWOLD$(if ($int4ModelFrom) { ', CC_SILVER_AARDWOLD_INT4_MIXED' }); games start with $Model."
+Say "Networks installed: $(if ($haveSmall) { 'CC_SMALL_FP8, ' })$(if ($expModelFrom) { 'CC_SMALL_FP8_EXPERIMENTAL, ' })CC_SILVER_AARDWOLD$(if ($optModelFrom) { ', CC_SILVER_AARDWOLD_OPTIMIZED' + $(if (-not $int4ModelFrom) { ' (without its int4 layers)' }) }); games start with $Model."
 Say "Switch the network in game at any time: the drop-down in $(if ($Route -eq 'optiscaler') { 'NR Control (End)' } else { 'ReShade''s Add-ons page' }), or Ctrl+F11 to cycle; settings: [Network] in dlssnr-amd.ini."
 Say 'The network runs as machine code made in advance by the ACO compiler (ACO Mode). When your driver cannot take it,'
 Say "$(if ($Route -eq 'optiscaler') { 'NR Control' } else { 'ReShade''s Add-ons page' }) and dlssnr-amd.log say why; an RX 9000 then runs the network compiled by the AMD driver"
-Say '(without CC_SMALL_FP8_EXPERIMENTAL and CC_SILVER_AARDWOLD_INT4_MIXED); RX 7000 and Radeon 700M / 800M / 8000S graphics have no NR then.'
+Say '(without CC_SMALL_FP8_EXPERIMENTAL and CC_SILVER_AARDWOLD_OPTIMIZED); RX 7000 and Radeon 700M / 800M / 8000S graphics have no NR then.'
 if ($Route -eq 'optiscaler') {
     Say 'In game, turn on DLSS, FSR or XeSS in the game''s settings. End opens NR Control (DirectX 11 / 12 and Vulkan games: every'
     Say 'NR setting: processing, network, Passes); Insert opens the OptiScaler menu (upscaling and frame generation only).'

@@ -1,28 +1,30 @@
 #!/usr/bin/env bash
 # Build the Windows package (64-bit games on the AMD Windows driver):
 #   dlssnr-amd/     the network: Windows shaders (windows/build/assemble_product_data.sh), and in aco/ the
-#                   same network as ACO's machine code (ACO Mode, always tried first): RX 9000's (RDNA4), int4 mixed's in
-#                   int4/, RX 7000's and the Radeon 700M / 800M / 8000S graphics' (RDNA3) in rdna3/; int4 mixed's data
-#                   in int4/, CC_SMALL_FP8_EXPERIMENTAL's SPIR-V in experimental/
+#                   same network as ACO's machine code (ACO Mode, always tried first): RX 9000's (RDNA4),
+#                   CC_SILVER_AARDWOLD_OPTIMIZED's int4 layers' in int4/, RX 7000's and the Radeon 700M / 800M / 8000S
+#                   graphics' (RDNA3) in rdna3/; the int4 layers' data in int4/, CC_SMALL_FP8_EXPERIMENTAL's SPIR-V in
+#                   experimental/, CC_SILVER_AARDWOLD_OPTIMIZED's in optimized/
 #   model-tools/    dlssnr_extract_model.exe: install.ps1 makes the model from the user's nvngx_dlssnr.dll;
-#                   dlssnr-int4-weights.exe: and int4 mixed's weights from the model
+#                   dlssnr-int4-weights.exe: and the int4 layers' weights from CC_SILVER_AARDWOLD_OPTIMIZED's
 #   experimental/   CC_SMALL_FP8_EXPERIMENTAL's weights as a difference from CC_SMALL_FP8's (install.ps1 applies it)
+#   optimized/      CC_SILVER_AARDWOLD_OPTIMIZED's weights as a difference from CC_SILVER_AARDWOLD's (the same)
 #   optiscaler/     OptiScaler (the official nightly, unmodified) and our NR plugin for it
 #   reshade/        ReShade + our add-on: dxgi.dll in DX10/11/12 games, a Vulkan layer otherwise
 #   dxvk/           D3D9 -> Vulkan, for the DX9 route only
 #   vulkan/         the Khronos loader the Vulkan-layer routes put beside the game
 #   install.bat, install.ps1, README.txt
 #
-#   [NR_MODEL=dlssnr.bin [NR_MODEL_SMALL=dlssnr-small.bin]] [NR_INT4=0] [NR_LANG_EXTRA=<dir>] [NR_SIGN=1] bash windows/build/build_package.sh [build dir]
+#   [NR_MODEL=CC_SILVER_AARDWOLD.bin [NR_MODEL_SMALL=CC_SMALL_FP8.bin]] [NR_INT4=0] [NR_LANG_EXTRA=<dir>] [NR_SIGN=1] bash windows/build/build_package.sh [build dir]
 #
 # The package carries no model: install.ps1 extracts it from the user's nvngx_dlssnr.dll on the first
-# install. NR_MODEL puts a dlssnr.bin you made yourself into the package (for your own use only), and with it
-# NR_MODEL_SMALL a dlssnr-small.bin (the new model, from the 310.9.16 DLL).
+# install. NR_MODEL puts a CC_SILVER_AARDWOLD.bin you made yourself into the package (for your own use only), and with it
+# NR_MODEL_SMALL a CC_SMALL_FP8.bin (the new model, from the 310.9.16 DLL).
 #
-# NR_INT4 (default 1): the programs built with int4 mixed and its data in the package; install.ps1 installs all four
-# networks (CC_SMALL_FP8, CC_SMALL_FP8_EXPERIMENTAL, CC_SILVER_AARDWOLD, CC_SILVER_AARDWOLD_INT4_MIXED; the
-# experimental one and int4 mixed run with ACO Mode only) and asks only which one a game starts with. NR_INT4=0: no int4
-# mixed.
+# NR_INT4 (default 1): the programs built with CC_SILVER_AARDWOLD_OPTIMIZED's int4 layers and their data in the
+# package; install.ps1 installs all four networks (CC_SMALL_FP8, CC_SMALL_FP8_EXPERIMENTAL, CC_SILVER_AARDWOLD,
+# CC_SILVER_AARDWOLD_OPTIMIZED; the experimental and the optimized one run with ACO Mode only) and asks only which one
+# a game starts with. NR_INT4=0: no int4 layers.
 #
 # D3D10/11/12 games keep the system's own D3D: the network runs on a Vulkan device of its own and the
 # frame crosses over through shared textures and a shared fence (windows/src/pe/nr_pe_bridge.hpp).
@@ -134,6 +136,12 @@ rm -rf -- "$out/aco-shaders-experimental"
 python3 linux/build/build_network.py rdna4 --experimental --out "$out/aco-shaders-experimental" > /dev/null
 mkdir -p -- "$pkg/dlssnr-amd/experimental"
 cp -r -- "$out/aco-shaders-experimental" "$pkg/dlssnr-amd/experimental/shaders"
+# CC_SILVER_AARDWOLD_OPTIMIZED (ACO Mode only) the same way: linux/build/build_network.py --optimized, its records in
+# aco/records, its SPIR-V in dlssnr-amd/optimized/shaders.
+rm -rf -- "$out/aco-shaders-optimized"
+python3 linux/build/build_network.py rdna4 --optimized --out "$out/aco-shaders-optimized" > /dev/null
+mkdir -p -- "$pkg/dlssnr-amd/optimized"
+cp -r -- "$out/aco-shaders-optimized" "$pkg/dlssnr-amd/optimized/shaders"
 # RDNA3 (RX 7000, Radeon 700M / 800M / 8000S graphics; nr_gpu_arch.hpp): its own network as ACO's machine code only
 # (windows/data/aco/rdna3), the SPIR-V the records were made from (windows/build/build_aco_network.py rdna3) and the
 # templates (shells: small shaders with the network's interfaces) the driver compiles for the containers.
@@ -145,10 +153,14 @@ cp -- windows/data/aco/rdna3/records/*.nrp "$aco/rdna3/records/"
 cp -r -- windows/data/aco/rdna3/shells "$aco/rdna3/shells"
 cp -- windows/data/aco/rdna3/shell-aliases.txt "$aco/rdna3/"
 if [[ "${NR_INT4:-1}" == 1 ]]; then
-    # int4 mixed as ACO's machine code (windows/data/aco/int4/records) and the Linux int4 network the records were
-    # made from (linux/build/build_network.py --int4)
-    rm -rf -- "$out/aco-shaders-int4"
+    # CC_SILVER_AARDWOLD_OPTIMIZED with its int4 layers as ACO's machine code (windows/data/aco/int4/records: the records
+    # of its three int4 levels, Balanced, Performance and Ultra Performance - one folder, the records are named by their
+    # SPIR-V) and the Linux networks the records were made from (linux/build/build_network.py --int4 / --performance /
+    # --ultra; the OPTIMIZED builds read their SPIR-V from their own dlssnr-amd folder, --spv-dir-aco)
+    rm -rf -- "$out/aco-shaders-int4" "$out/aco-shaders-performance" "$out/aco-shaders-ultra"
     python3 linux/build/build_network.py rdna4 --int4 --out "$out/aco-shaders-int4" > /dev/null
+    python3 linux/build/build_network.py rdna4 --performance --out "$out/aco-shaders-performance" > /dev/null
+    python3 linux/build/build_network.py rdna4 --ultra --out "$out/aco-shaders-ultra" > /dev/null
     mkdir -p -- "$aco/int4/records"
     cp -r -- "$out/aco-shaders-int4" "$aco/int4/shaders"
     cp -- windows/data/aco/int4/records/*.nrp "$aco/int4/records/"
@@ -169,9 +181,17 @@ for file in [root / 'shell-aliases.txt', root / 'int4/shell-aliases.txt']:
 PY
     # dlssnr-amd/int4/: the int4 data (one copy for both platforms, linux/data/int4/rdna4) and the SPIR-V the ACO
     # records belong to
-    mkdir -p -- "$pkg/dlssnr-amd/int4"
+    # dlssnr-amd/int4-performance/ (Balanced's tables, its network) and int4-ultra/ (Balanced's tables with
+    # linux/data/int4-ultra/rdna4 added, its settings.txt, its network); install.ps1 makes the int4 weights of all three
+    # from int4-ultra's tables
+    mkdir -p -- "$pkg/dlssnr-amd/int4" "$pkg/dlssnr-amd/int4-performance" "$pkg/dlssnr-amd/int4-ultra"
     cp -r -- linux/data/int4/rdna4/{vit,swin,settings.txt} "$pkg/dlssnr-amd/int4/"
     cp -r -- "$out/aco-shaders-int4" "$pkg/dlssnr-amd/int4/shaders"
+    cp -r -- linux/data/int4/rdna4/{vit,swin,settings.txt} "$pkg/dlssnr-amd/int4-performance/"
+    cp -r -- "$out/aco-shaders-performance" "$pkg/dlssnr-amd/int4-performance/shaders"
+    cp -r -- linux/data/int4/rdna4/{vit,swin,settings.txt} "$pkg/dlssnr-amd/int4-ultra/"
+    cp -r -- linux/data/int4-ultra/rdna4/. "$pkg/dlssnr-amd/int4-ultra/"
+    cp -r -- "$out/aco-shaders-ultra" "$pkg/dlssnr-amd/int4-ultra/shaders"
     "$cxx" "${common[@]}" "${NR_PRODUCT_DEFINES[@]}" -c windows/src/tools/nr_int4_weights.cpp -o "$out/int4_weights.o"
     # The generator stops before device creation. Vulkan calls abort if this contract is broken.
     syms=$({ "$cxx" -static -municode -o /dev/null "$out/int4_weights.o" "$out/nr_native_plan.o" 2>&1 || true; } |
@@ -281,7 +301,12 @@ cmp -s <(cd artifacts/windows/asi/shaders/wilsjo2 && sha256sum -- *.spv) <(cd "$
 # weights) and the SHA-256 of the result.
 mkdir -p -- "$pkg/experimental"
 cp -- linux/data/experimental/dlssnr-small-experimental.delta "$pkg/experimental/"
-cp -- linux/data/experimental/dlssnr-small-experimental.sha256 "$pkg/experimental/dlssnr-small-experimental.bin.sha256"
+cp -- linux/data/experimental/dlssnr-small-experimental.sha256 "$pkg/experimental/CC_SMALL_FP8_EXPERIMENTAL.bin.sha256"
+# optimized/: the same for CC_SILVER_AARDWOLD_OPTIMIZED, from CC_SILVER_AARDWOLD's weights (linux/data/optimized); the int4
+# layers' weights are made from the result (model-tools/dlssnr-int4-weights.exe).
+mkdir -p -- "$pkg/optimized"
+cp -- linux/data/optimized/dlssnr-optimized.delta "$pkg/optimized/"
+cp -- linux/data/optimized/dlssnr-optimized.sha256 "$pkg/optimized/CC_SILVER_AARDWOLD_OPTIMIZED.bin.sha256"
 
 # dlssnr-amd.ini, put in place at install: the text the programs write themselves (windows/package/make_ini.py),
 # with the line ends a Windows program writes.

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Make the model files from NVIDIA's nvngx_dlssnr.dll, written into <output folder>:
-#   310.9.16: dlssnr.bin (the old model, the DLL's preset 1) and dlssnr-small.bin (the new model, the DLL's default)
-#   310.8.0:  dlssnr.bin only
+#   310.9.16: CC_SILVER_AARDWOLD.bin (the old model, the DLL's preset 1) and CC_SMALL_FP8.bin (the new model, the DLL's default)
+#   310.8.0:  CC_SILVER_AARDWOLD.bin only
 #
 #   bash extract_model.sh <nvngx_dlssnr.dll or a .zip containing it> <output folder>
 #
@@ -47,10 +47,10 @@ fi
 got=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["dll_sha256"])' "$work/probe.json")
 case "$got" in
     "$sha_3109")
-        one WEIGHTS_HT descriptor.json block70.layer0.layer model-files.txt model-files.sha256 "$out/dlssnr.bin"
-        one WEIGHTS_CC_SMALL_FP8 descriptor-small.json block30.layer0.layer model-files-small.txt model-files-small.sha256 "$out/dlssnr-small.bin";;
+        one WEIGHTS_HT descriptor.json block70.layer0.layer model-files.txt model-files.sha256 "$out/CC_SILVER_AARDWOLD.bin"
+        one WEIGHTS_CC_SMALL_FP8 descriptor-small.json block30.layer0.layer model-files-small.txt model-files-small.sha256 "$out/CC_SMALL_FP8.bin";;
     "$sha_3108")
-        one WEIGHTS_HT descriptor.json block70.layer0.layer model-files.txt model-files.sha256 "$out/dlssnr.bin";;
+        one WEIGHTS_HT descriptor.json block70.layer0.layer model-files.txt model-files.sha256 "$out/CC_SILVER_AARDWOLD.bin";;
     *)
         echo "This is not nvngx_dlssnr 310.9.16 or 310.8.0 (SHA256 $got). One of these two DLL versions is required." >&2
         exit 1;;
