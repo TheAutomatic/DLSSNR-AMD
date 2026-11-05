@@ -22,6 +22,7 @@
 #include "nr_ini_network.hpp"
 #include "nr_pe_log.hpp"
 #include "nr_pe_d3d12split.hpp"
+#include "nr_vram_ledger.hpp"
 
 #include <windows.h>
 
@@ -213,15 +214,26 @@ void transition(ID3D12GraphicsCommandList* cmd, ID3D12Resource* r, D3D12_RESOURC
 // runtime_alpha.comp (windows/shaders/passes): the frame's alpha back onto the answer, the 8-bit rounding for an
 // 8-bit output.
 const char kAlpha[] =
-    "cbuffer C : register(b0) { uint g_w; uint g_h; uint g_u8; uint g_pad; };\n"
-    "RWStructuredBuffer<float4> result : register(u0);\n"
-    "RWStructuredBuffer<float4> original : register(u1);\n"
+    "cbuffer C : register(b0) { uint g_w; uint g_h; uint g_u8; uint g_half; };\n"
+    "RWByteAddressBuffer result : register(u0);\n"
+    "RWByteAddressBuffer original : register(u1);\n"
     "[numthreads(8, 8, 1)] void alpha(uint3 id : SV_DispatchThreadID) {\n"
     "    if (id.x >= g_w || id.y >= g_h) return;\n"
     "    const uint i = id.y * g_w + id.x;\n"
-    "    float3 rgb = result[i].rgb;\n"
-    "    if (g_u8 != 0) { precise float3 scaled = saturate(rgb) * 255.0; rgb = (floor(scaled) + step(0.5, frac(scaled))) / 255.0; }\n"
-    "    result[i] = float4(rgb, original[i].a);\n"
+    "    if (g_half != 0) {\n"
+    "        uint2 r = result.Load2(i * 8);\n"
+    "        uint2 o = original.Load2(i * 8);\n"
+    "        float3 rgb = f16tof32(uint3(r.x & 0xffffu, r.x >> 16, r.y & 0xffffu));\n"
+    "        if (g_u8 != 0) { precise float3 scaled = saturate(rgb) * 255.0; rgb = (floor(scaled) + step(0.5, frac(scaled))) / 255.0; }\n"
+    "        uint3 h = f32tof16(rgb);\n"
+    "        result.Store2(i * 8, uint2(h.x | (h.y << 16), h.z | (o.y & 0xffff0000u)));\n"
+    "    } else {\n"
+    "        float4 r = asfloat(result.Load4(i * 16));\n"
+    "        float4 o = asfloat(original.Load4(i * 16));\n"
+    "        float3 rgb = r.rgb;\n"
+    "        if (g_u8 != 0) { precise float3 scaled = saturate(rgb) * 255.0; rgb = (floor(scaled) + step(0.5, frac(scaled))) / 255.0; }\n"
+    "        result.Store4(i * 16, asuint(float4(rgb, o.a)));\n"
+    "    }\n"
     "}\n";
 
 // The temporal state of one feature (Runtime::Impl::FeatureState): its two history images (the post block writes the
@@ -424,14 +436,26 @@ std::shared_ptr<Built> build(ID3D12Device* device, const Carriers& carriers, ID3
         return nullptr;
     // The network memory (retarget): the arena zero (a new committed resource), the weights to upload once.
     const uint64_t wbytes = b->plan.weights.size();
-    b->act = buffer(device, D3D12_HEAP_TYPE_DEFAULT, b->plan.act_total, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
-    b->wgt = buffer(device, D3D12_HEAP_TYPE_DEFAULT, wbytes, D3D12_RESOURCE_STATE_COPY_DEST, true);
+    {
+        nr::vram::Scope s_act(nr::vram::kActivations, b->net);
+        b->act = buffer(device, D3D12_HEAP_TYPE_DEFAULT, b->plan.act_total, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
+        nr::vram::track_d3d12(device, b->act, nr::vram::kActivations);
+    }
+    {
+        nr::vram::Scope s_wgt(nr::vram::kWeights, b->net);
+        b->wgt = buffer(device, D3D12_HEAP_TYPE_DEFAULT, wbytes, D3D12_RESOURCE_STATE_COPY_DEST, true);
+        nr::vram::track_d3d12(device, b->wgt, nr::vram::kWeights);
+    }
     b->wgt_upload = buffer(device, D3D12_HEAP_TYPE_UPLOAD, wbytes, D3D12_RESOURCE_STATE_GENERIC_READ, false);
     b->stand = buffer(device, D3D12_HEAP_TYPE_DEFAULT, 256, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
     b->noise = buffer(device, D3D12_HEAP_TYPE_DEFAULT, 256, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
     b->tables = uint32_t(b->plan.noise.size() + b->plan.disp.size());
     b->slot_bytes = uint64_t(b->tables) * kTableBytes + kParamsBytes;
-    b->table = buffer(device, D3D12_HEAP_TYPE_DEFAULT, b->slot_bytes, D3D12_RESOURCE_STATE_COPY_DEST, true);
+    {
+        nr::vram::Scope s_buf(nr::vram::kUnset, b->net);
+        b->table = buffer(device, D3D12_HEAP_TYPE_DEFAULT, b->slot_bytes, D3D12_RESOURCE_STATE_COPY_DEST, true);
+        nr::vram::track_d3d12(device, b->table, nr::vram::kUnset);
+    }
     if (!b->act || !b->wgt || !b->wgt_upload || !b->stand || !b->noise || !b->table) {
         *why = "the network memory could not be made"; return nullptr;
     }
@@ -734,9 +758,14 @@ public:
             // history of a feature that still exists.
             auto fresh = std::make_shared<FeatureState>();
             fresh->f16 = f16;
-            for (auto& hh : fresh->hist)
-                hh = buffer(device_, D3D12_HEAP_TYPE_DEFAULT, uint64_t(b->w) * b->h * (f16 ? 8 : 16),
-                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
+            {
+                nr::vram::Scope s_hist(nr::vram::kUnset, b->net);
+                for (auto& hh : fresh->hist) {
+                    hh = buffer(device_, D3D12_HEAP_TYPE_DEFAULT, uint64_t(b->w) * b->h * (f16 ? 8 : 16),
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
+                    nr::vram::track_d3d12(device_, hh, nr::vram::kUnset);
+                }
+            }
             if (!fresh->hist[0] || !fresh->hist[1]) { *why = "the history images could not be made"; return false; }
             fs = fresh.get();
             b->features[temporal_.feature] = std::move(fresh);
@@ -905,11 +934,14 @@ public:
             }
             for (Img m : k.fam.images) {
                 auto* d = reinterpret_cast<uint32_t*>(t + at);
+                const uint32_t in_format = in.bytes == uint64_t(b->w) * b->h * 8 ? kFormatRgba16f : kFormatRgba32f;
+                const uint32_t out_format = out.bytes == uint64_t(b->w) * b->h * 8 ? kFormatRgba16f : kFormatRgba32f;
+                const uint32_t mv_format = temporal_.motion_f16 ? kFormatRgba16f : kFormatRgba32f;
                 switch (m) {
-                case TEX_IN: put_image(d, in.va, b->w, b->h, kFormatRgba32f); break;
-                case SURF0: put_image(d, out.va, b->w, b->h, kFormatRgba32f); break;
+                case TEX_IN: put_image(d, in.va, b->w, b->h, in_format); break;
+                case SURF0: put_image(d, out.va, b->w, b->h, out_format); break;
                 case SURF1: put_image(d, stand_va, 1, 1, kFormatRgba32f); break;
-                case FLOW: put_image(d, temporal_.motion_va, b->w, b->h, kFormatRgba32f); break;
+                case FLOW: put_image(d, temporal_.motion_va, b->w, b->h, mv_format); break;
                 case HIST: put_image(d, hist_va, b->w, b->h, hist_format); break;
                 case HIST_STORE: put_image(d, store_va, b->w, b->h, hist_format); break;
                 case DEPTH:
@@ -1030,7 +1062,8 @@ public:
             b->wgt_upload = nullptr;
         }
         if (controls_.automatic_mask) {
-            const UINT c[4] = {b->w, b->h, controls_.round_u8 ? 1u : 0u, 0u};
+            const uint32_t half_io = out.bytes == uint64_t(b->w) * b->h * 8 ? 1u : 0u;
+            const UINT c[4] = {b->w, b->h, controls_.round_u8 ? 1u : 0u, half_io};
             cmd->SetComputeRootSignature(alpha_rs_);
             cmd->SetPipelineState(alpha_pso_);
             cmd->SetComputeRoot32BitConstants(0, 4, c, 0);
@@ -1071,8 +1104,12 @@ public:
 
 private:
     void note_gpu(double ms) {
-        const float prev = gpu_avg_ms_.load();
-        gpu_avg_ms_.store(prev > 0.f ? float(prev * 0.9 + ms * 0.1) : float(ms));
+        gpu_ring_[gpu_ring_at_ % 32] = float(ms);
+        ++gpu_ring_at_;
+        const size_t n = std::min<size_t>(gpu_ring_at_, 32);
+        double s = 0;
+        for (size_t i = 0; i < n; ++i) s += gpu_ring_[i];
+        gpu_avg_ms_.store(float(s / double(n)));
         ++gpu_n_; gpu_sum_ += ms;
         gpu_min_ = gpu_n_ == 1 ? ms : std::min(gpu_min_, ms);
         gpu_max_ = std::max(gpu_max_, ms);
@@ -1145,6 +1182,8 @@ private:
     uint64_t frames_ = 0, resets_ = 0, gpu_seen_ = 0;
     unsigned gpu_n_ = 0;
     std::atomic<float> gpu_avg_ms_{0.f};
+    float gpu_ring_[32] = {};
+    size_t gpu_ring_at_ = 0;
     double gpu_sum_ = 0, gpu_min_ = 0, gpu_max_ = 0, cpu_sum_ = 0;
 };
 
