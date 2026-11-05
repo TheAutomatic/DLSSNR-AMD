@@ -23,6 +23,7 @@ using Settings = nr::renodx::Settings;   // RenoDX's own (nr_renodx.hpp)
 
 // RenoDX's FrameHdrMode on a DXGI format (nr_renodx.cpp's, on Vulkan's): 0 SDR, 1 linear HDR, 2 PQ.
 uint8_t frame_hdr_mode(DXGI_FORMAT format, bool hdr_flag);
+void prewarm_shaders(const std::wstring& shaders);
 
 // One frame, as evaluate_backend hands it over (nr_renodx.hpp StageFrame on the D3D12 route).
 struct Frame {
