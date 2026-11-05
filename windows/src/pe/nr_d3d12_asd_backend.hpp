@@ -23,6 +23,7 @@ struct AsdNetStatus {
     bool building = false;
     int building_net = -1;
     float building_seconds = 0.f;
+    float gpu_ms = 0.f;
 };
 
 struct LinearFrame {
