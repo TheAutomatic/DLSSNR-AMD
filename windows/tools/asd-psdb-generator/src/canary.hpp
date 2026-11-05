@@ -113,8 +113,8 @@ inline int build_seed(const Args& args, const std::string& repo, const std::stri
                 stored.push_back({value.Type, {value.Value.pValue, UINT(value.Value.ValueSize)}});
             }
         }
-        for (auto& value : values) free(value.Value.pValue);
         HRESULT storedHr = copied->StoreValue(&key, stored.data(), UINT(stored.size()));
+        for (auto& value : values) free(value.Value.pValue);
         j.s("store_hr", hr_name(storedHr));
         j.end_obj();
         check(storedHr, "StoreValue");
