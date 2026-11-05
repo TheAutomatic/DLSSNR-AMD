@@ -3,6 +3,7 @@
 #include "nr_d3d12_asd.hpp"
 #include "nr_d3d12_asd_api.h"
 #include "nr_d3d12_asd_canary_blob.h"
+#include "nr_d3d12_asd_elf.hpp"
 #include "nr_pe_d3d12split.hpp"
 #include "nr_pe_log.hpp"
 #include "nr_pe_session.hpp"
@@ -546,17 +547,12 @@ Canary run_canary(ID3D12Device* device, ID3D12CommandQueue* queue, std::string* 
         if (!pl.found) { line = why; break; }
         HRESULT hr = device->CreateRootSignature(0, pl.root.data(), pl.root.size(), IID_PPV_ARGS(&rs));
         if (FAILED(hr)) { line = "CreateRootSignature " + hr_text(hr); break; }
-        D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
-        pd.pRootSignature = rs;
-        pd.CS.pShaderBytecode = pl.cs.data();
-        pd.CS.BytecodeLength = pl.cs.size();
-        pd.NodeMask = pl.node_mask;
-        pd.Flags = D3D12_PIPELINE_STATE_FLAGS(pl.flags);
+        const uint32_t threads[3] = {64, 1, 1};
         const ULONGLONG t0 = GetTickCount64();
-        hr = device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso));
-        log("[asd] canary: CreateComputePipelineState %s in %llu ms", hr_text(hr).c_str(),
+        const bool pso_ok = elf::create_pso_from_elf(device, elf::kCanaryAcoElf, sizeof elf::kCanaryAcoElf, threads, &pso, &why);
+        log("[asd] canary: CreateComputePipelineFromElf %s in %llu ms", pso_ok ? "0x00000000" : why.c_str(),
             (unsigned long long)(GetTickCount64() - t0));
-        if (FAILED(hr)) { line = "CreateComputePipelineState " + hr_text(hr); break; }
+        if (!pso_ok) { line = why; break; }
         in = buffer(device, D3D12_HEAP_TYPE_UPLOAD, kN * 4, D3D12_RESOURCE_STATE_GENERIC_READ, false);
         table = buffer(device, D3D12_HEAP_TYPE_UPLOAD, 4096, D3D12_RESOURCE_STATE_GENERIC_READ, false);
         out = buffer(device, D3D12_HEAP_TYPE_DEFAULT, kN * 4, D3D12_RESOURCE_STATE_COMMON, true);
@@ -682,10 +678,7 @@ void start(HMODULE self) {
     log("[asd] D3D12 ASD backend %s (%s: Enabled %d, Register %d)", g_enabled ? "on" : "off", utf8(g_ini).c_str(),
         g_enabled ? 1 : 0, g_register ? 1 : 0);
     if (!g_enabled) return;
-    if (!g_register) { set_registration("not registered: Register = 0 (NR Control's Unregister)"); return; }
-    // Under the loader lock here: the thread runs once OptiScaler's DllMain has returned (as the watchdog's).
-    if (HANDLE t = CreateThread(nullptr, 0, &registration_thread, nullptr, 0, nullptr)) CloseHandle(t);
-    else set_registration("not registered: no thread");
+    set_registration("direct ELF (IAmdExtD3DDevice5::CreateComputePipelineFromElf; no ASD registration)");
 }
 
 void on_device(ID3D12Device* device) {
@@ -746,8 +739,7 @@ Status status() {
     std::lock_guard<std::mutex> g(g_lock);
     s.enabled = g_enabled;
     s.register_on = g_register;
-    s.files_found = !g_folder.empty() && exists(sodb_path());
-    for (const Family& f : kFamilies) s.files_found = s.files_found && exists(g_folder + L"\\" + f.psdb);
+    s.files_found = !g_folder.empty();
     s.folder = utf8(g_folder);
     s.registration = g_registration;
     s.canary = g_canary_line;

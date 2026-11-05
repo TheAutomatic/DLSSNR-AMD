@@ -18,6 +18,7 @@
 //   - the temporal params buffer travels with the frame's tables (one upload, one copy).
 #include "nr_d3d12_asd_net.hpp"
 #include "nr_d3d12_asd.hpp"
+#include "nr_d3d12_asd_elf.hpp"
 #include "nr_ini_network.hpp"
 #include "nr_pe_log.hpp"
 #include "nr_pe_d3d12split.hpp"
@@ -88,7 +89,7 @@ uint64_t fnv1a64(const uint8_t* p, size_t n) {
 }
 
 // ---- the carriers (net-carriers.bin, made with the PSDB by TheAutomatic's generator) -------------------------
-struct Carrier { uint32_t tag = 0, dims[3]{}; std::string stem, src; std::vector<uint8_t> dxil; };
+struct Carrier { uint32_t tag = 0, dims[3]{}; std::string stem, src; std::vector<uint8_t> dxil, elf_bytes; };
 struct Carriers {
     std::vector<uint8_t> rs;
     std::map<std::string, Carrier> by_stem;   // the "root" record before the int4 one of the same SPIR-V
@@ -341,13 +342,15 @@ std::shared_ptr<Built> build(ID3D12Device* device, const Carriers& carriers, ID3
     b->w = w; b->h = h;
     // The kernel's record: FNV of its SPIR-V (g_<kern>.spv in the shaders the graph was lowered against; the temporal
     // kernels' own files).
+    std::map<std::string, Carrier> built_carriers;
     auto resolve_file = [&](const std::string& path, const Carrier** out) {
         std::vector<uint8_t> spv;
         if (!slurp(wide(path), &spv)) return false;
-        char stem[32];
-        std::snprintf(stem, sizeof stem, "%016llx", (unsigned long long)fnv1a64(spv.data(), spv.size()));
-        auto it = carriers.by_stem.find(stem);
-        if (it == carriers.by_stem.end()) return false;
+        std::string stem, err;
+        Carrier k;
+        if (!elf::load_kernel_elf(b->plan.spv_dir, folder(), spv, &k.elf_bytes, k.dims, &stem, &err)) return false;
+        k.stem = stem;
+        auto [it, _] = built_carriers.emplace(stem, std::move(k));
         *out = &it->second;
         return true;
     };
@@ -404,12 +407,9 @@ std::shared_ptr<Built> build(ID3D12Device* device, const Carriers& carriers, ID3
     if (b->net < 0) b->net = want_net >= 0 ? want_net : nr::kSmallFp8;
     auto make = [&](const std::string& kern, const Carrier& c, Built::Kern* k) {
         if (!family_of(kern, &k->fam)) { *why = "no binding table for kernel " + kern; return false; }
-        D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
-        pd.pRootSignature = rs;
-        pd.CS.pShaderBytecode = c.dxil.data();
-        pd.CS.BytecodeLength = c.dxil.size();
-        if (FAILED(device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&k->pso)))) {
-            *why = "CreateComputePipelineState failed for kernel " + kern; return false;
+        std::string err;
+        if (!elf::create_pso_from_elf(device, c.elf_bytes.data(), c.elf_bytes.size(), c.dims, &k->pso, &err)) {
+            *why = "CreateComputePipelineFromElf failed for kernel " + kern + ": " + err; return false;
         }
         k->tag = c.tag;
         return true;
@@ -522,12 +522,8 @@ public:
 
     bool create(ID3D12Device* device, const char** why) override {
         static std::string w;
-        auto carriers = std::make_shared<Carriers>();
-        if (!load_carriers(folder_ + L"\\net-carriers.bin", carriers.get(), &w)) { *why = w.c_str(); return false; }
-        carriers_ = carriers;
-        if (FAILED(device->CreateRootSignature(0, carriers_->rs.data(), carriers_->rs.size(), IID_PPV_ARGS(&rs_)))) {
-            *why = "the carriers' root signature could not be made"; return false;
-        }
+        carriers_ = std::make_shared<Carriers>();
+        if (!elf::create_carrier_root_signature(device, &rs_, &w)) { *why = w.c_str(); return false; }
         // The alpha pass: constants, the answer, the frame.
         D3D12_ROOT_PARAMETER p[3]{};
         p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
@@ -696,6 +692,7 @@ public:
         if (shared_->building) {
             s.building_seconds = std::chrono::duration<float>(std::chrono::steady_clock::now() - shared_->build_started).count();
         }
+        s.gpu_ms = gpu_avg_ms_.load();
         return s;
     }
     void controls(const nr::D3d12NetControls& c) override { controls_ = c; }
@@ -1071,6 +1068,8 @@ public:
 
 private:
     void note_gpu(double ms) {
+        const float prev = gpu_avg_ms_.load();
+        gpu_avg_ms_.store(prev > 0.f ? float(prev * 0.9 + ms * 0.1) : float(ms));
         ++gpu_n_; gpu_sum_ += ms;
         gpu_min_ = gpu_n_ == 1 ? ms : std::min(gpu_min_, ms);
         gpu_max_ = std::max(gpu_max_, ms);
@@ -1142,6 +1141,7 @@ private:
     double hz_ = 0;
     uint64_t frames_ = 0, resets_ = 0, gpu_seen_ = 0;
     unsigned gpu_n_ = 0;
+    std::atomic<float> gpu_avg_ms_{0.f};
     double gpu_sum_ = 0, gpu_min_ = 0, gpu_max_ = 0, cpu_sum_ = 0;
 };
 

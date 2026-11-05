@@ -409,8 +409,8 @@ void report_control(nr::pe::Session& session, const Feature* f, uint32_t route, 
             st.build_progress = 0.f;
             st.build_phase.clear();
         }
-        st.gpu_ms = ran ? g_native_ms.load() : 0.f;
-        st.network_ms = 0.f;   // (the [asd] timing lines have the network's share)
+        st.network_ms = ran ? as.gpu_ms * float(std::max(st.passes, 1u)) : 0.f;
+        st.gpu_ms = ran ? std::max(g_native_ms.load(), st.network_ms) : 0.f;
         st.aco = 1;
         st.aco_rdna3 = false;
         st.aco_why = "via ASD: the network runs as ACO machine code (a precompiled shader database) on the game's D3D12 device";
