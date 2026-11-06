@@ -2955,7 +2955,6 @@ bool Session::Impl::carry(VkCommandBuffer cmd, uint64_t feature) {
 // The D3D12 ASD backend is off again (its canary did not hit): what it ruled out is decided as on the bridge.
 void Session::Impl::recheck_availability() {
     if (native_epoch == g_native_epoch.load()) return;
-    if (net_switch.reason(nr::kSilverAardwoldInt4) == "not on the D3D12 route (ASD)") net_switch.unavailable(nr::kSilverAardwoldInt4, "");
     availability_checked = false;
 }
 
@@ -2969,13 +2968,13 @@ void Session::Impl::check_availability() {
         const DWORD a = nr::u8::attributes((root + "\\" + rel).c_str());
         return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
     };
-    if (!exists("dlssnr-amd\\CC_SMALL_FP8.bin") && !exists("dlssnr-amd\\dlssnr-small.bin"))
+    if (!exists("dlssnr-amd\\CC_SMALL_FP8.bin"))
         net_switch.unavailable(nr::kSmallFp8, "needs the model of the 310.9.16 nvngx_dlssnr.dll (install.ps1 -Dll)");
-    if (!exists("dlssnr-amd\\CC_SILVER_AARDWOLD.bin") && !exists("dlssnr-amd\\dlssnr.bin"))
+    if (!exists("dlssnr-amd\\CC_SILVER_AARDWOLD.bin"))
         net_switch.unavailable(nr::kSilverAardwold, "the model file is missing (run install.bat again)");
     if (!exists("dlssnr-amd\\experimental\\shaders\\fixed-attention.txt"))
         net_switch.unavailable(nr::kSmallFp8Experimental, "not installed (run install.bat again)");
-    else if (!exists("dlssnr-amd\\CC_SMALL_FP8_EXPERIMENTAL.bin") && !exists("dlssnr-amd\\dlssnr-small-experimental.bin"))
+    else if (!exists("dlssnr-amd\\CC_SMALL_FP8_EXPERIMENTAL.bin"))
         net_switch.unavailable(nr::kSmallFp8Experimental, "needs the model of the 310.9.16 nvngx_dlssnr.dll (install.ps1 -Dll)");
     else if (!g_d3d12_native.load() && make_host().rdna3)
         net_switch.unavailable(nr::kSmallFp8Experimental, "not on RDNA3 GPUs (RX 7000, Radeon 700M / 800M / 8000S)");
@@ -2987,7 +2986,7 @@ void Session::Impl::check_availability() {
         net_switch.unavailable(nr::kSmallFp8Experimental, "the game's device has no pipeline binaries (ACO Mode)");
     // CC_SILVER_AARDWOLD_OPTIMIZED (Quality; ACO Mode only, as CC_SMALL_FP8_EXPERIMENTAL), then its int4 layers on top
     // (Balanced, then Performance, Ultra Performance)
-    if (!exists("dlssnr-amd\\CC_SILVER_AARDWOLD.bin") && !exists("dlssnr-amd\\dlssnr.bin"))
+    if (!exists("dlssnr-amd\\CC_SILVER_AARDWOLD.bin"))
         net_switch.unavailable(nr::kSilverAardwoldOptimizedFp8, "the model file is missing (run install.bat again)");
     else if (!exists("dlssnr-amd\\optimized\\shaders\\fixed-attention.txt"))
         net_switch.unavailable(nr::kSilverAardwoldOptimizedFp8, "not installed (run install.bat again)");
@@ -3006,7 +3005,7 @@ void Session::Impl::check_availability() {
 #if NR_INT4
     else if (!exists("dlssnr-amd\\int4\\settings.txt"))
         net_switch.unavailable(nr::kSilverAardwoldOptimized, "its int4 layers are not installed (run install.bat again)");
-    else if (!exists("dlssnr-amd\\CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin") && !exists("dlssnr-amd\\dlssnr-int4.bin"))
+    else if (!exists("dlssnr-amd\\CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin"))
         net_switch.unavailable(nr::kSilverAardwoldOptimized, "its int4 weights were not made at install (run install.bat again)");
 #else
     else

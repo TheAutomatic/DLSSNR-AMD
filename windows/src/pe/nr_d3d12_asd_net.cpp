@@ -417,6 +417,12 @@ std::shared_ptr<Built> build(ID3D12Device* device, const Carriers& carriers, ID3
     }
     b->net = nr::network_choice(b->plan.model.substr(0, b->plan.model.find(' ')));
     if (b->net < 0) b->net = want_net >= 0 ? want_net : nr::kSmallFp8;
+    else if (nr::network_optimized(b->net)) {
+        if (b->plan.model.find("(layers: quality)") != std::string::npos) b->net = nr::kSilverAardwoldOptimizedFp8;
+        else if (b->plan.model.find("(layers: performance)") != std::string::npos) b->net = nr::kSilverAardwoldOptimizedPerformance;
+        else if (b->plan.model.find("(layers: ultra performance)") != std::string::npos) b->net = nr::kSilverAardwoldOptimizedUltra;
+        else if (nr::network_optimized(want_net)) b->net = want_net;
+    }
     auto make = [&](const std::string& kern, const Carrier& c, Built::Kern* k) {
         if (!family_of(kern, &k->fam)) { *why = "no binding table for kernel " + kern; return false; }
         std::string err;
@@ -683,7 +689,7 @@ public:
             device_->AddRef();
             rs_->AddRef();
             nr::pe::log("[asd] building the %s network for %ux%u (until it is done these frames pass through with no NR; "
-                        "the bridge is not used)", nr::network_codename(want), w, h);
+                        "the bridge is not used)", nr::network_label(want), w, h);
             std::thread([sh = shared_, dev = device_, rs = rs_, c = carriers_, w, h, want] {
                 std::string e;
                 std::shared_ptr<Built> b;
@@ -698,7 +704,7 @@ public:
                 dev->Release();
             }).detach();
         }
-        *why = std::string("the ") + nr::network_codename(shared_->bnet) + " network for " + std::to_string(shared_->bw) + "x" + std::to_string(shared_->bh) + " is building";
+        *why = std::string("the ") + nr::network_label(shared_->bnet) + " network for " + std::to_string(shared_->bw) + "x" + std::to_string(shared_->bh) + " is building";
         building_ = true;   // it will run these frames (no bridge meanwhile)
         return false;
     }

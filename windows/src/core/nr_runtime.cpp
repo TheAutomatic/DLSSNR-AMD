@@ -3168,45 +3168,72 @@ bool plan_d3d12_network(const std::string& root_in, uint32_t mw, uint32_t mh, bo
         const auto network_shaders = std::filesystem::path(aco) / "shaders";
         // The model, as the constructor picks it: DLSSNR_MODEL over dlssnr-amd.ini [Network] Model; none: the small one.
         NetworkModel network = NetworkModel::Small;
-        bool experimental = false, int4 = false;
-        const std::filesystem::path xroot = data / "experimental";
-        const std::filesystem::path i4root = data / "int4";
+        bool experimental = false, optimized = false, int4 = false;
+        int level = nr::kLayersQuality;
+        const std::filesystem::path xroot = data / "experimental", oroot = data / "optimized";
+        std::filesystem::path i4root = data / "int4";
         std::map<std::string, std::string> int4_cfg;
         std::string from;
         {
             std::string env;
 #ifdef _WIN32
-            { char b[16] = {}; const unsigned long n = GetEnvironmentVariableA("DLSSNR_MODEL", b, sizeof b); if (n && n < sizeof b) env = b; }
+            { char b[64] = {}; const unsigned long n = GetEnvironmentVariableA("DLSSNR_MODEL", b, sizeof b); if (n && n < sizeof b) env = b; }
 #endif
             if (env.empty()) if (const char* e = std::getenv("DLSSNR_MODEL")) env = e;
             const int ev = env.empty() ? -1 : nr::network_value(env);
             const int iv = model_choice >= 0 || ev >= 0 ? -1 : nr::ini_network(ini);
             from = model_choice >= 0 ? "caller" : ev >= 0 ? "DLSSNR_MODEL" : iv >= 0 ? "dlssnr-amd.ini" : "default";
-            int v = model_choice >= 0 ? (model_choice == nr::kSmallFp8 ? 1 : model_choice == nr::kSmallFp8Experimental ? 2 : model_choice == nr::kSilverAardwoldInt4 ? 3 : 0)
+            int v = model_choice >= 0 ? (model_choice == nr::kSmallFp8 ? 1 : model_choice == nr::kSmallFp8Experimental ? 2 : nr::network_optimized(model_choice) ? 3 : 0)
                                       : (ev >= 0 ? ev : iv);
-            if (v == 0 && model_choice < 0) {
-                const int ec = env.empty() ? -1 : nr::network_choice(env);
-                if (ec == nr::kSilverAardwoldInt4 || (ec < 0 && nr::ini_int4(ini).enabled == 1)) v = 3;
-            }
             if (v == 0 || v == 3) network = NetworkModel::Original;
             std::error_code ec;
-#if NR_INT4
             if (v == 3) {
-                const char* missing = !std::filesystem::is_directory(i4root / "shaders" / "temporal", ec) || !std::filesystem::is_directory(i4root / "vit", ec) ||
-                                      !std::filesystem::is_regular_file(i4root / "settings.txt", ec) ? "dlssnr-amd/int4/ is incomplete"
-                    : !std::filesystem::is_regular_file(data / "dlssnr-int4.bin", ec) ? "dlssnr-amd/dlssnr-int4.bin is missing"
-                    : !std::filesystem::is_directory(std::filesystem::path(aco) / "int4/records", ec) ? "the ACO INT4 records are missing"
+                const char* missing = !std::filesystem::is_regular_file(oroot / "shaders" / "fixed-attention.txt", ec) ||
+                                      !std::filesystem::is_directory(oroot / "shaders" / "temporal", ec) ? "dlssnr-amd/optimized/ is incomplete"
+                    : !std::filesystem::is_regular_file(data / "CC_SILVER_AARDWOLD_OPTIMIZED.bin", ec)
+                              ? "dlssnr-amd/CC_SILVER_AARDWOLD_OPTIMIZED.bin is missing"
                     : nullptr;
                 if (missing) {
-                    out->note = std::string("CC_SILVER_AARDWOLD_INT4_MIXED, but ") + missing + ": CC_SILVER_AARDWOLD";
+                    out->note = std::string("CC_SILVER_AARDWOLD_OPTIMIZED, but ") + missing + ": CC_SILVER_AARDWOLD";
                     v = 0;
                 } else {
-                    int4 = true;
-                    int4_cfg["NR_I4_DIR"] = (i4root / "vit").string();
-                    if (std::filesystem::is_directory(i4root / "swin", ec)) int4_cfg["NR_SWI4_DIR"] = (i4root / "swin").string();
-                    int4_cfg["NR_I4_WEIGHTS"] = (data / "dlssnr-int4.bin").string();
-                    const auto t = slurp((i4root / "settings.txt").string());
-                    nr::int4_settings(std::string(t.begin(), t.end()), int4_cfg);
+                    optimized = true;
+                }
+            }
+#if NR_INT4
+            if (optimized) {
+                std::string int4_env;
+#ifdef _WIN32
+                { char b[16] = {}; const unsigned long n = GetEnvironmentVariableA("DLSSNR_INT4", b, sizeof b); if (n && n < sizeof b) int4_env = b; }
+#endif
+                if (int4_env.empty()) if (const char* e = std::getenv("DLSSNR_INT4")) int4_env = e;
+                level = nr::network_optimized(model_choice) ? nr::network_layers(model_choice) : nr::optimized_layers_value(int4_env);
+                if (!nr::network_optimized(model_choice) && int4_env.empty()) {
+                    const int il = nr::ini_optimized_layers(ini);
+                    level = il >= 0 ? il : nr::kLayersDefault;
+                }
+                if (level < 0) level = nr::kLayersQuality;
+                i4root = data / (level == nr::kLayersPerformance ? "int4-performance"
+                                 : level == nr::kLayersUltra ? "int4-ultra" : "int4");
+                const auto i4weights = data / "CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin";
+                if (level >= nr::kLayersBalanced) {
+                    const std::string incomplete = "dlssnr-amd/" + i4root.filename().string() + "/ is incomplete";
+                    const char* missing = !std::filesystem::is_directory(i4root / "shaders" / "temporal", ec) || !std::filesystem::is_directory(i4root / "vit", ec) ||
+                                          !std::filesystem::is_regular_file(i4root / "settings.txt", ec) ? incomplete.c_str()
+                        : !std::filesystem::is_regular_file(i4weights, ec) ? "dlssnr-amd/CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin is missing"
+                        : !std::filesystem::is_directory(std::filesystem::path(aco) / "int4/records", ec) ? "the ACO INT4 records are missing"
+                        : nullptr;
+                    if (missing) {
+                        out->note = std::string("optimized layers ") + nr::layers_word(level) + " requested, but " + missing + ": CC_SILVER_AARDWOLD_OPTIMIZED at quality";
+                        level = nr::kLayersQuality;
+                    } else {
+                        int4 = true;
+                        int4_cfg["NR_I4_DIR"] = (i4root / "vit").string();
+                        if (std::filesystem::is_directory(i4root / "swin", ec)) int4_cfg["NR_SWI4_DIR"] = (i4root / "swin").string();
+                        int4_cfg["NR_I4_WEIGHTS"] = i4weights.string();
+                        const auto t = slurp((i4root / "settings.txt").string());
+                        nr::int4_settings(std::string(t.begin(), t.end()), int4_cfg);
+                    }
                 }
             }
 #endif
@@ -3214,8 +3241,8 @@ bool plan_d3d12_network(const std::string& root_in, uint32_t mw, uint32_t mh, bo
                 const char* missing = !allow_experimental ? "its kernels are not in the PSDB"
                     : !std::filesystem::is_regular_file(xroot / "shaders" / "fixed-attention.txt", ec) ||
                               !std::filesystem::is_directory(xroot / "shaders" / "temporal", ec) ? "dlssnr-amd/experimental/ is incomplete"
-                    : !std::filesystem::is_regular_file(data / "dlssnr-small-experimental.bin", ec)
-                              ? "dlssnr-amd/dlssnr-small-experimental.bin is missing"
+                    : !std::filesystem::is_regular_file(data / "CC_SMALL_FP8_EXPERIMENTAL.bin", ec)
+                              ? "dlssnr-amd/CC_SMALL_FP8_EXPERIMENTAL.bin is missing"
                     : nullptr;
                 if (missing) {
                     out->note = std::string("CC_SMALL_FP8_EXPERIMENTAL, but ") + missing + ": CC_SMALL_FP8";
@@ -3225,13 +3252,13 @@ bool plan_d3d12_network(const std::string& root_in, uint32_t mw, uint32_t mh, bo
                 }
             }
             if (network == NetworkModel::Small && !experimental &&
-                !std::filesystem::is_regular_file(data / "dlssnr-small.bin", ec)) {
-                out->note = "dlssnr-amd/dlssnr-small.bin is missing: the original model";
+                !std::filesystem::is_regular_file(data / "CC_SMALL_FP8.bin", ec)) {
+                out->note = "dlssnr-amd/CC_SMALL_FP8.bin is missing: the original model";
                 network = NetworkModel::Original;
             }
         }
-        out->model = int4 ? "CC_SILVER_AARDWOLD_INT4_MIXED"
-                          : network == NetworkModel::Small ? (experimental ? "CC_SMALL_FP8_EXPERIMENTAL" : "CC_SMALL_FP8") : "original";
+        out->model = optimized ? nr::network_label(nr::network_with_layers(nr::kSilverAardwoldOptimized, level))
+                               : network == NetworkModel::Small ? (experimental ? "CC_SMALL_FP8_EXPERIMENTAL" : "CC_SMALL_FP8") : "original";
         out->model += " (" + from + ")";
         auto ini_on = [&](const char* key) {
             std::string v = nr::ini_network_key(ini, key);
@@ -3254,10 +3281,10 @@ bool plan_d3d12_network(const std::string& root_in, uint32_t mw, uint32_t mh, bo
             "--host-boundary", arena_reuse() ? "--reuse" : "--no-reuse", "--source-width", std::to_string(mw),
             "--source-height", std::to_string(mh), "--accumulation", "fp32",
             "--pipeline-cache", (data / "pipeline.cache").string(), "--lazy-images"};
-        if (experimental) {
+        if (experimental || optimized) {
             for (size_t i = 0; i + 1 < arguments.size(); ++i) {
-                if (arguments[i] == "--spv-dir") arguments[i + 1] = (xroot / "shaders").string();
-                if (arguments[i] == "--pipeline-cache") arguments[i + 1] = (xroot / "pipeline.cache").string();
+                if (arguments[i] == "--spv-dir") arguments[i + 1] = ((experimental ? xroot : oroot) / "shaders").string();
+                if (arguments[i] == "--pipeline-cache") arguments[i + 1] = ((experimental ? xroot : oroot) / "pipeline.cache").string();
             }
             arguments.push_back("--spv-dir-aco");
         }
@@ -3268,10 +3295,14 @@ bool plan_d3d12_network(const std::string& root_in, uint32_t mw, uint32_t mh, bo
             }
         }
         {
-            const auto pack = data / (experimental ? "dlssnr-small-experimental.bin"
-                                      : network == NetworkModel::Small ? "dlssnr-small.bin" : "dlssnr.bin");
+            const auto pack = data / (experimental ? "CC_SMALL_FP8_EXPERIMENTAL.bin"
+                                      : optimized ? "CC_SILVER_AARDWOLD_OPTIMIZED.bin"
+                                      : network == NetworkModel::Small ? "CC_SMALL_FP8.bin" : "CC_SILVER_AARDWOLD.bin");
             if (!std::filesystem::is_regular_file(pack)) { *why = "missing " + pack.string(); return false; }
             arguments.push_back("--model-pack"); arguments.push_back(pack.string());
+            if (optimized && int4 && level >= nr::kLayersPerformance) {
+                arguments.push_back("--model-pack-variant"); arguments.push_back("performance");
+            }
         }
         std::vector<char*> argv;
         for (auto& a : arguments) argv.push_back(a.data());
@@ -3316,7 +3347,10 @@ bool plan_d3d12_network(const std::string& root_in, uint32_t mw, uint32_t mh, bo
             }
             if (t.pre < 0 || t.post < 0) { *why = "the temporal path requires the fused FP32 image kernels"; return false; }
             if (c.disp[size_t(t.pre)].push.size() != kPrePushBytes) { *why = "temporal pre block: unexpected push size"; return false; }
-            const auto shaders = int4 ? i4root / "shaders" / "temporal" : experimental ? xroot / "shaders" / "temporal" : network_shaders / "temporal";
+            const auto shaders = int4 ? i4root / "shaders" / "temporal"
+                               : optimized ? oroot / "shaders" / "temporal"
+                               : experimental ? xroot / "shaders" / "temporal"
+                               : network_shaders / "temporal";
             std::error_code ec;
             auto have = [&](const char* name) { return std::filesystem::is_regular_file(shaders / name, ec); };
             const bool tp_nh = pre_nh && have("temporal_pre_fp32nh.spv");
