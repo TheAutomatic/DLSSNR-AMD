@@ -779,7 +779,7 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
     uint32_t ts = Backend::kTimeRing;
     if (g.stamps_map) {
         for (uint32_t i = 0; i < Backend::kTimeRing; ++i) {
-            if ((g.stamp_uses[i] && nr::pe::split::completed(g.stamp_uses[i])) || !g.booking) {
+            if (g.stamp_uses[i] ? nr::pe::split::completed(g.stamp_uses[i]) : !g.booking) {
                 uint64_t t2[2];
                 std::memcpy(t2, g.stamps_map + i * 16, 16);
                 if (t2[0] && t2[1] > t2[0]) {

@@ -1943,8 +1943,8 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
 
     const bool look_wanted = look::dispatched(ls, up_proxy.res && look::transport_wanted(ls, NW, NH, W, H));
     const bool area_enc = ls.upsample == look::kUpsampleAreaInput && up_proxy.res && look::transport_wanted(ls, NW, NH, W, H);
-    const bool sdr_fast_lin = !v6 && !prep_on && !fast && !look_wanted && !sdr_restore && !debug_show && !area_enc &&
-                              s.transfer_strength == 1.0f && NW == W && NH == H;
+    const bool sdr_fast_lin = !v6 && passes == 1 && !prep_on && !fast && !look_wanted && !sdr_restore && !debug_show &&
+                              !area_enc && (s.codec_mode == 0u || s.transfer_strength == 1.0f) && NW == W && NH == H;
     const bool v6_fast_lin = v6 && !prep_on && !fast && !look_wanted && !debug_show;
     const bool fast_lin = sdr_fast_lin || v6_fast_lin;
 
@@ -2648,11 +2648,20 @@ void prewarm_shaders(const std::wstring& shaders) {
             {"v6_resolve", "NR_PREP_RESOLVE"},
             {"v6_resolve_commit", "NR_PREP_RESOLVE"},
             {"v6_pedestal_reduce_unshaped", "NR_PREP_RESOLVE"},
+            {"v6_encode", "NR_LIN_IO"},
+            {"v6_resolve", "NR_LIN_IO"},
+            {"v6_resolve_commit", "NR_LIN_IO"},
         };
         std::string why;
         for (const auto& f : files) {
-            const std::string text = read_text(shaders + L"\\" + std::wstring(f.name, f.name + std::strlen(f.name)) + L".cs_5_1.hlsl");
+            std::string text = read_text(shaders + L"\\" + std::wstring(f.name, f.name + std::strlen(f.name)) + L".cs_5_1.hlsl");
             if (text.empty()) continue;
+            if (f.macro && std::strcmp(f.macro, "NR_LIN_IO") == 0) {
+                FolderInclude::replace_all(
+                    text, "Output[pixel] = float4(SrgbEncode(proxy), 1.0);",
+                    "{ uint4 h = f32tof16(float4(SrgbEncode(proxy), 1.0)); "
+                    "OutputLin.Store2((pixel.y * max(Size.x, 1u) + pixel.x) * 8u, uint2(h.x | (h.y << 16), h.z | (h.w << 16))); }");
+            }
             const D3D_SHADER_MACRO macros[] = {{f.macro, "1"}, {nullptr, nullptr}};
             release(compile_hlsl(text.data(), text.size(), "main", &why, &includer, f.macro ? macros : nullptr));
         }
