@@ -34,6 +34,11 @@ Notes for contributors and coding assistants. README.md covers what the project 
   pipeline whose name has no native Windows shader needs a template alias in `shell-aliases.txt`.
   `CC_SMALL_FP8_EXPERIMENTAL` and `CC_SILVER_AARDWOLD_OPTIMIZED` (with or without its int4 layers) run with ACO
   Mode only.
+- **RDNA3's records too.** The bundle's own RDNA3 network (`windows/build/build_aco_network.py rdna3`, also
+  `--experimental` and `--optimized`) keeps one record per pipeline in `windows/data/aco/rdna3/records` for all
+  three builds - found by the SPIR-V's hash, so their SPIR-V (`aco/rdna3/shaders`,
+  `aco/rdna3/experimental/shaders`, `aco/rdna3/optimized/shaders`) has to stay in step with it. Its int4 layers
+  are RDNA4's only: RDNA3 runs `CC_SILVER_AARDWOLD_OPTIMIZED` at Quality.
 - **No D3D device or swap chain inside the game's process** on Windows (NR Control): OptiScaler's hooks
   take them for the game's. `nr_present_probe.exe` finds DXGI's methods in a process of its own.
 - **Weight packing.** A new kernel that reads weights must be added to the host's weight packing

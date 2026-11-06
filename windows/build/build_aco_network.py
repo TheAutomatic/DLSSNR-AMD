@@ -5,10 +5,16 @@ build_network.py makes. RDNA3's network (rdna3: gfx11, e4m3 values as FP16 throu
 as ACO's machine code only: windows/data/aco/rdna3/records holds one record per pipeline, found by its SPIR-V's hash.
 (RDNA4's records belong to the Linux network: linux/build/build_network.py rdna4.)
 
-    build_aco_network.py <arch> --out DIR [--check DIR]
+    build_aco_network.py <arch> [--experimental | --optimized] --out DIR [--check DIR]
 
 Writes g_<name>.spv + the marker files, g_<name>_grade.spv (style_grade) and temporal/ (the temporal variants, their
 _grade twins and the motion estimator). --check DIR compares every SPV and marker with DIR byte for byte.
+
+--experimental / --optimized: pipelines.json with pipelines-<overlay>.json applied - "change" adds defines to the
+pipeline of that name, "new" builds extra pipelines from a base one's defines plus its own - and, in that folder,
+fixed-attention.txt (the pipelines whose fixed probability tables the host writes), const-heads.txt when the overlay
+marks constant heads (NR_CONSTH) and block-routes.txt when it routes blocks to pipelines of their own
+("<suffix> <kernel>... : <block>..."). The overlay carries no runtime/ passes: they are the default network's.
 """
 import argparse
 import json
@@ -33,16 +39,35 @@ def glslang(arch, src, defines, out):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('arch')
+    ap.add_argument('--experimental', action='store_true')
+    ap.add_argument('--optimized', action='store_true')
     ap.add_argument('--out', type=Path, required=True)
     ap.add_argument('--check', type=Path)
     a = ap.parse_args()
     src = R / 'windows/shaders' / a.arch
     table = json.loads((src / 'pipelines.json').read_text())
+    if a.experimental + a.optimized > 1:
+        sys.exit('one of --experimental, --optimized')
+    overlay = 'experimental' if a.experimental else 'optimized' if a.optimized else ''
+    if overlay:
+        ov = json.loads((src / f'pipelines-{overlay}.json').read_text())
+        default = table['pipelines']
+
+        def derive(e, c):
+            return dict(e, defines=[x for x in e['defines'] if x not in c.get('remove', [])] + c.get('add', []))
+        assert not set(ov['change']) - set(default), f'pipelines-{overlay}.json changes unknown pipelines'
+        table['pipelines'] = {k: derive(e, ov['change'].get(k, {})) for k, e in default.items()}
+        table['pipelines'].update({k: derive(default[c['base']], c) for k, c in ov['new'].items()})
     out = a.out
     if out.exists():
         shutil.rmtree(out)
     (out / 'temporal').mkdir(parents=True)
     pipelines = table['pipelines']
+    # post_no_out1 in the manifest tells the host that the post kernels never write their second output (it makes
+    # that image 1x1): it has to say what they are built with.
+    consts = dict(r.split() for r in table['markers']['shader-constants.txt'][1:])
+    if consts.get('post_no_out1') == '1' and 'NR_POST_NO_OUT1=1' not in pipelines['fswinimagepost32']['defines']:
+        sys.exit('pipelines.json: post_no_out1 1, but fswinimagepost32 is built without NR_POST_NO_OUT1=1')
     for name, e in pipelines.items():
         glslang(a.arch, src / e['source'], e['defines'], out / f'g_{name}.spv')
     for name, text in table['markers'].items():
@@ -61,6 +86,18 @@ def main():
     for k in MOTION:
         glslang(a.arch, R / 'windows/shaders/passes' / f'{k}.comp', [], out / 'temporal' / f'{k}.spv')
     shutil.copy2(out / 'shader-constants.txt', out / 'temporal' / 'shader-constants.txt')
+    if overlay:
+        fixp = sorted(k for k, e in pipelines.items() if 'NR_FIXP=1' in e['defines'])
+        (out / 'fixed-attention.txt').write_text('\n'.join(fixp) + '\n')
+        consth = sorted(k for k, e in pipelines.items() if 'NR_CONSTH=1' in e['defines'])
+        if consth:
+            (out / 'const-heads.txt').write_text('\n'.join(consth) + '\n')
+        if ov.get('routes'):
+            lines = []
+            for r in ov['routes']:
+                assert all(f'{k}{r["suffix"]}' in pipelines for k in r['kernels']), r
+                lines.append(' '.join([r['suffix']] + r['kernels'] + [':'] + [str(b) for b in r['blocks']]))
+            (out / 'block-routes.txt').write_text('\n'.join(lines) + '\n')
     print(f'{out}: {len(pipelines) + len(grade["pipelines"])} network pipelines, '
           f'{len(table["variants"]) + len(grade["variants"]) + len(MOTION)} temporal')
     if a.check:

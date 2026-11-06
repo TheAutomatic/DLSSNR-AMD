@@ -2553,6 +2553,10 @@ shared fe4m3vec4 nr_wl[3072];
 #define NR_HS_B 0.505
 #endif
 float nr_act_horner(float x) {
+#if defined(NR_SACT) && NR_SACT == 1   // CC_SMALL_FP8_EXPERIMENTAL: ReLU (pipelines-experimental.json)
+    return max(x,0.0);
+#endif
+
 #if NR_ACT_HS == 2
     return x * clamp(fma(x, NR_HS_A, NR_HS_B), 0.0, 1.0);   // s folded into the next weights (host NR_HS_FOLD)
 #else
@@ -2581,6 +2585,10 @@ float nr_act_horner(float x) {
 #define NR_ALT_M (NR_ACT_ALT == 1 || NR_ACT_ALT == 2)
 #endif
 float nr_act_horner_b(float x) {
+#if defined(NR_SACT) && NR_SACT == 1   // CC_SMALL_FP8_EXPERIMENTAL: ReLU (pipelines-experimental.json)
+    return max(x,0.0);
+#endif
+
 #if NR_ACT_HS == 2
     return x * clamp(fma(x, NR_HS_A, NR_HS_B), 0.0, 1.0);   // s folded into the next weights (host NR_HS_FOLD)
 #else

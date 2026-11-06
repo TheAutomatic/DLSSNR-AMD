@@ -144,11 +144,18 @@ mkdir -p -- "$pkg/dlssnr-amd/optimized"
 cp -r -- "$out/aco-shaders-optimized" "$pkg/dlssnr-amd/optimized/shaders"
 # RDNA3 (RX 7000, Radeon 700M / 800M / 8000S graphics; nr_gpu_arch.hpp): its own network as ACO's machine code only
 # (windows/data/aco/rdna3), the SPIR-V the records were made from (windows/build/build_aco_network.py rdna3) and the
-# templates (shells: small shaders with the network's interfaces) the driver compiles for the containers.
-rm -rf -- "$out/aco-shaders-rdna3"
+# templates (shells: small shaders with the network's interfaces) the driver compiles for the containers. Its
+# experimental and optimized networks (CC_SMALL_FP8_EXPERIMENTAL, CC_SILVER_AARDWOLD_OPTIMIZED at quality) go in
+# rdna3/experimental/shaders and rdna3/optimized/shaders, their records with the default ones (one folder, found by
+# the SPIR-V's hash).
+rm -rf -- "$out/aco-shaders-rdna3" "$out/aco-shaders-rdna3-experimental" "$out/aco-shaders-rdna3-optimized"
 python3 windows/build/build_aco_network.py rdna3 --out "$out/aco-shaders-rdna3" > /dev/null
-mkdir -p -- "$aco/rdna3/records"
+python3 windows/build/build_aco_network.py rdna3 --experimental --out "$out/aco-shaders-rdna3-experimental" > /dev/null
+python3 windows/build/build_aco_network.py rdna3 --optimized --out "$out/aco-shaders-rdna3-optimized" > /dev/null
+mkdir -p -- "$aco/rdna3/records" "$aco/rdna3/experimental" "$aco/rdna3/optimized"
 cp -r -- "$out/aco-shaders-rdna3" "$aco/rdna3/shaders"
+cp -r -- "$out/aco-shaders-rdna3-experimental" "$aco/rdna3/experimental/shaders"
+cp -r -- "$out/aco-shaders-rdna3-optimized" "$aco/rdna3/optimized/shaders"
 cp -- windows/data/aco/rdna3/records/*.nrp "$aco/rdna3/records/"
 cp -r -- windows/data/aco/rdna3/shells "$aco/rdna3/shells"
 cp -- windows/data/aco/rdna3/shell-aliases.txt "$aco/rdna3/"

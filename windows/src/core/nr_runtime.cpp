@@ -1246,7 +1246,15 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     // tree; missing: the original model, and the log says why.
     NetworkModel network = NetworkModel::Small;
     bool experimental = false, optimized = false;
-    const std::filesystem::path xroot = data / "experimental", oroot = data / "optimized";
+    // Their SPIR-V: the Linux network's in a dlssnr-amd folder on RDNA4, and on RDNA3 the bundle's own gfx11 builds
+    // (aco/rdna3/experimental/shaders, .../optimized/shaders: the records are aco/rdna3/records, found by hash).
+    const bool aco_rdna3 = host.rdna3 && !aco.empty();
+    const std::filesystem::path xroot = aco_rdna3 ? std::filesystem::path(aco) / "experimental" : data / "experimental";
+    const std::filesystem::path oroot = aco_rdna3 ? std::filesystem::path(aco) / "optimized" : data / "optimized";
+    const std::string x_incomplete = aco_rdna3 ? "dlssnr-amd/aco/rdna3/experimental/ is incomplete"
+                                               : "dlssnr-amd/experimental/ is incomplete";
+    const std::string o_incomplete = aco_rdna3 ? "dlssnr-amd/aco/rdna3/optimized/ is incomplete"
+                                               : "dlssnr-amd/optimized/ is incomplete";
     {
         std::string env;
 #ifdef _WIN32
@@ -1261,13 +1269,14 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         if (v == 0) network = NetworkModel::Original;
         std::error_code ec;
         // CC_SMALL_FP8_EXPERIMENTAL: the small model with its own weights (CC_SMALL_FP8_EXPERIMENTAL.bin, made by
-        // install.ps1 from the small model) and shaders (experimental/shaders: the Linux network's, run as ACO's machine
-        // code - ACO Mode only, as int4 mixed); anything missing: the small model.
+        // install.ps1 from the small model) and shaders (experimental/shaders: the Linux network's, run as ACO's
+        // machine code - ACO Mode only, as int4 mixed; RDNA3: the bundle's own aco/rdna3/experimental/shaders);
+        // anything missing: the small model.
         if (v == 2) {
             const char* missing = !installed ? "not an installed tree"
                 : aco.empty() ? "it needs ACO Mode (a driver with pipeline binaries)"
                 : !std::filesystem::is_regular_file(xroot / "shaders" / "fixed-attention.txt", ec) ||
-                          !std::filesystem::is_directory(xroot / "shaders" / "temporal", ec) ? "dlssnr-amd/experimental/ is incomplete"
+                          !std::filesystem::is_directory(xroot / "shaders" / "temporal", ec) ? x_incomplete.c_str()
                 : !std::filesystem::is_regular_file(data / "CC_SMALL_FP8_EXPERIMENTAL.bin", ec)
                           ? "dlssnr-amd/CC_SMALL_FP8_EXPERIMENTAL.bin is missing (run install.ps1 with the 310.9.16 nvngx_dlssnr.dll)"
                 : nullptr;
@@ -1280,13 +1289,14 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         }
         // CC_SILVER_AARDWOLD_OPTIMIZED: the 310.8 model with its own weights (CC_SILVER_AARDWOLD_OPTIMIZED.bin, made by install.ps1
         // from CC_SILVER_AARDWOLD.bin) and shaders (optimized/shaders: the Linux network's, run as ACO's machine code - ACO Mode
-        // only; with its int4 layers int4/, below); anything missing: the 310.8 model as it is.
+        // only; with its int4 layers int4/, below; RDNA3: the bundle's own aco/rdna3/optimized/shaders, no int4 layers);
+        // anything missing: the 310.8 model as it is.
         if (v == 3) {
             network = NetworkModel::Original;
             const char* missing = !installed ? "not an installed tree"
                 : aco.empty() ? "it needs ACO Mode (a driver with pipeline binaries)"
                 : !std::filesystem::is_regular_file(oroot / "shaders" / "fixed-attention.txt", ec) ||
-                          !std::filesystem::is_directory(oroot / "shaders" / "temporal", ec) ? "dlssnr-amd/optimized/ is incomplete"
+                          !std::filesystem::is_directory(oroot / "shaders" / "temporal", ec) ? o_incomplete.c_str()
                 : !std::filesystem::is_regular_file(data / "CC_SILVER_AARDWOLD_OPTIMIZED.bin", ec)
                           ? "dlssnr-amd/CC_SILVER_AARDWOLD_OPTIMIZED.bin is missing (run install.ps1 again)"
                 : nullptr;
@@ -1406,7 +1416,8 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     // shaders, quantisers, settings.txt), the int4 weights the installer made (CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin, one file for the three:
     // their int4 layers' FP8 weights are the same; Ultra Performance's tables cover the others'), Performance and Ultra
     // Performance their own FP8 weights for some layers (the "performance/" entries of the optimized pack) and ACO Mode
-    // enabled on a device supporting VK_KHR_pipeline_binary; anything missing: Quality, and the log says why.
+    // enabled on a device supporting VK_KHR_pipeline_binary; anything missing: Quality, and the log says why. RDNA3
+    // never has int4 layers (the int4 WMMA rewrite is RDNA4's): its CC_SILVER_AARDWOLD_OPTIMIZED is Quality.
     bool int4 = false;
     std::string int4_env;
 #ifdef _WIN32
@@ -1434,6 +1445,7 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         const std::string no_weights = "dlssnr-amd/" + i4weights.filename().string() + " is missing (run install.ps1 again)";
         const char* missing = network == NetworkModel::Small ? "the small model has no int4 layers"
             : !installed ? "not an installed tree"
+            : host.rdna3 ? "RDNA3 has no int4 layers (its int4 WMMA rewrite is RDNA4's)"
             : !std::filesystem::is_directory(i4root / "shaders" / "temporal", ec) || !std::filesystem::is_directory(i4root / "vit", ec) ||
                       !std::filesystem::is_regular_file(i4root / "settings.txt", ec) ? incomplete.c_str()
             : !std::filesystem::is_regular_file(i4weights, ec) ? no_weights.c_str()

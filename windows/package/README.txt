@@ -15,8 +15,9 @@ textures and a shared fence, all on the GPU. Only DX9 games are moved to Vulkan 
 Requirements
 ------------
 - RX 9000 series (RDNA4): every network
-- RX 7000 series, Radeon 700M / 800M / 8000S graphics (RDNA3 / RDNA3.5): CC_SMALL_FP8 and
-  CC_SILVER_AARDWOLD (see "ACO Mode")
+- RX 7000 series, Radeon 700M / 800M / 8000S graphics (RDNA3 / RDNA3.5): CC_SMALL_FP8,
+  CC_SMALL_FP8_EXPERIMENTAL, CC_SILVER_AARDWOLD and CC_SILVER_AARDWOLD_OPTIMIZED at Quality
+  (see "ACO Mode")
 - AMD Software 26.9 or newer
 - 64-bit games
 - Do not use it in online games with anti-cheat; start games with EasyAntiCheat with EAC off
@@ -56,18 +57,19 @@ CC_SILVER_AARDWOLD_OPTIMIZED are this project's). The installer asks which one a
 
     CC_SMALL_FP8                   the default network of 310.9.16 (default)
     CC_SMALL_FP8_EXPERIMENTAL      experimental: CC_SMALL_FP8 made faster; its picture differs
-                                   somewhat. RX 9000 only, with ACO Mode
+                                   somewhat. RX 9000 and RX 7000 / 700M - 8000S, with ACO Mode
     CC_SILVER_AARDWOLD             the network of 310.8.0 (also preset 1 of 310.9.16)
     CC_SILVER_AARDWOLD_OPTIMIZED   CC_SILVER_AARDWOLD made faster, its picture very close to it.
-                                   RX 9000 only, with ACO Mode
+                                   RX 9000 at every level; RX 7000 / 700M - 8000S at Quality
+                                   (its int4 layers are RX 9000's), with ACO Mode
 
 This only sets [Network] Model in dlssnr-amd.ini; the network can be switched in game at any time:
 the drop-down in NR Control (End) or on ReShade's Add-ons page, or Ctrl+F11 to cycle. The new network
 is prepared in the background, and the current one keeps running until it is ready. A network that
-cannot run is greyed out in the drop-down with the reason (on an RX 7000, for example, the two that
-need an RX 9000). The weights of CC_SMALL_FP8_EXPERIMENTAL and CC_SILVER_AARDWOLD_OPTIMIZED are made
-at install from your models; if that fails the other networks are installed and the one that failed
-is greyed out.
+cannot run is greyed out in the drop-down with the reason (on an RX 7000, for example,
+CC_SILVER_AARDWOLD_OPTIMIZED's int4 levels). The weights of CC_SMALL_FP8_EXPERIMENTAL and
+CC_SILVER_AARDWOLD_OPTIMIZED are made at install from your models; if that fails the other networks
+are installed and the one that failed is greyed out.
 CC_SILVER_AARDWOLD_OPTIMIZED replaces CC_SILVER_AARDWOLD_INT4_MIXED of earlier versions (a
 dlssnr-amd.ini that names that one gets CC_SILVER_AARDWOLD_OPTIMIZED). Optimized layers (in NR
 Control under the network, [Network] OptimizedLayers) sets how many of its layers run in a faster form;

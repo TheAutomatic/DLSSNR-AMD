@@ -542,6 +542,18 @@ NR_FRAG_IACC nr_a4mma(NR_FRAG_IACC c, uvec4 x, uvec4 w, const bool sw) {
 #ifndef NR_ATTN_KOFF
 #define NR_ATTN_KOFF 0
 #endif
+// NR_CONSTH (CC_SILVER_AARDWOLD_OPTIMIZED): heads whose probability matrix is 1/64 for every input. The host proves
+// it per head at weight packing (nr_graph.cpp, const-heads.txt: every position-bias entry so low that every
+// exponential sits at the lower clamp 2^-14, so the row sum is 2^-8 and P = 2^-6 exactly, an e4m3 value, for any
+// content, padding or extent) and marks the head with 0x7FC00001 in its scale slot. Such a head computes only V
+// (the same loads, MMAs and k order as the full loop for its fragments) and takes P = 2^-6; the PV product and
+// everything after it are unchanged. Byte-identical to the full computation; without marks the branch never runs.
+#ifndef NR_CONSTH
+#define NR_CONSTH 0
+#endif
+#if NR_CONSTH && (!NR_ATTN_TRANSPOSE || NR_ATTN_EDGE)
+#error "NR_CONSTH: the transposed attention without per-tile edge bodies (the V-only projection lives in the one shape)"
+#endif
 
 // Where the window's 64 tokens are, and where its output goes.
 //
@@ -1003,6 +1015,9 @@ void main() {
     for (uint hh = 0u; hh < uint(NR_HPW); ++hh) {
         const uint h = hbase + ((NR_SHARE_HEAD != 0) ? hh : wave * uint(NR_HPW) + hh);
         const uint hrow = h * 96u;                 // Q at +0, K at +32, V at +64
+#if NR_CONSTH
+        const bool nr_consth = floatBitsToUint(wgt_f32[pc.s_off + h]) == 0x7FC00001u;   // P = 1/64 (host certificate)
+#endif
 
         // ---- stage 1: the QKV projection, three 64x32 tensors ------------
         for (uint part = 0u; part < uint(NR_APARTS); ++part) {
@@ -1051,6 +1066,32 @@ void main() {
 #define NR_QK04 const uint k04 = k0 * 4u;
 #else
 #define NR_QK04
+#endif
+#if NR_CONSTH   // constant heads: the V fragments (4, 5) only - the same loads, MMAs and k order as the full loop
+#define NR_FOR_JV(X) X(4) X(5)
+#define NR_QLOADS_V NR_FOR_I(NR_AM, NR_QLA_I) NR_FOR_JV(NR_QLB_J)
+#define NR_QM_IV(i)  NR_QG(i) { const int ii = i; NR_FOR_JV(NR_QM_J) }
+#define NR_QSTEP_V(kf) { \
+        const int pp  = (kf) % NR_APIPE; \
+        const int cur = ((kf) + NR_APIPE - 1) % NR_APIPE; \
+        const uint kkl = uint((((kf) + NR_APIPE - 1) % NR_AKF) * 16); \
+        const uint kgl = k0 + kkl; \
+        if (NR_ABLATE_QKV_LOADS == 0 && (kf) + NR_APIPE - 1 < NR_AKF) { NR_QLOADS_V } \
+        if (NR_ABLATE_QKV_MMA == 0) { NR_FOR_I(NR_AM, NR_QM_IV) } \
+        if (NR_ACC_F16 > 0 && ((kf) + 1) % NR_ACC_F16 == 0) { NR_FOR_I(NR_AM, NR_QR_I) } \
+    }
+#define NR_QPRIME_V(kf) if ((kf) < NR_QPRIME_N) { \
+        const int cur = (kf) % NR_APIPE; \
+        const uint kkl = uint(((kf) % NR_AKF) * 16); \
+        const uint kgl = k0 + kkl; \
+        NR_QLOADS_V \
+    }
+#define NR_QKV_LOOP_V \
+            for (uint k0 = 0u; k0 < pc.C; k0 += uint(NR_AKCHUNK)) { \
+                NR_QK04 \
+                NR_FOR_K(NR_AKF, NR_QPRIME_V) \
+                NR_FOR_K(NR_AKF, NR_QSTEP_V) \
+            }
 #endif
 #if NR_ATTN_I4
 #if !(NR_ATTN_QKSWAP && NR_AN == 6 && NR_IMAGE)
@@ -1156,13 +1197,27 @@ void main() {
             for (int i = 0; i < NR_AM; ++i) nr_live = nr_live || !nr_tile_oob(mtok0 / 16u + uint(i));
             [[dont_flatten]] if (nr_live)
 #endif
+#if NR_CONSTH   // constant heads: V only, and the V epilogue moves here so Q/K are never stored
+            [[dont_flatten]] if (nr_consth) {
+#define NR_QLIVE 15
+                NR_QKV_LOOP_V
+#undef NR_QLIVE
+#include "attn_v_epi.glsl"
+            } else {
+#endif
 #define NR_QLIVE 15
             NR_QKV_LOOP
 #undef NR_QLIVE
+#if NR_CONSTH
+            }
+#endif
 #endif
             NR_QOOB
 #if NR_USE_FUSED_QK_NORM && NR_ATTN_QKSWAP
 #if !NR_QKV_DONE
+#if NR_CONSTH
+            [[dont_flatten]] if (!nr_consth)
+#endif
 #include "attn_qkv_epi.glsl"
 #endif
 #elif NR_USE_FUSED_QK_NORM
@@ -1372,6 +1427,14 @@ void main() {
             // This query tile's context is never stored.
             if (nr_tile_oob(i0 / 16u)) continue;
 #endif
+            NR_FRAG_B pf[4];
+#if NR_CONSTH
+            [[dont_flatten]] if (nr_consth) {
+                // 1/64 for every query and key of the head (the host's certificate): the same P the logits and the
+                // denominator below produce for these bias-only columns, so the PV product and its epilogue are unchanged.
+                for (int n = 0; n < 4; ++n) for (int c = 0; c < 8; ++c) pf[n][c] = NR_E4M3(NR_F16(0.015625));
+            } else {
+#endif
             NR_FRAG_ACC lg[4];
 #if NR_ATTN_BIAS_SEED
             // The bias is the accumulator's starting value, so the sum
@@ -1439,7 +1502,6 @@ void main() {
             // query l%16, and both lane halves hold all sixteen keys. The accumulator gives lane
             // l keys 2c + l/16 only, so the other half's value is exchanged and the two are
             // interleaved: key 2c is the lower half's, key 2c + 1 the upper half's.
-            NR_FRAG_B pf[4];
             const bool upper = lane >= 16u;
             for (int n = 0; n < 4; ++n)
                 for (int c = 0; c < 8; c += 2) {
@@ -1451,6 +1513,9 @@ void main() {
                     pf[n][2 * c]     = even.x; pf[n][2 * c + 1] = odd.x;
                     pf[n][2 * c + 2] = even.y; pf[n][2 * c + 3] = odd.y;
                 }
+#if NR_CONSTH
+            }
+#endif
             for (uint n = 0u; n < 2u; ++n) {
                 NR_FRAG_ACC ctx = NR_ACC_ZERO;
                 for (uint j = 0u; j < 4u; ++j) {

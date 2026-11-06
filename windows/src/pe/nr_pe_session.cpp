@@ -2968,16 +2968,22 @@ void Session::Impl::check_availability() {
         const DWORD a = nr::u8::attributes((root + "\\" + rel).c_str());
         return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
     };
+    // CC_SMALL_FP8_EXPERIMENTAL and CC_SILVER_AARDWOLD_OPTIMIZED read their SPIR-V from dlssnr-amd/ (the Linux
+    // network's, RDNA4) and from the ACO bundle's own gfx11 builds on RDNA3 (nr_runtime.cpp): what is installed is
+    // the folder that arch reads.
+    const bool rdna3 = !g_d3d12_native.load() && make_host().rdna3;
+    const char* x_attention = rdna3 ? "dlssnr-amd\\aco\\rdna3\\experimental\\shaders\\fixed-attention.txt"
+                                    : "dlssnr-amd\\experimental\\shaders\\fixed-attention.txt";
+    const char* o_attention = rdna3 ? "dlssnr-amd\\aco\\rdna3\\optimized\\shaders\\fixed-attention.txt"
+                                    : "dlssnr-amd\\optimized\\shaders\\fixed-attention.txt";
     if (!exists("dlssnr-amd\\CC_SMALL_FP8.bin"))
         net_switch.unavailable(nr::kSmallFp8, "needs the model of the 310.9.16 nvngx_dlssnr.dll (install.ps1 -Dll)");
     if (!exists("dlssnr-amd\\CC_SILVER_AARDWOLD.bin"))
         net_switch.unavailable(nr::kSilverAardwold, "the model file is missing (run install.bat again)");
-    if (!exists("dlssnr-amd\\experimental\\shaders\\fixed-attention.txt"))
+    if (!exists(x_attention))
         net_switch.unavailable(nr::kSmallFp8Experimental, "not installed (run install.bat again)");
     else if (!exists("dlssnr-amd\\CC_SMALL_FP8_EXPERIMENTAL.bin"))
         net_switch.unavailable(nr::kSmallFp8Experimental, "needs the model of the 310.9.16 nvngx_dlssnr.dll (install.ps1 -Dll)");
-    else if (!g_d3d12_native.load() && make_host().rdna3)
-        net_switch.unavailable(nr::kSmallFp8Experimental, "not on RDNA3 GPUs (RX 7000, Radeon 700M / 800M / 8000S)");
     else if (!g_d3d12_native.load() && nr::binary::directory().empty())
         net_switch.unavailable(nr::kSmallFp8Experimental, nr::binary::disabled_why().empty()
             ? std::string("needs ACO Mode, which is off for this run")
@@ -2988,12 +2994,10 @@ void Session::Impl::check_availability() {
     // (Balanced, then Performance, Ultra Performance)
     if (!exists("dlssnr-amd\\CC_SILVER_AARDWOLD.bin"))
         net_switch.unavailable(nr::kSilverAardwoldOptimizedFp8, "the model file is missing (run install.bat again)");
-    else if (!exists("dlssnr-amd\\optimized\\shaders\\fixed-attention.txt"))
+    else if (!exists(o_attention))
         net_switch.unavailable(nr::kSilverAardwoldOptimizedFp8, "not installed (run install.bat again)");
     else if (!exists("dlssnr-amd\\CC_SILVER_AARDWOLD_OPTIMIZED.bin"))
         net_switch.unavailable(nr::kSilverAardwoldOptimizedFp8, "its weights were not made at install (run install.bat again)");
-    else if (!g_d3d12_native.load() && make_host().rdna3)
-        net_switch.unavailable(nr::kSilverAardwoldOptimizedFp8, "not on RDNA3 GPUs (RX 7000, Radeon 700M / 800M / 8000S)");
     else if (!g_d3d12_native.load() && nr::binary::directory().empty())
         net_switch.unavailable(nr::kSilverAardwoldOptimizedFp8, nr::binary::disabled_why().empty()
             ? std::string("needs ACO Mode, which is off for this run")
@@ -3003,6 +3007,8 @@ void Session::Impl::check_availability() {
     if (!net_switch.reason(nr::kSilverAardwoldOptimizedFp8).empty())
         net_switch.unavailable(nr::kSilverAardwoldOptimized, net_switch.reason(nr::kSilverAardwoldOptimizedFp8));
 #if NR_INT4
+    else if (rdna3)   // its int4 WMMA rewrite is RDNA4's; Quality runs (CC_SILVER_AARDWOLD_OPTIMIZED above)
+        net_switch.unavailable(nr::kSilverAardwoldOptimized, "not on RDNA3 GPUs (use Quality)");
     else if (!exists("dlssnr-amd\\int4\\settings.txt"))
         net_switch.unavailable(nr::kSilverAardwoldOptimized, "its int4 layers are not installed (run install.bat again)");
     else if (!exists("dlssnr-amd\\CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin"))
