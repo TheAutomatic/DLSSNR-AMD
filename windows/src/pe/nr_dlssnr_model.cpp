@@ -1404,6 +1404,14 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
             frame.renodx_settings = nullptr;
         }
         if (backend(frame)) {
+            {
+                const auto ns = nr::pe::asd::backend_net_status();
+                const double net_ms = ns.gpu_ms;
+                const double tot_ms = ns.stage_ms > 0.0 ? ns.stage_ms : net_ms;
+                const bool produced = nr::pe::asd::backend_produced();
+                log_evaluate(f, "D3D12", width, height, static_cast<const void*>(color), static_cast<const void*>(output),
+                             reset != 0, produced, produced ? nullptr : "declined", tot_ms, net_ms);
+            }
             {   // NR Control's state from this frame, every frame as the bridge's evaluate reports its runs
                 {
                     uint32_t render_w = depth_rect.width, render_h = depth_rect.height;

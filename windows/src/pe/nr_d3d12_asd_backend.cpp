@@ -41,30 +41,32 @@ const char kShaders[] =
     "Texture2D<float4> src_tex : register(t0);\n"
     "SamplerState linear_clamp : register(s0);\n"
     "RWTexture2D<float4> dst_tex : register(u0);\n"
-    "StructuredBuffer<float4> lin_src : register(t1);\n"
-    "RWStructuredBuffer<float4> lin_dst : register(u1);\n"
+    "StructuredBuffer<uint2> lin_src : register(t1);\n"
+    "RWStructuredBuffer<uint2> lin_dst : register(u1);\n"
     "[numthreads(8, 8, 1)] void to_linear(uint3 id : SV_DispatchThreadID) {\n"
-    "    if (id.x < g_w && id.y < g_h) lin_dst[id.y * g_w + id.x] = src_tex.Load(int3(id.xy, 0));\n"
+    "    if (id.x < g_w && id.y < g_h) {\n"
+    "        uint4 h = f32tof16(src_tex.Load(int3(id.xy, 0)));\n"
+    "        lin_dst[id.y * g_w + id.x] = uint2(h.x | (h.y << 16), h.z | (h.w << 16));\n"
+    "    }\n"
     "}\n"
     "[numthreads(8, 8, 1)] void from_linear(uint3 id : SV_DispatchThreadID) {\n"
     "    if (id.x >= g_w || id.y >= g_h) return;\n"
-    "    dst_tex[id.xy] = lin_src[id.y * g_w + id.x];\n"
+    "    uint2 p = lin_src[id.y * g_w + id.x];\n"
+    "    dst_tex[id.xy] = f16tof32(uint4(p.x & 0xffffu, p.x >> 16, p.y & 0xffffu, p.y >> 16));\n"
     "}\n"
-    // The engine's motion onto the frame: at each pixel's centre, through a linear clamp-to-edge sampler, where the
-    // runtime's temporal kernels sample the guide in place (mv_direct: uv * region.xy + region.zw, the subrect's share
-    // of the allocation and its base); the kernels then read this field at the same pixel centres (region 1, 0).
     "[numthreads(8, 8, 1)] void to_motion(uint3 id : SV_DispatchThreadID) {\n"
     "    if (id.x >= g_w || id.y >= g_h) return;\n"
     "    const float2 uv = (float2(id.xy) + 0.5) / float2(g_w, g_h);\n"
-    "    lin_dst[id.y * g_w + id.x] = float4(src_tex.SampleLevel(linear_clamp, uv * g_region.xy + g_region.zw, 0).xy, 0, 0);\n"
+    "    uint2 h = f32tof16(src_tex.SampleLevel(linear_clamp, uv * g_region.xy + g_region.zw, 0).xy);\n"
+    "    lin_dst[id.y * g_w + id.x] = uint2(h.x | (h.y << 16), 0u);\n"
     "}\n"
-    // The engine's depth into the temporal path's linear buffer: texel for texel what a NEAREST blit
-    // of the subrect picks (runtime_depth.comp), stored as RGBA32F with depth in .r.
     "[numthreads(8, 8, 1)] void to_depth(uint3 id : SV_DispatchThreadID) {\n"
     "    if (id.x >= g_w || id.y >= g_h) return;\n"
     "    const float2 s = floor((float2(id.xy) + 0.5) * g_region.xy / float2(g_w, g_h));\n"
     "    const int2 t = min(int2(s), int2(g_region.xy) - 1);\n"
-    "    lin_dst[id.y * g_w + id.x] = float4(src_tex.Load(int3(t + int2(g_region.zw), 0)).r, 0, 0, 0);\n"
+    "    uint idx = (id.y * g_w + id.x) * 2;\n"
+    "    lin_dst[idx] = uint2(asuint(src_tex.Load(int3(t + int2(g_region.zw), 0)).r), 0u);\n"
+    "    lin_dst[idx + 1] = uint2(0u, 0u);\n"
     "}\n";
 
 ID3DBlob* compile(const char* entry, std::string* why) { return compile_cs(kShaders, sizeof kShaders - 1, entry, why); }
@@ -248,6 +250,7 @@ std::atomic<float> g_stage_avg_ms{0.f}, g_last_fast_passes{0.f};
 std::atomic<uint32_t> g_last_nr_w{0}, g_last_nr_h{0};
 std::atomic<bool> g_last_fast_fallback{false};
 void note_stage_gpu(double ms) {
+    if (g.stage_ring_at == 1 && ms < double(g.stage_ring[0]) * 0.75) g.stage_ring_at = 0;
     g.stage_ring[g.stage_ring_at % 32] = float(ms);
     ++g.stage_ring_at;
     const size_t n = std::min<size_t>(g.stage_ring_at, 32);
@@ -776,16 +779,20 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
     uint32_t ts = Backend::kTimeRing;
     if (g.stamps_map) {
         for (uint32_t i = 0; i < Backend::kTimeRing; ++i) {
-            if (g.stamp_uses[i] && nr::pe::split::completed(g.stamp_uses[i])) {
+            if ((g.stamp_uses[i] && nr::pe::split::completed(g.stamp_uses[i])) || !g.booking) {
                 uint64_t t2[2];
                 std::memcpy(t2, g.stamps_map + i * 16, 16);
-                if (t2[0] && t2[1] > t2[0]) note_stage_gpu(double(t2[1] - t2[0]) * 1000.0 / g.hz);
+                if (t2[0] && t2[1] > t2[0]) {
+                    note_stage_gpu(double(t2[1] - t2[0]) * 1000.0 / g.hz);
+                    std::memset(g.stamps_map + i * 16, 0, 16);
+                }
                 g.stamp_uses[i].reset();
             }
             if (!g.stamp_uses[i] && ts == Backend::kTimeRing) ts = i;
         }
+        if (!g.booking) ts = uint32_t(g.frames % Backend::kTimeRing);
     }
-    const bool timed = ts < Backend::kTimeRing && bool(g.booking);
+    const bool timed = g.stamps_map && ts < Backend::kTimeRing;
     if (timed) {
         g.stamp_uses[ts] = g.booking;
         std::memset(g.stamps_map + ts * 16, 0, 16);
@@ -943,11 +950,12 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
     if (!w || !h) return fallback("an empty extent");
     if (w != g.w || h != g.h) {
         retire(g.lin_in); retire(g.lin_out); retire(g.lin_mv); retire(g.lin_depth);
-        const uint64_t bytes = uint64_t(w) * h * 16;
-        g.lin_in = linear_buffer(f.device, bytes);
-        g.lin_out = linear_buffer(f.device, bytes);
-        g.lin_mv = linear_buffer(f.device, bytes);
-        g.lin_depth = linear_buffer(f.device, bytes);
+        const uint64_t bytes8 = uint64_t(w) * h * 8;
+        const uint64_t bytes16 = uint64_t(w) * h * 16;
+        g.lin_in = linear_buffer(f.device, bytes8);
+        g.lin_out = linear_buffer(f.device, bytes8);
+        g.lin_mv = linear_buffer(f.device, bytes8);
+        g.lin_depth = linear_buffer(f.device, bytes16);
         if (!g.lin_in || !g.lin_out || !g.lin_mv || !g.lin_depth) {
             retire(g.lin_in); retire(g.lin_out); retire(g.lin_mv); retire(g.lin_depth);
             g.lin_in = g.lin_out = g.lin_mv = g.lin_depth = nullptr;
@@ -1019,6 +1027,7 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
         nt.reset = f.reset != 0;
         nt.feature = f.feature;
         nt.have_motion = have_motion;
+        nt.motion_f16 = true;
         g.network->temporal(nt);
     }
     const auto state = nr::pe::split::snapshot(f.cmd);
@@ -1087,7 +1096,7 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
     }
 
     const bool in_place = f.color == f.output;
-    const LinearFrame in{g.lin_in, g.lin_in->GetGPUVirtualAddress(), w, h, uint64_t(w) * h * 16};
+    const LinearFrame in{g.lin_in, g.lin_in->GetGPUVirtualAddress(), w, h, uint64_t(w) * h * 8};
     const LinearFrame out{g.lin_out, g.lin_out->GetGPUVirtualAddress(), w, h, in.bytes};
     UINT constants[8] = {w, h, 0u, 0u, 0u, 0u, 0u, 0u};
     UINT mv_constants[8] = {w, h, 0u, 0u, 0u, 0u, 0u, 0u};
