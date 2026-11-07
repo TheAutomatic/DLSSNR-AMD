@@ -76,7 +76,7 @@ std::atomic<DWORD> g_watch_thread{0};
 std::atomic<uint64_t> g_last_present_ms{0};
 
 bool held() { return g_menu_open.load() && GetCurrentThreadId() != g_watch_thread.load(); }
-bool toggle_key(int vk) { return vk == VK_INSERT || vk == VK_END; }
+bool toggle_key(int vk) { return vk == VK_INSERT; }
 
 BOOL WINAPI clip_cursor(const RECT* r) {
     {
@@ -106,7 +106,11 @@ SHORT WINAPI get_async_key_state(int vk) { return (held() && !toggle_key(vk)) ? 
 SHORT WINAPI get_key_state(int vk) { return (held() && !toggle_key(vk)) ? 0 : g_real_keystate(vk); }
 BOOL WINAPI get_keyboard_state(BYTE* keys) {
     const BOOL ok = g_real_keyboard(keys);
-    if (ok && keys && held()) std::memset(keys, 0, 256);
+    if (ok && keys && held()) {
+        const BYTE ins = keys[VK_INSERT];
+        std::memset(keys, 0, 256);
+        keys[VK_INSERT] = ins;
+    }
     return ok;
 }
 UINT WINAPI get_raw_input_data(HRAWINPUT h, UINT command, void* data, UINT* size, UINT header) {

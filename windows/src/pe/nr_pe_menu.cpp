@@ -173,6 +173,7 @@ struct Input {
             chars_seen = s->chars_written;
             primed = true;
         }
+        if (open && !s->menu_open) open = false;   // closed externally (e.g. watch() 3s no-Present timeout)
         // the menu's key with its modifiers held (not while a field takes typing: a letter key would close the menu)
         const bool taking = open && nr::control_ui::capturing_key();
         const bool mods_held = (!(open_mods & MOD_CONTROL) || down(0x11)) && (!(open_mods & MOD_SHIFT) || down(0x10)) &&
