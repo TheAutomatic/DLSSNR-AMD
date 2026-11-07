@@ -73,8 +73,10 @@ RECT g_game_clip{};
 POINT g_frozen{};
 std::atomic<bool> g_menu_open{false};
 std::atomic<DWORD> g_watch_thread{0};
+std::atomic<uint64_t> g_last_present_ms{0};
 
 bool held() { return g_menu_open.load() && GetCurrentThreadId() != g_watch_thread.load(); }
+bool toggle_key(int vk) { return vk == VK_INSERT || vk == VK_END; }
 
 BOOL WINAPI clip_cursor(const RECT* r) {
     {
@@ -100,8 +102,8 @@ BOOL WINAPI get_cursor_info(CURSORINFO* ci) {
     if (ok && ci && held()) ci->ptScreenPos = g_frozen;
     return ok;
 }
-SHORT WINAPI get_async_key_state(int vk) { return held() ? 0 : g_real_async(vk); }
-SHORT WINAPI get_key_state(int vk) { return held() ? 0 : g_real_keystate(vk); }
+SHORT WINAPI get_async_key_state(int vk) { return (held() && !toggle_key(vk)) ? 0 : g_real_async(vk); }
+SHORT WINAPI get_key_state(int vk) { return (held() && !toggle_key(vk)) ? 0 : g_real_keystate(vk); }
 BOOL WINAPI get_keyboard_state(BYTE* keys) {
     const BOOL ok = g_real_keyboard(keys);
     if (ok && keys && held()) std::memset(keys, 0, 256);
@@ -187,9 +189,13 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             ++s->chars_written;
         }
         if (s->menu_open) {
-            // The menu has the keyboard and mouse: the game's window gets none of it.
-            if (msg == WM_INPUT) return DefWindowProcW(hwnd, msg, wp, lp);
-            if ((msg >= WM_KEYFIRST && msg <= WM_KEYLAST) || (msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST)) return 0;
+            // The menu has the keyboard and mouse: the game's window gets none of it (except OptiScaler's Insert key).
+            const bool is_toggle = (msg == WM_KEYDOWN || msg == WM_KEYUP || msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP) &&
+                                   toggle_key(int(wp));
+            if (!is_toggle) {
+                if (msg == WM_INPUT) return DefWindowProcW(hwnd, msg, wp, lp);
+                if ((msg >= WM_KEYFIRST && msg <= WM_KEYLAST) || (msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST)) return 0;
+            }
         }
     }
     return CallWindowProcW(g_previous, hwnd, msg, wp, lp);
@@ -216,6 +222,8 @@ void watch() {
     g_watch_thread.store(GetCurrentThreadId());
     for (;;) {
         nr::control::Shared* s = g_shared;
+        const uint64_t last_pres = g_last_present_ms.load(std::memory_order_relaxed);
+        if (s && s->menu_open && last_pres && GetTickCount64() - last_pres > 3000) s->menu_open = 0;
         const bool open = s && s->menu_open != 0;
         if (s && open != g_menu_open.load()) menu_changed(open);
         if (open && g_real_clip) {   // a clip set some other way while the menu is open
@@ -282,6 +290,7 @@ std::vector<int> g_chain;
 bool g_chain_known = false;
 std::vector<int> g_frame_layers;
 void present_layers() {
+    g_last_present_ms.store(GetTickCount64(), std::memory_order_relaxed);
     nr::control::Shared* s = shared(); if (!s) s = page();
     std::lock_guard<std::mutex> g(g_chain_lock);
     for (auto& r : s->layers)

@@ -195,10 +195,10 @@ ID3D12Resource* buffer(ID3D12Device* device, D3D12_HEAP_TYPE type, uint64_t byte
     if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, state, nullptr, IID_PPV_ARGS(&r)))) return nullptr;
     return r;
 }
-void uav_barrier(ID3D12GraphicsCommandList* cmd) {
+void uav_barrier(ID3D12GraphicsCommandList* cmd, ID3D12Resource* res = nullptr) {
     D3D12_RESOURCE_BARRIER b{};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-    b.UAV.pResource = nullptr;   // every UAV access: the next dispatch reads what this one wrote, as compute_barrier
+    b.UAV.pResource = res;   // scoped when res is known; nullptr for image/multi-buffer boundaries
     cmd->ResourceBarrier(1, &b);
 }
 void transition(ID3D12GraphicsCommandList* cmd, ID3D12Resource* r, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
@@ -406,14 +406,14 @@ std::shared_ptr<Built> build(ID3D12Device* device, const Carriers& carriers, ID3
             c_post16 = nullptr;
         if (missing.empty()) break;
         if (b->plan.model.rfind("CC_SMALL_FP8_EXPERIMENTAL", 0) != 0) break;
-        nr::pe::log("[asd] the %s network: kernel %s has no record in the PSDB; CC_SMALL_FP8 instead", b->plan.model.c_str(),
+        nr::pe::log("[asd] the %s network: kernel %s has no .nrp record; CC_SMALL_FP8 instead", b->plan.model.c_str(),
                     missing.c_str());
     }
-    if (!missing.empty()) { *why = "kernel " + missing + " has no record in the PSDB (" + b->plan.model + ")"; return nullptr; }
+    if (!missing.empty()) { *why = "kernel " + missing + " has no .nrp record (" + b->plan.model + ")"; return nullptr; }
     if (b->plan.temporal.pre < 0 || b->plan.temporal.post < 0) { *why = "the plan has no temporal pre / post block"; return nullptr; }
     // The table in a buffer of its own (the network shaders' manifest says noise_buffer) is what this side binds
     if (!b->plan.noise.empty() && !b->plan.noise_in_buffer) {
-        *why = "the shader folder keeps the noise table in the weights (not the shaders the PSDB was made for)"; return nullptr;
+        *why = "the shader folder keeps the noise table in the weights (not the shaders the direct ELF records were made for)"; return nullptr;
     }
     b->net = nr::network_choice(b->plan.model.substr(0, b->plan.model.find(' ')));
     if (b->net < 0) b->net = want_net >= 0 ? want_net : nr::kSmallFp8;
@@ -1055,7 +1055,7 @@ public:
             cmd->SetComputeRootUnorderedAccessView(1, table_va + uint64_t(i) * kTableBytes);
             cmd->Dispatch(grid[0], grid[1], grid[2]);
             const bool nobar = i >= base && (i - base) < b->plan.disp.size() && b->plan.disp[i - base].no_barrier_after;
-            if (!nobar) uav_barrier(cmd);
+            if (!nobar) uav_barrier(cmd, i < base ? b->noise : (k.fam.images.empty() ? b->act : nullptr));
         }
         if (first) {
             b->retargeted = true;
