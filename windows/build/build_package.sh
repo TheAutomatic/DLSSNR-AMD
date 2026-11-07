@@ -143,12 +143,15 @@ python3 linux/build/build_network.py rdna4 --optimized --out "$out/aco-shaders-o
 mkdir -p -- "$pkg/dlssnr-amd/optimized"
 cp -r -- "$out/aco-shaders-optimized" "$pkg/dlssnr-amd/optimized/shaders"
 # RDNA3 (RX 7000, Radeon 700M / 800M / 8000S graphics; nr_gpu_arch.hpp): its own network as ACO's machine code only
-# (windows/data/aco/rdna3), the SPIR-V the records were made from (windows/build/build_aco_network.py rdna3) and the
-# templates (shells: small shaders with the network's interfaces) the driver compiles for the containers.
-rm -rf -- "$out/aco-shaders-rdna3"
-python3 windows/build/build_aco_network.py rdna3 --out "$out/aco-shaders-rdna3" > /dev/null
-mkdir -p -- "$aco/rdna3/records"
-cp -r -- "$out/aco-shaders-rdna3" "$aco/rdna3/shaders"
+# (windows/data/aco/rdna3/records, one record a pipeline), and in place of its SPIR-V the stand-ins the runtime takes
+# for it (rdna3/shaders, rdna3/experimental/shaders, rdna3/optimized/shaders: each pipeline's interface shell naming
+# its record, nr_pipeline_binary.hpp record_reference, with the network's marker files) and the templates (shells:
+# small shaders with the network's interfaces) the driver compiles for the containers. CC_SMALL_FP8_EXPERIMENTAL and
+# CC_SILVER_AARDWOLD_OPTIMIZED (at Quality) have their records with the default ones.
+mkdir -p -- "$aco/rdna3/records" "$aco/rdna3/experimental" "$aco/rdna3/optimized"
+cp -r -- windows/data/aco/rdna3/shaders "$aco/rdna3/shaders"
+cp -r -- windows/data/aco/rdna3/experimental/shaders "$aco/rdna3/experimental/shaders"
+cp -r -- windows/data/aco/rdna3/optimized/shaders "$aco/rdna3/optimized/shaders"
 cp -- windows/data/aco/rdna3/records/*.nrp "$aco/rdna3/records/"
 cp -r -- windows/data/aco/rdna3/shells "$aco/rdna3/shells"
 cp -- windows/data/aco/rdna3/shell-aliases.txt "$aco/rdna3/"
@@ -192,6 +195,14 @@ PY
     cp -r -- linux/data/int4/rdna4/{vit,swin,settings.txt} "$pkg/dlssnr-amd/int4-ultra/"
     cp -r -- linux/data/int4-ultra/rdna4/. "$pkg/dlssnr-amd/int4-ultra/"
     cp -r -- "$out/aco-shaders-ultra" "$pkg/dlssnr-amd/int4-ultra/shaders"
+    # RDNA3's int4 levels (the same tables as above): their gfx11 records (aco/rdna3/int4/records, the iu4 rewrite of
+    # the NR_I4_MMA2 pairs made with them) and the stand-ins naming them, one folder a level as dlssnr-amd's
+    mkdir -p -- "$aco/rdna3/int4"
+    cp -r -- windows/data/aco/rdna3/int4/records "$aco/rdna3/int4/records"
+    for lv in int4 int4-performance int4-ultra; do
+        mkdir -p -- "$aco/rdna3/$lv"
+        cp -r -- "windows/data/aco/rdna3/$lv/shaders" "$aco/rdna3/$lv/shaders"
+    done
     "$cxx" "${common[@]}" "${NR_PRODUCT_DEFINES[@]}" -c windows/src/tools/nr_int4_weights.cpp -o "$out/int4_weights.o"
     # The generator stops before device creation. Vulkan calls abort if this contract is broken.
     syms=$({ "$cxx" -static -municode -o /dev/null "$out/int4_weights.o" "$out/nr_native_plan.o" 2>&1 || true; } |

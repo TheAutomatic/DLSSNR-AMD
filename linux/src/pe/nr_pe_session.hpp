@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 // One neural-rendering session bound to a game's D3D12 device, running at the
 // game's *render* resolution.
 //
@@ -26,6 +27,9 @@
 #include <string>
 
 namespace nr::pe {
+// The network's [Network] Motion Without Depth as the last RenoDX run's runtime has it (-1 none ran yet): the .asi's
+// Present guide sets copy the game's depth only when something reads it.
+extern std::atomic<int> g_motion_without_depth_now;
 
 class Session {
   public:

@@ -42,6 +42,8 @@ struct Fg {
     ID3D12Resource* game = nullptr;   // the game's resource, valid until the present
     D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
     bool substitute = false;       // NR's answer may be written back into `game` (frame generation reads it at the present)
+    bool hudless = true;           // a frame before the game's HUD (HUD FIX may run on it); false: the frame frame generation
+                                   // is dispatched from (ffxDispatch), which may hold the HUD - only NR's change goes into it
     const char* source = "";
     std::string why;               // not seen: why
     bool offered = false;          // not armed: a hand-over came in the last 2 s (the method could run)
@@ -63,6 +65,9 @@ void d3d12_backs(IDXGISwapChain* sc);
 // Frame generation's hand-overs are taken from the game's own calls only (`game` says whether a caller address is the
 // game's): OptiScaler's own frame generation calls the same libraries with its own command lists and threads.
 void set_game_caller(bool (*game)(void* caller));
+// The game dispatches its FSR frame generation itself (its last configure gave no frame-generation callback): the
+// generated frames are made from a frame of the game's, not from the back buffer at the present.
+bool ffx_app_dispatch();
 // After every ExecuteCommandLists of the game's (NR Control's queue hook calls the .asi's observer, which calls this;
 // the capture hooks the queue itself only where that hook is not there): the lists' writes in the GPU's order.
 nr::gpu::Ticket d3d12_recording(ID3D12GraphicsCommandList* list);

@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 // One neural-rendering session bound to a game's D3D12 device, running at the
 // game's *render* resolution.
 //
@@ -26,6 +27,13 @@
 #include <string>
 
 namespace nr::pe {
+// The network's [Network] Motion Without Depth as the last RenoDX run's runtime has it (-1 none ran yet): the .asi's
+// Present guide sets copy the game's depth only when something reads it.
+extern std::atomic<int> g_motion_without_depth_now;
+
+// The .asi's D3D12 passthrough is on for this process (nr_d3d12_asd.hpp): the network availability no longer
+// depends on the bridge's Vulkan device alone, and the int4 network is not offered (the backend has no int4 build).
+void set_d3d12_native(bool on);
 
 class Session {
   public:
@@ -513,6 +521,11 @@ class Session {
     State state() const;
     // [Network] Model from the host's UI, as the hotkey does (the switch writes Model to the ini).
     void set_network(int n);
+    // The network wanted now: steps NetworkSwitch (hotkey, dlssnr-amd.ini).
+    int frame_network();
+    void set_running_network(int net);
+    // [Network] History Precision as dlssnr-amd.ini says it now (true: 16, the default), for a backend of its own.
+    bool history_f16() const;
     // Between evaluations, from the host's own clock (with whatever lock its evaluations hold): after a while with no
     // evaluation (NR off), [Network] Residency frees what it would free of an inactive network, the running one included,
     // and networks retired since are freed (their frames are long done).

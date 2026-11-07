@@ -30,6 +30,12 @@ namespace nr::pe::menu {
 // process of its own (nr_present_probe.cpp: a swap chain made in the game would be seen, and kept, by its hooks).
 // Not from DllMain.
 void install();
+
+// Lines another part of the .asi adds to NR Control's Diagnostics (the D3D12 passthrough's,
+// nr_d3d12_asd_panel.cpp; no other build sets one).
+void set_extra_diagnostics(void (*draw)());
+// And to its Network page, under the network options (the D3D12 passthrough's switch).
+void set_extra_network(void (*draw)());
 // Learns which queue a D3D12 swap chain presents on (DXVK's DXGI gives its device only): hooks ExecuteCommandLists of
 // the queue class of `device` (the game's). Once per process; not from DllMain.
 void watch_queues(ID3D12Device* device);

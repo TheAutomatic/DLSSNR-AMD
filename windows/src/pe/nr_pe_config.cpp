@@ -8,6 +8,7 @@
 #include "nr_ini_int4.hpp"
 #include "nr_ini_network.hpp"
 #include "nr_pe_log.hpp"
+#include "nr_d3d12_asd.hpp"
 #include "nr_pipeline_binary.hpp"
 
 #include <windows.h>
@@ -1762,6 +1763,10 @@ void write_nrcontrol(FILE* f) {
         "; e.g. End, F7, Ctrl+M, Alt+Home. Empty = no key: NR Control cannot be opened until a key is set here again.\n"
         "; A text that names no key leaves End. Applied at once\n"
         "\n"
+        "PassOptiScalerKey = 0\n"
+        "; 1 = while NR Control is open, OptiScaler's menu key (Insert, or OptiScaler.ini [Menu] ShortcutKey) still reaches\n"
+        "; OptiScaler, so its menu opens and closes over NR Control. 0 (default) = NR Control keeps every key while open\n"
+        "\n"
         "Language =\n"
         "; The menus' language (NR Control and the ReShade Add-ons page): the name of a file in the lang folder of\n"
         "; dlssnr-amd, without .txt; empty = English. The README.txt there says how to make one. Applied at once\n"
@@ -1771,6 +1776,17 @@ void write_nrcontrol(FILE* f) {
         "; [wilsjo2]); other [LayerN] sections stay in the file and do not run. 1 = several layers (Add a layer on the\n"
         "; NR chain page), each a whole NR run with its own processing, network, place and settings. For ordinary\n"
         "; stacking use the layer's Passes, not layers. Applied at once\n");
+}
+
+void write_d3d12(FILE* f, bool enabled) {
+    std::fprintf(f,
+        "\n[D3D12Passthrough]\n"
+        "; The OptiScaler route in D3D12 games on an RX 9000 (experimental): NR's network runs on the game's own D3D12\n"
+        "; device as ACO's machine code instead of through the Vulkan bridge. A game or GPU it cannot serve uses the\n"
+        "; bridge (NR Control > Diagnostics says which). Takes effect when the game restarts.\n"
+        "\n"
+        "Enabled = %d\n"
+        "; 1 = on, 0 = off (the Vulkan bridge for every D3D12 game, as before 0.0.8.4)\n", enabled ? 1 : 0);
 }
 
 void write_log(FILE* f, bool enabled, bool clear) {
@@ -1876,6 +1892,7 @@ bool PreprocessFile::poll(const std::string& path, PreprocessConfig& out) {
             write_inspect(f, InspectConfig{});
             write_hudfix(f, HudFixConfig{});
             write_nrcontrol(f);
+            write_d3d12(f, nr::pe::asd::kDefaultEnabled);
             write_log(f, d.log_enabled, d.log_clear);
             std::fclose(f);
             log("[nr] dlssnr-amd.ini was missing (and dlssnr-amd\\dlssnr-amd.default.ini too): written with the defaults");

@@ -1,5 +1,6 @@
 #include "nr_path_u8.hpp"
 #include "nr_runtime.hpp"
+#include "nr_d3d12_net_plan.hpp"
 #include "nr_gpu_completion.hpp"
 #include "nr_native_plan.hpp"
 #include "nr_runtime_dispatch.hpp"
@@ -254,6 +255,58 @@ constexpr uint32_t kPrePushBytes = sizeof(PushFSwin) + sizeof(PushPreImage);
 constexpr uint32_t kPreSeedAt = sizeof(PushFSwin) + offsetof(PushPreImage, seed);
 constexpr uint32_t kPreNoiseFieldAt = sizeof(PushFSwin) + offsetof(PushPreImage, noise_off);
 
+// The pass's model controls into one dispatch's push block (Runtime::Impl::patch_push; the D3D12 passthrough through
+// d3d12_net_controls). post_alpha / round_u8: the post block restores the alpha (and the 8-bit rounding) itself; grade:
+// the Style grade pipelines exist and are on.
+void patch_push_controls(std::vector<uint8_t>& blob, const std::string& kern, int style, float intensity, float tone,
+                         float structure, float skin_in, bool mask, bool post_alpha, bool round_u8, bool grade) {
+    const struct { int style; float intensity, tone, structure, skin_in; bool mask; } r{style, intensity, tone, structure, skin_in, mask};
+    const float skin = r.mask ? (r.skin_in < 0 ? r.structure : r.skin_in) : -1.0f;
+    const float background = r.mask ? r.structure : -1.0f;
+    if (kern.rfind("fswinimagepreds32", 0) == 0) {
+        PushPreImage p{};
+        std::memcpy(&p, blob.data() + sizeof(PushFSwin), sizeof p);
+        p.style = float(r.style) / 128; p.tone = r.tone;
+        p.structure = r.mask ? 1 : r.structure;
+        p.skin = skin; p.other = background;
+        std::memcpy(blob.data() + sizeof(PushFSwin), &p, sizeof p);
+    } else if (kern.rfind("imgin", 0) == 0) {
+        PushImgIn p{}; std::memcpy(&p, blob.data(), sizeof p);
+        p.s434 = float(r.style) / 128; p.aux0 = r.tone;
+        p.aux1 = r.mask ? 1 : r.structure;
+        p.gate0 = skin; p.gate1 = background;
+        std::memcpy(blob.data(), &p, sizeof p);
+    } else if (kern == "fswinimagepost32") {
+        constexpr size_t offset = sizeof(PushFSwin) + sizeof(PushUps);
+        PushImageTail p{}; std::memcpy(&p, blob.data() + offset, sizeof p);
+        // Native compose (the OptiScaler and ReShade routes): the fused
+        // tail's own blend IS the DLL's post-block Intensity. **Not clamped
+        // to 1**: that clamp came from one post variant's `sat(Intensity)`
+        // in the PTX, which governs that variant's lerp and not the
+        // control - the DLL copies Intensity out of its settings
+        // unsaturated (18001cf07) and the Toolkit documents 0..2. The tail
+        // takes 0..1 as the lerp and past it as a luminance-ratio power;
+        // see windows/shaders/rdna4/fswin_t.comp.
+        // Every route, every pass: each pass carries its own Intensity
+        // into this blend, as each OptiScaler DLSS-NR pass is its own DLL
+        // feature with its own Intensity.
+        p.intensity = std::clamp(r.intensity, 0.0f, 2.0f);
+        // Bits 28-29: the Style. For Natural and Cinematic the DLL grades the composed answer after the post
+        // block (cg2r_post_process_kernel); the *_grade post pipelines do the same
+        // (windows/shaders/rdna4/include/nr_style_grade.glsl). Non-zero bits select that pipeline at dispatch;
+        // they stay 0 without it. Controls are checked to 0..2 before they get here; the DLL clamps to its
+        // style count, 3.
+        p.w_off = (p.w_off & 0x0FFFFFFFu) |
+                  (post_alpha ? 0x80000000u | (round_u8 ? 0x40000000u : 0u) : 0u) |
+                  (grade ? uint32_t(std::clamp(r.style, 0, 2)) << 28 : 0u);
+        std::memcpy(blob.data() + offset, &p, sizeof p);
+    } else if (kern.rfind("imgout", 0) == 0) {
+        PushImgOut p{}; std::memcpy(&p, blob.data(), sizeof p);
+        p.nr_intensity = std::clamp(r.intensity, 0.0f, 2.0f);
+        std::memcpy(blob.data(), &p, sizeof p);
+    }
+}
+
 // The model extent. At scale 1 it is the frame's own, unaligned, as every
 // game has run so far; below 1 it is rounded to a multiple of 8 (the
 // network's tile) and never above the frame; above 1 (supersampling) it is
@@ -308,7 +361,18 @@ struct Temporal {
     nrvk::Kernel post16_pp[2], post16_grade_pp[2];
     bool pingpong{};
     uint32_t hcur{};
-    nrvk::Context::Image& hist(uint32_t i) { return i ? history_b : history; }
+    // the history images rotate among the features (NR passes, layers) instead of one bound pair with every
+    // feature's own image copied in and out at each change (4K RGBA16F: two 66 MB copies per change, 3 passes ~1.3 ms
+    // a frame). A feature reads the image that holds its last frame (hread) and its post writes a free one (hwrite),
+    // which becomes the feature's; the one it read is free again. One feature: hist(0) / hist(1) in turn, as before.
+    // N features: N + 1 images (extra = the third and later), sets for each (read, write) pair made when first used.
+    std::vector<nrvk::Context::Image> extra;
+    struct Var { nrvk::Kernel pre, post, post_grade, post16, post16_grade; };
+    std::map<std::pair<uint32_t, uint32_t>, Var> vars;
+    uint32_t hread{}, hwrite{1};
+    bool hfresh{};   // hread starts from zeros this recording (a feature without history yet)
+    uint32_t hist_count() const { return 2u + uint32_t(extra.size()); }
+    nrvk::Context::Image& hist(uint32_t i) { return i == 0 ? history : i == 1 ? history_b : extra[i - 2u]; }
     // Where the engine's depth is put, so the consumer has one descriptor
     // whether a game supplies depth or not. Allocated always and left cleared
     // when it is not; the shader is told which by the parameter buffer rather
@@ -353,6 +417,13 @@ struct Temporal {
             if (post16_grade_pp[c].device) post16_grade_pp[c].destroy();
         }
         if (history_b.handle) ctx.destroy(history_b);
+        for (auto& v : vars)
+            for (nrvk::Kernel* k : {&v.second.pre, &v.second.post, &v.second.post_grade, &v.second.post16,
+                                    &v.second.post16_grade})
+                if (k->device) k->destroy();
+        vars.clear();
+        for (auto& e : extra) { e.sampler = VK_NULL_HANDLE; ctx.destroy(e); }   // (the sampler is history's)
+        extra.clear();
         if (hpass.handle) ctx.destroy(hpass);
         // flow0_sampled aliases flow[0]; only its sampler is ours to free.
         if (motion_sampler) vkDestroySampler(ctx.device, motion_sampler, nullptr);
@@ -445,10 +516,11 @@ struct Runtime::Impl {
     // every temporal kernel's set pointing at them (the sampled read of hist(c) in the [c] kernels, the storage write
     // of hist(c) in the post's [c ^ 1] ones), the old images retired. Each feature's own image goes too and every
     // history starts afresh (latch off): a switch is a cut, as a network switch is.
-    void switch_history(VkCommandBuffer cmd) {
+    bool switch_history(VkCommandBuffer cmd) {
         auto& t = temporal;
         auto& s = session;
-        if (!t.enabled || !t.pingpong || t.hp || !t.h16_ok || t.h16 == t.h16_want) return;
+        if (!t.enabled || !t.pingpong || t.hp || !t.h16_ok || t.h16 == t.h16_want) return false;
+        drop_rotation();   // the images beyond the pair and their sets go; every feature starts afresh below
         const VkFormat fmt = t.h16_want ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
         nrvk::Context::Image old[2] = {t.history, t.history_b}, made[2];
         const bool defer = s.ctx.defer_transitions;
@@ -505,6 +577,7 @@ struct Runtime::Impl {
         t.h16 = t.h16_want;
         nr::logf("[nr] history images %s ([Network] History Precision %s): the history starts afresh",
                  t.h16 ? "RGBA16F" : "RGBA32F", t.h16 ? "16" : "32");
+        return true;
     }
     // Tag history with its input domain, per feature. A global counter would reset alternating layers that use
     // different encodings even when neither layer's settings changed.
@@ -613,6 +686,7 @@ struct Runtime::Impl {
         bool cleared{};
         InputDomain input{};   // the encoding its history was made under
         uint32_t seed{};       // Temporal::seed
+        int slot{-1};          // the history image holding its last frame (Temporal::hist), -1 none yet
     };
     std::map<uint64_t, FeatureState> features;
     // A feature's own history image is made when it first has to leave the bound history (another feature binds
@@ -627,6 +701,147 @@ struct Runtime::Impl {
         f.cleared = false;   // still UNDEFINED: record_all brings it to GENERAL before its first copy
     }
     uint64_t bound_feature{};
+    // History rotation (Temporal::extra): on for the one-pass ping-pong history (the product's), off for the
+    // research NR_HPASS path, which keeps the copies.
+    bool rotation() const { return temporal.pingpong && !temporal.hp; }
+    bool slot_taken(uint32_t i, const FeatureState* except) const {
+        for (const auto& f : features) if (&f.second != except && f.second.slot == int(i)) return true;
+        return false;
+    }
+    // A free image other than `not_this`, preferring `want`; made (UNDEFINED -> GENERAL in cmd) when none is free.
+    uint32_t free_slot(VkCommandBuffer cmd, const FeatureState* fs, uint32_t want, uint32_t not_this) {
+        auto& t = temporal;
+        if (want < t.hist_count() && want != not_this && !slot_taken(want, fs)) return want;
+        for (uint32_t i = 0; i < t.hist_count(); ++i)
+            if (i != not_this && !slot_taken(i, fs)) return i;
+        nrvk::Context::Image im = session.ctx.image(t.history.w, t.history.h, t.history.format, true, false);
+        vkDestroySampler(session.ctx.device, im.sampler, nullptr);
+        im.sampler = t.history.sampler;   // LINEAR, history's (borrowed)
+        VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = im.handle; b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr,
+                             0, nullptr, 1, &b);
+        im.layout = VK_IMAGE_LAYOUT_GENERAL;
+        t.extra.push_back(im);
+        return t.hist_count() - 1u;
+    }
+    // This recording's history pair for feature `fs` (null: the unnamed caller, hist(hcur) / hist(hcur ^ 1)).
+    void select_history(VkCommandBuffer cmd, FeatureState* fs) {
+        auto& t = temporal;
+        if (!rotation() || !fs) { t.hread = t.hcur; t.hwrite = t.hcur ^ 1u; t.hfresh = false; return; }
+        t.hfresh = fs->slot < 0;
+        // a feature without history takes hist(hcur) when it is free, as the bound history it used to clear
+        t.hread = t.hfresh ? free_slot(cmd, fs, t.hcur, ~0u) : uint32_t(fs->slot);
+        t.hwrite = free_slot(cmd, fs, t.hread < 2u ? t.hread ^ 1u : ~0u, t.hread);
+        if (!(t.hread < 2u && t.hwrite == (t.hread ^ 1u))) variant(t.hread, t.hwrite);
+    }
+    // pre_pp / post_pp for a pair other than (0, 1) and (1, 0): copies of pre_pp[0] / post*_pp[0] with the history
+    // read (hist(0)) and write (hist_store[1]) bindings pointing at hist(r) / hist(w).
+    static void clone_kernel(const nrvk::Kernel& base, nrvk::Kernel& out,
+                             const std::vector<std::pair<VkImageView, nrvk::Context::Image>>& changes) {
+        out = base;
+        out.pool = VK_NULL_HANDLE; out.set = VK_NULL_HANDLE;
+        VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        dpi.maxSets = 1; dpi.poolSizeCount = uint32_t(base.pool_sizes.size()); dpi.pPoolSizes = base.pool_sizes.data();
+        NRVK_CHECK(vkCreateDescriptorPool(base.device, &dpi, nullptr, &out.pool));
+        VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        dai.descriptorPool = out.pool; dai.descriptorSetCount = 1; dai.pSetLayouts = &base.dsl;
+        NRVK_CHECK(vkAllocateDescriptorSets(base.device, &dai, &out.set));
+        std::vector<VkCopyDescriptorSet> copies(base.binding_ids.size());
+        for (size_t b = 0; b < base.binding_ids.size(); ++b) {
+            copies[b] = {VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET};
+            copies[b].srcSet = base.set; copies[b].srcBinding = base.binding_ids[b];
+            copies[b].dstSet = out.set; copies[b].dstBinding = base.binding_ids[b];
+            copies[b].descriptorCount = 1;
+        }
+        vkUpdateDescriptorSets(base.device, 0, nullptr, uint32_t(copies.size()), copies.data());
+        std::vector<VkDescriptorImageInfo> infos(base.image_views.size());
+        std::vector<VkWriteDescriptorSet> w;
+        for (uint32_t i = 0; i < uint32_t(base.image_views.size()); ++i)
+            for (const auto& ch : changes)
+                if (base.image_views[i] == ch.first) {
+                    infos[i] = {ch.second.sampler, ch.second.view, VK_IMAGE_LAYOUT_GENERAL};
+                    out.image_views[i] = ch.second.view;
+                    VkWriteDescriptorSet x{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                    x.dstSet = out.set; x.dstBinding = base.buffer_bindings + i; x.descriptorCount = 1;
+                    x.descriptorType = ch.second.sampler ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                                                         : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+                    x.pImageInfo = &infos[i];
+                    w.push_back(x);
+                    break;
+                }
+        vkUpdateDescriptorSets(base.device, uint32_t(w.size()), w.data(), 0, nullptr);
+    }
+    Temporal::Var& variant(uint32_t r, uint32_t w) {
+        auto& t = temporal;
+        auto it = t.vars.find({r, w});
+        if (it != t.vars.end()) return it->second;
+        Temporal::Var& v = t.vars[{r, w}];
+        nrvk::Context::Image rd = t.hist(r), wr = t.hist(w);
+        wr.sampler = VK_NULL_HANDLE;   // the storage view the post writes
+        const VkImageView read0 = t.hist(0).view, write1 = t.hist(1).view;
+        const std::vector<std::pair<VkImageView, nrvk::Context::Image>> pre_ch{{read0, rd}};
+        clone_kernel(t.pre_pp[0], v.pre, pre_ch);
+        // post_pp[0]: hist(0) sampled (read), hist(1) storage (write) - matched by view and kind
+        const auto post = [&](const nrvk::Kernel& base, nrvk::Kernel& out) {
+            if (!base.device) return;
+            clone_kernel(base, out, {{read0, rd}});
+            // the write binding: the storage descriptor showing hist(1)'s view (after the read was moved, a read of
+            // hist(1) - r == 1 - shows hist(1)'s view too: only the storage one is the write)
+            std::vector<VkDescriptorImageInfo> one(1, VkDescriptorImageInfo{VK_NULL_HANDLE, wr.view, VK_IMAGE_LAYOUT_GENERAL});
+            for (uint32_t i = 0; i < uint32_t(base.image_views.size()); ++i) {
+                if (base.image_views[i] != write1) continue;
+                VkWriteDescriptorSet x{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                x.dstSet = out.set; x.dstBinding = base.buffer_bindings + i; x.descriptorCount = 1;
+                x.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; x.pImageInfo = one.data();
+                vkUpdateDescriptorSets(base.device, 1, &x, 0, nullptr);
+                out.image_views[i] = wr.view;
+            }
+        };
+        post(t.post_pp[0], v.post);
+        post(t.post_grade_pp[0], v.post_grade);
+        post(t.post16_pp[0], v.post16);
+        post(t.post16_grade_pp[0], v.post16_grade);
+        return v;
+    }
+    const nrvk::Kernel& pre_for(uint32_t r, uint32_t w) {
+        auto& t = temporal;
+        return r < 2u && (!rotation() || w == (r ^ 1u)) ? t.pre_pp[r] : variant(r, w).pre;
+    }
+    nrvk::Kernel& post_for(uint32_t r, uint32_t w, bool h16) {
+        auto& t = temporal;
+        if (r < 2u && (!rotation() || w == (r ^ 1u))) return h16 ? t.post16_pp[r] : t.post_pp[r];
+        Temporal::Var& v = variant(r, w);
+        return h16 ? v.post16 : v.post;
+    }
+    // The grade twin of a post kernel post_for returned (null: none).
+    nrvk::Kernel* grade_of(const nrvk::Kernel* k) {
+        auto& t = temporal;
+        for (unsigned c = 0; c < 2; ++c) {
+            if (k == &t.post_pp[c]) return &t.post_grade_pp[c];
+            if (k == &t.post16_pp[c]) return &t.post16_grade_pp[c];
+        }
+        for (auto& v : t.vars) {
+            if (k == &v.second.post) return &v.second.post_grade;
+            if (k == &v.second.post16) return &v.second.post16_grade;
+        }
+        return nullptr;
+    }
+    // The history images and sets beyond the pair, all at once (a precision switch).
+    void drop_rotation() {
+        auto& t = temporal;
+        for (auto& v : t.vars)
+            for (nrvk::Kernel* k : {&v.second.pre, &v.second.post, &v.second.post_grade, &v.second.post16,
+                                    &v.second.post16_grade})
+                if (k->pool) { retired_pools.push_back(k->pool); k->pool = VK_NULL_HANDLE; k->set = VK_NULL_HANDLE; k->shared.reset(); }
+        t.vars.clear();
+        for (auto& e : t.extra) { e.sampler = VK_NULL_HANDLE; retiring.emplace_back(e, recordings + kRetireAfter, gpu_uses); }
+        t.extra.clear();
+        for (auto& f : features) f.second.slot = -1;
+    }
     // Released features, and the recording count at which their images may be
     // destroyed. Never a wait: the render thread that releases a feature must
     // not block on the GPU, and OptiScaler has already parked the feature for 32
@@ -782,8 +997,8 @@ struct Runtime::Impl {
     // Any of colour (with its depth) and motion may be null: that one is our
     // own image, bound as in the sets made at creation.
     const DirectSrc* direct_source(VkImage colour, VkFormat format, VkImage depth, VkImage motion,
-                                   VkFormat mformat, uint32_t c, bool store = false, VkImage target = VK_NULL_HANDLE,
-                                   bool plain = false) {
+                                   VkFormat mformat, uint32_t c, uint32_t cw, bool store = false,
+                                   VkImage target = VK_NULL_HANDLE, bool plain = false) {
         if (!colour && !motion) return nullptr;
         auto& s = session; auto& t = temporal;
         const VkDevice dev = s.ctx.device;
@@ -841,17 +1056,20 @@ struct Runtime::Impl {
             } else {
             // One pass: this parity's ping-pong pre and post. More (no ping-pong, `c` 0): the pre and post
             // every pass runs, the model's write going to surf1 as in their own sets.
-            const nrvk::Kernel& pre_k = t.pingpong ? t.pre_pp[c] : t.pre;
-            const nrvk::Kernel& post_k = t.pingpong ? t.post_pp[c] : t.post;
+            // this recording's history pair (c read, cw written; Temporal::hread / hwrite), its sets in [0]
+            const nrvk::Kernel& pre_k = t.pingpong ? pre_for(c, cw) : t.pre;
+            const nrvk::Kernel& post_k = t.pingpong ? post_for(c, cw, false) : t.post;
             nrvk::Context::Image surf1 = s.surf1;
-            nrvk::Context::Image* written = t.pingpong ? &t.hist_store[c ^ 1u] : &surf1;
-            d.pre[c] = t.hp ? kernel_set(dev, d.pool, pre_k, t.pre_buffers, {&cim, &mim, &t.hist(c), &dim, &t.hpass})
+            nrvk::Context::Image hw = t.pingpong ? t.hist(cw) : surf1;
+            hw.sampler = t.pingpong ? VK_NULL_HANDLE : hw.sampler;
+            nrvk::Context::Image* written = t.pingpong ? &hw : &surf1;
+            d.pre[0] = t.hp ? kernel_set(dev, d.pool, pre_k, t.pre_buffers, {&cim, &mim, &t.hist(c), &dim, &t.hpass})
                             : kernel_set(dev, d.pool, pre_k, t.pre_buffers, {&cim, &mim, &t.hist(c), &dim});
-            d.post[c] = t.hp ? kernel_set(dev, d.pool, post_k, t.post_buffers,
+            d.post[0] = t.hp ? kernel_set(dev, d.pool, post_k, t.post_buffers,
                                           {&surf0, written, &cim, &mim, &t.hist(c), &t.hpass})
                              : kernel_set(dev, d.pool, post_k, t.post_buffers,
                                           {&surf0, written, &cim, &mim, &t.hist(c)});
-            ok = d.pre[c] && d.post[c];
+            ok = d.pre[0] && d.post[0];
             }
         }
         if (!ok) {
@@ -1118,50 +1336,8 @@ struct Runtime::Impl {
     struct Resolved { int style; float intensity, tone, structure, skin_in; bool mask; };
 
     void patch_push(std::vector<uint8_t>& blob, const std::string& kern, const Resolved& r) const {
-        const float skin = r.mask ? (r.skin_in < 0 ? r.structure : r.skin_in) : -1.0f;
-        const float background = r.mask ? r.structure : -1.0f;
-        if (kern.rfind("fswinimagepreds32", 0) == 0) {
-            PushPreImage p{};
-            std::memcpy(&p, blob.data() + sizeof(PushFSwin), sizeof p);
-            p.style = float(r.style) / 128; p.tone = r.tone;
-            p.structure = r.mask ? 1 : r.structure;
-            p.skin = skin; p.other = background;
-            std::memcpy(blob.data() + sizeof(PushFSwin), &p, sizeof p);
-        } else if (kern.rfind("imgin", 0) == 0) {
-            PushImgIn p{}; std::memcpy(&p, blob.data(), sizeof p);
-            p.s434 = float(r.style) / 128; p.aux0 = r.tone;
-            p.aux1 = r.mask ? 1 : r.structure;
-            p.gate0 = skin; p.gate1 = background;
-            std::memcpy(blob.data(), &p, sizeof p);
-        } else if (kern == "fswinimagepost32") {
-            constexpr size_t offset = sizeof(PushFSwin) + sizeof(PushUps);
-            PushImageTail p{}; std::memcpy(&p, blob.data() + offset, sizeof p);
-            // Native compose (the OptiScaler and ReShade routes): the fused
-            // tail's own blend IS the DLL's post-block Intensity. **Not clamped
-            // to 1**: that clamp came from one post variant's `sat(Intensity)`
-            // in the PTX, which governs that variant's lerp and not the
-            // control - the DLL copies Intensity out of its settings
-            // unsaturated (18001cf07) and the Toolkit documents 0..2. The tail
-            // takes 0..1 as the lerp and past it as a luminance-ratio power;
-            // see windows/shaders/rdna4/fswin_t.comp.
-            // Every route, every pass: each pass carries its own Intensity
-            // into this blend, as each OptiScaler DLSS-NR pass is its own DLL
-            // feature with its own Intensity.
-            p.intensity = std::clamp(r.intensity, 0.0f, 2.0f);
-            // Bits 28-29: the Style. For Natural and Cinematic the DLL grades the composed answer after the post
-            // block (cg2r_post_process_kernel); the *_grade post pipelines do the same
-            // (windows/shaders/rdna4/include/nr_style_grade.glsl). Non-zero bits select that pipeline at dispatch;
-            // they stay 0 without it. Controls are checked to 0..2 before they get here; the DLL clamps to its
-            // style count, 3.
-            p.w_off = (p.w_off & 0x0FFFFFFFu) |
-                      (post_alpha ? 0x80000000u | (round_u8 ? 0x40000000u : 0u) : 0u) |
-                      (style_grade && style_grade_on ? uint32_t(std::clamp(r.style, 0, 2)) << 28 : 0u);
-            std::memcpy(blob.data() + offset, &p, sizeof p);
-        } else if (kern.rfind("imgout", 0) == 0) {
-            PushImgOut p{}; std::memcpy(&p, blob.data(), sizeof p);
-            p.nr_intensity = std::clamp(r.intensity, 0.0f, 2.0f);
-            std::memcpy(blob.data(), &p, sizeof p);
-        }
+        patch_push_controls(blob, kern, r.style, r.intensity, r.tone, r.structure, r.skin_in, r.mask, post_alpha, round_u8,
+                            style_grade && style_grade_on);
     }
 
     void controls(const Controls& c) {
@@ -1235,7 +1411,15 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     // tree; missing: the original model, and the log says why.
     NetworkModel network = NetworkModel::Small;
     bool experimental = false, optimized = false;
-    const std::filesystem::path xroot = data / "experimental", oroot = data / "optimized";
+    // Their SPIR-V: the Linux network's in a dlssnr-amd folder on RDNA4, and on RDNA3 the bundle's own gfx11 builds
+    // (aco/rdna3/experimental/shaders, .../optimized/shaders: the records are aco/rdna3/records, found by hash).
+    const bool aco_rdna3 = host.rdna3 && !aco.empty();
+    const std::filesystem::path xroot = aco_rdna3 ? std::filesystem::path(aco) / "experimental" : data / "experimental";
+    const std::filesystem::path oroot = aco_rdna3 ? std::filesystem::path(aco) / "optimized" : data / "optimized";
+    const std::string x_incomplete = aco_rdna3 ? "dlssnr-amd/aco/rdna3/experimental/ is incomplete"
+                                               : "dlssnr-amd/experimental/ is incomplete";
+    const std::string o_incomplete = aco_rdna3 ? "dlssnr-amd/aco/rdna3/optimized/ is incomplete"
+                                               : "dlssnr-amd/optimized/ is incomplete";
     {
         std::string env;
 #ifdef _WIN32
@@ -1250,13 +1434,14 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         if (v == 0) network = NetworkModel::Original;
         std::error_code ec;
         // CC_SMALL_FP8_EXPERIMENTAL: the small model with its own weights (CC_SMALL_FP8_EXPERIMENTAL.bin, made by
-        // install.ps1 from the small model) and shaders (experimental/shaders: the Linux network's, run as ACO's machine
-        // code - ACO Mode only, as int4 mixed); anything missing: the small model.
+        // install.ps1 from the small model) and shaders (experimental/shaders: the Linux network's, run as ACO's
+        // machine code - ACO Mode only, as int4 mixed; RDNA3: the bundle's own aco/rdna3/experimental/shaders);
+        // anything missing: the small model.
         if (v == 2) {
             const char* missing = !installed ? "not an installed tree"
                 : aco.empty() ? "it needs ACO Mode (a driver with pipeline binaries)"
                 : !std::filesystem::is_regular_file(xroot / "shaders" / "fixed-attention.txt", ec) ||
-                          !std::filesystem::is_directory(xroot / "shaders" / "temporal", ec) ? "dlssnr-amd/experimental/ is incomplete"
+                          !std::filesystem::is_directory(xroot / "shaders" / "temporal", ec) ? x_incomplete.c_str()
                 : !std::filesystem::is_regular_file(data / "CC_SMALL_FP8_EXPERIMENTAL.bin", ec)
                           ? "dlssnr-amd/CC_SMALL_FP8_EXPERIMENTAL.bin is missing (run install.ps1 with the 310.9.16 nvngx_dlssnr.dll)"
                 : nullptr;
@@ -1269,13 +1454,14 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         }
         // CC_SILVER_AARDWOLD_OPTIMIZED: the 310.8 model with its own weights (CC_SILVER_AARDWOLD_OPTIMIZED.bin, made by install.ps1
         // from CC_SILVER_AARDWOLD.bin) and shaders (optimized/shaders: the Linux network's, run as ACO's machine code - ACO Mode
-        // only; with its int4 layers int4/, below); anything missing: the 310.8 model as it is.
+        // only; with its int4 layers int4/, below; RDNA3: the bundle's own aco/rdna3/optimized/shaders);
+        // anything missing: the 310.8 model as it is.
         if (v == 3) {
             network = NetworkModel::Original;
             const char* missing = !installed ? "not an installed tree"
                 : aco.empty() ? "it needs ACO Mode (a driver with pipeline binaries)"
                 : !std::filesystem::is_regular_file(oroot / "shaders" / "fixed-attention.txt", ec) ||
-                          !std::filesystem::is_directory(oroot / "shaders" / "temporal", ec) ? "dlssnr-amd/optimized/ is incomplete"
+                          !std::filesystem::is_directory(oroot / "shaders" / "temporal", ec) ? o_incomplete.c_str()
                 : !std::filesystem::is_regular_file(data / "CC_SILVER_AARDWOLD_OPTIMIZED.bin", ec)
                           ? "dlssnr-amd/CC_SILVER_AARDWOLD_OPTIMIZED.bin is missing (run install.ps1 again)"
                 : nullptr;
@@ -1395,7 +1581,8 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     // shaders, quantisers, settings.txt), the int4 weights the installer made (CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin, one file for the three:
     // their int4 layers' FP8 weights are the same; Ultra Performance's tables cover the others'), Performance and Ultra
     // Performance their own FP8 weights for some layers (the "performance/" entries of the optimized pack) and ACO Mode
-    // enabled on a device supporting VK_KHR_pipeline_binary; anything missing: Quality, and the log says why.
+    // enabled on a device supporting VK_KHR_pipeline_binary; anything missing: Quality, and the log says why. RDNA3
+    // runs them as the bundle's gfx11 int4 records (the iu4 WMMA rewrite of NR_I4_MMA2 pairs made with the records).
     bool int4 = false;
     std::string int4_env;
 #ifdef _WIN32
@@ -1416,6 +1603,10 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     std::map<std::string, std::string> int4_cfg;
     const std::filesystem::path i4root = data / (level == nr::kLayersPerformance ? "int4-performance"
                                                  : level == nr::kLayersUltra ? "int4-ultra" : "int4");
+    // The int4 levels' SPIR-V: the Linux network's in i4root/shaders on RDNA4; on RDNA3 the bundle's own gfx11 builds
+    // (aco/rdna3/<int4 | int4-performance | int4-ultra>/shaders, stand-ins naming their records in aco/rdna3/int4/
+    // records). The tables (vit/, swin/, settings.txt) are i4root's on both: the same int4 network.
+    const std::filesystem::path i4spv = (aco_rdna3 ? std::filesystem::path(aco) / i4root.filename() : i4root) / "shaders";
     const std::filesystem::path i4weights = data / "CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin";
     if (level >= nr::kLayersBalanced && (optimized || !installed)) {
         std::error_code ec;
@@ -1423,7 +1614,7 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         const std::string no_weights = "dlssnr-amd/" + i4weights.filename().string() + " is missing (run install.ps1 again)";
         const char* missing = network == NetworkModel::Small ? "the small model has no int4 layers"
             : !installed ? "not an installed tree"
-            : !std::filesystem::is_directory(i4root / "shaders" / "temporal", ec) || !std::filesystem::is_directory(i4root / "vit", ec) ||
+            : !std::filesystem::is_directory(i4spv / "temporal", ec) || !std::filesystem::is_directory(i4root / "vit", ec) ||
                       !std::filesystem::is_regular_file(i4root / "settings.txt", ec) ? incomplete.c_str()
             : !std::filesystem::is_regular_file(i4weights, ec) ? no_weights.c_str()
             : nr::binary::directory().empty() || !nr::binary::enabled(host.device) ? "ACO Mode is off or pipeline binaries are unavailable"
@@ -1488,7 +1679,7 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
 #if NR_INT4
     if (int4)   // with the int4 layers: their own shaders and pipeline cache
         for (size_t i = 0; i + 1 < arguments.size(); ++i) {
-            if (arguments[i] == "--spv-dir") arguments[i + 1] = (i4root / "shaders").string();
+            if (arguments[i] == "--spv-dir") arguments[i + 1] = i4spv.string();
             if (arguments[i] == "--pipeline-cache") arguments[i + 1] = (i4root / "pipeline.cache").string();
         }
 #endif
@@ -1679,7 +1870,7 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         if (optimized) shaders = std::filesystem::canonical(oroot / "shaders" / "temporal");
 #if NR_INT4
         // with the int4 layers, the temporal pre/post variants built with their network's defines: int4/shaders/temporal
-        if (int4) shaders = std::filesystem::canonical(i4root / "shaders" / "temporal");
+        if (int4) shaders = std::filesystem::canonical(i4spv / "temporal");
 #endif
         require_variant_profile(shaders);
         if (!inside(shaders))
@@ -2194,11 +2385,43 @@ bool Runtime::carry_history(VkCommandBuffer cmd, const Runtime& from, uint64_t f
     if (from.impl_->heap) from.impl_->heap->uses[from.impl_->heap_region].touch();
     const auto fit = from.impl_->features.find(feature);
     if (fit == from.impl_->features.end() || !fit->second.latch) return false;
-    // What the feature's next frame would have read there: the bound history, or its own image.
-    const nrvk::Context::Image& src = from.impl_->bound_feature == feature ? ft.hist(ft.hcur) : fit->second.history;
+    // What the feature's next frame would have read there: the bound history, or its own image (rotation: the
+    // image its slot names).
+    if (from.impl_->rotation() && fit->second.slot < 0) return false;
+    const nrvk::Context::Image& src = from.impl_->rotation() ? ft.hist(uint32_t(fit->second.slot))
+                                      : from.impl_->bound_feature == feature ? ft.hist(ft.hcur) : fit->second.history;
     if (!src.handle) return false;
     auto& s = impl_->session;
     auto it = impl_->features.find(feature);
+    if (impl_->rotation()) {   // into the image this runtime's next recording of the feature reads
+        if (it == impl_->features.end()) it = impl_->features.emplace(feature, impl_->make_feature()).first;
+        Impl::FeatureState& fs = it->second;
+        if (fs.slot < 0) fs.slot = int(impl_->free_slot(cmd, &fs, t.hcur, ~0u));
+        nrvk::Context::Image& dst = t.hist(uint32_t(fs.slot));
+        barrier(cmd, src.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        barrier(cmd, dst.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_ACCESS_TRANSFER_WRITE_BIT);
+        VkImageBlit b{};
+        b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        b.srcOffsets[1] = {int32_t(src.w), int32_t(src.h), 1};
+        b.dstOffsets[1] = {int32_t(dst.w), int32_t(dst.h), 1};
+        const VkFilter filter = impl_->filters_linearly(src.format) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+        nrvk::blit(s.ctx.physical, s.ctx.device, cmd, src.handle, src.format, VK_IMAGE_LAYOUT_GENERAL, dst.handle,
+                   dst.format, VK_IMAGE_LAYOUT_GENERAL, 1, &b, filter);
+        barrier(cmd, dst.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        barrier(cmd, src.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0);
+        fs.cleared = true;
+        fs.latch = true;
+        fs.seed = fit->second.seed;
+        fs.parity = fit->second.parity;
+        fs.input = fit->second.input;
+        return true;
+    }
     if (it == impl_->features.end()) {
         Impl::FeatureState made{};
         // sampled as well, as temporal.history is: the temporal kernels read a feature's history through a sampler
@@ -2271,6 +2494,28 @@ void Runtime::release_feature(uint64_t feature) {
     for (auto& p : it->second.estimator_luma)
         if (p.handle) impl_->retiring.emplace_back(p, impl_->recordings + Impl::kRetireAfter, impl_->gpu_uses);
     impl_->features.erase(it);
+    // Rotation: the images beyond what the features left need (theirs and one to write) go, from the last
+    if (impl_->rotation()) {
+        auto& t = impl_->temporal;
+        uint32_t owned = 0;
+        for (const auto& f : impl_->features) if (f.second.slot >= 0) ++owned;
+        while (!t.extra.empty() && t.hist_count() > std::max(owned + 1u, 2u) &&
+               !impl_->slot_taken(t.hist_count() - 1u, nullptr)) {
+            const uint32_t last = t.hist_count() - 1u;
+            for (auto v = t.vars.begin(); v != t.vars.end();) {
+                if (v->first.first != last && v->first.second != last) { ++v; continue; }
+                for (nrvk::Kernel* k : {&v->second.pre, &v->second.post, &v->second.post_grade, &v->second.post16,
+                                        &v->second.post16_grade})
+                    if (k->pool) { impl_->retired_pools.push_back(k->pool); k->pool = VK_NULL_HANDLE; k->shared.reset(); }
+                v = t.vars.erase(v);
+            }
+            nrvk::Context::Image e = t.extra.back();
+            e.sampler = VK_NULL_HANDLE;
+            impl_->retiring.emplace_back(e, impl_->recordings + Impl::kRetireAfter, impl_->gpu_uses);
+            t.extra.pop_back();
+            if (t.hcur >= t.hist_count()) t.hcur = 0;
+        }
+    }
     // The bound history keeps whatever this feature left in it; the next
     // feature to record copies its own state over the top, and a feature that
     // is gone has no state to write back.
@@ -2421,11 +2666,12 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
                 it = impl_->features.emplace(temporal->feature, impl_->make_feature()).first;
             // This recording binds this feature over another: the other one's state leaves the bound history
             // into its own image, made now if it never left before.
-            if (impl_->bound_feature && impl_->bound_feature != temporal->feature) {
+            if (!impl_->rotation() && impl_->bound_feature && impl_->bound_feature != temporal->feature) {
                 auto bound = impl_->features.find(impl_->bound_feature);
                 if (bound != impl_->features.end()) impl_->ensure_history(bound->second);
             }
             auto& f = it->second;
+            impl_->select_history(cmd, &f);   // this recording's history pair
             if (!engine && f.estimator_luma.empty()) {
                 std::vector<nrvk::Context::Image> made(kTemporalLevels);
                 try {
@@ -2441,6 +2687,7 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
             }
         } else {
             impl_->unnamed_temporal_used = true;
+            impl_->select_history(cmd, nullptr);
         }
     }
     ControlMaskResult result{};
@@ -2566,16 +2813,20 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
     // What this frame copies through our own images: made now, before the in-place sets below bind them.
     impl_->materialize(cmd, !colour_direct && !plain_direct, !store_direct && !plain_store);
     if (impl_->want_noise) impl_->make_noise(cmd);
-    impl_->switch_history(cmd);   // [Network] History Precision changed: before anything binds the history
+    // [Network] History Precision changed: before anything binds the history (the pair chosen again)
+    if (impl_->switch_history(cmd) && temporal && impl_->temporal.enabled) {
+        auto it = temporal->feature ? impl_->features.find(temporal->feature) : impl_->features.end();
+        impl_->select_history(cmd, it != impl_->features.end() ? &it->second : nullptr);
+    }
     const Impl::DirectSrc* sets = nullptr;
     if (plain_direct)
         sets = impl_->direct_source(frame.image, frame.format, VK_NULL_HANDLE, VK_NULL_HANDLE,
-                                    VK_FORMAT_UNDEFINED, 0, plain_store, VK_NULL_HANDLE, true);
+                                    VK_FORMAT_UNDEFINED, 0, 1, plain_store, VK_NULL_HANDLE, true);
     else if (colour_direct || motion_direct)
         sets = impl_->direct_source(colour_direct ? frame.image : VK_NULL_HANDLE, frame.format,
                                     depth_in_place ? engine->depth.image : VK_NULL_HANDLE,
                                     motion_direct ? engine->motion.image : VK_NULL_HANDLE,
-                                    engine->motion.format, impl_->temporal.hcur, store_direct,
+                                    engine->motion.format, impl_->temporal.hread, impl_->temporal.hwrite, store_direct,
                                     tgt ? tgt->image : VK_NULL_HANDLE);
     if (sets && sets->cview) ds = sets;
     if (!ds) impl_->materialize(cmd, true, true);   // the frame could not be sampled in place: the copies
@@ -2868,7 +3119,23 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
     // Bind this feature's history: copy the previously bound feature's state out
     // and this one's in. Only on a change, so the single-feature case records
     // nothing at all here.
-    if (fs && impl_->bound_feature != temporal->feature) {
+    if (fs && impl_->rotation()) {
+        // no copies - the feature's own image is read where it is; one without history yet reads a cleared one
+        if (t.hfresh) {
+            const nrvk::Context::Image& h = t.hist(t.hread);
+            barrier(cmd, h.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+            VkClearColorValue zero{};
+            VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vkCmdClearColorImage(cmd, h.handle, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+            barrier(cmd, h.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+            fs->cleared = true;
+        }
+        impl_->bound_feature = temporal->feature;
+    } else if (fs && impl_->bound_feature != temporal->feature) {
         if (impl_->bound_feature) {
             auto prev = impl_->features.find(impl_->bound_feature);
             if (prev != impl_->features.end() && prev->second.history.handle) {
@@ -2945,11 +3212,11 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
             else if (!temporal && ds && step.k==impl_->plain_pre) set = ds->pre[0];
             else if (!temporal && ds && step.k==impl_->plain_post) set = ds->post[0];
             else if (temporal && step.k==t.original_pre) {
-                use = t.pingpong ? &t.pre_pp[t.hcur] : &t.pre;
-                if (sets) set = sets->pre[t.hcur];
+                use = t.pingpong ? &impl_->pre_for(t.hread, t.hwrite) : &t.pre;
+                if (sets) set = sets->pre[0];
             } else if (temporal && step.k==t.original_post) {
-                use = !t.pingpong ? &t.post : t.h16 ? &t.post16_pp[t.hcur] : &t.post_pp[t.hcur];
-                if (sets) set = sets->post[t.hcur];
+                use = !t.pingpong ? &t.post : &impl_->post_for(t.hread, t.hwrite, t.h16);
+                if (sets) set = sets->post[0];
             }
             const void* push = step.push;
             // A Style in the post block's push (bits 28-29, set only when the grade pipelines exist): its grade
@@ -2961,8 +3228,7 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
                     if (!set) set = use->set;
                     if (use == impl_->graph_post) use = &impl_->post_grade;
                     else if (use == &t.post) use = &t.post_grade;
-                    else if (use == &t.post_pp[0] || use == &t.post_pp[1]) use = &t.post_grade_pp[use - t.post_pp];
-                    else if (use == &t.post16_pp[0] || use == &t.post16_pp[1]) use = &t.post16_grade_pp[use - t.post16_pp];
+                    else if (nrvk::Kernel* g = impl_->grade_of(use)) use = g;
                     else throw std::runtime_error("Style grade: no grade pipeline for this post block");
                 }
             }
@@ -3006,8 +3272,11 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         // it: reset suppresses consumption, it does not un-write the buffer.
         if (fs) { fs->latch = true; fs->parity ^= 1u; }
         else { t.latch = true; t.parity ^= 1u; }
-        // The post variant wrote this frame's history into the other image.
-        if (t.pingpong) t.hcur ^= 1u;
+        // The post variant wrote this frame's history into the other image (hwrite, now the feature's).
+        if (t.pingpong) {
+            t.hcur = t.hwrite;
+            if (fs && impl_->rotation()) fs->slot = int(t.hwrite);
+        }
         if (history_consumed) *history_consumed = gate;
     }
     impl_->check_record(cmd);
@@ -3133,6 +3402,281 @@ float Runtime::last_gpu_ms() const { return impl_->gpu_ms; }
 float Runtime::average_gpu_ms() const { return impl_->gpu_ms_avg; }
 float Runtime::average_network_ms() const { return impl_->split_timing ? impl_->net_ms_avg : 0.0f; }
 void Runtime::discard_timing() { impl_->timings_recorded = 0; }
+
+// ---- the D3D12 passthrough's network (nr_d3d12_net_plan.hpp) ---------------------------------------------------
+//
+// Runtime::Runtime's model choice and build arguments, and NrSession::build with plan_only (the lowering; no device, no
+// pipelines), for a caller that runs the dispatches itself. Divergences from the constructor, all of them about the
+// Vulkan host this has not got: no device checks or adopt, no pipeline binaries check (ACO Mode is the configured
+// directory alone), no --tex-in-format / --out0-format (the D3D12 side hands the network RGBA32F), no int4 network.
+bool plan_d3d12_network(const std::string& root_in, uint32_t mw, uint32_t mh, bool allow_experimental, D3d12NetPlan* out,
+                        std::string* why, int model_choice, bool rdna3) {
+    try {
+        *out = D3d12NetPlan{};
+        const auto root = std::filesystem::canonical(nr::u8::path(root_in));
+        const auto data = std::filesystem::is_directory(root / "dlssnr-amd") ? root / "dlssnr-amd" : root;
+        if (data == root) { *why = "no dlssnr-amd folder in " + root.string(); return false; }
+        const std::string ini = (data.parent_path() / "dlssnr-amd.ini").string();
+        std::string aco = nr::binary::directory();
+        if (aco.empty()) {
+            *why = "ACO Mode is off" + (nr::binary::disabled_why().empty() ? std::string()
+                                                                           : " (" + nr::binary::disabled_why() + ")");
+            return false;
+        }
+        // RDNA3: the bundle's own rdna3 folder (its stand-ins name their records; the Vulkan runtime's aco_rdna3 layout),
+        // whether or not a Vulkan device of NR's switched the process's ACO folder to it already (use_rdna3)
+        if (rdna3) {
+            if (aco.size() > 6 && aco.compare(aco.size() - 6, 6, "/rdna3") == 0) aco.resize(aco.size() - 6);
+            aco += "/rdna3";
+            std::error_code ec;
+            if (!std::filesystem::is_directory(nr::u8::path(aco + "/records"), ec)) { *why = "the RDNA3 records are missing (" + aco + ")"; return false; }
+        }
+        const auto network_shaders = std::filesystem::path(aco) / "shaders";
+        // The model, as the constructor picks it: DLSSNR_MODEL over dlssnr-amd.ini [Network] Model; none: the small one.
+        NetworkModel network = NetworkModel::Small;
+        bool experimental = false, optimized = false, int4 = false;
+        int level = nr::kLayersQuality;
+        const std::filesystem::path xroot = rdna3 ? std::filesystem::path(aco) / "experimental" : data / "experimental";
+        const std::filesystem::path oroot = rdna3 ? std::filesystem::path(aco) / "optimized" : data / "optimized";
+        std::filesystem::path i4root = data / "int4";
+        // the int4 levels' SPIR-V: i4root's on RDNA4; RDNA3's own stand-ins in aco/rdna3/<level>/shaders (the tables -
+        // vit/, swin/, settings.txt - are i4root's on both, as the Vulkan runtime's i4spv)
+        const auto i4spv = [&] { return rdna3 ? std::filesystem::path(aco) / i4root.filename() / "shaders" : i4root / "shaders"; };
+        std::map<std::string, std::string> int4_cfg;
+        std::string from;
+        {
+            std::string env;
+#ifdef _WIN32
+            { char b[64] = {}; const unsigned long n = GetEnvironmentVariableA("DLSSNR_MODEL", b, sizeof b); if (n && n < sizeof b) env = b; }
+#endif
+            if (env.empty()) if (const char* e = std::getenv("DLSSNR_MODEL")) env = e;
+            const int ev = env.empty() ? -1 : nr::network_value(env);
+            const int iv = model_choice >= 0 || ev >= 0 ? -1 : nr::ini_network(ini);
+            from = model_choice >= 0 ? "caller" : ev >= 0 ? "DLSSNR_MODEL" : iv >= 0 ? "dlssnr-amd.ini" : "default";
+            int v = model_choice >= 0 ? (model_choice == nr::kSmallFp8 ? 1 : model_choice == nr::kSmallFp8Experimental ? 2 : nr::network_optimized(model_choice) ? 3 : 0)
+                                      : (ev >= 0 ? ev : iv);
+            if (v == 0 || v == 3) network = NetworkModel::Original;
+            std::error_code ec;
+            if (v == 3) {
+                const char* missing = !std::filesystem::is_regular_file(oroot / "shaders" / "fixed-attention.txt", ec) ||
+                                      !std::filesystem::is_directory(oroot / "shaders" / "temporal", ec) ? "dlssnr-amd/optimized/ is incomplete"
+                    : !std::filesystem::is_regular_file(data / "CC_SILVER_AARDWOLD_OPTIMIZED.bin", ec)
+                              ? "dlssnr-amd/CC_SILVER_AARDWOLD_OPTIMIZED.bin is missing"
+                    : nullptr;
+                if (missing) {
+                    out->note = std::string("CC_SILVER_AARDWOLD_OPTIMIZED, but ") + missing + ": CC_SILVER_AARDWOLD";
+                    v = 0;
+                } else {
+                    optimized = true;
+                }
+            }
+#if NR_INT4
+            if (optimized) {
+                std::string int4_env;
+#ifdef _WIN32
+                { char b[16] = {}; const unsigned long n = GetEnvironmentVariableA("DLSSNR_INT4", b, sizeof b); if (n && n < sizeof b) int4_env = b; }
+#endif
+                if (int4_env.empty()) if (const char* e = std::getenv("DLSSNR_INT4")) int4_env = e;
+                level = nr::network_optimized(model_choice) ? nr::network_layers(model_choice) : nr::optimized_layers_value(int4_env);
+                if (!nr::network_optimized(model_choice) && int4_env.empty()) {
+                    const int il = nr::ini_optimized_layers(ini);
+                    level = il >= 0 ? il : nr::kLayersDefault;
+                }
+                if (level < 0) level = nr::kLayersQuality;
+                i4root = data / (level == nr::kLayersPerformance ? "int4-performance"
+                                 : level == nr::kLayersUltra ? "int4-ultra" : "int4");
+                const auto i4weights = data / "CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin";
+                if (level >= nr::kLayersBalanced) {
+                    const std::string incomplete = "dlssnr-amd/" + i4root.filename().string() + "/ is incomplete";
+                    const char* missing = !std::filesystem::is_directory(i4spv() / "temporal", ec) || !std::filesystem::is_directory(i4root / "vit", ec) ||
+                                          !std::filesystem::is_regular_file(i4root / "settings.txt", ec) ? incomplete.c_str()
+                        : !std::filesystem::is_regular_file(i4weights, ec) ? "dlssnr-amd/CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin is missing"
+                        : !std::filesystem::is_directory(std::filesystem::path(aco) / "int4/records", ec) ? "the ACO INT4 records are missing"
+                        : nullptr;
+                    if (missing) {
+                        out->note = std::string("optimized layers ") + nr::layers_word(level) + " requested, but " + missing + ": CC_SILVER_AARDWOLD_OPTIMIZED at quality";
+                        level = nr::kLayersQuality;
+                    } else {
+                        int4 = true;
+                        int4_cfg["NR_I4_DIR"] = (i4root / "vit").string();
+                        if (std::filesystem::is_directory(i4root / "swin", ec)) int4_cfg["NR_SWI4_DIR"] = (i4root / "swin").string();
+                        int4_cfg["NR_I4_WEIGHTS"] = i4weights.string();
+                        const auto t = slurp((i4root / "settings.txt").string());
+                        nr::int4_settings(std::string(t.begin(), t.end()), int4_cfg);
+                    }
+                }
+            }
+#endif
+            if (v == 2) {
+                const char* missing = !allow_experimental ? "its kernels have no ACO records"
+                    : !std::filesystem::is_regular_file(xroot / "shaders" / "fixed-attention.txt", ec) ||
+                              !std::filesystem::is_directory(xroot / "shaders" / "temporal", ec) ? "dlssnr-amd/experimental/ is incomplete"
+                    : !std::filesystem::is_regular_file(data / "CC_SMALL_FP8_EXPERIMENTAL.bin", ec)
+                              ? "dlssnr-amd/CC_SMALL_FP8_EXPERIMENTAL.bin is missing"
+                    : nullptr;
+                if (missing) {
+                    out->note = std::string("CC_SMALL_FP8_EXPERIMENTAL, but ") + missing + ": CC_SMALL_FP8";
+                    v = 1;
+                } else {
+                    experimental = true;
+                }
+            }
+            if (network == NetworkModel::Small && !experimental &&
+                !std::filesystem::is_regular_file(data / "CC_SMALL_FP8.bin", ec)) {
+                out->note = "dlssnr-amd/CC_SMALL_FP8.bin is missing: the original model";
+                network = NetworkModel::Original;
+            }
+        }
+        out->model = optimized ? nr::network_label(nr::network_with_layers(nr::kSilverAardwoldOptimized, level))
+                               : network == NetworkModel::Small ? (experimental ? "CC_SMALL_FP8_EXPERIMENTAL" : "CC_SMALL_FP8") : "original";
+        out->model += " (" + from + ")";
+        auto ini_on = [&](const char* key) {
+            std::string v = nr::ini_network_key(ini, key);
+            for (auto& ch : v) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+            return !(v == "0" || v == "false" || v == "off" || v == "no");
+        };
+        out->style_grade = ini_on("style grade");
+        const auto native = make_native_plan(mw, mh, network);
+        std::istringstream plan_stream(native.text);
+        const auto prepared_plan = parse_plan(plan_stream);
+        auto arena_reuse = [] {
+            const char* e = std::getenv("NR_ARENA_REUSE");
+            return e && *e ? std::atoi(e) != 0 : kArenaReuseDefault;
+        };
+        // --lazy-images as the runtime builds: the pre push says "no noise table" until frames keep seed 0 and the table
+        // is made (Runtime::Impl::make_noise; the D3D12 side does the same).
+        std::vector<std::string> arguments = {"nr_runtime", "--plan", "compiled native descriptor",
+            "--unpacked", (data / "model").string(),
+            "--spv-dir", network_shaders.string(),
+            "--host-boundary", arena_reuse() ? "--reuse" : "--no-reuse", "--source-width", std::to_string(mw),
+            "--source-height", std::to_string(mh), "--accumulation", "fp32",
+            "--pipeline-cache", (data / "pipeline.cache").string(), "--lazy-images"};
+        if (experimental || optimized) {
+            for (size_t i = 0; i + 1 < arguments.size(); ++i) {
+                if (arguments[i] == "--spv-dir") arguments[i + 1] = ((experimental ? xroot : oroot) / "shaders").string();
+                if (arguments[i] == "--pipeline-cache") arguments[i + 1] = ((experimental ? xroot : oroot) / "pipeline.cache").string();
+            }
+            arguments.push_back("--spv-dir-aco");
+        }
+        if (int4) {
+            for (size_t i = 0; i + 1 < arguments.size(); ++i) {
+                if (arguments[i] == "--spv-dir") arguments[i + 1] = i4spv().string();
+                if (arguments[i] == "--pipeline-cache") arguments[i + 1] = (i4root / "pipeline.cache").string();
+            }
+        }
+        {
+            const auto pack = data / (experimental ? "CC_SMALL_FP8_EXPERIMENTAL.bin"
+                                      : optimized ? "CC_SILVER_AARDWOLD_OPTIMIZED.bin"
+                                      : network == NetworkModel::Small ? "CC_SMALL_FP8.bin" : "CC_SILVER_AARDWOLD.bin");
+            if (!std::filesystem::is_regular_file(pack)) { *why = "missing " + pack.string(); return false; }
+            arguments.push_back("--model-pack"); arguments.push_back(pack.string());
+            if (optimized && int4 && level >= nr::kLayersPerformance) {
+                arguments.push_back("--model-pack-variant"); arguments.push_back("performance");
+            }
+        }
+        std::vector<char*> argv;
+        for (auto& a : arguments) argv.push_back(a.data());
+        std::lock_guard<std::mutex> lock(build_mutex);
+#if NR_INT4
+        const nr::BuildCfgScope cfg_scope(&int4_cfg);
+#endif
+        NrSession s;
+        s.ctx.rdna3 = rdna3;   // RDNA3's lowering (its FP16 matrices, its packing): the stand-ins' interfaces are its
+        s.plan_only = true;
+        s.weights_out = &out->weights;
+        const int built = s.build(int(argv.size()), argv.data(), &prepared_plan);
+        if (built != 4 || !s.missing.empty() || !s.core) {
+            *why = "the graph's lowering failed (" + std::to_string(built) + (s.missing.empty() ? "" : ", missing files") + ")";
+            return false;
+        }
+        const GraphCore& c = *s.core;
+        out->disp.reserve(c.disp.size());
+        for (size_t i = 0; i < c.disp.size(); ++i) {
+            const Disp& d = c.disp[i];
+            D3d12NetPlan::Dispatch x;
+            x.kern = d.kern; x.gx = d.gx; x.gy = d.gy; x.gz = d.gz; x.push = d.push;
+            x.no_barrier_after = i + 1 < c.disp.size() && i < c.no_barrier_after.size() && c.no_barrier_after[i] != 0;
+            // put_act_address: the arena's address at act_lo (PushVAttn for vitattn, PushGemm for the GEMMs)
+            const size_t gap = int4 ? (d.kern == "vitattn" ? offsetof(PushVAttn, act_lo) : gemm_push_kern(d.kern) ? offsetof(PushGemm, act_lo) : 0) : 0;
+            if (gap && x.push.size() >= gap + 8) { std::memmove(x.push.data() + gap, x.push.data() + gap + 8, x.push.size() - gap - 8); std::memset(x.push.data() + x.push.size() - 8, 0, 8); }
+            else if (d.kern == "vitattn" && d.push.size() >= sizeof(PushVAttn)) x.act_at = int(offsetof(PushVAttn, act_lo));
+            else if (gemm_push_kern(d.kern) && d.push.size() >= sizeof(PushGemm)) x.act_at = int(offsetof(PushGemm, act_lo));
+            out->disp.push_back(std::move(x));
+        }
+        // The temporal path, as Runtime::Runtime sets it up (temporal_config.enable): the ACO bundle's shaders/temporal
+        // (experimental: its own), the no-upper-clamp pre when the graph's pre is fswinimagepreds32nh and the package has
+        // it, the post's Style-grade twin when it exists (else no grading), the RGBA16F history's posts when the folder
+        // has them (and the grade twin where the RGBA32F post has one: the runtime's h16_ok).
+        {
+            auto& t = out->temporal;
+            const bool pre_nh = std::any_of(c.disp.begin(), c.disp.end(), [](const Disp& d) { return d.kern == "fswinimagepreds32nh"; });
+            const std::string pre_name = pre_nh ? "fswinimagepreds32nh" : "fswinimagepreds32";
+            for (size_t i = 0; i < c.disp.size(); ++i) {
+                if (c.disp[i].kern == pre_name && t.pre < 0) t.pre = int(i);
+                if (c.disp[i].kern == "fswinimagepost32") t.post = int(i);
+            }
+            if (t.pre < 0 || t.post < 0) { *why = "the temporal path requires the fused FP32 image kernels"; return false; }
+            if (c.disp[size_t(t.pre)].push.size() != kPrePushBytes) { *why = "temporal pre block: unexpected push size"; return false; }
+            const auto shaders = int4 ? i4spv() / "temporal"
+                               : optimized ? oroot / "shaders" / "temporal"
+                               : experimental ? xroot / "shaders" / "temporal"
+                               : network_shaders / "temporal";
+            std::error_code ec;
+            auto have = [&](const char* name) { return std::filesystem::is_regular_file(shaders / name, ec); };
+            const bool tp_nh = pre_nh && have("temporal_pre_fp32nh.spv");
+            t.pre_spv = (shaders / (tp_nh ? "temporal_pre_fp32nh.spv" : "temporal_pre_fp32.spv")).string();
+            t.post_spv = (shaders / "temporal_post_fp32.spv").string();
+            if (!std::filesystem::is_regular_file(t.pre_spv, ec) || !std::filesystem::is_regular_file(t.post_spv, ec)) {
+                *why = "the temporal shaders are missing in " + shaders.string(); return false;
+            }
+            const bool grade32 = have("temporal_post_fp32_grade.spv");
+            if (grade32) t.post_grade_spv = (shaders / "temporal_post_fp32_grade.spv").string();
+            if (have("temporal_post_fp32h16.spv") && (!grade32 || have("temporal_post_fp32h16_grade.spv"))) {
+                t.post16_spv = (shaders / "temporal_post_fp32h16.spv").string();
+                if (grade32) t.post16_grade_spv = (shaders / "temporal_post_fp32h16_grade.spv").string();
+            }
+            if (!grade32) out->style_grade = false;
+            // [Network] History Precision: 16 (the default) or 32; NR_HIST16 in the environment wins (Runtime::Runtime)
+            {
+                std::string v = nr::ini_network_key(ini, "history precision");
+                for (auto& ch : v) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+                t.history_f16 = !(v == "32" || v == "fp32" || v == "full" || v == "rgba32f");
+                if (const char* e = std::getenv("NR_HIST16")) t.history_f16 = std::atoi(e) != 0;
+            }
+            t.pre_push_bytes = kPrePushBytes;
+            t.seed_at = kPreSeedAt;
+            t.noise_field_at = kPreNoiseFieldAt;
+            t.blend_scale = network == NetworkModel::Small ? kPostBlendScaleSmall : kPostBlendScale;
+            t.motion_without_depth = ini_on("motion without depth");
+        }
+        for (const NoiseJob& j : c.noise) out->noise.push_back({j.off, j.width, j.height, j.seed, j.noise});
+        out->noise_in_buffer = c.noise_in_buffer;
+        if (c.noise_in_buffer) {   // NrSession::noise_bytes: 16 bytes, then every job's table
+            out->noise_bytes = 16;
+            for (const NoiseJob& j : c.noise) out->noise_bytes += uint64_t(j.width) * j.height * 8u;
+        }
+        out->weights_end = c.weights_end;
+        out->act_total = c.act_total;
+        out->spv_dir = c.spv_dir;
+        out->width = mw; out->height = mh;
+        out->work_w = native.width; out->work_h = native.height;
+        // The tail (the records, and the noise table when it is not in a buffer of its own) at weights_end, as retarget
+        // puts it into the network memory.
+        if (out->weights.size() < c.weights_end + c.tail.size()) out->weights.resize(c.weights_end + c.tail.size(), 0);
+        if (!c.tail.empty()) std::memcpy(out->weights.data() + c.weights_end, c.tail.data(), c.tail.size());
+        return true;
+    } catch (const std::exception& e) {
+        *why = e.what();
+        return false;
+    }
+}
+
+void d3d12_net_controls(D3d12NetPlan::Dispatch& d, const D3d12NetControls& c, bool grade) {
+    // Like Vulkan (Runtime::record_all): the post block itself restores the alpha (and the 8-bit rounding) unless the
+    // automatic character mask is on (which writes the mask in .a for the alpha pass).
+    patch_push_controls(d.push, d.kern, c.style, c.intensity, c.local_tone, c.local_structure, c.skin_structure,
+                        c.automatic_mask, !c.automatic_mask, c.round_u8, grade);
+}
 }  // namespace nr
 
 namespace nr { bool Runtime::recordings_done() const { return impl_->gpu_uses.ready(); } }

@@ -695,6 +695,7 @@ struct Menu {
         if (hotkeys_read && now - hotkeys_read < 1000) return hotkeys;
         hotkeys_read = now;
         hotkeys.menu_key = true;
+        hotkeys.pass_opti_key = true;
         hotkeys.taken.clear();
         const std::string path = std::string(nr::pe::module_folder()) + "\\OptiScaler.ini";
         const auto opti_key = [&](const char* key, int def, const char* what) {

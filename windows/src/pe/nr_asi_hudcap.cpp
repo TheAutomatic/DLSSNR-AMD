@@ -19,6 +19,7 @@
 #include "nr_asi_hudcap.hpp"
 #include "nr_hud_capture.hpp"
 #include "nr_pe_log.hpp"
+#include "nr_path_u8.hpp"
 
 #include <MinHook.h>
 
@@ -26,6 +27,7 @@
 #include <cstdlib>
 #include <atomic>
 #include <cstring>
+#include <cwchar>
 #include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
@@ -718,7 +720,7 @@ struct FgState {
     uint64_t at = ~0ull;              // g.presents then (this frame's: the presents so far)
     ID3D12Resource* game = nullptr;
     D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
-    bool copied = false, until_present = false, substitute = false;
+    bool copied = false, until_present = false, substitute = false, hudless = true;
     const char* source = "";
     std::string refused;              // the last one not taken: why
     // a hand-over seen while not armed (HUD FIX in another mode): its time (GetTickCount64), so NR Control can tell
@@ -731,7 +733,7 @@ struct FgState {
 
 // A hand-over of `r` (in `state`; `list`: the game's command list it was made on, null none) by `source`.
 void fg_note(void* caller, ID3D12Resource* r, D3D12_RESOURCE_STATES state, ID3D12GraphicsCommandList* list, bool until_present,
-             bool substitute, const char* source) {
+             bool substitute, const char* source, bool hudless = true) {
     if (!r || t_own) return;
     // While the Present layers run at DLSS-G's evaluate (DLSS-G through NGX) the HUD-less frame frame generation reads
     // is the one that evaluate hands over (Streamline's copy, fg_note_dlssg): the game's own hand-overs (its Streamline
@@ -751,10 +753,11 @@ void fg_note(void* caller, ID3D12Resource* r, D3D12_RESOURCE_STATES state, ID3D1
         return;
     }
     if (!gf.armed.load(std::memory_order_relaxed)) {   // only seen (not during the Present: OptiScaler's own)
-        if (!gf.in_present.load()) gf.offered_ms.store(GetTickCount64());
+        if (!gf.in_present.load() && hudless) gf.offered_ms.store(GetTickCount64());   // (HUD FIX's method: HUD-less ones)
         return;
     }
     std::lock_guard<std::mutex> lk(gf.m);
+    if (!hudless && gf.at == g.presents && gf.game == r) return;   // dispatched from the HUD-less frame it was handed
     // During a Present the hand-overs are OptiScaler's own frame generation's - but not DLSS-G's own (caller null: its
     // evaluate through NGX). The count is the process's: Streamline's presenting thread sits in its Present most of the
     // time while DLSS-G evaluates on another, and most of its HUD-less frames went without NR's change (the generated
@@ -777,6 +780,7 @@ void fg_note(void* caller, ID3D12Resource* r, D3D12_RESOURCE_STATES state, ID3D1
     gf.source = source;
     gf.until_present = until_present;
     gf.substitute = substitute && until_present;
+    gf.hudless = hudless;
     gf.copied = false;
     gf.refused.clear();
     if (list && reinterpret_cast<uintptr_t>(list) > 0xFFFF && gf.list_copies.load()) {   // copied now, on the game's list (XeSS-FG's fake list: 1)
@@ -796,16 +800,70 @@ void fg_note(void* caller, ID3D12Resource* r, D3D12_RESOURCE_STATES state, ID3D1
 
 using PFN_FfxConfigure = int32_t (*)(void*, const FfxHeader*);
 PFN_FfxConfigure real_ffx_configure[3];
+// The caller's module, for the frame-generation lines below.
+std::string module_of(void* address) {
+    HMODULE m = nullptr;
+    wchar_t path[MAX_PATH] = {};
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            static_cast<LPCWSTR>(address), &m) || !m || !GetModuleFileNameW(m, path, MAX_PATH))
+        return "?";
+    const wchar_t* base = std::wcsrchr(path, L'\\');
+    return nr::u8::narrow(base ? base + 1 : path);
+}
+const char* const kFfxLibrary[3] = {"amd_fidelityfx_dx12.dll", "amd_fidelityfx_loader_dx12.dll",
+                                    "amd_fidelityfx_framegeneration_dx12.dll"};
+// The game's last frame-generation configure gave no frame-generation callback: it dispatches frame generation itself
+// (ffx_dispatch takes its presentColor then; through a callback the library dispatches inside its own Present).
+std::atomic<bool> g_ffx_app_dispatch{false};
 template <int I> int32_t ffx_configure(void* ctx, const FfxHeader* desc) {
     for (const FfxHeader* h = desc; h; h = h->next)
         if (h->type == kFfxConfigureFg) {
             const auto* c = reinterpret_cast<const FfxConfigureFg*>(h);
+            if (g_game_caller && g_game_caller(__builtin_return_address(0)))
+                g_ffx_app_dispatch.store(c->enabled && !c->fg_callback);
+            static std::atomic<int> told{0};
+            if (told.fetch_add(1) < 3)   // what the game hands frame generation (how its generated frames are made)
+                log("[nr] frame generation (FSR, %s from %s): configure enabled %d, async %d, swap chain %p, present "
+                    "callback %p, frame-generation callback %p, HUD-less %p (format %u, %ux%u)", kFfxLibrary[I],
+                    module_of(__builtin_return_address(0)).c_str(), c->enabled ? 1 : 0, c->async ? 1 : 0, c->swap_chain,
+                    c->present_callback, c->fg_callback, c->hudless.resource, c->hudless.format, c->hudless.width,
+                    c->hudless.height);
             if (c->enabled && c->hudless.resource)
                 fg_note(__builtin_return_address(0), static_cast<ID3D12Resource*>(c->hudless.resource),
                         d3d12_state_of_ffx(c->hudless.state), nullptr, true, true, "FSR frame generation");
             break;
         }
     return real_ffx_configure[I](ctx, desc);
+}
+// ffxDispatchDescFrameGeneration (ffx_framegeneration.h): a game that runs frame generation itself (no
+// frame-generation callback) records it on the swap chain's interpolation command list, from presentColor
+struct FfxDispatchFg {
+    FfxHeader header;
+    void* command_list;
+    FfxResource present_color;
+    FfxResource outputs[4];
+    uint32_t generated;
+};
+constexpr uint64_t kFfxDispatchFg = 0x00020003u;   // FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION
+using PFN_FfxDispatch = int32_t (*)(void*, const FfxHeader*);
+PFN_FfxDispatch real_ffx_dispatch[3];
+template <int I> int32_t ffx_dispatch(void* ctx, const FfxHeader* desc) {
+    if (desc && desc->type == kFfxDispatchFg) {
+        const auto* d = reinterpret_cast<const FfxDispatchFg*>(desc);
+        static std::atomic<int> told{0};
+        if (told.fetch_add(1) < 3)
+            log("[nr] frame generation (FSR, %s from %s): dispatched by the game on list %p from presentColor %p (format %u, "
+                "%ux%u, state 0x%x) into %p, %u generated", kFfxLibrary[I], module_of(__builtin_return_address(0)).c_str(),
+                d->command_list, d->present_color.resource, d->present_color.format, d->present_color.width,
+                d->present_color.height, d->present_color.state, d->outputs[0].resource, d->generated);
+        // The frame the generated frames are made from, when it is not the back buffer (d3d12_present checks): read when
+        // the swap chain presents, so the Present layers' change is put into it as into a HUD-less frame (fg_delta), or
+        // the generated frames are shown without NR
+        if (d->present_color.resource && g_ffx_app_dispatch.load())
+            fg_note(__builtin_return_address(0), static_cast<ID3D12Resource*>(d->present_color.resource),
+                    d3d12_state_of_ffx(d->present_color.state), nullptr, true, true, "FSR frame generation", false);
+    }
+    return real_ffx_dispatch[I](ctx, desc);
 }
 using PFN_XefgTag = int32_t (*)(void*, ID3D12CommandList*, uint32_t, const XefgResource*);
 PFN_XefgTag real_xefg_tag;
@@ -859,12 +917,15 @@ void fg_hook_libraries() {
     static const wchar_t* const ffx[3] = {L"amd_fidelityfx_dx12.dll", L"amd_fidelityfx_loader_dx12.dll",
                                           L"amd_fidelityfx_framegeneration_dx12.dll"};
     static void* const ffx_detour[3] = {as(&ffx_configure<0>), as(&ffx_configure<1>), as(&ffx_configure<2>)};
+    static void* const ffx_dispatch_detour[3] = {as(&ffx_dispatch<0>), as(&ffx_dispatch<1>), as(&ffx_dispatch<2>)};
     for (int i = 0; i < 3; ++i)
         if (!gf.hooked_ffx[i])
             if (HMODULE m = GetModuleHandleW(ffx[i])) {
                 gf.hooked_ffx[i] = true;
                 if (hook_export(m, "ffxConfigure", ffx_detour[i], reinterpret_cast<void**>(&real_ffx_configure[i])))
                     log("[nr] HUD FIX (frame generation): %ls's ffxConfigure followed", ffx[i]);
+                if (hook_export(m, "ffxDispatch", ffx_dispatch_detour[i], reinterpret_cast<void**>(&real_ffx_dispatch[i])))
+                    log("[nr] frame generation: %ls's ffxDispatch followed", ffx[i]);
             }
     if (!gf.hooked_xefg)
         if (HMODULE m = GetModuleHandleW(L"libxess_fg.dll")) {
@@ -915,6 +976,7 @@ void d3d12_executed(unsigned count, ID3D12CommandList* const* lists) { executed(
 Own::Own() { ++t_own; }
 Own::~Own() { --t_own; }
 void set_game_caller(bool (*game)(void* caller)) { g_game_caller = game; }
+bool ffx_app_dispatch() { return g_ffx_app_dispatch.load(); }
 PresentCall::PresentCall() { ++gf.in_present; }
 PresentCall::~PresentCall() { --gf.in_present; }
 
@@ -957,10 +1019,23 @@ Frame d3d12_present(ID3D12Device* device, IDXGISwapChain* sc, ID3D12CommandQueue
     {   // frame generation's HUD-less frame: this frame's hand-over (since the last Present), and its copy made ready
         std::lock_guard<std::mutex> lk(gf.m);
         if (fg_armed && device) {
-            if (gf.at == g.presents) {
+            bool own_back = false;   // dispatched from the back buffer itself: the layers' change is in it already
+            if (gf.at == g.presents && !gf.hudless && sc) {
+                DXGI_SWAP_CHAIN_DESC d{};
+                if (gf.game == back) own_back = true;
+                else if (SUCCEEDED(sc->GetDesc(&d)))
+                    for (UINT i = 0; i < d.BufferCount && i < 8 && !own_back; ++i) {
+                        ID3D12Resource* b = nullptr;
+                        if (SUCCEEDED(sc->GetBuffer(i, IID_PPV_ARGS(&b))) && b) { own_back = b == gf.game; b->Release(); }
+                    }
+            }
+            if (gf.at == g.presents && !own_back) {
                 f.fg.seen = true;
                 f.fg.copy = gf.copy; f.fg.copied = gf.copied; f.fg.game = gf.game; f.fg.state = gf.state;
-                f.fg.substitute = gf.substitute; f.fg.source = gf.source;
+                f.fg.substitute = gf.substitute; f.fg.source = gf.source; f.fg.hudless = gf.hudless;
+                if (!gf.hudless) f.fg.why = "the game hands its frame generation no HUD-less frame (it is dispatched from a frame of its own)";
+            } else if (own_back) {
+                f.fg.why = "the game's frame generation is dispatched from the back buffer itself";
             } else {
                 f.fg.why = !gf.refused.empty() ? gf.refused : "the game hands its frame generation no HUD-less frame (none this frame)";
             }

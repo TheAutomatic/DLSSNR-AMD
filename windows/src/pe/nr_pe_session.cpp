@@ -44,6 +44,15 @@
 #include <vector>
 
 namespace nr::pe {
+
+// The .asi's D3D12 passthrough is on for this process (set_d3d12_native): what can run is then not decided by
+// the bridge's Vulkan device alone. Turned off again when its canary does not hit (the bridge runs every frame): each
+// session then checks what can run once more (g_native_epoch).
+std::atomic<bool> g_d3d12_native{false};
+std::atomic<uint32_t> g_native_epoch{0};
+void set_d3d12_native(bool on) {
+    if (g_d3d12_native.exchange(on) && !on) ++g_native_epoch;
+}
 namespace {
 
 using nr::pe::log;
@@ -1191,7 +1200,9 @@ struct Session::Impl {
     std::set<int> said_unavailable;
     // What can run in this run, checked once the game's device is known (NetworkSwitch::unavailable).
     bool availability_checked{};
+    uint32_t native_epoch{};   // g_native_epoch when availability was last checked
     void check_availability();
+    void recheck_availability();
     uint32_t build_w{}, build_h{};
     VkFormat build_format{VK_FORMAT_UNDEFINED};
     std::unique_ptr<Runtime> built;
@@ -2245,6 +2256,7 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
     if (last_call - residency_checked >= kResidencyCheck) residency(false, false);
     if (!retired.empty()) free_retired();
     if (cache.size() > kMaxResident) trim_cache();
+    recheck_availability();
     if (!availability_checked) check_availability();
     net_want = wanted_network();
     // Adopt a finished background build first.
@@ -2940,50 +2952,63 @@ bool Session::Impl::carry(VkCommandBuffer cmd, uint64_t feature) {
     return ok;
 }
 
+// The D3D12 passthrough is off again (its canary did not hit): what it ruled out is decided as on the bridge.
+void Session::Impl::recheck_availability() {
+    if (native_epoch == g_native_epoch.load()) return;
+    availability_checked = false;
+}
+
 // What can run in this run, from the files installed, this build and the game's device; a UI shows the reason
 // beside a network that cannot, and the hotkey skips it. A build that falls back later says more (network_note).
 void Session::Impl::check_availability() {
-    if (!handles.device) return;
+    native_epoch = g_native_epoch.load();
+    if (!handles.device && !g_d3d12_native.load()) return;
     availability_checked = true;
     auto exists = [&](const char* rel) {
         const DWORD a = nr::u8::attributes((root + "\\" + rel).c_str());
         return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
     };
+    // CC_SMALL_FP8_EXPERIMENTAL and CC_SILVER_AARDWOLD_OPTIMIZED read their SPIR-V from dlssnr-amd/ (the Linux
+    // network's, RDNA4) and from the ACO bundle's own gfx11 builds on RDNA3 (nr_runtime.cpp): what is installed is
+    // the folder that arch reads.
+    const bool rdna3 = !g_d3d12_native.load() && make_host().rdna3;
+    const char* x_attention = rdna3 ? "dlssnr-amd\\aco\\rdna3\\experimental\\shaders\\fixed-attention.txt"
+                                    : "dlssnr-amd\\experimental\\shaders\\fixed-attention.txt";
+    const char* o_attention = rdna3 ? "dlssnr-amd\\aco\\rdna3\\optimized\\shaders\\fixed-attention.txt"
+                                    : "dlssnr-amd\\optimized\\shaders\\fixed-attention.txt";
     if (!exists("dlssnr-amd\\CC_SMALL_FP8.bin"))
         net_switch.unavailable(nr::kSmallFp8, "needs the model of the 310.9.16 nvngx_dlssnr.dll (install.ps1 -Dll)");
     if (!exists("dlssnr-amd\\CC_SILVER_AARDWOLD.bin"))
         net_switch.unavailable(nr::kSilverAardwold, "the model file is missing (run install.bat again)");
-    if (!exists("dlssnr-amd\\experimental\\shaders\\fixed-attention.txt"))
+    if (!exists(x_attention))
         net_switch.unavailable(nr::kSmallFp8Experimental, "not installed (run install.bat again)");
     else if (!exists("dlssnr-amd\\CC_SMALL_FP8_EXPERIMENTAL.bin"))
         net_switch.unavailable(nr::kSmallFp8Experimental, "needs the model of the 310.9.16 nvngx_dlssnr.dll (install.ps1 -Dll)");
-    else if (make_host().rdna3)
-        net_switch.unavailable(nr::kSmallFp8Experimental, "not on RDNA3 GPUs (RX 7000, Radeon 700M / 800M / 8000S)");
-    else if (nr::binary::directory().empty())
+    else if (!g_d3d12_native.load() && nr::binary::directory().empty())
         net_switch.unavailable(nr::kSmallFp8Experimental, nr::binary::disabled_why().empty()
             ? std::string("needs ACO Mode, which is off for this run")
             : "needs ACO Mode, which is off for this run: " + nr::binary::disabled_why());
-    else if (!nr::binary::enabled(handles.device))
+    else if (!g_d3d12_native.load() && !nr::binary::enabled(handles.device))
         net_switch.unavailable(nr::kSmallFp8Experimental, "the game's device has no pipeline binaries (ACO Mode)");
     // CC_SILVER_AARDWOLD_OPTIMIZED (Quality; ACO Mode only, as CC_SMALL_FP8_EXPERIMENTAL), then its int4 layers on top
     // (Balanced, then Performance, Ultra Performance)
     if (!exists("dlssnr-amd\\CC_SILVER_AARDWOLD.bin"))
         net_switch.unavailable(nr::kSilverAardwoldOptimizedFp8, "the model file is missing (run install.bat again)");
-    else if (!exists("dlssnr-amd\\optimized\\shaders\\fixed-attention.txt"))
+    else if (!exists(o_attention))
         net_switch.unavailable(nr::kSilverAardwoldOptimizedFp8, "not installed (run install.bat again)");
     else if (!exists("dlssnr-amd\\CC_SILVER_AARDWOLD_OPTIMIZED.bin"))
         net_switch.unavailable(nr::kSilverAardwoldOptimizedFp8, "its weights were not made at install (run install.bat again)");
-    else if (make_host().rdna3)
-        net_switch.unavailable(nr::kSilverAardwoldOptimizedFp8, "not on RDNA3 GPUs (RX 7000, Radeon 700M / 800M / 8000S)");
-    else if (nr::binary::directory().empty())
+    else if (!g_d3d12_native.load() && nr::binary::directory().empty())
         net_switch.unavailable(nr::kSilverAardwoldOptimizedFp8, nr::binary::disabled_why().empty()
             ? std::string("needs ACO Mode, which is off for this run")
             : "needs ACO Mode, which is off for this run: " + nr::binary::disabled_why());
-    else if (!nr::binary::enabled(handles.device))
+    else if (!g_d3d12_native.load() && !nr::binary::enabled(handles.device))
         net_switch.unavailable(nr::kSilverAardwoldOptimizedFp8, "the game's device has no pipeline binaries (ACO Mode)");
     if (!net_switch.reason(nr::kSilverAardwoldOptimizedFp8).empty())
         net_switch.unavailable(nr::kSilverAardwoldOptimized, net_switch.reason(nr::kSilverAardwoldOptimizedFp8));
 #if NR_INT4
+    else if (rdna3 && !exists("dlssnr-amd\\aco\\rdna3\\int4\\shaders\\shader-constants.txt"))   // RDNA3: the bundle's gfx11 int4 records
+        net_switch.unavailable(nr::kSilverAardwoldOptimized, "its RDNA3 int4 layers are not installed (run install.bat again)");
     else if (!exists("dlssnr-amd\\int4\\settings.txt"))
         net_switch.unavailable(nr::kSilverAardwoldOptimized, "its int4 layers are not installed (run install.bat again)");
     else if (!exists("dlssnr-amd\\CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin"))
@@ -3956,6 +3981,18 @@ Session::State Session::state() const {
 }
 
 void Session::set_network(int n) { impl_->net_switch.set(n); }
+int Session::frame_network() {
+    auto& m = *impl_;
+    m.recheck_availability();
+    if (!m.availability_checked) m.check_availability();
+    m.net_want = m.wanted_network();
+    return m.net_want;
+}
+
+void Session::set_running_network(int net) {
+    impl_->running_net = net;
+}
+bool Session::history_f16() const { return impl_->net_switch.file().history_f16; }
 
 void Session::idle() {
     auto& m = *impl_;
@@ -4619,6 +4656,7 @@ bool Session::Impl::finish11(Recording11& rec) {
 
 // The RenoDX-style option, shared by every route: the network at the frame's extent on RenoDX's proxy
 // (RGBA16F, the DLL's own composition), ready or building in the background.
+std::atomic<int> g_motion_without_depth_now{-1};
 bool Session::Impl::renodx_runtime(const Controls& controls, uint32_t w, uint32_t h, Controls* c) {
     // The network sees RenoDX's proxy and answers into the stage's own image, one pass: what RenoDX's
     // feature 18 evaluate is. Preprocess runs inside RenoDX's processing (RenoDXFrame::preprocess), not here.
@@ -4630,6 +4668,7 @@ bool Session::Impl::renodx_runtime(const Controls& controls, uint32_t w, uint32_
     c->enabled = true;
     c->apply_model = true;
     const bool ok = ensure_runtime(*c, w, h, VK_FORMAT_R16G16B16A16_SFLOAT);
+    if (ok && runtime) g_motion_without_depth_now = runtime->motion_without_depth() ? 1 : 0;
     return ok && runtime->takes_target(*c);   // the model not applied: the frame stays as it is
 }
 

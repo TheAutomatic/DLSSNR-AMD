@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -80,6 +81,11 @@ std::atomic<bool> g_menu_open{false};
 std::atomic<DWORD> g_watch_thread{0};
 
 bool held() { return g_menu_open.load() && GetCurrentThreadId() != g_watch_thread.load(); }
+// [NRControl] PassOptiScalerKey = 1: OptiScaler's menu key (its OptiScaler.ini [Menu] ShortcutKey, Insert) still
+// reaches the game's window and OptiScaler while NR Control is open, so OptiScaler's menu opens and closes over
+// ours. 0 (default): NR Control keeps every key. The key, or 0 when off; watch() reads both files once a second.
+std::atomic<int> g_pass_vk{0};
+bool passed(int vk) { const int p = g_pass_vk.load(std::memory_order_relaxed); return p != 0 && vk == p; }
 
 BOOL WINAPI clip_cursor(const RECT* r) {
     {
@@ -105,11 +111,16 @@ BOOL WINAPI get_cursor_info(CURSORINFO* ci) {
     if (ok && ci && held()) ci->ptScreenPos = g_frozen;
     return ok;
 }
-SHORT WINAPI get_async_key_state(int vk) { return held() ? 0 : g_real_async(vk); }
-SHORT WINAPI get_key_state(int vk) { return held() ? 0 : g_real_keystate(vk); }
+SHORT WINAPI get_async_key_state(int vk) { return held() && !passed(vk) ? 0 : g_real_async(vk); }
+SHORT WINAPI get_key_state(int vk) { return held() && !passed(vk) ? 0 : g_real_keystate(vk); }
 BOOL WINAPI get_keyboard_state(BYTE* keys) {
     const BOOL ok = g_real_keyboard(keys);
-    if (ok && keys && held()) std::memset(keys, 0, 256);
+    if (ok && keys && held()) {
+        const int p = g_pass_vk.load(std::memory_order_relaxed);
+        const BYTE kept = p > 0 && p < 256 ? keys[p] : 0;
+        std::memset(keys, 0, 256);
+        if (p > 0 && p < 256) keys[p] = kept;
+    }
     return ok;
 }
 UINT WINAPI get_raw_input_data(HRAWINPUT h, UINT command, void* data, UINT* size, UINT header) {
@@ -120,7 +131,7 @@ UINT WINAPI get_raw_input_data(HRAWINPUT h, UINT command, void* data, UINT* size
             in->data.mouse.lLastX = in->data.mouse.lLastY = 0;
             in->data.mouse.usButtonFlags = 0;
             in->data.mouse.usButtonData = 0;
-        } else if (in->header.dwType == RIM_TYPEKEYBOARD) {
+        } else if (in->header.dwType == RIM_TYPEKEYBOARD && !passed(in->data.keyboard.VKey)) {
             in->data.keyboard.VKey = 0xFF;   // no key
             in->data.keyboard.MakeCode = 0;
             in->data.keyboard.Message = 0;
@@ -184,9 +195,14 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             ++s->chars_written;
         }
         if (s->menu_open) {
-            // The menu has the keyboard and mouse: the game's window gets none of it.
-            if (msg == WM_INPUT) return DefWindowProcW(hwnd, msg, wp, lp);
-            if ((msg >= WM_KEYFIRST && msg <= WM_KEYLAST) || (msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST)) return 0;
+            // The menu has the keyboard and mouse: the game's window gets none of it (but OptiScaler's menu key
+            // with PassOptiScalerKey on).
+            const bool pass = (msg == WM_KEYDOWN || msg == WM_KEYUP || msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP) &&
+                              passed(int(wp));
+            if (!pass) {
+                if (msg == WM_INPUT) return DefWindowProcW(hwnd, msg, wp, lp);
+                if ((msg >= WM_KEYFIRST && msg <= WM_KEYLAST) || (msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST)) return 0;
+            }
         }
     }
     return CallWindowProcW(g_previous, hwnd, msg, wp, lp);
@@ -209,9 +225,32 @@ HWND game_window() {
     return f.best;
 }
 
+void read_pass_key() {   // [NRControl] PassOptiScalerKey and OptiScaler's [Menu] ShortcutKey, once a second
+    static ULONGLONG last = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (last && now - last < 1000) return;
+    last = now;
+    const std::string folder = module_folder();
+    char v[32] = {};
+    nr::u8::profile("NRControl", "PassOptiScalerKey", "0", v, sizeof v, folder + "\\dlssnr-amd.ini");
+    int vk = 0;
+    if (std::atoi(v) == 1 || !_stricmp(v, "true")) {
+        char k[32] = {};
+        nr::u8::profile("Menu", "ShortcutKey", "auto", k, sizeof k, folder + "\\OptiScaler.ini");
+        const std::string t = k;
+        vk = t.empty() || t == "auto" ? VK_INSERT : int(std::strtol(t.c_str(), nullptr, 0));
+        if (vk <= 0 || vk >= 256) vk = 0;
+    }
+    if (vk != g_pass_vk.exchange(vk)) {
+        if (vk) log("[nr] NR Control: OptiScaler's menu key (0x%02X) reaches OptiScaler while NR Control is open ([NRControl] PassOptiScalerKey)", vk);
+        else if (last) log("[nr] NR Control: every key stays with NR Control while it is open");
+    }
+}
+
 void watch() {
     g_watch_thread.store(GetCurrentThreadId());
     for (;;) {
+        read_pass_key();
         nr::control::Shared* s = g_shared;
         const bool open = s && s->menu_open != 0;
         if (s && open != g_menu_open.load()) menu_changed(open);

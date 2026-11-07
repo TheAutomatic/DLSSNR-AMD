@@ -33,8 +33,9 @@ graphics cards.
   settings). It loads the network as machine code that was made in advance with Mesa's ACO compiler (the Linux
   driver's compiler) and ships in the package, and comes close to Linux (see [Performance](#performance)); see
   [Windows](#windows).
-- **RX 7000 and Radeon 700M / 800M / 8000S graphics (RDNA3), Windows only, experimental:** `CC_SMALL_FP8` and
-  `CC_SILVER_AARDWOLD`, thanks to [TheAutomatic](https://github.com/TheAutomatic) and
+- **RX 7000 and Radeon 700M / 800M / 8000S graphics (RDNA3), Windows only, experimental:** `CC_SMALL_FP8`,
+  `CC_SMALL_FP8_EXPERIMENTAL`, `CC_SILVER_AARDWOLD` and `CC_SILVER_AARDWOLD_OPTIMIZED` (at Quality), thanks to
+  [TheAutomatic](https://github.com/TheAutomatic) and
   to [mauri870](https://github.com/mauri870), whose
   [DLSSNR-RDNA3](https://github.com/mauri870/DLSSNR-RDNA3) port it builds on. Tried on few machines; expect more
   problems than on RX 9000, and for now it may not match the stability and performance of DLSSNR-RDNA3 (see
@@ -79,8 +80,9 @@ these logs:
 | **Windows** | AMD Software 26.9 or newer | The same features as Linux; close to Linux in speed with ACO's machine code. |
 
 Both need an RX 9000 series (RDNA4) card for every network. On Windows RX 7000 and Radeon 700M / 800M / 8000S
-graphics (RDNA3) run `CC_SMALL_FP8` and `CC_SILVER_AARDWOLD` (experimental); they lack the FP8 matrix
-instructions, and their network runs FP16 in place of FP8. Older cards are not supported.
+graphics (RDNA3) run `CC_SMALL_FP8`, `CC_SMALL_FP8_EXPERIMENTAL`, `CC_SILVER_AARDWOLD` and
+`CC_SILVER_AARDWOLD_OPTIMIZED` at Quality (experimental); they lack the FP8 matrix instructions, and their
+network runs FP16 in place of FP8. Older cards are not supported.
 
 ## Performance
 
@@ -255,8 +257,9 @@ The file itself explains every setting.
 
 `CC_SILVER_AARDWOLD` made faster by this project. Since 0.0.8.3 it replaces `CC_SILVER_AARDWOLD_INT4_MIXED`
 (a `dlssnr-amd.ini`, `--model` or `-Model` that still names that one gets `CC_SILVER_AARDWOLD_OPTIMIZED`); its picture
-is very close to `CC_SILVER_AARDWOLD`'s - much closer than int4 mixed's was - and it is faster. RX 9000 only; on Windows it runs as
-[ACO's machine code](#windows) only.
+is very close to `CC_SILVER_AARDWOLD`'s - much closer than int4 mixed's was - and it is faster. On Windows it runs as
+[ACO's machine code](#windows) only: on RX 9000 at every level, on RX 7000 and Radeon 700M / 800M / 8000S at
+Quality (the int4 levels below are RX 9000's).
 
 How it is made faster, at every level:
 - the Swin blocks' MLPs (all but the first block) use ReLU, their weights fitted to the original network's outputs;
@@ -292,7 +295,7 @@ to `CC_SILVER_AARDWOLD`'s; switching in game builds the network again in the bac
 ## CC_SMALL_FP8_EXPERIMENTAL (optional)
 
 `CC_SMALL_FP8` made faster by this project (see Performance). On Windows it runs as ACO's machine code only, on
-RX 9000. Its Swin blocks (all but the first)
+RX 9000 and RX 7000 / Radeon 700M / 800M / 8000S. Its Swin blocks (all but the first)
 use ReLU as the MLP activation, and some window-attention layers in the decoder use one fixed attention table per layer (no QK^T,
 no softmax) with the V and output projections merged. The weights of the changed layers were fitted to the original
 network's outputs. Its picture differs somewhat from

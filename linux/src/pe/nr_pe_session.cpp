@@ -3542,6 +3542,7 @@ bool Session::run_after(ID3D12Device* device, ID3D12GraphicsCommandList* list,
 
 // The RenoDX-style option, shared by every route: the network at the frame's extent on RenoDX's proxy
 // (RGBA16F, the DLL's own composition), ready or building in the background.
+std::atomic<int> g_motion_without_depth_now{-1};
 bool Session::Impl::renodx_runtime(const Controls& controls, uint32_t w, uint32_t h, Controls* c) {
     // The network sees RenoDX's proxy and answers into the stage's own image, one pass: what RenoDX's
     // feature 18 evaluate is. Preprocess runs inside RenoDX's processing (RenoDXFrame::preprocess), not here.
@@ -3553,6 +3554,7 @@ bool Session::Impl::renodx_runtime(const Controls& controls, uint32_t w, uint32_
     c->enabled = true;
     c->apply_model = true;
     const bool ok = ensure_runtime(*c, w, h, VK_FORMAT_R16G16B16A16_SFLOAT);
+    if (ok && runtime) g_motion_without_depth_now = runtime->motion_without_depth() ? 1 : 0;
     return ok && runtime->takes_target(*c);   // the model not applied: the frame stays as it is
 }
 

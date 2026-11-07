@@ -978,6 +978,7 @@ struct HotkeysMenu {
     bool menu_key = false;              // NR Control's own key ([NRControl] MenuKey; the .asi's menu)
     // keys something else here already uses, and what (OptiScaler's menu key, ReShade's overlay)
     std::vector<std::pair<std::string, std::string>> taken;
+    bool pass_opti_key = false;         // the PassOptiScalerKey box (the .asi's menu, OptiScaler's menu key)
 };
 // A virtual key as dlssnr-amd.ini writes keys ("End", "F7"); empty for one parse_hotkey cannot read.
 inline std::string vk_word(int vk) {
@@ -1093,6 +1094,14 @@ inline void draw_hotkeys(nr::ini_edit::Ini& ini, nr::ini_edit::KeyValues& renodx
             ImGui::PopID();
         }
         ImGui::EndTable();
+    }
+    if (m.pass_opti_key) {
+        bool pass = ini.get("NRControl", "PassOptiScalerKey", "0") == "1";
+        if (ImGui::Checkbox(tr("Pass OptiScaler's menu key through"), &pass)) ini.set("NRControl", "PassOptiScalerKey", pass ? "1" : "0");
+        help("[NRControl] PassOptiScalerKey. On: while NR Control is open, OptiScaler's menu key (Insert, or the key its "
+                "OptiScaler.ini sets) still reaches OptiScaler, so its menu opens and closes without closing this one "
+                "first. Off (default): NR Control keeps every key from the game while it is open. Applied within a "
+                "second.");
     }
 }
 

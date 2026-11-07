@@ -195,6 +195,7 @@ uint64_t config_epoch();
 // [Log], with its comments (read by nr_pe_log.cpp; every route's file carries it).
 // [NRControl] (the OptiScaler route's menu: its key), with its comments.
 void write_nrcontrol(FILE* f);
+void write_d3d12(FILE* f, bool enabled);   // [D3D12Passthrough] (the OptiScaler route)
 void write_log(FILE* f, bool enabled, bool clear);
 // [Debug] of dlssnr-amd.ini in `folder`: every NR_* / DLSSNR_* key set in the process's environment, as if the game
 // had been started with it - the diagnostic switches the code reads from the environment, for players who cannot set

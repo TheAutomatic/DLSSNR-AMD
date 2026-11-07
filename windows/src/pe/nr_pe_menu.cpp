@@ -87,6 +87,8 @@ HMODULE dllModule = nullptr;
 
 namespace nr::pe::menu {
 namespace {
+std::atomic<void (*)()> g_extra_diagnostics{nullptr};   // set_extra_diagnostics
+std::atomic<void (*)()> g_extra_network{nullptr};       // set_extra_network
 using nr::lang::tr;
 using nr::lang::tr_text;
 
@@ -695,6 +697,7 @@ struct Menu {
         if (hotkeys_read && now - hotkeys_read < 1000) return hotkeys;
         hotkeys_read = now;
         hotkeys.menu_key = true;
+        hotkeys.pass_opti_key = true;
         hotkeys.taken.clear();
         const std::string path = std::string(nr::pe::module_folder()) + "\\OptiScaler.ini";
         const auto opti_key = [&](const char* key, int def, const char* what) {
@@ -744,6 +747,7 @@ struct Menu {
         nr::control_ui::draw_diag_package([s] { return diag_request(s); });
         ImGui::Separator();
         nr::control_ui::draw_session_stats();
+        if (auto draw = g_extra_diagnostics.load()) draw();
     }
     // The diagnostic package's request (Diagnostics' button; tests: NR_CONTROL_DIAG_AT)
     static nr::pe::diag::Request diag_request(const nr::control::Shared* s) {
@@ -951,6 +955,7 @@ struct Menu {
             }
             case kNetwork:
                 nr::control_ui::draw_network_options(ini, s, nr::control_ui::NetworkOptions{});
+                if (auto draw = g_extra_network.load()) draw();
                 // What the game hands NR, and who covers what it does not (the DLL's lines, nr_engine_panel.hpp)
                 if (s && s->route && s->panel_lines && !chain_rows(s) && nr::control_ui::section("Engine data")) {
                     nr::control_ui::engine_legend();
@@ -2025,6 +2030,9 @@ void install_now() {
 }
 
 }  // namespace
+
+void set_extra_diagnostics(void (*draw)()) { g_extra_diagnostics = draw; }
+void set_extra_network(void (*draw)()) { g_extra_network = draw; }
 
 void abandon_at_exit() {
     for (auto& [k, v] : g_vulkan) (void)v.release();

@@ -14,6 +14,12 @@ Changes (DLSSNR-AMD):
   v6_pedestal_reduce.cs_5_1.hlsl  (partial 0, 1, ... 255), instead of all four on one thread
   legacy_decode_reduce.cs_5_1.hlsl (new)  the decode and the black-level restore's reduce in one pass, for the frame
                              decoded in place (each thread its 2x2 in the reduce's order, the stored value read back)
+  legacy_decode_up.cs_5_1.hlsl (new)  look_upsample and legacy_decode in one pass where the network runs below the
+                             frame's extent (SDR, no black-level restore): each pixel's N'_up made where the decode
+                             needs it, through the RGBA16F store's rounding, instead of stored and read back
+  v6_resolve_commit_up.cs_5_1.hlsl (new), the same for v6_resolve_commit (HDR, the last pass, no pedestal):
+  v6_common.hlsli            NR_UP_FUSED only - ResolvePixel takes this pixel's P_up / N'_up from the pass;
+                             builds without NR_UP_FUSED are unchanged
 
   v6_common.hlsli          NR_PREP_RESOLVE only: include our prep_resolve.hlsli after DisplayCurveInverse, so the
                              Preprocess Curve=none inverse can match v6_encode's toe/shoulder (or shoulder alone).

@@ -626,7 +626,7 @@ inline FootRow aco_row(const nr::control::Shared* s) {
 inline FootRow path_row(const nr::control::Shared* s) {
     static const char* const kPath[] = {"-", NR_N("Bridge"), NR_N("Vulkan"), "D3D12"};
     const uint32_t p = s ? s->device_path : 0;
-    return {NR_N("Path"), tr(kPath[p < 4 ? p : 0]), false};
+    return {NR_N("Path"), tr(kPath[p < 4 ? p : 0]), p == 3};   // the D3D12 passthrough lit (green), as ACO's "On"
 }
 // The same in words (the Network page, the report): what the network runs on and how the frame gets there
 inline const char* path_text(uint32_t path) {
@@ -1006,6 +1006,7 @@ struct HotkeysMenu {
     bool menu_key = false;              // NR Control's own key ([NRControl] MenuKey; the .asi's menu)
     // keys something else here already uses, and what (OptiScaler's menu key, ReShade's overlay)
     std::vector<std::pair<std::string, std::string>> taken;
+    bool pass_opti_key = false;         // the PassOptiScalerKey box (the .asi's menu, OptiScaler's menu key)
 };
 // A virtual key as dlssnr-amd.ini writes keys ("End", "F7"); empty for one parse_hotkey cannot read.
 inline std::string vk_word(int vk) {
@@ -1121,6 +1122,14 @@ inline void draw_hotkeys(nr::ini_edit::Ini& ini, nr::ini_edit::KeyValues& renodx
             ImGui::PopID();
         }
         ImGui::EndTable();
+    }
+    if (m.pass_opti_key) {
+        bool pass = ini.get("NRControl", "PassOptiScalerKey", "0") == "1";
+        if (ImGui::Checkbox(tr("Pass OptiScaler's menu key through"), &pass)) ini.set("NRControl", "PassOptiScalerKey", pass ? "1" : "0");
+        help("[NRControl] PassOptiScalerKey. On: while NR Control is open, OptiScaler's menu key (Insert, or the key its "
+                "OptiScaler.ini sets) still reaches OptiScaler, so its menu opens and closes without closing this one "
+                "first. Off (default): NR Control keeps every key from the game while it is open. Applied within a "
+                "second.");
     }
 }
 
@@ -1281,7 +1290,13 @@ inline void draw_network_options(nr::ini_edit::Ini& ini, const nr::control::Shar
         help("ACO Mode: the network runs as machine code made in advance by the ACO compiler (the one the Linux version "
              "uses), loaded by the AMD driver. It is not a setting; when the driver cannot take it, the line above and "
              "dlssnr-amd.log say why.");
-        text_dim_wrapped("%s", tr(path_text(s->device_path)));
+        if (s->device_path == 3) {   // the D3D12 passthrough: green, as the footer's Path
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.45f, 0.85f, 0.45f, 1.f));
+            ImGui::TextWrapped("%s", tr(path_text(s->device_path)));
+            ImGui::PopStyleColor();
+        } else {
+            text_dim_wrapped("%s", tr(path_text(s->device_path)));
+        }
     }
     {
         const std::string k = ini.get("Network", "Hotkey", "Ctrl+F11");

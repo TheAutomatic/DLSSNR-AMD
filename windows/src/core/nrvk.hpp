@@ -59,8 +59,8 @@ inline void check(VkResult r, const char* what) {
 }
 #define NRVK_CHECK(expr) ::nrvk::check((expr), #expr)
 // The network the device's architecture runs (nr_gpu_arch.hpp): RDNA4's e4m3 operands go to the FP8 matrix
-// instructions, RDNA3's (gfx11 has none) travel as FP16 through the FP16 ones with FP32 accumulation
-// (windows/shaders/rdna3/include/coopmm.glsl). Context::rdna3 says which; the host lowering (weight packing, the FP16
+// instructions, RDNA3's (gfx11 has none) travel as FP16 through the FP16 ones with FP32 accumulation (its network
+// ships as ACO's machine code, windows/data/aco/rdna3). Context::rdna3 says which; the host lowering (weight packing, the FP16
 // twins) follows it at run time, so one program serves both.
 
 struct Buffer {
