@@ -232,12 +232,23 @@ void pyr1(uvec2 px, bool live) {
         if (lead) {
             vec4 s = vec4(0.0);
             vec2 dn = vec2(0.0);
-            for (uint y = 0u; y < 2u; ++y)
-                for (uint x = 0u; x < 2u; ++x) {
-                    if (any(greaterThanEqual(px + uvec2(x, y), pc.size))) continue;
-                    s += s_pp[li + y * 16u + x];
-                    if (i == 0u && depth) dn += s_dp[li + y * 16u + x];
+            // Keep the same 2x2 addition order and edge mask without nested loops/continue.
+            // After SPIRV-Cross, FXC treats that varying loop exit as making the outer
+            // slot loop divergent and rejects its group barriers (X3663).
+            s += s_pp[li];
+            if (i == 0u && depth) dn += s_dp[li];
+            if (px.x + 1u < pc.size.x) {
+                s += s_pp[li + 1u];
+                if (i == 0u && depth) dn += s_dp[li + 1u];
+            }
+            if (px.y + 1u < pc.size.y) {
+                s += s_pp[li + 16u];
+                if (i == 0u && depth) dn += s_dp[li + 16u];
+                if (px.x + 1u < pc.size.x) {
+                    s += s_pp[li + 17u];
+                    if (i == 0u && depth) dn += s_dp[li + 17u];
                 }
+            }
             const ivec2 d = ip / 2;
             imageStore(L1Out, ivec2(uint(d.x) + i * dw, d.y), s * 0.25);
             if (i == 0u && depth) imageStore(DP1Out, d, vec4(dn * 0.25, 0.0, 0.0));
