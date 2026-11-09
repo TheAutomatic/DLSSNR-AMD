@@ -12,7 +12,7 @@ namespace nr {
 // CC_SMALL_FP8_EXPERIMENTAL and CC_SILVER_AARDWOLD_OPTIMIZED are ours, not the DLL's: the small model and the 310.8
 // model made faster (ReLU, fixed attention on some decoder layers, ...), their weights fitted from the model's at
 // install. CC_SILVER_AARDWOLD_OPTIMIZED runs at one of four levels of its optimized layers ([Network] OptimizedLayers:
-// Quality, Balanced, Performance, Ultra Performance; RX 9000): four networks here (each built, kept and switched to as a
+// Quality, Balanced, Performance, Ultra Performance; RX 9000 and RX 7000): four networks here (each built, kept and switched to as a
 // network), one in the lists. Quality: none of its layers in int4 (kSilverAardwoldOptimizedFp8); Balanced: some of them (kSilverAardwoldOptimized, int4/); Performance: Balanced with fixed attention on the first full-resolution
 // layers (kSilverAardwoldOptimizedPerformance, int4-performance/); Ultra Performance, the default: Performance with more
 // int4 layers (kSilverAardwoldOptimizedUltra, int4-ultra/). One FP8 pack for the four (CC_SILVER_AARDWOLD_OPTIMIZED.bin; Performance and

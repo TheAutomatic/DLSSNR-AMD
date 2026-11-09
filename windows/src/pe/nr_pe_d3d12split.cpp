@@ -1608,7 +1608,17 @@ std::shared_ptr<nr::gpu::Recording> book(ID3D12CommandList* list) {
 bool completed(const std::shared_ptr<nr::gpu::Recording>& rec) {
     if (!rec) return false;                 // unknown is not complete
     std::lock_guard<std::recursive_mutex> guard(g_mutex);
-    return rec->strict_ready();
+    if (rec->strict_ready()) return true;
+    // A list kept without Reset after it ran (Recording::quiet_ready): finished, or every slot, stage and resource it
+    // used waits for it forever. Said a few times, so a log shows the game keeps its lists this way.
+    if (!rec->quiet_ready()) return false;
+    static int said = 0;
+    if (said < 3) {
+        ++said;
+        log("[nr] D3D12 passthrough: a recorded command list ran and finished but was not reset for 2 s (%s); taken as "
+            "finished", rec->sealed ? "sealed" : rec->ever_submitted ? "executed, kept by the game" : "never executed");
+    }
+    return true;
 }
 
 void note_execution(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists) {

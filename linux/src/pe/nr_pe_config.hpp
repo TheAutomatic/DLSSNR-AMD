@@ -2,6 +2,7 @@
 #include "nr_runtime.hpp"
 #include "nr_renodx.hpp"
 #include "nr_ini_network.hpp"
+#include "nr_control_shared.hpp"
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -165,6 +166,8 @@ struct HudFixConfig {
                          // FSR FG, XeSS FG), 3 captured before the HUD is drawn, 4 estimated (screen-fixed pixels while
                          // the picture moves)
     bool show_mask = false;   // ShowMask: the HUD's alpha shown (white = HUD, kept as the game drew it)
+    bool estimated_asked = false;   // Mode = estimated while Estimated is switched off (nr::control::kHudEstimated):
+                                    // `mode` is 0 then
 };
 
 struct ChainConfig {
@@ -279,7 +282,8 @@ struct Config {
     uint32_t downscale = 0;       // Downscale below 100 %: 0 area after encoding, 1 bilinear before encoding
     // Passes (fast) on a wilsjo2 layer (PassesMode, FastMethod, Fast<Method>Passes / HaloLimit / Fine, FastEditStrength)
     uint32_t passes_mode = 0;     // 0 legacy, 1 fast
-    uint32_t fast_method = 0;     // 0 Extrapolation, 1 Feedback, 2 Hybrid, 3 Edit strength
+    uint32_t fast_method = 1;     // as NRFastMethod: 0 Interleaved, 1 Extrapolation (default), 2 Feedback, 3 Hybrid, 4 Edit strength
+    uint32_t fast_interleaved_passes = 3;   // FastInterleavedPasses 2..8
     // each method's own: [0] Extrapolation, [1] Feedback, [2] Hybrid
     float fast_passes[3] = {3.0f, 3.0f, 3.0f};       // 1..8
     bool fast_halo_limit[3] = {false, false, false};

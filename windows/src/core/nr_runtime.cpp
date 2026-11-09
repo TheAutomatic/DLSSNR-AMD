@@ -2477,6 +2477,7 @@ int Runtime::layers() const { return impl_->layers; }
 #endif
 
 void Runtime::set_style_grade(bool on) { impl_->style_grade_on = on; }
+bool Runtime::style_grade_active() const { return impl_->style_grade && impl_->style_grade_on; }
 void Runtime::set_history_f16(bool on) { if (!std::getenv("NR_HIST16")) impl_->temporal.h16_want = on; }
 
 void Runtime::set_history_strength(float v) {
@@ -3185,6 +3186,25 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         impl_->bound_feature = temporal->feature;
         }
     }
+    // EngineFrame::history: the caller's history for this run, into the image this recording reads.
+    if (engine && engine->history.image && fs && gate) {
+        nrvk::Context::Image& dst = t.hist(impl_->rotation() ? t.hread : t.hcur);
+        auto& s = impl_->session;
+        barrier(cmd, engine->history.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        barrier(cmd, dst.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_ACCESS_TRANSFER_WRITE_BIT);
+        VkImageBlit b{};
+        b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        b.srcOffsets[1] = {int32_t(engine->history.width), int32_t(engine->history.height), 1};
+        b.dstOffsets[1] = {int32_t(dst.w), int32_t(dst.h), 1};
+        nrvk::blit(s.ctx.physical, s.ctx.device, cmd, engine->history.image, engine->history.format, VK_IMAGE_LAYOUT_GENERAL,
+                   dst.handle, dst.format, VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_NEAREST);
+        barrier(cmd, dst.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    }
     // The pass (one: a caller stacks passes as runs of its own).
     for (uint32_t pass = 0; pass < passes; ++pass) {
         ColourFrame shot_in{}, shot_out{};
@@ -3672,10 +3692,11 @@ bool plan_d3d12_network(const std::string& root_in, uint32_t mw, uint32_t mh, bo
 }
 
 void d3d12_net_controls(D3d12NetPlan::Dispatch& d, const D3d12NetControls& c, bool grade) {
-    // Like Vulkan (Runtime::record_all): the post block itself restores the alpha (and the 8-bit rounding) unless the
-    // automatic character mask is on (which writes the mask in .a for the alpha pass).
+    // As Runtime::record_all: the post block itself restores the alpha (and the 8-bit rounding) - the automatic
+    // character mask only steers the pre block (its skin / background push); no separate alpha pass (that one is the
+    // Vulkan runtime's for an external control mask, which the D3D12 passthrough has none of).
     patch_push_controls(d.push, d.kern, c.style, c.intensity, c.local_tone, c.local_structure, c.skin_structure,
-                        c.automatic_mask, !c.automatic_mask, c.round_u8, grade);
+                        c.automatic_mask, true, c.round_u8, grade);
 }
 }  // namespace nr
 

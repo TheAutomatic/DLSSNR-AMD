@@ -16,9 +16,9 @@
 #include <d3d12.h>
 #include <dxgi1_6.h>
 
-#include "nr_d3d12_asd.hpp"
-#include "nr_d3d12_asd_backend.hpp"
-#include "nr_d3d12_asd_net.hpp"
+#include "nr_d3d12_passthrough.hpp"
+#include "nr_d3d12_passthrough_backend.hpp"
+#include "nr_d3d12_passthrough_net.hpp"
 #include "nr_d3d12_net_plan.hpp"
 #include "nr_dlssnr_model.hpp"
 #include "nr_ini_network.hpp"
@@ -184,17 +184,17 @@ int main(int argc, char** argv) {
     nr::dlssnr::keep_caller_state();
 
     if (!vulkan_bridge) {
-        nr::pe::asd::start();
-        if (!nr::pe::asd::enabled()) {
-            std::printf("FAIL: nr::pe::asd::enabled() is false\n");
+        nr::pe::d3d12_passthrough::start();
+        if (!nr::pe::d3d12_passthrough::enabled()) {
+            std::printf("FAIL: nr::pe::d3d12_passthrough::enabled() is false\n");
             return 1;
         }
-        nr::pe::asd::set_net_planner(
+        nr::pe::d3d12_passthrough::set_net_planner(
             [](uint32_t w, uint32_t h, int model, bool experimental, nr::D3d12NetPlan* out, std::string* why) {
                 return nr::plan_d3d12_network(nr::pe::module_folder(), w, h, experimental, out, why, model);
             },
             &nr::d3d12_net_controls, &query_model);
-        nr::dlssnr::set_d3d12_backend(&nr::pe::asd::evaluate_backend);
+        nr::dlssnr::set_d3d12_backend(&nr::pe::d3d12_passthrough::evaluate_backend);
         nr::pe::set_d3d12_native(true);
     }
 
@@ -268,11 +268,12 @@ int main(int argc, char** argv) {
     }
 
     if (!vulkan_bridge) {
-        nr::pe::asd::on_device(device);
-        for (int i = 0; i < 100 && nr::pe::asd::canary() == nr::pe::asd::Canary::kRunning; ++i) Sleep(20);
-        std::printf("Canary: %s (%s)\n", nr::pe::asd::canary_name(nr::pe::asd::canary()),
-                    nr::pe::asd::status().canary.c_str());
-        if (nr::pe::asd::canary() != nr::pe::asd::Canary::kHit) {
+        nr::pe::d3d12_passthrough::on_device(device);
+        namespace pt = nr::pe::d3d12_passthrough;
+        for (int i = 0; i < 100 && pt::canary() == pt::Canary::kRunning; ++i) Sleep(20);
+        std::printf("Canary: %s (%s)\n", nr::pe::d3d12_passthrough::canary_name(nr::pe::d3d12_passthrough::canary()),
+                    nr::pe::d3d12_passthrough::status().canary.c_str());
+        if (nr::pe::d3d12_passthrough::canary() != nr::pe::d3d12_passthrough::Canary::kHit) {
             std::printf("FAIL: Canary did not hit!\n");
             return 1;
         }
@@ -558,7 +559,7 @@ int main(int argc, char** argv) {
             vk_net_ms = s.network_ms();
         });
     } else {
-        const auto ns = nr::pe::asd::backend_net_status();
+        const auto ns = nr::pe::d3d12_passthrough::backend_net_status();
         vk_stage_ms = ns.stage_ms;
         vk_net_ms = ns.gpu_ms;
     }

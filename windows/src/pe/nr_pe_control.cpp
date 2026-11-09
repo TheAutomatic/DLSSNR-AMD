@@ -454,8 +454,10 @@ void report(const Status& st) {
         r->nr_width = st.nr_width; r->nr_height = st.nr_height;
         r->passes = st.passes;
         r->fast_passes = st.fast_passes; r->motion = st.motion;
-        if (r->state == 1u && st.fast_fallback)
-            std::snprintf(r->note, sizeof r->note, "%s", NR_N("Extrapolation: no motion vectors"));
+        if (r->state == 1u && st.il_missing)
+            std::snprintf(r->note, sizeof r->note, "%s", nr::control::il_missing_note(st.il_missing));
+        else if (r->state == 1u && st.fast_fallback)
+            std::snprintf(r->note, sizeof r->note, "%s", nr::control::fast_fallback_note(st.fast_fallback_spatial));
         r->gpu_ms = st.gpu_ms; r->network_ms = st.network_ms;
         r->updated = uint32_t(now);
         nr::pe::events::layer_state(st.layer, r->state, r->note);

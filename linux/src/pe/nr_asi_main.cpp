@@ -1007,6 +1007,17 @@ bool clone_of(ID3D12Device* device, ID3D12Resource*& clone, ID3D12Resource* sour
     return true;
 }
 
+// Before copying a game's guides at its evaluate: a full barrier (aliasing, no resources). The states we assume for
+// them are a guess (OptiScaler's DepthResourceBarrier; a game may leave them as it wrote them), and with only the
+// transitions the depth copy took some tiles before the game's last write to it had landed - runs of one game differed,
+// those tiles holding last frame's depth (a test game under vkd3d-proton; with the full barrier: identical).
+// It waits for ALL of the queue's earlier GPU work: only where a depth copy is made (capture_guides: depth_wanted).
+void guide_copy_barrier(ID3D12GraphicsCommandList* cmd) {
+    D3D12_RESOURCE_BARRIER ab{};
+    ab.Type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
+    cmd->ResourceBarrier(1, &ab);
+}
+
 // The source metadata and guide textures belong to the held input, not the live game's next frame.
 bool hold_inputs(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, HoldCopy& h,
                  Frame& f, States& st, nr::asi::Wilsjo2Frame& wf) {
@@ -1018,6 +1029,7 @@ bool hold_inputs(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, HoldCopy&
         // Allocate the complete set before recording any copy.
         for (int i = 0; i < 3; ++i)
             if (src[i] && !clone_of(device, h.guides[i], src[i])) { h.held = false; return false; }
+        guide_copy_barrier(cmd);
         for (int i = 0; i < 3; ++i) if (src[i]) {
             transition(cmd, src[i], from[i], D3D12_RESOURCE_STATE_COPY_SOURCE);
             cmd->CopyResource(h.guides[i], src[i]);
@@ -1049,6 +1061,7 @@ void late_capture(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, const Fr
     }
     const std::pair<ID3D12Resource*, std::pair<ID3D12Resource*, D3D12_RESOURCE_STATES>> pairs[2] = {
         {g_late.depth, {f.depth, st.depth}}, {g_late.motion, {f.motion, st.motion}}};
+    guide_copy_barrier(cmd);
     for (const auto& pr : pairs) {
         transition(cmd, pr.second.first, pr.second.second, D3D12_RESOURCE_STATE_COPY_SOURCE);
         cmd->CopyResource(pr.first, pr.second.first);
@@ -1242,22 +1255,29 @@ struct PresentPath {
     ID3D12GraphicsCommandList* list = nullptr;
     ID3D12Fence* fence = nullptr;
     uint64_t submitted = 0, slot_value[kPresentRing] = {};
+    // HUD FIX's chain capture: its HUD count copied out by the slot's list (READBACK, 512 bytes a slot) and the image
+    // whose copy it was checking (0: none in that slot)
+    ID3D12Resource* hud_rb = nullptr;
+    uint64_t hud_rb_image[kPresentRing] = {};
+    uint32_t hud_rb_total[kPresentRing] = {};
     HANDLE event = nullptr;
     bool slot_wait_off = false;
     ID3D12Resource* target = nullptr;          // the back buffer's copy NR runs on, in place
     D3D12_RESOURCE_STATES target_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     // wilsjo2's HDR10 finished picture: the linear BT.709 copy it runs on and the re-encoded one (UNORDERED_ACCESS)
     ID3D12Resource *linear = nullptr, *encoded = nullptr;
-    // HUD FIX (wilsjo2_hudfix.comp): the frame before the layers, the last one (the estimate's), the HUD's alpha and
-    // confidence (R16G16B16A16_FLOAT), the counts and the estimate's tile flags (R32_UINT, hud_stats_size);
+    // HUD FIX (hudfix.comp): the frame before the layers, the last one (the estimate's), the HUD's alpha and
+    // confidence (R16G16B16A16_FLOAT), counts and HUD colours (R32_UINT, hud_stats_w / _h);
     // UNORDERED_ACCESS between uses
     ID3D12Resource *hud_back = nullptr, *hud_prev = nullptr, *hud_alpha = nullptr, *hud_stats = nullptr;
+    ID3D12Resource* hud_ui = nullptr; // typed copy of the game's authored UI; UNORDERED_ACCESS between uses
+    D3D12_RESOURCE_STATES hud_ui_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    int hud_ui_report = -1;
     D3D12_RESOURCE_STATES hud_back_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                           hud_prev_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                           hud_alpha_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                           hud_stats_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     bool hud_prev_valid = false, hud_fresh = true, hud_said = false;
-    uint32_t hud_parity = 0;
     // frame generation's HUD-less frame with the layers' change (present_layers' fg_delta): the frame before the layers
     // (when HUD FIX keeps none), the result, an alpha of 0 (R16G16B16A16_FLOAT, zero at creation); UNORDERED_ACCESS
     ID3D12Resource *fg_pre = nullptr, *fg_out = nullptr, *fg_zero = nullptr;
@@ -1309,15 +1329,15 @@ bool aspect_matches(uint32_t sw, uint32_t sh, uint32_t tw, uint32_t th) {   // p
 }
 
 bool present_layer(const Layer& l) { return l.cfg.placement == nr::pe::Placement::kPresent; }
-// HUD FIX's counts image (wilsjo2_hudfix.comp): its counts in row 0, a texel an 8 x 8 tile below
-uint32_t hud_stats_w(uint32_t w) { return std::max(4u, (w + 7) / 8); }
-uint32_t hud_stats_h(uint32_t h) { return 1 + 2 * ((h + 7) / 8); }   // two tile-flag sets
+// HUD FIX's counts image (hudfix.comp): its counts in row 0, the estimate's HUD colours below (a texel a pixel)
+uint32_t hud_stats_w(uint32_t w) { return std::max(4u, w); }
+uint32_t hud_stats_h(uint32_t h) { return 1 + h; }
 
 // HUD FIX's line for NR Control (nr_pe_control.hpp hud_facts), from a Present that reached its layers (`layers`: some
 // run there). `follows`: the capture follows this API (D3D12, D3D11, Vulkan); `captured` this frame, else `why` not.
 void hud_report(bool layers, bool follows = false, bool captured = false, const std::string& why = std::string(),
                 bool fg_api = false, bool fg = false, const std::string& fg_why = std::string(), const char* fg_source = "",
-                bool broken = false, bool fg_offered = false, int capture_ok = -1) {
+                bool broken = false, bool fg_offered = false, int capture_ok = -1, const char* how = nullptr) {
     const bool d3d12 = follows;
     // greyed while it cannot run: frame generation's HUD-less frame not handed over for 2 s; the capture's hooks failed.
     // Hand-overs are followed in every mode (fg_offered while not armed), so the menu shows what can run before a
@@ -1348,16 +1368,27 @@ void hud_report(bool layers, bool follows = false, bool captured = false, const 
     }
     const char* const no_game = NR_N("frame generation's HUD-less frame is read for D3D12 games only");
     const char* const no_capture = NR_N("the capture before the HUD does not follow this game's API");
-    std::string now = mode == 0 ? NR_N("off")
+    const bool estimated_off = c && c->hud.estimated_asked;
+    std::string now = estimated_off ? NR_N("off: Estimated is switched off in this version")
+                      : mode == 0 ? NR_N("off")
                       : !layers ? NR_N("nothing: no layer runs at Present")
                       : mode == 4 ? NR_N("estimated")
                       : fg && (mode == 1 || mode == 2) ? std::string(NR_N("frame generation's HUD-less frame (")) + fg_source + ")"
                       : mode == 2 ? (fg_api ? NR_N("nothing this frame: ") + fg_why : std::string(NR_N("nothing: ")) + no_game)
-                      : captured  ? NR_N("captured before the HUD")
-                      : mode == 1 ? (d3d12 ? NR_N("estimated (captured: ") + why + ")" : std::string(NR_N("estimated")))
+                      : captured  ? std::string(how ? how : NR_N("captured before the HUD"))
+                      : mode == 1 && nr::control::kHudEstimated
+                          ? (d3d12 ? NR_N("estimated (captured: ") + why + ")" : std::string(NR_N("estimated")))
+                      : mode == 1 ? (d3d12 ? NR_N("nothing this frame: ") + why : std::string(NR_N("nothing: ")) + no_capture)
                       : d3d12     ? NR_N("nothing this frame: ") + why : std::string(NR_N("nothing: ")) + no_capture;
-    static std::string said;   // the log: its changes, the first 40
+    static std::string said;
     static int changes = 0;
+    static uint32_t logged_mode=~0u;
+    if (logged_mode!=mode) {
+        static const char* modes[]={"off","auto","game","captured","estimated"};
+        log("[nr] HUD FIX mode: %s",mode<5 ? modes[mode] : "unknown");
+        logged_mode=mode;
+        said.clear(); changes=0; // Each selected mode needs its own actual-source status, even after startup chatter.
+    }
     if (now != said && changes < 40) {
         ++changes;
         log("[nr] HUD FIX now: %s%s", now.c_str(), changes == 40 ? " (further changes not logged)" : "");
@@ -1432,6 +1463,9 @@ void capture_guides(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, const 
     }
     const std::pair<ID3D12Resource*, std::pair<ID3D12Resource*, D3D12_RESOURCE_STATES>> pairs[2] = {
         {target->depth, {f.depth, st.depth}}, {target->motion, {f.motion, st.motion}}};
+    // (the full barrier only where the depth is copied - the race it closes was the depth's; a motion-only copy, the
+    // usual Present layer (Motion Without Depth), takes the transitions alone, as 0.0.8.3: no GPU-wide wait a frame)
+    if (depth_wanted) guide_copy_barrier(cmd);
     for (const auto& pr : pairs) {
         if (!pr.first) continue;
         transition(cmd, pr.second.first, pr.second.second, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -1455,7 +1489,7 @@ void capture_guides(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, const 
 // After every ExecuteCommandLists (nr_pe_menu.hpp on_execute): a guide set recorded on one of these lists is submitted
 // on this queue; our fence on it is signalled after them, so a Present on another queue can tell when they ran.
 void on_execute(ID3D12CommandQueue* queue, unsigned count, ID3D12CommandList* const* lists) {
-    nr::asi::hudcap::d3d12_executed(count, lists);   // HUD FIX's capture: the writes in the GPU's order
+    nr::asi::hudcap::d3d12_executed(count, lists, queue);   // HUD FIX's capture: the writes in the GPU's order
     std::lock_guard<std::mutex> guard(g_capture_lock);
     bool any = false;
     for (GuideSet& s : g_present.sets) {
@@ -1481,7 +1515,7 @@ void on_execute(ID3D12CommandQueue* queue, unsigned count, ID3D12CommandList* co
     tracker.first->AddRef();
     const auto fence = std::shared_ptr<ID3D12Fence>(tracker.first, [](ID3D12Fence* f) { f->Release(); });
     for (const auto& t : tickets) {
-        if (signalled) t->submitted([fence, value] { return fence->GetCompletedValue() >= value; });
+        if (signalled) t->submitted([fence, value] { const auto done=fence->GetCompletedValue(); return done!=UINT64_MAX && done>=value; });
         else t->submitted({});
     }
     for (GuideSet& s : g_present.sets)
@@ -1536,6 +1570,8 @@ bool ensure_ring(ID3D12Device* device) {
     if (g_present.list) { g_present.list->Release(); g_present.list = nullptr; }
     for (auto*& a : g_present.allocators) if (a) { a->Release(); a = nullptr; }
     if (g_present.fence) { g_present.fence->Release(); g_present.fence = nullptr; }
+    if (g_present.hud_rb) { g_present.hud_rb->Release(); g_present.hud_rb = nullptr; }
+    for (auto& v : g_present.hud_rb_image) v = 0;
     g_present.device = nullptr;
     for (auto*& a : g_present.allocators)
         if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&a)))) return false;
@@ -1858,6 +1894,7 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
     g_present.served_ms = GetTickCount64();   // a Present of the game's reached its layers (evaluates: Present is alive)
     // HUD FIX's capture (nr_asi_hudcap.hpp): armed for Auto and Captured, its verdict on this frame
     const uint32_t hud_mode = chain->hud.mode;
+    nr::asi::hudcap::set_capture_wanted(hud_mode == 1 || hud_mode == 3);   // (its view bookkeeping: only then)
     // and frame generation's HUD-less frame (Auto's first choice, Game): what the game handed it this frame
     const nr::asi::hudcap::Frame hud_cap = nr::asi::hudcap::d3d12_present(
         device, sc, queue, back, format, w, h, !runs.empty() && (hud_mode == 1 || hud_mode == 3),
@@ -1866,9 +1903,13 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
     const bool hud_fg = hud_cap.fg.seen && hud_cap.fg.copy && hud_cap.fg.hudless && (hud_mode == 1 || hud_mode == 2);
     const bool hud_captured = hud_fg || (hud_cap.result == nr::asi::hudcap::Result::kCaptured && hud_cap.hudless);
     ID3D12Resource* const hud_hudless = hud_fg ? hud_cap.fg.copy : hud_cap.hudless;
+    // (the chain capture: the copy of the final pass's input; until it is trusted the layers run on the frame itself and
+    // the copy only says where the HUD is - source 5)
+    const bool hud_chain_check = hud_captured && !hud_fg && hud_cap.chain;   // (checked on the GPU every frame: source 5 / 6)
     hud_report(!runs.empty(), true, hud_captured && !hud_fg, hud_cap.why, true, hud_fg, hud_cap.fg.why, hud_cap.fg.source,
                hud_cap.broken, hud_cap.fg.offered || (hud_cap.fg.seen && hud_cap.fg.hudless),
-               hud_cap.result == nr::asi::hudcap::Result::kCaptured && hud_cap.hudless);
+               hud_cap.result == nr::asi::hudcap::Result::kCaptured && hud_cap.hudless,
+               !hud_cap.chain || hud_fg ? nullptr : NR_N("captured: the final pass's input"));
     if (runs.empty()) return;
     // Frame generation (present_path.hpp RunPresentPath): a matching DLSS-G declaration is authoritative; without one
     // the cadence of presents against fresh captures, over windows (nr_present_cadence.hpp)
@@ -1943,6 +1984,19 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
         }
     }
     if (!at) g_present.slot_wait_off = false;
+    // HUD FIX's chain capture: the count this slot's last list read back (the slot is free: its list is done)
+    if (!at && g_present.hud_rb && g_present.hud_rb_image[slot] && g_present.fence->GetCompletedValue() >= g_present.slot_value[slot]) {
+        const D3D12_RANGE range{size_t(slot) * 512, size_t(slot) * 512 + 16};
+        void* mapped = nullptr;
+        if (SUCCEEDED(g_present.hud_rb->Map(0, &range, &mapped)) && mapped) {
+            uint32_t counts[4];
+            std::memcpy(counts, static_cast<const uint8_t*>(mapped) + size_t(slot) * 512, sizeof counts);
+            const D3D12_RANGE none{0, 0};
+            g_present.hud_rb->Unmap(0, &none);
+            nr::asi::hudcap::chain_checked(g_present.hud_rb_image[slot], counts[0], g_present.hud_rb_total[slot]);
+        }
+        g_present.hud_rb_image[slot] = 0;
+    }
     // Which guide sets this Present may read: submitted and ordered before it (on its queue, or complete on another)
     bool ordered[kD12GuideSets] = {};
     {
@@ -1966,6 +2020,7 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
         nr::gpu::reset(l);
     }
     nr::gpu::Scope recording(nr::asi::hudcap::d3d12_recording(l));
+    nr::asi::hudcap::d3d12_use_chain(hud_cap);
     g_d12_uses.touch();
     // The first layer, a RenoDX one, reads the back buffer itself (a shader resource view) and stores its answer
     // into our copy, which then goes back as before - the copy of the back buffer into ours goes (4K RGBA16F 0.11 ms,
@@ -2039,8 +2094,10 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
     // HUD FIX: the frame before the layers kept; composed after the last of them (before a final-picture comparison
     // shows it). Captured (Auto's first choice): the layers run on the copy made before the HUD, the difference of the
     // two is the HUD (source 2; Auto keeps the estimate's state too); else the estimate (Auto, Estimated).
-    const uint32_t hud_source = hud_captured ? 2u : hud_mode == 1 || hud_mode == 4 ? 4u : 0u;   // hud_captured: FG's too
-    const bool hud_estimate = hud_source == 4 || (hud_captured && hud_mode == 1);
+    // (Estimated switched off - nr::control::kHudEstimated: Auto without a capture runs nothing)
+    uint32_t hud_source = hud_captured ? (hud_chain_check ? 5u : 2u)
+                                : nr::control::kHudEstimated && (hud_mode == 1 || hud_mode == 4) ? 4u : 0u;   // hud_captured: FG's too
+    const bool hud_estimate = hud_source == 4 || (nr::control::kHudEstimated && hud_captured && hud_mode == 1);
     bool hud = false;
     if (hud_source && !runs.empty()) {
         PresentPath& P = g_present;
@@ -2085,7 +2142,25 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
                 transition(l, hud_cap.fg.copy, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 transition(l, hud_cap.fg.game, D3D12_RESOURCE_STATE_COPY_SOURCE, hud_cap.fg.state);
             }
-            if (hud_captured) copy(hud_hudless, P.target);   // the layers run on the frame without its HUD
+            // Read alpha from a separately tagged UI only after the pairing/lifetime gate in hudcap.
+            // Copy to a typed texture: the game's RGBA8 source can be TYPELESS (DXGI 27 in a game seen).
+            if (hud_fg && hud_cap.fg.ui && ensure_texture(device, P.hud_ui, P.hud_ui_state, format, w, h)) {
+                transition(l, hud_cap.fg.ui, hud_cap.fg.ui_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                transition(l, P.hud_ui, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+                l->CopyResource(P.hud_ui, hud_cap.fg.ui);
+                transition(l, P.hud_ui, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                transition(l, hud_cap.fg.ui, D3D12_RESOURCE_STATE_COPY_SOURCE, hud_cap.fg.ui_state);
+                hud_source = 1; // existing HUD_COMPOSE UI.a path; no alpha estimation or dilation
+            }
+            if (hud_fg && P.hud_ui_report != int(hud_source == 1)) {
+                P.hud_ui_report = int(hud_source == 1);
+                log("[nr] HUD FIX alpha: %s (XeSS presentId %u)", hud_source == 1 ?
+                    "authored UI.a, paired full-frame SDR texture" : "no paired UI; RGB-difference fallback", hud_cap.fg.ui_frame);
+            }
+            if (hud_captured && !hud_chain_check) copy(hud_hudless, P.target);   // the layers run on the frame without its HUD
+            // the chain capture's copy where it fits the frame (else the frame: the composition then takes NR's answer
+            // whole), decided on the GPU before the layers; not recorded: the layers run on the frame
+            if (hud_chain_check) (void)nr::asi::hudfix_select_d3d12(l, device, P.hud_back, hud_hudless, P.hud_stats, P.target, w, h);
         }
     }
     // Frame generation reads the game's HUD-less frame at the present: FSR and XeSS frame generation interpolate the
@@ -2148,7 +2223,8 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
     const auto hud_end = [&] {
         PresentPath& P = g_present;
         nr::asi::HudFixD3D12 r;
-        r.back = P.hud_back; r.frame = P.target; r.alpha = P.hud_alpha; r.stats = P.hud_stats; r.previous = P.hud_prev;
+        r.back = P.hud_back; r.frame = P.target; r.alpha = hud_source == 1 ? P.hud_ui : P.hud_alpha;
+        r.stats = P.hud_stats; r.previous = P.hud_prev;
         r.hudless = hud_captured ? hud_hudless : nullptr;
         // the estimate with the game's motion vectors: the newest fresh guides of the back buffer's aspect, their units
         // in output pixels (low-resolution vectors: by the output's size over the render size) per present
@@ -2172,8 +2248,7 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
             transition(l, hud_cap.fg.game, D3D12_RESOURCE_STATE_COPY_DEST, hud_cap.fg.state);
             transition(l, P.target, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         }
-        if (!nr::asi::wilsjo2_hudfix(l, device, r, w, h, hud_source, chain->hud.show_mask, P.hud_fresh, P.hud_parity,
-                                     hud_estimate)) {
+        if (!nr::asi::hudfix_d3d12(l, device, r, w, h, hud_source, chain->hud.show_mask, P.hud_fresh, hud_estimate)) {
             if (hud_captured) {   // the layers ran on the copy without the HUD: the frame as the game drew it goes back
                 transition(l, P.hud_back, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
                 transition(l, P.target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -2193,8 +2268,37 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
         }
         if (hud_estimate) {
             P.hud_fresh = false;
-            P.hud_parity ^= 1u;
             P.hud_estimated_at = P.presents;
+        }
+        // the chain capture's check: this frame's HUD count (hudfix.comp's u1.x) read back by this slot's list
+        if (hud_cap.chain && !hud_fg && !at) {
+            if (!P.hud_rb) {
+                D3D12_HEAP_PROPERTIES hp{};
+                hp.Type = D3D12_HEAP_TYPE_READBACK;
+                D3D12_RESOURCE_DESC bd{};
+                bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+                bd.Width = 512 * kPresentRing; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+                bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                           nullptr, IID_PPV_ARGS(&P.hud_rb))))
+                    P.hud_rb = nullptr;
+            }
+            if (P.hud_rb) {
+                transition(l, P.hud_stats, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                D3D12_TEXTURE_COPY_LOCATION to{}, from{};
+                to.pResource = P.hud_rb;
+                to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                to.PlacedFootprint.Offset = uint64_t(slot) * 512;
+                to.PlacedFootprint.Footprint = {DXGI_FORMAT_R32_UINT, 4, 1, 1, 256};
+                from.pResource = P.hud_stats;
+                from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                from.SubresourceIndex = 0;
+                const D3D12_BOX box{0, 0, 0, 4, 1, 1};
+                l->CopyTextureRegion(&to, 0, 0, 0, &from, &box);
+                transition(l, P.hud_stats, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                P.hud_rb_image[slot] = hud_cap.chain_image;
+                P.hud_rb_total[slot] = w * h;
+            }
         }
         // this frame's kept frame becomes the next one's previous by swapping the two textures' roles (the next
         // frame overwrites hud_back first) instead of copying it into hud_prev; both rest in UNORDERED_ACCESS
@@ -3813,6 +3917,9 @@ struct LdrLoaded { ULONG flags; const LdrUnicode* full_name; const LdrUnicode* b
 VOID NTAPI fg_library_loaded(ULONG reason, const LdrLoaded* data, PVOID) {
     ++g_module_changes;   // renodx_mod_white's module walk
     if (!data || !data->base_name || !data->base_name->buffer) return;
+    const std::wstring loaded_name(data->base_name->buffer,data->base_name->length/sizeof(wchar_t));
+    if (reason==1 && _wcsicmp(loaded_name.c_str(),L"d3d12.dll")==0)
+        nr::asi::hudcap::d3d12_module(static_cast<HMODULE>(data->base));
     if (!fg_library_name(std::wstring(data->base_name->buffer, data->base_name->length / sizeof(wchar_t)))) return;
     const auto lo = reinterpret_cast<uintptr_t>(data->base);
     if (reason == 2) { fg_range_set(lo, 0); return; }   // LDR_DLL_NOTIFICATION_REASON_UNLOADED
@@ -4045,7 +4152,11 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_evaluate(ID3D12GraphicsCommandList* cmd, const 
     if (present_wanted) {
         bool depth_wanted = nr::pe::g_motion_without_depth_now.load() != 1 || chain->inspect.hold;
         for (const Layer& l : chain->layers)
-            depth_wanted |= present_layer(l) && l.cfg.processing == nr::pe::Processing::kWilsjo2;
+            // (Passes (fast) Interleaved reads the depth itself - its anti-ghost's disocclusion test and vector
+            // dilation - whatever the network does: without the copy those tests never ran at Present)
+            depth_wanted |= present_layer(l) && (l.cfg.processing == nr::pe::Processing::kWilsjo2 ||
+                                                 (renodx_layer(l) && l.cfg.renodx.values.passes_mode == 1u &&
+                                                  l.cfg.renodx.values.fast_method == 0u));
         capture_guides(cmd, device, f, st, wf, h->Id, depth_wanted);
     }
 
@@ -5960,12 +6071,11 @@ struct VkPresentPath {
     OwnImage xfer;                          // the copy bridge's picture (a swap chain not shared with NR's family)
     bool said_xfer = false;
     OwnImage linear, encoded;               // wilsjo2's HDR10 finished picture (as D3D12's)
-    // HUD FIX (wilsjo2_hudfix.comp): the frame before the layers, the last one (the estimate's), the HUD's alpha and
-    // confidence (RG16F), the counts (R32_UINT 4 x 1)
+    // HUD FIX (hudfix.comp): the frame before the layers, the last one (the estimate's), the HUD's alpha and
+    // the estimate's state (RGBA16F), the counts and HUD colours (R32_UINT, hud_stats_w / _h)
     OwnImage hud_back, hud_prev, hud_alpha, hud_stats;
     bool hud_prev_valid = false, hud_fresh = true;
     bool hud_said = false;
-    uint32_t hud_parity = 0;
     uint64_t hud_estimated_at = ~0ull;   // the estimate's last Present: after a gap it starts afresh
     std::atomic<bool> wanted{false};        // the chain has Present layers (evaluates copy guides)
     std::atomic<uint64_t> served_ms{0};     // a present of the game's last reached the layers
@@ -6074,7 +6184,9 @@ std::vector<VkPresentRun> present_runs(const std::vector<const Layer*>& layers, 
 // `frame` (ours, GENERAL, w x h, `format`): the runs on it in order, recorded into `cmd`. True when a layer changed it.
 // HUD FIX on these routes: the estimate (no HUD-less frame of the game's, no capture before its HUD here) - Mode Auto
 // or Estimated; Game / Captured run nothing (NR Control greys them out with the reason). 0: off.
-uint32_t vk_hud_source(const nr::pe::HudFixConfig& h) { return h.mode == 1 || h.mode == 4 ? 4u : 0u; }
+uint32_t vk_hud_source(const nr::pe::HudFixConfig& h) {
+    return nr::control::kHudEstimated && (h.mode == 1 || h.mode == 4) ? 4u : 0u;
+}
 // This Present's HUD-less frame (HUD FIX's capture, nr_asi_hudcap.hpp; image null: none): the layers run on it and the
 // composition is against it (source 2); Auto keeps the estimate's state too.
 struct VkHudless {
@@ -6151,7 +6263,7 @@ void vk_hud_end(VkCommandBuffer cmd, VkPresentPath& P, const nr::pe::HudFixConfi
     if (hl.image.image) im.hudless = hl.image;
     const uint32_t source = hl.image.image ? 2u : 4u;
     const bool estimate = source == 4 || hl.estimate_too;
-    if (!nr::asi::wilsjo2_hudfix_vk(cmd, im, w, h, source, hud.show_mask, P.hud_fresh, P.hud_parity, hl.estimate_too)) {
+    if (!nr::asi::hudfix_vk(cmd, im, w, h, source, hud.show_mask, P.hud_fresh, hl.estimate_too)) {
         if (hl.image.image) {   // the layers ran on the copy without the HUD: the frame as the game drew it goes back
             vk_barrier(cmd, P.hud_back.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
             vk_barrier(cmd, frame, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
@@ -6164,7 +6276,6 @@ void vk_hud_end(VkCommandBuffer cmd, VkPresentPath& P, const nr::pe::HudFixConfi
     }
     if (estimate) {
         P.hud_fresh = false;
-        P.hud_parity ^= 1u;
         P.hud_estimated_at = P.presents;
     }
     // the roles swapped instead of the copy (as on D3D12); both rest in GENERAL
@@ -7198,7 +7309,7 @@ const VkPresentInfoKHR* vk_present_one(VkQueue queue, const VkPresentInfoKHR* in
     VkHudless hudless;
     if (hud_captured) {
         hudless.image = w2_of(P.hudless);
-        hudless.estimate_too = hud_mode == 1;
+        hudless.estimate_too = nr::control::kHudEstimated && hud_mode == 1;
     }
     const bool changed = vk_present_run(cmd, P, chain, runs, P.frame.image, ff, w, h, hudless);
     if (changed) {
@@ -8268,7 +8379,7 @@ void d11_present_layers(IDXGISwapChain* sc, ID3D11Device* device) {
     if (hud_captured && d11_image(hud_cap.hudless, hl)) {
         d11_hold(hud_cap.hudless);
         hudless.image = w2_image(&hl.ngx, hl.layout);
-        hudless.estimate_too = hud_mode == 1;
+        hudless.estimate_too = nr::control::kHudEstimated && hud_mode == 1;
     }
     // Captured with no copy this frame: the layers' answer as it is (no estimate)
     bool filled = true;
@@ -8513,6 +8624,14 @@ bool hook(const char* name, void* detour, void** real, bool required) {
 
 }  // namespace
 
+// HUD FIX wants the capture ([HudFix] Mode Auto / Captured) as the game makes its D3D12 device: read from the ini on its
+// own (no g_lock: a device can be made anywhere), for nr_asi_hudcap's view bookkeeping.
+bool hud_capture_wanted_at_start() {
+    nr::pe::ChainFile file;
+    nr::pe::ChainConfig config;
+    file.poll(std::string(nr::pe::module_folder()) + "\\dlssnr-amd.ini", config);
+    return config.hud.mode == 1 || config.hud.mode == 3;
+}
 // Called by OptiScaler from its DllMain, under the loader lock: hooks only.
 extern "C" __declspec(dllexport) void InitializeASI() {
     static bool done = false;
@@ -8525,6 +8644,7 @@ extern "C" __declspec(dllexport) void InitializeASI() {
     g_self_range = range_of(g_self);
     // frame generation's HUD-less hand-overs: the game's own only (not OptiScaler's own frame generation's calls)
     nr::asi::hudcap::set_game_caller(&game_fg_call);
+    nr::asi::hudcap::set_capture_wanted_query(&hud_capture_wanted_at_start);
     nr::pe::set_module(g_opti);   // dlssnr-amd.ini, dlssnr-amd\, the log and control.bin sit beside OptiScaler
     nr::pe::install_crash_watch();
     // an exception that leaves one of NR's threads ends the process through std::terminate: said in the log first
@@ -8585,6 +8705,7 @@ extern "C" __declspec(dllexport) void InitializeASI() {
     hook_present_beat();
     hook_game_dxgi();
     hook_fg_libraries();
+    nr::asi::hudcap::d3d12_module(GetModuleHandleW(L"d3d12.dll"));
     log("[nr] %s (Unreal Engine by the executable: %s)", ok ? "NR runs in OptiScaler's D3D12 evaluate"
                                                              : "OptiScaler's D3D12 evaluate could not be hooked: NR does not run",
         g_unreal_by_exe ? "yes" : "no");

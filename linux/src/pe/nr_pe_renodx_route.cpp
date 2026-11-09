@@ -36,6 +36,12 @@ CallNetwork::CallNetwork(int network) : previous(t_call_network) { t_call_networ
 CallNetwork::~CallNetwork() { t_call_network = previous; }
 int call_network() { return t_call_network; }
 namespace {
+thread_local HistoryRef t_call_history{};
+}  // namespace
+CallHistory::CallHistory(const HistoryRef& h) : previous(t_call_history) { t_call_history = h; }
+CallHistory::~CallHistory() { t_call_history = previous; }
+const HistoryRef& call_history() { return t_call_history; }
+namespace {
 thread_local int t_call_layer = 0;
 }  // namespace
 CallLayer::CallLayer(int number) : previous(t_call_layer) { t_call_layer = number; }

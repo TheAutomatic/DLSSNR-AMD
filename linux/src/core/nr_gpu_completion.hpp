@@ -44,6 +44,17 @@ struct Recording {
         // A secondary can be reset while an executable primary still retains its earlier recording.
         return due || std::all_of(kept.begin(), kept.end(), [](const auto& p) { return p->ready(); });
     }
+    // HUD capture cannot treat elapsed time/submission count as a resource lifetime proof.
+    bool capture_ready() {
+        std::vector<std::shared_ptr<Recording>> owners;
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            waits.erase(std::remove_if(waits.begin(), waits.end(), [](auto& f) { return f(); }), waits.end());
+            if (!sealed || unknown_submit || !waits.empty()) return false;
+            for (const auto& p:parents) if (auto owner=p.lock()) owners.push_back(std::move(owner));
+        }
+        return std::all_of(owners.begin(),owners.end(),[](const auto& p){return p->capture_ready();});
+    }
     void seal() { std::lock_guard<std::mutex> guard(mutex); sealed = true; }
     void submitted(std::function<bool()> wait) {
         std::vector<std::shared_ptr<Recording>> kept;

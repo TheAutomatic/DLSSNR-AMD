@@ -1,0 +1,58 @@
+#version 460
+// Passes (fast) Interleaved, the fill where moved increments were not used (research, NR_IL_FILL=1): a pyramid of the
+// slots' usable increments (push-pull, as frame interpolation fills its holes), each level half the size, the slots side
+// by side in one image (slot i at x offset i * the level's width); rgb = mean of increment x weight, a = mean weight.
+//   mode 0: level 1 from the moved increments (S0..S7) and the weight Trust.r
+//   mode 1: level l + 1 from level l (Src)
+#extension GL_EXT_samplerless_texture_functions : require
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0) uniform texture2D Trust;
+layout(set = 0, binding = 1) uniform texture2D S0;
+layout(set = 0, binding = 2) uniform texture2D S1;
+layout(set = 0, binding = 3) uniform texture2D S2;
+layout(set = 0, binding = 4) uniform texture2D S3;
+layout(set = 0, binding = 5) uniform texture2D S4;
+layout(set = 0, binding = 6) uniform texture2D S5;
+layout(set = 0, binding = 7) uniform texture2D S6;
+layout(set = 0, binding = 8) uniform texture2D S7;
+layout(set = 0, binding = 9) uniform texture2D Src;
+layout(set = 0, binding = 10, rgba16f) uniform writeonly image2D Dst;
+// the depth pyramid (flags & 1, research NR_IL_DFILL): per level the mean of nearness x weight and the mean weight of the
+// usable pixels (one for all slots: the weight is Trust's), level 1 from this frame's nearness (il.comp mode 5)
+layout(set = 0, binding = 11) uniform texture2D Near;
+layout(set = 0, binding = 12) uniform texture2D DSrc;
+layout(set = 0, binding = 13, rg32f) uniform writeonly image2D DDst;
+// ssize: the source's size per slot (mode 0: the frame's), dsize: the destination's per slot
+layout(push_constant) uniform Push { uvec2 ssize, dsize; uint mode, n, flags; } pc;
+vec3 inc(uint i, ivec2 c) {
+    switch (i) {
+        case 0u: return texelFetch(S0, c, 0).rgb; case 1u: return texelFetch(S1, c, 0).rgb;
+        case 2u: return texelFetch(S2, c, 0).rgb; case 3u: return texelFetch(S3, c, 0).rgb;
+        case 4u: return texelFetch(S4, c, 0).rgb; case 5u: return texelFetch(S5, c, 0).rgb;
+        case 6u: return texelFetch(S6, c, 0).rgb; default: return texelFetch(S7, c, 0).rgb;
+    }
+}
+void main() {
+    const uvec2 g = gl_GlobalInvocationID.xy;
+    if (g.x >= pc.dsize.x * pc.n || g.y >= pc.dsize.y) return;
+    const uint i = g.x / pc.dsize.x;
+    const ivec2 d = ivec2(g.x - i * pc.dsize.x, g.y);
+    vec4 s = vec4(0.0);
+    vec2 dn = vec2(0.0);
+    const bool depth = (pc.flags & 1u) != 0u && i == 0u;
+    for (int y = 0; y < 2; ++y)
+        for (int x = 0; x < 2; ++x) {
+            const ivec2 c = 2 * d + ivec2(x, y);
+            if (any(greaterThanEqual(uvec2(c), pc.ssize))) continue;
+            if (pc.mode == 0u) {
+                const float w = texelFetch(Trust, c, 0).r;
+                s += vec4(inc(i, c) * w, w);
+                if (depth) dn += vec2(texelFetch(Near, c, 0).r * w, w);
+            } else {
+                s += texelFetch(Src, ivec2(c.x + int(i * pc.ssize.x), c.y), 0);
+                if (depth) dn += texelFetch(DSrc, c, 0).rg;
+            }
+        }
+    imageStore(Dst, ivec2(g), s * 0.25);
+    if (depth) imageStore(DDst, d, vec4(dn * 0.25, 0.0, 0.0));
+}

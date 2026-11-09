@@ -22,6 +22,26 @@ inline constexpr uint32_t kMaxLayers = 8;
 inline constexpr char kNoExposureHint[] = "!The game gives no exposure.";
 // A network field's "none (yet)": one past the networks (nr::NetworkChoice).
 inline constexpr uint32_t kNoNet = nr::kNetworkChoices;
+// HUD FIX's Estimated method ([HudFix] Mode = estimated; hudfix.comp HudMode 4) is switched off: the menus do not offer
+// it, Auto never falls back to it (nor keeps its state beside a capture), and a file that asks for it gets HUD FIX off,
+// with NR Control and the log saying why. Its code stays; true brings it back (and its line in the ini's [HudFix]
+// comment, nr_pe_config.cpp write_hudfix: "; estimated = an estimate: pixels that stay still while the picture moves
+// are taken as HUD and kept as they are (NR still sees the HUD).").
+inline constexpr bool kHudEstimated = false;
+#ifndef NR_N
+#define NR_N(text) text   // a text for the menus' language file (nr_lang.hpp)
+#endif
+// A layer's note when Feedback / Hybrid cannot run (one network pass): no motion vectors, or peripheral compression
+inline const char* fast_fallback_note(bool spatial) {
+    return spatial ? NR_N("Feedback / Hybrid cannot run: peripheral compression is on")
+                   : NR_N("Feedback / Hybrid cannot run: no motion vectors");
+}
+// A layer's note when Passes (fast) Interleaved is chosen and cannot run (it then runs one network pass, no other method).
+inline const char* il_missing_note(uint32_t why) {
+    return why == 2u ? NR_N("Interleaved cannot run: peripheral compression is on")
+         : why == 3u ? NR_N("Interleaved cannot run: its shaders are missing")
+                     : NR_N("Interleaved cannot run: no motion vectors");
+}
 
 // One layer of the .asi's NR chain as it last ran, for NR Control's status (rows by layer number; 0: an empty row).
 struct LayerStatus {

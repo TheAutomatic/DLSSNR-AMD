@@ -71,7 +71,7 @@ enum Mode : uint32_t { kEncode = 0, kResolve = 1, kDownsample = 2, kMeter = 3, k
                       kInspect = 40,
                       // ours: [Preprocess] on the layer itself (wilsjo2_light.comp, wilsjo2_prep.comp)
                       kLight = 60, kPrepMeter = 61, kPrepForward = 62, kPrepBack = 63,
-                      // ours: HUD FIX at Present, any processing's (wilsjo2_hudfix.comp)
+                      // ours: HUD FIX at Present, any processing's (hudfix.comp)
                       kHudClear = 50, kHudCount = 51, kHudEstimate = 52, kHudCompose = 53,
                       // peripheral compression: pack the proxy, pack the guides, unpack the pair
                       kSpatialPack = 100, kSpatialGuides = 101, kSpatialUnpack = 102 };
@@ -99,12 +99,15 @@ struct Settings {
     // Passes (fast) (ours, as a RenoDX layer's NRPassesMode / NRFastPasses / NRFastMethod / NRFastHaloLimit): one network
     // pass strengthened after it (nr_fast_passes.hpp), instead of Passes network passes
     uint32_t passes_mode = 0;                // PassesMode: 0 legacy, 1 fast
-    uint32_t fast_method = 0;                // FastMethod: 0 Extrapolation, 1 Feedback, 2 Hybrid, 3 Edit strength
+    // FastMethod as a RenoDX layer's NRFastMethod: 0 Interleaved, 1 Extrapolation (default), 2 Feedback, 3 Hybrid,
+    // 4 Edit strength
+    uint32_t fast_method = 1;
+    uint32_t fast_interleaved_passes = 3;    // FastInterleavedPasses 2..8 (Interleaved: the legacy passes it takes turns of)
     // Each method's own, [0] Extrapolation, [1] Feedback, [2] Hybrid (Fast<Method>Passes / HaloLimit / Fine)
     float fast_passes[3] = {3.0f, 3.0f, 3.0f};       // 1..8, referred to legacy pass counts
     bool fast_halo_limit[3] = {false, false, false};
     float fast_fine[3] = {0.0f, 1.0f, 1.0f};         // 0..2
-    float fast_edit_strength = 2.0f;         // FastEditStrength 0..4 (method 3)
+    float fast_edit_strength = 2.0f;         // FastEditStrength 0..4 (method 4)
     PassOverride pass[kMaxPasses];           // [k]: pass k's (k >= 1; key prefix Pass{k+1})
     uint32_t preset = 0;                     // Preset
     uint32_t style = 0;                      // Style
@@ -474,14 +477,13 @@ struct Dispatch {
     Constants constants{};
 };
 
-// HUD FIX's constants (wilsjo2_hudfix.comp): `mode` (kHud*), the extent, the source (0 a UI alpha, 1 a UI colour's
-// alpha, 2 the difference mask against a HUD-less frame, 4 the estimate), RenoDX's limits (present_path.hpp
+// HUD FIX's constants (hudfix.comp): `mode` (kHud*), the extent, the source (0 a UI alpha, 1 a UI colour's
+// alpha, 2 the difference mask against a HUD-less frame, 4 the estimate, 5 as 2 for the chain capture's copy under its
+// check: the layers ran on the frame itself, above the HUD limit their answer whole), RenoDX's limits (present_path.hpp
 // kPresentPreFgEpsilon 1/510, kPresentPreFgHudShare 0.25, the residual form as its Auto), the estimate's share of
 // changed pixels for a moving frame (0.25), ShowMask.
 // `fresh`: the estimate's state image is new (its contents read as 0).
-// `parity`: the estimate's tile-flag set read this frame (the other one is written; the caller flips it a frame).
-Constants hudfix_constants(uint32_t mode, uint32_t w, uint32_t h, uint32_t source, bool show_mask, bool fresh = false,
-                           uint32_t parity = 0);
+Constants hudfix_constants(uint32_t mode, uint32_t w, uint32_t h, uint32_t source, bool show_mask, bool fresh = false);
 // The estimate's motion vectors (t2) into its constants: output pixels per unit, their region's origin, texels per
 // output pixel
 void hudfix_motion(Constants& c, float scale_x, float scale_y, uint32_t x, uint32_t y, float step_x, float step_y);
@@ -511,6 +513,12 @@ public:
     struct FastImage { uint32_t binding; Image image; };
     void record_fast(VkCommandBuffer, uint32_t program, const FastImage* images, uint32_t count, const void* push,
                      uint32_t bytes, uint32_t gx, uint32_t gy);
+    // Passes (fast) Interleaved's programs (wilsjo2_il.spv / wilsjo2_il_pp.spv, the RenoDX-style stage's il / il_pp
+    // sources): optional. `program` 0 il (`step`: its pipeline specialised for that step, as the RenoDX-style stage's),
+    // 1 il_pp. Records one dispatch with a barrier after it; throws as record() does.
+    bool has_il() const;
+    void record_il(VkCommandBuffer, uint32_t program, uint32_t step, const FastImage* images, uint32_t count,
+                   const void* push, uint32_t bytes, uint32_t gx, uint32_t gy);
 
     struct Impl;
 private:

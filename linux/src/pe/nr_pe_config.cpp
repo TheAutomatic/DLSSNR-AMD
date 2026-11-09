@@ -248,13 +248,15 @@ bool dlssnr_key(Config& c, int& passes, const std::string& key, const std::strin
         if (v == "legacy" || v == "0") c.passes_mode = 0;
         else if (v == "fast" || v == "1") c.passes_mode = 1;
     }
-    else if (key == "fastmethod") {
+    else if (key == "fastmethod") {   // as a RenoDX layer's NRFastMethod
         const std::string v = lower(value);
-        if (v == "extrapolation" || v == "0") c.fast_method = 0;
-        else if (v == "feedback" || v == "1") c.fast_method = 1;
-        else if (v == "hybrid" || v == "2") c.fast_method = 2;
-        else if (v == "edit strength" || v == "editstrength" || v == "3") c.fast_method = 3;
+        if (v == "interleaved" || v == "0") c.fast_method = 0;
+        else if (v == "extrapolation" || v == "1") c.fast_method = 1;
+        else if (v == "feedback" || v == "2") c.fast_method = 2;
+        else if (v == "hybrid" || v == "3") c.fast_method = 3;
+        else if (v == "edit strength" || v == "editstrength" || v == "4") c.fast_method = 4;
     }
+    else if (key == "fastinterleavedpasses") c.fast_interleaved_passes = uint32_t(number(value, 2, 8, float(c.fast_interleaved_passes)));
     else if (fast_method_key("fast", key, value, c.fast_passes, c.fast_halo_limit, c.fast_fine, false)) {}
     else if (key == "fasteditstrength") c.fast_edit_strength = number(value, 0, 4, c.fast_edit_strength);
     else if (key == "scalingdownscaler") { const int v = nr::parse_integer<int>(value, -1); if (v >= 0 && v <= 7) k.scaling_downscaler = v; }
@@ -591,6 +593,7 @@ void* renodx_field(RenoDXConfig& r, int index) {
         case 112: return &v.fast_passes[2];
         case 113: return &v.fast_halo_limit[2];
         case 114: return &v.fast_fine[2];
+        case 115: return &v.fast_interleaved_passes;
         default: return nullptr;
     }
 }
@@ -616,7 +619,8 @@ bool parse_renodx_key(RenoDXConfig& r, const std::string& key, const std::string
         else if (mode == "fast") v.passes_mode = 1;
         else nr::bad_number(value);
     }
-    else if (key == "nrfastmethod") v.fast_method = renodx_enum(value, d.fast_method, 0, 3);
+    else if (key == "nrfastmethod") v.fast_method = renodx_enum(value, d.fast_method, 0, 4);
+    else if (key == "nrfastinterleavedpasses") v.fast_interleaved_passes = renodx_enum(value, d.fast_interleaved_passes, 2, 8);
     else if (fast_method_key("nrfast", key, value, v.fast_passes, v.fast_halo_limit, v.fast_fine, true)) {}
     else if (key == "nrfasteditstrength") v.fast_edit_strength = renodx_float(value, d.fast_edit_strength, 0.f, 4.f);
     else if (key == "nrpasses") v.passes = renodx_enum(value, d.passes, 1, 30);
@@ -771,11 +775,12 @@ void write_renodx(FILE* f, const RenoDXConfig& r) {
         "NRPassesMode = %s\n"
         "; legacy = Passes (legacy), the network runs again for every pass (default); fast = Passes (fast), the network runs once a frame.\n"
         "NRFastMethod = %u\n"
-        "; 0 = Extrapolation (default): strengthens this frame's one network change; needs no motion vectors, works from the first frame.\n"
-        "; 1 = Feedback: feeds the last frame's change back into this frame's network input along the motion vectors; builds up over the first frames.\n"
-        "; 2 = Hybrid: Feedback where the history can be trusted, Extrapolation on new surfaces, scene cuts and edges.\n"
-        "; 3 = Edit strength: the same method as Adjust NR's look's Edit strength, the network's change (in code values) times the strength; needs no motion vectors.\n"
-        "; Without motion vectors Feedback / Hybrid fall back to Extrapolation and the status line says why. Each method has its own settings:\n"
+        "; 0 = Interleaved: the legacy passes run one per frame in turn, each with its own history; a still picture looks as legacy's. Needs motion vectors: without them it does not run (one network pass).\n"
+        "; 1 = Extrapolation (default): strengthens this frame's one network change; needs no motion vectors, works from the first frame.\n"
+        "; 2 = Feedback: feeds the last frame's change back into this frame's network input along the motion vectors; builds up over the first frames.\n"
+        "; 3 = Hybrid: Feedback where the history can be trusted, Extrapolation on new surfaces, scene cuts and edges.\n"
+        "; 4 = Edit strength: the same method as Adjust NR's look's Edit strength, the network's change (in code values) times the strength; needs no motion vectors.\n"
+        "; Without motion vectors Interleaved / Feedback / Hybrid do not run (one network pass) and the status line says why. Each method has its own settings:\n"
         "; Passes = how strong (1.00 .. 8.00, default 3.00, in legacy passes); HaloLimit = limits new halos (default 0);\n"
         "; Fine = the amount of the fine detail in the strengthening (0 .. 2; lower it when the game's own grain gets amplified). In fast mode the legacy passes and the settings of pass 2 on below are ignored.\n"
         "NRFastExtrapolationPasses = %.2f\n"
@@ -791,6 +796,8 @@ void write_renodx(FILE* f, const RenoDXConfig& r) {
         "; Feedback's and Hybrid's Fine: default 1.00\n"
         "NRFastEditStrength = %.2f\n"
         "; the Edit strength method's strength: 0 .. 4, default 2.00; 1 = the network as it is.\n"
+        "NRFastInterleavedPasses = %u\n"
+        "; Interleaved: 2 .. 8 (default 3) legacy passes, one of them each frame. Every pass more holds two more pictures at the network's size in video memory.\n"
         "\n"
         "NRPasses = %u\n"
         "; 1 .. 4, default 1; 1 .. 30 with NRUnlockPasses = 1\n"
@@ -1040,7 +1047,7 @@ void write_renodx(FILE* f, const RenoDXConfig& r) {
         r.enabled ? 1 : 0, v.nr_enabled ? 1 : 0, r.toggle_key.c_str(), v.hook_point, v.intensity, v.style,
         v.local_tone, v.local_structure, v.skin_structure, v.auto_mask ? 1 : 0, v.skin_independent ? 1 : 0, v.passes_mode == 1u ? "fast" : "legacy", v.fast_method,
         v.fast_passes[0], v.fast_halo_limit[0] ? 1 : 0, v.fast_fine[0], v.fast_passes[1], v.fast_halo_limit[1] ? 1 : 0,
-        v.fast_fine[1], v.fast_passes[2], v.fast_halo_limit[2] ? 1 : 0, v.fast_fine[2], double(v.fast_edit_strength), v.passes,
+        v.fast_fine[1], v.fast_passes[2], v.fast_halo_limit[2] ? 1 : 0, v.fast_fine[2], double(v.fast_edit_strength), v.fast_interleaved_passes, v.passes,
         v.unlock_passes ? 1 : 0, v.chained_history ? 1 : 0, v.noise_every_frame ? 1 : 0, v.pass_transfer[0], v.pass_color[0], v.pass_intensity[0],
         v.pass_follow[0] ? 1 : 0, v.pass_style[0], v.pass_local_tone[0], v.pass_local_structure[0],
         v.pass_skin_structure[0], v.pass_auto_mask[0] ? 1 : 0, v.pass_transfer[1], v.pass_color[1],
@@ -1335,6 +1342,8 @@ bool read_chain(const std::string& path, ChainConfig& out) {
                 else if (v == "game" || v == "fg" || v == "2") c.hud.mode = 2;
                 else if (v == "captured" || v == "capture" || v == "3") c.hud.mode = 3;
                 else if (v == "estimated" || v == "estimate" || v == "4") c.hud.mode = 4;
+                c.hud.estimated_asked = c.hud.mode == 4 && !nr::control::kHudEstimated;
+                if (c.hud.estimated_asked) c.hud.mode = 0;
             } else if (k == "showmask") {
                 if (auto b = parse_bool(value)) c.hud.show_mask = *b;
             }
@@ -1736,8 +1745,8 @@ void write_hudfix(FILE* f, const HudFixConfig& h) {
         ";        NR runs on the HUD-less picture, the HUD is put back as it was, frame generation gets NR's picture; only when the game runs frame\n"
         ";        generation and hands over a HUD-less picture. OptiScaler's own frame generation gets no such picture; captured serves those games;\n"
         "; captured = the picture taken before the game draws its HUD: NR runs on it, the HUD is put back as it was (games that draw the HUD over\n"
-        ";            the finished picture; not Vulkan or D3D9 games on the ReShade route);\n"
-        "; estimated = an estimate: pixels that stay still while the picture moves are taken as HUD and kept as they are (NR still sees the HUD).\n"
+        ";            the finished picture; not Vulkan or D3D9 games on the ReShade route); where a D3D12 game composes its HUD in its final pass,\n"
+        ";            the picture that pass reads, used where it matches the presented frame outside the HUD.\n"
         "; A method that cannot be used is greyed out in the menu with the reason\n"
         "ShowMask = %s\n"
         "; true = shows the HUD's area (white = HUD, kept as the game drew it), for debugging\n",

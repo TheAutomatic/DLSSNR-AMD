@@ -174,7 +174,7 @@ hudfix = render("void write_hudfix(", {"h": struct("HudFixConfig")})[0]   # off 
 hudfix_addon = render("void write_hudfix(", {"h": dict(struct("HudFixConfig"), mode=0)})[0]   # off on the ReShade route
 nrcontrol = formats(body_of("void write_nrcontrol("))[0][0]   # NR Control's key (the OptiScaler route's menu)
 d3d12_default = re.search(r"kDefaultEnabled = (true|false);",
-                          (srcdir / "pe/nr_d3d12_asd.hpp").read_text(encoding="utf-8")).group(1) == "true"
+                          (srcdir / "pe/nr_d3d12_passthrough.hpp").read_text(encoding="utf-8")).group(1) == "true"
 d3d12 = render("void write_d3d12(", {"enabled": d3d12_default})[0]   # [D3D12Passthrough] (the OptiScaler route)
 save = formats(body_of("void Config::save("))
 assert len(save) == 8, len(save)   # [DlssNr], six Pass<N> lines (none by default), own keys

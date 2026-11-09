@@ -126,14 +126,14 @@ mauri870's DLSSNR-RDNA3 (https://github.com/mauri870/DLSSNR-RDNA3), its int4 inc
 
 D3D12 passthrough (experimental)
 --------------------------------
-On the optiscaler route in D3D12 games on an RX 9000, the network runs on the game's own D3D12 device as the same
-ACO machine code, made into pipelines by AMD's driver (its D3D12 extension), instead of on a Vulkan device of
-NR's own with the frame handed across: no hand-over between the two devices. First implemented by
+On the optiscaler route in D3D12 games on an RX 9000 or RX 7000, the network runs on the game's own D3D12 device
+as the same ACO machine code, made into pipelines by AMD's driver (its D3D12 extension), instead of on a Vulkan
+device of NR's own with the frame handed across: no hand-over between the two devices. First implemented by
 TheAutomatic. It is on by default in this version: [D3D12Passthrough] Enabled in dlssnr-amd.ini (1 on, 0 off),
-or the checkbox on NR Control's Network page; either takes effect at the next game start. At the first frame a
-small check runs on the game's device; a game or GPU it cannot serve (another GPU, a driver without the
-extension, the check failing) runs through the Vulkan device as before. The Network page shows the check's result
-and how many frames ran each way, Diagnostics more; dlssnr-amd.log has the details ([d3d12] lines).
+or the checkbox on NR Control's Network page; either takes effect at the next game start. On an RX 9000 a small
+check runs on the game's device at the first frame; a game or GPU it cannot serve (another GPU, a driver without
+the extension, the check failing) runs through the Vulkan device as before. The Network page shows the check's
+result and how many frames ran each way, Diagnostics more; dlssnr-amd.log has the details ([d3d12] lines).
 
 Use
 ---

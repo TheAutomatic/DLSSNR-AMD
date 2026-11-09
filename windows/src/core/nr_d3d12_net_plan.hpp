@@ -1,5 +1,5 @@
 #pragma once
-// The lowered network as the D3D12 passthrough runs it (windows/src/pe/nr_d3d12_asd_net.cpp): the same lowering
+// The lowered network as the D3D12 passthrough runs it (windows/src/pe/nr_d3d12_passthrough_net.cpp): the same lowering
 // the Vulkan runtime builds (nr::Runtime, nr_runtime.cpp: the model choice, the build arguments, NrSession::build), kept
 // as data - every dispatch with its kernel, grid and push block, the weight blob with its tail, the noise table's jobs and
 // the activation arena's extent - and handed over without a Vulkan device. No Vulkan type in here: the D3D12 side
@@ -61,6 +61,7 @@ struct D3d12NetControls {
     float history_strength = -1.0f;   // Controls::history_strength (< 0: the session's, 1)
     bool noise_every_frame = false;
     bool seed_fixed = false;       // Controls::seed_fixed, including temporal frames
+    bool no_grade = false;         // this call without the Style grade (Passes (fast) Interleaved's plain pass)
 };
 
 // nr_runtime.cpp. The network for a `width` x `height` frame of the installation at `root` (the folder with

@@ -43,10 +43,11 @@ mkdir -p -- "$dst/lang"
 python3 windows/build/make_lang.py "$dst/lang/English.txt" windows/src/pe/nr_pe_menu.cpp windows/src/ui/nr_control_ui.hpp \
     windows/src/ui/nr_control_pages.hpp windows/src/core/nr_renodx_keys.hpp windows/src/ui/nr_wilsjo2_shared_keys.hpp \
     windows/src/ui/nr_wilsjo2_keys.hpp windows/src/ui/nr_reshade_layer_keys.hpp windows/src/pe/nr_pe_events.hpp \
-    windows/src/pe/nr_reshade_addon.cpp windows/src/pe/nr_d3d12_asd_panel.cpp \
+    windows/src/pe/nr_reshade_addon.cpp windows/src/pe/nr_d3d12_passthrough_panel.cpp \
     --producers windows/src/pe/nr_asi_main.cpp windows/src/pe/nr_asi_hudcap.cpp windows/src/pe/nr_pe_control.cpp \
     windows/src/pe/nr_dlssnr_model.cpp windows/src/pe/nr_pe_session.cpp windows/src/pe/nr_engine_panel.hpp \
-    windows/src/pe/nr_reshade_addon.cpp windows/src/pe/nr_pe_bridge.cpp windows/src/pe/nr_pe_d3d12split.cpp > /dev/null
+    windows/src/pe/nr_reshade_addon.cpp windows/src/pe/nr_pe_bridge.cpp windows/src/pe/nr_pe_d3d12split.cpp \
+    windows/src/core/nr_control_shared.hpp > /dev/null
 cp -- windows/package/lang/README.txt "$dst/lang/README.txt"
 
 # The weights are NVIDIA's and are never part of this repository: --model takes a CC_SILVER_AARDWOLD.bin made

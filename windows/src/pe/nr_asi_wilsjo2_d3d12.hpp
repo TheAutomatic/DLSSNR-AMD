@@ -3,6 +3,7 @@
 // pipelines the driver makes, recorded into the game's list. nr_asi_wilsjo2.cpp's route.
 #pragma once
 
+#include "nr_d3d12_il.hpp"
 #include "nr_d3dcompiler.hpp"
 #include "nr_gpu_completion.hpp"
 #include "nr_wilsjo2.hpp"
@@ -27,6 +28,7 @@
 
 namespace nr::asi::native {
 namespace w2 = nr::wilsjo2;
+namespace d3d12_il = nr::pe::d3d12_il;
 
 inline DXGI_FORMAT srv_format(DXGI_FORMAT f) {
     switch (f) {
@@ -125,6 +127,10 @@ public:
     using Ensure = std::function<void(ID3D12Resource*, D3D12_RESOURCE_STATES)>;
 
     ~Stage12() override {
+        for (auto* p : il_pso_) if (p) p->Release();
+        if (ilpp_pso_) ilpp_pso_->Release();
+        if (il_lay_.rs) il_lay_.rs->Release();
+        if (ilpp_lay_.rs) ilpp_lay_.rs->Release();
         for (auto* p : fast_pso_) if (p) p->Release();
         if (rs_fast_) rs_fast_->Release();
         for (auto* p : pso_) if (p) p->Release();
@@ -274,6 +280,13 @@ public:
                 }
             }
         }
+        // Passes (fast) Interleaved's programs (renodx\renodx_il.hlsl's steps, renodx_il_pp.hlsl - the same SPIR-V as
+        // wilsjo2_il*): each its own root signature (nr_d3d12_il.hpp). Without them Interleaved cannot run (NR Control says so).
+        {
+            std::string err;
+            if (!load_il(folder + L"\\renodx\\", &err))
+                NR_W2D3D12_LOG("[d3d12] wilsjo2 on D3D12: Interleaved's programs are not available (%s): Interleaved cannot run", err.c_str());
+        }
         std::map<std::string, ID3D12PipelineState*> made;
         // Every pipeline this call made is released on the way out, including a required program failing halfway: the
         // earlier return used to skip the release loop and keep the initial references.
@@ -326,11 +339,73 @@ public:
         cmd_->SetComputeRootSignature(rs_);
     }
     void end() { cmd_ = nullptr; ensure_ = nullptr; bound_ = nullptr; }
-    void end_recording() override { sweep_blocks(); }
+    void end_recording() override { sweep_blocks(); sweep_copies(); }
+    // A copy no dispatch has asked for in 240 recordings (the flow moved to another size or format) goes once its last
+    // use is done: copies_ held one image per description ever seen for the stage's life.
+    void sweep_copies() {
+        ++recordings_;
+        for (size_t i = 0; i < copies_.size();) {
+            ID3D12Resource* c = copies_[i];
+            const auto u = copy_use_.find(c);
+            const bool idle = u == copy_use_.end() || (recordings_ - u->second.recording > 240 && done(u->second.ticket));
+            if (!idle) { ++i; continue; }
+            copy_use_.erase(c); copy_dest_.erase(c);
+            c->Release();
+            copies_.erase(copies_.begin() + long(i));
+        }
+    }
     bool has_fast() const override {
         return fast_pso_[0] && fast_pso_[1] && fast_pso_[2] && fast_pso_[3] && pso_[w2::kHalfCopy];
     }
     bool has(w2::Mode mode) const override { return mode < kModes && pso_[mode]; }
+    bool has_il() const override { return il_loaded_ && has_fast(); }
+    // Passes (fast) Interleaved's dispatch (the Vulkan stage's record_il): `program` 0 il (its `step`'s pipeline), 1 il_pp;
+    // the images by binding - a binding its program declares as an image is written (UAV), as a texture read (SRV).
+    void record_il(uint32_t program, uint32_t step, const w2::Stage::FastImage* images, uint32_t count, const void* push,
+                   uint32_t bytes, uint32_t gx, uint32_t gy) override {
+        if (!cmd_) throw std::runtime_error("wilsjo2 stage (D3D12): Interleaved recorded outside a recording");
+        if (!il_loaded_ || program > 1u || (program == 0u && (step >= 6u || !il_pso_[step])))
+            throw std::runtime_error("wilsjo2 stage (D3D12): no Interleaved program " + std::to_string(program) + "/" + std::to_string(step));
+        const d3d12_il::Layout& lay = program == 0u ? il_lay_ : ilpp_lay_;
+        std::vector<d3d12_il::Bind> binds;
+        for (uint32_t i = 0; i < count; ++i) {
+            ID3D12Resource* r = resource(images[i].image);
+            const uint32_t b = images[i].binding;
+            const bool write = std::find(lay.uav.begin(), lay.uav.end(), b) != lay.uav.end();
+            const bool read = std::find(lay.srv.begin(), lay.srv.end(), b) != lay.srv.end();
+            if (!r || (!write && !read)) continue;
+            const D3D12_RESOURCE_DESC rd = r->GetDesc();
+            const DXGI_FORMAT f = write ? uav_format(rd.Format) : srv_format(rd.Format);
+            if (f == DXGI_FORMAT_UNKNOWN || rd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+                (write && !(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)))
+                throw std::runtime_error("wilsjo2 stage (D3D12): an Interleaved image it cannot " + std::string(write ? "write" : "read") +
+                                         " (format " + std::to_string(int(rd.Format)) + ")");
+            ensure_(r, write ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            binds.push_back({b, r, f, write});
+        }
+        const UINT k = (lay.descriptors() + 15) / 16;
+        const SlotRef sr = take_slots(k);
+        bind_block(sr.block);
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu = sr.block->heap->GetCPUDescriptorHandleForHeapStart();
+        D3D12_GPU_DESCRIPTOR_HANDLE gpu = sr.block->heap->GetGPUDescriptorHandleForHeapStart();
+        cpu.ptr += SIZE_T(sr.index) * 16 * inc_;
+        gpu.ptr += UINT64(sr.index) * 16 * inc_;
+        if (!d3d12_il::write_descriptors(device_, cpu, inc_, lay, binds.data(), binds.size()))
+            throw std::runtime_error("wilsjo2 stage (D3D12): an Interleaved binding its program does not declare");
+        D3D12_GPU_DESCRIPTOR_HANDLE gpu_uav = gpu;
+        gpu_uav.ptr += UINT64(lay.srv.size()) * inc_;
+        cmd_->SetComputeRootSignature(lay.rs);
+        cmd_->SetPipelineState(program == 0u ? il_pso_[step] : ilpp_pso_);
+        cmd_->SetComputeRoot32BitConstants(0, std::min((bytes + 3) / 4, lay.dwords), push, 0);
+        cmd_->SetComputeRootDescriptorTable(1, gpu);
+        cmd_->SetComputeRootDescriptorTable(2, gpu_uav);
+        cmd_->Dispatch(gx, gy, 1);
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        b.UAV.pResource = nullptr;
+        cmd_->ResourceBarrier(1, &b);
+        ++dispatches_;
+    }
     void record(const w2::Dispatch& d) override {
         const uint32_t mode = d.constants.mode;
         if (!cmd_) throw std::runtime_error("wilsjo2 stage (D3D12): recorded outside a recording");
@@ -518,6 +593,78 @@ public:
     void set_tickets(TicketOf t, DoneOf d) { ticket_of_ = std::move(t); done_of_ = std::move(d); }
     const nr::gpu::Uses& uses() const { return uses_; }
 private:
+    d3d12_il::Layout il_lay_, ilpp_lay_;
+    ID3D12PipelineState* il_pso_[6] = {};   // il's steps (0, 1, 3, 4, 5)
+    ID3D12PipelineState* ilpp_pso_ = nullptr;
+    bool il_loaded_ = false;
+    bool load_il(const std::wstring& dir, std::string* why) {
+        const auto text_of = [&](const wchar_t* name) {
+            std::string t;
+            if (FILE* fp = _wfopen((dir + name).c_str(), L"rb")) {
+                char buf[65536];
+                size_t n;
+                while ((n = std::fread(buf, 1, sizeof buf, fp)) > 0) t.append(buf, n);
+                std::fclose(fp);
+            }
+            return t;
+        };
+        const std::string il = text_of(L"renodx_il.hlsl"), pp = text_of(L"renodx_il_pp.hlsl");
+        if (il.empty() || pp.empty()) { *why = "renodx_il.hlsl / renodx_il_pp.hlsl missing"; return false; }
+        d3d12_il::registers(il, &il_lay_);
+        il_lay_.dwords = 24;
+        d3d12_il::registers(pp, &ilpp_lay_);
+        ilpp_lay_.dwords = 7;
+        if (il_lay_.srv.empty() || il_lay_.uav.empty() || ilpp_lay_.srv.empty() || ilpp_lay_.uav.empty()) {
+            *why = "a program declares no reads or no writes";
+            return false;
+        }
+        if (!d3d12_il::make_root_signature(device_, &il_lay_, why) || !d3d12_il::make_root_signature(device_, &ilpp_lay_, why))
+            return false;
+        const auto pipeline = [&](const std::string& text, const d3d12_il::Layout& lay, uint32_t step, ID3D12PipelineState** out) {
+            ID3DBlob* code = d3d12_il::compile(text, step, why);
+            if (!code) return false;
+            D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+            pd.pRootSignature = lay.rs;
+            pd.CS.pShaderBytecode = code->GetBufferPointer();
+            pd.CS.BytecodeLength = code->GetBufferSize();
+            const HRESULT hr = device_->CreateComputePipelineState(&pd, IID_PPV_ARGS(out));
+            code->Release();
+            if (FAILED(hr) || !*out) { *why = "a program does not make a pipeline"; return false; }
+            return true;
+        };
+        for (uint32_t step : {0u, 1u, 3u, 4u, 5u})
+            if (!pipeline(il, il_lay_, step, &il_pso_[step])) return false;
+        if (!pipeline(pp, ilpp_lay_, ~0u, &ilpp_pso_)) return false;
+        il_loaded_ = true;
+        return true;
+    }
+    // `k` contiguous slots of the current block (an Interleaved dispatch's descriptors take several), by take_slot's
+    // rule for each; none free in a row: a block of its own.
+    SlotRef take_slots(uint32_t k) {
+        if (k <= 1) return take_slot();
+        if (blocks_.empty()) throw std::runtime_error("wilsjo2 stage (D3D12): no descriptor block");
+        const nr::gpu::Ticket ticket = ticket_here();
+        const auto claim = [&](Block* b, uint32_t i) {
+            for (uint32_t j = 0; j < k; ++j) { b->used[i + j] = 1; b->slots[i + j] = ticket; }
+            prune(b->uses);
+            prune(uses_);
+            b->uses.tickets.push_back(ticket);
+            uses_.tickets.push_back(ticket);
+            b->next = (i + k) % kSlots;
+            return SlotRef{b, i};
+        };
+        Block* b = blocks_.front().get();
+        for (uint32_t n = 0; n < kSlots; ++n) {
+            const uint32_t i = (b->next + n) % kSlots;
+            if (i + k > kSlots) continue;
+            bool free = true;
+            for (uint32_t j = 0; j < k && free; ++j) free = !b->used[i + j] || done(b->slots[i + j]);
+            if (free) return claim(b, i);
+        }
+        std::string why;
+        if (!make_block(&why)) throw std::runtime_error("wilsjo2 stage (D3D12): " + why);
+        return claim(blocks_.front().get(), 0);
+    }
     bool make_block(std::string* why) {
         struct Cleanup {
             Block& b;
@@ -644,6 +791,7 @@ private:
         return copy_into(r, c);
     }
     ID3D12Resource* copy_into(ID3D12Resource* r, ID3D12Resource* c) {
+        copy_use_[c] = CopyUse{ticket_here(), recordings_};
         ensure_(r, D3D12_RESOURCE_STATE_COPY_SOURCE);
         D3D12_RESOURCE_BARRIER b{};
         b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -664,6 +812,9 @@ private:
     bool is_copy(ID3D12Resource* r) const { return std::find(copies_.begin(), copies_.end(), r) != copies_.end(); }
     std::vector<ID3D12Resource*> copies_;
     std::set<ID3D12Resource*> copy_dest_;   // made, not yet copied into (in COPY_DEST)
+    struct CopyUse { nr::gpu::Ticket ticket; uint64_t recording = 0; };
+    std::map<ID3D12Resource*, CopyUse> copy_use_;   // each copy's last use (sweep_copies)
+    uint64_t recordings_ = 0;
     static constexpr uint32_t kModes = 128;
     ID3D12Device* device_ = nullptr;
     ID3D12RootSignature* rs_ = nullptr;

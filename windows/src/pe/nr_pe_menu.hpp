@@ -32,7 +32,7 @@ namespace nr::pe::menu {
 void install();
 
 // Lines another part of the .asi adds to NR Control's Diagnostics (the D3D12 passthrough's,
-// nr_d3d12_asd_panel.cpp; no other build sets one).
+// nr_d3d12_passthrough_panel.cpp; no other build sets one).
 void set_extra_diagnostics(void (*draw)());
 // And to its Network page, under the network options (the D3D12 passthrough's switch).
 void set_extra_network(void (*draw)());

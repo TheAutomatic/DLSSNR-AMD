@@ -1,8 +1,8 @@
 #include "nr_path_u8.hpp"
-// The real network of the D3D12 passthrough (nr_d3d12_asd_net.hpp). Same steps, same order, same names as
+// The real network of the D3D12 passthrough (nr_d3d12_passthrough_net.hpp). Same steps, same order, same names as
 // nr::Runtime runs its network (windows/src/core/nr_runtime.cpp): build, retarget, controls / patch_push, record. What
 // differs is only what D3D12 and the ELF pipelines need:
-//   - a dispatch is the pipeline made from its kernel's ACO record (nr_d3d12_asd_elf.hpp) with a 4 KB table per
+//   - a dispatch is the pipeline made from its kernel's ACO record (nr_d3d12_passthrough_elf.hpp) with a 4 KB table per
 //     dispatch - buffer and image descriptors, the push block at 512, the grid at 640 - bound as the root UAV (the
 //     ELF's prefix loads the kernel's descriptor pointer, push constants and grid from it), where the Vulkan runtime
 //     binds a descriptor set and pushes constants;
@@ -14,11 +14,11 @@
 //   - the activation arena's "zero once" is a fresh committed resource (D3D12 zeroes those);
 //   - the seed-0 noise table is a buffer of its own at the pre kernels' binding 5, made once frames keep seed 0
 //     (a 256-byte stand-in until then), as Runtime::Impl::make_noise;
-//   - the alpha pass is HLSL on the linear buffers (runtime_alpha.comp's arithmetic);
+//   - the post block restores the frame's alpha (and the 8-bit rounding) itself, as the runtime's (no alpha pass);
 //   - the temporal params buffer travels with the frame's tables (one upload, one copy).
-#include "nr_d3d12_asd_net.hpp"
-#include "nr_d3d12_asd.hpp"
-#include "nr_d3d12_asd_elf.hpp"
+#include "nr_d3d12_passthrough_net.hpp"
+#include "nr_d3d12_passthrough.hpp"
+#include "nr_d3d12_passthrough_elf.hpp"
 #include "tinlayout.hpp"
 #include "nr_ini_network.hpp"
 #include "nr_pe_log.hpp"
@@ -41,7 +41,7 @@
 #include <utility>
 #include <vector>
 
-namespace nr::pe::asd {
+namespace nr::pe::d3d12_passthrough {
 namespace {
 
 template <class T> void release(T*& p) { if (p) { p->Release(); p = nullptr; } }
@@ -90,7 +90,8 @@ uint64_t fnv1a64(const uint8_t* p, size_t n) {
     return h;
 }
 
-// ---- a kernel's pipeline: its ACO record wrapped into a PAL ELF (nr_d3d12_asd_elf.hpp) ------------------------
+// ---- a kernel's pipeline: its ACO record wrapped into a PAL ELF (nr_d3d12_passthrough_elf.hpp)
+// ------------------------
 struct KernElf { uint32_t dims[3]{}; std::string stem; std::vector<uint8_t> elf_bytes; std::set<uint32_t> e4m3;
                  std::vector<uint32_t> aliases; };
 // RDNA3's stand-ins: the storage-buffer bindings that hold e4m3 data (nrvk.hpp's e4m3_view_bindings, the same rule: the
@@ -169,17 +170,18 @@ void put_buf(uint32_t* d, uint64_t va, uint64_t bytes) {
     d[2] = uint32_t(bytes);
     d[3] = 0x30014facu;
 }
-// A linear image over a buffer, pitch = width. `format`: the RDNA4 image format, 63 32_32_32_32_FLOAT (RGBA32F) or
-// 57 16_16_16_16_FLOAT (RGBA16F); RADV's own descriptors for linear images of the two formats differ in that field
-// alone (vkGetDescriptorEXT, gfx1201).
+// A linear image over a buffer, rows of `pitch` texels (lin_pitch: a multiple of 128 bytes). `format`: the RDNA4 image
+// format, 63 32_32_32_32_FLOAT (RGBA32F) or 57 16_16_16_16_FLOAT (RGBA16F); RADV's own descriptors for linear images of
+// the two formats differ in that field alone (vkGetDescriptorEXT, gfx1201). The pitch - 1 in word 4: its low 14 bits
+// there (DEPTH_GFX12), the rest in PITCH_MSB_GFX12 - pitches above 16384 texels are not made (ready() refuses them).
 constexpr uint32_t kFormatRgba32f = 63, kFormatRgba16f = 57;
-void put_image(uint32_t* d, uint64_t va, uint32_t width, uint32_t height, uint32_t format) {
+void put_image(uint32_t* d, uint64_t va, uint32_t width, uint32_t height, uint32_t format, uint32_t pitch) {
     const uint32_t wm1 = width - 1, hm1 = height - 1;
     d[0] = uint32_t(va >> 8);
     d[1] = uint32_t((va >> 40) & 0xffu) | (format << 17) | ((wm1 & 3u) << 30);
     d[2] = (wm1 >> 2) | (hm1 << 14);
     d[3] = 0x90000facu;
-    d[4] = wm1;
+    d[4] = pitch - 1u;
     d[5] = 4u << 20;
     d[6] = 1u << 15;
     d[7] = 0;
@@ -234,55 +236,6 @@ void transition(ID3D12GraphicsCommandList* cmd, ID3D12Resource* r, D3D12_RESOURC
     cmd->ResourceBarrier(1, &b);
 }
 
-// runtime_alpha.comp (windows/shaders/passes): the frame's alpha back onto the answer, the 8-bit rounding for an
-// 8-bit output.
-const char kAlpha[] =
-    "cbuffer C : register(b0) { uint g_w; uint g_h; uint g_u8; uint g_half; };\n"
-    "RWByteAddressBuffer result : register(u0);\n"
-    "RWByteAddressBuffer original : register(u1);\n"
-    "[numthreads(8, 8, 1)] void alpha(uint3 id : SV_DispatchThreadID) {\n"
-    "    if (id.x >= g_w || id.y >= g_h) return;\n"
-    "    const uint i = id.y * g_w + id.x;\n"
-    "    if (g_half != 0) {\n"
-    "        uint2 r = result.Load2(i * 8);\n"
-    "        uint2 o = original.Load2(i * 8);\n"
-    "        float3 rgb = f16tof32(uint3(r.x & 0xffffu, r.x >> 16, r.y & 0xffffu));\n"
-    "        if (g_u8 != 0) { precise float3 scaled = saturate(rgb) * 255.0; rgb = (floor(scaled) + step(0.5, frac(scaled))) / 255.0; }\n"
-    "        uint3 h = f32tof16(rgb);\n"
-    "        result.Store2(i * 8, uint2(h.x | (h.y << 16), h.z | (o.y & 0xffff0000u)));\n"
-    "    } else {\n"
-    "        float4 r = asfloat(result.Load4(i * 16));\n"
-    "        float4 o = asfloat(original.Load4(i * 16));\n"
-    "        float3 rgb = r.rgb;\n"
-    "        if (g_u8 != 0) { precise float3 scaled = saturate(rgb) * 255.0; rgb = (floor(scaled) + step(0.5, frac(scaled))) / 255.0; }\n"
-    "        result.Store4(i * 16, asuint(float4(rgb, o.a)));\n"
-    "    }\n"
-    "}\n";
-
-// RDNA3's: the same pass over rows of `g_pitch` texels (lin_pitch: 256-byte aligned rows there).
-const char kAlphaPitched[] =
-    "cbuffer C : register(b0) { uint g_w; uint g_h; uint g_u8; uint g_half; uint g_pitch; };\n"
-    "RWByteAddressBuffer result : register(u0);\n"
-    "RWByteAddressBuffer original : register(u1);\n"
-    "[numthreads(8, 8, 1)] void alpha(uint3 id : SV_DispatchThreadID) {\n"
-    "    if (id.x >= g_w || id.y >= g_h) return;\n"
-    "    const uint i = id.y * g_pitch + id.x;\n"
-    "    if (g_half != 0) {\n"
-    "        uint2 r = result.Load2(i * 8);\n"
-    "        uint2 o = original.Load2(i * 8);\n"
-    "        float3 rgb = f16tof32(uint3(r.x & 0xffffu, r.x >> 16, r.y & 0xffffu));\n"
-    "        if (g_u8 != 0) { precise float3 scaled = saturate(rgb) * 255.0; rgb = (floor(scaled) + step(0.5, frac(scaled))) / 255.0; }\n"
-    "        uint3 h = f32tof16(rgb);\n"
-    "        result.Store2(i * 8, uint2(h.x | (h.y << 16), h.z | (o.y & 0xffff0000u)));\n"
-    "    } else {\n"
-    "        float4 r = asfloat(result.Load4(i * 16));\n"
-    "        float4 o = asfloat(original.Load4(i * 16));\n"
-    "        float3 rgb = r.rgb;\n"
-    "        if (g_u8 != 0) { precise float3 scaled = saturate(rgb) * 255.0; rgb = (floor(scaled) + step(0.5, frac(scaled))) / 255.0; }\n"
-    "        result.Store4(i * 16, asuint(float4(rgb, o.a)));\n"
-    "    }\n"
-    "}\n";
-
 // The temporal state of one feature (Runtime::Impl::FeatureState): its two history images (the post block writes the
 // next frame's into the other, t.pingpong), the latch, the seed counter, the input domain its history was made under.
 // D3D12 zeroes a new committed resource: a fresh feature's history is cleared as the runtime clears it.
@@ -303,6 +256,8 @@ struct FeatureState {
 struct Built {
     uint32_t w = 0, h = 0;
     nr::D3d12NetPlan plan;
+    std::chrono::steady_clock::time_point last{};   // its last record (the stale-history rule on a switch back)
+    int hist_f16 = -1;                                // the history precision its features were made in (-1: none yet)
     // RDNA3: the bindings that read an FP16 twin (e4m3 views: the arena's and the weights' twins) and the alias
     // bindings (kAliasBase + k: raw-word views of buffer k), from the stand-in's interface
     struct Kern { ID3D12PipelineState* pso = nullptr; uint32_t tag = 0; Family fam; std::set<uint32_t> e4m3;
@@ -603,7 +558,7 @@ std::shared_ptr<Built> build(ID3D12Device* device, ID3D12RootSignature* rs, uint
     return b;
 }
 
-class AcoNetwork final : public D3d12AsdNetwork {
+class AcoNetwork final : public D3d12PassthroughNetwork {
 public:
     AcoNetwork() : shared_(std::make_shared<Shared>()) {}
     ~AcoNetwork() override {
@@ -617,7 +572,7 @@ public:
         for (auto& r : retire_upload_) if (r.upload) r.upload->Release();
         if (stamps_map_) stamps_->Unmap(0, nullptr);
         release(stamps_); release(queries_);
-        release(alpha_pso_); release(alpha_rs_); release(rs_);
+        release(rs_);
         if (device_) device_->Release();
     }
     const char* name() const override { return name_.c_str(); }
@@ -643,35 +598,6 @@ public:
     bool create(ID3D12Device* device, const char** why) override {
         static std::string w;
         if (!elf::create_carrier_root_signature(device, 1, &rs_, &w)) { *why = w.c_str(); return false; }
-        // The alpha pass: constants, the answer, the frame.
-        D3D12_ROOT_PARAMETER p[3]{};
-        p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        p[0].Constants.Num32BitValues = rdna3() ? 5 : 4;   // (RDNA3: + the row pitch)
-        p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
-        p[1].Descriptor.ShaderRegister = 0;
-        p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
-        p[2].Descriptor.ShaderRegister = 1;
-        D3D12_ROOT_SIGNATURE_DESC rd{};
-        rd.NumParameters = 3;
-        rd.pParameters = p;
-        ID3DBlob *blob = nullptr, *errors = nullptr;
-        const HRESULT hr = D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors);
-        release(errors);
-        if (FAILED(hr) || !blob) { *why = "the alpha pass's root signature did not serialize"; return false; }
-        const HRESULT hr2 = device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&alpha_rs_));
-        release(blob);
-        if (FAILED(hr2)) { *why = "the alpha pass's root signature could not be made"; return false; }
-        alpha_pitched_ = rdna3();
-        ID3DBlob* code = alpha_pitched_ ? compile_cs(kAlphaPitched, sizeof kAlphaPitched - 1, "alpha", &w)
-                                        : compile_cs(kAlpha, sizeof kAlpha - 1, "alpha", &w);
-        if (!code) { *why = w.c_str(); return false; }
-        D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
-        pd.pRootSignature = alpha_rs_;
-        pd.CS.pShaderBytecode = code->GetBufferPointer();
-        pd.CS.BytecodeLength = code->GetBufferSize();
-        const HRESULT hr3 = device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&alpha_pso_));
-        release(code);
-        if (FAILED(hr3)) { *why = "the alpha pass's pipeline could not be made"; return false; }
         // The network's GPU time: two timestamps per measured recording, read back after its completion. The
         // tick rate from a queue of our own (the device's timestamp frequency; nothing is submitted to it).
         D3D12_QUERY_HEAP_DESC qh{};
@@ -696,13 +622,18 @@ public:
 
     bool ready(ID3D12Device*, uint32_t w, uint32_t h, std::string* why) override {
         sweep();
+        Built* const was = current_;   // the network the last ready() settled on (the stale-history rule's "switch")
         {
             std::lock_guard<std::recursive_mutex> l(state_m_);
             current_shared_.reset();
             current_ = nullptr;
         }
         building_ = false;
-        if (w % 8) { *why = "width " + std::to_string(w) + " is not a multiple of 8 (the network's RGBA32F image rows)"; return false; }
+        // Any width (lin_pitch pads the rows, as RADV's linear images); RDNA4's pitch word holds at most 16384 texels
+        if (!w || !h || lin_pitch(w, 8) > 16384u) {
+            *why = "a network extent of " + std::to_string(w) + " x " + std::to_string(h) + " (rows of at most 16384 texels)";
+            return false;
+        }
         NetModelQuery query = g_model_query.load();
         const int q = query ? query() : -1;
         const int want = q >= 0 ? q : (last_want_ >= 0 ? last_want_ : nr::kSmallFp8);
@@ -727,6 +658,15 @@ public:
         }
         if (auto it = nets_.find(key); it != nets_.end()) {
             std::lock_guard<std::recursive_mutex> l(state_m_);
+            // Taken up again after serving nothing for 250 ms: its features start afresh, as after a Reset
+            // (Session::select_runtime's kStaleHistory -> Runtime::forget_history); layers taking turns every frame
+            // keep theirs.
+            if (was != it->second.get() && it->second->last != std::chrono::steady_clock::time_point{} &&
+                std::chrono::steady_clock::now() - it->second->last > std::chrono::milliseconds(250)) {
+                for (auto& fe : it->second->features)
+                    if (fe.second) fe.second->latch = false;
+                nr::pe::log("[d3d12] network %ux%u taken up again: its history starts afresh", it->second->w, it->second->h);
+            }
             current_shared_ = it->second;
             current_ = current_shared_.get();
             current_->used = tick_;
@@ -800,8 +740,8 @@ public:
         return false;
     }
     bool building() const override { return building_; }
-    AsdNetStatus status() const override {
-        AsdNetStatus s;
+    PassthroughNetStatus status() const override {
+        PassthroughNetStatus s;
         {
             std::lock_guard<std::recursive_mutex> l(state_m_);
             s.running_net = current_ ? current_->net : -1;
@@ -817,8 +757,17 @@ public:
         return s;
     }
     void controls(const nr::D3d12NetControls& c) override { controls_ = c; }
-    void history_f16(bool on) override { f16_set_ = true; f16_want_ = on; }
+    void history_f16(bool on) override {   // NR_HIST16 in the environment wins (Runtime::set_history_f16)
+        if (std::getenv("NR_HIST16")) return;
+        f16_set_ = true; f16_want_ = on;
+    }
+    void style_grade(bool on) override { grade_set_ = true; grade_want_ = on; }
     void temporal(const NetTemporal& t) override { temporal_ = t; }
+    uint32_t history_texel_bytes() const override {   // (record's own rule for the precision below)
+        const Built* b = current_;
+        if (!b) return 0;
+        return (f16_set_ ? f16_want_ : b->plan.temporal.history_f16) && b->t_post16.pso ? 8u : 16u;
+    }
     bool motion_without_depth() const override {
         if (current_) return current_->plan.temporal.motion_without_depth;
         if (!nets_.empty()) return nets_.begin()->second->plan.temporal.motion_without_depth;
@@ -829,11 +778,28 @@ public:
         const auto c0 = std::chrono::steady_clock::now();
         Built* b = current_;
         if (!b || b->w != in.width || b->h != in.height) { *why = "no network for this extent"; return false; }
-        if ((in.va & 255) || (out.va & 255) || (temporal_.motion_va & 255) || (temporal_.depth_va & 255)) { *why = "a linear buffer is not 256-byte aligned"; return false; }
+        b->last = c0;
+        if ((in.va & 255) || (out.va & 255) || (temporal_.motion_va & 255) || (temporal_.depth_va & 255) || (temporal_.history_va & 255)) { *why = "a linear buffer is not 256-byte aligned"; return false; }
         const auto& tp = b->plan.temporal;
         // [Network] History Precision as the caller last said (history_f16), the plan's ini value before that; RGBA16F
         // only when the folder has its posts (the runtime's h16_ok).
         const bool f16 = (f16_set_ ? f16_want_ : tp.history_f16) && b->t_post16.pso;
+        // A change of the precision is a cut for every feature of this network, not only the one recording now
+        // (Runtime::Impl::switch_history clears them all): one left in the old format would otherwise come back
+        // with a history from before the switch.
+        if (b->hist_f16 >= 0 && b->hist_f16 != int(f16)) {
+            for (auto it = b->features.begin(); it != b->features.end();) {
+                RetiredUse r;
+                r.net = current_shared_;
+                if (it->second) { r.frame = it->second->last_frame; r.uses = it->second->gpu; }
+                r.hold = std::move(it->second);
+                retired_features_.push_back(std::move(r));
+                it = b->features.erase(it);
+            }
+            nr::pe::log("[d3d12] history images %s ([Network] History Precision %s): every feature starts afresh",
+                        f16 ? "RGBA16F" : "RGBA32F", f16 ? "16" : "32");
+        }
+        b->hist_f16 = int(f16);
         // This frame's feature (Runtime::record_all): its state, made on its first frame. A feature whose history is
         // in the other format starts afresh (Runtime::Impl::switch_history: a switch is a cut, as a network switch is).
         FeatureState* fs = nullptr;
@@ -859,7 +825,7 @@ public:
                 nr::vram::Scope s_hist(nr::vram::kUnset, b->net);
                 for (auto& hh : fresh->hist) {
                     hh = buffer(device_, D3D12_HEAP_TYPE_DEFAULT,
-                                uint64_t(lin_pitch(b->w, f16 ? 8 : 16)) * b->h * (f16 ? 8 : 16),   // (RDNA3: pitched rows)
+                                uint64_t(lin_pitch(b->w, f16 ? 8 : 16)) * b->h * (f16 ? 8 : 16),   // (rows of lin_pitch texels)
                                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
                     nr::vram::track_d3d12(device_, hh, nr::vram::kUnset);
                 }
@@ -897,9 +863,15 @@ public:
         const uint64_t stand_va = b->stand->GetGPUVirtualAddress();
         const uint64_t table_va = b->table->GetGPUVirtualAddress();
         const uint64_t params_va = table_va + uint64_t(b->tables) * kTableBytes;
-        const uint64_t hist_va = fs->hist[fs->hcur]->GetGPUVirtualAddress(), store_va = fs->hist[fs->hcur ^ 1u]->GetGPUVirtualAddress();
+        // (Passes (fast) Interleaved: the pass's history as it made it, read in place of the feature's; the post block still
+        // stores into the feature's other image, the next frame's history)
+        const uint64_t hist_va = temporal_.history_va ? temporal_.history_va : fs->hist[fs->hcur]->GetGPUVirtualAddress();
+        const uint64_t store_va = fs->hist[fs->hcur ^ 1u]->GetGPUVirtualAddress();
         NetControlsPatch patch = g_patch.load();
-        const bool grade = b->t_grade.pso && controls_.style != 0;
+        // [Network] Style Grade as the caller last said (style_grade), the plan's ini value before that (the Vulkan
+        // runtime's style_grade && style_grade_on)
+        const bool grade = b->t_grade.pso && controls_.style != 0 && !controls_.no_grade &&
+                           (grade_set_ ? grade_want_ : b->plan.style_grade);
 
         // retarget: the weights with their tail once. Recorded only after this record has a slot: a record that
         // declines below must not leave the weight copy in the list, or the next one would transition b->wgt from
@@ -1046,7 +1018,8 @@ public:
                 const uint32_t in_format = in.bytes == uint64_t(lin_pitch(b->w, 8)) * b->h * 8 ? kFormatRgba16f : kFormatRgba32f;
                 const uint32_t out_format = out.bytes == uint64_t(lin_pitch(b->w, 8)) * b->h * 8 ? kFormatRgba16f : kFormatRgba32f;
                 const auto put_img = [&](uint32_t* dd, uint64_t va, uint32_t iw, uint32_t ih, uint32_t fmt) {
-                    if (b->rdna3) put_image_gfx11(dd, va, iw, ih, fmt); else put_image(dd, va, iw, ih, fmt);
+                    if (b->rdna3) put_image_gfx11(dd, va, iw, ih, fmt);   // (its rows: 256-byte aligned, no pitch word)
+                    else put_image(dd, va, iw, ih, fmt, lin_pitch(iw, fmt == kFormatRgba16f ? 8u : 16u));
                 };
                 const uint32_t mv_format = temporal_.motion_f16 ? kFormatRgba16f : kFormatRgba32f;
                 switch (m) {
@@ -1191,17 +1164,6 @@ public:
                 b->wgt_e_upload = nullptr;
             }
         }
-        if (controls_.automatic_mask) {
-            const uint32_t half_io = out.bytes == uint64_t(lin_pitch(b->w, 8)) * b->h * 8 ? 1u : 0u;
-            const UINT c[5] = {b->w, b->h, controls_.round_u8 ? 1u : 0u, half_io, lin_pitch(b->w, half_io ? 8 : 16)};
-            cmd->SetComputeRootSignature(alpha_rs_);
-            cmd->SetPipelineState(alpha_pso_);
-            cmd->SetComputeRoot32BitConstants(0, alpha_pitched_ ? 5 : 4, c, 0);
-            cmd->SetComputeRootUnorderedAccessView(1, out.va);
-            cmd->SetComputeRootUnorderedAccessView(2, in.va);
-            cmd->Dispatch((b->w + 7) / 8, (b->h + 7) / 8, 1);
-            uav_barrier(cmd);
-        }
         if (timed) {
             cmd->EndQuery(queries_, D3D12_QUERY_TYPE_TIMESTAMP, ts * 2 + 1);
             cmd->ResolveQueryData(queries_, D3D12_QUERY_TYPE_TIMESTAMP, ts * 2, 2, stamps_, uint64_t(ts) * 16);
@@ -1243,7 +1205,7 @@ private:
         ++gpu_n_; gpu_sum_ += ms;
         gpu_min_ = gpu_n_ == 1 ? ms : std::min(gpu_min_, ms);
         gpu_max_ = std::max(gpu_max_, ms);
-        if (++gpu_seen_ <= 3) nr::pe::log("[d3d12] timing: one D3D12 network frame took %.3f ms on the GPU (network + alpha pass)", ms);
+        if (++gpu_seen_ <= 3) nr::pe::log("[d3d12] timing: one D3D12 network frame took %.3f ms on the GPU", ms);
     }
     std::string gpu_text() {
         char t[96];
@@ -1268,9 +1230,6 @@ private:
     std::string name_ = "the ACO network";
     ID3D12Device* device_ = nullptr;
     ID3D12RootSignature* rs_ = nullptr;
-    ID3D12RootSignature* alpha_rs_ = nullptr;
-    ID3D12PipelineState* alpha_pso_ = nullptr;
-    bool alpha_pitched_ = false;   // RDNA3's pass (kAlphaPitched, five constants)
     std::shared_ptr<Shared> shared_;
     std::map<std::tuple<uint32_t, uint32_t, int>, std::shared_ptr<Built>> nets_;
     std::shared_ptr<Built> current_shared_;
@@ -1300,6 +1259,7 @@ private:
     uint64_t tick_ = 0;
     nr::D3d12NetControls controls_;
     bool f16_set_ = false, f16_want_ = true;   // [Network] History Precision from the caller (history_f16)
+    bool grade_set_ = false, grade_want_ = true;   // [Network] Style Grade from the caller (style_grade)
     NetTemporal temporal_;
     uint32_t plain_seed_ = 0;
     std::map<uint64_t, uint32_t> plain_seeds_;
@@ -1323,8 +1283,8 @@ void set_net_planner(NetPlanner planner, NetControlsPatch patch, NetModelQuery m
 }
 NetPlanner net_planner() { return g_planner.load(); }
 
-std::unique_ptr<D3d12AsdNetwork> make_aco_network() {
+std::unique_ptr<D3d12PassthroughNetwork> make_aco_network() {
     return std::make_unique<AcoNetwork>();
 }
 
-}  // namespace nr::pe::asd
+}  // namespace nr::pe::d3d12_passthrough

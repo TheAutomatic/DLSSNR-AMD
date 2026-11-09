@@ -397,6 +397,11 @@ struct EngineFrame {
     // extent, one pass, the model applied). `colour` is then only read, and the
     // host's seed copy of the colour into the target is not needed.
     ColourFrame target;
+    // A history the caller made for this run (RGBA16F at the network's size, GENERAL): written into the image the
+    // feature's history is read from, before the network runs, when the history gate is open. Passes (fast)
+    // Interleaved: what this pass would have written last frame, made from the slots' increments, so a pass that ran
+    // several frames ago reads a history one frame old (read with this frame's own motion vectors).
+    ColourFrame history;
 };
 
 struct EngineResult {
@@ -539,6 +544,8 @@ public:
     // Natural and Cinematic graded after the post block as NVIDIA's DLL does (true, the default), or not (false: the
     // picture these styles had before the grade was ported). Per frame; nothing is rebuilt.
     void set_style_grade(bool);
+    // Whether Natural / Cinematic are graded now (the switch on and the grade's pipelines in the shader folder).
+    bool style_grade_active() const;
     // [Network] History Precision, live: true = the history images in RGBA16F (the default), false = RGBA32F. Applied
     // at the next recording; the history starts afresh then. NR_HIST16 in the environment wins (comparisons).
     void set_history_f16(bool);

@@ -24,6 +24,8 @@ namespace nr::asi::hudcap {
 // The game's swap chain was made on `device` (its back buffers' views and the pipelines made from now on are followed
 // once the capture is armed; `armed_now`: [HudFix] Mode is Auto or Captured already - the device's hooks go in at once).
 void d3d12_device(ID3D12Device* device, bool armed_now);
+// Observe root creation early; this does not adopt a device or arm capture.
+void d3d12_module(HMODULE module);
 
 // At the game's Present, before the layers: armed or not this frame (the hooks go in at the first armed one; `queue` the
 // one the game presents on), and the verdict on the frame's writes for `back` (its swap chain's current buffer, `format`
@@ -38,6 +40,12 @@ enum class Result { kOff, kCaptured, kClean, kMissed };
 struct Fg {
     bool seen = false;             // this frame's, usable: `copy` holds it, or (copied == false) `game` in `state` does
     ID3D12Resource* copy = nullptr;   // ours (UNORDERED_ACCESS, the back buffer's writable format, w x h)
+    // Authored XeSS UI alpha, paired with this HUD-less resource by context/presentId/epoch.
+    // Full-frame SDR RGBA8 only, valid until Present; ui_keep pins the original through the GPU copy.
+    ID3D12Resource* ui = nullptr;
+    D3D12_RESOURCE_STATES ui_state = D3D12_RESOURCE_STATE_COMMON;
+    uint32_t ui_frame = 0;
+    std::shared_ptr<void> ui_keep;
     bool copied = false;           // already copied into `copy` (on the game's list, when it was handed over)
     ID3D12Resource* game = nullptr;   // the game's resource, valid until the present
     D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
@@ -54,7 +62,19 @@ struct Frame {
     std::string why;
     bool broken = false;   // the capture cannot run in this game at all (its hooks): greyed in the menu, `why`
     Fg fg;
+    // kCaptured by the chain capture (nr_hud_capture.hpp chain_picks): `hudless` is the copy of the game's image
+    // `chain_image`, the last finished picture of the back buffer's size before its final pass. Until it is trusted
+    // (`chain_trusted`: its copies fitted the presented frame - chain_checked) the layers run on the frame itself and
+    // the copy only says where the HUD is.
+    bool chain = false, chain_trusted = false;
+    uint64_t chain_image = 0;
+    std::shared_ptr<void> chain_keep; // pins selected snapshot until its reader recording is registered
 };
+// The chain capture's check (the Present layers, a few frames later): the copy of `image` composed against the presented
+// frame differed from it in `hud` of `total` pixels. A copy differing in more than a quarter is not the frame without
+// its HUD: refused for a while; one fitting for 15 frames in a row is trusted (NR then runs on it).
+void chain_checked(uint64_t image, uint32_t hud, uint32_t total);
+void d3d12_use_chain(const Frame& frame); // current nr::gpu recording reads this snapshot
 // fg_list_copies: a hand-over valid only while it is handed over is copied on the command list it came with (HUD FIX takes
 // it); otherwise only hand-overs valid until the present are kept (read at the Present, nothing put into another's list).
 Frame d3d12_present(ID3D12Device* device, IDXGISwapChain* sc, ID3D12CommandQueue* queue, ID3D12Resource* back,
@@ -65,6 +85,10 @@ void d3d12_backs(IDXGISwapChain* sc);
 // Frame generation's hand-overs are taken from the game's own calls only (`game` says whether a caller address is the
 // game's): OptiScaler's own frame generation calls the same libraries with its own command lists and threads.
 void set_game_caller(bool (*game)(void* caller));
+// HUD FIX wants the capture (Auto / Captured): the views' bookkeeping runs (hooks installed then; off: stopped). The
+// query answers at a device's creation, before the first Present ([HudFix] Mode read from the ini).
+void set_capture_wanted(bool wanted);
+void set_capture_wanted_query(bool (*query)());
 // The game dispatches its FSR frame generation itself (its last configure gave no frame-generation callback): the
 // generated frames are made from a frame of the game's, not from the back buffer at the present.
 bool ffx_app_dispatch();
@@ -72,7 +96,7 @@ bool ffx_app_dispatch();
 // the capture hooks the queue itself only where that hook is not there): the lists' writes in the GPU's order.
 nr::gpu::Ticket d3d12_recording(ID3D12GraphicsCommandList* list);
 bool vk_lifetime(VkDevice device);
-void d3d12_executed(unsigned count, ID3D12CommandList* const* lists);
+void d3d12_executed(unsigned count, ID3D12CommandList* const* lists, ID3D12CommandQueue* queue);
 // NGX's DLSS-G evaluate (the .asi's NVSDK_NGX_D3D12_EvaluateFeature hook): its DLSSG.HUDLess (COPY_DEST there, as
 // OptiScaler takes it), copied on its command list. `layers_here`: the Present layers run in this evaluate (d3d12_present
 // is called from it next, `sc` null): the frame is this present's, NR's change may be put into it.

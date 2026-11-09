@@ -99,7 +99,8 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* feature, void* param
 void release_d3d12(Feature* feature);
 
 // A backend that can take the evaluate's frame instead of everything evaluate_d3d12 does after NR Control is installed
-// (the .asi's D3D12 passthrough, nr_d3d12_asd_backend.cpp; no other build sets one). True: it recorded the frame
+// (the .asi's D3D12 passthrough, nr_d3d12_passthrough_backend.cpp; no other build sets one). True: it recorded the
+// frame
 // (colour -> output); false: nothing was recorded and evaluate_d3d12 goes on as without it (the Vulkan bridge). Colour and output are the
 // same resource (in UNORDERED_ACCESS) on the RenoDX route's direct frame.
 struct D3d12BackendFrame {
@@ -117,6 +118,7 @@ struct D3d12BackendFrame {
     int reversible_mode;   // Controls::reversible_mode (proxy_curve)
     int noise_every_frame;
     int history_f16;       // [Network] History Precision 16 (else 32), as the session reads dlssnr-amd.ini
+    int style_grade;       // [Network] Style Grade (live, as the Vulkan runtime's set_style_grade)
     // The temporal inputs, as the session's EngineResources takes them (evaluate_d3d12): the motion guide in
     // NON_PIXEL_SHADER_RESOURCE, its subrect (0 extent: the whole texture), MVecScale over the region's extent
     // (normalized_mv_scale), DLSSNR.Reset, the feature (its history).
@@ -139,6 +141,10 @@ struct D3d12BackendFrame {
     int renodx_hdr_flag;           // the game's colour is HDR (OptiScaler's judgement)
     int renodx_after_upscale;      // NR runs on the upscaler's output
     int renodx_fast_motion;        // a bound neutral texture is not a provider for temporal fast passes
+    // RenoDX's NR screenshot (nr_screenshot.hpp): this frame is OptiScaler's finished picture (NR moved there for the
+    // capture, nr_pe_optifix.cpp lock_all), and the third in a row with no inline NR between them (note_finished)
+    int renodx_finished;
+    int renodx_clean;
     ID3D12Resource* exposure;      // the game's exposure texture, as DLSS got it
     int exposure_state;
     float pre_exposure, exposure_scale;
@@ -151,6 +157,11 @@ struct D3d12BackendFrame {
     float prep_contrast;
     float prep_saturation;
     int prep_inverse;
+    // Passes (fast) Interleaved's pass (a wilsjo2 layer on the D3D12 flow, route::CallHistory): the history it made for
+    // this call (RGBA16F at the frame's extent, in UNORDERED_ACCESS; null: the feature's own), and the network plain
+    // (Intensity 1 already in `intensity`, no Style grade)
+    ID3D12Resource* history;
+    int no_grade;
     // (out, may be null): set to 1 by a backend that returns false only because its network for this extent is still
     // being made - it will take such frames; evaluate_d3d12 then passes the frame through (output := colour) with no NR
     // and does not start the Vulkan bridge's network for them.

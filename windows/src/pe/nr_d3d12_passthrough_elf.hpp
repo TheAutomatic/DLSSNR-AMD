@@ -14,7 +14,7 @@
 #include <utility>
 #include <vector>
 
-namespace nr::pe::asd::elf {
+namespace nr::pe::d3d12_passthrough::elf {
 
 using Bytes = std::vector<uint8_t>;
 
@@ -975,7 +975,8 @@ inline uint64_t record_reference(const Bytes& spv) {
 }
 
 // A kernel's ELF from its record: <aco>\records\<FNV of its SPIR-V>.nrp, or <aco>\int4\records\ for the int4 layers'
-// SPIR-V (a folder of int4 SPIR-V). `aco` is the package's dlssnr-amd\aco (asd::aco_folder()). RDNA3 (`gfx11_mach`
+// SPIR-V (a folder of int4 SPIR-V). `aco` is the package's dlssnr-amd\aco (d3d12_passthrough::aco_folder()). RDNA3
+// (`gfx11_mach`
 // not 0): the records in <aco>\rdna3\records (int4: <aco>\rdna3\int4\records), named by the stand-in's reference.
 inline bool load_kernel_elf(const std::string& spv_dir, const std::wstring& aco_in, const Bytes& spv,
                             Bytes* out_elf, uint32_t out_dims[3], std::string* out_stem, std::string* why,
@@ -986,7 +987,22 @@ inline bool load_kernel_elf(const std::string& spv_dir, const std::wstring& aco_
     std::snprintf(stem, sizeof stem, "%016llx", (unsigned long long)(ref ? ref : fnv_hash(spv.data(), spv.size())));
     if (out_stem) *out_stem = stem;
     const std::wstring file = utf8_to_wide(std::string(stem) + ".nrp");
-    const bool want_int4 = spv_dir.find("int4") != std::string::npos;
+    // The int4 layers' SPIR-V sits in <data>\int4\shaders, int4-performance\shaders, int4-ultra\shaders (RDNA3:
+    // aco\rdna3\<the same>\shaders): the folder above `shaders`, not a substring anywhere in the path - a game
+    // installed under "...\Sprint4\..." is not one.
+    const bool want_int4 = [&] {
+        std::string d = spv_dir;
+        while (!d.empty() && (d.back() == '\\' || d.back() == '/')) d.pop_back();
+        auto last = [&](std::string& path) {
+            const size_t cut = path.find_last_of("\\/");
+            std::string name = cut == std::string::npos ? path : path.substr(cut + 1);
+            path = cut == std::string::npos ? std::string() : path.substr(0, cut);
+            return name;
+        };
+        std::string name = last(d);
+        if (name == "shaders") name = last(d);
+        return name.rfind("int4", 0) == 0;
+    }();
     Bytes nrp;
     if (!read_file_w(aco + (want_int4 ? L"\\int4\\records\\" : L"\\records\\") + file, &nrp)) {
         *why = std::string("no ACO record ") + stem + ".nrp in dlssnr-amd\\aco" + (gfx11_mach ? "\\rdna3" : "") +
@@ -998,4 +1014,4 @@ inline bool load_kernel_elf(const std::string& spv_dir, const std::wstring& aco_
     return build_model_elf_from_nrp(nrp.data(), nrp.size(), spv_dims, out_elf, out_dims, why, gfx11_mach);
 }
 
-} // namespace nr::pe::asd::elf
+} // namespace nr::pe::d3d12_passthrough::elf

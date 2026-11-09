@@ -56,7 +56,9 @@ struct Wilsjo2Facts {
     bool prep_missing = false;   // [Preprocess] wanted but its programs / textures are unavailable: not run at all
     bool prep_outside = false;   // [Preprocess] run by the layer itself from the frame's light (not in the runtime)
     float fast_passes = 0.f;     // Passes (fast) running: its strength (0: legacy passes)
-    bool fast_fallback = false;  // Feedback / Hybrid asked for, Extrapolation run
+    bool fast_fallback = false;  // Feedback / Hybrid asked for and not run (one network pass)
+    bool fast_fallback_spatial = false;   // ... because of peripheral compression
+    uint8_t il_missing = 0;      // Interleaved asked for and not run (nr::wilsjo2::FlowFacts::il_missing)
 };
 struct CallWilsjo2 {
     explicit CallWilsjo2(const Wilsjo2Facts* facts);
@@ -76,6 +78,21 @@ struct CallNetwork {
     int previous;
 };
 int call_network();
+// A wilsjo2 layer's Passes (fast) Interleaved: the history this call's network reads (the pass's own output of last frame,
+// made from the slots' increments; RGBA16F at the network's size) - a D3D12 resource (UNORDERED_ACCESS) or a Vulkan
+// image (GENERAL); none outside such a call.
+struct HistoryRef {
+    void* d3d12 = nullptr; uint64_t vk_image = 0; uint32_t vk_format = 0, width = 0, height = 0;
+    bool raw = false;   // the network plain (Intensity 1, no Style grade): the layer composes them
+};
+struct CallHistory {
+    explicit CallHistory(const HistoryRef& h);
+    ~CallHistory();
+    CallHistory(const CallHistory&) = delete;
+    CallHistory& operator=(const CallHistory&) = delete;
+    HistoryRef previous;
+};
+const HistoryRef& call_history();
 // The .asi's NR chain: the layer this call runs (its number), for NR Control's per-layer status; 0 outside one.
 struct CallLayer {
     explicit CallLayer(int number);

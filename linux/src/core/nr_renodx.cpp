@@ -461,6 +461,7 @@ struct Image {
 // A program: one RenoDX shader, its descriptor layout read from the SPIR-V (binding -> sampled or
 // storage image), its push range.
 struct Program {
+    VkPipeline steps[8]{};   // (Interleaved: a pipeline per step, specialization constant 0)
     VkShaderModule module{};
     VkDescriptorSetLayout dsl{};
     VkPipelineLayout layout{};
@@ -560,6 +561,8 @@ struct Stage::Impl {
              kDecodeUpL,   // look_upsample + legacy_decode (SDR, the network below the frame's extent)
              kResolveCommit6Up,   // look_upsample + v6_resolve_commit (HDR, the same)
              kPrepFused,   // Preprocess with RenoDX's SDR encode (mode 3) and decode (mode 4) folded in
+             kIl, kIlMv,   // Passes (fast) Interleaved: the slots' increments, the vectors for a slot's older history
+             kIlPp,   // the fill's pyramid
              kCount };
     Program programs[kCount];
 
@@ -607,6 +610,64 @@ struct Stage::Impl {
     Image motion;                  // the game's motion vectors, copied (region at the origin)
     Image st_fineh, st_fbadd, st_d0, st_d1, st_t0, st_t1, st_g0, st_g1, st_f0[2], st_f1[2];
     uint32_t st_cur = 0; bool st_valid = false;
+    // Passes (fast) Interleaved: the encoded frame (Base), every slot's increment (ping-pong: moved from one into the
+    // other each frame), the last three frames' vectors at the network's size (pixels) and the composed vector for a
+    // slot's history; when each slot last ran.
+    static constexpr uint32_t kIlSlots = 8;
+    Image il_pyr[6];   // the fill's pyramid
+    Image il_dpyr[6];   // its depth pyramid: per level mean nearness x weight, mean weight
+    Image il_depth[2];   // the game's nearness at the network's size, this frame's and last frame's
+    uint32_t il_dcur = 0;
+    bool il_graded_last = false;
+    Image il_tdbg;   // (research NR_IL_DEBUG=2: each test's own answer; 1 x 1 unless that view is on)
+    Image il_base, il_base2, il_trust, il_inc[2][kIlSlots], il_ring[3], il_comp, il_hist;
+    uint32_t il_cur = 0, il_frame = 0, il_ring_cur = 0, il_last[kIlSlots] = {}, il_slots = 0, il_pyr_slots = 0, il_bcur = 0;
+    bool il_valid = false;
+    Stage::NetworkMotion network_motion;   // what Stage::network_motion() reports inside a Network call
+    void ensure_il(VkCommandBuffer cmd, uint32_t nw, uint32_t nh, uint32_t slots) {
+        if (!programs[kIl].pipeline) { load(programs[kIl], "il", 96, 0x3Bu); load(programs[kIlMv], "il_mv", 44); load(programs[kIlPp], "il_pp", 28); }
+        const VkImageUsageFlags rw = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+        if (il_base.w != nw || il_base.h != nh) {
+            retire_il();
+            il_base = make_image(nw, nh, VK_FORMAT_R16G16B16A16_SFLOAT, rw);
+            il_base2 = make_image(nw, nh, VK_FORMAT_R16G16B16A16_SFLOAT, rw);
+            il_trust = make_image(nw, nh, VK_FORMAT_R16_SFLOAT, rw);   // (one channel: every step reads .r only)
+            static const bool dbg2 = [] { const char* e = std::getenv("NR_IL_DEBUG"); return e && e[0] == '2'; }();
+            il_tdbg = dbg2 ? make_image(nw, nh, VK_FORMAT_R16G16B16A16_SFLOAT, rw) : make_image(1, 1, VK_FORMAT_R16G16B16A16_SFLOAT, rw);
+            for (Image& i : il_ring) i = make_image(nw, nh, VK_FORMAT_R32G32_SFLOAT, rw);
+            il_comp = make_image(nw, nh, VK_FORMAT_R16G16_SFLOAT, rw);
+            il_hist = make_image(nw, nh, VK_FORMAT_R16G16B16A16_SFLOAT, rw);
+            uint32_t pw = nw, ph = nh;
+            for (Image& i : il_dpyr) { pw = (pw + 1) / 2; ph = (ph + 1) / 2; i = make_image(pw, ph, VK_FORMAT_R32G32_SFLOAT, rw); }
+            for (Image& i : il_depth) i = make_image(nw, nh, VK_FORMAT_R32_SFLOAT, rw);
+        }
+        // A change of the passes: only the slots past it are made or retired, the pyramid only when it must grow - a
+        // remake of everything (4K, 8 passes: ~1.5 GB) under VRAM pressure put the new images in system memory for good
+        if (il_slots != slots) {
+            for (auto& a : il_inc)
+                for (uint32_t i = 0; i < kIlSlots; ++i) {
+                    if (i < slots && !a[i].handle) a[i] = make_image(nw, nh, VK_FORMAT_R16G16B16A16_SFLOAT, rw);
+                    else if (i >= slots && a[i].handle) retire(a[i]);
+                }
+            if (slots > il_pyr_slots) {
+                uint32_t pw = nw, ph = nh;
+                for (Image& i : il_pyr) { retire(i); pw = (pw + 1) / 2; ph = (ph + 1) / 2; i = make_image(pw * slots, ph, VK_FORMAT_R16G16B16A16_SFLOAT, rw); }
+                il_pyr_slots = slots;
+            }
+            il_slots = slots;
+            il_valid = false;   // (the passes start over)
+        }
+        init_fresh(cmd);
+    }
+    void retire_il() {
+        retire(il_base); retire(il_base2); retire(il_trust); retire(il_tdbg); retire(il_comp); retire(il_hist);
+        for (Image& i : il_pyr) retire(i);
+        for (Image& i : il_dpyr) retire(i);
+        for (Image& i : il_depth) retire(i);
+        for (auto& a : il_inc) for (Image& i : a) retire(i);
+        for (Image& i : il_ring) retire(i);
+        il_valid = false; il_slots = 0; il_pyr_slots = 0;
+    }
     // Passes (fast)'s images: the fine part (RG16F: the edit's fine part and the answer's lightness) and the guided
     // filter's quarter-size work images; with `feedback` (the method is Feedback / Hybrid) also the feedback's add and
     // its history, which go when the method is Extrapolation.
@@ -716,7 +777,7 @@ struct Stage::Impl {
         fresh.clear();
     }
 
-    void load(Program& p, const std::string& name, uint32_t push_bytes) {
+    void load(Program& p, const std::string& name, uint32_t push_bytes, uint32_t steps = 0) {
         p.name = name;
         const auto code = read_spirv(cfg.shaders + "/renodx_" + name + ".spv");
         p.bindings = reflect(code);
@@ -744,6 +805,13 @@ struct Stage::Impl {
         robustness.images = VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT;
         if (pipeline_robustness) ci.pNext = &robustness;
         check(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &ci, nullptr, &p.pipeline), name.c_str());
+        for (uint32_t k = 0; k < 8; ++k) {   // the steps `steps` names (bit k: step k), specialised
+            if (!(steps >> k & 1u)) continue;
+            const VkSpecializationMapEntry me{0, 0, sizeof(uint32_t)};
+            const VkSpecializationInfo sp{1, &me, sizeof(uint32_t), &k};
+            ci.stage.pSpecializationInfo = &sp;
+            check(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &ci, nullptr, &p.steps[k]), name.c_str());
+        }
     }
 
     // One descriptor set of `p` with `views[binding]`; every binding the program declares must be given.
@@ -806,9 +874,9 @@ struct Stage::Impl {
     // and the sets naming them (the linearize's, the commit's, each pass's compose) are this recording's only - a
     // game's image handle can come back for another image once the game frees it - and are freed once the frames in
     // flight are past them, as the retired images are.
-    struct Borrow { nr::gpu::Ticket gpu; VkImageView in{}, out{}, motion{}; VkDescriptorPool pool{}; };
+    struct Borrow { nr::gpu::Ticket gpu; VkImageView in{}, out{}, motion{}, depth{}; VkDescriptorPool pool{}; };
     std::vector<Borrow> borrows;
-    bool in_place_logged = false, motion_logged = false;
+    bool in_place_logged = false, motion_logged = false, il_depth_logged = false, il_missing_logged = false, fb_missing_logged = false;
     Borrow& borrow_slot() {
         if (borrows.empty()) borrows.resize(66);   // retire()'s 64 recordings, and two
         Borrow& b = nr::gpu::slot(borrows, size_t(recordings % borrows.size()));
@@ -816,11 +884,14 @@ struct Stage::Impl {
         if (b.in) vkDestroyImageView(device, b.in, nullptr);
         if (b.out) vkDestroyImageView(device, b.out, nullptr);
         if (b.motion) vkDestroyImageView(device, b.motion, nullptr);
-        b.in = b.out = b.motion = VK_NULL_HANDLE;
+        if (b.depth) vkDestroyImageView(device, b.depth, nullptr);
+        b.in = b.out = b.motion = b.depth = VK_NULL_HANDLE;
         if (!b.pool) {
-            constexpr uint32_t kSets = 16 + 2 * kMaxUnlockedPasses;   // + the HDR frame-as-work0 sets
-            VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 8 * kSets},
-                                            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 12 * kSets},
+            // (+ Interleaved's: up to 3 sets per slot on a reset frame and 8 slots, 26 sampled and 15 storage images a set)
+            constexpr uint32_t kBase = 16 + 2 * kMaxUnlockedPasses, kIlSets = 3 * kIlSlots + 8;   // + the HDR frame-as-work0 sets
+            constexpr uint32_t kSets = kBase + kIlSets;
+            VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 8 * kBase + 26 * kIlSets},
+                                            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 12 * kBase + 17 * kIlSets},
                                             {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 * kSets}};
             VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
             pi.maxSets = kSets; pi.poolSizeCount = 3; pi.pPoolSizes = sizes;
@@ -854,6 +925,8 @@ struct Stage::Impl {
         std::vector<std::string> order;
         std::map<std::string, std::pair<double, uint32_t>> acc;
     } prof;
+    VkPipeline step_pipeline = VK_NULL_HANDLE;   // the next dispatch's pipeline instead of the program's (a specialised step)
+    std::string mark_name;   // (research NR_IL_PROFMODES: the next dispatches' profiler name instead of the program's)
     void mark(VkCommandBuffer cmd, const std::string& name) {
         if (!prof.on || !prof.pool) return;
         auto& n = prof.names[prof.slot];
@@ -912,11 +985,11 @@ struct Stage::Impl {
 
     void dispatch(VkCommandBuffer cmd, P p, VkDescriptorSet set, const void* push, uint32_t bytes, uint32_t x, uint32_t y) {
         const Program& pr = programs[p];
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pr.pipeline);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, step_pipeline ? step_pipeline : pr.pipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pr.layout, 0, 1, &set, 0, nullptr);
         vkCmdPushConstants(cmd, pr.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, std::min(bytes, pr.push_bytes), push);
         vkCmdDispatch(cmd, x, y, 1);
-        mark(cmd, pr.name);
+        mark(cmd, mark_name.empty() ? std::string(pr.name) : mark_name);
         // Every dispatch's writes before whatever the next one reads (RenoDX orders them the same way,
         // UAV barrier / storage-to-storage transition after each pass).
         memory_barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
@@ -1269,11 +1342,18 @@ Stage::~Stage() {
                       &m.up_neural, &m.band_a, &m.band_b, &m.band_max_a, &m.band_max_b, &m.work_p, &m.prep_keep, &m.ph16})
         m.destroy(*im);
     for (Image* im : {&m.st_fineh, &m.st_fbadd, &m.st_d0, &m.st_d1, &m.st_t0, &m.st_t1, &m.st_g0, &m.st_g1, &m.st_f0[0], &m.st_f0[1], &m.st_f1[0], &m.st_f1[1]}) m.destroy(*im);
+    m.destroy(m.il_hist); m.destroy(m.il_base2); m.destroy(m.il_trust); m.destroy(m.il_tdbg);
+    for (auto& i : m.il_pyr) m.destroy(i);
+    for (auto& i : m.il_dpyr) m.destroy(i);
+    for (auto& i : m.il_depth) m.destroy(i);
+    for (Image* im : {&m.il_base, &m.il_comp, &m.il_ring[0], &m.il_ring[1], &m.il_ring[2]}) m.destroy(*im);
+    for (auto& a : m.il_inc) for (Image& im : a) m.destroy(im);
     for (auto& pl : m.looks)
         for (int i = 0; i < 2; ++i) { m.destroy(pl.history[i]); m.destroy(pl.history_z[i]); }
     for (auto& r : m.retired) m.destroy(r.second);
     for (Program& p : m.programs) {
         if (p.pipeline) vkDestroyPipeline(m.device, p.pipeline, nullptr);
+        for (VkPipeline q : p.steps) if (q) vkDestroyPipeline(m.device, q, nullptr);
         if (p.module) vkDestroyShaderModule(m.device, p.module, nullptr);
         if (p.layout) vkDestroyPipelineLayout(m.device, p.layout, nullptr);
         if (p.dsl) vkDestroyDescriptorSetLayout(m.device, p.dsl, nullptr);
@@ -1295,7 +1375,7 @@ bool history_settings_differ(const Settings& a, const Settings& b) {
            std::memcmp(a.fast_passes, b.fast_passes, sizeof a.fast_passes) != 0 ||
            std::memcmp(a.fast_halo_limit, b.fast_halo_limit, sizeof a.fast_halo_limit) != 0 ||
            std::memcmp(a.fast_fine, b.fast_fine, sizeof a.fast_fine) != 0 ||
-           a.fast_edit_strength != b.fast_edit_strength ||
+           a.fast_edit_strength != b.fast_edit_strength || a.fast_interleaved_passes != b.fast_interleaved_passes ||
            a.auto_mask != b.auto_mask || a.chained_history != b.chained_history || a.codec_mode != b.codec_mode ||
            a.depth_mode != b.depth_mode || a.feed_mode != b.feed_mode || a.intensity != b.intensity ||
            a.local_structure != b.local_structure || a.local_tone != b.local_tone ||
@@ -1332,6 +1412,8 @@ void Stage::set(const Settings& s) {
 }
 
 uint8_t Stage::hdr_mode() const { return impl_->hdr; }
+Stage::NetworkMotion Stage::network_motion() const { return impl_->network_motion; }
+
 Stage::Facts Stage::facts() const {
     Facts f = impl_->facts;
     if (impl_->probe_mapped && f.hdr_mode && !f.absolute) {
@@ -1728,19 +1810,42 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
     // Read in place where the game's image stays in GENERAL and can be sampled (the compose reads it at the region's
     // base); else the vectors' region, copied to the origin of an image of its own (once a frame, every pass reads it).
     // Edit strength (method 3) runs at any strength but 1 (its own slider; Passes (fast) is not its)
-    const uint32_t fast_slot = std::min(s.fast_method, 2u);   // the chosen method's own settings (Edit strength: none)
-    const bool fast = s.passes_mode == 1u && (s.fast_method == 3u ? s.fast_edit_strength != 1.f : s.fast_passes[fast_slot] > 1.f);
+    // Interleaved (method 0) needs the motion vectors (it moves each pass's increment along them): without them it does
+    // not run - one network pass, and NR Control says why (no other method in its place)
     const bool fast_motion = have_motion && fr.fast_motion_available;
-    const bool fast_history = s.fast_method == 1u || s.fast_method == 2u;   // Feedback / Hybrid (Edit strength: none)
-    const bool fast_feedback = fast && fast_history && fast_motion;
-    m.facts.fast_passes = s.passes_mode == 1u ? (s.fast_method == 3u ? s.fast_edit_strength : s.fast_passes[fast_slot]) : 0.f;
+    const uint32_t il_n = std::clamp(s.fast_interleaved_passes, 2u, Impl::kIlSlots);
+    const bool il_chosen = s.passes_mode == 1u && s.fast_method == 0u;
+    const bool il_on = il_chosen && fast_motion;
+    const uint32_t fast_slot = s.fast_method == 0u ? 0u : s.fast_method == 4u ? 2u : s.fast_method - 1u;   // the chosen method's own settings (Edit strength: none)
+    // Feedback / Hybrid need the motion vectors too: without them they do not run either (one network pass, said)
+    const bool fast_history = s.fast_method == 2u || s.fast_method == 3u;   // Feedback / Hybrid (Edit strength: none)
+    const bool fb_missing = s.passes_mode == 1u && fast_history && !fast_motion;
+    const bool fast = s.passes_mode == 1u && !il_chosen && !fb_missing &&
+                      (s.fast_method == 4u ? s.fast_edit_strength != 1.f : s.fast_passes[fast_slot] > 1.f);
+    const bool fast_feedback = fast && fast_history;
+    m.facts.fast_passes = s.passes_mode == 1u ? (s.fast_method == 4u ? s.fast_edit_strength : s.fast_method == 0u ? (il_on ? float(il_n) : 0.f) : fb_missing ? 0.f : s.fast_passes[fast_slot]) : 0.f;
     m.facts.motion = fast_motion;
-    m.facts.fast_fallback = fast && fast_history && !fast_motion;
+    m.facts.fast_fallback = fb_missing;
+    if (fb_missing && !m.fb_missing_logged) {
+        m.fb_missing_logged = true;
+        nr::logf("[nr] RenoDX stage: Passes (fast) Feedback / Hybrid cannot run: no motion vectors (one network pass)");
+    } else if (!fb_missing) {
+        m.fb_missing_logged = false;
+    }
+    m.facts.il_missing = il_chosen && !il_on ? 1u : 0u;
+    if (il_chosen && !il_on && !m.il_missing_logged) {
+        m.il_missing_logged = true;
+        nr::logf("[nr] RenoDX stage: Passes (fast) Interleaved cannot run: no motion vectors (one network pass)");
+    } else if (il_on) {
+        m.il_missing_logged = false;
+    }
+    m.facts.interleaved = il_on;
+    if (!il_on && m.il_slots) m.retire_il();
     if (!fast) {
         for (Image* im : {&m.st_fineh, &m.st_fbadd, &m.st_d0, &m.st_d1, &m.st_t0, &m.st_t1, &m.st_g0, &m.st_g1, &m.st_f0[0], &m.st_f0[1], &m.st_f1[0], &m.st_f1[1]}) m.retire(*im);
         m.st_valid = false;
     }
-    const bool motion_wanted = (ls.stabilize == 2u && have_motion && look::dispatched(ls, false)) || fast_feedback;
+    const bool motion_wanted = (ls.stabilize == 2u && have_motion && look::dispatched(ls, false)) || fast_feedback || il_on;
     if (motion_wanted && fr.motion.before == VK_IMAGE_LAYOUT_GENERAL && fr.motion.after == VK_IMAGE_LAYOUT_GENERAL &&
         (fr.motion.usage & VK_IMAGE_USAGE_SAMPLED_BIT)) {
         if (!borrow) borrow = &m.borrow_slot();
@@ -1798,7 +1903,7 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
     static const bool prep_recompute = [] { const char* e = std::getenv("NR_PREP_RECOMP"); return e && e[0] == '1'; }();
     const bool prep_fused = !m.hdr && m.prep_on && prep_apart && sdr_inplace && read_in_place && store_in_place &&
         passes == 1 && NW == W && NH == H && !look::dispatched(ls, false) && !(s.codec_mode != 0u && s.sdr_black_restore != 0u) &&
-        !(s.debug_view >= 1u && s.debug_view <= 3u) && !fast && !prep_recompute && m.programs[Impl::kPrepFused].pipeline;
+        !(s.debug_view >= 1u && s.debug_view <= 3u) && !fast && !il_on && !prep_recompute && m.programs[Impl::kPrepFused].pipeline;
     for (uint32_t k = 0; k < passes; ++k) {
         float transfer = 1.f, color = 1.f;
         m.strengths(k, &transfer, &color);
@@ -1872,7 +1977,7 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
         }
         // Work in the input the network actually reads, including SDR Preprocess APART.
         const VkImageView fast_input = prep_apart ? m.prep_keep.view : m.proxy.view;
-        const float nfast = std::clamp(s.fast_passes[fast_slot], 1.f, 8.f);
+        const float nfast = s.fast_method == 0u ? float(il_n) : std::clamp(s.fast_passes[fast_slot], 1.f, 8.f);
         const uint32_t segment = std::min(uint32_t(nfast), 3u) - 1u;
         const float kt[] = {1.f, 1.77f, 2.36f, 2.94f}, wt[] = {0.f, 0.5f, 0.67f, 0.75f};
         const float part = nfast - float(segment + 1u);
@@ -1895,7 +2000,223 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
         const bool reset = reset_all || (k > 0 && !s.chained_history);
         p.image = prep_apart ? m.prep_keep.handle : m.proxy.handle;
         m.mark(cmd, "before-network");
-        network(k, p, n, reset);
+        // The motion vectors as Interleaved reads them: in place or the stage's copy, the region's
+        // base, normalised units to the network's pixels.
+        const bool mv_borrowed = borrow && borrow->motion;
+        const VkImageView mv_view = !motion_copied ? VK_NULL_HANDLE : mv_borrowed ? borrow->motion : m.motion.view;
+        const uint32_t mv_base[2] = {mv_borrowed ? fr.motion_x : 0u, mv_borrowed ? fr.motion_y : 0u};
+        const float mv_scale[2] = {fr.motion_scale_x * float(NW), fr.motion_scale_y * float(NH)};
+        // (a set naming a borrowed view - the game's vectors, or Interleaved's view of the game's depth, made every
+        // frame - is this recording's only: the set cache keys on view handles, and a freed view's handle comes back for
+        // a later frame's view; a cached set then read another frame's depth guide copy)
+        const auto set_of = [&](Impl::P prog, const std::map<uint32_t, VkImageView>& v) {
+            return mv_borrowed || (borrow && borrow->depth) ? m.set_for(m.programs[prog], v, {}, borrow->pool) : m.S(prog, v);
+        };
+        const auto after_network = [&] {
+            Impl::memory_barrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT |
+                                     VK_ACCESS_TRANSFER_WRITE_BIT);
+        };
+        if (il_on && mv_view) {
+            // Passes (fast) Interleaved: one slot a frame (every slot, in order, on a reset = legacy N), its input the
+            // frame + the earlier slots' moved increments, the answer the frame + every increment.
+            m.ensure_il(cmd, NW, NH, il_n);
+            // each slot's network reads a history one frame old, made from last frame's increments (NR_IL_HIST=0, research:
+            // its own history, several frames old, moved by the composed vectors)
+            static const bool il_fresh_history = [] { const char* e = std::getenv("NR_IL_HIST"); return !(e && e[0] == '0'); }();
+            // The anti-ghost set (on; NR_IL_ANTIGHOST=0 turns it off, NR_IL_VTRUST / BOX / FILL / DEPTH=0 one part): moved
+            // increments are not used where they belong to something else now - disocclusion by the vectors and by the
+            // game's depth (FSR2/3), the picture they were made on gone from the neighbourhood (FSR2's history box) - and
+            // are filled from their usable surroundings (push-pull, as frame interpolation fills its holes).
+            static const bool il_ag = [] { const char* e = std::getenv("NR_IL_ANTIGHOST"); return !(e && e[0] == '0'); }();
+            const auto il_switch = [](const char* name) { const char* e = std::getenv(name); return e && e[0] ? e[0] != '0' : il_ag; };
+            // NR_IL_JUDGE=k0,k1 (research): the network's own new increment for this slot against its moved old one - where they
+            // disagree (relative difference k0..k1) the other slots' moved increments are not used
+            static const std::pair<bool, std::pair<float, float>> il_judge = [] {
+                const char* e = std::getenv("NR_IL_JUDGE"); float a = 0.6f, b = 1.2f;
+                if (!e || !e[0] || e[0] == '0') {
+                    const char* x = std::getenv("NR_IL_BOX"); a = 0.02f; b = 0.06f;   // (NR_IL_BOX=k0,k1: its range)
+                    if (x && x[0] && x[0] != '0' && std::sscanf(x, "%f,%f", &a, &b) != 2) { a = 0.02f; b = 0.06f; }
+                    return std::make_pair(false, std::make_pair(a, b));
+                }
+                std::sscanf(e, "%f,%f", &a, &b); return std::make_pair(true, std::make_pair(a, b)); }();
+            // NR_IL_DEPTH (research): the game's depth for a disocclusion test (1, 2) and vector dilation (1, 3)
+            static const uint32_t il_depth_mode = [] { const char* e = std::getenv("NR_IL_DEPTH"); return e && e[0] ? uint32_t(std::atoi(e)) : il_ag ? 1u : 0u; }();
+            VkImageView depth_view = VK_NULL_HANDLE;
+            const VkImageAspectFlags depth_aspects =
+                fr.depth.format == VK_FORMAT_D32_SFLOAT || fr.depth.format == VK_FORMAT_D16_UNORM || fr.depth.format == VK_FORMAT_X8_D24_UNORM_PACK32
+                    ? VK_IMAGE_ASPECT_DEPTH_BIT
+                : fr.depth.format == VK_FORMAT_D32_SFLOAT_S8_UINT || fr.depth.format == VK_FORMAT_D24_UNORM_S8_UINT || fr.depth.format == VK_FORMAT_D16_UNORM_S8_UINT
+                    ? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+            if (il_depth_mode && fr.depth.image && (fr.depth.usage & VK_IMAGE_USAGE_SAMPLED_BIT)) {
+                VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+                vi.image = fr.depth.image; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = fr.depth.format;
+                vi.subresourceRange = {depth_aspects == VK_IMAGE_ASPECT_COLOR_BIT ? VK_IMAGE_ASPECT_COLOR_BIT : VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+                if (vkCreateImageView(m.device, &vi, nullptr, &depth_view) == VK_SUCCESS) {
+                    if (!borrow) borrow = &m.borrow_slot();
+                    borrow->depth = depth_view;
+                    if (!m.il_depth_logged) { m.il_depth_logged = true; nr::logf("[nr] RenoDX stage: Interleaved reads the game's depth (VkFormat %u, %ux%u, layout %d -> %d)", unsigned(fr.depth.format), fr.depth.width, fr.depth.height, int(fr.depth.before), int(fr.depth.after)); }
+                } else depth_view = VK_NULL_HANDLE;
+            }
+            const auto depth_layout = [&](bool to_general) {
+                VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                b.oldLayout = to_general ? fr.depth.before : VK_IMAGE_LAYOUT_GENERAL; b.newLayout = to_general ? VK_IMAGE_LAYOUT_GENERAL : fr.depth.after;
+                b.srcAccessMask = to_general ? fr.depth.before_access : 0; b.dstAccessMask = to_general ? VK_ACCESS_SHADER_READ_BIT : fr.depth.after_access;
+                b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                b.image = fr.depth.image; b.subresourceRange = {depth_aspects, 0, 1, 0, 1};
+                vkCmdPipelineBarrier(cmd, to_general ? fr.depth.before_stage : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                     to_general ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : fr.depth.after_stage, 0, 0, nullptr, 0, nullptr, 1, &b);
+            };
+            struct { uint32_t size[2], mbase[2], mgrid[2]; float mscale[2]; uint32_t mode, slot, n, flags; float k0, k1; uint32_t dbase[2], dgrid[2];
+                     uint32_t styles; float pad0; float inten[4]; } ip{
+                {NW, NH}, {mv_base[0], mv_base[1]}, {fr.motion.width, fr.motion.height}, {mv_scale[0], mv_scale[1]}, 0u, 0u, il_n, 0u,
+                il_judge.second.first, il_judge.second.second, {fr.depth_x, fr.depth_y}, {fr.depth.width ? fr.depth.width : 1u, fr.depth.height ? fr.depth.height : 1u},
+                0u, 0.f, {1.f, 1.f, 1.f, 1.f}};
+            // Each pass's Intensity and Style as the session gives them (pass_controls: pass 1's, or the pass's own once its
+            // "Same as pass 1" is off; the Intensity always the pass's own). Not plain (a Style, an Intensity other than 1):
+            // the slots' networks run plain and the stage composes - the slots' histories must be the network's own
+            // output, not the graded answer, or the grade comes round again every frame (Natural: grey, then noise).
+            bool il_graded = false;
+            for (uint32_t k = 0; k < 4; ++k) {
+                const bool own = k > 0 && !s.pass_follow[k - 1];
+                const uint32_t st = fr.style_grade ? std::min(own ? s.pass_style[k - 1] : s.style, 2u) : 0u;
+                const float in = k == 0 ? s.intensity : s.pass_intensity[k - 1];
+                ip.styles |= st << (2 * k); ip.inten[k] = in;
+                if (k < il_n && (st != 0 || in != 1.0f)) il_graded = true;
+            }
+            // (the increments mean the network's own output or the graded answer: a change between them starts over)
+            if (il_graded != m.il_graded_last) { m.il_valid = false; m.il_graded_last = il_graded; }
+            bool il_moved = false;   // (a normal frame: the slots' increments were moved, the judge may compare)
+            static const bool il_fill = il_switch("NR_IL_FILL");
+            // NR_IL_BOX=k0,k1 (research): not used where last frame's picture they come from is outside this frame's 3 x 3
+            // range by k0..k1 (the judge's k0 / k1 are shared: the two are not tried together)
+            static const bool il_box = il_switch("NR_IL_BOX");
+            // The vector test predicts the flow's change over the move (a camera turn's flow is not uniform): 2 (default) the
+            // gradient here, at the source and their mean; 1 here only; NR_IL_VLIN=0 as before (rejects static walls in turns)
+            static const uint32_t il_vlin = [] { const char* e = std::getenv("NR_IL_VLIN"); return e && e[0] ? uint32_t(std::atoi(e)) : 2u; }();
+            // NR_IL_VPREV (research): the vector test compares with last frame's vector at the source (il_mv's ring) - 1 only
+            // that (fails: a shaking camera changes its velocity every frame), 2 the better of it and this frame's
+            static const uint32_t il_vprev = [] { const char* e = std::getenv("NR_IL_VPREV"); return e && e[0] ? uint32_t(std::atoi(e)) : 0u; }();
+            // Content coming in from outside the picture is filled from its neighbours (NR_IL_EDGE=0: left to this frame's slot)
+            static const bool il_edge = il_switch("NR_IL_EDGE");
+            // The fill takes from what lies at the hole's depth (a depth pyramid, joint bilateral; NR_IL_DFILL=0: from all around)
+            static const bool il_dfill = il_switch("NR_IL_DFILL");
+            // NR_IL_DEBUG (research): 1 the moved increments not used shown red, 2 each test in its colour, 3 the game's depth
+            static const uint32_t il_debug = [] { const char* e = std::getenv("NR_IL_DEBUG"); return e && e[0] ? uint32_t(std::atoi(e)) : 0u; }();
+            // the network's input: this frame's Base image, where steps 0 / 4 put the slot's input (the proxy kept)
+            const auto il_input = [&] {
+                ColourFrame in = p;
+                in.image = (m.il_bcur ? m.il_base2 : m.il_base).handle;
+                return in;
+            };
+            const auto il = [&](uint32_t mode, uint32_t slot, bool move) {
+                if (mode == 3u) m.il_bcur ^= 1u;   // (Base: this frame's written, last frame's read)
+                if (mode == 3u) return;   // (the proxy kept, il.comp flags & 268435456: no Base copy - the pair's turn only)
+                if (mode == 0u) m.il_cur ^= 1u;
+                const Image& base = m.il_bcur ? m.il_base2 : m.il_base;
+                const Image& base_prev = m.il_bcur ? m.il_base : m.il_base2;
+                const uint32_t d = m.il_cur, o = d ^ 1u;
+                // NR_IL_TRUST=1 (research, off: no gain on the test sets): the moved increments not used where neither last
+                // frame's moved picture nor the one in place fits this frame's
+                static const bool il_trust = [] { const char* e = std::getenv("NR_IL_TRUST"); return e && e[0] == '1'; }();
+                ip.mode = mode; ip.slot = slot;
+                // NR_IL_VTRUST=1 (research): not used where the place they come from shows something moving differently now
+                static const bool il_vtrust = il_switch("NR_IL_VTRUST");
+                // NR_IL_FILL=1 (research): increments not used are replaced by their usable neighbours' (a pyramid)
+                ip.flags = (move ? 1u : 0u) | (mode == 0u && move && il_fresh_history ? 2u : 0u) | (move && il_trust ? 4u : 0u) |
+                           268435456u |
+                           (move && il_vtrust ? 8u : 0u) | (mode == 1u && il_judge.first && il_moved ? 32u : 0u) |
+                           (il_fill && il_moved ? 64u : 0u) | (move && il_box ? 128u : 0u) |
+                           (mode == 0u && il_fill && il_moved ? 536870912u : 0u) |
+                           (mode == 0u && il_fill && il_moved && il_dfill && depth_view ? 1073741824u : 0u) |
+                           (depth_view && move && (il_depth_mode == 1u || il_depth_mode == 3u) ? 256u : 0u) |
+                           (depth_view && move && (il_depth_mode == 1u || il_depth_mode == 2u) ? 512u : 0u) | (fr.depth_inverted ? 1024u : 0u) |
+                           (il_graded ? 2048u : 0u) |
+                           (mode == 1u && il_moved && (il_trust || il_vtrust || il_box || (depth_view && (il_depth_mode == 1u || il_depth_mode == 2u))) ? 65536u : 0u) |
+                           (mode == 1u && il_moved && il_debug ? 262144u : 0u) | ((mode == 1u && il_moved) || (mode == 0u && move) ? (il_debug == 2u ? 2097152u : 0u) : 0u) |
+                           (mode == 1u && il_moved && il_debug == 3u ? 4194304u : 0u) | (move && il_vlin ? 524288u : 0u) |
+                           (move && il_vlin > 1u ? 1048576u : 0u) | (move && il_vprev == 1u ? 8388608u : 0u) | (move && il_vprev == 2u ? 16777216u : 0u) | (move && il_edge ? 33554432u : 0u) |
+                           (mode == 4u && il_dfill && depth_view ? 67108864u : 0u);
+                // slots beyond N: the first slot's images bound in their place (never read or written)
+                // (the network's own input: the proxy, or with SDR [Preprocess] its image apart)
+                std::map<uint32_t, VkImageView> v{{0, fast_input}, {1, m.neural.view}, {2, base.view}, {3, mv_view}, {20, m.il_hist.view},
+                                                  {21, base_prev.view}, {22, m.il_trust.view}, {43, m.il_tdbg.view}};
+                for (uint32_t l = 0; l < 6; ++l) { v[23 + l] = m.il_pyr[l].view; v[37 + l] = m.il_dpyr[l].view; }
+                v[44] = m.il_pyr[0].view; v[45] = m.il_dpyr[0].view;   // (step 0 makes the pyramid's first level)
+                v[29] = depth_view ? depth_view : m.il_trust.view;
+                v[30] = m.il_depth[m.il_dcur].view; v[31] = m.il_depth[m.il_dcur ^ 1u].view;
+                v[36] = m.il_ring[(m.il_ring_cur + 2u) % 3u].view;
+                for (uint32_t i = 0; i < Impl::kIlSlots; ++i) {
+                    v[4 + i] = m.il_inc[o][i < il_n ? i : 0].view;
+                    v[12 + i] = m.il_inc[d][i < il_n ? i : 0].view;
+                }
+                static const bool prof_modes = [] { const char* e = std::getenv("NR_IL_PROFMODES"); return e && e[0] == '1'; }();
+                if (prof_modes) m.mark_name = "il" + std::to_string(mode);
+                m.step_pipeline = mode < 8 ? m.programs[Impl::kIl].steps[mode] : VK_NULL_HANDLE;
+                m.dispatch(cmd, Impl::kIl, set_of(Impl::kIl, v), &ip, sizeof ip, nx, ny);
+                m.step_pipeline = VK_NULL_HANDLE;
+                m.mark_name.clear();
+            };
+            // this frame's vectors into the ring; a slot's history `age` frames old: the composed vector
+            struct { uint32_t size[2], mbase[2], mgrid[2]; float mscale[2]; uint32_t mode, cur, age; } vp{
+                {NW, NH}, {mv_base[0], mv_base[1]}, {fr.motion.width, fr.motion.height}, {mv_scale[0], mv_scale[1]}, 0u, m.il_ring_cur, 0u};
+            const auto vectors = [&](uint32_t mode, uint32_t age) {
+                vp.mode = mode; vp.age = age;
+                m.dispatch(cmd, Impl::kIlMv, set_of(Impl::kIlMv, {{0, mv_view}, {1, m.il_ring[0].view}, {2, m.il_ring[1].view},
+                    {3, m.il_ring[2].view}, {4, m.il_ring[0].view}, {5, m.il_ring[1].view}, {6, m.il_ring[2].view}, {7, m.il_comp.view}}),
+                    &vp, sizeof vp, nx, ny);
+            };
+            if (!il_fresh_history || il_vprev) vectors(0u, 0u);
+            if (depth_view) { depth_layout(true); m.il_dcur ^= 1u; il(5u, 0u, false); }
+            if (reset || !m.il_valid) {
+                if (depth_view) depth_layout(false);   // (the game's depth back before the network reads it)
+                m.network_motion = Stage::NetworkMotion{false, {}, {}, il_graded};
+                for (uint32_t j = 0; j < il_n; ++j) {
+                    il(3u, j, false); il(0u, j, false); network(j, il_input(), n, true); after_network(); il(1u, j, false);
+                    if (j + 1 < il_n) ++ran;
+                    m.il_last[j] = 0;
+                }
+                m.network_motion = {};
+                m.il_valid = true; m.il_frame = 1;
+            } else {
+                const uint32_t slot = m.il_frame % il_n, age = std::min(m.il_frame - m.il_last[slot], 3u);   // (age: NR_IL_HIST=0 only)
+                if (!il_fresh_history) vectors(1u, age);
+                il(3u, slot, true); il_moved = true;
+                il(0u, slot, true);
+                if (il_fill) {
+                    // the pyramid of the usable moved increments (this frame's, written by mode 0), then the fill
+                    const bool dfill = il_dfill && depth_view;
+                    uint32_t sw = NW, sh = NH;
+                    for (uint32_t l = 0; l < 6; ++l) {
+                        const uint32_t dw = (sw + 1) / 2, dh = (sh + 1) / 2;
+                        if (l == 0) { sw = dw; sh = dh; continue; }   // (step 0 made the first level)
+                        struct { uint32_t ssize[2], dsize[2], mode, n, flags; } pp{{sw, sh}, {dw, dh}, l ? 1u : 0u, il_n, dfill ? 1u : 0u};
+                        std::map<uint32_t, VkImageView> v{{0, m.il_trust.view}, {9, m.il_pyr[l ? l - 1 : 1].view}, {10, m.il_pyr[l].view},
+                                                          {11, m.il_depth[m.il_dcur].view}, {12, m.il_dpyr[l ? l - 1 : 1].view}, {13, m.il_dpyr[l].view}};
+                        for (uint32_t i = 0; i < Impl::kIlSlots; ++i) v[1 + i] = m.il_inc[m.il_cur][i < il_n ? i : 0].view;
+                        m.dispatch(cmd, Impl::kIlPp, set_of(Impl::kIlPp, v), &pp, sizeof pp, (dw * il_n + 15) / 16, (dh + 15) / 16);
+                        sw = dw; sh = dh;
+                    }
+                    il(4u, slot, true);
+                }
+                if (depth_view) depth_layout(false);
+                ColourFrame comp;
+                comp.image = m.il_comp.handle; comp.format = VK_FORMAT_R16G16_SFLOAT; comp.width = NW; comp.height = NH;
+                comp.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+                ColourFrame hist = comp;
+                hist.image = m.il_hist.handle; hist.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+                m.network_motion = il_fresh_history ? Stage::NetworkMotion{false, {}, hist, il_graded} : Stage::NetworkMotion{true, comp, {}, il_graded};
+                network(slot, il_input(), n, false);
+                m.mark(cmd, "network-il");   // (NR_RENODX_PROF: the network apart from the slots' steps around it)
+                m.network_motion = {};
+                after_network(); il(1u, slot, false);
+                m.il_last[slot] = m.il_frame++;
+            }
+            m.il_ring_cur = (m.il_ring_cur + 1u) % 3u;
+        } else {
+            network(k, p, n, reset);
+        }
         m.mark(cmd, "network");
         ++ran;
         // Its answer, whoever wrote it, before the compose and the resolve read it.
@@ -1907,21 +2228,21 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
             const bool fb = fast_feedback && motion_copied;
             struct { uint32_t size[2], low[2]; float k; uint32_t mode; float halo, chroma; uint32_t satkeep;
                      float fine, base, rho, lam, dcol, cfloor, ring, ccap, nohalo; uint32_t restored; float ocap, darkcol; }
-                ap{{NW, NH}, {(NW + 3) / 4, (NH + 3) / 4}, fast_k, fb ? (s.fast_method == 2u ? 8u : 6u) : 9u,
+                ap{{NW, NH}, {(NW + 3) / 4, (NH + 3) / 4}, fast_k, fb ? (s.fast_method == 3u ? 8u : 6u) : 9u,
                    fb ? nfast - 1.f : (s.fast_halo_limit[fast_slot] ? 0.f : 1.f), fb ? 0.6f : 0.3f, bits(0.5f),
                    fb ? 1.f : 2.f, 1.f, 0.3f, 0.f, 0.5f, fb ? 0.f : 0.6f, 2.f, fb ? 0.f : 2.5f,
                    fb ? (s.fast_halo_limit[fast_slot] ? 1.f : 0.5f) : 0.f, 0u, fb ? -0.5f : 0.f, fb ? 0.45f : 0.f};
-            if (fb && s.fast_method == 1u) ap.k = nfast - 1.f;
+            if (fb && s.fast_method == 2u) ap.k = nfast - 1.f;
             // Fine detail: Extrapolation's fine band, Feedback's detail add (k), Hybrid's feedback branch's (halo);
-            // (the chosen method's own Fine, also when Feedback / Hybrid run as Extrapolation for want of motion vectors)
+            // (the chosen method's own Fine)
             const float fine = s.fast_fine[fast_slot];
             if (fine != 1.f) {
                 if (!fb) ap.fine *= fine;
-                else if (s.fast_method == 1u) ap.k *= fine;
+                else if (s.fast_method == 2u) ap.k *= fine;
                 else { ap.halo *= fine; ap.fine = fine; }   // Hybrid: feedback branch and overlay's fine part
             }
             ap.restored = fb ? 1u : 0u;   // with feedback also P given back and this frame's edit's cell means
-            const bool edit = s.fast_method == 3u;   // Edit strength: the apply alone (no fine part, no guided filter)
+            const bool edit = s.fast_method == 4u;   // Edit strength: the apply alone (no fine part, no guided filter)
             if (edit) { ap.mode = 10u; ap.k = std::clamp(s.fast_edit_strength, 0.f, 4.f); }
             const uint32_t pp[5] = {NW, NH, (NW + 3) / 4, (NH + 3) / 4, fb ? 1u : 0u};
             if (!edit) {

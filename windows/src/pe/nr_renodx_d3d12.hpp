@@ -3,11 +3,11 @@
 // host logic and RenoDX's own D3D12 shaders (windows/shaders/renodx *.cs_5_1.hlsl, compiled at runtime with
 // d3dcompiler_47 exactly as they are, RENODX_VULKAN not defined - their cbuffer is register(b0), texture binding N
 // is tN, image binding N is uN under the codec set's numbering: storage binding 4 -> u0), the network runs between
-// encode and resolve through the backend's D3D12 network (D3d12AsdNetwork) over linear buffers. The frame is taken
-// whole: colour copied in, the result stored into the output; no Vulkan bridge.
+// encode and resolve through the backend's D3D12 network (D3d12PassthroughNetwork) over linear buffers. The frame is
+// taken whole: colour copied in, the result stored into the output; no Vulkan bridge.
 //
 // SDR (the legacy codec) and HDR (the v6 codec), as the Vulkan stage.
-#include "nr_d3d12_asd_backend.hpp"
+#include "nr_d3d12_passthrough_backend.hpp"
 #include "nr_renodx.hpp"
 
 #include <d3d12.h>
@@ -18,7 +18,7 @@
 #include <memory>
 #include <string>
 #include <vector>
-namespace nr::pe::asd::renodx12 {
+namespace nr::pe::d3d12_passthrough::renodx12 {
 using Settings = nr::renodx::Settings;   // RenoDX's own (nr_renodx.hpp)
 
 // RenoDX's FrameHdrMode on a DXGI format (nr_renodx.cpp's, on Vulkan's): 0 SDR, 1 linear HDR, 2 PQ.
@@ -54,6 +54,10 @@ struct Frame {
     // The frame's own model controls (D3d12BackendFrame's), the base the per-pass ones are built on.
     nr::D3d12NetControls base_controls{};
     bool motion_without_depth = true;   // the network's own ([Network] Motion Without Depth)
+    // The network's history texel (D3d12PassthroughNetwork::history_texel_bytes: 8 RGBA16F, 16 RGBA32F; 0 none): the
+    // layout Passes (fast) Interleaved hands each pass's history in (NetTemporal::history_va)
+    uint32_t net_history_bytes = 0;
+    bool style_grade = true;   // [Network] Style Grade as the network applies it (Interleaved grades its passes itself)
     float present_white_nits = 203.0f;
     // The network's motion/depth guides resampled by the stage (to_motion / to_depth at the network's extent);
     // `net` runs one pass: the controls the D3D12 network takes, its temporal inputs, and the pass's linear buffers
@@ -99,6 +103,8 @@ public:
     struct Facts {
         float fast_passes = 0.f;
         bool motion = false, fast_fallback = false;
+        bool interleaved = false;    // Passes (fast) Interleaved ran
+        uint8_t il_missing = 0;      // Interleaved chosen and not run: 1 no motion vectors, 3 its programs missing
         uint8_t hdr_mode = 0;
         bool absolute = false;
         bool prep_exposure = false;
@@ -118,4 +124,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace nr::pe::asd::renodx12
+}  // namespace nr::pe::d3d12_passthrough::renodx12

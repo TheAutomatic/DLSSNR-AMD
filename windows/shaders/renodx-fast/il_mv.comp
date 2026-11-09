@@ -1,0 +1,42 @@
+#version 460
+// Passes (fast) Interleaved: the motion vectors for a slot's network history, which is `age` frames old.
+//   mode 0: this frame's vectors (the game's, at the network's pixels, in pixels) into ring slot `cur`
+//   mode 1: the composed vector over the last `age` frames (each frame's vector read where the previous step landed),
+//           normalised by the network's size (EngineFrame's convention with scale 1), into Comp
+#extension GL_EXT_samplerless_texture_functions : require
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0) uniform texture2D Motion;
+layout(set = 0, binding = 1) uniform texture2D R0;
+layout(set = 0, binding = 2) uniform texture2D R1;
+layout(set = 0, binding = 3) uniform texture2D R2;
+layout(set = 0, binding = 4, rg32f) uniform writeonly image2D W0;
+layout(set = 0, binding = 5, rg32f) uniform writeonly image2D W1;
+layout(set = 0, binding = 6, rg32f) uniform writeonly image2D W2;
+layout(set = 0, binding = 7, rg16f) uniform writeonly image2D Comp;
+layout(push_constant) uniform Push { uvec2 size, mbase, mgrid; vec2 mscale; uint mode, cur, age; } pc;
+vec2 bil(uint r, vec2 p) {   // bilinear at p (texel centres at +0.5), edges clamped
+    const vec2 f = p - 0.5, b0 = floor(f), w = f - b0;
+    const ivec2 i0 = ivec2(b0), hi = ivec2(pc.size) - 1;
+    vec2 t[4];
+    for (int k = 0; k < 4; ++k) {
+        const ivec2 c = clamp(i0 + ivec2(k & 1, k >> 1), ivec2(0), hi);
+        t[k] = (r == 0u ? texelFetch(R0, c, 0) : r == 1u ? texelFetch(R1, c, 0) : texelFetch(R2, c, 0)).xy;
+    }
+    return mix(mix(t[0], t[1], w.x), mix(t[2], t[3], w.x), w.y);
+}
+void main() {
+    const uvec2 px = gl_GlobalInvocationID.xy;
+    if (any(greaterThanEqual(px, pc.size))) return;
+    if (pc.mode == 0u) {
+        const uvec2 t = pc.mbase + min(uvec2((vec2(px) + 0.5) * vec2(pc.mgrid) / vec2(pc.size)), pc.mgrid - 1u);
+        const vec4 d = vec4(texelFetch(Motion, ivec2(t), 0).xy * pc.mscale, 0.0, 0.0);
+        if (pc.cur == 0u) imageStore(W0, ivec2(px), d); else if (pc.cur == 1u) imageStore(W1, ivec2(px), d); else imageStore(W2, ivec2(px), d);
+        return;
+    }
+    vec2 p = vec2(px) + 0.5, c = vec2(0.0);
+    for (uint j = 0u; j < pc.age; ++j) {
+        const vec2 d = bil((pc.cur + 3u - j) % 3u, p);
+        p += d; c += d;
+    }
+    imageStore(Comp, ivec2(px), vec4(c / vec2(pc.size), 0.0, 0.0));
+}

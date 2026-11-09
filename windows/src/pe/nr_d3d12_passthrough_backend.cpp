@@ -1,14 +1,17 @@
-// The D3D12 passthrough's frame path (nr_d3d12_asd_backend.hpp), on the game's command list: the RenoDX
+// The D3D12 passthrough's frame path (nr_d3d12_passthrough_backend.hpp), on the game's command list: the RenoDX
 // processing's frames through its D3D12 stage around the network; the network calls of the wilsjo2 processing's D3D12
 // flow (nr_asi_wilsjo2.cpp) as HLSL copy-in, the network, HLSL writeback. Everything that can fail is checked before
 // the first command is recorded, so a false return leaves the list as it came and the Vulkan bridge runs the frame.
 #include "nr_d3dcompiler.hpp"
-#include "nr_d3d12_asd_backend.hpp"
-#include "nr_d3d12_asd.hpp"
-#include "nr_d3d12_asd_net.hpp"
+#include "nr_d3d12_passthrough_backend.hpp"
+#include "nr_d3d12_passthrough.hpp"
+#include "nr_d3d12_passthrough_net.hpp"
 #include "nr_pe_d3d12split.hpp"
 #include "nr_renodx_d3d12.hpp"   // the RenoDX stage on this route
+#include "nr_d3d12_shot.hpp"      // the NR screenshot's readback pair
+#include "nr_screenshot.hpp"
 #include "nr_pe_log.hpp"
+#include "nr_pe_session.hpp"   // g_motion_without_depth_now
 #include <d3dcompiler.h>
 #include <windows.h>
 
@@ -23,7 +26,7 @@
 #include <utility>
 #include <vector>
 
-namespace nr::pe::asd {
+namespace nr::pe::d3d12_passthrough {
 namespace {
 
 template <class T> void release(T*& p) { if (p) { p->Release(); p = nullptr; } }
@@ -50,6 +53,14 @@ const char kShaders[] =
     "        lin_dst[id.y * g_w + id.x] = uint2(h.x | (h.y << 16), h.z | (h.w << 16));\n"
     "    }\n"
     "}\n"
+    // a pass history for an RGBA32F network history (Passes (fast) Interleaved): two uint2 a texel, lin_pitch(w, 16) rows
+    "[numthreads(8, 8, 1)] void to_linear32(uint3 id : SV_DispatchThreadID) {\n"
+    "    if (id.x < g_w && id.y < g_h) {\n"
+    "        const uint4 v = asuint(src_tex.Load(int3(id.xy, 0)));\n"
+    "        lin_dst[(id.y * g_w + id.x) * 2] = v.xy;\n"
+    "        lin_dst[(id.y * g_w + id.x) * 2 + 1] = v.zw;\n"
+    "    }\n"
+    "}\n"
     "[numthreads(8, 8, 1)] void from_linear(uint3 id : SV_DispatchThreadID) {\n"
     "    if (id.x >= g_w || id.y >= g_h) return;\n"
     "    uint2 p = lin_src[id.y * g_w + id.x];\n"
@@ -70,8 +81,8 @@ const char kShaders[] =
     "    lin_dst[idx + 1] = uint2(0u, 0u);\n"
     "}\n";
 
-// RDNA3: the network reads these buffers as images whose rows are 256-byte aligned (lin_pitch), so its copies address
-// rows of g_pitch texels (constant 2, unused on RDNA4). The RDNA4 text is kShaders unchanged.
+// The network reads these buffers as images whose rows are lin_pitch's (RDNA4 128-byte, RDNA3 256-byte aligned), so
+// the copies address rows of g_pitch texels (constant 2): one text for both architectures.
 const std::string& shaders_pitched() {
     static const std::string s = [] {
         std::string t(kShaders, sizeof kShaders - 1);
@@ -85,8 +96,7 @@ const std::string& shaders_pitched() {
     return s;
 }
 ID3DBlob* compile(const char* entry, std::string* why) {
-    if (rdna3()) return compile_cs(shaders_pitched().data(), shaders_pitched().size(), entry, why);
-    return compile_cs(kShaders, sizeof kShaders - 1, entry, why);
+    return compile_cs(shaders_pitched().data(), shaders_pitched().size(), entry, why);
 }
 
 }  // namespace
@@ -95,7 +105,7 @@ ID3DBlob* compile_cs(const char* source, size_t bytes, const char* entry, std::s
     static PFN_D3DCompile fn = reinterpret_cast<PFN_D3DCompile>(nr::pe::system_d3dcompile());   // System32's, not a game's
     if (!fn) { *why = "d3dcompiler_47.dll (D3DCompile) is not available"; return nullptr; }
     ID3DBlob *code = nullptr, *errors = nullptr;
-    const HRESULT hr = fn(source, bytes, "nr_d3d12_asd", nullptr, nullptr, entry, "cs_5_0",
+    const HRESULT hr = fn(source, bytes, "nr_d3d12_passthrough", nullptr, nullptr, entry, "cs_5_0",
                           D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors);
     if (FAILED(hr) || !code) {
         *why = std::string("the ") + entry + " shader did not compile";
@@ -150,20 +160,37 @@ struct Backend {
     ID3D12Device* device = nullptr;
     ID3D12RootSignature* rs = nullptr;
     ID3D12PipelineState *to_linear = nullptr, *from_linear = nullptr, *to_motion = nullptr, *to_depth = nullptr;
+    ID3D12PipelineState* to_linear32 = nullptr;   // a pass history into an RGBA32F network history's layout
     ID3D12DescriptorHeap* heap = nullptr;
     UINT increment = 0, slot = 0;
-    static constexpr UINT kSlots = 2048;   // the first heap: four descriptors a frame, 512 segments
+    static constexpr UINT kSlots = 2048;   // the first heap's descriptors: one segment (kSegment of them) a frame
     // A segment is rewritten only when the GPU has finished the frame that last used it (the net's completion
     // watermark, refresh_executed). Running out of finished segments grows the heap - it never overwrites one still
     // in flight, which would make a recorded dispatch read descriptors another frame wrote.
-    UINT segments = kSlots / 4;
+    // a segment: the colour's SRV, the output's UAV, the motion's and the depth's SRVs, a pass history's SRV (Passes
+    // (fast) Interleaved, nr_d3d12_passthrough_backend.cpp's history copy)
+    static constexpr UINT kSegment = 5;
+    UINT segments = kSlots / kSegment;
     std::vector<int64_t> segment_owner;    // per segment: the frame that last used it (-1: never)
+    // The plain frame path's linear buffers, one set per extent (the bridge keeps a runtime per extent): a wilsjo2 flow
+    // with layers at two sizes takes turns every frame and must not make them again each time. lin_* are this frame's.
+    struct LinearSet {
+        uint32_t w = 0, h = 0;
+        ID3D12Resource *in = nullptr, *out = nullptr, *mv = nullptr, *depth = nullptr;
+        ID3D12Resource* hist = nullptr;   // a Passes (fast) Interleaved pass's history, the network's layout (made on use)
+        uint64_t used = 0;   // the frame that last used it (the LRU)
+    };
+    static constexpr size_t kLinearSets = 4;
+    std::vector<LinearSet> linear_sets;
     ID3D12Resource *lin_in = nullptr, *lin_out = nullptr, *lin_mv = nullptr, *lin_depth = nullptr;
+    // The plain frame path's extent per feature (Session::resized), and how many changes were logged
+    std::map<uint64_t, std::pair<uint32_t, uint32_t>> feature_extent;
+    uint64_t resizes = 0;
     ID3D12Resource* neutral_mv = nullptr;
     uint32_t w = 0, h = 0;
     // A shared_ptr, not a unique_ptr: a reader off the game's thread (the heartbeat, NR Control's status) copies
     //    the pointer under `owner_lock` and uses it outside the lock, so a device swap cannot free it under a reader.
-    std::shared_ptr<D3d12AsdNetwork> network;
+    std::shared_ptr<D3d12PassthroughNetwork> network;
     bool broken = false;   // something of the device's could not be made: the Vulkan bridge from now on
     // Set while a device generation is being dropped: a stage's destructor calls retire() for the surfaces it still
     // holds, and those must be released here, not queued into the next generation's list (their watermark is gone).
@@ -264,6 +291,7 @@ Backend g;
 std::atomic<float> g_stage_avg_ms{0.f}, g_last_fast_passes{0.f};
 std::atomic<uint32_t> g_last_nr_w{0}, g_last_nr_h{0};
 std::atomic<bool> g_last_fast_fallback{false};
+std::atomic<uint8_t> g_last_il_missing{0};
 // the RenoDX stage's last frame's facts (backend_net_status, NR Control's engine-data panel)
 std::mutex g_facts_lock;
 bool g_facts_known = false;
@@ -302,6 +330,18 @@ ID3D12Resource* heap_buffer(ID3D12Device* device, D3D12_HEAP_TYPE type, uint64_t
 
 // The frame the object was last used in: the one about to be recorded (a replaced stage was used by the frame before,
 // so this is one frame of margin, never less).
+// A feature whose frame extent changed since its last evaluate starts its history again (Session::resized, which the
+// bridge ORs into every path's Reset; Resize History's carry is not on the D3D12 passthrough). Remembers the extent.
+bool resized(uint64_t feature, uint32_t w, uint32_t h) {
+    auto& e = g.feature_extent[feature];
+    const bool changed = e.first && (e.first != w || e.second != h);
+    if (changed && ++g.resizes <= 8)
+        nr::pe::log("[d3d12] feature #%u: %ux%u -> %ux%u, history restarts%s", unsigned(feature), e.first, e.second, w, h,
+                    g.resizes == 8 ? "; not logged again" : "");
+    e = {w, h};
+    return changed;
+}
+
 void retire(IUnknown* p) {
     if (!p) return;
     if (g.discarding) { p->Release(); return; }
@@ -330,7 +370,48 @@ bool generation_done(Backend& b) {
     return b.frames == 0 || b.executed >= int64_t(b.frames) - 1;
 }
 
+// RenoDX's NR screenshot on this route, by nr_pe_session.cpp's final-picture rules: the pair is copied in the game's
+// list around the stage and handed to the worker once that list's recording has finished (we own no fence here). Kept
+// outside the generations: a device swap does not stop copies already recorded.
+struct PendingShot {
+    nr::pe::d3d12shot::Readback pair;
+    std::shared_ptr<nr::gpu::Recording> ticket;   // the recording both copies are in
+    bool deliver = false;                          // false: a copy the frame dropped, only released once it ran
+    uint8_t hdr = 0;
+    std::string meta;
+    std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+};
+std::vector<std::unique_ptr<PendingShot>> g_shots;
+bool shot_pending() {
+    for (const auto& p : g_shots) if (p->deliver) return true;
+    return false;
+}
+void shot_poll() {
+    for (size_t i = 0; i < g_shots.size();) {
+        PendingShot& p = *g_shots[i];
+        if (p.ticket->never_submitted()) {   // closed and reset without running: nothing wrote the buffers
+            p.pair.release();
+            if (p.deliver) nr::pe::screenshot::abandon("capture_failed", "the captured frame's commands never ran");
+        } else if (nr::pe::split::completed(p.ticket)) {
+            if (!p.deliver) {
+                p.pair.release();
+            } else if (!p.pair.deliver(p.hdr, std::move(p.meta))) {
+                p.pair.release();
+                nr::pe::screenshot::abandon("capture_failed", "the readback buffers could not be mapped");
+            }
+        } else if (std::chrono::steady_clock::now() - p.since > std::chrono::seconds(10)) {
+            p.pair.forget();   // no proof the copies ran: the buffers stay (the GPU may still write them)
+            if (p.deliver) nr::pe::screenshot::abandon("capture_failed", "the captured frame did not finish within 10 s");
+        } else {
+            ++i;
+            continue;
+        }
+        g_shots.erase(g_shots.begin() + long(i));
+    }
+}
+
 void sweep() {
+    shot_poll();
     ++g.tick;
     // Previous generations: released only when their own evidence has passed their last recorded frame.
     for (size_t i = 0; i < g_old_generations.size();) {
@@ -460,7 +541,8 @@ bool build(ID3D12Device* device, std::string* why) {
     release(blob);
     if (FAILED(hr)) { *why = "CreateRootSignature failed"; return false; }
     for (auto [entry, pso] : {std::pair{"to_linear", &g.to_linear}, std::pair{"from_linear", &g.from_linear},
-                              std::pair{"to_motion", &g.to_motion}, std::pair{"to_depth", &g.to_depth}}) {
+                              std::pair{"to_motion", &g.to_motion}, std::pair{"to_depth", &g.to_depth},
+                              std::pair{"to_linear32", &g.to_linear32}}) {
         ID3DBlob* code = compile(entry, why);
         if (!code) return false;
         D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
@@ -473,7 +555,7 @@ bool build(ID3D12Device* device, std::string* why) {
     }
     D3D12_DESCRIPTOR_HEAP_DESC hd{};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = Backend::kSlots;
+    hd.NumDescriptors = Backend::kSlots / Backend::kSegment * Backend::kSegment;
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g.heap)))) { *why = "CreateDescriptorHeap failed"; return false; }
     g.increment = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -542,8 +624,10 @@ void drop_device() {
     g.discarding = true;   // the destructors below release their own surfaces here, not into the next generation
     g.renodx.clear();
     g.renodx_retired.clear();
-    retire(g.rs); retire(g.to_linear); retire(g.from_linear); retire(g.to_motion); retire(g.to_depth); retire(g.heap);
-    retire(g.lin_in); retire(g.lin_out); retire(g.lin_mv); retire(g.lin_depth);
+    retire(g.rs); retire(g.to_linear); retire(g.from_linear); retire(g.to_motion); retire(g.to_depth); retire(g.to_linear32);
+    retire(g.heap);
+    for (auto& ls : g.linear_sets) { retire(ls.in); retire(ls.out); retire(ls.mv); retire(ls.depth); retire(ls.hist); }
+    g.linear_sets.clear();
     retire(g.neutral_mv);
     if (g.token_map) g.token->Unmap(0, nullptr);
     if (g.done_map) g.done->Unmap(0, nullptr);
@@ -558,10 +642,10 @@ void drop_device() {
     g.retired.clear();
     g.token_retired.clear();
     g.token_map = nullptr; g.done_map = nullptr; g.token_slots = 0; g.frames = 0; g.executed = -1;
-    g.segments = Backend::kSlots / 4;
+    g.segments = Backend::kSlots / Backend::kSegment;
     g.segment_owner.clear();
     g.slot = 0;
-    g.rs = nullptr; g.to_linear = g.from_linear = g.to_motion = g.to_depth = nullptr; g.heap = nullptr;
+    g.rs = nullptr; g.to_linear = g.from_linear = g.to_motion = g.to_depth = g.to_linear32 = nullptr; g.heap = nullptr;
     g.lin_in = g.lin_out = g.lin_mv = g.lin_depth = nullptr;
     g.neutral_mv = nullptr;
     g.discarding = false;
@@ -663,7 +747,12 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
     }
     e.stack = passes;
     uint32_t nw = 0, nh = 0;
-    renodx::working_resolution(s, w, h, f.motion_w, f.motion_h, &nw, &nh);
+    // The game's render size (NRFollowInputRes): the motion vectors' region, the whole texture when the game gives
+    // none (0) - Session::renodx_extent's guide size; f.motion_w alone made "Follow input resolution" fall back to
+    // the Model resolution scale for every game that hands no subrect.
+    const uint32_t guide_w = f.motion_w ? f.motion_w : f.motion ? uint32_t(f.motion->GetDesc().Width) : 0u;
+    const uint32_t guide_h = f.motion_h ? f.motion_h : f.motion ? f.motion->GetDesc().Height : 0u;
+    renodx::working_resolution(s, w, h, guide_w, guide_h, &nw, &nh);
     const bool settings_changed = e.scale != s.resolution_scale || e.follow != s.follow_input_res || e.w != w ||
                                   e.h != h;
     e.scale = s.resolution_scale;
@@ -677,16 +766,21 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
     }
 
     std::string why;
-    if (!g.network->ready(f.device, nw, nh, &why)) {
+    // NR off (NeuralUplift): the stage copies the frame through and never calls the network - none is needed, none
+    // built (the Vulkan route asks for its runtime only with NR on, Session::renodx_frame)
+    if (s.nr_enabled && !g.network->ready(f.device, nw, nh, &why)) {
         if (g.network->building() && f.waiting) {
             *f.waiting = 1;
-            note_backend(("not run yet: the network: " + why + " (frames pass through with no NR; the bridge is not used)").c_str(), false);
+            note_backend(("not run yet: the network: " + why + " (frames pass through with no NR; the bridge is not used)").c_str(), false, true);
             return false;
         }
         return fallback("the RenoDX route: the network: " + why);
     }
     note_network(g.network->name());
 
+    // The network's extent changed with the frame's staying (Model resolution, or NRFollowInputRes after its debounce):
+    // the networks are kept per extent, so this feature's history there is from before - restart it as below.
+    const bool net_resized = e.stage && (e.nw != nw || e.nh != nh);
     if (!e.stage || e.w != w || e.h != h || e.nw != nw || e.nh != nh || e.format != sf ||
         e.hdr != f.renodx_hdr_flag || e.present != f.renodx_present) {
         renodx12::Stage::Config c;
@@ -738,7 +832,10 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
     rf.colour_state = color_state;
     rf.output = f.output;
     rf.output_state = output_state;
-    rf.reset = f.reset != 0;
+    // A frame or network extent change restarts the feature's history: the networks here are kept per extent, and
+    // one taken up again within 250 ms (net's stale rule) would blend the history it had before. (The bridge's
+    // Session::run_renodx does not reset on these; see the dx01 notes.)
+    rf.reset = f.reset != 0 || resized(f.feature, w, h) || net_resized;
     rf.after_upscale = f.renodx_after_upscale != 0;
     rf.fast_motion_available = f.renodx_fast_motion != 0;
     rf.motion = f.motion;
@@ -768,19 +865,22 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
     rf.preprocess.inverse = f.prep_inverse != 0;
     rf.present_white_nits = f.renodx_white_nits;
     rf.motion_without_depth = g.network->motion_without_depth();
+    // The Present layers' depth copies follow the network that runs (Session::renodx_runtime sets it on the bridge)
+    if (s.nr_enabled) nr::pe::g_motion_without_depth_now = rf.motion_without_depth ? 1 : 0;
     rf.base_controls.style = f.style;
     rf.base_controls.intensity = f.intensity;
     rf.base_controls.local_tone = f.local_tone;
     rf.base_controls.local_structure = f.local_structure;
     rf.base_controls.skin_structure = f.skin_structure;
     rf.base_controls.automatic_mask = f.automatic_mask != 0;
-    rf.base_controls.round_u8 = df == DXGI_FORMAT_R8G8B8A8_UNORM || df == DXGI_FORMAT_B8G8R8A8_UNORM ||
-                                df == DXGI_FORMAT_B8G8R8X8_UNORM;
+    // The network answers into the stage's RGBA16F image whatever the frame's format (the Vulkan route's RenoDX
+    // runtime is made RGBA16F): no 8-bit rounding of the answer - the resolve and the store do the frame's format
+    rf.base_controls.round_u8 = false;
     rf.base_controls.reversible = f.reversible_mode >= 0 && f.reversible_mode <= 4 ? uint32_t(f.reversible_mode) : 0u;
     rf.base_controls.history_strength = f.history_strength;
     rf.base_controls.noise_every_frame = f.noise_every_frame != 0;
 
-    const uint64_t bytes = uint64_t(lin_pitch(nw, 8)) * nh * 8;   // (the stage's lin_proxy / lin_neural; RDNA3 pitched)
+    const uint64_t bytes = uint64_t(lin_pitch(nw, 8)) * nh * 8;   // (the stage's lin_proxy / lin_neural: lin_pitch rows)
     const char* nwhy = "NR is disabled";
     const auto net = [&](uint32_t, uint64_t, const nr::D3d12NetControls& controls, NetTemporal nt,
                          ID3D12Resource* in, ID3D12Resource* out) {
@@ -794,6 +894,35 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
     };
     const auto state = nr::pe::split::snapshot(f.cmd);
     if (!state) return fallback("the RenoDX route: no snapshot of the command list's state");
+    // RenoDX's NR screenshot (nr_pe_session.cpp run_renodx, the same rules): the final picture - OptiScaler's finished
+    // picture, NR moved there for the capture (nr_pe_optifix.cpp lock_all), or the .asi's Present layer - with no inline
+    // NR on it (clean); the frame before NR here, the output after NR below the stage.
+    std::unique_ptr<PendingShot> capture;
+    const bool final_frame = f.renodx_present != 0 || f.renodx_finished != 0;
+    if (!shot_pending() && s.nr_enabled && nr::pe::screenshot::wants_final() && final_frame && f.renodx_clean) {
+        if (nr::pe::vulkan_format_of(sf) != nr::pe::vulkan_format_of(df)) {
+            nr::pe::screenshot::fail("unsupported_present", "the frame's input and output formats differ");
+        } else if (!g.booking) {
+            nr::pe::screenshot::fail("unsupported_present", "the frame's command list cannot be followed to its end");
+        } else {
+            D3D12_RESOURCE_DESC region = sd;
+            region.Format = sf;
+            region.Width = w;
+            region.Height = h;
+            capture = std::make_unique<PendingShot>();
+            if (capture->pair.prepare(f.device, region)) {   // (a refusal has ended the request with its reason)
+                capture->ticket = g.booking;
+                capture->pair.copy(f.cmd, f.color, color_state, 0);
+            } else {
+                capture.reset();
+            }
+        }
+    } else if (nr::pe::screenshot::armed() && !s.nr_enabled) {
+        nr::pe::screenshot::fail("nr_disabled", "enable NR before taking a comparison");
+    }
+    if (s.nr_enabled && nr::pe::screenshot::wants_model())
+        nr::pe::screenshot::fail("unsupported_diagnostic", "the D3D12 passthrough does not read the model's input and "
+                                 "output ([D3D12Passthrough] Enabled = 0 does)");
     e.stage->set_frame(g.frames);
     uint32_t ts = Backend::kTimeRing;
     if (g.stamps_map) {
@@ -817,15 +946,40 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
         std::memset(g.stamps_map + ts * 16, 0, 16);
         f.cmd->EndQuery(g.queries, D3D12_QUERY_TYPE_TIMESTAMP, ts * 2);
     }
+    rf.net_history_bytes = s.nr_enabled ? g.network->history_texel_bytes() : 0u;   // (ready() settled the network above)
+    rf.style_grade = f.style_grade != 0;
     const uint32_t ran = e.stage->record(f.cmd, rf, net);
     if (timed) {
         f.cmd->EndQuery(g.queries, D3D12_QUERY_TYPE_TIMESTAMP, ts * 2 + 1);
         f.cmd->ResolveQueryData(g.queries, D3D12_QUERY_TYPE_TIMESTAMP, ts * 2, 2, g.stamps, uint64_t(ts) * 16);
     }
+    if (capture) {
+        if (e.stage->record_ok() && e.stage->net_ran()) {
+            capture->pair.copy(f.cmd, f.output, output_state, 1);
+            // HDR stays HDR (nr_pe_session.cpp's rule): PQ codes as they are, scRGB (1.0 = 80 nits) to PQ; SDR as display
+            // codes. OptiScaler's finished picture is the back buffer: a float format is scRGB, 10 bits PQ when judged HDR.
+            const bool pq = sf == DXGI_FORMAT_R10G10B10A2_UNORM;
+            const bool linear = sf == DXGI_FORMAT_R16G16B16A16_FLOAT || sf == DXGI_FORMAT_R32G32B32A32_FLOAT ||
+                                sf == DXGI_FORMAT_R11G11B10_FLOAT;
+            capture->hdr = f.renodx_present ? uint8_t(f.renodx_present == 2 ? 2 : f.renodx_present == 3 ? 1 : 0)
+                                            : uint8_t(linear ? 1 : pq && f.renodx_hdr_flag ? 2 : 0);
+            capture->meta = std::string("path=") + (f.renodx_present ? "present" : "optiscaler-finished-picture") +
+                            "\ncomparison=final-picture-before-after-nr\nroute=d3d12-passthrough\nstack=" +
+                            std::to_string(passes) + "\nwidth=" + std::to_string(w) + "\nheight=" + std::to_string(h) +
+                            "\nsource_format=" + std::to_string(int(nr::pe::vulkan_format_of(sf))) +
+                            "\nhdr_mode=" + std::to_string(capture->hdr) + "\n";
+            capture->deliver = true;
+            nr::pe::screenshot::recorded();
+        }
+        // Otherwise the request stays armed for the next clean frame; the before-NR copy is already in the list, so
+        // its buffers are released only once the list has run.
+        g_shots.push_back(std::move(capture));
+    }
     g_last_nr_w.store(nw); g_last_nr_h.store(nh);
     const auto facts = e.stage->facts();
     g_last_fast_passes.store(facts.fast_passes);
     g_last_fast_fallback.store(facts.fast_fallback);
+    g_last_il_missing.store(facts.il_missing);
     { std::lock_guard<std::mutex> l(g_facts_lock); g_last_facts = facts; g_facts_known = true; }
     nr::pe::split::restore(f.cmd, state);
     // 0 passes is a legitimate copy-through only when the stage says it made everything it needed; otherwise the
@@ -903,7 +1057,7 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
     // As wilsjo2_ready: passing states wait (the frame as it came, no NR, no bridge); lasting ones take the bridge
     const auto wait = [&](const std::string& y) {
         *f.waiting = 1;
-        note_backend(("not run yet: " + y + " (frames pass through with no NR; the bridge is not used)").c_str(), false);
+        note_backend(("not run yet: " + y + " (frames pass through with no NR; the bridge is not used)").c_str(), false, true);
         return false;
     };
     if (!nr::pe::split::prepare(f.cmd, &why)) {
@@ -928,6 +1082,7 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
     }
     if (g.broken) return fallback(g.broken_why);
     g.network->history_f16(f.history_f16 != 0);   // [Network] History Precision, live
+    g.network->style_grade(f.style_grade != 0);   // [Network] Style Grade, live
 
     if (renodx) {
         g.booking = nr::pe::split::book(f.cmd);
@@ -968,22 +1123,34 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
         return fallback("the output's format has no typed UAV store");
     const uint32_t w = std::min<uint64_t>({f.width, sd.Width, dd.Width}), h = std::min<uint32_t>({f.height, sd.Height, dd.Height});
     if (!w || !h) return fallback("an empty extent");
-    if (w != g.w || h != g.h) {
-        retire(g.lin_in); retire(g.lin_out); retire(g.lin_mv); retire(g.lin_depth);
-        const uint64_t bytes8 = uint64_t(lin_pitch(w, 8)) * h * 8;      // (RDNA3: pitched rows; RDNA4 w * h)
-        const uint64_t bytes16 = uint64_t(lin_pitch(w, 16)) * h * 16;
-        g.lin_in = linear_buffer(f.device, bytes8);
-        g.lin_out = linear_buffer(f.device, bytes8);
-        g.lin_mv = linear_buffer(f.device, bytes8);
-        g.lin_depth = linear_buffer(f.device, bytes16);
-        if (!g.lin_in || !g.lin_out || !g.lin_mv || !g.lin_depth) {
-            retire(g.lin_in); retire(g.lin_out); retire(g.lin_mv); retire(g.lin_depth);
-            g.lin_in = g.lin_out = g.lin_mv = g.lin_depth = nullptr;
-            g.w = g.h = 0;
+    Backend::LinearSet* set = nullptr;
+    for (auto& ls : g.linear_sets)
+        if (ls.w == w && ls.h == h) { set = &ls; break; }
+    if (!set) {
+        if (g.linear_sets.size() >= Backend::kLinearSets) {   // the least recently used extent goes (retired: in flight)
+            auto lru = g.linear_sets.begin();
+            for (auto it = g.linear_sets.begin(); it != g.linear_sets.end(); ++it) if (it->used < lru->used) lru = it;
+            retire(lru->in); retire(lru->out); retire(lru->mv); retire(lru->depth); retire(lru->hist);
+            g.linear_sets.erase(lru);
+        }
+        const uint64_t bytes8 = uint64_t(lin_pitch(w, 8)) * h * 8;      // (rows of lin_pitch texels)
+        Backend::LinearSet ls;
+        ls.w = w; ls.h = h;
+        ls.in = linear_buffer(f.device, bytes8);
+        ls.out = linear_buffer(f.device, bytes8);
+        ls.mv = linear_buffer(f.device, bytes8);
+        // depth: made below when a frame reads it (Motion Without Depth = 1, the default: never; the Vulkan runtime's
+        // 1 x 1 stand-in) - 4K RGBA32F is 127 MiB
+        if (!ls.in || !ls.out || !ls.mv) {
+            retire(ls.in); retire(ls.out); retire(ls.mv);
             return fallback("the linear buffers could not be made");
         }
-        g.w = w; g.h = h;
+        g.linear_sets.push_back(ls);
+        set = &g.linear_sets.back();
     }
+    set->used = uint64_t(g.frames);
+    g.lin_in = set->in; g.lin_out = set->out; g.lin_mv = set->mv; g.lin_depth = set->depth;
+    g.w = w; g.h = h;
     const bool wants_depth = have_motion && f.depth && !g.network->motion_without_depth();
     DXGI_FORMAT depth_view = DXGI_FORMAT_UNKNOWN;
     D3D12_RESOURCE_DESC depth_desc{};
@@ -994,7 +1161,14 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
             depth_view = depth_view_format(depth_desc.Format);
         }
     }
-    const bool have_depth = depth_view != DXGI_FORMAT_UNKNOWN;
+    bool have_depth = depth_view != DXGI_FORMAT_UNKNOWN;
+    if (have_depth && !g.lin_depth) {
+        g.lin_depth = set->depth = linear_buffer(f.device, uint64_t(lin_pitch(w, 16)) * h * 16);
+        if (!g.lin_depth) {
+            have_depth = false;
+            nr::pe::log("[d3d12] the depth guide's buffer could not be made; running without depth");
+        }
+    }
     if (wants_depth && !have_depth) {
         static bool warned = false;
         if (!warned) {
@@ -1011,13 +1185,14 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
                         unsigned(depth_view));
         }
     }
+    uint32_t hist_bytes = 0;   // a Passes (fast) Interleaved pass's history handed in: the network's history texel (8 / 16)
     {
         std::string nwhy;
         if (!g.network->ready(f.device, w, h, &nwhy)) {
             // While the passthrough's network builds, no bridge: the model passes the frame through with no NR
             if (g.network->building() && f.waiting) {
                 *f.waiting = 1;
-                note_backend(("not run yet: " + nwhy + " (frames pass through with no NR; the bridge is not used)").c_str(), false);
+                note_backend(("not run yet: " + nwhy + " (frames pass through with no NR; the bridge is not used)").c_str(), false, true);
                 return false;
             }
             return fallback("the network: " + nwhy);
@@ -1034,6 +1209,7 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
         nc.reversible = f.reversible_mode >= 0 && f.reversible_mode <= 4 ? uint32_t(f.reversible_mode) : 0u;   // reversible_of
         nc.history_strength = f.history_strength;
         nc.noise_every_frame = f.noise_every_frame != 0;
+        nc.no_grade = f.no_grade != 0;
         g.network->controls(nc);
 
 
@@ -1044,10 +1220,26 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
         nt.depth_va = have_depth ? g.lin_depth->GetGPUVirtualAddress() : 0;
         nt.have_depth = have_depth;
         nt.depth_inverted = f.depth_inverted != 0;
-        nt.reset = f.reset != 0;
+        // A feature whose extent changed starts its history again (Session::resized: the bridge's frame and
+        // wilsjo2 paths OR it into the frame's Reset; Resize History's carry is not on this path) - a network per
+        // extent here, so A -> B -> A within 250 ms would otherwise blend the old A history with its gate open.
+        nt.reset = f.reset != 0 || resized(f.feature, w, h);
         nt.feature = f.feature;
         nt.have_motion = have_motion;
         nt.motion_f16 = true;
+        // Interleaved's pass history (wilsjo2 on the D3D12 flow): copied below into the network's history layout and read
+        // in place of the feature's own (the Vulkan runtime's EngineFrame::history blit)
+        if (f.history && have_motion) {
+            const D3D12_RESOURCE_DESC hd = f.history->GetDesc();
+            const uint32_t hb = g.network->history_texel_bytes();
+            if ((hb == 8u || hb == 16u) && hd.Width >= w && hd.Height >= h) {
+                const uint64_t need = uint64_t(lin_pitch(w, hb)) * h * hb;
+                if (set->hist && set->hist->GetDesc().Width < need) { retire(set->hist); set->hist = nullptr; }
+                if (!set->hist) set->hist = linear_buffer(f.device, need);
+                if (set->hist) { hist_bytes = hb; nt.history_va = set->hist->GetGPUVirtualAddress(); }
+                else nr::pe::log("[d3d12] Interleaved: the pass history's buffer could not be made; its network runs on its own history");
+            }
+        }
         g.network->temporal(nt);
     }
     const auto state = nr::pe::split::snapshot(f.cmd);
@@ -1057,13 +1249,13 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
     // rewritten: the heap grows instead (D3D12 does not keep a descriptor's resource alive for its GPU use).
     g.refresh_executed();
     if (g.segment_owner.empty()) g.segment_owner.assign(g.segments, -1);
-    UINT seg = g.slot / 4;
+    UINT seg = g.slot / Backend::kSegment;
     if (g.segment_owner[seg] >= 0 && !frame_done(g.segment_owner[seg])) {
         const UINT grown = g.segments * 2;
         ID3D12DescriptorHeap* nh = nullptr;
         D3D12_DESCRIPTOR_HEAP_DESC hd{};
         hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        hd.NumDescriptors = grown * 4;   // the SRV and UAV of each segment, as the first heap laid them out
+        hd.NumDescriptors = grown * Backend::kSegment;   // each segment's descriptors, as the first heap laid them out
         hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         if (FAILED(f.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&nh))) || !nh)
             return fallback("no descriptor segment whose GPU use has finished");
@@ -1074,12 +1266,13 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
         g.slot = 0;
         seg = 0;
         char msg[160];
-        std::snprintf(msg, sizeof msg, "descriptor heap grown to %u segments (completion protection)", grown);
+        std::snprintf(msg, sizeof msg, "descriptor heap grown to %u segments (completion protection; frame %llu)", grown,
+                      static_cast<unsigned long long>(g.frames));
         nr::pe::log("[d3d12] %s", msg);
     }
     g.segment_owner[seg] = int64_t(g.frames);
-    const UINT slot = seg * 4;
-    g.slot = (seg + 1) * 4 % (g.segments * 4);
+    const UINT slot = seg * Backend::kSegment;
+    g.slot = (seg + 1) * Backend::kSegment % (g.segments * Backend::kSegment);
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = g.heap->GetCPUDescriptorHandleForHeapStart();
     D3D12_GPU_DESCRIPTOR_HANDLE gpu = g.heap->GetGPUDescriptorHandleForHeapStart();
     cpu.ptr += SIZE_T(slot) * g.increment;
@@ -1118,8 +1311,8 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
     const bool in_place = f.color == f.output;
     const LinearFrame in{g.lin_in, g.lin_in->GetGPUVirtualAddress(), w, h, uint64_t(lin_pitch(w, 8)) * h * 8};
     const LinearFrame out{g.lin_out, g.lin_out->GetGPUVirtualAddress(), w, h, in.bytes};
-    // constant 2 = RDNA3's row pitch in texels (0 and unread on RDNA4)
-    const UINT p8 = rdna3() ? lin_pitch(w, 8) : 0u, p16 = rdna3() ? lin_pitch(w, 16) : 0u;
+    // constant 2 = the rows' pitch in texels (lin_pitch)
+    const UINT p8 = lin_pitch(w, 8), p16 = lin_pitch(w, 16);   // the rows' texels (lin_pitch)
     UINT constants[8] = {w, h, p8, 0u, 0u, 0u, 0u, 0u};
     UINT mv_constants[8] = {w, h, p8, 0u, 0u, 0u, 0u, 0u};
     UINT depth_constants[8] = {w, h, p16, 0u, 0u, 0u, 0u, 0u};
@@ -1185,6 +1378,30 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
         cmd->SetComputeRootUnorderedAccessView(4, g.lin_depth->GetGPUVirtualAddress());
         cmd->Dispatch(gx, gy, 1);
     }
+    if (hist_bytes) {   // Interleaved's pass history (UNORDERED_ACCESS, ours) -> set->hist in the network's history layout
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu_hist = cpu;
+        cpu_hist.ptr += SIZE_T(4) * g.increment;
+        D3D12_GPU_DESCRIPTOR_HANDLE gpu_hist = gpu;
+        gpu_hist.ptr += UINT64(4) * g.increment;
+        D3D12_SHADER_RESOURCE_VIEW_DESC hv{};
+        hv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        hv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        hv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        hv.Texture2D.MipLevels = 1;
+        f.device->CreateShaderResourceView(f.history, &hv, cpu_hist);
+        D3D12_RESOURCE_BARRIER hb2[2];
+        transition(hb2[0], f.history, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        transition(hb2[1], set->hist, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        cmd->ResourceBarrier(2, hb2);
+        const UINT hist_constants[8] = {w, h, lin_pitch(w, hist_bytes), 0u, 0u, 0u, 0u, 0u};
+        cmd->SetPipelineState(hist_bytes == 16u ? g.to_linear32 : g.to_linear);
+        cmd->SetComputeRoot32BitConstants(0, 8, hist_constants, 0);
+        cmd->SetComputeRootDescriptorTable(1, gpu_hist);
+        cmd->SetComputeRootUnorderedAccessView(4, set->hist->GetGPUVirtualAddress());
+        cmd->Dispatch(gx, gy, 1);
+        transition(hb2[0], f.history, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        cmd->ResourceBarrier(1, hb2);
+    }
     b[0] = D3D12_RESOURCE_BARRIER{};
     b[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     b[0].UAV.pResource = nullptr;   // lin_in, lin_mv and lin_depth
@@ -1228,6 +1445,7 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
     transition(b[n++], g.lin_mv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
     if (have_depth)
         transition(b[n++], g.lin_depth, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+    if (hist_bytes) transition(b[n++], set->hist, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
     cmd->ResourceBarrier(n, b);
     nr::pe::split::restore(cmd, state);
 
@@ -1244,6 +1462,7 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
     return true;
 }
 void release_renodx_feature(uint64_t feature) {
+    g.feature_extent.erase(feature);   // (Session::release_feature)
     if (auto it = g.renodx.find(feature); it != g.renodx.end()) {
         if (it->second.stage) g.renodx_retired.push_back({int64_t(g.frames), g.uses_now(), "feature", std::move(it->second.stage)});
         g.renodx.erase(it);
@@ -1273,25 +1492,26 @@ HRESULT device_removed_reason() {
 void abandon_at_exit() {
     // No lock: the game's other threads are gone, one may have died holding it. Moved into memory never freed, so no
     // destructor of theirs runs.
-    new std::shared_ptr<D3d12AsdNetwork>(std::move(g.network));
+    new std::shared_ptr<D3d12PassthroughNetwork>(std::move(g.network));
     new decltype(g.renodx)(std::move(g.renodx));
     new decltype(g.renodx_retired)(std::move(g.renodx_retired));
     new decltype(g.recordings)(std::move(g.recordings));
     new decltype(g.booking)(std::move(g.booking));
 }
 
-AsdNetStatus backend_net_status() {
-    std::shared_ptr<D3d12AsdNetwork> n;
+PassthroughNetStatus backend_net_status() {
+    std::shared_ptr<D3d12PassthroughNetwork> n;
     {
         std::lock_guard<std::recursive_mutex> l(g_owner_lock);
         n = g.network;
     }
-    AsdNetStatus s = n ? n->status() : AsdNetStatus{};
+    PassthroughNetStatus s = n ? n->status() : PassthroughNetStatus{};
     s.stage_ms = g_stage_avg_ms.load();
     s.nr_w = g_last_nr_w.load();
     s.nr_h = g_last_nr_h.load();
     s.fast_passes = g_last_fast_passes.load();
     s.fast_fallback = g_last_fast_fallback.load();
+    s.il_missing = g_last_il_missing.load();
     {
         std::lock_guard<std::mutex> l(g_facts_lock);
         s.renodx_known = g_facts_known;
@@ -1305,4 +1525,4 @@ AsdNetStatus backend_net_status() {
 }
 
 
-}  // namespace nr::pe::asd
+}  // namespace nr::pe::d3d12_passthrough

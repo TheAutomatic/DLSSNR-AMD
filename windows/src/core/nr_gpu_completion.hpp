@@ -45,6 +45,17 @@ struct Recording {
         // A secondary can be reset while an executable primary still retains its earlier recording.
         return due || std::all_of(kept.begin(), kept.end(), [](const auto& p) { return p->ready(); });
     }
+    // HUD capture cannot treat elapsed time/submission count as a resource lifetime proof.
+    bool capture_ready() {
+        std::vector<std::shared_ptr<Recording>> owners;
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            waits.erase(std::remove_if(waits.begin(), waits.end(), [](auto& f) { return f(); }), waits.end());
+            if (!sealed || unknown_submit || !waits.empty()) return false;
+            for (const auto& p:parents) if (auto owner=p.lock()) owners.push_back(std::move(owner));
+        }
+        return std::all_of(owners.begin(),owners.end(),[](const auto& p){return p->capture_ready();});
+    }
     void seal() { std::lock_guard<std::mutex> guard(mutex); sealed = true; }
     // Strict form for a consumer that must never take the fallback as proof (the D3D12 passthrough): finished means
     // sealed, and every submission's wait has answered. An unknown submission is never strict-ready.
@@ -58,6 +69,16 @@ struct Recording {
         std::lock_guard<std::mutex> guard(mutex);
         waits.erase(std::remove_if(waits.begin(), waits.end(), [](auto& f) { return f(); }), waits.end());
         return sealed && !unknown_submit && waits.empty();
+    }
+    // Not sealed, but nothing of it can still run on the GPU: every known execution has answered (or there was none),
+    // no submission was unknown, and it has been quiet for the fallback window. A command list a game keeps in a pool
+    // without Reset looks like this once it ran; strict_ready() alone waits for it forever (a tester's game: the D3D12
+    // passthrough's descriptor heap doubled until it overflowed, replaced stages were never released). Only a later
+    // re-execution of the same closed list, after the window, is not covered.
+    bool quiet_ready() {
+        std::lock_guard<std::mutex> guard(mutex);
+        waits.erase(std::remove_if(waits.begin(), waits.end(), [](auto& f) { return f(); }), waits.end());
+        return !unknown_submit && waits.empty() && fallback_due();
     }
     void submitted(std::function<bool()> wait) {
         std::vector<std::shared_ptr<Recording>> kept;

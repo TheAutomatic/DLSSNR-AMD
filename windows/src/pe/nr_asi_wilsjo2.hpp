@@ -67,7 +67,7 @@ bool wilsjo2_inspect(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, ID3D1
                      ID3D12Resource* target, uint32_t w, uint32_t h, uint32_t compare, float split, float zoom, bool swap,
                      bool apply_model);
 
-// HUD FIX at Present on D3D12 (wilsjo2_hudfix.comp), as wilsjo2_hudfix_vk: every resource UNORDERED_ACCESS; `hudless`
+// HUD FIX at Present on D3D12 (hudfix.comp), as hudfix_vk: every resource UNORDERED_ACCESS; `hudless`
 // null: `back`; `fresh`: `alpha` was just made (read as 0). `estimate_too` (source 2): the estimate's state follows this
 // frame as well (`previous`; Auto composing from a HUD-less frame). False when not recorded.
 struct HudFixD3D12 {
@@ -79,8 +79,13 @@ struct HudFixD3D12 {
     float motion_scale_x = 1.f, motion_scale_y = 1.f, motion_step_x = 1.f, motion_step_y = 1.f;
     uint32_t motion_x = 0, motion_y = 0;
 };
-bool wilsjo2_hudfix(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, const HudFixD3D12& r, uint32_t w, uint32_t h,
-                    uint32_t source, bool show_mask, bool fresh, uint32_t parity, bool estimate_too = false);
+bool hudfix_d3d12(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, const HudFixD3D12& r, uint32_t w, uint32_t h,
+                  uint32_t source, bool show_mask, bool fresh, bool estimate_too = false);
+// HUD FIX's chain capture before the layers: `out` = `hudless` where its HUD count against `frame` (into `stats`) is
+// within the limit, else `frame` (hudfix.comp HUD_COUNT, HUD_COMPOSE HudMode 5); every resource UNORDERED_ACCESS.
+// False when not recorded.
+bool hudfix_select_d3d12(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, ID3D12Resource* frame,
+                         ID3D12Resource* hudless, ID3D12Resource* stats, ID3D12Resource* out, uint32_t w, uint32_t h);
 // Frame generation's HUD-less frame with the Present layers' change (present_layers' fg_delta): `out` = `hudless` +
 // (`after` - `before`), HUD_COMPOSE with HudMode 0 and `zero` (an alpha of 0); every resource UNORDERED_ACCESS, `stats`
 // HUD FIX's R32_UINT texture (bound, not read in this mode). False when not recorded.
@@ -153,13 +158,14 @@ struct VkCopySide {
 };
 bool wilsjo2_copy_vk(VkCommandBuffer cmd, const VkCopySide& source, bool storage_read, uint32_t sx, uint32_t sy,
                      const VkCopySide& target, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h);
-// HUD FIX at Present (wilsjo2_hudfix.comp), on the Vulkan and D3D11 routes: every image GENERAL. `back` the frame as
+// HUD FIX at Present (hudfix.comp), on the Vulkan and D3D11 routes: every image GENERAL. `back` the frame as
 // the game presented it (its copy, before the Present layers), `hudless` the same frame without its HUD (null image:
-// `back`), `frame` the layers' answer on it, written over with the composition; `alpha` (RG16F: .r the HUD's alpha) and
-// `stats` (R32_UINT, max(4, W/8) x 1 + H/8: the counts, the estimate's tile flags) the stream's; `fresh`: `alpha` and
-// `stats` were just made (read as 0). `source`: 2 the difference mask of hudless against back, 4 the estimate
-// (`previous`, the last frame's back, and alpha updated first), 0 / 1 a UI alpha / UI colour in `alpha`. `show_mask`:
-// the alpha shown instead. `estimate_too` (source 2): the estimate's state follows this frame as well (`previous`).
+// `back`), `frame` the layers' answer on it, written over with the composition; `alpha` (RGBA16F: .r the HUD's
+// alpha, the estimate's state) and `stats` (R32_UINT, max(4, W) x 1 + H: the counts, the estimate's HUD colours) the
+// stream's; `fresh`: `alpha` and `stats` were just made (read as 0). `source`: 2 the difference mask of hudless
+// against back, 4 the estimate (`previous`, the last frame's back, and alpha updated first), 0 / 1 a UI alpha / UI
+// colour in `alpha`. `show_mask`: the alpha shown instead. `estimate_too` (source 2): the estimate's state follows
+// this frame as well (`previous`).
 // False when not recorded.
 struct HudFixVkImages {
     Wilsjo2VkImage back, hudless, frame, alpha, stats, previous;
@@ -168,8 +174,8 @@ struct HudFixVkImages {
     float motion_scale_x = 1.f, motion_scale_y = 1.f, motion_step_x = 1.f, motion_step_y = 1.f;
     uint32_t motion_x = 0, motion_y = 0;
 };
-bool wilsjo2_hudfix_vk(VkCommandBuffer cmd, const HudFixVkImages& im, uint32_t w, uint32_t h, uint32_t source, bool show_mask,
-                       bool fresh, uint32_t parity, bool estimate_too = false);
+bool hudfix_vk(VkCommandBuffer cmd, const HudFixVkImages& im, uint32_t w, uint32_t h, uint32_t source, bool show_mask,
+               bool fresh, bool estimate_too = false);
 // NR Control's comparison on the Vulkan and D3D11 routes, as wilsjo2_inspect: `before` and `after` (GENERAL) shown into
 // `target` (GENERAL, w x h). False when not recorded.
 bool wilsjo2_inspect_vk(VkCommandBuffer cmd, const Wilsjo2VkImage& before, const Wilsjo2VkImage& after,

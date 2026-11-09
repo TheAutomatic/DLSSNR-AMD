@@ -1,0 +1,282 @@
+#version 460
+// HUD FIX (NR Control's [HudFix], ours): NR's change kept off the game's HUD at Present. The composition is
+// NVIDIA DLSSNR.UICorrection's as 310.9.16's post kernel does it and RenoDX
+// v8.5.0-rc10's pre-frame-generation composition (shaders/prefg_compose.cs_5_1.hlsl, MIT, the same formula):
+//     Final = Back + (1 - a) * (Enhanced - Hudless)
+// Back the frame with its HUD, Hudless the same frame without it (where none: Back itself), Enhanced NR's answer on
+// Hudless, a the HUD's alpha. Every value in the frame's own encoding, where the game composed its HUD.
+// One file, four programs (built with one of the defines):
+//   HUD_CLEAR    u1's counts (R32_UINT, its row 0, x 0..3) set to 0. Below them, from row 1, the estimate's HUD colours
+//                (one texel a pixel).
+//   HUD_COUNT    per pixel of t0 (Back) against t1 (Hudless, or the previous frame for the estimate): HudMode 2 counts
+//                the HUD pixels (u1.x: beyond Epsilon, u1.y: beyond the grain-sized tolerance, prefg_compose's Stats);
+//                HudMode 3 counts the pixels that changed since the previous frame (u1.z: beyond Epsilon, u1.w:
+//                beyond 4/255 - the frame moves, not only TAA's jitter).
+//   HUD_ESTIMATE the HUD estimated where nothing tells where it is (ours), against the previous frame (t1) and, when the
+//                game gives them, its motion vectors (t2, MotionOn; without them the scene is taken as unmoved).
+//                Two votes for HUD, one for the scene:
+//                - motion: the pixel's 3 x 3 is compared with the frame before at the same place (e: screen-fixed) and
+//                  where its scene came from, bilinear (r). HUD: r > 2.5 e + 2/255, the pixel itself within 3/255 of
+//                  the frame before (a HUD repeats its pixels; a light fixed to the screen over a moving surface does
+//                  not), a step of 12/255 to a 4-neighbour within 2 pixels (text, icons, frames; a light's rim is a
+//                  soft gradient), its whole 3 x 3 inside the frame by the vectors. Scene: e > 2.5 r + 2/255.
+//                - still: the pixel bit-exact for 8 frames in a row (u0.b counts them), a sharp step near, not clipped
+//                  (0..2 or 253..255 codes in every channel), while the camera moves (at least Threshold of the frame
+//                  changed by more than 4/255: a still scene repeats its pixels as a HUD does - a standing figure, a
+//                  converged distance -, so a frame that does not move votes nothing), and such pixels at least 3/10
+//                  of the 8 x 8 group's pixels with a sharp step near (a HUD element, not scattered dots). It finds
+//                  the HUD in motion where the vectors cannot tell (the centre, a route without vectors).
+//                u0 (RGBA16F, read and written): .g the presence c (+0.34 a HUD vote, -0.5 a scene vote, -0.1 a frame the
+//                pixel is not the HUD's colour T within 24/255 and no vote), .a the memory M (+0.1 / -0.02), .r the
+//                alpha max(smoothstep(.3, .9, c) x the pixel near T (16/255 .. 64/255), smoothstep(.3, .9, M) x the
+//                pixel showing T (4/255 .. 24/255): a HUD that hid and came back), .b the bit-exact run. T, the pixel at
+//                its last HUD vote, 10 bits a channel, in u1 from row 1. A pixel no vote tells keeps its state (an edge,
+//                a flat inside). Values above 1 (scRGB) are compared compressed (2 - 1/v); SDR and PQ as they are.
+//   HUD_COMPOSE  u0 = the composition. HudMode 0: a = t3.r (a UI alpha), 1: a = t3.a (a UI colour's alpha), 2: the
+//                difference mask (Back == Hudless within Epsilon: scene, else HUD), with prefg_compose's limits - above
+//                HudLimit HUD pixels the mask is no HUD (Residual 1 and the grain-sized count within it: NR's change on
+//                Back where the difference is grain, else Back kept; Residual 2 - the chain capture under its check,
+//                the layers ran on Back itself - Enhanced whole; else Back kept whole); 3: the estimate, a = the
+//                largest t3.r of the 5 x 5 around the pixel (the HUD's antialiased edges with it); Hudless = Back.
+//                5: the chain capture's pick (above).
+//                (prefg_compose takes Enhanced whole in the last case, but only for the frames until its add-on's
+//                two-pass path runs NR on Back. Nothing takes over here, and Enhanced whole is the scene without what
+//                was drawn after the copy: a menu over most of the screen vanished, the scene before it shown.)
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D t0;
+layout(set = 0, binding = 1) uniform sampler2D t1;
+layout(set = 0, binding = 2) uniform sampler2D t2;
+layout(set = 0, binding = 3) uniform sampler2D t3;
+#if defined(HUD_ESTIMATE)
+layout(set = 0, binding = 4, rgba16f) uniform image2D u0;
+#else
+layout(set = 0, binding = 4) uniform writeonly image2D u0;
+#endif
+layout(set = 0, binding = 5, r32ui) uniform coherent uimage2D u1;
+
+// The prefix of the stage's 256-byte constants (wilsjo2_common.glsl) these programs read
+layout(push_constant, std430) uniform Constants {
+    uint Mode;            //  0
+    float WhitePoint;     //  4
+    uint Width;           //  8
+    uint Height;          // 12
+    float Unused16[2];    // 16, 20
+    uint ShowMask;        // 24 (DebugView): the HUD's alpha shown instead of the picture
+    uint Unused28;        // 28
+    uint Fresh;           // 32 (Passthrough): the estimate's state is new (read as 0)
+    float MvScaleX, MvScaleY;   // 36, 40 (the estimate with motion vectors: output pixels per unit)
+    uint HudLimit;        // 44 (GuideWidth): the HUD pixels above which a difference mask is no HUD
+    uint Residual;        // 48 (GuideHeight): 1 the residual form above the limit (prefg_compose Auto)
+    uint HudMode;         // 52 (CompareMode)
+    float Epsilon;        // 56 (CompareSplit): equal within, relative above 1
+    float Threshold;      // 60 (CompareZoom): the estimate's share of changed pixels for a moving frame
+    uint MotionOn;        // 64 (CompareSwap): the estimate has the game's motion vectors (t2)
+    uint MotionBase;      // 68 (Transfer): their region's origin in t2, x | y << 16
+    float MotionStepX;    // 72 (DebugScale): t2 texels per output pixel
+    float MotionStepY;    // 76 (ReversibleMode's slot)
+} cb;
+
+const float kGrainTolerance = 1.0 / 16.0;   // prefg_compose: 16 8-bit steps
+
+shared uint s_hud, s_coarse, s_changed, s_moved;
+
+#if defined(HUD_ESTIMATE)
+// the estimate: an 8 x 8 group's neighbourhoods in shared memory
+shared uvec2 s_c[14 * 14];                        // the frame, 3 pixels around the group (half floats)
+// per pixel, half floats: against the frame before here (e0) / where the scene was (r0; -1: outside the frame)
+shared uint s_er[10 * 10];
+shared uint s_sh[12];                             // rows of 12 (2 pixels around): a step of kSharp to a 4-neighbour
+shared uint s_sv[8];                              // the group's rows: such a step within 2 pixels (bit x)
+shared uint s_still, s_sharp;                     // the group's still candidates and pixels with a sharp step near
+const float kK = 2.5, kTau = 2.0 / 255.0, kStill = 3.0 / 255.0, kSharp = 12.0 / 255.0, kRun = 8.0;
+float squash(float v) { return v <= 1.0 ? v : 2.0 - 1.0 / v; }
+vec3 squash3(vec3 v) { return vec3(squash(v.r), squash(v.g), squash(v.b)); }
+float mdiff(vec3 a, vec3 b) { const vec3 d = abs(a - b); return max(d.r, max(d.g, d.b)); }
+uint pack_t(vec3 v) {
+    const uvec3 q = uvec3(round(clamp(v * 0.5, 0.0, 1.0) * 1023.0));
+    return q.r | (q.g << 10) | (q.b << 20);
+}
+vec3 unpack_t(uint u) { return vec3(uvec3(u, u >> 10, u >> 20) & 1023u) * (2.0 / 1023.0); }
+uvec2 pack_c(vec3 v) { return uvec2(packHalf2x16(v.rg), packHalf2x16(vec2(v.b, 0.0))); }
+vec3 sc(int i) { const uvec2 u = s_c[i]; return vec3(unpackHalf2x16(u.x), unpackHalf2x16(u.y).x); }
+// the frame's value as s_c holds it (half floats), for decisions that must match the ones made from s_c
+vec3 half_c(vec3 v) { const uvec2 u = pack_c(v); return vec3(unpackHalf2x16(u.x), unpackHalf2x16(u.y).x); }
+#endif
+
+bool differs(vec3 a, vec3 b, float tolerance) {
+    const vec3 scale = max(vec3(1.0), abs(b));
+    return any(greaterThan(abs(a - b), tolerance * scale));
+}
+
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    const bool inside = p.x < int(cb.Width) && p.y < int(cb.Height);
+#if defined(HUD_CLEAR)
+    if (p.x < 4 && p.y == 0) imageStore(u1, p, uvec4(0u));
+#elif defined(HUD_COUNT)
+    if (gl_LocalInvocationIndex == 0u) { s_hud = 0u; s_coarse = 0u; s_changed = 0u; s_moved = 0u; }
+    barrier();
+    if (inside) {
+        const vec3 a = texelFetch(t0, p, 0).rgb, b = texelFetch(t1, p, 0).rgb;
+        if (cb.HudMode == 3u) {
+            if (differs(a, b, cb.Epsilon)) atomicAdd(s_changed, 1u);
+            if (differs(a, b, 4.0 / 255.0)) atomicAdd(s_moved, 1u);
+        } else {
+            if (differs(a, b, cb.Epsilon)) atomicAdd(s_hud, 1u);
+            if (differs(a, b, kGrainTolerance)) atomicAdd(s_coarse, 1u);
+        }
+    }
+    barrier();
+    if (gl_LocalInvocationIndex == 0u) {
+        if (s_hud != 0u) imageAtomicAdd(u1, ivec2(0, 0), s_hud);
+        if (s_coarse != 0u) imageAtomicAdd(u1, ivec2(1, 0), s_coarse);
+        if (s_changed != 0u) imageAtomicAdd(u1, ivec2(2, 0), s_changed);
+        if (s_moved != 0u) imageAtomicAdd(u1, ivec2(3, 0), s_moved);
+    }
+#elif defined(HUD_ESTIMATE)
+    // a quiet group (most of a moving frame): no state and no pixel within kStill of the frame before - no vote can fire
+    // (both need it) and there is nothing to lower: its state stays 0 and nothing else is read. Asked only while the
+    // frame moves (u1.w; in a still frame every group has such pixels and the question would only cost).
+    if (float(imageLoad(u1, ivec2(3, 0)).x) >= cb.Threshold * float(cb.Width) * float(cb.Height)) {
+        const vec4 l0 = cb.Fresh != 0u || !inside ? vec4(0.0) : imageLoad(u0, p);
+        const bool busy = inside && (l0.g > 0.0 || l0.a > 0.0 ||
+                          unpackHalf2x16(packHalf2x16(vec2(mdiff(half_c(squash3(texelFetch(t0, p, 0).rgb)),
+                                                                 squash3(texelFetch(t1, p, 0).rgb)), 0.0))).x <= kStill);
+        if (gl_LocalInvocationIndex == 0u) s_still = 0u;
+        barrier();
+        if (busy) atomicOr(s_still, 1u);
+        barrier();
+        if (s_still == 0u) {
+            if (inside) imageStore(u0, p, vec4(0.0));
+            return;
+        }
+    }
+    const ivec2 g0 = ivec2(gl_WorkGroupID.xy) * 8, hi = ivec2(int(cb.Width) - 1, int(cb.Height) - 1);
+    const vec2 size = vec2(float(cb.Width), float(cb.Height));
+    const uint li = gl_LocalInvocationIndex;
+    for (uint i = li; i < 14u * 14u; i += 64u)
+        s_c[i] = pack_c(squash3(texelFetch(t0, clamp(g0 - 3 + ivec2(i % 14u, i / 14u), ivec2(0), hi), 0).rgb));
+    if (li < 12u) s_sh[li] = 0u;
+    barrier();
+    const ivec2 base = ivec2(int(cb.MotionBase & 0xffffu), int(cb.MotionBase >> 16));
+    for (uint i = li; i < 10u * 10u; i += 64u) {
+        const ivec2 o = ivec2(i % 10u, i / 10u), q = clamp(g0 - 1 + o, ivec2(0), hi);
+        const vec3 c = sc((o.y + 2) * 14 + o.x + 2);
+        vec2 src = vec2(q);
+        if (cb.MotionOn != 0u) {
+            const ivec2 tq = clamp(base + ivec2((vec2(q) + 0.5) * vec2(cb.MotionStepX, cb.MotionStepY)), ivec2(0),
+                                   textureSize(t2, 0) - 1);
+            src += texelFetch(t2, tq, 0).rg * vec2(cb.MvScaleX, cb.MvScaleY);
+        }
+        const bool in_frame = all(greaterThanEqual(src, vec2(0.0))) && all(lessThanEqual(src, vec2(hi)));
+        s_er[i] = packHalf2x16(vec2(mdiff(c, squash3(texelFetch(t1, q, 0).rgb)),
+                                    in_frame ? mdiff(c, squash3(textureLod(t1, (src + 0.5) / size, 0.0).rgb)) : -1.0));
+    }
+    for (uint i = li; i < 12u * 12u; i += 64u) {
+        const ivec2 o = ivec2(i % 12u, i / 12u) + 1;
+        const int k = o.y * 14 + o.x;
+        const vec3 c = sc(k);
+        const float st = max(max(mdiff(c, sc(k + 1)), mdiff(c, sc(k - 1))), max(mdiff(c, sc(k + 14)), mdiff(c, sc(k - 14))));
+        if (st >= kSharp) atomicOr(s_sh[o.y - 1], 1u << uint(o.x - 1));
+    }
+    barrier();
+    if (li < 8u) {   // 5 x 5 around each pixel: the rows' bits x..x+4, then rows y..y+4
+        uint v = 0u;
+        for (uint y = li; y < li + 5u; ++y) {
+            const uint m = s_sh[y];
+            v |= m | (m >> 1) | (m >> 2) | (m >> 3) | (m >> 4);
+        }
+        s_sv[li] = v;
+    }
+    barrier();
+    const ivec2 o = ivec2(gl_LocalInvocationID.xy);
+    vec2 er = vec2(0.0);
+    bool inn = true;
+    for (int y = 0; y < 3; ++y)
+        for (int x = 0; x < 3; ++x) {
+            const vec2 v = unpackHalf2x16(s_er[(o.y + y) * 10 + o.x + x]);
+            er += v; inn = inn && v.y >= 0.0;
+        }
+    const float e = er.x / 9.0, r = er.y / 9.0, e0 = unpackHalf2x16(s_er[(o.y + 1) * 10 + o.x + 1]).x;
+    const bool sharp = (s_sv[o.y] & (1u << uint(o.x))) != 0u;
+    bool hud = inn && r > kK * e + kTau && e0 <= kStill && sharp;
+    const bool scene = inn && e > kK * r + kTau;
+    const vec4 last = cb.Fresh != 0u || !inside ? vec4(0.0) : imageLoad(u0, p);
+    const vec3 cur = sc((o.y + 3) * 14 + o.x + 3);
+    // the still vote: bit-exact for kRun frames in a row, a sharp step near, not clipped, while the frame lives;
+    // counted per group (the tile's still candidates against its pixels with a sharp step near)
+    const float run = e0 < 0.5 / 255.0 ? min(last.b + 1.0, 255.0) : 0.0;
+    const float pixels = float(cb.Width) * float(cb.Height);
+    const bool alive = float(imageLoad(u1, ivec2(2, 0)).x) >= cb.Threshold * pixels &&
+                       float(imageLoad(u1, ivec2(3, 0)).x) >= cb.Threshold * pixels;
+    const bool clipped = max(cur.r, max(cur.g, cur.b)) <= 2.0 / 255.0 || min(cur.r, min(cur.g, cur.b)) >= 253.0 / 255.0;
+    const bool still = inside && alive && run >= kRun && sharp && !clipped;
+    if (li == 0u) { s_still = 0u; s_sharp = 0u; }
+    barrier();
+    if (still) atomicAdd(s_still, 1u);
+    if (inside && sharp) atomicAdd(s_sharp, 1u);
+    barrier();
+    if (!inside) return;
+    hud = hud || (still && 10u * s_still >= 3u * s_sharp);
+    float c = hud ? min(last.g + 0.34, 1.0) : scene ? max(last.g - 0.5, 0.0) : last.g;
+    const float m = hud ? min(last.a + 0.1, 1.0) : scene ? max(last.a - 0.02, 0.0) : last.a;
+    const ivec2 tp = ivec2(p.x, 1 + p.y);
+    uint t = cb.Fresh != 0u ? 0u : imageLoad(u1, tp).x;
+    if (hud) {
+        t = pack_t(cur);
+        imageStore(u1, tp, uvec4(t));
+    }
+    const float dt = mdiff(cur, unpack_t(t));
+    if (dt > 24.0 / 255.0 && !hud) c = max(c - 0.1, 0.0);   // no longer the HUD's colour: its presence fades
+    const float a = max(smoothstep(0.3, 0.9, c) * (1.0 - smoothstep(16.0 / 255.0, 64.0 / 255.0, dt)),
+                        smoothstep(0.3, 0.9, m) * (1.0 - smoothstep(4.0 / 255.0, 24.0 / 255.0, dt)));
+    imageStore(u0, p, vec4(a, c, run, m));
+#elif defined(HUD_COMPOSE)
+    if (!inside) return;
+    // HudMode 5 (the chain capture's pick, before the layers): u0 = the copy t1 where its HUD count against the frame t0
+    // (u1.x, HUD_COUNT HudMode 2) is within HudLimit, else the frame - the layers never run on a copy that is not the
+    // frame without its HUD
+    if (cb.HudMode == 5u) {
+        imageStore(u0, p, imageLoad(u1, ivec2(0, 0)).x > cb.HudLimit ? texelFetch(t0, p, 0) : texelFetch(t1, p, 0));
+        return;
+    }
+    const vec4 back = texelFetch(t0, p, 0);
+    const vec4 hudless = cb.HudMode == 3u ? back : texelFetch(t1, p, 0);
+    const vec4 enhanced = texelFetch(t2, p, 0);
+    vec4 result;
+    if (cb.HudMode == 2u) {
+        const bool hud = differs(back.rgb, hudless.rgb, cb.Epsilon);
+        const bool coarse = differs(back.rgb, hudless.rgb, kGrainTolerance);
+        if (imageLoad(u1, ivec2(0, 0)).x > cb.HudLimit) {
+            if (cb.Residual == 2u)
+                result = vec4(enhanced.rgb, back.a);
+            else if (cb.Residual != 0u && imageLoad(u1, ivec2(1, 0)).x <= cb.HudLimit)
+                result = coarse ? back : vec4(back.rgb + (enhanced.rgb - hudless.rgb), back.a);
+            else
+                result = back;
+        } else {
+            result = hud ? back : vec4(enhanced.rgb, back.a);
+        }
+    } else {
+        float alpha;
+        if (cb.HudMode == 3u) {
+            alpha = 0.0;
+            for (int y = -2; y <= 2; ++y)
+                for (int x = -2; x <= 2; ++x) {
+                    const ivec2 q = clamp(p + ivec2(x, y), ivec2(0), ivec2(int(cb.Width) - 1, int(cb.Height) - 1));
+                    alpha = max(alpha, texelFetch(t3, q, 0).r);
+                }
+        } else {
+            const vec4 ui = texelFetch(t3, p, 0);
+            alpha = clamp(cb.HudMode == 0u ? ui.r : ui.a, 0.0, 1.0);
+        }
+        result = alpha >= 1.0 ? back : vec4(back.rgb + (1.0 - alpha) * (enhanced.rgb - hudless.rgb), back.a);
+        if (cb.ShowMask != 0u) result = vec4(vec3(alpha), 1.0);
+    }
+    if (cb.ShowMask != 0u && cb.HudMode == 2u)
+        result = differs(back.rgb, hudless.rgb, cb.Epsilon) ? vec4(1.0) : vec4(vec3(0.0), 1.0);
+    imageStore(u0, p, result);
+#endif
+}

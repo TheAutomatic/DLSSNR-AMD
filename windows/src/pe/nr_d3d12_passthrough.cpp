@@ -1,7 +1,7 @@
-// The D3D12 passthrough's switch and canary (nr_d3d12_asd.hpp): the switch from dlssnr-amd.ini, the canary on the
-// game's own D3D12 device and queue.
-#include "nr_d3d12_asd.hpp"
-#include "nr_d3d12_asd_elf.hpp"
+// The D3D12 passthrough's switch and canary (nr_d3d12_passthrough.hpp): the switch from dlssnr-amd.ini, the canary on
+// the game's own D3D12 device and queue.
+#include "nr_d3d12_passthrough.hpp"
+#include "nr_d3d12_passthrough_elf.hpp"
 #include "nr_gpu_arch.hpp"
 #include "nr_path_u8.hpp"
 #include "nr_pe_d3d12split.hpp"
@@ -17,7 +17,7 @@
 #include <mutex>
 #include <string>
 
-namespace nr::pe::asd {
+namespace nr::pe::d3d12_passthrough {
 namespace {
 
 using nr::pe::log;
@@ -33,7 +33,7 @@ std::atomic<bool> g_canary_started{false};
 std::string g_canary_line = "not run";
 std::atomic<bool> g_rdna3{false};
 std::atomic<uint32_t> g_gfx11_mach{0};
-std::atomic<uint64_t> g_runs{0}, g_fallbacks{0};
+std::atomic<uint64_t> g_runs{0}, g_fallbacks{0}, g_waits{0};
 std::atomic<bool> g_produced{false};   // the last recorded frame actually carried NR (not a copy-through)
 
 std::string hr_text(HRESULT hr) {
@@ -280,34 +280,74 @@ DWORD WINAPI canary_thread(void* p) {
     return 0;
 }
 
-// The adapter behind `device`, its name and architecture, for what NR Control shows: OptiScaler may report it as
-// another vendor's (spoofed as NVIDIA), then the system's AMD adapter is named instead (TheAutomatic's way). Only shown:
-// whether the passthrough runs is the canary's answer on the device itself (an adapter whose name or IDs read wrong
-// through such a spoof still gets its check).
+// The PCI vendor and device IDs of the adapter with `luid` as the kernel reports them (D3DKMT, gdi32): OptiScaler's
+// DXGI spoofing rewrites GetDesc / GetDesc1 of every adapter (TargetVendorId auto = all), so an RDNA3 card reads as
+// an NVIDIA one there and RDNA4's canary ran on it (an RX 7800 XT log, 11-08: 128 of 128 differ, passthrough off).
+// The kernel thunks are not hooked. False when they cannot be had (the caller keeps what DXGI said).
+bool kernel_ids(LUID luid, UINT* vendor, UINT* device_id) {
+    HMODULE gdi = GetModuleHandleW(L"gdi32.dll");
+    if (!gdi) gdi = LoadLibraryW(L"gdi32.dll");
+    if (!gdi) return false;
+    // D3DKMT_OPENADAPTERFROMLUID, _DEVICE_IDS, _QUERY_DEVICE_IDS, _QUERYADAPTERINFO, _CLOSEADAPTER (d3dkmthk.h)
+    struct OpenFromLuid { LUID AdapterLuid; UINT hAdapter; };
+    struct DeviceIds { UINT VendorID, DeviceID, SubVendorID, SubSystemID, RevisionID, BusType; };
+    struct QueryDeviceIds { UINT PhysicalAdapterIndex; DeviceIds Ids; };
+    struct QueryInfo { UINT hAdapter; UINT Type; void* pPrivateDriverData; UINT PrivateDriverDataSize; };
+    struct CloseAdapter { UINT hAdapter; };
+    using Open = LONG(APIENTRY*)(OpenFromLuid*);
+    using Query = LONG(APIENTRY*)(const QueryInfo*);
+    using Close = LONG(APIENTRY*)(const CloseAdapter*);
+    const auto open = reinterpret_cast<Open>(reinterpret_cast<void*>(GetProcAddress(gdi, "D3DKMTOpenAdapterFromLuid")));
+    const auto query = reinterpret_cast<Query>(reinterpret_cast<void*>(GetProcAddress(gdi, "D3DKMTQueryAdapterInfo")));
+    const auto close = reinterpret_cast<Close>(reinterpret_cast<void*>(GetProcAddress(gdi, "D3DKMTCloseAdapter")));
+    if (!open || !query || !close) return false;
+    OpenFromLuid o{luid, 0};
+    if (open(&o) != 0) return false;
+    QueryDeviceIds ids{};
+    const QueryInfo q{o.hAdapter, 31u /* KMTQAITYPE_PHYSICALADAPTERDEVICEIDS */, &ids, UINT(sizeof ids)};
+    const bool ok = query(&q) == 0 && ids.Ids.VendorID != 0;
+    const CloseAdapter c{o.hAdapter};
+    close(&c);
+    if (ok) { *vendor = ids.Ids.VendorID; *device_id = ids.Ids.DeviceID; }
+    return ok;
+}
+
+// The adapter behind `device`, its name and architecture: the architecture from the kernel's PCI IDs (kernel_ids:
+// OptiScaler's DXGI spoofing cannot change them), else from DXGI. OptiScaler may report the name as another vendor's
+// (spoofed as NVIDIA), then the system's AMD adapter is named instead (TheAutomatic's way) - the name is only shown.
 nr::arch::GpuArch adapter_arch(ID3D12Device* device, std::string* name) {
     nr::arch::GpuArch arch = nr::arch::GpuArch::unknown;
     IDXGIFactory4* fac = nullptr;
-    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&fac))) || !fac) return arch;
-    IDXGIAdapter1* ad = nullptr;
-    DXGI_ADAPTER_DESC1 desc{};
-    if (SUCCEEDED(fac->EnumAdapterByLuid(device->GetAdapterLuid(), IID_PPV_ARGS(&ad))) && ad) {
-        if (SUCCEEDED(ad->GetDesc1(&desc))) {
-            if (desc.VendorId != 0x1002) {
-                for (UINT i = 0;; ++i) {
-                    IDXGIAdapter1* a2 = nullptr;
-                    if (fac->EnumAdapters1(i, &a2) != S_OK) break;
-                    DXGI_ADAPTER_DESC1 d2{};
-                    const bool amd = SUCCEEDED(a2->GetDesc1(&d2)) && d2.VendorId == 0x1002;
-                    a2->Release();
-                    if (amd) { desc = d2; break; }
+    if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&fac))) && fac) {
+        IDXGIAdapter1* ad = nullptr;
+        DXGI_ADAPTER_DESC1 desc{};
+        if (SUCCEEDED(fac->EnumAdapterByLuid(device->GetAdapterLuid(), IID_PPV_ARGS(&ad))) && ad) {
+            if (SUCCEEDED(ad->GetDesc1(&desc))) {
+                if (desc.VendorId != 0x1002) {
+                    for (UINT i = 0;; ++i) {
+                        IDXGIAdapter1* a2 = nullptr;
+                        if (fac->EnumAdapters1(i, &a2) != S_OK) break;
+                        DXGI_ADAPTER_DESC1 d2{};
+                        const bool amd = SUCCEEDED(a2->GetDesc1(&d2)) && d2.VendorId == 0x1002;
+                        a2->Release();
+                        if (amd) { desc = d2; break; }
+                    }
                 }
+                *name = nr::u8::narrow(desc.Description);
+                arch = nr::arch::from_device_id(desc.VendorId, desc.DeviceId);
             }
-            *name = nr::u8::narrow(desc.Description);
-            arch = nr::arch::from_device_id(desc.VendorId, desc.DeviceId);
+            ad->Release();
         }
-        ad->Release();
+        fac->Release();
     }
-    fac->Release();
+    UINT vendor = 0, device_id = 0;
+    if (kernel_ids(device->GetAdapterLuid(), &vendor, &device_id)) {
+        const nr::arch::GpuArch kernel = nr::arch::from_device_id(vendor, device_id);
+        if (kernel != arch)
+            log("[d3d12] the adapter is PCI %04x:%04x (%s) as the kernel reports it; DXGI said %s", vendor, device_id,
+                nr::arch::name(kernel), nr::arch::name(arch));
+        arch = kernel;
+    }
     return arch;
 }
 
@@ -406,12 +446,13 @@ Status status() {
     s.network = g_network;
     s.runs = g_runs.load();
     s.fallbacks = g_fallbacks.load();
+    s.waits = g_waits.load();
     return s;
 }
 bool backend_produced() { return g_produced.load(); }
 void note_backend_produced(bool produced) { g_produced = produced; }
-void note_backend(const char* line, bool ran) {
-    (ran ? g_runs : g_fallbacks)++;
+void note_backend(const char* line, bool ran, bool waiting) {
+    (ran ? g_runs : waiting ? g_waits : g_fallbacks)++;
     std::lock_guard<std::mutex> g(g_lock);
     if (g_backend != line) {
         g_backend = line;
@@ -423,4 +464,4 @@ void note_network(const char* name) {
     g_network = name ? name : "";
 }
 
-}  // namespace nr::pe::asd
+}  // namespace nr::pe::d3d12_passthrough

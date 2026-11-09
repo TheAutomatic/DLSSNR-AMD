@@ -246,6 +246,9 @@ struct AddonLayer {
     uint64_t feature() const { return uint64_t(number) * 2u + (renodx ? 1u : 0u); }
 };
 nr::pe::ChainFile chain_file{};
+// HUD FIX's capture events registered at the add-on's load (HUD FIX Auto / Captured then); never added later (ReShade's
+// event lists are not safe to change while the game records): off at the start, the capture needs a restart.
+bool cap_registered = false;
 nr::pe::ChainConfig chain{};
 std::vector<AddonLayer> layers_now{};   // enabled, by number
 bool layered{};                 // the file has [LayerN] sections
@@ -993,7 +996,7 @@ void inspect_show(command_list* cl, resource colour, resource_view rtv, const nr
 // the layers and composes the layers' answer over it as NVIDIA's UICorrection does (Final = Back + (1 - a)(NR -
 // Hudless)), as the .asi's Present layers do, with one of two methods:
 //   Captured (D3D10/11/12): the frame copied where the game starts drawing its HUD (the capture below); the layers run
-//            on that copy, the HUD is where the frame and the copy differ (wilsjo2_hudfix.comp HudMode 2);
+//            on that copy, the HUD is where the frame and the copy differ (hudfix.comp HudMode 2);
 //   Estimated: the HUD's alpha estimated from the frame and the last one (pixels that stay put while the picture around
 //            them moves, HudMode 3); the layers run on the frame itself.
 // Auto: Captured on the frames the capture holds, else Estimated (its state follows every frame either way). The images are made through ReShade (one description for every API, its barriers keep its
@@ -1006,7 +1009,7 @@ struct HudFixState {
     resource hudless{};   // the capture's copy
     unsigned w = 0, h = 0;
     format fmt{};
-    uint32_t cur = 0, parity = 0;
+    uint32_t cur = 0;
     bool prev_valid = false, fresh = true, failed = false;
     uint64_t frame = 0, estimated_at = ~0ull;   // the estimate's last frame: after a gap it starts afresh
     std::unique_ptr<nr::wilsjo2::Stage> stage;
@@ -1045,8 +1048,9 @@ void hudfix_now(const std::string& what) {
     hudfix.now = what;
 }
 
-unsigned hudfix_stats_w(unsigned w) { return std::max(4u, (w + 7) / 8); }
-unsigned hudfix_stats_h(unsigned h) { return 1 + 2 * ((h + 7) / 8); }
+// the counts (row 0), then the estimate's HUD colours (one texel a pixel, hudfix.comp)
+unsigned hudfix_stats_w(unsigned w) { return std::max(4u, w); }
+unsigned hudfix_stats_h(unsigned h) { return 1 + h; }
 
 // One texture copy between `from` and `to` in the states they are kept in (ReShade's barriers around it).
 void hudfix_copy(command_list* cl, resource from, resource_usage from_state, resource to, resource_usage to_state) {
@@ -1536,7 +1540,7 @@ bool hudfix_ensure(device* dev, unsigned w, unsigned h, format f) {
     }
     H.dev = dev; H.w = w; H.h = h; H.fmt = typed;
     H.failed = false;
-    H.cur = 0; H.parity = 0;
+    H.cur = 0;
     H.prev_valid = false;
     H.fresh = true;
     cap.hudless.store(H.hudless.handle, std::memory_order_release);
@@ -1552,11 +1556,13 @@ HudPlan hudfix_plan(device* dev, command_list* cl, uint64_t colour) {
     cap.dev.store(dev);
     cap.api.store(int(api));
     if (api == device_api::d3d10 || api == device_api::d3d11) cap.immediate.store(cl);
-    cap.armed.store(can_capture && (mode == 1 || mode == 3));
+    cap.armed.store(can_capture && cap_registered && (mode == 1 || mode == 3));
     HudPlan p;
     std::string why;
     CapVerdict v = CapVerdict::kMissed;
+    const char* const restart = NR_N("on the ReShade route the capture is set up as the game starts: start it with HUD FIX on");
     if (armed_before && cap.armed.load()) v = cap_verdict(colour, why);
+    else if (can_capture && !cap_registered) why = restart;
     else {
         why = NR_N("it starts with the next frame");
         if (armed_before) (void)cap_verdict(colour, why);   // switched off: its writes go
@@ -1565,6 +1571,7 @@ HudPlan hudfix_plan(device* dev, command_list* cl, uint64_t colour) {
         const ULONGLONG now_ms = GetTickCount64();
         std::string grey;
         if (!can_capture) grey = NR_N("the capture before the HUD does not follow this game's API");
+        else if (!cap_registered) grey = restart;
         else if (!cap.armed.load()) hudfix.cap_watched = 0;
         else {
             if (!hudfix.cap_watched) hudfix.cap_watched = now_ms;
@@ -1578,11 +1585,18 @@ HudPlan hudfix_plan(device* dev, command_list* cl, uint64_t colour) {
     }
     switch (mode) {
     case 1:   // Auto
-        p.run = p.estimate = true;
         p.captured = v == CapVerdict::kCaptured;
-        hudfix_now(p.captured ? "captured before the HUD"
-                   : can_capture ? "estimated (captured: " + why + ")"
-                                 : "estimated (Captured: unsupported graphics API)");
+        if (nr::control::kHudEstimated) {
+            p.run = p.estimate = true;
+            hudfix_now(p.captured ? "captured before the HUD"
+                       : can_capture ? "estimated (captured: " + why + ")"
+                                     : "estimated (Captured: unsupported graphics API)");
+        } else {   // Estimated switched off: Auto without a capture runs nothing
+            p.run = p.captured;
+            hudfix_now(p.captured ? "captured before the HUD"
+                       : can_capture ? "nothing this frame: " + why
+                                     : "nothing: Captured does not run on this graphics API");
+        }
         break;
     case 3:   // Captured
         p.run = p.captured = v == CapVerdict::kCaptured;
@@ -1597,7 +1611,7 @@ HudPlan hudfix_plan(device* dev, command_list* cl, uint64_t colour) {
         hudfix_now("nothing: this route has no frame generation's frames");
         break;
     default:
-        hudfix_now("off");
+        hudfix_now(chain.hud.estimated_asked ? "off: Estimated is switched off in this version" : "off");
         break;
     }
     return p;
@@ -1659,7 +1673,7 @@ bool hudfix_record(VkCommandBuffer vk, const nr::HostDevice& host, const ImageOf
         if (t3) d.t3 = *t3;
         d.u0 = u0;
         d.u1 = stats;
-        d.constants = w2::hudfix_constants(mode, width, height, source, chain.hud.show_mask, H.fresh, H.parity);
+        d.constants = w2::hudfix_constants(mode, width, height, source, chain.hud.show_mask, H.fresh);
         if (mode == w2::kHudEstimate && motion.image && motion.format) {
             // the estimate with the motion vectors the layers get (DLSS5_MV: back-buffer pixels whatever its size,
             // prev = p + mv), read across the whole texture as the layers read it
@@ -1764,7 +1778,6 @@ void hudfix_end(device* dev, command_list* cl, resource colour, const HudPlan& p
     H.said.clear();
     if (p.estimate) {
         H.fresh = false;
-        H.parity ^= 1u;
         H.estimated_at = H.frame;
     }
     H.cur ^= 1u;
@@ -2773,10 +2786,13 @@ void note_layer(int number, bool wilsjo2, uint32_t state, const char* note, unsi
         r->gpu_ms = session->gpu_ms(); r->network_ms = session->network_ms();
         if (!wilsjo2 && st.renodx_known) {
             r->fast_passes = st.renodx.fast_passes; r->motion = st.renodx.motion;
-            if (st.renodx.fast_fallback) std::snprintf(r->note, sizeof r->note, "%s", NR_N("Extrapolation: no motion vectors"));
+            if (st.renodx.il_missing) std::snprintf(r->note, sizeof r->note, "%s", nr::control::il_missing_note(st.renodx.il_missing));
+            else if (st.renodx.fast_fallback) std::snprintf(r->note, sizeof r->note, "%s", nr::control::fast_fallback_note(false));
         } else if (wilsjo2) {
             r->fast_passes = st.wilsjo2_fast_passes; r->motion = st.wilsjo2_motion ? 1u : 0u;
-            if (st.wilsjo2_fast_fallback) std::snprintf(r->note, sizeof r->note, "%s", NR_N("Extrapolation: no motion vectors"));
+            if (st.wilsjo2_il_missing) std::snprintf(r->note, sizeof r->note, "%s", nr::control::il_missing_note(st.wilsjo2_il_missing));
+            else if (st.wilsjo2_fast_fallback)
+                std::snprintf(r->note, sizeof r->note, "%s", nr::control::fast_fallback_note(st.wilsjo2_fast_fallback_spatial));
         }
         r->state = state;
         r->net = st.running_net < 0 ? nr::control::kNoNet : uint32_t(st.running_net);
@@ -2838,7 +2854,8 @@ nr::wilsjo2::Settings w2_settings(const nr::Controls& c, const nr::pe::Config& c
     s.working_scale = cfg.model_scale;
     s.downscale = cfg.downscale;
     s.passes_mode = cfg.passes_mode;
-    s.fast_method = cfg.fast_method;
+    s.fast_method = std::min(cfg.fast_method, 4u);   // (both RenoDX's numbering: 0 Interleaved .. 4 Edit strength)
+    s.fast_interleaved_passes = std::clamp(cfg.fast_interleaved_passes, 2u, 8u);
     for (int m = 0; m < 3; ++m) {   // each method's own
         s.fast_passes[m] = cfg.fast_passes[m]; s.fast_halo_limit[m] = cfg.fast_halo_limit[m]; s.fast_fine[m] = cfg.fast_fine[m];
     }
@@ -3455,6 +3472,7 @@ void dlssnr_as_layer(nr::ini_edit::Ini& ini, const std::string& sec) {
     num("Passes", float(c.passes)); flag("UnlockPasses", config.unlock_passes); flag("ColourLimit", config.colour_limit);
     ini.set(sec, "PassesMode", config.passes_mode == 1 ? "fast" : "legacy");
     num("FastMethod", float(config.fast_method));
+    num("FastInterleavedPasses", float(config.fast_interleaved_passes));
     for (int m = 0; m < 3; ++m) {   // each method's own (Fast<Method>Passes / HaloLimit / Fine)
         static const char* const names[] = {"FastExtrapolation", "FastFeedback", "FastHybrid"};
         const std::string n = names[m];
@@ -4140,6 +4158,13 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
             config_path = folder + "\\dlssnr-amd.ini";
             nr::pe::restore_ini(folder);   // a deleted dlssnr-amd.ini: the installed one, before it is read
             config.load(config_path);
+            {   // HUD FIX at the start: its capture events only for Auto / Captured (registered below)
+                nr::pe::ChainFile start_file;
+                nr::pe::ChainConfig start;
+                start.hud.mode = 0;
+                start_file.poll(config_path, start);
+                cap_registered = start.hud.mode == 1 || start.hud.mode == 3;
+            }
             log("[nr] settings file %s: enabled=%d intensity=%.2f history=%.2f", config_path.c_str(),
                 int(config.controls.enabled), config.controls.intensity, config.history);
             renodx_on = config.renodx.enabled;
@@ -4169,31 +4194,39 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         reshade::register_event<reshade::addon_event::reshade_render_technique>(on_render_technique);
         reshade::register_event<reshade::addon_event::reshade_present>(on_reshade_present);
         reshade::register_event<reshade::addon_event::destroy_device>(on_destroy_device);
-        // HUD FIX's capture: the game's writes on its back buffers
-        reshade::register_event<reshade::addon_event::barrier>(on_cap_barrier);
-        reshade::register_event<reshade::addon_event::bind_pipeline_states>(on_cap_states);
-        reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(on_cap_bind_targets);
-        reshade::register_event<reshade::addon_event::begin_render_pass>(on_cap_begin_pass);
-        reshade::register_event<reshade::addon_event::end_render_pass>(on_cap_end_pass);
-        reshade::register_event<reshade::addon_event::bind_pipeline>(on_cap_bind_pipeline);
-        reshade::register_event<reshade::addon_event::bind_viewports>(on_cap_viewports);
-        reshade::register_event<reshade::addon_event::bind_scissor_rects>(on_cap_scissors);
-        reshade::register_event<reshade::addon_event::draw>(on_cap_draw);
-        reshade::register_event<reshade::addon_event::draw_indexed>(on_cap_draw_indexed);
-        reshade::register_event<reshade::addon_event::draw_or_dispatch_indirect>(on_cap_indirect);
-        reshade::register_event<reshade::addon_event::clear_render_target_view>(on_cap_clear);
-        reshade::register_event<reshade::addon_event::copy_resource>(on_cap_copy_resource);
-        reshade::register_event<reshade::addon_event::copy_texture_region>(on_cap_copy_texture);
-        reshade::register_event<reshade::addon_event::copy_buffer_to_texture>(on_cap_copy_buffer);
-        reshade::register_event<reshade::addon_event::resolve_texture_region>(on_cap_resolve);
-        reshade::register_event<reshade::addon_event::update_texture_region>(on_cap_update);
-        reshade::register_event<reshade::addon_event::execute_command_list>(on_cap_execute);
-        reshade::register_event<reshade::addon_event::execute_secondary_command_list>(on_cap_execute_secondary);
-        reshade::register_event<reshade::addon_event::reset_command_list>(on_cap_reset_list);
+        // A destroyed command list: our GPU completion record of it goes (nr::gpu::reset) - always (once a list, not a
+        // frame's calls); HUD FIX's state of it too.
         reshade::register_event<reshade::addon_event::destroy_command_list>(on_cap_destroy_list);
-        reshade::register_event<reshade::addon_event::init_pipeline>(on_cap_init_pipeline);
-        reshade::register_event<reshade::addon_event::destroy_pipeline>(on_cap_destroy_pipeline);
-        reshade::register_event<reshade::addon_event::destroy_swapchain>(on_cap_destroy_swapchain);
+        // HUD FIX's capture: the game's writes on its back buffers - only for HUD FIX Auto / Captured at the start
+        // (each registered event makes ReShade convert every such call of the game, HUD FIX on or not)
+        if (cap_registered) {
+            reshade::register_event<reshade::addon_event::barrier>(on_cap_barrier);
+            reshade::register_event<reshade::addon_event::bind_pipeline_states>(on_cap_states);
+            reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(on_cap_bind_targets);
+            reshade::register_event<reshade::addon_event::begin_render_pass>(on_cap_begin_pass);
+            reshade::register_event<reshade::addon_event::end_render_pass>(on_cap_end_pass);
+            reshade::register_event<reshade::addon_event::bind_pipeline>(on_cap_bind_pipeline);
+            reshade::register_event<reshade::addon_event::bind_viewports>(on_cap_viewports);
+            reshade::register_event<reshade::addon_event::bind_scissor_rects>(on_cap_scissors);
+            reshade::register_event<reshade::addon_event::draw>(on_cap_draw);
+            reshade::register_event<reshade::addon_event::draw_indexed>(on_cap_draw_indexed);
+            reshade::register_event<reshade::addon_event::draw_or_dispatch_indirect>(on_cap_indirect);
+            reshade::register_event<reshade::addon_event::clear_render_target_view>(on_cap_clear);
+            reshade::register_event<reshade::addon_event::copy_resource>(on_cap_copy_resource);
+            reshade::register_event<reshade::addon_event::copy_texture_region>(on_cap_copy_texture);
+            reshade::register_event<reshade::addon_event::copy_buffer_to_texture>(on_cap_copy_buffer);
+            reshade::register_event<reshade::addon_event::resolve_texture_region>(on_cap_resolve);
+            reshade::register_event<reshade::addon_event::update_texture_region>(on_cap_update);
+            reshade::register_event<reshade::addon_event::execute_command_list>(on_cap_execute);
+            reshade::register_event<reshade::addon_event::execute_secondary_command_list>(on_cap_execute_secondary);
+            reshade::register_event<reshade::addon_event::reset_command_list>(on_cap_reset_list);
+            reshade::register_event<reshade::addon_event::init_pipeline>(on_cap_init_pipeline);
+            reshade::register_event<reshade::addon_event::destroy_pipeline>(on_cap_destroy_pipeline);
+            reshade::register_event<reshade::addon_event::destroy_swapchain>(on_cap_destroy_swapchain);
+            log("[nr] HUD FIX: Auto / Captured at the start: its capture follows the game's command lists");
+        } else {
+            log("[nr] HUD FIX off at the start: its capture is not set up (no cost); switching it on needs a game restart on this route");
+        }
         reshade::register_overlay(nullptr, draw_overlay);
         reshade::register_event<reshade::addon_event::reshade_overlay>(on_reshade_overlay);
     } else if (reason == DLL_PROCESS_DETACH) {

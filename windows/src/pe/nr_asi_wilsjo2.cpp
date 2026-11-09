@@ -5,8 +5,8 @@
 // specification by one of our OptiScaler fixes (nr_pe_optifix.cpp), the fix is what is followed, and said so below.
 #include "nr_asi_wilsjo2.hpp"
 #include "nr_asi_wilsjo2_d3d12.hpp"
-#include "nr_d3d12_asd.hpp"
-#include "nr_d3d12_asd_backend.hpp"
+#include "nr_d3d12_passthrough.hpp"
+#include "nr_d3d12_passthrough_backend.hpp"
 #include "nr_pe_d3d12split.hpp"
 
 #include "nr_pe_config.hpp"
@@ -156,7 +156,8 @@ nr::dlssnr::Controls6 controls_of(const w2::PassControls& pc, bool noise = false
 
 
 // ---- the native D3D12 route: the stage's programs as D3D12 compute --------------------------------------------
-// On the D3D12 passthrough (nr_d3d12_asd.hpp) once its check passed, the flow below records into the game's own list: the
+// On the D3D12 passthrough (nr_d3d12_passthrough.hpp) once its check passed, the flow below records into the game's own
+// list: the
 // wilsjo2 programs - the very SPIR-V the Vulkan stage loads, its 256-byte constant block moved from push constants to a
 // read-only buffer (windows/build/w2_spv_d3d12.py), written as HLSL by SPIRV-Cross (windows/build/build_d3d12_hlsl.sh)
 // and compiled in the game - created by the D3D12 driver as ordinary compute pipelines, as the bridge has the Vulkan
@@ -444,6 +445,7 @@ DXGI_FORMAT dxgi_of(w2::Fmt f, DXGI_FORMAT frame) {
         case w2::Fmt::kRG32F: return DXGI_FORMAT_R32G32_FLOAT;
         case w2::Fmt::kF32: return DXGI_FORMAT_R32G32B32A32_FLOAT;
         case w2::Fmt::kRG16F: return DXGI_FORMAT_R16G16_FLOAT;
+        case w2::Fmt::kR16F: return DXGI_FORMAT_R16_FLOAT;
     }
     return frame;
 }
@@ -516,6 +518,13 @@ public:
     }
     bool has(w2::Mode mode) const override { return nstage_ ? nstage_->has(mode) : g_stage && g_stage->has(mode); }
     bool has_fast() const override { return nstage_ ? nstage_->has_fast() : !g_stage || g_stage->has_fast(); }
+    bool has_il() const override { return nstage_ ? nstage_->has_il() : !g_stage || g_stage->has_il(); }
+    bool stage_made() const override { return nstage_ != nullptr || g_stage != nullptr; }
+    bool style_graded() const override {
+        bool on = false;
+        nr::dlssnr::with_d3d12_session([&](nr::pe::Session& s) { on = s.style_grade_active(); });
+        return on;
+    }
     bool stage_failed() const override { return nstage_ ? false : g_stage_retry.blocked(); }
     w2::PassReady pass(uint32_t k, const w2::PassControls& pc, uint32_t mw, uint32_t mh) override {
         if (k < o_.models.size() && o_.models[k]) return w2::PassReady::kReady;
@@ -546,6 +555,10 @@ public:
             bool on_;
         } native_call(nstage_ != nullptr);
         const auto rect = [](const w2::Rect& r) { nr::dlssnr::Rect o; o.x = r.x; o.y = r.y; o.width = r.width; o.height = r.height; return o; };
+        route::HistoryRef hist;
+        hist.d3d12 = c.history.h;   // (Interleaved: our resource, in UNORDERED_ACCESS)
+        hist.raw = c.raw;
+        route::CallHistory history(hist);
         const int result = nr::dlssnr::evaluate_d3d12(
             cmd_, o_.models[c.pass], nullptr, static_cast<ID3D12Resource*>(c.input.h), static_cast<ID3D12Resource*>(c.depth.h),
             static_cast<ID3D12Resource*>(c.motion.h), static_cast<ID3D12Resource*>(c.output.h), c.width, c.height,
@@ -560,7 +573,7 @@ public:
         facts_.hdr = x.hdr; facts_.exposure = int(x.exposure); facts_.asked = x.asked; facts_.white = x.white;
         facts_.history = x.history; facts_.mode = x.mode; facts_.passes = x.passes;
         facts_.prep_outside = x.prep_outside; facts_.prep_missing = x.prep_missing;
-        facts_.fast_passes = x.fast_passes; facts_.fast_fallback = x.fast_fallback;
+        facts_.fast_passes = x.fast_passes; facts_.fast_fallback = x.fast_fallback; facts_.fast_fallback_spatial = x.fast_fallback_spatial; facts_.il_missing = x.il_missing;
         told_.emplace(&facts_);
         // the output NR Control shows: before the upscaler the upscaler's (the frame is the render's; "No upscaling" was
         // shown), else the frame
@@ -623,6 +636,7 @@ private:
             ok = false;
         }
         nimpl_->end();
+        nimpl_->end_recording();   // the replaced descriptor blocks and stale copies go (the bridge's Stage::end_recording)
         nr::pe::split::restore(cmd_, saved);
         return ok;
     }
@@ -745,7 +759,8 @@ std::string native_refusal(ID3D12GraphicsCommandList* cmd, ID3D12Device* device,
                            const w2::Settings& s, ID3D12Resource* target, uint32_t w, uint32_t h, w2::Stage** stage,
                            native::Stage12** impl, bool* waiting) {
     *waiting = false;
-    if (!nr::pe::asd::enabled()) return "the D3D12 passthrough is off (dlssnr-amd.ini [D3D12Passthrough])";
+    if (!nr::pe::d3d12_passthrough::enabled())
+        return "the D3D12 passthrough is off (dlssnr-amd.ini [D3D12Passthrough])";
     const auto readable = [](ID3D12Resource* r, const char* what) -> std::string {
         if (!r) return std::string("the ") + what + " is missing";
         const D3D12_RESOURCE_DESC d = r->GetDesc();
@@ -774,7 +789,7 @@ std::string native_refusal(ID3D12GraphicsCommandList* cmd, ID3D12Device* device,
     w2::flow_model_extent(s, w, h, o.flow, true, &mw, &mh);
     std::string nwhy;
     bool building = false;
-    const bool net_ready = nr::pe::asd::wilsjo2_ready(device, cmd, mw, mh, &nwhy, &building);
+    const bool net_ready = nr::pe::d3d12_passthrough::wilsjo2_ready(device, cmd, mw, mh, &nwhy, &building);
     if (!net_ready && !building) return nwhy;   // the passthrough will not run it: the bridge (passing states set `building`)
     if (!*stage) {
         if (!native::programs_failed()) { *waiting = true; return why; }
@@ -804,10 +819,11 @@ bool wilsjo2_run(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, Wilsjo2Ow
                 return false;
             }
             if (!why.empty()) {
-                if (nr::pe::asd::enabled()) native::say_route("the Vulkan bridge for now: " + why);
+                if (nr::pe::d3d12_passthrough::enabled()) native::say_route("the Vulkan bridge for now: " + why);
                 return run_bridged(cmd, device, o, f, s, target, w, h, before_upscale);
             }
-            native::say_route(std::string("on the D3D12 route (canary ") + nr::pe::asd::canary_name(nr::pe::asd::canary()) +
+            namespace pt = nr::pe::d3d12_passthrough;
+            native::say_route(std::string("on the D3D12 route (canary ") + pt::canary_name(pt::canary()) +
                               "): its programs D3D12 compute, its network ACO on the game's device");
         }
     }
@@ -901,7 +917,7 @@ bool wilsjo2_run(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, Wilsjo2Ow
 
 bool wilsjo2_convert(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, ID3D12Resource* source,
                      ID3D12Resource* original, ID3D12Resource* target, uint32_t w, uint32_t h, bool to_linear) {
-    if (device && source && target && (to_linear || original) && nr::pe::asd::enabled()) {
+    if (device && source && target && (to_linear || original) && nr::pe::d3d12_passthrough::enabled()) {
         // HDR10 at Present on the D3D12 passthrough: the conversion as D3D12 compute where its program is made (the
         // caller has source / original readable, target writable)
         bool bridged = false;
@@ -928,6 +944,7 @@ bool wilsjo2_convert(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, ID3D1
                 ok = false;
             }
             impl->end();
+            impl->end_recording();
             nr::pe::split::restore(cmd, saved);
             return ok;
         }
@@ -965,8 +982,8 @@ bool wilsjo2_convert(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, ID3D1
     return recorded;
 }
 
-bool wilsjo2_hudfix(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, const HudFixD3D12& r, uint32_t w, uint32_t h,
-                    uint32_t source, bool show_mask, bool fresh, uint32_t parity, bool estimate_too) {
+bool hudfix_d3d12(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, const HudFixD3D12& r, uint32_t w, uint32_t h,
+                  uint32_t source, bool show_mask, bool fresh, bool estimate_too) {
     if (g_stage_retry.blocked()) return false;
     bool recorded = false;
     nr::dlssnr::with_d3d12_session([&](nr::pe::Session& session) {
@@ -1002,7 +1019,7 @@ bool wilsjo2_hudfix(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, const 
                 if (t3) d.t3 = *t3;
                 d.u0 = u0;
                 d.u1 = stats;
-                d.constants = w2::hudfix_constants(mode, width, height, src, show_mask, fresh, parity);
+                d.constants = w2::hudfix_constants(mode, width, height, src, show_mask, fresh);
                 if (mode == w2::kHudEstimate && motion.format) {   // the estimate with the game's motion vectors
                     d.t2 = motion;
                     w2::hudfix_motion(d.constants, r.motion_scale_x, r.motion_scale_y, r.motion_x, r.motion_y,
@@ -1018,9 +1035,55 @@ bool wilsjo2_hudfix(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, const 
                     run(w2::kHudEstimate, back, &prev, nullptr, nullptr, alpha, w, h);
                     src = source;
                 }
-                if (source == 2 || source == 4) run(w2::kHudCount, back, &ref, nullptr, nullptr, frame, w, h);
+                if (source == 2 || source == 4 || source == 5) run(w2::kHudCount, back, &ref, nullptr, nullptr, frame, w, h);
                 if (source == 4) run(w2::kHudEstimate, back, &ref, nullptr, nullptr, alpha, w, h);
                 run(w2::kHudCompose, back, &ref, &frame, &alpha, frame, w, h);
+            } catch (const std::exception& x) {
+                log("[nr] HUD FIX: %s", x.what());
+                return false;
+            }
+            return true;
+        });
+        if (g_stage) g_stage->end_recording();
+    });
+    return recorded;
+}
+
+bool hudfix_select_d3d12(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, ID3D12Resource* frame,
+                         ID3D12Resource* hudless, ID3D12Resource* stats, ID3D12Resource* out, uint32_t w, uint32_t h) {
+    if (g_stage_retry.blocked()) return false;
+    bool recorded = false;
+    nr::dlssnr::with_d3d12_session([&](nr::pe::Session& session) {
+        recorded = session.record_raw(device, cmd, [&](VkCommandBuffer vk, const HostDevice& host,
+                                                       const nr::pe::Session::RawLookup& lookup) {
+            if (!g_stage) {
+                try {
+                    if (stage_fail_test()) throw std::runtime_error("NR_TEST_STAGE_FAIL");
+                    g_stage = std::make_unique<w2::Stage>(host, std::string(nr::pe::module_folder()) +
+                                                                    "\\dlssnr-amd\\shaders\\wilsjo2");
+                    g_stage_retry.made();
+                } catch (const std::exception& x) {
+                    g_stage_retry.fail(x.what());
+                    return false;
+                }
+            }
+            const w2::Image f = image_of(lookup(frame, kUav, true)), hl = image_of(lookup(hudless, kUav, true)),
+                            st = image_of(lookup(stats, kUav, true)), o = image_of(lookup(out, kUav, true));
+            if (!f.format || !hl.format || !st.format || !o.format) return false;
+            const auto run = [&](uint32_t mode, uint32_t source, const w2::Image* t1, const w2::Image& u0, uint32_t width,
+                                 uint32_t height) {
+                w2::Dispatch d;
+                d.t0 = f;
+                if (t1) d.t1 = *t1;
+                d.u0 = u0;
+                d.u1 = st;
+                d.constants = w2::hudfix_constants(mode, width, height, source, false, false);
+                g_stage->record(vk, d);
+            };
+            try {
+                run(w2::kHudClear, 2, nullptr, o, 1, 1);
+                run(w2::kHudCount, 2, &hl, o, w, h);
+                run(w2::kHudCompose, 6, &hl, o, w, h);
             } catch (const std::exception& x) {
                 log("[nr] HUD FIX: %s", x.what());
                 return false;
