@@ -33,7 +33,7 @@ extern std::atomic<int> g_motion_without_depth_now;
 
 // The .asi's D3D12 passthrough is on for this process (nr_d3d12_passthrough.hpp): the network availability no longer
 // depends on the bridge's Vulkan device alone, and the int4 network is not offered (the backend has no int4 build).
-void set_d3d12_native(bool on);
+void set_d3d12_native(bool on, bool rdna3 = false);
 
 class Session {
   public:

@@ -340,8 +340,11 @@ inline VkResult create_aco(VkDevice device,VkPipelineCache cache,const VkCompute
     // The PAL container comes from the driver's own compile of a template SPIR-V with the same interface:
     // the first shell directory holding the name (NR_ACO_SHELL_DIR, or the product's aco/shell then the
     // native network shaders), else the Linux SPIR-V itself.
-    std::string shell_path;
-    {
+    // A record-referencing stand-in is itself the carrier interface. Looking up a
+    // generic shell by filename can drop INT4 aliases (20/23) or use another
+    // variant's interface. Its bytes also enter the import-cache key below.
+    std::string shell_path = ref ? path : std::string();
+    if (!ref) {
         auto name=path.substr(path.find_last_of("/\\")+1);
         // The name itself, else the native shader that serves as its template (the bundle's alias list).
         // A temporal pre/post block's template is looked for in a temporal\ folder first (RDNA3's shells keep them there).

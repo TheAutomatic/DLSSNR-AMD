@@ -3,6 +3,7 @@
 #include "nr_d3d12_passthrough.hpp"
 #include "nr_d3d12_passthrough_elf.hpp"
 #include "nr_gpu_arch.hpp"
+#include "nr_pipeline_binary.hpp"
 #include "nr_path_u8.hpp"
 #include "nr_pe_d3d12split.hpp"
 #include "nr_pe_log.hpp"
@@ -396,7 +397,12 @@ void on_device(ID3D12Device* device) {
     if (arch == nr::arch::GpuArch::rdna3) {
         // RDNA3: the network runs as the RDNA3 records in gfx11 ELFs; RDNA4's canary is gfx12 machine code, not run here
         g_rdna3 = true;
-        nr::pe::set_d3d12_native(true);
+        std::string why;
+        if (!nr::binary::use_rdna3(&why)) {
+            finish_canary(Canary::kFail, "RDNA3: " + why);
+            return;
+        }
+        nr::pe::set_d3d12_native(true, true);
         finish_canary(Canary::kHit, "RDNA3 (" + name + "): the passthrough runs the RDNA3 records (no gfx11 canary)");
         return;
     }

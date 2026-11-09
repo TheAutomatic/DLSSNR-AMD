@@ -3571,6 +3571,9 @@ bool plan_d3d12_network(const std::string& root_in, uint32_t mw, uint32_t mh, bo
             "--host-boundary", arena_reuse() ? "--reuse" : "--no-reuse", "--source-width", std::to_string(mw),
             "--source-height", std::to_string(mh), "--accumulation", "fp32",
             "--pipeline-cache", (data / "pipeline.cache").string(), "--lazy-images"};
+        // This planner has already selected the architecture's ACO folder. Do not let
+        // network_spv_dir replace RDNA3's base shaders with a process-global directory.
+        if (rdna3) arguments.push_back("--spv-dir-aco");
         if (experimental || optimized) {
             for (size_t i = 0; i + 1 < arguments.size(); ++i) {
                 if (arguments[i] == "--spv-dir") arguments[i + 1] = ((experimental ? xroot : oroot) / "shaders").string();

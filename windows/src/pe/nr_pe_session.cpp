@@ -49,8 +49,10 @@ namespace nr::pe {
 // the bridge's Vulkan device alone. Turned off again when its canary does not hit (the bridge runs every frame): each
 // session then checks what can run once more (g_native_epoch).
 std::atomic<bool> g_d3d12_native{false};
+std::atomic<bool> g_d3d12_native_rdna3{false};
 std::atomic<uint32_t> g_native_epoch{0};
-void set_d3d12_native(bool on) {
+void set_d3d12_native(bool on, bool rdna3) {
+    g_d3d12_native_rdna3 = on && rdna3;
     if (g_d3d12_native.exchange(on) && !on) ++g_native_epoch;
 }
 namespace {
@@ -2974,7 +2976,7 @@ void Session::Impl::check_availability() {
     // CC_SMALL_FP8_EXPERIMENTAL and CC_SILVER_AARDWOLD_OPTIMIZED read their SPIR-V from dlssnr-amd/ (the Linux
     // network's, RDNA4) and from the ACO bundle's own gfx11 builds on RDNA3 (nr_runtime.cpp): what is installed is
     // the folder that arch reads.
-    const bool rdna3 = !g_d3d12_native.load() && make_host().rdna3;
+    const bool rdna3 = g_d3d12_native.load() ? g_d3d12_native_rdna3.load() : make_host().rdna3;
     const char* x_attention = rdna3 ? "dlssnr-amd\\aco\\rdna3\\experimental\\shaders\\fixed-attention.txt"
                                     : "dlssnr-amd\\experimental\\shaders\\fixed-attention.txt";
     const char* o_attention = rdna3 ? "dlssnr-amd\\aco\\rdna3\\optimized\\shaders\\fixed-attention.txt"

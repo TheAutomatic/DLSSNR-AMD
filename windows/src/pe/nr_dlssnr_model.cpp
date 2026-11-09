@@ -479,7 +479,7 @@ void report_control(nr::pe::Session& session, const Feature* f, uint32_t route, 
         const float total_ms = (rs && as.stage_ms > 0.f) ? as.stage_ms : g_native_ms.load();
         st.gpu_ms = ran ? std::max(total_ms, st.network_ms) : 0.f;
         st.aco = 1;
-        st.aco_rdna3 = false;
+        st.aco_rdna3 = nr::pe::d3d12_passthrough::rdna3();
         st.aco_why = "D3D12 passthrough: the network runs as ACO machine code on the game's D3D12 device";
         st.device_path = 3;   // Path "D3D12" (the session's own is the bridge's Vulkan device, which this frame did not use)
         d3d12_session().set_running_network(st.net_running);
