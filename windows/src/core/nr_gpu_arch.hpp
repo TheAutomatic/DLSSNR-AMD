@@ -49,10 +49,25 @@ inline GpuArch from_device_id(uint32_t vendor, uint32_t device) {
     switch (device) {
     case 0x15bf: case 0x15c8: case 0x1900: case 0x1901:   // Phoenix / Hawk Point (780M / 760M / 740M)
     case 0x150e: case 0x1586: case 0x1114:                 // Strix Point (890M), Strix Halo (8060S), Krackan Point
+    case 0x1502: case 0x1581:                              // Strix Point / Strix Halo variants
         return GpuArch::rdna3;
     default:
         return GpuArch::unknown;
     }
+}
+
+// A GPU name string fallback when PCI IDs are unlisted.
+inline GpuArch from_name(const char* s) {
+    if (!s || !*s) return GpuArch::unknown;
+    std::string low(s);
+    for (char& c : low)
+        if (c >= 'A' && c <= 'Z') c = char(c - 'A' + 'a');
+    for (const char* p : {"rx 90", "r9700", "gfx12"})
+        if (low.find(p) != std::string::npos) return GpuArch::rdna4;
+    for (const char* p : {"rx 7", "7900", "7800", "7700", "7600", "780m", "760m", "740m",
+                          "890m", "880m", "860m", "840m", "8060s", "8050s", "8040s", "gfx11"})
+        if (low.find(p) != std::string::npos) return GpuArch::rdna3;
+    return GpuArch::unknown;
 }
 
 namespace detail {
@@ -243,20 +258,36 @@ inline GpuArch of(VkPhysicalDevice physical, std::string* how = nullptr) {
             const uint32_t mach = detail::compiled_machine(icd, id.deviceLUID);
             if (!mach) continue;
             arch = from_machine(mach);
-            std::snprintf(text, sizeof text, "the driver's compiler makes machine 0x%02x code", unsigned(mach & 0xffu));
-            said = text;
-            break;
+            if (arch != GpuArch::unknown) {
+                std::snprintf(text, sizeof text, "the driver's compiler makes machine 0x%02x code", unsigned(mach & 0xffu));
+                said = text;
+                break;
+            }
         }
     }
 #endif
-    if (said.empty()) {
+    if (arch == GpuArch::unknown) {
         VkPhysicalDeviceProperties props = asked.properties;
         VkPhysicalDeviceDriverProperties drv{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
         const bool driver = nr::driver::amd_reported(physical, &props, &drv);
         arch = from_device_id(props.vendorID, props.deviceID);
+        if (arch == GpuArch::unknown && props.vendorID == 0x1002) arch = from_name(props.deviceName);
         std::snprintf(text, sizeof text, "PCI device %04x:%04x (%s)", unsigned(props.vendorID), unsigned(props.deviceID),
                       driver ? "as AMD's driver reports it" : "as the Vulkan loader reports it");
         said = text;
+        if (arch == GpuArch::unknown && props.vendorID == 0x1002) {
+            VkPhysicalDeviceShaderFloat8FeaturesEXT f8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT};
+            VkPhysicalDeviceCooperativeMatrixFeaturesKHR cm{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR, &f8};
+            VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &cm};
+            vkGetPhysicalDeviceFeatures2(physical, &f2);
+            if (f8.shaderFloat8CooperativeMatrix) {
+                arch = GpuArch::rdna4;
+                said = "Vulkan features (shaderFloat8CooperativeMatrix)";
+            } else if (cm.cooperativeMatrix) {
+                arch = GpuArch::rdna3;
+                said = "Vulkan features (cooperativeMatrix without shaderFloat8CooperativeMatrix)";
+            }
+        }
     }
     if (id.deviceLUIDValid) {
         Known k{};

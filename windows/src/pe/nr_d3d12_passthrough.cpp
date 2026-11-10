@@ -349,6 +349,8 @@ nr::arch::GpuArch adapter_arch(ID3D12Device* device, std::string* name) {
                 nr::arch::name(kernel), nr::arch::name(arch));
         arch = kernel;
     }
+    if (arch == nr::arch::GpuArch::unknown && (!vendor || vendor == 0x1002) && !name->empty())
+        arch = nr::arch::from_name(name->c_str());
     return arch;
 }
 
@@ -404,6 +406,10 @@ void on_device(ID3D12Device* device) {
         }
         nr::pe::set_d3d12_native(true, true);
         finish_canary(Canary::kHit, "RDNA3 (" + name + "): the passthrough runs the RDNA3 records (no gfx11 canary)");
+        return;
+    }
+    if (arch != nr::arch::GpuArch::rdna4) {
+        finish_canary(Canary::kFail, "unsupported or unknown GPU architecture (" + name + ")");
         return;
     }
     // From here NR's network choice is the passthrough's (nr_pe_session.cpp: what can run is not the Vulkan device's),

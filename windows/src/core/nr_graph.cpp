@@ -3622,7 +3622,9 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                 // CC_SILVER_AARDWOLD_OPTIMIZED (marker <spv-dir>/const-heads.txt): heads whose P is 1/64 for
                 // every input (all bias entries + 1.2|s| + 0.05 <= -6.25: every exponential at the lower clamp)
                 // carry 0x7FC00001 in their scale slot; attn.comp then skips their Q/K projection and softmax.
-                if (std::filesystem::exists(spv_dir + "/const-heads.txt") && attn_bias.size() == 16u * 4096u) {
+                // Skipped on RDNA3: its precompiled g_attn.spv record (5c86eb8932563ea5.nrp) corrupts output when
+                // 0x7FC00001 scale markers are passed.
+                if (!ctx.rdna3 && std::filesystem::exists(spv_dir + "/const-heads.txt") && attn_bias.size() == 16u * 4096u) {
                     int nconst = 0;
                     for (int h = 0; h < 16; ++h) {
                         const double L = 1.2 * std::fabs(double(sc[size_t(h)])) + 0.05;

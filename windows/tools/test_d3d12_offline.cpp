@@ -21,6 +21,7 @@
 #include "nr_d3d12_passthrough_net.hpp"
 #include "nr_d3d12_net_plan.hpp"
 #include "nr_dlssnr_model.hpp"
+#include "nr_ini_int4.hpp"
 #include "nr_ini_network.hpp"
 #include "nr_pe_config.hpp"
 #include "nr_pe_d3d12split.hpp"
@@ -151,15 +152,24 @@ int main(int argc, char** argv) {
     const uint32_t W = 3840, H = 2160;
     const char* dump = nullptr;
     const char *model_arg = nullptr, *layers_arg = nullptr;
+    int adapter_arg = -1;
     const int total_frames = argc > 1 && argv[1][0] != '-' ? std::atoi(argv[1]) : 60;
     bool vulkan_bridge = false;
     bool hdr_mode = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--vulkan") == 0) vulkan_bridge = true;
         if (std::strcmp(argv[i], "--hdr") == 0) hdr_mode = true;
-        if (std::strcmp(argv[i], "--model") == 0 && i + 1 < argc) model_arg = argv[++i];
+        if (std::strcmp(argv[i], "--adapter") == 0 && i + 1 < argc) adapter_arg = std::atoi(argv[++i]);
+        else if (std::strcmp(argv[i], "--model") == 0 && i + 1 < argc) model_arg = argv[++i];
         else if (std::strcmp(argv[i], "--layers") == 0 && i + 1 < argc) layers_arg = argv[++i];
         else if (std::strcmp(argv[i], "--dump") == 0 && i + 1 < argc) dump = argv[++i];
+    }
+    if (model_arg) {
+        const int mv = nr::network_value(model_arg);
+        const int lv = layers_arg ? nr::optimized_layers_value(layers_arg) : nr::kLayersDefault;
+        g_model_choice = mv == 1 ? nr::kSmallFp8 : mv == 2 ? nr::kSmallFp8Experimental
+                       : mv == 3 ? nr::network_with_layers(nr::kSilverAardwoldOptimized, lv >= 0 ? lv : nr::kLayersQuality)
+                       : nr::kSilverAardwold;
     }
 
     std::printf("=== Offline D3D12 %s Test (%s) ===\n", vulkan_bridge ? "Vulkan Bridge" : "Direct ELF",
@@ -191,7 +201,8 @@ int main(int argc, char** argv) {
         }
         nr::pe::d3d12_passthrough::set_net_planner(
             [](uint32_t w, uint32_t h, int model, bool experimental, nr::D3d12NetPlan* out, std::string* why) {
-                return nr::plan_d3d12_network(nr::pe::module_folder(), w, h, experimental, out, why, model);
+                return nr::plan_d3d12_network(nr::pe::module_folder(), w, h, experimental, out, why, model,
+                                              nr::pe::d3d12_passthrough::rdna3());
             },
             &nr::d3d12_net_controls, &query_model);
         nr::dlssnr::set_d3d12_backend(&nr::pe::d3d12_passthrough::evaluate_backend);
@@ -211,7 +222,11 @@ int main(int argc, char** argv) {
         for (UINT i = 0; factory->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; ++i) {
             DXGI_ADAPTER_DESC1 desc{};
             a->GetDesc1(&desc);
-            if (desc.VendorId == 0x1002 && !(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) && desc.DedicatedVideoMemory > best) {
+            std::wprintf(L"Seen Adapter [%u]: %ls (Vendor 0x%04x, Device 0x%04x, VRAM: %llu MB)\n", i, desc.Description,
+                         desc.VendorId, desc.DeviceId, (unsigned long long)(desc.DedicatedVideoMemory / (1024 * 1024)));
+            const bool pick = adapter_arg >= 0 ? (int(i) == adapter_arg)
+                            : (desc.VendorId == 0x1002 && !(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) && desc.DedicatedVideoMemory > best);
+            if (pick) {
                 if (adapter) adapter->Release();
                 adapter = a;
                 best = desc.DedicatedVideoMemory;
@@ -385,7 +400,7 @@ int main(int argc, char** argv) {
         {
             nr::pe::renodx_route::CallStyle style(true);
             nr::pe::renodx_route::CallSettings settings(&rs);
-            nr::pe::renodx_route::CallNetwork network(nr::kSilverAardwoldOptimizedUltra);
+            nr::pe::renodx_route::CallNetwork network(g_model_choice);
             nr::pe::renodx_route::CallLayer number(1);
             const nr::dlssnr::Rect whole{0, 0, W, H};
             nr::dlssnr::evaluate_d3d12(cmd, feat, nullptr, target, depth, motion, target, W, H, whole, whole, 1, reset,

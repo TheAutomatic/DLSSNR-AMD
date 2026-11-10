@@ -52,8 +52,10 @@ std::atomic<bool> g_d3d12_native{false};
 std::atomic<bool> g_d3d12_native_rdna3{false};
 std::atomic<uint32_t> g_native_epoch{0};
 void set_d3d12_native(bool on, bool rdna3) {
-    g_d3d12_native_rdna3 = on && rdna3;
-    if (g_d3d12_native.exchange(on) && !on) ++g_native_epoch;
+    const bool want_rdna3 = on && rdna3;
+    const bool prev_rdna3 = g_d3d12_native_rdna3.exchange(want_rdna3);
+    const bool prev_on = g_d3d12_native.exchange(on);
+    if (prev_on != on || prev_rdna3 != want_rdna3) ++g_native_epoch;
 }
 namespace {
 
@@ -2966,9 +2968,10 @@ void Session::Impl::recheck_availability() {
 // What can run in this run, from the files installed, this build and the game's device; a UI shows the reason
 // beside a network that cannot, and the hotkey skips it. A build that falls back later says more (network_note).
 void Session::Impl::check_availability() {
-    native_epoch = g_native_epoch.load();
     if (!handles.device && !g_d3d12_native.load()) return;
+    native_epoch = g_native_epoch.load();
     availability_checked = true;
+    for (int i = 0; i < nr::kNetworkChoices; ++i) net_switch.unavailable(i, "");
     auto exists = [&](const char* rel) {
         const DWORD a = nr::u8::attributes((root + "\\" + rel).c_str());
         return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
