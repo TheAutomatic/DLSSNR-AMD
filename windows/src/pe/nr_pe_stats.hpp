@@ -29,7 +29,7 @@ inline Kind kind_of(const std::string& why) {
     static const char* const expected[] = {"building", "size is changing", "changing frame size", "moving",
                                            "freeing the previous network", "freeing the least recently used",
                                            "weights are moving to RAM", "plan for this frame size", "NR is off",
-                                           "turned off", "no layer", "waits for", "frame generation"};
+                                           "turned off", "NR is disabled", "no layer", "waits for", "frame generation"};
     static const char* const memory[] = {"video memory", "MB is free", "MB of video memory", "not enough video memory",
                                          "Memory Guard"};
     for (const char* m : memory)

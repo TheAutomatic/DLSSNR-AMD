@@ -1,0 +1,130 @@
+#pragma once
+// The D3D12 passthrough's frame path, beside the Vulkan bridge: on the game's own command list and device, no
+// interop -
+//
+//   colour --(HLSL copy-in)--> linear buffer --(D3d12PassthroughNetwork)--> linear buffer --(HLSL writeback)--> output
+//
+// (the RenoDX route: its stage around the network, nr_renodx_d3d12.hpp). Runs only on its check passed
+// (nr_d3d12_passthrough.hpp); any failure before a command is recorded hands the frame back to the Vulkan bridge.
+#include <d3d12.h>
+#include <cstdint>
+
+#include "nr_dlssnr_model.hpp"
+#include "nr_d3d12_net_plan.hpp"
+
+#include <string>
+
+namespace nr::pe::d3d12_passthrough {
+
+// The linear buffers: float4 (RGBA, fp32) per pixel, row-major, width x height, as UAV-capable default-heap buffers.
+struct PassthroughNetStatus {
+    int running_net = -1;
+    int want_net = -1;
+    bool building = false;
+    int building_net = -1;
+    float building_seconds = 0.f;
+    float gpu_ms = 0.f;
+    float stage_ms = 0.f;
+    uint32_t nr_w = 0, nr_h = 0;
+    float fast_passes = 0.f;
+    bool fast_fallback = false;
+    uint8_t il_missing = 0;   // Passes (fast) Interleaved chosen and not run (renodx12::Stage::Facts::il_missing)
+    // The RenoDX stage's last frame (renodx12::Stage::facts), for NR Control's engine-data panel: on the passthrough
+    // the Vulkan session's own facts are an older bridge frame's (or none)
+    bool renodx_known = false;
+    uint8_t renodx_hdr_mode = 0;
+    bool renodx_absolute = false;
+    int renodx_feed = -1;
+    int renodx_exposure_texture = -1;
+    float renodx_divisor = 0.f;
+};
+
+struct LinearFrame {
+    ID3D12Resource* buffer;
+    uint64_t va;
+    uint32_t width, height;
+    uint64_t bytes;
+};
+
+// The frame's temporal inputs (nr::Runtime's TemporalFrame + EngineFrame as the D3D12 session fills them): the engine's
+// motion already resampled onto the frame (a linear RGBA32F buffer like `in`, .xy the motion vector times MVecScale
+// over the motion region's extent; see evaluate_backend), DLSSNR.Reset, the feature the history belongs to.
+struct NetTemporal {
+    uint64_t motion_va = 0;
+    float motion_scale_x = 1.0f, motion_scale_y = 1.0f;
+    uint64_t depth_va = 0;
+    bool have_depth = false;
+    bool depth_inverted = false;
+    bool reset = false;
+    uint64_t feature = 0;
+    bool have_motion = true;
+    bool motion_f16 = false;
+    // Passes (fast) Interleaved: the history this call's network reads in place of the feature's own (the pass's
+    // history as Interleaved made it), a linear buffer laid out as the feature's history images (rows of lin_pitch
+    // texels, history_texel_bytes() a texel); 0 the feature's own. Read only where the history is (the gate open).
+    uint64_t history_va = 0;
+};
+
+// What the ACO network becomes on this side: records into the game's list. Both buffers arrive in UNORDERED_ACCESS
+// (the input written, its UAV writes finished) and must be left so, `out` holding the result. `create` once per
+// device, on the evaluate's thread; false: the backend does not run.
+class D3d12PassthroughNetwork {
+public:
+    virtual ~D3d12PassthroughNetwork() = default;
+    virtual const char* name() const = 0;
+    virtual bool create(ID3D12Device* device, const char** why) = 0;
+    // Before anything is recorded, every evaluate: false (and why) - not ready for this extent yet (the network builds
+    // on a thread) or never; the frame takes the Vulkan bridge.
+    virtual bool ready(ID3D12Device*, uint32_t, uint32_t, std::string*) { return true; }
+    // After a false ready(): true when only because the network for that extent is still building (it will run
+    // these frames; the caller passes them through, no NR, rather than starting the bridge), false when it never will.
+    virtual bool building() const { return false; }
+    // [Network] Motion Without Depth: true when the network reads motion without depth (default 1).
+    virtual bool motion_without_depth() const { return true; }
+    // The frame's model controls, before record.
+    virtual PassthroughNetStatus status() const { return {}; }
+    virtual void controls(const nr::D3d12NetControls&) {}
+    // [Network] History Precision (true: 16, the history images RGBA16F), live: a change starts the history afresh.
+    virtual void history_f16(bool) {}
+    virtual void style_grade(bool) {}   // [Network] Style Grade, live
+    // The frame's temporal inputs, before record.
+    virtual void temporal(const NetTemporal&) {}
+    // The bytes of one history texel of the network ready() settled on for the next record (8 RGBA16F, 16 RGBA32F;
+    // 0 none): the layout NetTemporal::history_va must have.
+    virtual uint32_t history_texel_bytes() const { return 0; }
+    virtual bool record(ID3D12GraphicsCommandList* cmd, const LinearFrame& in, const LinearFrame& out, const char** why) = 0;
+    // The caller destroyed this feature (model.cpp's release_feature): its history, latch and seed must go now.
+    virtual void release_feature(uint64_t) {}
+};
+
+// An HLSL compute shader (cs_5_0) through d3dcompiler_47.dll; null and why when it does not compile.
+ID3DBlob* compile_cs(const char* source, size_t bytes, const char* entry, std::string* why);
+
+// The wilsjo2 layer on the native runtime, before anything of its frame is recorded: whether its network calls
+// will run on this backend - the passthrough enabled, its check passed, the backend made on `device`, the command list's state
+// known and the network ready for w x h (one is built on a thread otherwise: false until it is). False: `why`, and the
+// layer takes the Vulkan bridge for the frame.
+// `building` (may be null): set when false only because the network is still being made (no bridge then), the command
+// list's state is not known yet / its recording is blocked this moment, or the canary has not answered yet (not run,
+// running): those frames wait too. The bridge only for lasting reasons.
+bool wilsjo2_ready(ID3D12Device* device, ID3D12GraphicsCommandList* cmd, uint32_t w, uint32_t h, std::string* why,
+                   bool* building = nullptr);
+
+// The backend slot nr::dlssnr::evaluate_d3d12 calls (nr::dlssnr::set_d3d12_backend, from InitializeASI).
+bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& frame);
+PassthroughNetStatus backend_net_status();
+// The process is ending (nr::dlssnr::abandon_at_exit, from DllMain): the network and the RenoDX stages are left as they
+// are, never destroyed - their destructors would run after amdxc64.dll / d3d12 were detached (loaded after us) and
+// release pipelines made through the driver's extension (a fail-fast inside amdxc64.dll at every game exit).
+void abandon_at_exit();
+
+
+// A game feature the caller destroyed: its RenoDX stage and the network's per-feature state are retired (the stage
+// through the completion watermark), so a later feature that reuses the id starts clean.
+void release_renodx_feature(uint64_t feature);
+// The D3D12 passthrough's device as it stands (S_OK when there is none): a removed device is the one signal a game that dies
+// without an exception leaves behind, so a watchdog can poll it.
+HRESULT device_removed_reason();
+
+
+}  // namespace nr::pe::d3d12_passthrough

@@ -122,10 +122,18 @@ for exe in pathlib.Path(sys.argv[1]).glob("*.exe"):
 print(" ".join(sorted(seen)))
 PY
 )
+# The game folder's exes: one bitness, both (a 32-bit launcher or helper beside the game), none, or unreadable
+has32=0; has64=0
+[[ " $exe_bits " == *" 32 "* ]] && has32=1
+[[ " $exe_bits " == *" 64 "* ]] && has64=1
+if (( has32 && has64 )); then exe_note="the game folder has both 32-bit and 64-bit exes (use the package that matches the game's own exe)"
+elif (( has32 || has64 )); then exe_note="the game folder's exe is $(( has64 ? 64 : 32 ))-bit"
+elif [[ -n "$exe_bits" ]]; then exe_note="the bitness of the game folder's exe could not be read"
+else exe_note="no exe was found in the game folder"; fi
 
 if [[ -z "$route" ]]; then
     echo
-    echo "This is the $bits-bit package; the game folder's exe is ${exe_bits:-unknown}-bit. Choose a route:"
+    echo "This is the $bits-bit package; $exe_note. Choose a route:"
     echo "  1) optiscaler             the game has a DLSS, FSR or XeSS option (OptiScaler, 64-bit only)"
     echo "  2) reshade-feeder         D3D10/11/12 game without a usable upscaler"
     echo "  3) reshade-feeder-vulkan  Vulkan game, or D3D9 game"
@@ -428,8 +436,8 @@ if [[ -f "$manifest" ]]; then
     echo "Found a previous installation, removing it first."
     remove_installed
 fi
-if [[ -n "$exe_bits" && "$exe_bits" != "?" && "$exe_bits" != *"$bits"* ]]; then
-    echo "Note: this is the $bits-bit package but the game exe is $exe_bits-bit; DLLs of the other bitness will not load." >&2
+if (( has32 != has64 )) && (( bits == 64 ? has32 : has64 )); then
+    echo "Note: this is the $bits-bit package but the game exe is $(( has64 ? 64 : 32 ))-bit; DLLs of the other bitness will not load." >&2
 fi
 
 : > "$manifest"; record "dlssnr-amd-install.txt"

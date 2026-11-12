@@ -11,6 +11,7 @@
 #include "nr_lang.hpp"
 #include "pe/nr_engine_panel.hpp"
 
+#include <algorithm>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -305,20 +306,22 @@ bool draw_renodx(A& a, Route route, bool running, const std::function<void()>& s
                 }
             } else {
                 const int method = key_index("NRFastMethod");
-                const uint32_t m = std::min(a.u(method), 3u);
-                const char* names[] = {NR_N("Extrapolation"), NR_N("Feedback"), NR_N("Hybrid"), NR_N("Edit strength")};
+                const uint32_t m = std::min(a.u(method), 4u);
+                const char* names[] = {NR_N("Interleaved"), NR_N("Extrapolation"), NR_N("Feedback"), NR_N("Hybrid"), NR_N("Edit strength")};
                 if (ImGui::BeginCombo(tr("Method"), tr(names[m]))) {
-                    for (uint32_t j = 0; j < 4; ++j) {
-                        ImGui::BeginDisabled((j == 1 || j == 2) && !have_motion);
+                    for (uint32_t j = 0; j < 5; ++j) {
+                        ImGui::BeginDisabled((j == 0 || j == 2 || j == 3) && !have_motion);
                         if (ImGui::Selectable(tr(names[j]), m == j)) { a.u(method) = j; changed = true; }
                         ImGui::EndDisabled();
                     }
                     ImGui::EndCombo();
                 }
                 help(kKeys[method].help);
-                if (!have_motion && (m == 1u || m == 2u)) ImGui::TextDisabled(tr("No motion vectors: Feedback / Hybrid use Extrapolation."));
+                if (!have_motion && (m == 2u || m == 3u)) ImGui::TextDisabled(tr("No motion vectors: Feedback / Hybrid cannot run (one network pass)."));
+                if (!have_motion && m == 0u) ImGui::TextDisabled(tr("No motion vectors: Interleaved cannot run (one network pass)."));
                 // the chosen method's own settings (each method keeps its own)
-                if (m == 3u) changed |= draw_key(a, key_index("NRFastEditStrength"));
+                if (m == 4u) changed |= draw_key(a, key_index("NRFastEditStrength"));
+                else if (m == 0u) { changed |= draw_key(a, key_index("NRFastInterleavedPreset")); changed |= draw_key(a, key_index("NRFastInterleavedPasses")); }
                 else {
                     const std::string pre = std::string("NRFast") + names[m];
                     changed |= draw_key(a, key_index((pre + "Passes").c_str()));

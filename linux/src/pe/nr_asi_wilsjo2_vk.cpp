@@ -263,6 +263,7 @@ VkFormat vk_of(w2::Fmt f, VkFormat frame) {
         case w2::Fmt::kRG32F: return VK_FORMAT_R32G32_SFLOAT;
         case w2::Fmt::kF32: return VK_FORMAT_R32G32B32A32_SFLOAT;
         case w2::Fmt::kRG16F: return VK_FORMAT_R16G16_SFLOAT;
+        case w2::Fmt::kR16F: return VK_FORMAT_R16_SFLOAT;
     }
     return frame;
 }
@@ -301,6 +302,13 @@ public:
     }
     bool has(w2::Mode mode) const override { return g_stage && g_stage->has(mode); }
     bool has_fast() const override { return !g_stage || g_stage->has_fast(); }
+    bool has_il() const override { return !g_stage || g_stage->has_il(); }
+    bool stage_made() const override { return g_stage != nullptr; }
+    bool style_graded() const override {
+        bool on = false;
+        nr::dlssnr::with_vk_session([&](nr::pe::Session& s) { on = s.style_grade_active(); });
+        return on;
+    }
     bool stage_failed() const override { return g_stage_retry.blocked(); }
     w2::PassReady pass(uint32_t k, const w2::PassControls&, uint32_t mw, uint32_t mh) override {
         if (k < o_.models.size() && o_.models[k]) return w2::PassReady::kReady;
@@ -323,6 +331,13 @@ public:
         namespace route = nr::pe::renodx_route;
         route::begin_run(rf_);
         const auto rect = [](const w2::Rect& r) { nr::dlssnr::Rect o; o.x = r.x; o.y = r.y; o.width = r.width; o.height = r.height; return o; };
+        route::HistoryRef hist;
+        if (c.history) {   // (Interleaved: our image, GENERAL)
+            const nr::dlssnr::VkImageRef h = ref(c.history);
+            hist.vk_image = h.image; hist.vk_format = h.format; hist.width = h.width; hist.height = h.height;
+        }
+        hist.raw = c.raw;
+        route::CallHistory history(hist);
         const int result = nr::dlssnr::evaluate_vk_asi(cmd_, o_.models[c.pass], ref(c.input), ref(c.output), ref(c.depth),
                                                        ref(c.motion), c.width, c.height, rect(c.depth_rect), rect(c.motion_rect),
                                                        c.depth_inverted ? 1 : 0, c.reset ? 1 : 0,
@@ -337,7 +352,7 @@ public:
         facts_.hdr = x.hdr; facts_.exposure = int(x.exposure); facts_.asked = x.asked; facts_.white = x.white;
         facts_.history = x.history; facts_.mode = x.mode; facts_.passes = x.passes;
         facts_.prep_outside = x.prep_outside; facts_.prep_missing = x.prep_missing;
-        facts_.fast_passes = x.fast_passes; facts_.fast_fallback = x.fast_fallback;
+        facts_.fast_passes = x.fast_passes; facts_.fast_fallback = x.fast_fallback; facts_.fast_fallback_spatial = x.fast_fallback_spatial; facts_.il_missing = x.il_missing;
         told_.emplace(&facts_);
         route::note_pass(f_->flags, 1.0f, f_->depth_rect.width, f_->depth_rect.height, f_->out_w ? f_->out_w : w_,
                          f_->out_h ? f_->out_h : h_);   // as on D3D12
@@ -508,13 +523,12 @@ bool wilsjo2_copy_vk(VkCommandBuffer cmd, const VkCopySide& source, bool storage
     });
 }
 
-bool wilsjo2_hudfix_vk(VkCommandBuffer cmd, const HudFixVkImages& im, uint32_t w, uint32_t h, uint32_t source,
-                       bool show_mask, bool fresh, uint32_t parity, bool estimate_too) {
+bool hudfix_vk(VkCommandBuffer cmd, const HudFixVkImages& im, uint32_t w, uint32_t h, uint32_t source,
+               bool show_mask) {
     if (g_stage_retry.blocked()) return false;
     return record(cmd, [&](VkCommandBuffer vk, nr::pe::Session&) {
-        const Wilsjo2VkImage& ref = source == 4 ? im.previous : im.hudless.image ? im.hudless : im.back;
-        const bool warm = estimate_too && source == 2 && im.previous.image;
-        uint32_t src = source;
+        const Wilsjo2VkImage& ref = im.hudless.image ? im.hudless : im.back;
+        const Wilsjo2VkImage& alpha = im.alpha.image ? im.alpha : im.back;
         const auto run = [&](uint32_t mode, const Wilsjo2VkImage& t0, const Wilsjo2VkImage* t1, const Wilsjo2VkImage* t2,
                              const Wilsjo2VkImage* t3, const Wilsjo2VkImage& u0, uint32_t width, uint32_t height) {
             w2::Dispatch d;
@@ -524,25 +538,13 @@ bool wilsjo2_hudfix_vk(VkCommandBuffer cmd, const HudFixVkImages& im, uint32_t w
             if (t3) d.t3 = image_of(*t3);
             d.u0 = image_of(u0);
             d.u1 = image_of(im.stats);
-            d.constants = w2::hudfix_constants(mode, width, height, src, show_mask, fresh, parity);
-            if (mode == w2::kHudEstimate && im.motion.image) {   // the estimate with the game's motion vectors
-                d.t2 = image_of(im.motion);
-                w2::hudfix_motion(d.constants, im.motion_scale_x, im.motion_scale_y, im.motion_x, im.motion_y,
-                                  im.motion_step_x, im.motion_step_y);
-            }
+            d.constants = w2::hudfix_constants(mode, width, height, source, show_mask);
             g_stage->record(vk, d);
         };
         try {
             run(w2::kHudClear, im.back, nullptr, nullptr, nullptr, im.frame, 1, 1);
-            if (warm) {   // the estimate's state, this frame against the last
-                src = 4;
-                run(w2::kHudCount, im.back, &im.previous, nullptr, nullptr, im.frame, w, h);
-                run(w2::kHudEstimate, im.back, &im.previous, nullptr, nullptr, im.alpha, w, h);
-                src = source;
-            }
-            if (source == 2 || source == 4) run(w2::kHudCount, im.back, &ref, nullptr, nullptr, im.frame, w, h);
-            if (source == 4) run(w2::kHudEstimate, im.back, &im.previous, nullptr, nullptr, im.alpha, w, h);
-            run(w2::kHudCompose, im.back, &ref, &im.frame, &im.alpha, im.frame, w, h);
+            if (source == 2) run(w2::kHudCount, im.back, &ref, nullptr, nullptr, im.frame, w, h);
+            run(w2::kHudCompose, im.back, &ref, &im.frame, &alpha, im.frame, w, h);
         } catch (const std::exception& x) {
             log("[nr] HUD FIX: %s", x.what());
             return false;

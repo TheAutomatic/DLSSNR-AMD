@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 // One neural-rendering session bound to a game's D3D12 device, running at the
 // game's *render* resolution.
 //
@@ -26,6 +27,9 @@
 #include <string>
 
 namespace nr::pe {
+// The network's [Network] Motion Without Depth as the last RenoDX run's runtime has it (-1 none ran yet): the .asi's
+// Present guide sets copy the game's depth only when something reads it.
+extern std::atomic<int> g_motion_without_depth_now;
 
 class Session {
   public:
@@ -124,10 +128,17 @@ class Session {
         bool colour_encoded{};
         // A wilsjo2 layer (run_after on the ReShade route): its flow on the output, in place.
         const Wilsjo2Frame* wilsjo2{};
+        // A history the caller made for this run (EngineFrame::history; RGBA16F at the network's size, in
+        // UNORDERED_ACCESS): a wilsjo2 layer's Passes (fast) Interleaved pass.
+        ID3D12Resource* history{};
     };
 
     ID3D12Resource* run(ID3D12Device* device, ID3D12GraphicsCommandList* list,
                         const EngineResources& resources, const Controls& controls);
+    // The next runs' network plain: no Style grade (a wilsjo2 layer's Passes (fast) Interleaved, which composes the
+    // grade itself); and whether the network grades now ([Network] Style Grade).
+    void set_raw_call(bool raw);
+    bool style_grade_active() const;
 
     // The post-upscale placement: the upscaler has already written its output at
     // display resolution and the network runs over that, in place. This is where
@@ -308,6 +319,8 @@ class Session {
         bool depth_inverted{true};
         float motion_scale_x{1.0f}, motion_scale_y{1.0f};
         bool reset{};
+        // As EngineResources::history (GENERAL)
+        VkImage history{}; VkFormat history_format{VK_FORMAT_UNDEFINED}; uint32_t history_width{}, history_height{};
         bool upscaler_input{};   // as D3D11Frame::upscaler_input
         bool linear_hdr{};       // as D3D11Frame::linear_hdr
         // The caller's output (optional): the network reads `colour` in place and writes
@@ -435,6 +448,8 @@ class Session {
         // the last wilsjo2 run of this session (the ReShade route's layers): Passes (fast) and the motion vectors
         float wilsjo2_fast_passes = 0.f;
         bool wilsjo2_fast_fallback = false, wilsjo2_motion = false;
+        uint8_t wilsjo2_il_missing = 0;   // Interleaved asked for and not run (nr::wilsjo2::FlowFacts::il_missing)
+        bool wilsjo2_fast_fallback_spatial = false;   // Feedback / Hybrid not run for peripheral compression
         bool motion_without_depth = true;
         float prep_ev = NAN;   // the running network's Preprocess auto exposure (smoothed EV), NaN not metered
         // The last evaluation passed its frame through (not building: waiting for video memory, a size that moves...)

@@ -1,17 +1,28 @@
 #pragma once
-// The GPU's architecture, which decides the network NR runs on it: RDNA4 (gfx12) the network as written, FP8 through
-// the FP8 matrix instructions; RDNA3 and RDNA3.5 (gfx11) the RDNA3 network, whose e4m3 values travel as FP16 through
-// the FP16 matrix instructions, as ACO's machine code only (ACO Mode); anything else is not supported. One more
-// architecture is one more value here and its own network beside the others.
+// The GPU's architecture, which decides the network NR runs on it. Every architecture is a value of its own and every
+// caller decides by `switch` over the ones NR has a network for (has_network); anything else - an architecture NR
+// knows but has no network for (RDNA1, RDNA2), or one it cannot tell - is refused by its name. No architecture is the
+// default of another: RDNA4 is never "not RDNA3", RDNA3 never "not RDNA4". One more supported architecture is one more
+// value here, its rows in the tables below, and its own case wherever a network is chosen.
 //
-// Asked of AMD's driver itself, not of the Vulkan loader (OptiScaler's GPU spoofing rewrites what the loader reports):
-// its compiler makes a pipeline binary of a trivial shader on a device of its own, and the binary's ELF header names
-// the machine the code is for (EF_AMDGPU_MACH). Where that cannot be done (no AMD driver module in the process, a
-// driver without pipeline binaries), the GPU's PCI device ID - the driver's own where it can be had - by family.
+// Today: RDNA4 (gfx12) runs the network as written, FP8 through the FP8 matrix instructions; RDNA3 and RDNA3.5 (gfx11)
+// the RDNA3 network, whose e4m3 values travel as FP16 through the FP16 matrix instructions, as ACO's machine code only.
+//
+// How it is found (identify), in this order, never guessed:
+// 1. AMD's driver itself, not the Vulkan loader (OptiScaler's GPU spoofing rewrites what the loader reports): its
+//    compiler makes a pipeline binary of a trivial shader on a device of its own, and the ELF header names the exact
+//    machine the code is for (EF_AMDGPU_MACH, kMachines). Whatever it names is the answer, known to NR or not.
+// 2. Only where the driver cannot be asked (no AMD driver module in the process, a driver without pipeline binaries):
+//    the GPU's exact PCI device ID in kDevices (the driver's own report where it can be had). No ID ranges (0x74xx
+//    holds RDNA2's Navi 24 and Instinct parts beside RDNA3), no names, no feature guesses: an unlisted ID is unknown.
+#include "nr_gpu_arch_ids.hpp"
 #include "nr_driver_identity.hpp"
 
 #include <vulkan/vulkan.h>
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -19,40 +30,34 @@
 
 namespace nr::arch {
 
-enum class GpuArch { unknown, rdna3, rdna4 };
-
-inline const char* name(GpuArch a) {
-    return a == GpuArch::rdna4 ? "RDNA4" : a == GpuArch::rdna3 ? "RDNA3" : "unknown";
-}
-// The folder of an architecture's ACO network inside dlssnr-amd\aco (RDNA4's is the bundle itself).
-inline const char* aco_folder(GpuArch a) { return a == GpuArch::rdna3 ? "rdna3" : ""; }
-
-// EF_AMDGPU_MACH of an AMDGPU ELF.
-inline GpuArch from_machine(uint32_t mach) {
-    switch (mach & 0xffu) {
-    case 0x48: case 0x4e:   // gfx1200 (RX 9060), gfx1201 (RX 9070, Radeon AI PRO R9700)
-        return GpuArch::rdna4;
-    case 0x41: case 0x46: case 0x47: case 0x44:   // gfx1100 (RX 7900), gfx1101 (RX 7800 / 7700), gfx1102 (RX 7600),
-                                                  // gfx1103 (Radeon 780M / 760M)
-    case 0x43: case 0x4a: case 0x55: case 0x58:   // gfx1150 (890M), gfx1151 (8060S), gfx1152, gfx1153
-        return GpuArch::rdna3;
-    default:
-        return GpuArch::unknown;
-    }
+// dlssnr-amd.ini [GPU] Architecture as the program reads it (nr_pe_config.cpp registers its reader when it loads; a
+// program without it - the installer's int4 weight tool - is always auto): unknown = auto; `said` its value as read.
+using ManualReader = GpuArch (*)(std::string* said);
+inline ManualReader& manual_reader() { static ManualReader r = nullptr; return r; }
+inline GpuArch manual(std::string* said = nullptr) {
+    if (const ManualReader r = manual_reader()) return r(said);
+    if (said) *said = "auto";
+    return GpuArch::unknown;
 }
 
-// A PCI device ID by family: what is known to be RDNA4 or RDNA3; anything else unknown.
-inline GpuArch from_device_id(uint32_t vendor, uint32_t device) {
-    if (vendor != 0x1002) return GpuArch::unknown;
-    if ((device & 0xff00u) == 0x7500u) return GpuArch::rdna4;   // Navi 48 / 44
-    if ((device & 0xff00u) == 0x7400u) return GpuArch::rdna3;   // Navi 31 / 32 / 33
-    switch (device) {
-    case 0x15bf: case 0x15c8: case 0x1900: case 0x1901:   // Phoenix / Hawk Point (780M / 760M / 740M)
-    case 0x150e: case 0x1586: case 0x1114:                 // Strix Point (890M), Strix Halo (8060S), Krackan Point
-        return GpuArch::rdna3;
-    default:
-        return GpuArch::unknown;
+// The architecture set by hand ([GPU] Architecture) over what was found: the fallback for a GPU auto cannot tell, so it
+// is used as set, whatever AMD's driver or the PCI IDs say (a driver naming another architecture is warned about in
+// the log, not obeyed); auto: as found.
+inline Identity with_manual(Identity r) {
+    std::string said;
+    const GpuArch m = manual(&said);
+    if (m == GpuArch::unknown) {
+        if (!has_network(r.arch))
+            r.how += "; dlssnr-amd.ini [GPU] Architecture (NR Control > Network) can set it by hand: rdna4 or rdna3";
+        return r;
     }
+    const std::string found = r.how;
+    const bool other = r.mach && r.arch != m;
+    r.how = std::string("set by hand: dlssnr-amd.ini [GPU] Architecture = ") + said +
+            (other ? std::string(" - WARNING: AMD's driver names ") + name(r.arch) + "; machine code for " + name(m) +
+                     " runs on it as set" : "") + " (auto: " + name(r.arch) + ", " + found + ")";
+    r.arch = m;
+    return r;
 }
 
 namespace detail {
@@ -66,6 +71,17 @@ inline const uint32_t kProbe[] = {
     0x00000040,0x0004002b,0x00000006,0x00000009,0x00000001,0x0006002c,0x00000007,0x0000000a,0x00000008,0x00000009,
     0x00000009,0x00050036,0x00000002,0x00000004,0x00000000,0x00000003,0x000200f8,0x00000005,0x000100fd,0x00010038,
 };
+
+// EF_AMDGPU_MACH of an AMD GPU code object: an ELF64, little-endian, e_machine EM_AMDGPU (224) - the whole header
+// checked, not one byte of it; anything else 0 (not an answer).
+inline uint32_t elf_machine(const uint8_t* d, size_t bytes) {
+    if (bytes < 64 || std::memcmp(d, "\x7f" "ELF", 4) != 0 || d[4] != 2 /* ELFCLASS64 */ || d[5] != 1 /* LSB */) return 0;
+    const uint16_t e_machine = uint16_t(d[18] | (d[19] << 8));
+    if (e_machine != 224) return 0;
+    uint32_t flags = 0;
+    std::memcpy(&flags, d + 48, 4);   // e_flags (ELF64)
+    return flags & 0xffu;             // EF_AMDGPU_MACH
+}
 
 #ifdef _WIN32
 // The machine of the code AMD's driver module `icd` compiles for the GPU with this LUID: a pipeline binary of kProbe,
@@ -182,12 +198,8 @@ inline uint32_t compiled_machine(HMODULE icd, const uint8_t* luid) {
                     if (!machine && p_vkGetPipelineBinaryDataKHR(device, &info, &key, &bytes, nullptr) == VK_SUCCESS &&
                         bytes >= 64 && bytes <= (64u << 20)) {
                         std::vector<uint8_t> data(bytes);
-                        if (p_vkGetPipelineBinaryDataKHR(device, &info, &key, &bytes, data.data()) == VK_SUCCESS &&
-                            bytes >= 64 && !std::memcmp(data.data(), "\x7f" "ELF", 4) && data[18] == 224) {
-                            uint32_t flags = 0;
-                            std::memcpy(&flags, data.data() + 48, 4);
-                            machine = flags;
-                        }
+                        if (p_vkGetPipelineBinaryDataKHR(device, &info, &key, &bytes, data.data()) == VK_SUCCESS)
+                            machine = elf_machine(data.data(), bytes);
                     }
                     if (p_vkDestroyPipelineBinaryKHR) p_vkDestroyPipelineBinaryKHR(device, b, nullptr);
                 }
@@ -209,64 +221,338 @@ inline uint32_t compiled_machine(HMODULE icd, const uint8_t* luid) {
 #endif
 }  // namespace detail
 
-// The architecture of `physical` (the loader's), and how it was found (for the log). Asked once per GPU (LUID).
-inline GpuArch of(VkPhysicalDevice physical, std::string* how = nullptr) {
-    VkPhysicalDeviceIDProperties id{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
-    VkPhysicalDeviceProperties2 asked{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &id};
-    vkGetPhysicalDeviceProperties2(physical, &asked);
-    struct Known { uint8_t luid[VK_LUID_SIZE]; GpuArch arch; std::string how; };
-    static std::mutex m;
-    static std::vector<Known> known;
-    std::lock_guard<std::mutex> guard(m);
-    if (id.deviceLUIDValid)
-        for (const Known& k : known)
-            if (!std::memcmp(k.luid, id.deviceLUID, VK_LUID_SIZE)) {
-                if (how) *how = k.how;
-                return k.arch;
-            }
-    GpuArch arch = GpuArch::unknown;
-    std::string said;
-    char text[160];
 #ifdef _WIN32
-    if (id.deviceLUIDValid) {
-        // every AMD driver module in the process (one per driver package: an integrated GPU may have its own)
-        std::vector<HMODULE> icds;
-        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
-        if (snap != INVALID_HANDLE_VALUE) {
-            MODULEENTRY32W me{};
-            me.dwSize = sizeof me;
-            for (BOOL more = Module32FirstW(snap, &me); more; more = Module32NextW(snap, &me))
-                if (_wcsicmp(me.szModule, L"amdvlk64.dll") == 0) icds.push_back(me.hModule);
-            CloseHandle(snap);
+namespace detail {
+// The module a Vulkan driver manifest names (its "library_path", relative to the manifest's folder unless absolute);
+// a value naming a .dll itself is that module. UTF-8, JSON escapes.
+inline std::wstring manifest_module(const std::wstring& manifest) {
+    auto ends = [](const std::wstring& t, const wchar_t* e) {
+        const size_t n = wcslen(e);
+        return t.size() >= n && _wcsicmp(t.c_str() + t.size() - n, e) == 0;
+    };
+    if (ends(manifest, L".dll")) return manifest;
+    std::string text;
+    if (FILE* f = _wfopen(manifest.c_str(), L"rb")) {
+        char buf[4096]; size_t got;
+        while ((got = std::fread(buf, 1, sizeof buf, f)) > 0 && text.size() < (1u << 20)) text.append(buf, got);
+        std::fclose(f);
+    }
+    const size_t key = text.find("\"library_path\"");
+    const size_t colon = key == std::string::npos ? key : text.find(':', key);
+    const size_t q0 = colon == std::string::npos ? colon : text.find('"', colon);
+    if (q0 == std::string::npos) return {};
+    std::string lib;
+    for (size_t k = q0 + 1; k < text.size() && text[k] != '"'; ++k) {
+        if (text[k] == '\\' && k + 1 < text.size()) {
+            ++k;
+            if (text[k] == 'u') { k += 4; continue; }   // (\uXXXX: not in a driver path; skipped)
         }
-        for (HMODULE icd : icds) {
-            const uint32_t mach = detail::compiled_machine(icd, id.deviceLUID);
-            if (!mach) continue;
-            arch = from_machine(mach);
-            std::snprintf(text, sizeof text, "the driver's compiler makes machine 0x%02x code", unsigned(mach & 0xffu));
-            said = text;
-            break;
+        lib += text[k];
+    }
+    if (lib.empty()) return {};
+    std::wstring w(lib.size() + 1, L'\0');
+    const int n = MultiByteToWideChar(CP_UTF8, 0, lib.c_str(), int(lib.size()), &w[0], int(w.size()));
+    w.resize(n > 0 ? size_t(n) : 0);
+    if (w.rfind(L".\\", 0) == 0 || w.rfind(L"./", 0) == 0) w = w.substr(2);
+    const bool absolute = w.size() > 2 && (w[1] == L':' || (w[0] == L'\\' && w[1] == L'\\'));
+    return absolute ? w : manifest.substr(0, manifest.find_last_of(L"\\/") + 1) + w;
+}
+// Every string of a REG_MULTI_SZ / REG_SZ value.
+inline std::vector<std::wstring> reg_strings(HKEY key, const wchar_t* sub, const wchar_t* value) {
+    std::vector<std::wstring> out;
+    DWORD bytes = 0;
+    if (RegGetValueW(key, sub, value, RRF_RT_REG_MULTI_SZ | RRF_RT_REG_SZ, nullptr, nullptr, &bytes) != ERROR_SUCCESS ||
+        !bytes || bytes > (1u << 20))
+        return out;
+    std::vector<wchar_t> buf(bytes / sizeof(wchar_t) + 2, L'\0');
+    if (RegGetValueW(key, sub, value, RRF_RT_REG_MULTI_SZ | RRF_RT_REG_SZ, nullptr, buf.data(), &bytes) != ERROR_SUCCESS)
+        return out;
+    for (const wchar_t* p = buf.data(); *p; p += wcslen(p) + 1) out.emplace_back(p);
+    return out;
+}
+}  // namespace detail
+
+// AMD's Vulkan driver modules that may serve the adapter with `luid`, each way on its own (OptiScaler's GPU spoofing
+// hooks D3DKMT - a log 11-10: even the kernel's PCI IDs were 10de:2684 - so D3DKMT is one way, not the way):
+//   d3dkmt   the adapter's VulkanDriverName (KMTQAITYPE_QUERYREGISTRY, the path translated), every entry
+//   class    the display adapters' registry keys, read directly (VulkanDriverName, every entry)
+//   khronos  HKLM\SOFTWARE\Khronos\Vulkan\Drivers
+//   umd      beside the D3D12 driver's amdxc64.dll (the same driver package)
+// Only modules named amdvlk64.dll (AMD's Vulkan driver) are kept: another vendor's driver is never loaded here.
+// `steps`: what each way found, for the log.
+inline std::vector<std::wstring> vulkan_driver_paths(LUID luid, std::string* steps) {
+    std::vector<std::wstring> manifests;
+    std::string said;
+    auto note = [&](const char* way, size_t before) {
+        said += std::string(said.empty() ? "" : "; ") + way + " " + std::to_string(manifests.size() - before);
+    };
+    {   // d3dkmt
+        const size_t before = manifests.size();
+        HMODULE gdi = GetModuleHandleW(L"gdi32.dll");
+        if (!gdi) gdi = LoadLibraryW(L"gdi32.dll");
+        // D3DKMT_OPENADAPTERFROMLUID, _QUERYADAPTERINFO, _CLOSEADAPTER, D3DDDI_QUERYREGISTRY_INFO (d3dkmthk.h)
+        struct OpenFromLuid { LUID AdapterLuid; UINT hAdapter; };
+        struct QueryInfo { UINT hAdapter; UINT Type; void* pPrivateDriverData; UINT PrivateDriverDataSize; };
+        struct CloseAdapter { UINT hAdapter; };
+        struct RegistryInfo {
+            UINT QueryType;     // D3DDDI_QUERYREGISTRY_ADAPTERKEY = 1
+            UINT QueryFlags;    // bit 0 TranslatePath
+            WCHAR ValueName[MAX_PATH];
+            ULONG ValueType;
+            ULONG PhysicalAdapterIndex;
+            ULONG OutputValueSize;
+            UINT Status;        // 0 success, 1 buffer overflow
+            union { DWORD OutputDword; UINT64 OutputQword; WCHAR OutputString[1]; BYTE OutputBinary[1]; };
+        };
+        static_assert(offsetof(RegistryInfo, OutputDword) == 544 && sizeof(RegistryInfo) == 552, "D3DDDI_QUERYREGISTRY_INFO");
+        using Open = LONG(APIENTRY*)(OpenFromLuid*);
+        using Query = LONG(APIENTRY*)(const QueryInfo*);
+        using Close = LONG(APIENTRY*)(const CloseAdapter*);
+        const auto open = gdi ? reinterpret_cast<Open>(reinterpret_cast<void*>(GetProcAddress(gdi, "D3DKMTOpenAdapterFromLuid"))) : nullptr;
+        const auto query = gdi ? reinterpret_cast<Query>(reinterpret_cast<void*>(GetProcAddress(gdi, "D3DKMTQueryAdapterInfo"))) : nullptr;
+        const auto close = gdi ? reinterpret_cast<Close>(reinterpret_cast<void*>(GetProcAddress(gdi, "D3DKMTCloseAdapter"))) : nullptr;
+        OpenFromLuid o{luid, 0};
+        if (open && query && close && open(&o) == 0) {
+            RegistryInfo base{};
+            base.QueryType = 1;
+            base.QueryFlags = 1;
+            base.ValueType = REG_MULTI_SZ;
+            wcsncpy(base.ValueName, L"VulkanDriverName", MAX_PATH - 1);
+            QueryInfo q{o.hAdapter, 48u /* KMTQAITYPE_QUERYREGISTRY */, &base, UINT(sizeof base)};
+            const LONG first = query(&q);
+            std::vector<uint8_t> full;
+            const wchar_t* strings = nullptr;
+            size_t chars = 0;
+            if (first == 0 && base.Status == 1 && base.OutputValueSize && base.OutputValueSize < (1u << 20)) {
+                full.assign(sizeof(RegistryInfo) + base.OutputValueSize + 4, 0);
+                auto* info = reinterpret_cast<RegistryInfo*>(full.data());
+                *info = base;
+                q.pPrivateDriverData = info;
+                q.PrivateDriverDataSize = UINT(sizeof(RegistryInfo) + base.OutputValueSize);
+                if (query(&q) == 0 && info->Status == 0) { strings = info->OutputString; chars = info->OutputValueSize / sizeof(wchar_t); }
+            } else if (first == 0 && base.Status == 0) {
+                strings = base.OutputString; chars = base.OutputValueSize / sizeof(wchar_t);
+            }
+            for (size_t k = 0; strings && k < chars && strings[k];) {   // every entry of the MULTI_SZ
+                const std::wstring one(strings + k);
+                manifests.push_back(one);
+                k += one.size() + 1;
+            }
+            const CloseAdapter c{o.hAdapter};
+            close(&c);
+        }
+        note("d3dkmt", before);
+    }
+    {   // class: HKLM\SYSTEM\CurrentControlSet\Control\Class\{display}\NNNN
+        const size_t before = manifests.size();
+        HKEY cls = nullptr;
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}",
+                          0, KEY_READ, &cls) == ERROR_SUCCESS) {
+            wchar_t sub[64];
+            for (DWORD i = 0;; ++i) {
+                DWORD n = DWORD(sizeof sub / sizeof sub[0]);
+                if (RegEnumKeyExW(cls, i, sub, &n, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) break;
+                for (const std::wstring& m : detail::reg_strings(cls, sub, L"VulkanDriverName")) manifests.push_back(m);
+            }
+            RegCloseKey(cls);
+        }
+        note("class", before);
+    }
+    {   // khronos: the value names are the manifests
+        const size_t before = manifests.size();
+        HKEY k = nullptr;
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Khronos\\Vulkan\\Drivers", 0, KEY_READ, &k) == ERROR_SUCCESS) {
+            wchar_t name[MAX_PATH * 2];
+            for (DWORD i = 0;; ++i) {
+                DWORD n = DWORD(sizeof name / sizeof name[0]);
+                if (RegEnumValueW(k, i, name, &n, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) break;
+                manifests.emplace_back(name, n);
+            }
+            RegCloseKey(k);
+        }
+        note("khronos", before);
+    }
+    std::vector<std::wstring> paths;
+    auto keep = [&](const std::wstring& path) {
+        const size_t slash = path.find_last_of(L"\\/");
+        const std::wstring file = slash == std::wstring::npos ? path : path.substr(slash + 1);
+        if (_wcsicmp(file.c_str(), L"amdvlk64.dll") != 0 || GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) return;
+        for (const std::wstring& p : paths)
+            if (_wcsicmp(p.c_str(), path.c_str()) == 0) return;
+        paths.push_back(path);
+    };
+    for (const std::wstring& m : manifests) keep(detail::manifest_module(m));
+    if (HMODULE umd = GetModuleHandleW(L"amdxc64.dll")) {   // umd
+        wchar_t buf[MAX_PATH * 2] = {};
+        const DWORD n = GetModuleFileNameW(umd, buf, DWORD(sizeof buf / sizeof buf[0]));
+        if (n && n < sizeof buf / sizeof buf[0]) {
+            std::wstring path(buf, n);
+            keep(path.substr(0, path.find_last_of(L"\\/") + 1) + L"amdvlk64.dll");
+        }
+        said += "; umd loaded";
+    } else {
+        said += "; umd not loaded";
+    }
+    said += "; " + std::to_string(paths.size()) + " AMD driver module(s)";
+    if (steps) *steps = said;
+    return paths;
+}
+
+// AMD's Vulkan driver modules in the process (one per driver package).
+inline std::vector<HMODULE> loaded_icds() {
+    std::vector<HMODULE> icds;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    if (snap != INVALID_HANDLE_VALUE) {
+        MODULEENTRY32W me{};
+        me.dwSize = sizeof me;
+        for (BOOL more = Module32FirstW(snap, &me); more; more = Module32NextW(snap, &me))
+            if (_wcsicmp(me.szModule, L"amdvlk64.dll") == 0) icds.push_back(me.hModule);
+        CloseHandle(snap);
+    }
+    return icds;
+}
+
+// The last way, only where every other found no driver that knows the adapter: the system's Vulkan loader loads the
+// drivers as for any Vulkan program (an instance and its devices enumerated); the instance is kept, so the drivers stay.
+inline void load_drivers_through_the_loader() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        wchar_t sys[MAX_PATH] = {};
+        const UINT n = GetSystemDirectoryW(sys, MAX_PATH);
+        if (!n || n >= MAX_PATH) return;
+        HMODULE loader = LoadLibraryW((std::wstring(sys) + L"\\vulkan-1.dll").c_str());
+        if (!loader) return;
+        auto create = reinterpret_cast<PFN_vkCreateInstance>(reinterpret_cast<void*>(GetProcAddress(loader, "vkCreateInstance")));
+        auto enumerate = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(
+            reinterpret_cast<void*>(GetProcAddress(loader, "vkEnumeratePhysicalDevices")));
+        if (!create || !enumerate) return;
+        VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+        app.pApplicationName = "DLSSNR-AMD architecture check";
+        app.apiVersion = VK_API_VERSION_1_1;
+        VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+        ici.pApplicationInfo = &app;
+        VkInstance instance = VK_NULL_HANDLE;
+        if (create(&ici, nullptr, &instance) != VK_SUCCESS || !instance) return;
+        uint32_t count = 0;
+        enumerate(instance, &count, nullptr);   // (kept: its drivers stay loaded)
+    });
+}
+
+// The machine AMD's own compiler makes code for on the adapter with `luid` (EF_AMDGPU_MACH; 0: it could not be
+// asked, `how` says why). AMD's Vulkan driver modules already in the process first, then those the registry names
+// (vulkan_driver_paths), then whatever the system's loader loads. Modules loaded here stay loaded (a driver module
+// unloaded under threads of its own is not safe).
+inline uint32_t driver_machine(LUID luid, std::string* how) {
+    static_assert(sizeof(LUID) == VK_LUID_SIZE, "LUID size");
+    uint8_t id[VK_LUID_SIZE];
+    std::memcpy(id, &luid, sizeof id);
+    std::vector<HMODULE> tried;
+    auto ask_loaded = [&](const char* what) -> uint32_t {
+        for (HMODULE icd : loaded_icds()) {
+            if (std::find(tried.begin(), tried.end(), icd) != tried.end()) continue;
+            tried.push_back(icd);
+            if (const uint32_t mach = detail::compiled_machine(icd, id)) { *how = std::string("AMD's Vulkan driver (") + what + ")"; return mach; }
+        }
+        return 0;
+    };
+    if (const uint32_t mach = ask_loaded("loaded")) return mach;
+    std::string steps;
+    for (const std::wstring& path : vulkan_driver_paths(luid, &steps)) {
+        HMODULE icd = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+        if (!icd || std::find(tried.begin(), tried.end(), icd) != tried.end()) continue;
+        tried.push_back(icd);
+        if (const uint32_t mach = detail::compiled_machine(icd, id)) {
+            char narrow[MAX_PATH * 2] = {};
+            WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1, narrow, int(sizeof narrow) - 1, nullptr, nullptr);
+            *how = std::string("AMD's Vulkan driver ") + narrow;
+            return mach;
         }
     }
+    load_drivers_through_the_loader();
+    if (const uint32_t mach = ask_loaded("loaded by the Vulkan loader")) return mach;
+    *how = "AMD's driver could not be asked: no AMD Vulkan driver module knows this adapter (" + steps + "; " +
+           std::to_string(tried.size()) + " module(s) asked)";
+    return 0;
+}
 #endif
-    if (said.empty()) {
-        VkPhysicalDeviceProperties props = asked.properties;
-        VkPhysicalDeviceDriverProperties drv{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
-        const bool driver = nr::driver::amd_reported(physical, &props, &drv);
-        arch = from_device_id(props.vendorID, props.deviceID);
-        std::snprintf(text, sizeof text, "PCI device %04x:%04x (%s)", unsigned(props.vendorID), unsigned(props.deviceID),
-                      driver ? "as AMD's driver reports it" : "as the Vulkan loader reports it");
-        said = text;
+
+namespace detail {
+// One identification per GPU (LUID) for the process - only one the driver's compiler gave. One without it (PCI IDs
+// only, or nothing) is never kept: the next caller asks again (the D3D12 passthrough asks before anything loads AMD's
+// Vulkan driver; a log 11-10: OptiScaler's spoofing made even the kernel's PCI IDs 10de:2684, and the kept "unknown"
+// refused the bridge on an RX 9070 too).
+struct Known { uint8_t luid[VK_LUID_SIZE]; Identity id; };
+inline std::mutex& known_lock() { static std::mutex m; return m; }
+inline std::vector<Known>& known() { static std::vector<Known> k; return k; }
+inline bool find_known(const uint8_t* luid, Identity* out) {
+    for (const Known& k : known())
+        if (!std::memcmp(k.luid, luid, VK_LUID_SIZE)) { *out = k.id; return true; }
+    return false;
+}
+inline void add_known(const uint8_t* luid, const Identity& id) {
+    if (!id.mach) return;
+    for (const Known& k : known())
+        if (!std::memcmp(k.luid, luid, VK_LUID_SIZE)) return;
+    Known k{};
+    std::memcpy(k.luid, luid, VK_LUID_SIZE);
+    k.id = id;
+    known().push_back(k);
+}
+}  // namespace detail
+
+// The architecture of `physical` (a Vulkan physical device, possibly the loader's under OptiScaler's spoofing).
+// `manual`: [GPU] Architecture may apply (the GPU the game runs on); false where a GPU is looked for among several - the
+// hand setting names the game's GPU, not every GPU (an RDNA2 integrated GPU beside an RDNA4 must not become RDNA4).
+inline Identity identify(VkPhysicalDevice physical, bool manual = true) {
+    VkPhysicalDeviceIDProperties idp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+    VkPhysicalDeviceProperties2 asked{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &idp};
+    vkGetPhysicalDeviceProperties2(physical, &asked);
+    std::lock_guard<std::mutex> guard(detail::known_lock());
+    Identity r;
+    if (idp.deviceLUIDValid && detail::find_known(idp.deviceLUID, &r)) return manual ? with_manual(r) : r;
+    uint32_t mach = 0;
+    std::string why = "the device has no LUID";
+#ifdef _WIN32
+    if (idp.deviceLUIDValid) {
+        LUID luid;
+        std::memcpy(&luid, idp.deviceLUID, sizeof luid);
+        mach = driver_machine(luid, &why);
     }
-    if (id.deviceLUIDValid) {
-        Known k{};
-        std::memcpy(k.luid, id.deviceLUID, VK_LUID_SIZE);
-        k.arch = arch;
-        k.how = said;
-        known.push_back(k);
-    }
-    if (how) *how = said;
-    return arch;
+#else
+    why = "not on Windows";
+#endif
+    VkPhysicalDeviceProperties props = asked.properties;
+    VkPhysicalDeviceDriverProperties drv{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    const bool driver = nr::driver::amd_reported(physical, &props, &drv);
+    r = decide(mach, why, driver ? "AMD's driver reports them" : "the Vulkan loader reports them", props.vendorID,
+               props.deviceID);
+    if (idp.deviceLUIDValid) detail::add_known(idp.deviceLUID, r);   // (the driver's answer only; the hand setting never)
+    if (manual) r = with_manual(r);
+    return r;
+}
+
+#ifdef _WIN32
+// The architecture of the adapter with `luid` (a D3D adapter), its PCI IDs as `ids` says (null: none).
+inline Identity identify(LUID luid, const char* ids, uint32_t vendor, uint32_t device) {
+    uint8_t key[VK_LUID_SIZE];
+    std::memcpy(key, &luid, sizeof key);
+    std::lock_guard<std::mutex> guard(detail::known_lock());
+    Identity r;
+    if (detail::find_known(key, &r)) return with_manual(r);
+    std::string why;
+    const uint32_t mach = driver_machine(luid, &why);
+    r = decide(mach, why, ids, vendor, device);
+    detail::add_known(key, r);   // (the driver's answer only; the hand setting never)
+    r = with_manual(r);
+    return r;
+}
+#endif
+
+// The architecture alone (and the log line).
+inline GpuArch of(VkPhysicalDevice physical, std::string* how = nullptr, bool manual = true) {
+    const Identity id = identify(physical, manual);
+    if (how) *how = id.how;
+    return id.arch;
 }
 
 }  // namespace nr::arch

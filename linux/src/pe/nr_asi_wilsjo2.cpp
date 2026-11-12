@@ -201,6 +201,7 @@ DXGI_FORMAT dxgi_of(w2::Fmt f, DXGI_FORMAT frame) {
         case w2::Fmt::kRG32F: return DXGI_FORMAT_R32G32_FLOAT;
         case w2::Fmt::kF32: return DXGI_FORMAT_R32G32B32A32_FLOAT;
         case w2::Fmt::kRG16F: return DXGI_FORMAT_R16G16_FLOAT;
+        case w2::Fmt::kR16F: return DXGI_FORMAT_R16_FLOAT;
     }
     return frame;
 }
@@ -269,6 +270,13 @@ public:
     }
     bool has(w2::Mode mode) const override { return g_stage && g_stage->has(mode); }
     bool has_fast() const override { return !g_stage || g_stage->has_fast(); }
+    bool has_il() const override { return !g_stage || g_stage->has_il(); }
+    bool stage_made() const override { return g_stage != nullptr; }
+    bool style_graded() const override {
+        bool on = false;
+        nr::dlssnr::with_d3d12_session([&](nr::pe::Session& s) { on = s.style_grade_active(); });
+        return on;
+    }
     bool stage_failed() const override { return g_stage_retry.blocked(); }
     w2::PassReady pass(uint32_t k, const w2::PassControls& pc, uint32_t mw, uint32_t mh) override {
         if (k < o_.models.size() && o_.models[k]) return w2::PassReady::kReady;
@@ -292,6 +300,10 @@ public:
         namespace route = nr::pe::renodx_route;
         route::begin_run(rf_);
         const auto rect = [](const w2::Rect& r) { nr::dlssnr::Rect o; o.x = r.x; o.y = r.y; o.width = r.width; o.height = r.height; return o; };
+        route::HistoryRef hist;
+        hist.d3d12 = c.history.h;   // (Interleaved: our resource, in UNORDERED_ACCESS)
+        hist.raw = c.raw;
+        route::CallHistory history(hist);
         const int result = nr::dlssnr::evaluate_d3d12(
             cmd_, o_.models[c.pass], nullptr, static_cast<ID3D12Resource*>(c.input.h), static_cast<ID3D12Resource*>(c.depth.h),
             static_cast<ID3D12Resource*>(c.motion.h), static_cast<ID3D12Resource*>(c.output.h), c.width, c.height,
@@ -306,7 +318,7 @@ public:
         facts_.hdr = x.hdr; facts_.exposure = int(x.exposure); facts_.asked = x.asked; facts_.white = x.white;
         facts_.history = x.history; facts_.mode = x.mode; facts_.passes = x.passes;
         facts_.prep_outside = x.prep_outside; facts_.prep_missing = x.prep_missing;
-        facts_.fast_passes = x.fast_passes; facts_.fast_fallback = x.fast_fallback;
+        facts_.fast_passes = x.fast_passes; facts_.fast_fallback = x.fast_fallback; facts_.fast_fallback_spatial = x.fast_fallback_spatial; facts_.il_missing = x.il_missing;
         told_.emplace(&facts_);
         // the output NR Control shows: before the upscaler the upscaler's (the frame is the render's; "No upscaling" was
         // shown), else the frame
@@ -478,8 +490,8 @@ bool wilsjo2_convert(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, ID3D1
     return recorded;
 }
 
-bool wilsjo2_hudfix(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, const HudFixD3D12& r, uint32_t w, uint32_t h,
-                    uint32_t source, bool show_mask, bool fresh, uint32_t parity, bool estimate_too) {
+bool hudfix_d3d12(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, const HudFixD3D12& r, uint32_t w, uint32_t h,
+                  uint32_t source, bool show_mask) {
     if (g_stage_retry.blocked()) return false;
     bool recorded = false;
     nr::dlssnr::with_d3d12_session([&](nr::pe::Session& session) {
@@ -497,15 +509,10 @@ bool wilsjo2_hudfix(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, const 
                 }
             }
             const w2::Image back = image_of(lookup(r.back, kUav, true)), frame = image_of(lookup(r.frame, kUav, true)),
-                            alpha = image_of(lookup(r.alpha, kUav, true)), stats = image_of(lookup(r.stats, kUav, true));
-            const w2::Image ref = source == 4 ? image_of(lookup(r.previous, kUav, true))
-                                  : r.hudless ? image_of(lookup(r.hudless, kUav, true)) : back;
-            const bool warm = estimate_too && source == 2 && r.previous;
-            const w2::Image motion = r.motion ? image_of(lookup(r.motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, false))
-                                              : w2::Image{};
-            const w2::Image prev = warm ? image_of(lookup(r.previous, kUav, true)) : ref;
-            if (!back.format || !frame.format || !alpha.format || !stats.format || !ref.format || !prev.format) return false;
-            uint32_t src = source;
+                            stats = image_of(lookup(r.stats, kUav, true));
+            const w2::Image alpha = r.alpha ? image_of(lookup(r.alpha, kUav, true)) : back;
+            const w2::Image ref = r.hudless ? image_of(lookup(r.hudless, kUav, true)) : back;
+            if (!back.format || !frame.format || !alpha.format || !stats.format || !ref.format) return false;
             const auto run = [&](uint32_t mode, const w2::Image& t0, const w2::Image* t1, const w2::Image* t2,
                                  const w2::Image* t3, const w2::Image& u0, uint32_t width, uint32_t height) {
                 w2::Dispatch d;
@@ -515,25 +522,59 @@ bool wilsjo2_hudfix(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, const 
                 if (t3) d.t3 = *t3;
                 d.u0 = u0;
                 d.u1 = stats;
-                d.constants = w2::hudfix_constants(mode, width, height, src, show_mask, fresh, parity);
-                if (mode == w2::kHudEstimate && motion.format) {   // the estimate with the game's motion vectors
-                    d.t2 = motion;
-                    w2::hudfix_motion(d.constants, r.motion_scale_x, r.motion_scale_y, r.motion_x, r.motion_y,
-                                      r.motion_step_x, r.motion_step_y);
-                }
+                d.constants = w2::hudfix_constants(mode, width, height, source, show_mask);
                 g_stage->record(vk, d);
             };
             try {
                 run(w2::kHudClear, back, nullptr, nullptr, nullptr, frame, 1, 1);
-                if (warm) {   // the estimate's state, this frame against the last
-                    src = 4;
-                    run(w2::kHudCount, back, &prev, nullptr, nullptr, frame, w, h);
-                    run(w2::kHudEstimate, back, &prev, nullptr, nullptr, alpha, w, h);
-                    src = source;
-                }
-                if (source == 2 || source == 4) run(w2::kHudCount, back, &ref, nullptr, nullptr, frame, w, h);
-                if (source == 4) run(w2::kHudEstimate, back, &ref, nullptr, nullptr, alpha, w, h);
+                if (source == 2 || source == 5) run(w2::kHudCount, back, &ref, nullptr, nullptr, frame, w, h);
                 run(w2::kHudCompose, back, &ref, &frame, &alpha, frame, w, h);
+            } catch (const std::exception& x) {
+                log("[nr] HUD FIX: %s", x.what());
+                return false;
+            }
+            return true;
+        });
+        if (g_stage) g_stage->end_recording();
+    });
+    return recorded;
+}
+
+bool hudfix_select_d3d12(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, ID3D12Resource* frame,
+                         ID3D12Resource* hudless, ID3D12Resource* stats, ID3D12Resource* out, uint32_t w, uint32_t h) {
+    if (g_stage_retry.blocked()) return false;
+    bool recorded = false;
+    nr::dlssnr::with_d3d12_session([&](nr::pe::Session& session) {
+        recorded = session.record_raw(device, cmd, [&](VkCommandBuffer vk, const HostDevice& host,
+                                                       const nr::pe::Session::RawLookup& lookup) {
+            if (!g_stage) {
+                try {
+                    if (stage_fail_test()) throw std::runtime_error("NR_TEST_STAGE_FAIL");
+                    g_stage = std::make_unique<w2::Stage>(host, std::string(nr::pe::module_folder()) +
+                                                                    "\\dlssnr-amd\\shaders\\wilsjo2");
+                    g_stage_retry.made();
+                } catch (const std::exception& x) {
+                    g_stage_retry.fail(x.what());
+                    return false;
+                }
+            }
+            const w2::Image f = image_of(lookup(frame, kUav, true)), hl = image_of(lookup(hudless, kUav, true)),
+                            st = image_of(lookup(stats, kUav, true)), o = image_of(lookup(out, kUav, true));
+            if (!f.format || !hl.format || !st.format || !o.format) return false;
+            const auto run = [&](uint32_t mode, uint32_t source, const w2::Image* t1, const w2::Image& u0, uint32_t width,
+                                 uint32_t height) {
+                w2::Dispatch d;
+                d.t0 = f;
+                if (t1) d.t1 = *t1;
+                d.u0 = u0;
+                d.u1 = st;
+                d.constants = w2::hudfix_constants(mode, width, height, source, false);
+                g_stage->record(vk, d);
+            };
+            try {
+                run(w2::kHudClear, 2, nullptr, o, 1, 1);
+                run(w2::kHudCount, 2, &hl, o, w, h);
+                run(w2::kHudCompose, 6, &hl, o, w, h);
             } catch (const std::exception& x) {
                 log("[nr] HUD FIX: %s", x.what());
                 return false;

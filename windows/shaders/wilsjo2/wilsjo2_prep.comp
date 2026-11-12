@@ -113,6 +113,19 @@ vec3 light_at(vec3 P, ivec2 xy) { return light(P); }   // prep_math.glsl's meter
 // The proxy's encoding of light (the encode's: wilsjo2_encode.comp), for the back's difference.
 vec3 encode_as_proxy(vec3 v) { return pc.kind == 0u ? enc(knee(v)) : pc.kind == 1u ? enc(v) : v; }
 
+// Neutral SDR: the scene-linear cap alone does not bound visible errors in dark
+// channels. Limit the encoded residual too, with one RGB scale to retain its
+// direction. The budget uses the edit after fast-pass processing, before the
+// later look composition. Edits within the budget return unchanged.
+vec3 neutral_sdr_bound(vec3 original, vec3 resolved, vec3 nin, vec3 nout, float cap) {
+    const vec3 input_edit = abs(nout - nin);
+    const float limit = cap * max(input_edit.r, max(input_edit.g, input_edit.b));
+    const vec3 residual = resolved - original;
+    const vec3 magnitude = abs(residual);
+    const float peak = max(magnitude.r, max(magnitude.g, magnitude.b));
+    return peak > limit ? original + residual * (limit / peak) : resolved;
+}
+
 void main() {
     const vec4 sv = imageLoad(state, ivec2(0));
     st.s[0] = sv.x; st.s[1] = sv.y; st.s[2] = sv.z; st.s[3] = sv.w;
@@ -139,11 +152,14 @@ void main() {
             // [Preprocess] Inverse = 0: the change as its ratio in the picture the network was shown
             d = p * (clamp(max(dout, vec3(1.0 / 1024.0)) / max(din, vec3(1.0 / 1024.0)), 0.25, 4.0) - 1.0);
         } else {
-            d = backward(dout) - backward(din);
+            const vec3 w = forward(vec3(1.0));   // display white through the forward curve
+            d = backward(min(dout, vec3(max(w.r, max(w.g, w.b))))) - backward(din);
             const vec3 lim = pc.cap * abs(dout - din) / gain();
             d = clamp(d, -lim, lim);
         }
         M = max(P.rgb + encode_as_proxy(max(p + d, vec3(0.0))) - encode_as_proxy(p), vec3(0.0));
+        if (pc.kind == 1u && pc.curve == 1u && (pc.flags & RATIO) == 0u)
+            M = neutral_sdr_bound(P.rgb, M, nin.rgb, nout.rgb, pc.cap);
         if (!finite(M)) M = P.rgb;
     }
     imageStore(a, xy, vec4(M, nout.a));

@@ -26,7 +26,7 @@ struct Surf {
     bool operator!=(const Surf& o) const { return h != o.h; }
 };
 // The formats the flow makes surfaces in: the frame's own, 16-bit float RGBA, R32F, RG32F, 32-bit float RGBA.
-enum class Fmt : uint8_t { kFrame, kHalf, kR32F, kRG32F, kF32, kRG16F };
+enum class Fmt : uint8_t { kFrame, kHalf, kR32F, kRG32F, kF32, kRG16F, kR16F };
 // How the next step touches a surface: read by a shader (D3D12: NON_PIXEL_SHADER_RESOURCE) or written (UNORDERED_ACCESS).
 enum class Access : uint8_t { kRead, kWrite };
 
@@ -44,6 +44,10 @@ struct NetCall {
     bool noise_every_frame = false;
     uint32_t proxy_curve = 0;   // the layer's ReversibleMode (the network's proxy curve)
     float mv_x = 1.0f, mv_y = 1.0f;
+    // Passes (fast) Interleaved: the history this pass's network reads instead of its own (what it would have written
+    // last frame, made from the slots' increments; 16-bit float RGBA at the model's extent, Access::kWrite); empty: its own
+    Surf history;
+    bool raw = false;   // (Interleaved with a Style / Intensity) the network plain: no Style grade (Intensity 1 in controls)
 };
 
 // What NR Control is told of a run (the route forwards it).
@@ -55,7 +59,9 @@ struct FlowFacts {
     uint32_t mode = 0, passes = 0;
     bool prep_outside = false, prep_missing = false;
     float fast_passes = 0.f;    // Passes (fast) running: its strength (0: legacy passes)
-    bool fast_fallback = false; // Feedback / Hybrid asked for, Extrapolation run (no motion vectors / peripheral compression)
+    bool fast_fallback = false; // Feedback / Hybrid asked for and not run (no motion vectors / peripheral compression)
+    bool fast_fallback_spatial = false;   // ... because of peripheral compression (the vectors are there)
+    uint8_t il_missing = 0;     // Interleaved asked for and not run: 1 no motion vectors, 2 peripheral compression, 3 no programs
 };
 
 // A pass's model on the route: ready, made this frame (the frame is left as it came), or not to be had.
@@ -78,6 +84,13 @@ public:
     virtual bool has(Mode mode) const = 0;
     // Whether Passes (fast)'s programs are there (true before the stage was made: they ship with it).
     virtual bool has_fast() const = 0;
+    // Whether Passes (fast) Interleaved's are (as has_fast) and the route takes NetCall::history.
+    virtual bool has_il() const { return false; }
+    // Whether the route's stage exists yet (the .asi routes make it at their first recording): before that, has() is
+    // false for every program - not a missing program.
+    virtual bool stage_made() const { return true; }
+    // Whether the network grades its answer by the Style ([Network] Style Grade).
+    virtual bool style_graded() const { return false; }
     virtual bool stage_failed() const = 0;
     // Pass k's model for `pc` at the model extent: made if missing (kMade: the frame is left as it came).
     virtual PassReady pass(uint32_t k, const PassControls& pc, uint32_t model_w, uint32_t model_h) = 0;
@@ -119,6 +132,33 @@ struct FlowFrame {
                                   // provider runs; a texture can stay bound with it off)
 };
 
+// Passes (fast) Interleaved on a wilsjo2 layer (the RenoDX-style stage's, nr_renodx.cpp; linux/shaders/renodx-fast
+// il.comp): one legacy pass a frame in turn, each with its own model and history; each pass's increment (its answer -
+// its input) kept and moved along the motion vectors; the answer the frame + every increment. The anti-ghost set as the
+// RenoDX-style stage's defaults (vector test with the flow's gradient, box test, the game's depth for disocclusion and
+// dilation, content from outside the picture filled; the increments not usable replaced by stand-ins from the usable
+// ones around at the hole's depth). Its surfaces at the model's extent, kept between frames.
+struct IlPush {   // il.comp's push block (96 bytes, as the RenoDX-style stage's)
+    uint32_t size[2], mbase[2], mgrid[2]; float mscale[2]; uint32_t mode, slot, n, flags; float k0, k1;
+    uint32_t dbase[2], dgrid[2]; uint32_t styles; float pad0; float inten[4];
+};
+static_assert(sizeof(IlPush) == 96, "il.comp's push block");
+// Interleaved preset 1 (FastInterleavedPreset = 1): 0.0.8.4's method - its surfaces (the fill's pyramid and
+// its depth pyramid in place of the stand-ins' maps), il_pp.comp's push block; its code below as it was
+struct IlState1 {
+    Surf base[2], trust, tdbg, hist, inc[2][8], pyr[6], dpyr[6], depth[2], lf[2];
+    uint32_t w = 0, h = 0, n = 0, cur = 0, bcur = 0, dcur = 0, frame = 0, last[8] = {};
+    uint32_t pyr_n = 0;   // the passes the pyramid was made for (a wider one serves fewer)
+    bool valid = false, graded_last = false, lf_valid = false, depth_const = false;
+    uint32_t preset = 0, lfcur = 0;
+};
+struct IlPpPush { uint32_t ssize[2], dsize[2], mode, n, flags; };   // il_pp.comp's (28 bytes)
+// Interleaved's preset: 1 = 0.0.8.4's method, 2 = the newer one (research NR_IL_PRESET=1|2 over the setting)
+inline uint32_t il_preset(const Settings& s) {
+    static const uint32_t env = [] { const char* e = std::getenv("NR_IL_PRESET"); return e && (e[0] == '1' || e[0] == '2') ? uint32_t(e[0] - '0') : 0u; }();
+    return env ? env : s.fast_interleaved_preset == 1u || s.fast_interleaved_preset == 2u ? s.fast_interleaved_preset : nr::fast::kDefaultInterleavedPreset;
+}
+
 // One layer's state on one route: its surfaces, the passes' controls, the latch.
 struct FlowState {
     Surf proxy, keep, answer, scratch, clamp, small, native;
@@ -152,6 +192,8 @@ struct FlowState {
     EncodingState encoding;
     std::chrono::steady_clock::time_point prep_metered{};
     uint64_t frame_format_key = 0;   // the route's frame format (a change remakes everything)
+    IlState1 il1;                    // Interleaved carrier and optional preset2 display state
+    int il_said = -1;
 };
 
 inline bool same_controls(const PassControls& a, const PassControls& b) {
@@ -160,24 +202,70 @@ inline bool same_controls(const PassControls& a, const PassControls& b) {
            a.skin_structure == b.skin_structure && a.auto_mask == b.auto_mask;
 }
 
-// Passes (fast) as the layer asks for it (one legacy pass is the network's own answer).
-// The chosen method's own setting (Fast<Method>...): [0] Extrapolation, [1] Feedback, [2] Hybrid.
-inline uint32_t fast_slot(const Settings& s) { return std::min(s.fast_method, 2u); }
-inline bool fast_requested(const Settings& s) {   // Edit strength (method 3): at any strength but 1
-    return s.passes_mode == 1 && (s.fast_method == 3 ? s.fast_edit_strength != 1.f : s.fast_passes[fast_slot(s)] > 1.f);
+// Passes (fast) as the layer asks for it (one legacy pass is the network's own answer). FastMethod as RenoDX numbers it:
+// 0 Interleaved, 1 Extrapolation, 2 Feedback, 3 Hybrid, 4 Edit strength.
+// The chosen method's own setting (Fast<Method>...): [0] Extrapolation, [1] Feedback, [2] Hybrid (Interleaved where it
+// cannot run: Extrapolation's).
+inline uint32_t fast_slot(const Settings& s) { return s.fast_method >= 1 && s.fast_method <= 3 ? s.fast_method - 1 : 0; }
+inline bool fast_requested(const Settings& s) {   // Edit strength: at any strength but 1; Interleaved: always
+    return s.passes_mode == 1 && (s.fast_method == 4 ? s.fast_edit_strength != 1.f
+                                  : s.fast_method == 0 || s.fast_passes[fast_slot(s)] > 1.f);
 }
-inline nr::fast::Settings fast_settings(const Settings& s) {
+inline nr::fast::Settings fast_settings(const Settings& s) {   // (nr_fast_passes.hpp counts 0 Extrapolation .. 3 Edit strength)
     nr::fast::Settings f;
     f.passes = s.fast_passes[fast_slot(s)];
-    f.method = s.fast_method;
+    f.method = s.fast_method == 0 ? 0 : s.fast_method - 1;
     f.halo_limit = s.fast_halo_limit[fast_slot(s)];
     f.fine = s.fast_fine[fast_slot(s)];
     f.edit_strength = s.fast_edit_strength;
     return f;
 }
 
+inline void il_release1(FlowIo& io, IlState1& l) {
+    for (Surf* x : {&l.base[0], &l.base[1], &l.trust, &l.tdbg, &l.hist, &l.depth[0], &l.depth[1]}) io.retire(*x);
+    for (auto& a : l.inc) for (Surf& x : a) io.retire(x);
+    for (Surf& x : l.pyr) io.retire(x);
+    for (Surf& x : l.dpyr) io.retire(x);
+    for (Surf& x : l.lf) io.retire(x);
+    l = {};
+}
+// Its surfaces for n passes at w x h. A new size makes them all again; a change of the passes only the slots past it
+// (and the pyramid when it must grow) - a remake of everything under VRAM pressure put the new surfaces in system
+// memory for good. Either way the passes start over.
+inline bool il_ensure1(FlowIo& io, IlState1& l, uint32_t w, uint32_t h, uint32_t n, uint32_t preset) {
+    if (l.w == w && l.h == h && l.n == n && l.preset == preset && l.base[0]) return true;
+    bool ok = true;
+    const auto make = [&](Surf& x, Fmt f, uint32_t xw, uint32_t xh) { x = io.make(f, xw, xh); ok = ok && x; };
+    if (l.w != w || l.h != h || l.preset != preset || !l.base[0]) {
+        il_release1(io, l);
+        for (Surf& x : l.base) make(x, Fmt::kHalf, w, h);
+        make(l.trust, Fmt::kR16F, w, h);
+        make(l.tdbg, Fmt::kHalf, 1, 1);   // (the debug view's: not on a wilsjo2 layer)
+        make(l.hist, Fmt::kHalf, w, h);
+        for (Surf& x : l.depth) make(x, Fmt::kR32F, w, h);
+        if (preset == 2u) for (Surf& x : l.lf) make(x, Fmt::kHalf, 2 * ((w + 7) / 8), (h + 7) / 8);
+        uint32_t pw = w, ph = h;
+        for (uint32_t k = 0; k < 6; ++k) { pw = (pw + 1) / 2; ph = (ph + 1) / 2; make(l.dpyr[k], Fmt::kRG32F, pw, ph); }
+    }
+    for (auto& a : l.inc)
+        for (uint32_t i = 0; i < 8; ++i) {
+            if (i < n && !a[i]) make(a[i], Fmt::kHalf, w, h);
+            else if (i >= n && a[i]) io.retire(a[i]);
+        }
+    if (n > l.pyr_n) {
+        uint32_t pw = w, ph = h;
+        for (uint32_t k = 0; k < 6; ++k) { pw = (pw + 1) / 2; ph = (ph + 1) / 2; io.retire(l.pyr[k]); make(l.pyr[k], Fmt::kHalf, pw * n, ph); }
+        l.pyr_n = n;
+    }
+    if (!ok) { il_release1(io, l); return false; }
+    l.w = w; l.h = h; l.n = n; l.preset = preset;
+    l.valid = false;
+    return true;
+}
+
 inline void flow_release(FlowIo& io, FlowState& o) {
     io.release_passes(0);
+    il_release1(io, o.il1);
     o.built.clear(); o.fresh.clear(); o.failed.clear();
     io.retire(o.f_in); io.retire(o.f_out); io.retire(o.f_net); io.retire(o.f_ans);
     for (Surf& r : o.fast) io.retire(r);
@@ -232,6 +320,144 @@ inline void release_from(FlowIo& io, FlowState& o, size_t from) {
     o.built.resize(std::min(from, o.built.size()));
     o.fresh.resize(o.built.size());
     o.failed.resize(o.built.size());
+}
+// Interleaved preset 1 (0.0.8.4's method, its code as it was; the host's programs 2 = il0, 1 = il_pp) on this frame (the RenoDX-style stage's sequence, nr_renodx.cpp): the game's nearness; on
+// a reset (or a pass made again) every pass in order, from the frame alone (= legacy n); else this frame's pass: the
+// frame kept (Base), every increment moved by the vectors and tested (not used where it belongs to something else now;
+// those filled from the usable ones at the hole's depth), the pass's input = Base + the earlier passes' increments, its
+// history = what it would have written last frame, the network, then its new increment and the answer = Base + every
+// increment (into o.f_out). o.f_in holds the frame in 16-bit float at the model's extent (the network's input).
+inline bool il_run1(FlowIo& io, FlowState& o, const FlowFrame& f, const Settings& s, const NetCall& tmpl, uint32_t mw,
+                   uint32_t mh, uint32_t n) {
+    IlState1& L = o.il1;
+    const bool depth = bool(f.depth), stable = il_preset(s) == 2u;
+    IlPush ip{};
+    ip.size[0] = mw; ip.size[1] = mh;
+    ip.mbase[0] = f.motion_rect.x; ip.mbase[1] = f.motion_rect.y;
+    ip.mgrid[0] = std::max(f.motion_rect.width, 1u); ip.mgrid[1] = std::max(f.motion_rect.height, 1u);
+    // the NGX scale gives pixels of the vectors' region; the increments move in the network's pixels
+    ip.mscale[0] = f.mv_x * float(mw) / float(ip.mgrid[0]);
+    ip.mscale[1] = f.mv_y * float(mh) / float(ip.mgrid[1]);
+    ip.n = n;
+    ip.k0 = 0.02f; ip.k1 = 0.06f;   // the box test's range (the RenoDX-style stage's default)
+    ip.dbase[0] = f.depth_rect.x; ip.dbase[1] = f.depth_rect.y;
+    ip.dgrid[0] = depth ? std::max(f.depth_rect.width, 1u) : 1u; ip.dgrid[1] = depth ? std::max(f.depth_rect.height, 1u) : 1u;
+    // Each pass's Intensity and Style: not plain (a Style the network grades, an Intensity other than 1) - the passes'
+    // networks run plain and the passes are composed here (their histories must be the network's own output, or the
+    // grade comes round again every frame)
+    const bool grade_on = io.style_graded();
+    bool graded = false;
+    for (uint32_t k = 0; k < 4; ++k) {
+        const PassControls pc = pass_controls(s, k);
+        const uint32_t st = grade_on ? std::min(pc.style, 2u) : 0u;
+        ip.styles |= st << (2 * k);
+        ip.inten[k] = pc.intensity;
+        if (k < n && (st != 0 || pc.intensity != 1.0f)) graded = true;
+    }
+    if (graded != L.graded_last) { L.valid = false; L.graded_last = graded; }
+    if (o.latch) L.valid = false;
+    for (uint32_t k = 0; k < n && k < o.fresh.size(); ++k) if (o.fresh[k]) L.valid = false;
+    bool moved = false;
+    // (research NR_IL_DEBUG, as on a RenoDX layer: 1 the moved increments not used shown red, 3 the game's depth)
+    static const int dbg = [] { const char* e = std::getenv("NR_IL_DEBUG"); return e && (e[0] == '1' || e[0] == '3') ? e[0] - '0' : 0; }();
+    struct Use { uint32_t binding; Surf surf; bool storage; };
+    const auto run = [&](uint32_t program, uint32_t step, const std::vector<Use>& uses, const void* push, uint32_t bytes,
+                         uint32_t gx, uint32_t gy) {
+        for (const Use& u : uses) io.use(u.surf, u.storage ? Access::kWrite : Access::kRead);
+        return io.record([&](VkCommandBuffer vk, Stage& stage, const FlowIo::ImageOf& image_of) {
+            std::vector<Stage::FastImage> im;
+            im.reserve(uses.size());
+            for (const Use& u : uses) {
+                im.push_back({u.binding, image_of(u.surf)});
+                if (!im.back().image.format) return false;
+            }
+            stage.record_il(vk, program, step, im.data(), uint32_t(im.size()), push, bytes, gx, gy);
+            return true;
+        });
+    };
+    const auto il = [&](uint32_t mode, uint32_t slot, bool move) {
+        if (mode == 3u) L.bcur ^= 1u;   // (Base: this frame's written, last frame's read)
+        if (mode == 3u) return true;   // (the proxy kept, il.comp flags & 268435456: no Base copy - the pair's turn only)
+        if (mode == 0u) L.cur ^= 1u;
+        const uint32_t d = L.cur, od = d ^ 1u;
+        ip.mode = mode; ip.slot = slot;
+        ip.flags = (stable && (mode == 6u || mode == 1u) && L.lf_valid ? 16u : 0u) | (stable && depth ? 131072u : 0u) | (move ? 1u : 0u) | (mode == 0u && move ? 2u : 0u) | 268435456u | (move ? 8u : 0u) | (moved ? 64u : 0u) |
+                   (mode == 0u && move ? 536870912u : 0u) | (mode == 0u && move && depth ? 1073741824u : 0u) |
+                   (move ? 128u : 0u) | (depth && move ? 768u : 0u) | (tmpl.depth_inverted ? 1024u : 0u) |
+                   (graded ? 2048u : 0u) | (mode == 1u && moved ? 65536u : 0u) | (move ? 524288u | 1048576u : 0u) |
+                   (move ? 33554432u : 0u) | (mode == 4u && depth ? 67108864u : 0u) |
+                   (mode == 1u && moved && dbg ? 262144u : 0u) | (mode == 1u && moved && dbg == 3 ? 4194304u : 0u);
+        std::vector<Use> u{{0, o.f_in, true}, {1, o.f_out, true}, {2, L.base[L.bcur], true}, {3, f.motion, false},
+                           {20, L.hist, true}, {21, L.base[L.bcur ^ 1u], false}, {22, L.trust, true},
+                           {29, depth ? f.depth : L.depth[L.dcur ^ 1u], false}, {30, L.depth[L.dcur], true},
+                           {31, L.depth[L.dcur ^ 1u], false}, {36, L.depth[L.dcur ^ 1u], false}, {43, L.tdbg, true}};
+        for (uint32_t i = 0; i < 8; ++i) {
+            u.push_back({4 + i, L.inc[od][i < n ? i : 0], false});
+            u.push_back({12 + i, L.inc[d][i < n ? i : 0], true});
+        }
+        for (uint32_t l = 0; l < 6; ++l) { u.push_back({23 + l, L.pyr[l], false}); u.push_back({37 + l, L.dpyr[l], false}); }
+        u.push_back({44, L.pyr[0], true}); u.push_back({45, L.dpyr[0], true});   // (step 0 makes the pyramid's first level)
+        if (stable) { u.push_back({46, L.lf[L.lfcur ^ 1u], false}); u.push_back({47, L.lf[L.lfcur], true}); }
+        return run(stable ? 0u : 2u, mode, u, &ip, sizeof ip, (mw + 15) / 16, (mh + 15) / 16);
+    };
+    const auto pyramid = [&] {   // the usable moved increments (and their nearness), level by level
+        uint32_t sw = mw, sh = mh;
+        for (uint32_t l = 0; l < 6; ++l) {
+            const uint32_t dw = (sw + 1) / 2, dh = (sh + 1) / 2;
+            if (l == 0) { sw = dw; sh = dh; continue; }   // (step 0 made the first level)
+            const IlPpPush pp{{sw, sh}, {dw, dh}, l ? 1u : 0u, n, depth ? 1u : 0u};
+            std::vector<Use> u{{0, L.trust, false}, {9, L.pyr[l ? l - 1 : 1], false}, {10, L.pyr[l], true},
+                               {11, L.depth[L.dcur], false}, {12, L.dpyr[l ? l - 1 : 1], false}, {13, L.dpyr[l], true}};
+            for (uint32_t i = 0; i < 8; ++i) u.push_back({1 + i, L.inc[L.cur][i < n ? i : 0], false});
+            if (!run(1, 0, u, &pp, sizeof pp, (dw * n + 15) / 16, (dh + 15) / 16)) return false;
+            sw = dw; sh = dh;
+        }
+        return true;
+    };
+    const auto network = [&](uint32_t k, bool reset, bool history) {
+        const Surf input = L.base[L.bcur];   // the slot's input, where steps 0 / 4 put it (the proxy kept)
+        io.use(input, Access::kRead);
+        io.use(o.f_out, Access::kWrite);
+        if (history) io.use(L.hist, Access::kWrite);
+        NetCall c = tmpl;
+        c.pass = k;
+        c.input = input;
+        c.output = o.f_out;
+        c.reset = reset;
+        c.controls = o.built[k];
+        if (graded) c.controls.intensity = 1.0f;
+        c.raw = graded;
+        c.last = true;
+        c.history = history ? L.hist : Surf{};
+        return io.network(c) == 0;
+    };
+    if (depth) { L.dcur ^= 1u; if (!il(5u, 0u, false)) return false; L.depth_const = false; }
+    else if (stable && !L.depth_const) {
+        if (!il(5u, 0u, false)) return false;
+        L.dcur ^= 1u;
+        if (!il(5u, 0u, false)) return false;
+        L.depth_const = true;
+    }
+    if (!L.valid) {
+        L.lf_valid = false;
+        for (uint32_t j = 0; j < n; ++j) {
+            if (!il(3u, j, false) || !il(0u, j, false) || !network(j, true, false) || !il(1u, j, false)) return false;
+            L.last[j] = 0;
+        }
+        L.valid = true;
+        L.frame = 1;
+    } else {
+        const uint32_t slot = L.frame % n;
+        if (!il(3u, slot, true)) return false;
+        moved = true;
+        if (!il(0u, slot, true) || !pyramid() || !il(4u, slot, true) || !network(slot, false, true))
+            return false;
+        if (stable) { L.lfcur ^= 1u; if (!il(6u, slot, false)) return false; L.lf_valid = true; }
+        if (!il(1u, slot, false)) return false;
+        L.last[slot] = L.frame++;
+    }
+    for (uint32_t k = 0; k < n && k < o.fresh.size(); ++k) o.fresh[k] = false;
+    return true;
 }
 }  // namespace flow_detail
 
@@ -356,7 +582,27 @@ inline bool flow_run(FlowIo& io, FlowState& o, const FlowFrame& f, const Setting
     // again (with a reset); fewer passes: the ones past them go. At most one is made a frame, in pass order, and a
     // frame that made one is left as it came; a pass whose model could not be made ends the chain there (pass 0: NR
     // does not run).
-    const uint32_t requested = passes_requested(s);
+    // Passes (fast) Interleaved (FastMethod 0) needs the game's motion vectors (it moves each pass's increment along
+    // them), its programs, and no peripheral compression (whose packed picture has no place for the increments). Without
+    // one of them it does not run: one network pass, and NR Control says why (no other method in its place).
+    const bool il_want = s.passes_mode == 1 && s.fast_method == 0;
+    // (the stage not made yet - the first frame on the .asi routes: nothing is missing; that frame runs one plain pass
+    // and says nothing)
+    const bool stage_made = io.stage_made();
+    const uint8_t il_missing = !il_want ? 0u
+                             : !f.motion || !f.fast_motion ? 1u
+                             : spatial ? 2u
+                             : stage_made && (!io.has_il() || !io.has_fast() || !io.has(kHalfCopy)) ? 3u : 0u;
+    const bool il_on = il_want && !il_missing && stage_made;
+    if (il_missing) {
+        once(io, o.il_said, 10 + il_missing, il_missing == 1u ? "Passes (fast) Interleaved cannot run: no motion vectors (one network pass)"
+                                      : il_missing == 2u ? "Passes (fast) Interleaved cannot run: peripheral compression is on (one network pass)"
+                                                         : "Passes (fast) Interleaved cannot run: its programs are unavailable (one network pass)");
+    } else if (il_on && o.il_said != 0) {
+        once(io, o.il_said, 0, "Passes (fast) Interleaved");
+    }
+    if (!il_on && o.il1.base[0]) il_release1(io, o.il1);
+    const uint32_t requested = il_want && !il_on ? 1u : passes_requested(s);
     for (size_t k = 0; k < o.built.size(); ++k)
         if (!o.failed[k] && !same_controls(pass_controls(s, uint32_t(k)), o.built[k])) {
             flow_detail::release_from(io, o, 0);
@@ -694,26 +940,29 @@ inline bool flow_run(FlowIo& io, FlowState& o, const FlowFrame& f, const Setting
     // Passes (fast) (nr_fast_passes.hpp; one network pass, passes_requested): the pass's input copied to 16-bit float
     // (rounded as the network rounds it: the network is shown the same values), with Feedback / Hybrid the last frame's
     // edit moved by the motion vectors into that copy, and after the network its answer (16-bit float, model_format)
-    // strengthened in place. Feedback / Hybrid need the game's motion vectors and run as Extrapolation without them and
-    // with peripheral compression (whose packed vectors are of another picture).
+    // strengthened in place. Feedback / Hybrid need the game's motion vectors and do not run without them nor with
+    // peripheral compression (whose packed vectors are of another picture): one plain network pass, said.
     const nr::fast::Settings fs = fast_settings(s);
     const bool fast_programs = io.has_fast() && io.has(kHalfCopy);
     const bool fast_on = fast_requested(s) && fast_programs;
     if (!fast_on && (o.f_in || o.f_out)) flow_detail::release_fast(io, o);
     if (fast_requested(s) && !fast_programs) {
-        once(io, o.fast_said, 1, "Passes (fast)'s programs are unavailable; one network pass runs");
+        if (stage_made) once(io, o.fast_said, 1, "Passes (fast)'s programs are unavailable; one network pass runs");
         // the first frame only (the stage was not made when the model's images were chosen 16-bit float): the network's
         // input and answer differ in format; from the next frame they are the frame's
         if (half && !spatial) return false;
     }
     const bool history_method = fs.method == 1 || fs.method == 2;   // Feedback / Hybrid (Edit strength: none)
     const bool feedback = fast_on && history_method && f.motion && f.fast_motion && !spatial;
+    const bool fb_missing = fast_on && history_method && !feedback;
+    const bool plain = il_want || fb_missing;   // the half copy and the network alone (Interleaved has its own work)
     // The fast work's arithmetic takes a display-encoded picture in [0, 1]. A float frame passed through as it is (no
     // HDR flag; without [Preprocess], whose input is its own) can go above 1: the fast work then runs in a bounded domain
     // (wilsjo2_half_copy.comp DebugView 1 / 2, the hybrid curve: identity to 0.75) and the network on the light - its
     // input f_net (as it came, or the fed input brought back), its answer f_ans (brought into the domain for the fast
     // work and back after it).
-    const bool fast_map = fast_on && passthrough && !f.unorm && !prep;
+    // Interleaved (and a frame it cannot run on) works in the values the network is shown: no mapped domain.
+    const bool fast_map = fast_on && !plain && passthrough && !f.unorm && !prep;
     if (fast_on && !fast_map) { io.retire(o.f_net); io.retire(o.f_ans); }
     if (fast_on) {
         const uint32_t lw = nr::fast::low(model_w), lh = nr::fast::low(model_h);
@@ -724,7 +973,8 @@ inline bool flow_run(FlowIo& io, FlowState& o, const FlowFrame& f, const Setting
         bool made = o.f_in && o.f_out && (!fast_map || (o.f_net && o.f_ans));
         for (uint32_t i = nr::fast::kFbAdd; i < nr::fast::kImageCount; ++i) {
             const auto image = nr::fast::Image(i);
-            if (nr::fast::feedback_image(image) && !history_method) {   // Extrapolation / Edit strength: no feedback's add or history
+            // Extrapolation / Edit strength: no feedback's add or history; Interleaved: none of them (its own surfaces)
+            if (plain || (nr::fast::feedback_image(image) && !history_method)) {
                 if (o.fast[i]) io.retire(o.fast[i]);
                 continue;
             }
@@ -738,9 +988,9 @@ inline bool flow_run(FlowIo& io, FlowState& o, const FlowFrame& f, const Setting
             once(io, o.fast_said, 2, "Passes (fast)'s textures could not be made; NR skips the frame");
             return false;
         }
-        if (history_method && !feedback)
-            once(io, o.fast_said, spatial ? 3 : 4, spatial ? "Passes (fast): Feedback / Hybrid run as Extrapolation with peripheral compression"
-                                                           : "Passes (fast): no motion vectors; Feedback / Hybrid run as Extrapolation");
+        if (fb_missing)
+            once(io, o.fast_said, spatial ? 3 : 4, spatial ? "Passes (fast) Feedback / Hybrid cannot run: peripheral compression is on (one network pass)"
+                                                           : "Passes (fast) Feedback / Hybrid cannot run: no motion vectors (one network pass)");
         else if (o.fast_said > 0)
             o.fast_said = 0;
         // the history restarts where the network's does, and is not kept without feedback
@@ -771,6 +1021,7 @@ inline bool flow_run(FlowIo& io, FlowState& o, const FlowFrame& f, const Setting
                 return true;
             };
             if (!copy(net_input, o.f_in, fast_map ? 1u : 0u)) return false;
+            if (plain) return true;   // Interleaved / a plain pass: the input in 16-bit float is all it needs here
             flow_detail::FastRecorder d(vk, stage, image_of, o, f.motion);
             if (!nr::fast::feed(d, fs, model_w, model_h, motion, o.fast_history, feedback)) return false;
             // the network's own input: the light as it came, or with the feedback brought back from the domain
@@ -810,10 +1061,29 @@ inline bool flow_run(FlowIo& io, FlowState& o, const FlowFrame& f, const Setting
         facts.passes = ready;
         facts.prep_outside = prep || prep_missing;
         facts.prep_missing = prep_missing;
-        facts.fast_passes = fast_on ? (fs.method == 3u ? fs.edit_strength : fs.passes) : 0.f;
-        facts.fast_fallback = fast_on && history_method && !feedback;
+        facts.fast_passes = il_on ? float(ready) : plain ? 0.f : fast_on ? (fs.method == 3u ? fs.edit_strength : fs.passes) : 0.f;
+        facts.fast_fallback = fb_missing;
+        facts.fast_fallback_spatial = fb_missing && spatial && f.motion && f.fast_motion;
+        facts.il_missing = il_missing;
         io.passes_begin(facts);
-        for (uint32_t k = 0; k < ready; ++k) {
+        if (il_on) {
+            // Interleaved: every pass of a reset in order (= legacy), else this frame's pass on its input (the frame +
+            // the earlier passes' moved increments) with its history made here, one frame old
+            // (the preset's own surfaces; the other preset's go)
+            const uint32_t preset = il_preset(s);
+            if (ready < requested || !il_ensure1(io, o.il1, model_w, model_h, ready, preset)) {
+                once(io, o.il_said, 2, "Passes (fast) Interleaved's textures could not be made; NR skips the frame");
+                all_ran = false;
+            } else if (!flow_detail::il_run1(io, o, f, s, call, model_w, model_h, ready)) {
+                once(io, o.il_said, 3, "Passes (fast) Interleaved could not be recorded; the frame is left as it came");
+                o.il1.valid = false;
+                o.latch = true;
+                all_ran = false;
+            } else {
+                final_answer = o.f_out;
+            }
+        }
+        for (uint32_t k = 0; k < ready && !il_on; ++k) {
             // pass 0 reads the proxy; a later pass the previous answer clamped (mode 8, 8.8) into passClamp.
             // Answers alternate output / passScratch.
             const Surf input = fast_on ? (fast_map ? o.f_net : o.f_in) : k == 0 ? net_input : clamp_image;
@@ -872,7 +1142,7 @@ inline bool flow_run(FlowIo& io, FlowState& o, const FlowFrame& f, const Setting
         once(io, o.said, 5, "the model's evaluate failed; the frame is left as it came");
         return false;   // no answer: the latch stays set (step 13), nothing is composed
     }
-    if (fast_on) {   // the answer strengthened in place; with feedback the input given back and the edit kept
+    if (fast_on && !plain) {   // the answer strengthened in place; with feedback the input given back and the edit kept
         io.use(o.f_in, Access::kWrite);
         io.use(o.f_out, Access::kWrite);
         if (fast_map) io.use(o.f_ans, Access::kWrite);

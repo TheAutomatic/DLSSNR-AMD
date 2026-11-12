@@ -11,6 +11,19 @@
 
 namespace nr::fast {
 
+// The method where nothing says one (NRFastMethod / FastMethod, RenoDX's numbering: 0 Interleaved, 1 Extrapolation, 2
+// Feedback, 3 Hybrid, 4 Edit strength): Interleaved on the OptiScaler route - the upscaler hands over the game's motion
+// vectors, which Interleaved needs; Extrapolation on the ReShade route, whose vectors are estimated or absent. The
+// ReShade add-on's sources are compiled with NR_RESHADE_ROUTE (build_package.sh), every one of them.
+#ifdef NR_RESHADE_ROUTE
+inline constexpr uint32_t kDefaultMethod = 1;
+#else
+inline constexpr uint32_t kDefaultMethod = 0;
+#endif
+// Interleaved's preset where nothing says one (NRFastInterleavedPreset / FastInterleavedPreset: 1 = the method of
+// 0.0.8.4, 2 = a later method). Use the method of 0.0.8.4 by default.
+inline constexpr uint32_t kDefaultInterleavedPreset = 1;
+
 enum Program : uint32_t { kFbIn, kPrep, kBox, kApply, kProgramCount };
 inline const char* program_name(Program p) {
     static const char* const names[] = {"st_fb_in", "st_prep", "st_box", "st_apply"};

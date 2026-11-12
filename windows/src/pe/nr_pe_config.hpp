@@ -2,6 +2,7 @@
 #include "nr_runtime.hpp"
 #include "nr_renodx.hpp"
 #include "nr_ini_network.hpp"
+#include "nr_control_shared.hpp"
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -163,9 +164,10 @@ struct InspectConfig {
 enum class HudSource : uint32_t { kOff = 0, kAuto = 1, kGame = 2, kCaptured = 3, kEstimated = 4 };
 struct HudFixConfig {
     uint32_t mode = 0;   // Mode: 0 off (the default, both routes), 1 Auto, 2 frame generation's HUD-less frame (DLSS-G,
-                         // FSR FG, XeSS FG), 3 captured before the HUD is drawn, 4 estimated (screen-fixed pixels while
-                         // the picture moves)
+                         // FSR FG, XeSS FG), 3 captured before the HUD is drawn; 4 (estimated) was removed: a file
+                         // that asks for it gets 0 and estimated_asked
     bool show_mask = false;   // ShowMask: the HUD's alpha shown (white = HUD, kept as the game drew it)
+    bool estimated_asked = false;   // Mode = estimated (removed): `mode` is 0, NR Control and the log say why
 };
 
 struct ChainConfig {
@@ -195,6 +197,10 @@ uint64_t config_epoch();
 // [Log], with its comments (read by nr_pe_log.cpp; every route's file carries it).
 // [NRControl] (the OptiScaler route's menu: its key), with its comments.
 void write_nrcontrol(FILE* f);
+void write_d3d12(FILE* f, bool enabled);   // [D3D12Passthrough] (the OptiScaler route)
+void write_gpu(FILE* f);   // [GPU] (Architecture: nr_gpu_arch.hpp gpu_manual)
+// dlssnr-amd.ini [GPU] Architecture (read once): unknown = auto; `said` its value as read
+nr::arch::GpuArch gpu_manual(std::string* said = nullptr);
 void write_log(FILE* f, bool enabled, bool clear);
 // [Debug] of dlssnr-amd.ini in `folder`: every NR_* / DLSSNR_* key set in the process's environment, as if the game
 // had been started with it - the diagnostic switches the code reads from the environment, for players who cannot set
@@ -287,7 +293,9 @@ struct Config {
     uint32_t downscale = 0;       // Downscale below 100 %: 0 area after encoding, 1 bilinear before encoding
     // Passes (fast) on a wilsjo2 layer (PassesMode, FastMethod, Fast<Method>Passes / HaloLimit / Fine, FastEditStrength)
     uint32_t passes_mode = 0;     // 0 legacy, 1 fast
-    uint32_t fast_method = 0;     // 0 Extrapolation, 1 Feedback, 2 Hybrid, 3 Edit strength
+    uint32_t fast_method = fast::kDefaultMethod;   // as NRFastMethod: 0 Interleaved, 1 Extrapolation, 2 Feedback, 3 Hybrid, 4 Edit strength (the route's default)
+    uint32_t fast_interleaved_passes = 3;   // FastInterleavedPasses 2..8
+    uint32_t fast_interleaved_preset = fast::kDefaultInterleavedPreset;   // FastInterleavedPreset 1 | 2 (as NRFastInterleavedPreset)
     // each method's own: [0] Extrapolation, [1] Feedback, [2] Hybrid
     float fast_passes[3] = {3.0f, 3.0f, 3.0f};       // 1..8
     bool fast_halo_limit[3] = {false, false, false};

@@ -290,7 +290,18 @@ struct Temporal {
     nrvk::Kernel post16_pp[2], post16_grade_pp[2];
     bool pingpong{};
     uint32_t hcur{};
-    nrvk::Context::Image& hist(uint32_t i) { return i ? history_b : history; }
+    // the history images rotate among the features (NR passes, layers) instead of one bound pair with every
+    // feature's own image copied in and out at each change (4K RGBA16F: two 66 MB copies per change, 3 passes ~1.3 ms
+    // a frame). A feature reads the image that holds its last frame (hread) and its post writes a free one (hwrite),
+    // which becomes the feature's; the one it read is free again. One feature: hist(0) / hist(1) in turn, as before.
+    // N features: N + 1 images (extra = the third and later), sets for each (read, write) pair made when first used.
+    std::vector<nrvk::Context::Image> extra;
+    struct Var { nrvk::Kernel pre, post, post_grade, post16, post16_grade; };
+    std::map<std::pair<uint32_t, uint32_t>, Var> vars;
+    uint32_t hread{}, hwrite{1};
+    bool hfresh{};   // hread starts from zeros this recording (a feature without history yet)
+    uint32_t hist_count() const { return 2u + uint32_t(extra.size()); }
+    nrvk::Context::Image& hist(uint32_t i) { return i == 0 ? history : i == 1 ? history_b : extra[i - 2u]; }
     // Where the engine's depth is put, so the consumer has one descriptor
     // whether a game supplies depth or not. Allocated always and left cleared
     // when it is not; the shader is told which by the parameter buffer rather
@@ -335,6 +346,13 @@ struct Temporal {
             if (post16_grade_pp[c].device) post16_grade_pp[c].destroy();
         }
         if (history_b.handle) ctx.destroy(history_b);
+        for (auto& v : vars)
+            for (nrvk::Kernel* k : {&v.second.pre, &v.second.post, &v.second.post_grade, &v.second.post16,
+                                    &v.second.post16_grade})
+                if (k->device) k->destroy();
+        vars.clear();
+        for (auto& e : extra) { e.sampler = VK_NULL_HANDLE; ctx.destroy(e); }   // (the sampler is history's)
+        extra.clear();
         if (hpass.handle) ctx.destroy(hpass);
         // flow0_sampled aliases flow[0]; only its sampler is ours to free.
         if (motion_sampler) vkDestroySampler(ctx.device, motion_sampler, nullptr);
@@ -427,10 +445,11 @@ struct Runtime::Impl {
     // every temporal kernel's set pointing at them (the sampled read of hist(c) in the [c] kernels, the storage write
     // of hist(c) in the post's [c ^ 1] ones), the old images retired. Each feature's own image goes too and every
     // history starts afresh (latch off): a switch is a cut, as a network switch is.
-    void switch_history(VkCommandBuffer cmd) {
+    bool switch_history(VkCommandBuffer cmd) {
         auto& t = temporal;
         auto& s = session;
-        if (!t.enabled || !t.pingpong || t.hp || !t.h16_ok || t.h16 == t.h16_want) return;
+        if (!t.enabled || !t.pingpong || t.hp || !t.h16_ok || t.h16 == t.h16_want) return false;
+        drop_rotation();   // the images beyond the pair and their sets go; every feature starts afresh below
         const VkFormat fmt = t.h16_want ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
         nrvk::Context::Image old[2] = {t.history, t.history_b}, made[2];
         const bool defer = s.ctx.defer_transitions;
@@ -487,6 +506,7 @@ struct Runtime::Impl {
         t.h16 = t.h16_want;
         nr::logf("[nr] history images %s ([Network] History Precision %s): the history starts afresh",
                  t.h16 ? "RGBA16F" : "RGBA32F", t.h16 ? "16" : "32");
+        return true;
     }
     // Tag history with its input domain, per feature. A global counter would reset alternating layers that use
     // different encodings even when neither layer's settings changed.
@@ -595,6 +615,7 @@ struct Runtime::Impl {
         bool cleared{};
         InputDomain input{};   // the encoding its history was made under
         uint32_t seed{};       // Temporal::seed
+        int slot{-1};          // the history image holding its last frame (Temporal::hist), -1 none yet
     };
     std::map<uint64_t, FeatureState> features;
     // A feature's own history image is made when it first has to leave the bound history (another feature binds
@@ -609,6 +630,147 @@ struct Runtime::Impl {
         f.cleared = false;   // still UNDEFINED: record_all brings it to GENERAL before its first copy
     }
     uint64_t bound_feature{};
+    // History rotation (Temporal::extra): on for the one-pass ping-pong history (the product's), off for the
+    // research NR_HPASS path, which keeps the copies.
+    bool rotation() const { return temporal.pingpong && !temporal.hp; }
+    bool slot_taken(uint32_t i, const FeatureState* except) const {
+        for (const auto& f : features) if (&f.second != except && f.second.slot == int(i)) return true;
+        return false;
+    }
+    // A free image other than `not_this`, preferring `want`; made (UNDEFINED -> GENERAL in cmd) when none is free.
+    uint32_t free_slot(VkCommandBuffer cmd, const FeatureState* fs, uint32_t want, uint32_t not_this) {
+        auto& t = temporal;
+        if (want < t.hist_count() && want != not_this && !slot_taken(want, fs)) return want;
+        for (uint32_t i = 0; i < t.hist_count(); ++i)
+            if (i != not_this && !slot_taken(i, fs)) return i;
+        nrvk::Context::Image im = session.ctx.image(t.history.w, t.history.h, t.history.format, true, false);
+        vkDestroySampler(session.ctx.device, im.sampler, nullptr);
+        im.sampler = t.history.sampler;   // LINEAR, history's (borrowed)
+        VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = im.handle; b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr,
+                             0, nullptr, 1, &b);
+        im.layout = VK_IMAGE_LAYOUT_GENERAL;
+        t.extra.push_back(im);
+        return t.hist_count() - 1u;
+    }
+    // This recording's history pair for feature `fs` (null: the unnamed caller, hist(hcur) / hist(hcur ^ 1)).
+    void select_history(VkCommandBuffer cmd, FeatureState* fs) {
+        auto& t = temporal;
+        if (!rotation() || !fs) { t.hread = t.hcur; t.hwrite = t.hcur ^ 1u; t.hfresh = false; return; }
+        t.hfresh = fs->slot < 0;
+        // a feature without history takes hist(hcur) when it is free, as the bound history it used to clear
+        t.hread = t.hfresh ? free_slot(cmd, fs, t.hcur, ~0u) : uint32_t(fs->slot);
+        t.hwrite = free_slot(cmd, fs, t.hread < 2u ? t.hread ^ 1u : ~0u, t.hread);
+        if (!(t.hread < 2u && t.hwrite == (t.hread ^ 1u))) variant(t.hread, t.hwrite);
+    }
+    // pre_pp / post_pp for a pair other than (0, 1) and (1, 0): copies of pre_pp[0] / post*_pp[0] with the history
+    // read (hist(0)) and write (hist_store[1]) bindings pointing at hist(r) / hist(w).
+    static void clone_kernel(const nrvk::Kernel& base, nrvk::Kernel& out,
+                             const std::vector<std::pair<VkImageView, nrvk::Context::Image>>& changes) {
+        out = base;
+        out.pool = VK_NULL_HANDLE; out.set = VK_NULL_HANDLE;
+        VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        dpi.maxSets = 1; dpi.poolSizeCount = uint32_t(base.pool_sizes.size()); dpi.pPoolSizes = base.pool_sizes.data();
+        NRVK_CHECK(vkCreateDescriptorPool(base.device, &dpi, nullptr, &out.pool));
+        VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        dai.descriptorPool = out.pool; dai.descriptorSetCount = 1; dai.pSetLayouts = &base.dsl;
+        NRVK_CHECK(vkAllocateDescriptorSets(base.device, &dai, &out.set));
+        std::vector<VkCopyDescriptorSet> copies(base.binding_ids.size());
+        for (size_t b = 0; b < base.binding_ids.size(); ++b) {
+            copies[b] = {VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET};
+            copies[b].srcSet = base.set; copies[b].srcBinding = base.binding_ids[b];
+            copies[b].dstSet = out.set; copies[b].dstBinding = base.binding_ids[b];
+            copies[b].descriptorCount = 1;
+        }
+        vkUpdateDescriptorSets(base.device, 0, nullptr, uint32_t(copies.size()), copies.data());
+        std::vector<VkDescriptorImageInfo> infos(base.image_views.size());
+        std::vector<VkWriteDescriptorSet> w;
+        for (uint32_t i = 0; i < uint32_t(base.image_views.size()); ++i)
+            for (const auto& ch : changes)
+                if (base.image_views[i] == ch.first) {
+                    infos[i] = {ch.second.sampler, ch.second.view, VK_IMAGE_LAYOUT_GENERAL};
+                    out.image_views[i] = ch.second.view;
+                    VkWriteDescriptorSet x{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                    x.dstSet = out.set; x.dstBinding = base.buffer_bindings + i; x.descriptorCount = 1;
+                    x.descriptorType = ch.second.sampler ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                                                         : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+                    x.pImageInfo = &infos[i];
+                    w.push_back(x);
+                    break;
+                }
+        vkUpdateDescriptorSets(base.device, uint32_t(w.size()), w.data(), 0, nullptr);
+    }
+    Temporal::Var& variant(uint32_t r, uint32_t w) {
+        auto& t = temporal;
+        auto it = t.vars.find({r, w});
+        if (it != t.vars.end()) return it->second;
+        Temporal::Var& v = t.vars[{r, w}];
+        nrvk::Context::Image rd = t.hist(r), wr = t.hist(w);
+        wr.sampler = VK_NULL_HANDLE;   // the storage view the post writes
+        const VkImageView read0 = t.hist(0).view, write1 = t.hist(1).view;
+        const std::vector<std::pair<VkImageView, nrvk::Context::Image>> pre_ch{{read0, rd}};
+        clone_kernel(t.pre_pp[0], v.pre, pre_ch);
+        // post_pp[0]: hist(0) sampled (read), hist(1) storage (write) - matched by view and kind
+        const auto post = [&](const nrvk::Kernel& base, nrvk::Kernel& out) {
+            if (!base.device) return;
+            clone_kernel(base, out, {{read0, rd}});
+            // the write binding: the storage descriptor showing hist(1)'s view (after the read was moved, a read of
+            // hist(1) - r == 1 - shows hist(1)'s view too: only the storage one is the write)
+            std::vector<VkDescriptorImageInfo> one(1, VkDescriptorImageInfo{VK_NULL_HANDLE, wr.view, VK_IMAGE_LAYOUT_GENERAL});
+            for (uint32_t i = 0; i < uint32_t(base.image_views.size()); ++i) {
+                if (base.image_views[i] != write1) continue;
+                VkWriteDescriptorSet x{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                x.dstSet = out.set; x.dstBinding = base.buffer_bindings + i; x.descriptorCount = 1;
+                x.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; x.pImageInfo = one.data();
+                vkUpdateDescriptorSets(base.device, 1, &x, 0, nullptr);
+                out.image_views[i] = wr.view;
+            }
+        };
+        post(t.post_pp[0], v.post);
+        post(t.post_grade_pp[0], v.post_grade);
+        post(t.post16_pp[0], v.post16);
+        post(t.post16_grade_pp[0], v.post16_grade);
+        return v;
+    }
+    const nrvk::Kernel& pre_for(uint32_t r, uint32_t w) {
+        auto& t = temporal;
+        return r < 2u && (!rotation() || w == (r ^ 1u)) ? t.pre_pp[r] : variant(r, w).pre;
+    }
+    nrvk::Kernel& post_for(uint32_t r, uint32_t w, bool h16) {
+        auto& t = temporal;
+        if (r < 2u && (!rotation() || w == (r ^ 1u))) return h16 ? t.post16_pp[r] : t.post_pp[r];
+        Temporal::Var& v = variant(r, w);
+        return h16 ? v.post16 : v.post;
+    }
+    // The grade twin of a post kernel post_for returned (null: none).
+    nrvk::Kernel* grade_of(const nrvk::Kernel* k) {
+        auto& t = temporal;
+        for (unsigned c = 0; c < 2; ++c) {
+            if (k == &t.post_pp[c]) return &t.post_grade_pp[c];
+            if (k == &t.post16_pp[c]) return &t.post16_grade_pp[c];
+        }
+        for (auto& v : t.vars) {
+            if (k == &v.second.post) return &v.second.post_grade;
+            if (k == &v.second.post16) return &v.second.post16_grade;
+        }
+        return nullptr;
+    }
+    // The history images and sets beyond the pair, all at once (a precision switch).
+    void drop_rotation() {
+        auto& t = temporal;
+        for (auto& v : t.vars)
+            for (nrvk::Kernel* k : {&v.second.pre, &v.second.post, &v.second.post_grade, &v.second.post16,
+                                    &v.second.post16_grade})
+                if (k->pool) { retired_pools.push_back(k->pool); k->pool = VK_NULL_HANDLE; k->set = VK_NULL_HANDLE; k->shared.reset(); }
+        t.vars.clear();
+        for (auto& e : t.extra) { e.sampler = VK_NULL_HANDLE; retiring.emplace_back(e, recordings + kRetireAfter, gpu_uses); }
+        t.extra.clear();
+        for (auto& f : features) f.second.slot = -1;
+    }
     // Released features, and the recording count at which their images may be
     // destroyed. Never a wait: the render thread that releases a feature must
     // not block on the GPU, and OptiScaler has already parked the feature for 32
@@ -761,8 +923,8 @@ struct Runtime::Impl {
     // Any of colour (with its depth) and motion may be null: that one is our
     // own image, bound as in the sets made at creation.
     const DirectSrc* direct_source(VkImage colour, VkFormat format, VkImage depth, VkImage motion,
-                                   VkFormat mformat, uint32_t c, bool store = false, VkImage target = VK_NULL_HANDLE,
-                                   bool plain = false) {
+                                   VkFormat mformat, uint32_t c, uint32_t cw, bool store = false,
+                                   VkImage target = VK_NULL_HANDLE, bool plain = false) {
         if (!colour && !motion) return nullptr;
         auto& s = session; auto& t = temporal;
         const VkDevice dev = s.ctx.device;
@@ -820,17 +982,20 @@ struct Runtime::Impl {
             } else {
             // One pass: this parity's ping-pong pre and post. More (no ping-pong, `c` 0): the pre and post
             // every pass runs, the model's write going to surf1 as in their own sets.
-            const nrvk::Kernel& pre_k = t.pingpong ? t.pre_pp[c] : t.pre;
-            const nrvk::Kernel& post_k = t.pingpong ? t.post_pp[c] : t.post;
+            // this recording's history pair (c read, cw written; Temporal::hread / hwrite), its sets in [0]
+            const nrvk::Kernel& pre_k = t.pingpong ? pre_for(c, cw) : t.pre;
+            const nrvk::Kernel& post_k = t.pingpong ? post_for(c, cw, false) : t.post;
             nrvk::Context::Image surf1 = s.surf1;
-            nrvk::Context::Image* written = t.pingpong ? &t.hist_store[c ^ 1u] : &surf1;
-            d.pre[c] = t.hp ? kernel_set(dev, d.pool, pre_k, t.pre_buffers, {&cim, &mim, &t.hist(c), &dim, &t.hpass})
+            nrvk::Context::Image hw = t.pingpong ? t.hist(cw) : surf1;
+            hw.sampler = t.pingpong ? VK_NULL_HANDLE : hw.sampler;
+            nrvk::Context::Image* written = t.pingpong ? &hw : &surf1;
+            d.pre[0] = t.hp ? kernel_set(dev, d.pool, pre_k, t.pre_buffers, {&cim, &mim, &t.hist(c), &dim, &t.hpass})
                             : kernel_set(dev, d.pool, pre_k, t.pre_buffers, {&cim, &mim, &t.hist(c), &dim});
-            d.post[c] = t.hp ? kernel_set(dev, d.pool, post_k, t.post_buffers,
+            d.post[0] = t.hp ? kernel_set(dev, d.pool, post_k, t.post_buffers,
                                           {&surf0, written, &cim, &mim, &t.hist(c), &t.hpass})
                              : kernel_set(dev, d.pool, post_k, t.post_buffers,
                                           {&surf0, written, &cim, &mim, &t.hist(c)});
-            ok = d.pre[c] && d.post[c];
+            ok = d.pre[0] && d.post[0];
             }
         }
         if (!ok) {
@@ -2120,11 +2285,43 @@ bool Runtime::carry_history(VkCommandBuffer cmd, const Runtime& from, uint64_t f
     if (from.impl_->heap) from.impl_->heap->uses[from.impl_->heap_region].touch();
     const auto fit = from.impl_->features.find(feature);
     if (fit == from.impl_->features.end() || !fit->second.latch) return false;
-    // What the feature's next frame would have read there: the bound history, or its own image.
-    const nrvk::Context::Image& src = from.impl_->bound_feature == feature ? ft.hist(ft.hcur) : fit->second.history;
+    // What the feature's next frame would have read there: the bound history, or its own image (rotation: the
+    // image its slot names).
+    if (from.impl_->rotation() && fit->second.slot < 0) return false;
+    const nrvk::Context::Image& src = from.impl_->rotation() ? ft.hist(uint32_t(fit->second.slot))
+                                      : from.impl_->bound_feature == feature ? ft.hist(ft.hcur) : fit->second.history;
     if (!src.handle) return false;
     auto& s = impl_->session;
     auto it = impl_->features.find(feature);
+    if (impl_->rotation()) {   // into the image this runtime's next recording of the feature reads
+        if (it == impl_->features.end()) it = impl_->features.emplace(feature, impl_->make_feature()).first;
+        Impl::FeatureState& fs = it->second;
+        if (fs.slot < 0) fs.slot = int(impl_->free_slot(cmd, &fs, t.hcur, ~0u));
+        nrvk::Context::Image& dst = t.hist(uint32_t(fs.slot));
+        barrier(cmd, src.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        barrier(cmd, dst.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_ACCESS_TRANSFER_WRITE_BIT);
+        VkImageBlit b{};
+        b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        b.srcOffsets[1] = {int32_t(src.w), int32_t(src.h), 1};
+        b.dstOffsets[1] = {int32_t(dst.w), int32_t(dst.h), 1};
+        const VkFilter filter = impl_->filters_linearly(src.format) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+        nrvk::blit(s.ctx.physical, s.ctx.device, cmd, src.handle, src.format, VK_IMAGE_LAYOUT_GENERAL, dst.handle,
+                   dst.format, VK_IMAGE_LAYOUT_GENERAL, 1, &b, filter);
+        barrier(cmd, dst.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        barrier(cmd, src.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0);
+        fs.cleared = true;
+        fs.latch = true;
+        fs.seed = fit->second.seed;
+        fs.parity = fit->second.parity;
+        fs.input = fit->second.input;
+        return true;
+    }
     if (it == impl_->features.end()) {
         Impl::FeatureState made{};
         // sampled as well, as temporal.history is: the temporal kernels read a feature's history through a sampler
@@ -2180,6 +2377,7 @@ int Runtime::layers() const { return impl_->layers; }
 #endif
 
 void Runtime::set_style_grade(bool on) { impl_->style_grade_on = on; }
+bool Runtime::style_grade_active() const { return impl_->style_grade && impl_->style_grade_on; }
 void Runtime::set_history_f16(bool on) { if (!std::getenv("NR_HIST16")) impl_->temporal.h16_want = on; }
 
 void Runtime::set_history_strength(float v) {
@@ -2197,6 +2395,28 @@ void Runtime::release_feature(uint64_t feature) {
     for (auto& p : it->second.estimator_luma)
         if (p.handle) impl_->retiring.emplace_back(p, impl_->recordings + Impl::kRetireAfter, impl_->gpu_uses);
     impl_->features.erase(it);
+    // Rotation: the images beyond what the features left need (theirs and one to write) go, from the last
+    if (impl_->rotation()) {
+        auto& t = impl_->temporal;
+        uint32_t owned = 0;
+        for (const auto& f : impl_->features) if (f.second.slot >= 0) ++owned;
+        while (!t.extra.empty() && t.hist_count() > std::max(owned + 1u, 2u) &&
+               !impl_->slot_taken(t.hist_count() - 1u, nullptr)) {
+            const uint32_t last = t.hist_count() - 1u;
+            for (auto v = t.vars.begin(); v != t.vars.end();) {
+                if (v->first.first != last && v->first.second != last) { ++v; continue; }
+                for (nrvk::Kernel* k : {&v->second.pre, &v->second.post, &v->second.post_grade, &v->second.post16,
+                                        &v->second.post16_grade})
+                    if (k->pool) { impl_->retired_pools.push_back(k->pool); k->pool = VK_NULL_HANDLE; k->shared.reset(); }
+                v = t.vars.erase(v);
+            }
+            nrvk::Context::Image e = t.extra.back();
+            e.sampler = VK_NULL_HANDLE;
+            impl_->retiring.emplace_back(e, impl_->recordings + Impl::kRetireAfter, impl_->gpu_uses);
+            t.extra.pop_back();
+            if (t.hcur >= t.hist_count()) t.hcur = 0;
+        }
+    }
     // The bound history keeps whatever this feature left in it; the next
     // feature to record copies its own state over the top, and a feature that
     // is gone has no state to write back.
@@ -2329,11 +2549,12 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
                 it = impl_->features.emplace(temporal->feature, impl_->make_feature()).first;
             // This recording binds this feature over another: the other one's state leaves the bound history
             // into its own image, made now if it never left before.
-            if (impl_->bound_feature && impl_->bound_feature != temporal->feature) {
+            if (!impl_->rotation() && impl_->bound_feature && impl_->bound_feature != temporal->feature) {
                 auto bound = impl_->features.find(impl_->bound_feature);
                 if (bound != impl_->features.end()) impl_->ensure_history(bound->second);
             }
             auto& f = it->second;
+            impl_->select_history(cmd, &f);   // this recording's history pair
             if (!engine && f.estimator_luma.empty()) {
                 std::vector<nrvk::Context::Image> made(kTemporalLevels);
                 try {
@@ -2349,6 +2570,7 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
             }
         } else {
             impl_->unnamed_temporal_used = true;
+            impl_->select_history(cmd, nullptr);
         }
     }
     ControlMaskResult result{};
@@ -2473,16 +2695,20 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
     // What this frame copies through our own images: made now, before the in-place sets below bind them.
     impl_->materialize(cmd, !colour_direct && !plain_direct, !store_direct && !plain_store);
     if (impl_->want_noise) impl_->make_noise(cmd);
-    impl_->switch_history(cmd);   // [Network] History Precision changed: before anything binds the history
+    // [Network] History Precision changed: before anything binds the history (the pair chosen again)
+    if (impl_->switch_history(cmd) && temporal && impl_->temporal.enabled) {
+        auto it = temporal->feature ? impl_->features.find(temporal->feature) : impl_->features.end();
+        impl_->select_history(cmd, it != impl_->features.end() ? &it->second : nullptr);
+    }
     const Impl::DirectSrc* sets = nullptr;
     if (plain_direct)
         sets = impl_->direct_source(frame.image, frame.format, VK_NULL_HANDLE, VK_NULL_HANDLE,
-                                    VK_FORMAT_UNDEFINED, 0, plain_store, VK_NULL_HANDLE, true);
+                                    VK_FORMAT_UNDEFINED, 0, 1, plain_store, VK_NULL_HANDLE, true);
     else if (colour_direct || motion_direct)
         sets = impl_->direct_source(colour_direct ? frame.image : VK_NULL_HANDLE, frame.format,
                                     depth_in_place ? engine->depth.image : VK_NULL_HANDLE,
                                     motion_direct ? engine->motion.image : VK_NULL_HANDLE,
-                                    engine->motion.format, impl_->temporal.hcur, store_direct,
+                                    engine->motion.format, impl_->temporal.hread, impl_->temporal.hwrite, store_direct,
                                     tgt ? tgt->image : VK_NULL_HANDLE);
     if (sets && sets->cview) ds = sets;
     if (!ds) impl_->materialize(cmd, true, true);   // the frame could not be sampled in place: the copies
@@ -2775,7 +3001,23 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
     // Bind this feature's history: copy the previously bound feature's state out
     // and this one's in. Only on a change, so the single-feature case records
     // nothing at all here.
-    if (fs && impl_->bound_feature != temporal->feature) {
+    if (fs && impl_->rotation()) {
+        // no copies - the feature's own image is read where it is; one without history yet reads a cleared one
+        if (t.hfresh) {
+            const nrvk::Context::Image& h = t.hist(t.hread);
+            barrier(cmd, h.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+            VkClearColorValue zero{};
+            VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vkCmdClearColorImage(cmd, h.handle, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+            barrier(cmd, h.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+            fs->cleared = true;
+        }
+        impl_->bound_feature = temporal->feature;
+    } else if (fs && impl_->bound_feature != temporal->feature) {
         if (impl_->bound_feature) {
             auto prev = impl_->features.find(impl_->bound_feature);
             if (prev != impl_->features.end() && prev->second.history.handle) {
@@ -2825,6 +3067,25 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         impl_->bound_feature = temporal->feature;
         }
     }
+    // EngineFrame::history: the caller's history for this run, into the image this recording reads.
+    if (engine && engine->history.image && fs && gate) {
+        nrvk::Context::Image& dst = t.hist(impl_->rotation() ? t.hread : t.hcur);
+        auto& s = impl_->session;
+        barrier(cmd, engine->history.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        barrier(cmd, dst.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_ACCESS_TRANSFER_WRITE_BIT);
+        VkImageBlit b{};
+        b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        b.srcOffsets[1] = {int32_t(engine->history.width), int32_t(engine->history.height), 1};
+        b.dstOffsets[1] = {int32_t(dst.w), int32_t(dst.h), 1};
+        nrvk::blit(s.ctx.physical, s.ctx.device, cmd, engine->history.image, engine->history.format, VK_IMAGE_LAYOUT_GENERAL,
+                   dst.handle, dst.format, VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_NEAREST);
+        barrier(cmd, dst.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    }
     // The pass (one: a caller stacks passes as runs of its own).
     for (uint32_t pass = 0; pass < passes; ++pass) {
         ColourFrame shot_in{}, shot_out{};
@@ -2852,11 +3113,11 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
             else if (!temporal && ds && step.k==impl_->plain_pre) set = ds->pre[0];
             else if (!temporal && ds && step.k==impl_->plain_post) set = ds->post[0];
             else if (temporal && step.k==t.original_pre) {
-                use = t.pingpong ? &t.pre_pp[t.hcur] : &t.pre;
-                if (sets) set = sets->pre[t.hcur];
+                use = t.pingpong ? &impl_->pre_for(t.hread, t.hwrite) : &t.pre;
+                if (sets) set = sets->pre[0];
             } else if (temporal && step.k==t.original_post) {
-                use = !t.pingpong ? &t.post : t.h16 ? &t.post16_pp[t.hcur] : &t.post_pp[t.hcur];
-                if (sets) set = sets->post[t.hcur];
+                use = !t.pingpong ? &t.post : &impl_->post_for(t.hread, t.hwrite, t.h16);
+                if (sets) set = sets->post[0];
             }
             const void* push = step.push;
             // A Style in the post block's push (bits 28-29, set only when the grade pipelines exist): its grade
@@ -2868,8 +3129,7 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
                     if (!set) set = use->set;
                     if (use == impl_->graph_post) use = &impl_->post_grade;
                     else if (use == &t.post) use = &t.post_grade;
-                    else if (use == &t.post_pp[0] || use == &t.post_pp[1]) use = &t.post_grade_pp[use - t.post_pp];
-                    else if (use == &t.post16_pp[0] || use == &t.post16_pp[1]) use = &t.post16_grade_pp[use - t.post16_pp];
+                    else if (nrvk::Kernel* g = impl_->grade_of(use)) use = g;
                     else throw std::runtime_error("Style grade: no grade pipeline for this post block");
                 }
             }
@@ -2913,8 +3173,11 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         // it: reset suppresses consumption, it does not un-write the buffer.
         if (fs) { fs->latch = true; fs->parity ^= 1u; }
         else { t.latch = true; t.parity ^= 1u; }
-        // The post variant wrote this frame's history into the other image.
-        if (t.pingpong) t.hcur ^= 1u;
+        // The post variant wrote this frame's history into the other image (hwrite, now the feature's).
+        if (t.pingpong) {
+            t.hcur = t.hwrite;
+            if (fs && impl_->rotation()) fs->slot = int(t.hwrite);
+        }
         if (history_consumed) *history_consumed = gate;
     }
     impl_->check_record(cmd);

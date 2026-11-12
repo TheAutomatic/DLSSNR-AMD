@@ -189,6 +189,9 @@ static bool tchain_kern(const std::string& k);
 // int4 mixed: per Swin block whether its MLP weights took the hard-swish fold, and the e_off values that are int4
 // records (never packed as matrices).
 static std::map<int, bool> g_hs_folded;
+// The blocks whose Swin layer got its int4 QKV tables (record words 10-12; NR_SWQ4 pipelines read them): the guard
+// below refuses an int4-QKV pipeline on any other block (its words would be 0 - the tables read from the buffer's start)
+static std::set<int> g_qkv4_blocks;
 static std::set<uint32_t> g_swi4_eoff;
 // The int4 pipelines are their base kernels for every table keyed on kernel names.
 static std::string i4base(const std::string& k) {
@@ -1509,6 +1512,9 @@ struct NrSession {
     // The weight blob past weights_end (noise field, records) and a hash of the weights before it.
     std::vector<uint8_t> tail;
     uint64_t weights_hash = 0;
+    // A plan's whole weight blob (the weights, then the tail at weights_end), for a caller that uploads it itself (the
+    // the D3D12 passthrough: nr::plan_d3d12_network); null: not kept.
+    std::vector<uint8_t>* weights_out = nullptr;
     size_t arena_total = 0;   // the activation arena's bytes (values, sync words, tile counters)
     void keep_tail(const WeightBlob& wblob);
     std::shared_ptr<const struct GraphCore> make_core(int argc, char** argv, const std::string& spv_dir);
@@ -1791,7 +1797,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     // the int4 state too - one process may build the exact and the int4_mixed network in turn ([Int4Mixed] Hotkey)
     // The installed int4 weights file is read once per build (the arena probe build inside it uses the same copy) and
     // let go when the build ends, as are the ViT weight copies: nothing int4 stays in host memory after a build.
-    g_hs_folded.clear(); g_swi4_eoff.clear();
+    g_hs_folded.clear(); g_qkv4_blocks.clear(); g_swi4_eoff.clear();
     if (!arena_probe) { g_i4_wsave.clear(); i4_store_reset(); }
     struct I4OutScope {
         std::string path; std::vector<I4Entry> list; bool out = false, top = false;
@@ -2093,7 +2099,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     for (const auto& kv : vsize) if (kv.second) plain_total += align(kv.second, 256);
     if (reuse) {
         NrSession probe;
-        probe.ctx.rdna3 = ctx.rdna3;
+        probe.ctx.set_arch(ctx.arch);
         probe.arena_probe = true;
         const nr::LogSink sink = nr::g_log_sink;
         const uint32_t epoch_word = g_chain_epoch_word;
@@ -2463,6 +2469,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                         const I4Mat imq = i4_obtain(std::string(nb) + ".qkv", qsel, N3, K4, 1, yaq);
                         rv[11] = pairrec(imq.q, N3, K4);
                         rv[12] = f16pairs(imq.sc, N3);
+                        g_qkv4_blocks.insert(s.block);
                     }
                     std::vector<uint8_t> rec(256, 0);
                     std::memcpy(rec.data(), rv, sizeof rv);
@@ -5501,6 +5508,28 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             nr::logf("hard-swish guard: %zu pipelines, folds consistent", hs.size());
         }
     }
+    // guard: a pipeline built with the int4 QKV products (spv marker int4-qkv.txt: NR_SWQ4) runs only layers that have
+    // their int4 QKV tables. Ultra has them for the encoder's C=256 layers only; with persistent runs off (RDNA3's
+    // default) the decoder's C=256 layers ran the same plain kernel with record words 0 and read garbage tables - a wrong
+    // picture and no error (RDNA3 OPTIMIZED Ultra, 0.0.8.4-t17). block-routes.txt gives the encoder its own pipeline.
+    {
+        const std::string qm = spv_dir + "/int4-qkv.txt";
+        if (std::filesystem::exists(qm)) {
+            std::set<std::string> q4;
+            { std::ifstream f(nr::u8::path(qm)); std::string k; while (f >> k) q4.insert(k); }
+            std::string bad;
+            for (const Disp& d : disp) {
+                if (!q4.count(d.kern)) continue;
+                std::vector<int> blocks;
+                if (d.lo >= 0) for (int q = d.lo; q <= d.hi; ++q) blocks.push_back(run[size_t(q)]->block);
+                else if (d.s) blocks.push_back(d.s->block);
+                for (int b : blocks)
+                    if (!g_qkv4_blocks.count(b)) bad += " b" + std::to_string(b) + "@" + d.kern;
+            }
+            if (!bad.empty()) throw std::runtime_error("int4 QKV pipeline on a layer without its int4 QKV tables:" + bad);
+            nr::logf("int4 QKV guard: %zu pipelines, %zu layers with tables, consistent", q4.size(), g_qkv4_blocks.size());
+        }
+    }
 #endif
     // One pass of the graph a submit. A pass is a few milliseconds, which is
     // under a display frame, so the compositor is never blocked for longer than
@@ -5611,6 +5640,10 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     }
     // A plan ends here (the resize path): what it lowered, for build_shared.
     if (plan_only) {
+        if (weights_out) {
+            weights_out->assign(wblob.size(), 0);
+            if (!weights_out->empty()) wblob.read(0, weights_out->data(), weights_out->size());
+        }
         keep_tail(wblob);
         core = make_core(argc, argv, spv_dir);
         return 4;

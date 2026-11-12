@@ -39,6 +39,7 @@ struct Adapter {
     LUID luid{};
     std::unique_ptr<Device> device;
     std::string why;   // the failure, kept and repeated
+    uint64_t again_ms = 0;   // a GPU AMD's driver could not be asked about yet: tried again from then (0: never)
 };
 std::mutex g_device_mutex;
 std::vector<Adapter> g_adapters;
@@ -152,8 +153,10 @@ void Device::abandon_at_exit() {
 
 Device* Device::get(const LUID& luid, std::string* why) {
     std::lock_guard<std::mutex> guard(g_device_mutex);
-    for (auto& a : g_adapters) {
+    for (auto it = g_adapters.begin(); it != g_adapters.end(); ++it) {
+        Adapter& a = *it;
         if (std::memcmp(&a.luid, &luid, sizeof luid) != 0) continue;
+        if (!a.device && a.again_ms && GetTickCount64() >= a.again_ms) { g_adapters.erase(it); break; }   // asked again
         if (!a.device) *why = a.why;
         return a.device.get();
     }
@@ -171,7 +174,10 @@ Device* Device::get(const LUID& luid, std::string* why) {
         a.device = std::move(d);
     } else {
         a.why = *why;
-        log("[nr] bridge: %s", why->c_str());
+        static int asked = 0;   // (6 times at most: a GPU nothing can identify is not asked about all game long)
+        const bool again = d->unidentified_ && ++asked < 6;
+        if (again) a.again_ms = GetTickCount64() + 10000;
+        log("[nr] bridge: %s%s", why->c_str(), again ? " (asked again in 10 s)" : "");
     }
     g_adapters.push_back(std::move(a));
     return g_adapters.back().device.get();
@@ -221,28 +227,33 @@ bool Device::create(const LUID& luid, std::string* why) {
     }
 
     // The network this GPU runs, by its architecture (asked of AMD's driver, not of the loader OptiScaler may spoof).
-    std::string how;
-    const nr::arch::GpuArch arch = nr::arch::of(physical_, &how);
-    if (arch == nr::arch::GpuArch::unknown) {
-        *why = std::string(chosen.deviceName) + " is not an RDNA4 or RDNA3 GPU (" + how + ")";
-        return false;
-    }
-    rdna3_ = arch == nr::arch::GpuArch::rdna3;
-    log("[nr] bridge: %s is %s (%s)", chosen.deviceName, nr::arch::name(arch), how.c_str());
-    if (rdna3_) {
+    const nr::arch::Identity id = nr::arch::identify(physical_);
+    log("[nr] bridge: %s is %s", chosen.deviceName, nr::arch::describe(id).c_str());
+    switch (id.arch) {
+    case nr::arch::GpuArch::rdna4:
+        break;
+    case nr::arch::GpuArch::rdna3: {
         std::string aco;
         if (!nr::binary::use_rdna3(&aco)) {
             *why = "RDNA3 GPUs run NR as ACO's machine code only, and " + aco;
             return false;
         }
+        break;
     }
+    case nr::arch::GpuArch::unknown: case nr::arch::GpuArch::rdna1: case nr::arch::GpuArch::rdna2:
+        *why = std::string(chosen.deviceName) + ": NR has no network for this GPU (" + nr::arch::describe(id) + ")";
+        unidentified_ = id.arch == nr::arch::GpuArch::unknown && !id.mach && nr::arch::manual() == nr::arch::GpuArch::unknown;
+        return false;
+    }
+    arch_ = id.arch;
+    const bool fp8_network = arch_ == nr::arch::GpuArch::rdna4;   // RDNA3's network has no FP8 (nr_gpu_arch.hpp)
 
     uint32_t n = 0;
     vkEnumerateDeviceExtensionProperties(physical_, nullptr, &n, nullptr);
     std::vector<VkExtensionProperties> have(n);
     vkEnumerateDeviceExtensionProperties(physical_, nullptr, &n, have.data());
     std::vector<const char*> extensions(std::begin(kRequiredExtensions), std::end(kRequiredExtensions));
-    if (!rdna3_) extensions.push_back(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
+    if (fp8_network) extensions.push_back(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
     for (const char* e : extensions) {
         bool found = false;
         for (const auto& h : have) found = found || std::strcmp(h.extensionName, e) == 0;
@@ -277,8 +288,8 @@ bool Device::create(const LUID& luid, std::string* why) {
     vkGetPhysicalDeviceFeatures2(physical_, &q);
     struct { bool have; const char* name; } required[] = {
         {bool(coop.cooperativeMatrix), "cooperativeMatrix"},
-        {rdna3_ || bool(fp8.shaderFloat8), "shaderFloat8"},
-        {rdna3_ || bool(fp8.shaderFloat8CooperativeMatrix), "shaderFloat8CooperativeMatrix"},
+        {!fp8_network || bool(fp8.shaderFloat8), "shaderFloat8"},
+        {!fp8_network || bool(fp8.shaderFloat8CooperativeMatrix), "shaderFloat8CooperativeMatrix"},
         {bool(f11.storageBuffer16BitAccess), "storageBuffer16BitAccess"},
         {bool(f12.storageBuffer8BitAccess), "storageBuffer8BitAccess"},
         {bool(f12.shaderFloat16), "shaderFloat16"},
@@ -310,7 +321,7 @@ bool Device::create(const LUID& luid, std::string* why) {
     wml.workgroupMemoryExplicitLayout = wml.workgroupMemoryExplicitLayout8BitAccess =
         wml.workgroupMemoryExplicitLayout16BitAccess = VK_TRUE;
     coop.pNext = &fp8; fp8.pNext = &f11; f11.pNext = &f12; f12.pNext = &f13; f13.pNext = &wml;
-    if (rdna3_) coop.pNext = &f11;   // no FP8 extension, so no FP8 features in the chain
+    if (!fp8_network) coop.pNext = &f11;   // no FP8 extension, so no FP8 features in the chain
     const bool robustness = robustness_ext && prf.pipelineRobustness;
     prf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT};
     if (robustness) {

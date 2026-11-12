@@ -12,6 +12,7 @@
 //   commit] -> the frame's output. A chain whose every pass is at zero strength leaves the frame as it is.
 //
 // Off by default; a runtime without a stage records exactly what it recorded before.
+#include "nr_fast_passes.hpp"
 #include "nr_runtime.hpp"
 
 #include <cstdint>
@@ -40,12 +41,17 @@ struct Settings {
     // The stack: passes 2..4 with their own controls once "Same as pass 1" is off (NRPass2FollowPass1 ...).
     uint32_t passes = 1;                // NRPasses 1..4 (1..30 with NRUnlockPasses)
     uint32_t passes_mode = 0;           // NRPassesMode: 0 legacy, 1 fast
-    uint32_t fast_method = 0;           // NRFastMethod: 0 Extrapolation, 1 Feedback, 2 Hybrid, 3 Edit strength
+    uint32_t fast_method = fast::kDefaultMethod;   // NRFastMethod: 0 Interleaved, 1 Extrapolation, 2 Feedback, 3 Hybrid, 4 Edit strength (the route's default)
     // Each method's own settings, [0] Extrapolation, [1] Feedback, [2] Hybrid (NRFast<Method>Passes / HaloLimit / Fine)
     float fast_passes[3] = {3.0f, 3.0f, 3.0f};       // 1..8, referred to legacy pass counts
     bool fast_halo_limit[3] = {false, false, false};
     float fast_fine[3] = {0.0f, 1.0f, 1.0f};         // 0..2: the strengthening's fine-detail part, x (1: as made)
     float fast_edit_strength = 2.0f;    // NRFastEditStrength 0..4: Edit strength's stops x (the look's Edit strength)
+    // Interleaved: legacy passes 2..8, one of them a frame in turn, each with its own history (needs motion vectors:
+    // without them it does not run - one network pass)
+    uint32_t fast_interleaved_passes = 3;   // NRFastInterleavedPasses 2..8
+    // NRFastInterleavedPreset: Interleaved's variant - 1 = the method of 0.0.8.4 , 2 = a later method (the default: nr_fast_passes.hpp)
+    uint32_t fast_interleaved_preset = fast::kDefaultInterleavedPreset;
     bool unlock_passes = false;         // NRUnlockPasses: ours, as OptiScaler's UnlockPasses (passes 5.. take pass 4's)
     float pass_intensity[3] = {1.0f, 1.0f, 1.0f};
     bool pass_follow[3] = {true, true, true};
@@ -172,6 +178,14 @@ struct StageFrame {
     ColourFrame motion;
     uint32_t motion_x = 0, motion_y = 0;
     float motion_scale_x = 0.0f, motion_scale_y = 0.0f;
+    // The game's depth (Passes (fast) Interleaved's disocclusion test and vector dilation, research): its region (x, y,
+    // depth.width/height) and whether nearer is larger (inverted). No image: none.
+    ColourFrame depth;
+    uint32_t depth_x = 0, depth_y = 0;
+    bool depth_inverted = false;
+    // The runtime grades Natural / Cinematic after its post block (Runtime::style_grade_active): Interleaved then grades
+    // its own composition the same way.
+    bool style_grade = false;
     // The game's exposure as DLSS was given it (RenoDX's feed v2): the exposure texture (texel 0,0 is read),
     // DLSS.Pre.Exposure and DLSS.Exposure.Scale, and whether the game created its DLSS with AutoExposure
     // (then the texture is not used). No image: there is none.
@@ -209,11 +223,22 @@ public:
     // The frame through every pass of the stack (Settings::passes) into StageFrame::output. Returns how many passes
     // ran the network (0: NR off, or every pass at zero strength - the frame copied through as it is).
     uint32_t record(VkCommandBuffer, const StageFrame&, const Network&);
+    // Inside a Network call: the motion vectors that pass's history needs, when they are not the frame's own
+    // (Interleaved: a slot's history is several frames old) - `use` false: the frame's own. Normalised backward
+    // vectors at the network's size, scale 1, region at the origin.
+    // `history` (when its image is set): the history that pass is to read (EngineFrame::history), with the frame's
+    // own vectors.
+    // raw: run this pass's network without its Intensity compose and Style grade (Intensity 1, the grade off; the Style
+    // stays - it is also the network's own input) - the stage applies the pass's Intensity and grade itself
+    struct NetworkMotion { bool use = false; ColourFrame motion; ColourFrame history; bool raw = false; };
+    NetworkMotion network_motion() const;
 
     // What the last record() decided about the frame, for the menus' engine-data panel.
     struct Facts {
         float fast_passes = 0.f;
         bool motion = false, fast_fallback = false;
+        bool interleaved = false;   // Passes (fast) Interleaved ran
+        uint8_t il_missing = 0;     // Interleaved chosen but cannot run: 1 no motion vectors
         uint8_t hdr_mode = 0;        // 0 SDR, 1 linear HDR, 2 PQ
         bool absolute = false;       // absolute units: the frame's own nits, no divisor
         bool prep_exposure = false;  // [Preprocess]'s exposure replaced the divisor

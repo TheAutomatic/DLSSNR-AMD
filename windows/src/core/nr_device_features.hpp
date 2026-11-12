@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 #include "nr_device_chain_sizes.hpp"
+#include "nr_gpu_arch_ids.hpp"
 
 namespace nr {
 // Preserve app feature fields and all known extension structures. Never write
@@ -44,7 +45,8 @@ public:
         head = reinterpret_cast<VkBaseOutStructure*>(p);
         return p;
     }
-    void enable(bool rdna3 = false) {
+    // The features the network of `arch` (nr_gpu_arch.hpp; one NR has a network for, checked by the caller) needs.
+    void enable(nr::arch::GpuArch arch) {
         if (auto* f = find<VkPhysicalDeviceVulkan11Features>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES))
             f->storageBuffer16BitAccess = true;
         else get<VkPhysicalDevice16BitStorageFeatures>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES)->storageBuffer16BitAccess = true;
@@ -64,10 +66,16 @@ public:
             f->subgroupSizeControl = true;
         else get<VkPhysicalDeviceSubgroupSizeControlFeatures>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES)->subgroupSizeControl = true;
         get<VkPhysicalDeviceCooperativeMatrixFeaturesKHR>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR)->cooperativeMatrix = true;
-        // The FP8 features are the rdna4-fp8 target's; rdna3-fp16 multiplies FP16 operands and enables nothing here.
-        if (!rdna3) {
+        // The FP8 features are RDNA4's network's; RDNA3's multiplies FP16 operands and enables nothing here.
+        switch (arch) {
+        case nr::arch::GpuArch::rdna4: {
             auto* f = get<VkPhysicalDeviceShaderFloat8FeaturesEXT>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT);
             f->shaderFloat8 = f->shaderFloat8CooperativeMatrix = true;
+            break;
+        }
+        case nr::arch::GpuArch::rdna3:
+        case nr::arch::GpuArch::unknown: case nr::arch::GpuArch::rdna1: case nr::arch::GpuArch::rdna2:
+            break;
         }
     }
 };

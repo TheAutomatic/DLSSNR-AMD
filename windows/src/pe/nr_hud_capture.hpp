@@ -10,12 +10,16 @@
 // without its HUD when the write before it was a scene write, no scene write came after it and it is of this frame's
 // back buffer.
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace nr::hudcap {
 
-enum : uint8_t { kLost = 0, kScene = 1, kOverlay = 2, kCopy = 3, kUnknown = 4 };
+enum : uint8_t { kLost = 0, kScene = 1, kOverlay = 2, kCopy = 3, kUnknown = 4, kChain = 5 };
+// kChain (the chain capture, below): image `back` - one of the back buffer's size, not a back buffer - copied into `dst`
+// where its finished picture was: the game ended its writes on it (a transition out of render target or unordered
+// access) with a scene write last, or started drawing an overlay over it.
 // kUnknown: a write on the back buffer this capture cannot judge (a draw whose pipeline it does not know, indirect work
 // that may be a dispatch, a secondary command buffer / bundle / deferred context, a next subpass): the frame is not
 // trusted.
@@ -23,6 +27,9 @@ struct Rec {
     uint8_t kind;
     uint64_t back;   // the back buffer written (kLost: the records before were dropped)
     uint64_t dst = 0;   // kCopy: the image copied into (a list recorded before that image was made again copies elsewhere)
+    uint8_t how = 0;    // kChain: 0 at the image's own end of writes or before an overlay over it, 1 as an input of the
+                        // back buffer's final pass
+    std::shared_ptr<void> keep; // snapshot lease copied with recording/submission records
 };
 constexpr uint32_t kMaxCopies = 8;   // copies a frame at most (where every place is copied: D3D12)
 constexpr size_t kMaxRecs = 4096;    // a list's records kept unread at most
@@ -80,6 +87,43 @@ inline Verdict verdict(const std::vector<Rec>& recs, uint64_t colour, bool forei
           : !copied ? "the HUD's first draw was not where the last frame's was (it is copied there from the next frame)"
                     : "the scene was written again after the copy";
     return Verdict::kMissed;
+}
+
+// The chain capture: many games draw no HUD over the finished scene on the back buffer. Their last pass (a copy or a
+// full-screen draw: a scene write by the rules above, nothing after it - Verdict::kClean) reads the finished scene from
+// an image of the back buffer's size, with the HUD drawn into another image or into that one afterwards. The frame
+// without its HUD is then the last kChain copy before the back buffer's last scene write, as long as nothing was copied
+// into that copy's image after it. Whether it is that pass's input at all is not known here (bindless games bind
+// nothing the hooks could see): the caller checks the copy against the presented frame before trusting it.
+// Every such copy (in the GPU's order) before the back buffer's last scene write whose image was not copied into again
+// after it - the caller takes a trusted one, else the last; `how` as Rec::how.
+struct ChainCopy {
+    uint64_t image = 0, dst = 0;
+    uint8_t how = 0;
+    std::shared_ptr<void> keep;
+};
+inline std::vector<ChainCopy> chain_picks(const std::vector<Rec>& recs, uint64_t colour, std::string& why) {
+    std::vector<ChainCopy> seen, picks;
+    bool scene = false;
+    size_t at_scene = 0;
+    for (const Rec& r : recs) {
+        if (r.kind == kChain) {
+            seen.push_back({r.back, r.dst, r.how, r.keep});
+        } else if (r.kind == kScene && r.back == colour) {
+            scene = true;
+            at_scene = seen.size();
+        }
+    }
+    if (!scene) { why = "no scene write on the back buffer"; return {}; }
+    if (seen.empty()) { why = "no finished picture of the back buffer's size was seen before its last write"; return {}; }
+    for (size_t i = 0; i < at_scene; ++i) {
+        bool again = false;   // (its copy's image written again later: by a later copy of the same image, or after the pass)
+        for (size_t j = i + 1; j < seen.size(); ++j) again = again || seen[j].dst == seen[i].dst;
+        if (!again) picks.push_back(seen[i]);
+    }
+    if (picks.empty()) why = at_scene ? "the copies of the final pass's inputs were overwritten after that pass"
+                                      : "no finished picture of the back buffer's size before its last write (only after it)";
+    return picks;
 }
 
 }  // namespace nr::hudcap

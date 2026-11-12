@@ -59,8 +59,8 @@ inline void check(VkResult r, const char* what) {
 }
 #define NRVK_CHECK(expr) ::nrvk::check((expr), #expr)
 // The network the device's architecture runs (nr_gpu_arch.hpp): RDNA4's e4m3 operands go to the FP8 matrix
-// instructions, RDNA3's (gfx11 has none) travel as FP16 through the FP16 ones with FP32 accumulation
-// (windows/shaders/rdna3/include/coopmm.glsl). Context::rdna3 says which; the host lowering (weight packing, the FP16
+// instructions, RDNA3's (gfx11 has none) travel as FP16 through the FP16 ones with FP32 accumulation (its network
+// ships as ACO's machine code, windows/data/aco/rdna3). Context::rdna3 says which; the host lowering (weight packing, the FP16
 // twins) follows it at run time, so one program serves both.
 
 struct Buffer {
@@ -96,10 +96,31 @@ struct ImageHeap {
 struct SharedPipeline;   // below; Context::pin
 
 struct Context {
-    // The RDNA3 network (set before create / adopt from the device's architecture, nr_gpu_arch.hpp).
+    // The GPU's architecture (nr_gpu_arch.hpp), set by set_arch before adopt (create asks the GPU itself). Unknown
+    // until then: adopt and create refuse a context without a supported one, so no network is built for a GPU by
+    // default. `rdna3` is the lowering it selects (RDNA3's FP16 matrices and twins, its weight packing), set only by
+    // set_arch.
+    nr::arch::GpuArch arch = nr::arch::GpuArch::unknown;
     bool rdna3 = false;
-    const char* target_name() const { return rdna3 ? "RDNA3 (FP16 matrices)" : "RDNA4 (FP8 matrices)"; }
-    bool target_float8() const { return !rdna3; }
+    bool set_arch(nr::arch::GpuArch a, std::string* why = nullptr) {
+        switch (a) {
+        case nr::arch::GpuArch::rdna4: arch = a; rdna3 = false; return true;
+        case nr::arch::GpuArch::rdna3: arch = a; rdna3 = true; return true;
+        case nr::arch::GpuArch::unknown: case nr::arch::GpuArch::rdna1: case nr::arch::GpuArch::rdna2: break;
+        }
+        arch = nr::arch::GpuArch::unknown; rdna3 = false;
+        if (why) *why = std::string("NR has no network for this GPU's architecture (") + nr::arch::name(a) + ")";
+        return false;
+    }
+    const char* target_name() const {
+        switch (arch) {
+        case nr::arch::GpuArch::rdna4: return "RDNA4 (FP8 matrices)";
+        case nr::arch::GpuArch::rdna3: return "RDNA3 (FP16 matrices)";
+        case nr::arch::GpuArch::unknown: case nr::arch::GpuArch::rdna1: case nr::arch::GpuArch::rdna2: break;
+        }
+        return "no architecture set";
+    }
+    bool target_float8() const { return arch == nr::arch::GpuArch::rdna4; }
     VkComponentTypeKHR target_matrix_ab() const {
         return rdna3 ? VK_COMPONENT_TYPE_FLOAT16_KHR : VK_COMPONENT_TYPE_FLOAT8_E4M3_EXT;
     }
@@ -157,8 +178,8 @@ struct Context {
         for (uint32_t i = 0; i < count; ++i) {
             VkPhysicalDeviceProperties p{};
             vkGetPhysicalDeviceProperties(devices[i], &p);
-            const nr::arch::GpuArch a = forced || p.vendorID != 0x1002 ? nr::arch::GpuArch::unknown : nr::arch::of(devices[i]);
-            const bool want = forced ? i == uint32_t(atoi(forced)) : a != nr::arch::GpuArch::unknown;
+            const nr::arch::GpuArch a = forced || p.vendorID != 0x1002 ? nr::arch::GpuArch::unknown : nr::arch::of(devices[i], nullptr, false);   // (looking among GPUs: not the hand setting)
+            const bool want = forced ? i == uint32_t(atoi(forced)) : nr::arch::has_network(a);
             if (!want) continue;
             if (physical)
                 throw std::runtime_error("more than one candidate GPU: " + seen + " and " + p.deviceName + "; set NR_GPU");
@@ -168,7 +189,10 @@ struct Context {
             seen = p.deviceName;
         }
         if (!physical) throw std::runtime_error("no RDNA4 or RDNA3 GPU found; set NR_GPU");
-        rdna3 = nr::arch::of(physical) == nr::arch::GpuArch::rdna3;
+        {
+            std::string how, why;
+            if (!set_arch(nr::arch::of(physical, &how), &why)) throw std::runtime_error(why + ": " + how);
+        }
 
         require_matrix_config();
 
@@ -356,6 +380,7 @@ struct Context {
             if (why) *why = n;
             return false;
         };
+        if (!nr::arch::has_network(arch)) return no("the GPU's architecture was not set (nr_gpu_arch.hpp)");
         VkPhysicalDeviceCooperativeMatrixFeaturesKHR c{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
         VkPhysicalDeviceShaderFloat8FeaturesEXT f8{

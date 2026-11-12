@@ -57,7 +57,7 @@ python3 linux/build/make_lang.py "$dst/lang/English.txt" linux/src/pe/nr_pe_menu
     linux/src/pe/nr_reshade_addon.cpp \
     --producers linux/src/pe/nr_asi_main.cpp linux/src/pe/nr_asi_hudcap.cpp linux/src/pe/nr_pe_control.cpp \
     linux/src/pe/nr_dlssnr_model.cpp linux/src/pe/nr_pe_session.cpp linux/src/pe/nr_engine_panel.hpp \
-    linux/src/pe/nr_reshade_addon.cpp > /dev/null
+    linux/src/pe/nr_reshade_addon.cpp linux/src/core/nr_control_shared.hpp > /dev/null
 cp -- linux/package/lang/README.txt "$dst/lang/README.txt"
 cp -- linux/shaders/renodx/LICENSE "$dst/shaders/renodx/RenoDX-LICENSE.txt"
 

@@ -67,6 +67,13 @@ glslang=${NR_GLSLANG:-toolchain/glslang/bin/glslang}
 "$glslang" -V --target-env vulkan1.0 --vn kMenuComposeVert windows/shaders/control/menu_compose.vert -o "$out/menu_compose_vert.h" > /dev/null
 "$glslang" -V --target-env vulkan1.0 --vn kMenuComposeFrag windows/shaders/control/menu_compose.frag -o "$out/menu_compose_frag.h" > /dev/null
 "$cxx" "${common[@]}" -I"$minhook/include" -I"$imgui" -Iwindows/src/ui -c windows/src/pe/nr_pe_menu.cpp -o "$out/menu.o"
+# the D3D12 passthrough (dlssnr-amd.ini [D3D12Passthrough] Enabled)
+"$cxx" "${common[@]}" -c windows/src/pe/nr_d3d12_passthrough.cpp -o "$out/d3d12_passthrough.o"
+"$cxx" "${common[@]}" -c windows/src/pe/nr_d3d12_passthrough_backend.cpp -o "$out/d3d12_passthrough_backend.o"
+"$cxx" "${common[@]}" -c windows/src/pe/nr_d3d12_passthrough_net.cpp -o "$out/d3d12_passthrough_net.o"
+"$cxx" "${common[@]}" -c windows/src/pe/nr_renodx_d3d12.cpp -o "$out/renodx_d3d12.o"
+"$cxx" "${common[@]}" -I"$imgui" -Iwindows/src/ui -c windows/src/pe/nr_d3d12_passthrough_panel.cpp \
+    -o "$out/d3d12_passthrough_panel.o"
 for unit in imgui imgui_draw imgui_tables imgui_widgets imgui_impl_dx11 imgui_impl_vulkan; do
     "$cxx" -std=c++17 -O2 -DNDEBUG -Itoolchain/Vulkan-Headers/include -I"$imgui" -c "$imgui/$unit.cpp" -o "$out/im_$unit.o"
 done
@@ -80,7 +87,9 @@ done
 "$cxx" -std=c++17 -O2 -DNDEBUG -municode windows/src/pe/nr_present_probe.cpp -o "$out/nr_present_probe.exe" \
     -ldxgi -static -static-libgcc -static-libstdc++
 
-objs=("$out/asi_main.o" "$out/asi_wilsjo2.o" "$out/asi_wilsjo2_vk.o" "$out/nr_wilsjo2.o" "$out/asi_hudcap.o" "$out/menu.o"
+objs=("$out/asi_main.o" "$out/d3d12_passthrough.o" "$out/d3d12_passthrough_backend.o" "$out/d3d12_passthrough_net.o"
+      "$out/renodx_d3d12.o" "$out/d3d12_passthrough_panel.o" "$out/asi_wilsjo2.o" "$out/asi_wilsjo2_vk.o"
+      "$out/nr_wilsjo2.o" "$out/asi_hudcap.o" "$out/menu.o"
       "$out"/im_*.o "$out/model.o" "$out/session.o" "$out/bridge.o" "$out/d3d12split.o" "$out/config.o" "$out/interop.o"
       "$out/vram_ledger.o" "$out/log.o" "$out/crash.o" "$out/vkdevice.o" "$out/nr_runtime.o" "$out/nr_native_plan.o"
       "$out/nr_renodx.o" "$out/renodx_route.o" "$out/control.o" "$out/screenshot.o" "$out"/mh_*.o)
@@ -89,6 +98,14 @@ ldflags=(-ld3d12 -ld3d11 -ldxgi -lole32 -lversion -static -static-libgcc -static
 # Vulkan is resolved at run time rather than imported (windows/build/vulkan_lazy.sh).
 count=$(bash windows/build/vulkan_lazy.sh "$out" "$cxx" -shared "${objs[@]}" "${ldflags[@]}" | grep -o '[0-9]*$')
 "$cxx" -shared -o "$out/dlssnr-amd.asi" "${objs[@]}" "$out/vulkan_lazy_s.o" "$out/vulkan_lazy_c.o" "${ldflags[@]}"
+
+# NR_TOOLS=1: test_d3d12_offline.exe (windows/tools/test_d3d12_offline.cpp, not in the package): the D3D12 passthrough
+# and the bridge on a synthetic frame without a game, the plugin's objects without its entry point
+if [[ ${NR_TOOLS:-0} == 1 ]]; then
+    "$cxx" "${common[@]}" -c windows/tools/test_d3d12_offline.cpp -o "$out/test_d3d12_offline.o"
+    "$cxx" -o "$out/test_d3d12_offline.exe" "$out/test_d3d12_offline.o" "${objs[@]:1}" "$out/vulkan_lazy_s.o" \
+        "$out/vulkan_lazy_c.o" "${ldflags[@]}" -lgdi32 -luuid -lpsapi -lshlwapi -ldwmapi
+fi
 
 echo "built $out/dlssnr-amd.asi ($(stat -c %s "$out/dlssnr-amd.asi") bytes, $count Vulkan entry points at run time), $out/nr_present_probe.exe and $out/shaders/wilsjo2"
 echo "exports: $("$objdump" -p "$out/dlssnr-amd.asi" | grep -c 'InitializeASI')  imports: $("$objdump" -p "$out/dlssnr-amd.asi" | grep 'DLL Name' | awk '{print $3}' | tr '\n' ' ')"

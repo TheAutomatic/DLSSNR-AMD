@@ -346,13 +346,23 @@ float3 SampleNeuralLinearBilinear(uint2 tex_size, uint2 pixel) {
 // One pixel of the v6 resolve, in linear source units.  Users: v6_resolve,
 // and v6_pedestal_reduce built with MEASURE_UNSHAPED (the pedestal measuring
 // NR's own lift while the look shapes).
+#ifdef NR_UP_FUSED
+static float3 g_up_proxy;    // DLSSNR-AMD: this pixel's P_up / N'_up texels (v6_resolve_commit_up)
+static float3 g_up_neural;
+#endif
 float3 ResolvePixel(uint2 pixel, float3 original) {
   // A game's non-finite pixel (Inf or NaN in its colour) passes through as
   // the game made it: any gain turns Inf into NaN (Inf - Inf in the lerp),
   // at every strength (rc11, DATA-09).
   if (any((asuint(original) & 0x7F800000u) == 0x7F800000u)) return original;
+#ifdef NR_UP_FUSED
+  // DLSSNR-AMD (v6_resolve_commit_up): P_up and N'_up made by this pass (look_upsample's), as their RGBA16F texels
+  const float3 proxy = DecodeProxyLinear(g_up_proxy);
+  const float3 neural = DecodeProxyLinear(g_up_neural);
+#else
   const float3 proxy = SampleProxyLinearBilinear(max(ProxySize, uint2(1, 1)), pixel);
   const float3 neural = SampleNeuralLinearBilinear(max(NeuralSize, uint2(1, 1)), pixel);
+#endif
   float3 result;
   [branch]
   if (Curve == 1u) {

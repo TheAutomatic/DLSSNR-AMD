@@ -33,9 +33,13 @@
 #include "nr_pe_menu.hpp"
 #include "nr_screenshot.hpp"
 #include "nr_pe_session.hpp"
+#include "nr_pe_stats.hpp"
 #include "nr_pe_vkdevice.hpp"
+#include "nr_d3d12_passthrough.hpp"
+#include "nr_d3d12_passthrough_backend.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <map>
 #include <cmath>
 #include <cstdint>
@@ -81,6 +85,53 @@ struct Feature {
 namespace {
 
 std::mutex g_lock;
+std::atomic<D3d12Backend> g_d3d12_backend{nullptr};   // set_d3d12_backend
+thread_local bool t_native_call = false;                 // set_d3d12_native_call
+std::atomic<int> g_d3d12_network{-1};
+// The D3D12 passthrough's frames, logged every 10 s as the bridge's session logs its own ("last 10 s: ... ran ...,
+// ... passed the frame through"): frames that carried NR, copy-through frames (recorded, no NR), frames passed through
+// while its network builds - so a log shows when frames go without NR on this path (one in two: the picture flickers).
+struct PassthroughCount {
+    std::mutex m;
+    uint64_t ran = 0, copied = 0, waited = 0;
+    ULONGLONG since = 0;
+    std::string why;   // the backend's last state when a frame went without NR
+};
+PassthroughCount g_pt_count;
+// When the D3D12 passthrough last took a frame (ran or waited for its network): NR Control's Path says "D3D12" for the
+// whole process while it does - another caller's report (a Present layer's, an NR-chain layer's) is not the bridge's
+// then. A D3D11 game (OptiScaler's D3D11-on-D3D12 upscalers included) never gets here: no D3D12 evaluate.
+std::atomic<ULONGLONG> g_pt_last{0};
+// Diagnostic: NR_DEBUG_ALWAYS_RESET=1 suppresses history on every evaluate (the D3D12 passthrough's and the bridge's),
+// to separate "the second pass's history is wrong" from "the second pass's output is lost". Read once.
+bool debug_always_reset() {
+    static const bool on = [] {
+        char v[8] = {}; DWORD n = GetEnvironmentVariableA("NR_DEBUG_ALWAYS_RESET", v, sizeof v);
+        const bool yes = n > 0 && v[0] == '1';
+        if (yes) log("[nr] NR_DEBUG_ALWAYS_RESET=1: every evaluate runs without history");
+        return yes;
+    }();
+    return on;
+}
+void count_passthrough(int what) {   // 0 ran, 1 copy-through, 2 waiting for its network
+    std::lock_guard<std::mutex> l(g_pt_count.m);
+    const ULONGLONG now = GetTickCount64();
+    if (what != 1) g_pt_last = now;
+    if (!g_pt_count.since) g_pt_count.since = now;
+    (what == 0 ? g_pt_count.ran : what == 1 ? g_pt_count.copied : g_pt_count.waited)++;
+    if (what != 0) g_pt_count.why = nr::pe::d3d12_passthrough::status().backend;
+    // the session's run statistics (NR Control's Diagnostics, the report): these frames never reach Session::evaluate,
+    // which counts the bridge's - without this the report said "no layer was asked to run" while NR ran every frame
+    nr::pe::stats::evaluate(nr::pe::renodx_route::call_layer(), what == 0, what == 0 ? std::string() : g_pt_count.why);
+    if (now - g_pt_count.since >= 10000) {
+        log("[d3d12] last %.0f s: %llu frames ran NR on the D3D12 passthrough, %llu recorded without NR, %llu passed through "
+            "while its network builds%s%s", double(now - g_pt_count.since) / 1000.0, (unsigned long long)g_pt_count.ran,
+            (unsigned long long)g_pt_count.copied, (unsigned long long)g_pt_count.waited,
+            g_pt_count.copied || g_pt_count.waited ? "; last: " : "", g_pt_count.copied || g_pt_count.waited ? g_pt_count.why.c_str() : "");
+        g_pt_count.ran = g_pt_count.copied = g_pt_count.waited = 0;
+        g_pt_count.since = now;
+    }
+}
 
 // One session for the whole process per API, not one per NGX feature. A feature here is a handle and
 // a set of controls; the expensive thing -- the device, the queue and a ~300 MB weight upload -- is
@@ -260,9 +311,11 @@ PanelGuides panel_guides_d3d12(ID3D12Resource* color, ID3D12Resource* motion, ID
     return g;
 }
 
+std::atomic<float> g_native_ms{0.f};   // note_native_ms: the wilsjo2 native route's GPU time, smoothed
+
 void report_control(nr::pe::Session& session, const Feature* f, uint32_t route, unsigned int w, unsigned int h,
                     const nr::renodx::Settings* rs, size_t live, uint32_t render_w, uint32_t render_h,
-                    const PanelGuides& guides, bool ran) {
+                    const PanelGuides& guides, bool ran, bool passthrough_frame = false) {
     nr::pe::control::Status st;
     st.layer = nr::pe::renodx_route::call_layer();
     static uint64_t vram_at = 0;   // the heap's use, four times a second (a driver query)
@@ -294,6 +347,7 @@ void report_control(nr::pe::Session& session, const Feature* f, uint32_t route, 
     if (rs && ss.renodx_known && ran) {
         st.fast_passes = ss.renodx.fast_passes;
         st.fast_fallback = ss.renodx.fast_fallback;
+        st.il_missing = ss.renodx.il_missing;
     }
     // The engine-data panel
     {
@@ -333,6 +387,22 @@ void report_control(nr::pe::Session& session, const Feature* f, uint32_t route, 
             pf.hdr_why = "RenoDX style's judgement";
             if (ss.renodx.exposure_texture >= 0) pf.exposure_texture = ss.renodx.exposure_texture;
         }
+        // the D3D12 passthrough ran this frame: its RenoDX stage's facts, not the session's (a bridge frame's)
+        if (passthrough_frame) {
+            const auto as = nr::pe::d3d12_passthrough::backend_net_status();
+            pf.renodx_known = as.renodx_known;
+            if (as.renodx_known) {
+                pf.renodx_hdr = as.renodx_hdr_mode;
+                pf.renodx_absolute = as.renodx_absolute;
+                pf.renodx_feed = as.renodx_feed;
+                pf.renodx_divisor = as.renodx_divisor;
+                if (pf.renodx) {
+                    pf.hdr = as.renodx_hdr_mode == 2 ? 2 : as.renodx_hdr_mode;
+                    pf.hdr_why = "RenoDX style's judgement";
+                    if (as.renodx_exposure_texture >= 0) pf.exposure_texture = as.renodx_exposure_texture;
+                }
+            }
+        }
         const nr::Preprocess& pp = f->controls.preprocess;
         pf.preprocess_exposure = pp.active() ? pp.exposure : 0;
         pf.motion = guides.motion ? 1 : 0;
@@ -346,7 +416,8 @@ void report_control(nr::pe::Session& session, const Feature* f, uint32_t route, 
         if (const auto* w = nr::pe::renodx_route::call_wilsjo2()) {
             // its passes on one runtime: the network's time is one pass's average times the passes
             st.passes = w->passes;
-            if (ran && w->fast_passes > 0.f) { st.fast_passes = w->fast_passes; st.fast_fallback = w->fast_fallback; }
+            if (ran && w->fast_passes > 0.f) { st.fast_passes = w->fast_passes; st.fast_fallback = w->fast_fallback; st.fast_fallback_spatial = w->fast_fallback_spatial; }
+            if (ran) st.il_missing = w->il_missing;
             // the layer's whole run, timed around all its passes (Session::outer_begin); until that reading is there,
             // nothing (a one-pass runtime average times the passes would mix two layers' and two configurations' times)
             if (!session.network_ms_whole_run()) st.network_ms = st.gpu_ms = 0.f;
@@ -373,11 +444,49 @@ void report_control(nr::pe::Session& session, const Feature* f, uint32_t route, 
     for (int n = 0; n < nr::kNetworkChoices; ++n) st.net_why[n] = ss.unavailable[n];
     st.aco = ss.aco; st.aco_why = ss.aco_why; st.aco_rdna3 = ss.aco_rdna3;
     st.device_path = ss.device_path;
+    // the bridge's session reporting while the passthrough serves this process's D3D12 frames (within 2 s): D3D12
+    if (!passthrough_frame && st.device_path == 1 && g_pt_last.load() && GetTickCount64() - g_pt_last.load() < 2000)
+        st.device_path = 3;
     if (ss.building) {
         char phase[128];
         st.building_net = ss.building_net;
         st.build_progress = nr::pe::build_progress(ss, phase, sizeof phase);
         st.build_phase = phase;
+    }
+    // the D3D12 passthrough recorded this frame - the network runs as ACO machine code on the game's D3D12 device; the
+    // Vulkan session's own build (started by the bridge's first evaluates) is not NR's state
+    if (passthrough_frame) {
+        const auto as = nr::pe::d3d12_passthrough::backend_net_status();
+        st.ran = ran;
+        st.waiting = !ran;
+        if (st.waiting) st.waiting_why = "building the network in the background; frames pass through until it is ready";
+        else st.waiting_why.clear();
+        st.building = as.building;
+        st.building_net = as.building_net;
+        st.net_want = as.want_net >= 0 ? as.want_net : ss.want_net;
+        st.net_running = as.running_net >= 0 ? as.running_net : (as.building ? -1 : st.net_want);
+        if (as.building) {
+            nr::pe::Session::State bst;
+            bst.stage = 4;
+            bst.building_seconds = as.building_seconds;
+            char phase[128] = {};
+            st.build_progress = nr::pe::build_progress(bst, phase, sizeof phase);
+            st.build_phase = phase;
+        } else {
+            st.build_progress = 0.f;
+            st.build_phase.clear();
+        }
+        st.network_ms = ran ? as.gpu_ms * float(std::max(st.passes, 1u)) : 0.f;
+        if (as.nr_w && as.nr_h) { st.nr_width = as.nr_w; st.nr_height = as.nr_h; }
+        if (rs && ran && as.fast_passes > 0.f) { st.fast_passes = as.fast_passes; st.fast_fallback = as.fast_fallback; }
+        if (rs && ran) st.il_missing = as.il_missing;
+        const float total_ms = (rs && as.stage_ms > 0.f) ? as.stage_ms : g_native_ms.load();
+        st.gpu_ms = ran ? std::max(total_ms, st.network_ms) : 0.f;
+        st.aco = 1;
+        st.aco_rdna3 = nr::pe::d3d12_passthrough::rdna3();
+        st.aco_why = "D3D12 passthrough: the network runs as ACO machine code on the game's D3D12 device";
+        st.device_path = 3;   // Path "D3D12" (the session's own is the bridge's Vulkan device, which this frame did not use)
+        d3d12_session().set_running_network(st.net_running);
     }
     nr::pe::control::report(st);
 }
@@ -1244,6 +1353,188 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
         return 0;
     }
     nr::pe::menu::install();   // NR Control (End), once per process
+    // The RenoDX-style option's frame for this evaluate (nr_pe_session.cpp's run_renodx block, as one builder so
+    // the D3D12 passthrough and the bridge cannot drift): OptiScaler's own judgement and frame, the .asi's Present
+    // layer overriding it.
+    const auto renodx_frame_of = [&](const nr::Preprocess& preprocess) {
+        const auto encode = nr::pe::renodx_route::last_encode();
+        note_renodx_extent(encode, width, height);
+        const auto rframe = nr::pe::renodx_route::current_frame();
+        nr::pe::Session::RenoDXFrame rf;
+        rf.hdr_flag = encode.hdr;
+        rf.settings = renodx_frame_settings();
+        rf.preprocess = preprocess;
+        note_finished(rf, rframe.known && rframe.finished_picture);
+        if (rframe.known && rframe.present) {   // the .asi's Present layer: as the ReShade routes run it
+            rf.present = rframe.present;
+            rf.present_white_nits = rframe.present_white_nits;
+            rf.hdr_flag = rframe.present == 3;
+            rf.after_upscale = true;
+        }
+        if (rframe.known && !rframe.present) {
+            // OptiScaler's own frame: NR before or after the upscaler, and the game's exposure as DLSS got it.
+            rf.after_upscale = !rframe.before_upscale;
+            rf.exposure = static_cast<ID3D12Resource*>(rframe.exposure);
+            rf.exposure_state = static_cast<D3D12_RESOURCE_STATES>(rframe.exposure_state);
+            rf.pre_exposure = rframe.pre_exposure > 0.0f ? rframe.pre_exposure : 1.0f;
+            rf.exposure_scale = rframe.exposure_scale;
+            rf.auto_exposure = rframe.flags_known && (rframe.create_flags & 0x40u) != 0;   // AutoExposure
+            rf.create_flags_known = rframe.flags_known;
+        } else {
+            rf.create_flags_known = false;
+        }
+        return rf;
+    };
+
+    // The .asi's D3D12 passthrough, when one is set (off: never set, and everything below runs as before), for
+    // the RenoDX processing's frames and the network calls of the wilsjo2 processing's own D3D12 flow
+    // (set_d3d12_native_call): a wilsjo2 flow on the bridge records its passes around this evaluate there, so its
+    // network stays there too.
+    D3d12Backend backend = g_d3d12_backend.load();
+    if (backend && !nr::pe::renodx_route::installed() && !t_native_call) backend = nullptr;
+    if (backend) {
+        // An NR-chain layer's own network (and layer) first, as the bridge's branch below sets them: frame_network()
+        // picks the network from them - set only there, the passthrough ran every layer on whatever the last bridge
+        // call had left (or [Network] Model).
+        d3d12_session().set_call_network(nr::pe::renodx_route::call_network());
+        d3d12_session().set_call_layer(nr::pe::renodx_route::call_layer());
+        g_d3d12_network.store(d3d12_session().frame_network());   // (also re-reads dlssnr-amd.ini at most once a second)
+        auto* direct = nr::pe::renodx_route::installed() ? static_cast<ID3D12Resource*>(nr::pe::renodx_route::direct())
+                                                         : nullptr;
+        D3d12BackendFrame frame{};
+        frame.device = device;
+        frame.cmd = cmd;
+        frame.color = direct ? direct : color;
+        frame.color_state = int(direct ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        frame.output = direct ? direct : output;
+        frame.output_state = int(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        frame.width = width;
+        frame.height = height;
+        {
+            const nr::Controls c = controls_from(controls);
+            frame.style = c.style;
+            frame.intensity = c.intensity;
+            frame.local_tone = c.local_tone;
+            frame.local_structure = c.local_structure;
+            frame.skin_structure = c.skin_structure;
+            frame.automatic_mask = c.automatic_mask ? 1 : 0;
+            frame.reversible_mode = c.reversible_mode;
+            frame.noise_every_frame = c.noise_every_frame ? 1 : 0;
+        }
+        frame.history_f16 = d3d12_session().history_f16() ? 1 : 0;
+        frame.style_grade = d3d12_session().style_grade() ? 1 : 0;
+        // The temporal inputs, as the session's resources below take them.
+        frame.motion = motion;
+        frame.motion_x = motion_rect.x; frame.motion_y = motion_rect.y;
+        frame.motion_w = motion_rect.width; frame.motion_h = motion_rect.height;
+        {
+            const D3D12_RESOURCE_DESC md = motion ? motion->GetDesc() : D3D12_RESOURCE_DESC{};
+            const unsigned int mw = motion_rect.width ? motion_rect.width : motion ? unsigned(md.Width) : width;
+            const unsigned int mh = motion_rect.height ? motion_rect.height : motion ? unsigned(md.Height) : height;
+            frame.motion_scale_x = normalized_mv_scale(mv_scale_x, mw);
+            frame.motion_scale_y = normalized_mv_scale(mv_scale_y, mh);
+        }
+        frame.depth = debug_depth() == DebugDepth::Off ? nullptr : depth;
+        frame.depth_x = depth_rect.x; frame.depth_y = depth_rect.y;
+        frame.depth_w = depth_rect.width; frame.depth_h = depth_rect.height;
+        frame.depth_inverted = (depth_inverted != 0) != (debug_depth() == DebugDepth::Flip) ? 1 : 0;
+        frame.reset = reset != 0 || debug_always_reset() ? 1 : 0;   // (NR_DEBUG_ALWAYS_RESET on this path too)
+        frame.feature = static_cast<unsigned long long>(f->id);
+        frame.history_strength = -1.0f;
+        {   // a wilsjo2 layer's Interleaved pass: its history, and its network plain (the layer composes Intensity and Style)
+            const auto ch = nr::pe::renodx_route::call_history();
+            frame.history = static_cast<ID3D12Resource*>(ch.d3d12);
+            frame.no_grade = ch.raw ? 1 : 0;
+            if (ch.raw) frame.intensity = 1.0f;
+        }
+        const auto* w2 = nr::pe::renodx_route::call_wilsjo2();
+        if (w2) frame.history_strength = w2->history;
+        const bool prep_outside = w2 && w2->prep_outside;
+        const nr::Preprocess pp = prep_outside ? nr::Preprocess{} : preprocess_now();
+        frame.renodx_route = nr::pe::renodx_route::installed() ? 1 : 0;
+        frame.preprocess = pp.active() ? 1 : 0;
+        frame.prep_exposure = pp.exposure;
+        frame.prep_bias_ev = pp.bias_ev;
+        frame.prep_curve = pp.curve;
+        frame.prep_contrast = pp.contrast;
+        frame.prep_saturation = pp.saturation;
+        frame.prep_inverse = pp.inverse ? 1 : 0;
+        int waiting = 0;
+        frame.waiting = &waiting;
+        f->controls = controls_from(controls);
+        if (w2) f->controls.history_strength = w2->history;
+        f->controls.preprocess = pp;
+        f->prep_by_layer = prep_outside && preprocess_now().active() && !w2->prep_missing;
+        nr::pe::Session::RenoDXFrame renodx_rf;   // (outlives the backend call: renodx_settings points into it)
+        if (nr::pe::renodx_route::installed()) {  // the RenoDX stage's own frame, for the D3D12 passthrough's stage
+            renodx_rf = renodx_frame_of(pp);
+            frame.renodx_settings = &renodx_rf.settings;
+            frame.renodx_present = int(renodx_rf.present);
+            frame.renodx_white_nits = renodx_rf.present_white_nits;
+            frame.renodx_hdr_flag = renodx_rf.hdr_flag ? 1 : 0;
+            frame.renodx_finished = renodx_rf.finished ? 1 : 0;
+            frame.renodx_clean = renodx_rf.clean ? 1 : 0;
+            frame.renodx_after_upscale = renodx_rf.after_upscale ? 1 : 0;
+            frame.renodx_fast_motion = renodx_rf.fast_motion_available ? 1 : 0;
+            frame.exposure = renodx_rf.exposure;
+            frame.exposure_state = int(renodx_rf.exposure_state);
+            frame.pre_exposure = renodx_rf.pre_exposure;
+            frame.exposure_scale = renodx_rf.exposure_scale;
+            frame.auto_exposure = renodx_rf.auto_exposure ? 1 : 0;
+            frame.create_flags_known = renodx_rf.create_flags_known ? 1 : 0;
+        } else {
+            frame.renodx_settings = nullptr;
+        }
+        if (backend(frame)) {
+            count_passthrough(nr::pe::d3d12_passthrough::backend_produced() ? 0 : 1);
+            {
+                const auto ns = nr::pe::d3d12_passthrough::backend_net_status();
+                const double net_ms = ns.gpu_ms;
+                const double tot_ms = ns.stage_ms > 0.0 ? ns.stage_ms : net_ms;
+                const bool produced = nr::pe::d3d12_passthrough::backend_produced();
+                log_evaluate(f, "D3D12", width, height, static_cast<const void*>(color), static_cast<const void*>(output),
+                             reset != 0, produced, produced ? nullptr : "declined", tot_ms, net_ms);
+            }
+            {   // NR Control's state from this frame, every frame as the bridge's evaluate reports its runs
+                {
+                    uint32_t render_w = depth_rect.width, render_h = depth_rect.height;
+                    if ((!render_w || !render_h) && depth) {
+                        const D3D12_RESOURCE_DESC dd = depth->GetDesc();
+                        render_w = uint32_t(dd.Width); render_h = dd.Height;
+                    }
+                    // What the frame actually carried, not what the caller hoped: a copy-through frame is a success.
+                    report_control(d3d12_session(), f, 1, width, height, frame.renodx_settings, g_live_d3d12.size(), render_w, render_h,
+                                   panel_guides_d3d12(color, motion, depth, motion_rect, reset != 0, mv_scale_x, mv_scale_y),
+                                   nr::pe::d3d12_passthrough::backend_produced(), true);
+                }
+            }
+            device->Release();
+            return static_cast<int>(NVSDK_NGX_Result_Success);
+        }
+        if (waiting) {
+            count_passthrough(2);
+            // The passthrough takes these frames once its network is made; until then the frame as it came, no NR, no bridge
+            if (frame.output != frame.color) {
+                barrier(cmd, color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                barrier(cmd, output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+                cmd->CopyResource(output, color);
+                barrier(cmd, color, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                barrier(cmd, output, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            }
+            {
+                uint32_t render_w = depth_rect.width, render_h = depth_rect.height;
+                if ((!render_w || !render_h) && depth) {
+                    const D3D12_RESOURCE_DESC dd = depth->GetDesc();
+                    render_w = uint32_t(dd.Width); render_h = dd.Height;
+                }
+                report_control(d3d12_session(), f, 1, width, height, frame.renodx_settings, g_live_d3d12.size(), render_w, render_h,
+                               panel_guides_d3d12(color, motion, depth, motion_rect, reset != 0, mv_scale_x, mv_scale_y),
+                               false, true);
+            }
+            device->Release();
+            return static_cast<int>(NVSDK_NGX_Result_Success);
+        }
+    }
 
     // NR_DEBUG_READBACK=1: which evaluate this is, and the pair the previous one recorded.
     //
@@ -1314,17 +1605,9 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
     resources.depth_inverted = (depth_inverted != 0) != (debug_depth() == DebugDepth::Flip);
     // The caller's flag and nothing else: every feature has its own history now.
     resources.reset = reset != 0;
-    // Diagnostic (2026-09-16): NR_DEBUG_ALWAYS_RESET=1 suppresses history on every evaluate, to
-    // separate "the second pass's history is wrong" from "the second pass's output is lost".
-    {
-        static const int always_reset = [] {
-            char v[8] = {}; DWORD n = GetEnvironmentVariableA("NR_DEBUG_ALWAYS_RESET", v, sizeof v);
-            const int on = (n > 0 && v[0] == '1') ? 1 : 0;
-            if (on) log("[nr] NR_DEBUG_ALWAYS_RESET=1: every evaluate runs without history");
-            return on;
-        }();
-        if (always_reset) resources.reset = true;
-    }
+    // a wilsjo2 layer's Passes (fast) Interleaved pass: the history it made for this call
+    resources.history = static_cast<ID3D12Resource*>(nr::pe::renodx_route::call_history().d3d12);
+    if (debug_always_reset()) resources.reset = true;
     {
         const D3D12_RESOURCE_DESC md = motion ? motion->GetDesc() : D3D12_RESOURCE_DESC{};
         const unsigned int mw = motion_rect.width ? motion_rect.width : motion ? unsigned(md.Width) : width;
@@ -1347,6 +1630,12 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
 
     auto& session = d3d12_session();
     session.set_call_network(nr::pe::renodx_route::call_network());   // an NR-chain layer's own network, else -1
+    // a wilsjo2 layer's Interleaved pass with a Style or an Intensity: the network plain (Intensity 1, no Style grade);
+    // the layer composes them (the pass's history must be the network's own output, or the grade comes round again)
+    const bool raw_call = nr::pe::renodx_route::call_history().raw;
+    if (raw_call) f->controls.intensity = 1.0f;
+    session.set_raw_call(raw_call);
+    struct RawEnd { nr::pe::Session& s; ~RawEnd() { s.set_raw_call(false); } } raw_end{session};
     session.set_call_layer(nr::pe::renodx_route::call_layer());
     // NR_DEBUG_SKIP_PASS: this feature's pass number is its rank among the live features.
     const int pass_number = pass_number_of(g_live_d3d12, f);
@@ -1362,31 +1651,7 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
     // then outputs unchanged. It never runs the network on the raw frame.
     if (nr::pe::renodx_route::installed()) {
         const auto encode = nr::pe::renodx_route::last_encode();
-        note_renodx_extent(encode, width, height);
-        const auto frame = nr::pe::renodx_route::current_frame();
-        nr::pe::Session::RenoDXFrame rf;
-        rf.hdr_flag = encode.hdr;
-        rf.settings = renodx_frame_settings();
-        rf.preprocess = f->controls.preprocess;
-        note_finished(rf, frame.known && frame.finished_picture);
-        if (frame.known && frame.present) {   // the .asi's Present layer: as the ReShade routes run it
-            rf.present = frame.present;
-            rf.present_white_nits = frame.present_white_nits;
-            rf.hdr_flag = frame.present == 3;
-            rf.after_upscale = true;
-        }
-        if (frame.known && !frame.present) {
-            // OptiScaler's own frame: NR before or after the upscaler, and the game's exposure as DLSS got it.
-            rf.after_upscale = !frame.before_upscale;
-            rf.exposure = static_cast<ID3D12Resource*>(frame.exposure);
-            rf.exposure_state = static_cast<D3D12_RESOURCE_STATES>(frame.exposure_state);
-            rf.pre_exposure = frame.pre_exposure > 0.0f ? frame.pre_exposure : 1.0f;
-            rf.exposure_scale = frame.exposure_scale;
-            rf.auto_exposure = frame.flags_known && (frame.create_flags & 0x40u) != 0;   // AutoExposure
-            rf.create_flags_known = frame.flags_known;
-        } else {
-            rf.create_flags_known = false;
-        }
+        const nr::pe::Session::RenoDXFrame rf = renodx_frame_of(f->controls.preprocess);
         // OptiScaler's encode skipped (nr_pe_optifix.cpp): the frame itself is read and written, in the state
         // OptiScaler holds it in across the call, and left as it is when NR does not run (its resolve is skipped too).
         auto* direct = static_cast<ID3D12Resource*>(nr::pe::renodx_route::direct());
@@ -1496,6 +1761,9 @@ void release_d3d12(Feature* f) {
     // (DlssNr_Dx12.cpp ParkNrFeature) before releasing it, and the runtime retires the feature's
     // images for a further 64 recordings before destroying them.
     if (f && g_d3d12_session) g_d3d12_session->release_feature(f->id);
+    // The D3D12 passthrough keeps its own stage and per-feature history: without this it learns of the feature's
+    // death only from an LRU budget guess.
+    if (f) nr::pe::d3d12_passthrough::release_renodx_feature(f->id);
     g_live_d3d12.erase(std::remove(g_live_d3d12.begin(), g_live_d3d12.end(), f), g_live_d3d12.end());
     // The readback pair goes the same way and for the same reason: a copy into it may still be in a
     // list the GPU has not reached, so it is retired for 64 further evaluates rather than released
@@ -1849,6 +2117,11 @@ int evaluate_vk_on(nr::pe::Session& session, const nr::pe::DeviceHandles& handle
     frame.depth_inverted = (depth_inverted != 0) != (debug_depth() == DebugDepth::Flip);
     frame.feature = f->id;
     frame.reset = reset != 0;
+    if (const auto& h = nr::pe::renodx_route::call_history(); h.vk_image) {   // a wilsjo2 Interleaved pass's history
+        frame.history = (VkImage)(uintptr_t)h.vk_image;
+        frame.history_format = VkFormat(h.vk_format);
+        frame.history_width = h.width; frame.history_height = h.height;
+    }
     frame.motion_scale_x = normalized_mv_scale(
         mv_scale_x, motion_rect.width ? motion_rect.width : frame.motion_width ? frame.motion_width : frame.width);
     frame.motion_scale_y = normalized_mv_scale(
@@ -1864,6 +2137,12 @@ int evaluate_vk_on(nr::pe::Session& session, const nr::pe::DeviceHandles& handle
     }
 
     session.set_call_network(nr::pe::renodx_route::call_network());   // an NR-chain layer's own network, else -1
+    // a wilsjo2 layer's Interleaved pass with a Style or an Intensity: the network plain (Intensity 1, no Style grade);
+    // the layer composes them (the pass's history must be the network's own output, or the grade comes round again)
+    const bool raw_call = nr::pe::renodx_route::call_history().raw;
+    if (raw_call) f->controls.intensity = 1.0f;
+    session.set_raw_call(raw_call);
+    struct RawEnd { nr::pe::Session& s; ~RawEnd() { s.set_raw_call(false); } } raw_end{session};
     session.set_call_layer(nr::pe::renodx_route::call_layer());
     // The RenoDX style, as the D3D12 route's direct path runs it: what the .asi told renodx_route of the frame.
     nr::pe::Session::RenoDXFrame rf;
@@ -1975,6 +2254,9 @@ int evaluate_bridge12(void* cmd_buffer, Feature* f, const VkImageRef& colour, co
 void release_bridge12(Feature* f) {
     std::lock_guard<std::mutex> guard(g_lock);
     if (f && g_d3d12_session) g_d3d12_session->release_feature(f->id);
+    // The D3D12 passthrough keeps its own stage and per-feature history: without this it learns of the feature's
+    // death only from an LRU budget guess.
+    if (f) nr::pe::d3d12_passthrough::release_renodx_feature(f->id);
     g_live_d3d12.erase(std::remove(g_live_d3d12.begin(), g_live_d3d12.end(), f), g_live_d3d12.end());
     delete f;
 }
@@ -1993,6 +2275,25 @@ void layer_changed(int layer) {
     std::lock_guard<std::mutex> guard(g_lock);
     if (g_d3d12_session) g_d3d12_session->reset_layer_timing(layer);
     if (g_vk_session) g_vk_session->reset_layer_timing(layer);
+}
+
+void set_d3d12_backend(D3d12Backend backend) { g_d3d12_backend = backend; }
+void set_d3d12_native_call(bool on) { t_native_call = on; }
+int frame_network() {
+    return g_d3d12_network.load();
+}
+
+
+void note_native_ms(float ms) {
+
+    static float ring[32] = {};
+    static size_t at = 0;
+    ring[at % 32] = ms;
+    ++at;
+    const size_t n = std::min<size_t>(at, 32);
+    double s = 0.0;
+    for (size_t i = 0; i < n; ++i) s += ring[i];
+    g_native_ms = float(s / double(n));   // smoothed for NR Control's line
 }
 
 }  // namespace nr::dlssnr

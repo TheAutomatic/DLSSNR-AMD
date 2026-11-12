@@ -3,6 +3,7 @@
 #include <vector>
 #include <vulkan/vulkan.h>
 #include "nr_native_plan.hpp"
+#include "nr_gpu_arch_ids.hpp"
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -177,8 +178,9 @@ struct HostDevice {
     // then reads the activation arena through a buffer_reference where that is faster (Windows
     // network only).
     bool buffer_device_address = false;
-    // The device runs RDNA3's network (nr_gpu_arch.hpp: gfx11), not RDNA4's.
-    bool rdna3 = false;
+    // The GPU's architecture (nr_gpu_arch.hpp identify of `physical`): the network built is that architecture's; one
+    // without a network (unknown, RDNA2, ...) is refused, never built as another's.
+    nr::arch::GpuArch arch = nr::arch::GpuArch::unknown;
 };
 // [Network] Residency offload: a network held by a core alone (no runtime, no frame of it in flight) moves its weights
 // to RAM and releases its device memory (its weight buffer, its hold on the activation arena); reload_network brings
@@ -397,6 +399,11 @@ struct EngineFrame {
     // extent, one pass, the model applied). `colour` is then only read, and the
     // host's seed copy of the colour into the target is not needed.
     ColourFrame target;
+    // A history the caller made for this run (RGBA16F at the network's size, GENERAL): written into the image the
+    // feature's history is read from, before the network runs, when the history gate is open. Passes (fast)
+    // Interleaved: what this pass would have written last frame, made from the slots' increments, so a pass that ran
+    // several frames ago reads a history one frame old (read with this frame's own motion vectors).
+    ColourFrame history;
 };
 
 struct EngineResult {
@@ -539,6 +546,8 @@ public:
     // Natural and Cinematic graded after the post block as NVIDIA's DLL does (true, the default), or not (false: the
     // picture these styles had before the grade was ported). Per frame; nothing is rebuilt.
     void set_style_grade(bool);
+    // Whether Natural / Cinematic are graded now (the switch on and the grade's pipelines in the shader folder).
+    bool style_grade_active() const;
     // [Network] History Precision, live: true = the history images in RGBA16F (the default), false = RGBA32F. Applied
     // at the next recording; the history starts afresh then. NR_HIST16 in the environment wins (comparisons).
     void set_history_f16(bool);

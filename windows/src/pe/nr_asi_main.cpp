@@ -32,6 +32,11 @@
 #include "nr_path_win.hpp"
 #include "MinHook.h"
 #include "nr_asi_wilsjo2.hpp"
+#include "nr_d3d12_passthrough.hpp"
+#include "nr_d3d12_passthrough_backend.hpp"
+#include "nr_d3d12_shot.hpp"
+#include "nr_d3d12_passthrough_net.hpp"
+#include "nr_d3d12_net_plan.hpp"
 #include "nr_device_features.hpp"
 #include "nr_dlssnr_model.hpp"
 #include "nr_pe_session.hpp"
@@ -919,10 +924,30 @@ long chosen_index(const nr::pe::InspectConfig& ic, const std::vector<const Layer
     return -1;
 }
 
-void run_renodx(ID3D12GraphicsCommandList* cmd, LayerState& ls, const Layer& layer, int placement, const Frame& f,
-                ID3D12Resource* target, uint32_t w, uint32_t h, const States& st) {
+// Whether a RenoDX layer may read the game's resource where it is (the back buffer at Present, the colour before the
+// upscaler) on this device: under vkd3d-proton (the game's own Vulkan images) or on the D3D12 passthrough (its stage
+// reads a colour other than the output where it is). The Vulkan bridge copies every resource into a twin of its own -
+// there a direct read would only add a twin a back buffer, so the copies stay.
+bool d12_reads_in_place(ID3D12Device* device) {
+    if (!device) return false;
+    namespace pt = nr::pe::d3d12_passthrough;
+    if (pt::enabled() && pt::canary() == pt::Canary::kHit) return true;
+    static std::atomic<ID3D12Device*> asked{nullptr};
+    static std::atomic<bool> vkd3d{false};
+    if (asked.load() != device) {
+        vkd3d = nr::pe::device_handles(device).valid();
+        asked = device;
+    }
+    return vkd3d.load();
+}
+
+// `colour`: when given, the picture read from another resource, in NON_PIXEL_SHADER_RESOURCE (the game's colour before the
+// upscaler), its answer stored into `target` (UNORDERED_ACCESS); null: `target` in place. True when it evaluated (then
+// `target` holds the answer, or the colour where the network did not run).
+bool run_renodx(ID3D12GraphicsCommandList* cmd, LayerState& ls, const Layer& layer, int placement, const Frame& f,
+                ID3D12Resource* target, uint32_t w, uint32_t h, const States& st, ID3D12Resource* colour = nullptr) {
     ID3D12Device* device = nullptr;
-    if (FAILED(cmd->GetDevice(IID_PPV_ARGS(&device))) || !device) return;
+    if (FAILED(cmd->GetDevice(IID_PPV_ARGS(&device))) || !device) return false;
     Feature*& feature = ls.nr[placement];
     if (!feature) {
         int rc = 0;
@@ -930,7 +955,7 @@ void run_renodx(ID3D12GraphicsCommandList* cmd, LayerState& ls, const Layer& lay
         if (!feature) {
             log("[nr] NR feature could not be made (0x%08X): %s", unsigned(rc), nr::dlssnr::last_error());
             device->Release();
-            return;
+            return false;
         }
     }
     // What the forked OptiScaler's hooks told the model (nr_pe_renodx_route.hpp), from the game's own block: the
@@ -947,7 +972,7 @@ void run_renodx(ID3D12GraphicsCommandList* cmd, LayerState& ls, const Layer& lay
     rf.exposure_state = uint32_t(st.exposure);
     route::begin_run(rf);
     route::note_encode(hdr, w, h);
-    route::set_direct(target);
+    route::set_direct(colour ? nullptr : target);
     // The guides in the state the model reads them in, as the forked OptiScaler held them for it.
     transition(cmd, f.depth, st.depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     if (f.motion != f.depth) transition(cmd, f.motion, st.motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -956,7 +981,7 @@ void run_renodx(ID3D12GraphicsCommandList* cmd, LayerState& ls, const Layer& lay
         route::CallSettings settings(&layer.cfg.renodx.values);
         route::CallNetwork network(layer.network);
         route::CallLayer number(row_number(layer));
-        nr::dlssnr::evaluate_d3d12(cmd, feature, nullptr, target, f.depth, f.motion, target, w, h, f.depth_rect,
+        nr::dlssnr::evaluate_d3d12(cmd, feature, nullptr, colour ? colour : target, f.depth, f.motion, target, w, h, f.depth_rect,
                                    f.motion_rect, (f.flags & kFlagDepthInverted) ? 1 : 0, f.reset || hold_released(row_number(layer)) ? 1 : 0,
                                    nr::dlssnr::Controls6{}, f.mv_x, f.mv_y);
     }
@@ -964,6 +989,7 @@ void run_renodx(ID3D12GraphicsCommandList* cmd, LayerState& ls, const Layer& lay
     transition(cmd, f.depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, st.depth);
     route::end_run();
     device->Release();
+    return true;
 }
 
 // ---- RenoDX's NR screenshot of the final picture -----------------------------------------------------------------
@@ -1008,6 +1034,81 @@ bool clone_of(ID3D12Device* device, ID3D12Resource*& clone, ID3D12Resource* sour
     return true;
 }
 
+// The game's depth for the Present layers, read by a shader into a plain R32_FLOAT texture of ours (the bridge's depth
+// pass, nr_pe_bridge.hpp DepthCopyD3D12) - not CopyResource of the depth-stencil resource into a depth-stencil twin. That
+// copy took the depth's compressed tiles as the declared (guessed) state let the driver treat them: on the AMD Windows
+// driver Interleaved, the one Present method that reads the depth, showed ground patches on the fill pyramid's 64-px
+// grid that changed from frame to frame (native D3D12 and the bridge alike; Linux / vkd3d-proton fine). A shader read
+// goes through the texture unit, which reads compressed depth as it is, as the upscalers read it.
+// One pass per device it was built for (a second device: built again).
+struct GuideDepth {
+    ID3D12Device* device = nullptr;
+    std::unique_ptr<nr::pe::bridge::DepthCopyD3D12> pass;
+    bool said = false;
+};
+GuideDepth g_guide_depth;
+bool depth_read_only(D3D12_RESOURCE_STATES s) {
+    const auto kReads = D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | D3D12_RESOURCE_STATE_INDEX_BUFFER |
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT | D3D12_RESOURCE_STATE_COPY_SOURCE |
+                        D3D12_RESOURCE_STATE_DEPTH_READ;
+    return s != D3D12_RESOURCE_STATE_COMMON && (s & ~kReads) == 0;
+}
+// Our R32_FLOAT twin of the game's depth `source` (unordered access; it rests in NON_PIXEL_SHADER_RESOURCE).
+bool depth_twin_of(ID3D12Device* device, ID3D12Resource*& twin, ID3D12Resource* source) {
+    const D3D12_RESOURCE_DESC s = source->GetDesc();
+    if (twin) {
+        const D3D12_RESOURCE_DESC c = twin->GetDesc();
+        if (c.Format == DXGI_FORMAT_R32_FLOAT && c.Width == s.Width && c.Height == s.Height) return true;
+        release_resource(twin);
+    }
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC d{};
+    d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    d.Width = s.Width; d.Height = s.Height; d.DepthOrArraySize = 1; d.MipLevels = 1;
+    d.Format = DXGI_FORMAT_R32_FLOAT; d.SampleDesc.Count = 1; d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                               nullptr, IID_PPV_ARGS(&twin)))) {
+        twin = nullptr;
+        return false;
+    }
+    nr::vram::track_d3d12(device, twin, nr::vram::kCopies);
+    return true;
+}
+// The game's depth (`from`: its state as assumed) read into `twin` on `cmd`. False when the pass cannot run here.
+bool depth_read_into(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, ID3D12Resource* depth, D3D12_RESOURCE_STATES from,
+                     ID3D12Resource* twin) {
+    GuideDepth& g = g_guide_depth;
+    if (g.device != device) { g.pass.reset(new nr::pe::bridge::DepthCopyD3D12()); g.device = device; g.said = false; }
+    std::string why;
+    if (!g.pass->ready(device, &why)) {
+        if (!g.said) { g.said = true; log("[nr] Present layers: the game's depth cannot be read by our pass (%s): it is copied as it is", why.c_str()); }
+        return false;
+    }
+    // a read state gains the compute-read bit; a write state (or none) becomes the compute read alone (as the bridge)
+    const auto kRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    const D3D12_RESOURCE_STATES read = (from & kRead) ? from : depth_read_only(from) ? (from | kRead) : kRead;
+    transition(cmd, depth, from, read);
+    transition(cmd, twin, kRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    const bool ok = g.pass->record(device, cmd, depth, twin, &why);
+    transition(cmd, twin, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kRead);
+    transition(cmd, depth, read, from);
+    if (!ok && !g.said) { g.said = true; log("[nr] Present layers: the game's depth was not read (%s)", why.c_str()); }
+    return ok;
+}
+
+// Before copying a game's guides at its evaluate: a full barrier (aliasing, no resources). The states we assume for
+// them are a guess (OptiScaler's DepthResourceBarrier; a game may leave them as it wrote them), and with only the
+// transitions the depth copy took some tiles before the game's last write to it had landed - runs of one game differed,
+// those tiles holding last frame's depth (a test game under vkd3d-proton; with the full barrier: identical).
+// It waits for ALL of the queue's earlier GPU work: only where a depth copy is made (capture_guides: depth_wanted).
+void guide_copy_barrier(ID3D12GraphicsCommandList* cmd) {
+    D3D12_RESOURCE_BARRIER ab{};
+    ab.Type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
+    cmd->ResourceBarrier(1, &ab);
+}
+
 // The source metadata and guide textures belong to the held input, not the live game's next frame.
 bool hold_inputs(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, HoldCopy& h,
                  Frame& f, States& st, nr::asi::Wilsjo2Frame& wf) {
@@ -1019,6 +1120,7 @@ bool hold_inputs(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, HoldCopy&
         // Allocate the complete set before recording any copy.
         for (int i = 0; i < 3; ++i)
             if (src[i] && !clone_of(device, h.guides[i], src[i])) { h.held = false; return false; }
+        guide_copy_barrier(cmd);
         for (int i = 0; i < 3; ++i) if (src[i]) {
             transition(cmd, src[i], from[i], D3D12_RESOURCE_STATE_COPY_SOURCE);
             cmd->CopyResource(h.guides[i], src[i]);
@@ -1050,6 +1152,7 @@ void late_capture(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, const Fr
     }
     const std::pair<ID3D12Resource*, std::pair<ID3D12Resource*, D3D12_RESOURCE_STATES>> pairs[2] = {
         {g_late.depth, {f.depth, st.depth}}, {g_late.motion, {f.motion, st.motion}}};
+    guide_copy_barrier(cmd);
     for (const auto& pr : pairs) {
         transition(cmd, pr.second.first, pr.second.second, D3D12_RESOURCE_STATE_COPY_SOURCE);
         cmd->CopyResource(pr.first, pr.second.first);
@@ -1243,22 +1346,26 @@ struct PresentPath {
     ID3D12GraphicsCommandList* list = nullptr;
     ID3D12Fence* fence = nullptr;
     uint64_t submitted = 0, slot_value[kPresentRing] = {};
+    // HUD FIX's chain capture: its HUD count copied out by the slot's list (READBACK, 512 bytes a slot) and the image
+    // whose copy it was checking (0: none in that slot)
+    ID3D12Resource* hud_rb = nullptr;
+    uint64_t hud_rb_image[kPresentRing] = {};
+    uint32_t hud_rb_total[kPresentRing] = {};
     HANDLE event = nullptr;
     bool slot_wait_off = false;
     ID3D12Resource* target = nullptr;          // the back buffer's copy NR runs on, in place
     D3D12_RESOURCE_STATES target_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     // wilsjo2's HDR10 finished picture: the linear BT.709 copy it runs on and the re-encoded one (UNORDERED_ACCESS)
     ID3D12Resource *linear = nullptr, *encoded = nullptr;
-    // HUD FIX (wilsjo2_hudfix.comp): the frame before the layers, the last one (the estimate's), the HUD's alpha and
-    // confidence (R16G16B16A16_FLOAT), the counts and the estimate's tile flags (R32_UINT, hud_stats_size);
+    // HUD FIX (hudfix.comp): the frame before the layers and the counts (R32_UINT, kHudStatsW x kHudStatsH);
     // UNORDERED_ACCESS between uses
-    ID3D12Resource *hud_back = nullptr, *hud_prev = nullptr, *hud_alpha = nullptr, *hud_stats = nullptr;
+    ID3D12Resource *hud_back = nullptr, *hud_stats = nullptr;
+    ID3D12Resource* hud_ui = nullptr; // typed copy of the game's authored UI; UNORDERED_ACCESS between uses
+    D3D12_RESOURCE_STATES hud_ui_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    int hud_ui_report = -1;
     D3D12_RESOURCE_STATES hud_back_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                          hud_prev_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                          hud_alpha_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                           hud_stats_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    bool hud_prev_valid = false, hud_fresh = true, hud_said = false;
-    uint32_t hud_parity = 0;
+    bool hud_said = false;
     // frame generation's HUD-less frame with the layers' change (present_layers' fg_delta): the frame before the layers
     // (when HUD FIX keeps none), the result, an alpha of 0 (R16G16B16A16_FLOAT, zero at creation); UNORDERED_ACCESS
     ID3D12Resource *fg_pre = nullptr, *fg_out = nullptr, *fg_zero = nullptr;
@@ -1266,7 +1373,6 @@ struct PresentPath {
                           fg_out_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                           fg_zero_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     bool fg_said = false;
-    uint64_t hud_estimated_at = ~0ull;   // the estimate's last Present: after a gap it starts afresh
     D3D12_RESOURCE_STATES linear_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS, encoded_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     std::map<int, PresentLayer> layers;        // by layer number
     std::atomic<bool> unusable{false};         // this swap chain cannot be served: the layers run after the upscaler
@@ -1310,15 +1416,14 @@ bool aspect_matches(uint32_t sw, uint32_t sh, uint32_t tw, uint32_t th) {   // p
 }
 
 bool present_layer(const Layer& l) { return l.cfg.placement == nr::pe::Placement::kPresent; }
-// HUD FIX's counts image (wilsjo2_hudfix.comp): its counts in row 0, a texel an 8 x 8 tile below
-uint32_t hud_stats_w(uint32_t w) { return std::max(4u, (w + 7) / 8); }
-uint32_t hud_stats_h(uint32_t h) { return 1 + 2 * ((h + 7) / 8); }   // two tile-flag sets
+// HUD FIX's counts (hudfix.comp u1): four counters in one row
+constexpr uint32_t kHudStatsW = 4, kHudStatsH = 1;
 
 // HUD FIX's line for NR Control (nr_pe_control.hpp hud_facts), from a Present that reached its layers (`layers`: some
 // run there). `follows`: the capture follows this API (D3D12, D3D11, Vulkan); `captured` this frame, else `why` not.
 void hud_report(bool layers, bool follows = false, bool captured = false, const std::string& why = std::string(),
                 bool fg_api = false, bool fg = false, const std::string& fg_why = std::string(), const char* fg_source = "",
-                bool broken = false, bool fg_offered = false, int capture_ok = -1) {
+                bool broken = false, bool fg_offered = false, int capture_ok = -1, const char* how = nullptr) {
     const bool d3d12 = follows;
     // greyed while it cannot run: frame generation's HUD-less frame not handed over for 2 s; the capture's hooks failed.
     // Hand-overs are followed in every mode (fg_offered while not armed), so the menu shows what can run before a
@@ -1349,16 +1454,24 @@ void hud_report(bool layers, bool follows = false, bool captured = false, const 
     }
     const char* const no_game = NR_N("frame generation's HUD-less frame is read for D3D12 games only");
     const char* const no_capture = NR_N("the capture before the HUD does not follow this game's API");
-    std::string now = mode == 0 ? NR_N("off")
+    const bool estimated_off = c && c->hud.estimated_asked;
+    std::string now = estimated_off ? NR_N("off: Estimated is switched off in this version")
+                      : mode == 0 ? NR_N("off")
                       : !layers ? NR_N("nothing: no layer runs at Present")
-                      : mode == 4 ? NR_N("estimated")
                       : fg && (mode == 1 || mode == 2) ? std::string(NR_N("frame generation's HUD-less frame (")) + fg_source + ")"
                       : mode == 2 ? (fg_api ? NR_N("nothing this frame: ") + fg_why : std::string(NR_N("nothing: ")) + no_game)
-                      : captured  ? NR_N("captured before the HUD")
-                      : mode == 1 ? (d3d12 ? NR_N("estimated (captured: ") + why + ")" : std::string(NR_N("estimated")))
+                      : captured  ? std::string(how ? how : NR_N("captured before the HUD"))
+                      : mode == 1 ? (d3d12 ? NR_N("nothing this frame: ") + why : std::string(NR_N("nothing: ")) + no_capture)
                       : d3d12     ? NR_N("nothing this frame: ") + why : std::string(NR_N("nothing: ")) + no_capture;
-    static std::string said;   // the log: its changes, the first 40
+    static std::string said;
     static int changes = 0;
+    static uint32_t logged_mode=~0u;
+    if (logged_mode!=mode) {
+        static const char* modes[]={"off","auto","game","captured","estimated"};
+        log("[nr] HUD FIX mode: %s",mode<5 ? modes[mode] : "unknown");
+        logged_mode=mode;
+        said.clear(); changes=0; // Each selected mode needs its own actual-source status, even after startup chatter.
+    }
     if (now != said && changes < 40) {
         ++changes;
         log("[nr] HUD FIX now: %s%s", now.c_str(), changes == 40 ? " (further changes not logged)" : "");
@@ -1377,7 +1490,7 @@ bool renodx_layer(const Layer& l) { return l.cfg.processing == nr::pe::Processin
 // At a game evaluate, while the chain has Present layers: its motion vectors and depth copied into the oldest set no
 // Present on the GPU still reads (none free: no copy this frame).
 void capture_guides(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, const Frame& f, const States& st,
-                    const nr::asi::Wilsjo2Frame& wf, uint32_t feature) {
+                    const nr::asi::Wilsjo2Frame& wf, uint32_t feature, bool depth_wanted) {
     GuideSet* target = nullptr;
     const uint64_t done = g_present.fence ? g_present.fence->GetCompletedValue() : ~0ull;
     // the set a Present read last is kept (present_path.hpp: a capture in flight must not leave every candidate
@@ -1391,7 +1504,7 @@ void capture_guides(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, const 
         if (s.read_value > done && done != ~0ull) continue;   // a Present on the GPU still reads it
         if (s.read_ticket && !s.read_ticket->ready()) continue;   // DLSS-G's evaluate list still reads it (or may)
         if (&s == last_read) continue;
-        if (k >= kD12GuideSetsBase && !s.depth) {
+        if (k >= kD12GuideSetsBase && !s.motion) {   // (the motion copy marks a set made; depth may be none)
             if (!spare) spare = &s;
             continue;
         }
@@ -1423,13 +1536,41 @@ void capture_guides(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, const 
         const D3D12_RESOURCE_DESC d = r->GetDesc();
         if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.DepthOrArraySize != 1 || d.SampleDesc.Count != 1) return;
     }
-    if (!clone_of(device, target->depth, f.depth) || !clone_of(device, target->motion, f.motion)) {
+    // The depth copied only when a Present reads it (Motion Without Depth off, a wilsjo2 Present layer, a held
+    // frame): a RenoDX layer's network with Motion Without Depth (the default, as NVIDIA's DLL) never binds it - four
+    // render-size depth copies less (4K render, 32-bit depth: 4 x 33 MB) and one copy a frame
+    if (!depth_wanted && target->depth) release_resource(target->depth);
+    // the depth through our shader pass (depth_read_into) into an R32_FLOAT twin; where that pass cannot run here, the
+    // copy of the resource as it is (said in the log once)
+    std::string depth_why;
+    bool depth_by_pass = false;
+    if (depth_wanted) {
+        if (g_guide_depth.device != device) { g_guide_depth.pass.reset(new nr::pe::bridge::DepthCopyD3D12()); g_guide_depth.device = device; g_guide_depth.said = false; }
+        depth_by_pass = g_guide_depth.pass->ready(device, &depth_why) &&
+                        nr::pe::bridge::depth_view_format(f.depth->GetDesc().Format) != DXGI_FORMAT_UNKNOWN &&
+                        !(f.depth->GetDesc().Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE);
+        if (!depth_by_pass && !g_guide_depth.said) {
+            g_guide_depth.said = true;
+            log("[nr] Present layers: the game's depth (DXGI format %u) cannot be read by our pass%s%s: it is copied as it is",
+                unsigned(f.depth->GetDesc().Format), depth_why.empty() ? "" : ": ", depth_why.c_str());
+        }
+    }
+    if ((depth_wanted && !(depth_by_pass ? depth_twin_of(device, target->depth, f.depth) : clone_of(device, target->depth, f.depth))) ||
+        !clone_of(device, target->motion, f.motion)) {
         target->serial = 0;
         return;
     }
     const std::pair<ID3D12Resource*, std::pair<ID3D12Resource*, D3D12_RESOURCE_STATES>> pairs[2] = {
-        {target->depth, {f.depth, st.depth}}, {target->motion, {f.motion, st.motion}}};
+        {depth_by_pass ? nullptr : target->depth, {f.depth, st.depth}}, {target->motion, {f.motion, st.motion}}};
+    // (the full barrier only where the depth is copied - the race it closes was the depth's; a motion-only copy, the
+    // usual Present layer (Motion Without Depth), takes the transitions alone, as 0.0.8.3: no GPU-wide wait a frame)
+    if (depth_wanted) guide_copy_barrier(cmd);
+    if (depth_by_pass && !depth_read_into(cmd, device, f.depth, st.depth, target->depth)) {
+        target->serial = 0;
+        return;
+    }
     for (const auto& pr : pairs) {
+        if (!pr.first) continue;
         transition(cmd, pr.second.first, pr.second.second, D3D12_RESOURCE_STATE_COPY_SOURCE);
         cmd->CopyResource(pr.first, pr.second.first);
         transition(cmd, pr.second.first, D3D12_RESOURCE_STATE_COPY_SOURCE, pr.second.second);
@@ -1451,7 +1592,7 @@ void capture_guides(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, const 
 // After every ExecuteCommandLists (nr_pe_menu.hpp on_execute): a guide set recorded on one of these lists is submitted
 // on this queue; our fence on it is signalled after them, so a Present on another queue can tell when they ran.
 void on_execute(ID3D12CommandQueue* queue, unsigned count, ID3D12CommandList* const* lists) {
-    nr::asi::hudcap::d3d12_executed(count, lists);   // HUD FIX's capture: the writes in the GPU's order
+    nr::asi::hudcap::d3d12_executed(count, lists, queue);   // HUD FIX's capture: the writes in the GPU's order
     std::lock_guard<std::mutex> guard(g_capture_lock);
     bool any = false;
     for (GuideSet& s : g_present.sets) {
@@ -1477,7 +1618,7 @@ void on_execute(ID3D12CommandQueue* queue, unsigned count, ID3D12CommandList* co
     tracker.first->AddRef();
     const auto fence = std::shared_ptr<ID3D12Fence>(tracker.first, [](ID3D12Fence* f) { f->Release(); });
     for (const auto& t : tickets) {
-        if (signalled) t->submitted([fence, value] { return fence->GetCompletedValue() >= value; });
+        if (signalled) t->submitted([fence, value] { const auto done=fence->GetCompletedValue(); return done!=UINT64_MAX && done>=value; });
         else t->submitted({});
     }
     for (GuideSet& s : g_present.sets)
@@ -1532,6 +1673,8 @@ bool ensure_ring(ID3D12Device* device) {
     if (g_present.list) { g_present.list->Release(); g_present.list = nullptr; }
     for (auto*& a : g_present.allocators) if (a) { a->Release(); a = nullptr; }
     if (g_present.fence) { g_present.fence->Release(); g_present.fence = nullptr; }
+    if (g_present.hud_rb) { g_present.hud_rb->Release(); g_present.hud_rb = nullptr; }
+    for (auto& v : g_present.hud_rb_image) v = 0;
     g_present.device = nullptr;
     for (auto*& a : g_present.allocators)
         if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&a)))) return false;
@@ -1550,37 +1693,50 @@ bool ensure_ring(ID3D12Device* device) {
 // A RenoDX mod's Game Brightness (present_path.hpp present_mod_white), as the ReShade route reads it: a renodx-*.addon
 // loaded in the process and its [renodx-preset1] ToneMapGameNits (48..10000) with its tone mapper on, read from the
 // ReShade.ini beside the ReShade module (else the game's folder). 0: none. Polled at most once a second.
+// Every DLL loaded or unloaded in the process (the loader notification, fg_library_loaded): the module list changed.
+// renodx_mod_white walks the modules again only then - a module snapshot under Wine costs ~2 ms on the game's Present
+// thread, and it used to run once a second whatever happened (a 2 ms hitch every second at Present).
+std::atomic<uint64_t> g_module_changes{0};
+std::atomic<bool> g_module_notified{false};   // the loader notification is registered (else: a walk once a second)
 float renodx_mod_white() {
     static ULONGLONG polled = 0;
     static float white = 0.f;
+    static uint64_t walked = ~0ull;   // g_module_changes at the last walk
+    static bool mod = false;
+    static std::wstring reshade_dir;
     const ULONGLONG now = GetTickCount64();
     if (polled && now - polled < 1000) return white;
     polled = now;
     white = 0.f;
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, 0);
-    if (snap == INVALID_HANDLE_VALUE) return white;
-    MODULEENTRY32W me{};
-    me.dwSize = sizeof me;
-    bool mod = false;
-    std::wstring reshade_dir;
-    for (BOOL ok = Module32FirstW(snap, &me); ok; ok = Module32NextW(snap, &me)) {
-        std::wstring n = me.szModule;
-        for (wchar_t& c : n) c = wchar_t(std::towlower(c));
-        mod |= n.rfind(L"renodx-", 0) == 0 && n.find(L".addon") != std::wstring::npos;
-        if (n == L"reshade64.dll" || n == L"reshade32.dll" || GetProcAddress(me.hModule, "ReShadeRegisterAddon")) {
-            std::wstring path = me.szExePath;
-            reshade_dir = path.substr(0, path.find_last_of(L"\\/"));
+    const uint64_t changes = g_module_changes.load();
+    if (!g_module_notified.load() || changes != walked) {
+        walked = changes;
+        mod = false;
+        reshade_dir.clear();
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, 0);
+        if (snap == INVALID_HANDLE_VALUE) { walked = ~0ull; return white; }
+        MODULEENTRY32W me{};
+        me.dwSize = sizeof me;
+        for (BOOL ok = Module32FirstW(snap, &me); ok; ok = Module32NextW(snap, &me)) {
+            std::wstring n = me.szModule;
+            for (wchar_t& c : n) c = wchar_t(std::towlower(c));
+            mod |= n.rfind(L"renodx-", 0) == 0 && n.find(L".addon") != std::wstring::npos;
+            if (n == L"reshade64.dll" || n == L"reshade32.dll" || GetProcAddress(me.hModule, "ReShadeRegisterAddon")) {
+                std::wstring path = me.szExePath;
+                reshade_dir = path.substr(0, path.find_last_of(L"\\/"));
+            }
         }
+        CloseHandle(snap);
     }
-    CloseHandle(snap);
     if (!mod) return white;
-    if (reshade_dir.empty()) {
+    std::wstring dir = reshade_dir;
+    if (dir.empty()) {
         wchar_t exe[MAX_PATH] = {};
         GetModuleFileNameW(nullptr, exe, MAX_PATH);
-        reshade_dir = exe;
-        reshade_dir = reshade_dir.substr(0, reshade_dir.find_last_of(L"\\/"));
+        dir = exe;
+        dir = dir.substr(0, dir.find_last_of(L"\\/"));
     }
-    const std::wstring ini = reshade_dir + L"\\ReShade.ini";
+    const std::wstring ini = dir + L"\\ReShade.ini";
     wchar_t type[32] = {}, nits[32] = {};
     GetPrivateProfileStringW(L"renodx-preset1", L"ToneMapType", L"0", type, 32, ini.c_str());
     GetPrivateProfileStringW(L"renodx-preset1", L"ToneMapGameNits", L"0", nits, 32, ini.c_str());
@@ -1626,45 +1782,17 @@ uint32_t w2_present_encoding(int space, bool space_set, DXGI_FORMAT format);
 // and the layers) and the final one (after the last layer and HUD FIX's composition), every processing's - read back
 // once our list is done. The request is taken here (screenshot::recorded), so no stage takes a pair of its own run.
 struct PresentShot {
-    ID3D12Resource* rb[2] = {};
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
-    uint32_t w = 0, h = 0;
-    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    nr::pe::d3d12shot::Readback pair;   // the copies and the hand-over (nr_d3d12_shot.hpp, shared with the passthrough)
     bool ok = false, done = false;
     bool submitted = false;   // our list with the copies was executed: the buffers are freed only once it is done
     bool prepare(ID3D12Device* device, ID3D12Resource* target) {
-        const D3D12_RESOURCE_DESC d = target->GetDesc();
-        if (!nr::pe::screenshot::readable(nr::pe::vulkan_format_of(d.Format))) {
-            nr::pe::screenshot::fail("unsupported_present", "the frame's format cannot be read back");
-            return false;
-        }
-        UINT64 total = 0;
-        device->GetCopyableFootprints(&d, 0, 1, 0, &fp, nullptr, nullptr, &total);
-        D3D12_HEAP_PROPERTIES hp{};
-        hp.Type = D3D12_HEAP_TYPE_READBACK;
-        D3D12_RESOURCE_DESC bd{};
-        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = total; bd.Height = 1; bd.DepthOrArraySize = 1;
-        bd.MipLevels = 1; bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        for (auto*& r : rb)
-            if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                                       IID_PPV_ARGS(&r))))
-                r = nullptr;
-        if (!rb[0] || !rb[1]) {
-            nr::pe::screenshot::abandon("allocation_failed", "the readback buffers could not be allocated");
-            return false;
-        }
-        w = uint32_t(d.Width); h = d.Height; format = d.Format;
+        if (!pair.prepare(device, target->GetDesc())) return false;
         nr::pe::screenshot::recorded();
         return ok = true;
     }
     void copy(ID3D12GraphicsCommandList* l, ID3D12Resource* target, int i) {
         if (!ok) return;
-        transition(l, target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
-        dst.pResource = rb[i]; dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst.PlacedFootprint = fp;
-        src.pResource = target; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        l->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-        transition(l, target, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        pair.copy(l, target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, i);
     }
     // `hdr`: 0 SDR, 1 scRGB (1.0 = 80 nits), 2 PQ; `layers` the chain's
     void deliver(ID3D12Fence* fence, uint64_t value, uint8_t hdr, size_t layers) {
@@ -1675,35 +1803,18 @@ struct PresentShot {
             if (e) CloseHandle(e);
         }
         if (fence->GetCompletedValue() < value) {   // not done in time: the buffers are kept (the GPU may still write them)
-            rb[0] = rb[1] = nullptr;
+            pair.forget();
             return;   // ~PresentShot abandons the request
         }
-        void* m[2] = {};
-        const D3D12_RANGE all{0, SIZE_T(fp.Footprint.RowPitch) * h};
-        if (FAILED(rb[0]->Map(0, &all, &m[0])) || FAILED(rb[1]->Map(0, &all, &m[1]))) return;
-        nr::pe::screenshot::Pair pair;
-        pair.width = w; pair.height = h; pair.row_pitch = fp.Footprint.RowPitch;
-        pair.format = nr::pe::vulkan_format_of(format);
-        pair.hdr_mode = hdr; pair.linear_unit_nits = 80.0f;
-        pair.pre = m[0]; pair.post = m[1];
-        pair.bytes = uint64_t(fp.Footprint.RowPitch) * h;
-        pair.meta = "path=present\ncomparison=final-picture-before-after-nr\nlayers=" + std::to_string(layers) +
-                    "\nwidth=" + std::to_string(w) + "\nheight=" + std::to_string(h) + "\nsource_format=" +
-                    std::to_string(int(pair.format)) + "\nhdr_mode=" + std::to_string(hdr) + "\n";
-        struct Owner { ID3D12Resource* rb[2]; };
-        pair.owner = new Owner{{rb[0], rb[1]}};
-        pair.release = [](void* o) {
-            auto* own = static_cast<Owner*>(o);
-            for (ID3D12Resource* r : own->rb) { r->Unmap(0, nullptr); r->Release(); }
-            delete own;
-        };
-        rb[0] = rb[1] = nullptr;
-        done = true;
-        nr::pe::screenshot::deliver(std::move(pair));
+        const std::string meta = "path=present\ncomparison=final-picture-before-after-nr\nlayers=" + std::to_string(layers) +
+                                 "\nwidth=" + std::to_string(pair.w) + "\nheight=" + std::to_string(pair.h) +
+                                 "\nsource_format=" + std::to_string(int(nr::pe::vulkan_format_of(pair.format))) +
+                                 "\nhdr_mode=" + std::to_string(hdr) + "\n";
+        done = pair.deliver(hdr, meta);
     }
     ~PresentShot() {
         // executed without a proof it finished (a failed Signal): kept; never executed: freed
-        if (!submitted) for (ID3D12Resource* r : rb) if (r) r->Release();
+        if (!submitted) pair.release();
         if (ok && !done) nr::pe::screenshot::abandon("capture_failed", "the Present's pair did not complete");
     }
 };
@@ -1828,7 +1939,7 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
             layer_note(*l, 2, 3, "Present cannot serve this swap chain's colour format");
             continue;
         }
-        runs.push_back({l, e, present_white_of(rs, windows_white)});
+        runs.push_back({l, e, e == 1u ? 0.f : present_white_of(rs, windows_white)});
     }
     g_present.unusable_w2 = w2_any && !w2_encoding;
     if (unusable != g_present.unusable.exchange(unusable)) {
@@ -1841,17 +1952,22 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
     g_present.served_ms = GetTickCount64();   // a Present of the game's reached its layers (evaluates: Present is alive)
     // HUD FIX's capture (nr_asi_hudcap.hpp): armed for Auto and Captured, its verdict on this frame
     const uint32_t hud_mode = chain->hud.mode;
+    nr::asi::hudcap::set_capture_wanted(hud_mode == 1 || hud_mode == 3);   // (its view bookkeeping: only then)
     // and frame generation's HUD-less frame (Auto's first choice, Game): what the game handed it this frame
     const nr::asi::hudcap::Frame hud_cap = nr::asi::hudcap::d3d12_present(
         device, sc, queue, back, format, w, h, !runs.empty() && (hud_mode == 1 || hud_mode == 3),
         !runs.empty(),   // (every mode: fg_delta below)
         hud_mode == 1 || hud_mode == 2);   // copies on the hand-over's own command list only for HUD FIX (as 0.0.8.1)
-    const bool hud_fg = hud_cap.fg.seen && hud_cap.fg.copy && (hud_mode == 1 || hud_mode == 2);
+    const bool hud_fg = hud_cap.fg.seen && hud_cap.fg.copy && hud_cap.fg.hudless && (hud_mode == 1 || hud_mode == 2);
     const bool hud_captured = hud_fg || (hud_cap.result == nr::asi::hudcap::Result::kCaptured && hud_cap.hudless);
     ID3D12Resource* const hud_hudless = hud_fg ? hud_cap.fg.copy : hud_cap.hudless;
+    // (the chain capture: the copy of the final pass's input; until it is trusted the layers run on the frame itself and
+    // the copy only says where the HUD is - source 5)
+    const bool hud_chain_check = hud_captured && !hud_fg && hud_cap.chain;   // (checked on the GPU every frame: source 5 / 6)
     hud_report(!runs.empty(), true, hud_captured && !hud_fg, hud_cap.why, true, hud_fg, hud_cap.fg.why, hud_cap.fg.source,
-               hud_cap.broken, hud_cap.fg.offered || hud_cap.fg.seen,
-               hud_cap.result == nr::asi::hudcap::Result::kCaptured && hud_cap.hudless);
+               hud_cap.broken, hud_cap.fg.offered || (hud_cap.fg.seen && hud_cap.fg.hudless),
+               hud_cap.result == nr::asi::hudcap::Result::kCaptured && hud_cap.hudless,
+               !hud_cap.chain || hud_fg ? nullptr : NR_N("captured: the final pass's input"));
     if (runs.empty()) return;
     // Frame generation (present_path.hpp RunPresentPath): a matching DLSS-G declaration is authoritative; without one
     // the cadence of presents against fresh captures, over windows (nr_present_cadence.hpp)
@@ -1909,7 +2025,7 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
             log("[nr] Present trace: present %llu, %ux, guides #%llu from %lld presents ago, HUD FIX %s%s%s",
                 static_cast<unsigned long long>(g_present.presents), multiplier, static_cast<unsigned long long>(newest),
                 newest ? static_cast<long long>(g_present.presents - newest_at) : -1ll,
-                hud_fg ? "frame generation's HUD-less frame" : hud_captured ? "captured" : "estimated / none",
+                hud_fg ? "frame generation's HUD-less frame" : hud_captured ? "captured" : "none",
                 hud_fg && hud_cap.fg.substitute ? " (NR's answer handed to frame generation)" : "",
                 hud_fg && hud_cap.fg.copied ? " (copied on the game's list)" : "");
         }
@@ -1947,6 +2063,19 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
         }
     }
     if (!at) g_present.slot_wait_off = false;
+    // HUD FIX's chain capture: the count this slot's last list read back (the slot is free: its list is done)
+    if (!at && g_present.hud_rb && g_present.hud_rb_image[slot] && g_present.fence->GetCompletedValue() >= g_present.slot_value[slot]) {
+        const D3D12_RANGE range{size_t(slot) * 512, size_t(slot) * 512 + 16};
+        void* mapped = nullptr;
+        if (SUCCEEDED(g_present.hud_rb->Map(0, &range, &mapped)) && mapped) {
+            uint32_t counts[4];
+            std::memcpy(counts, static_cast<const uint8_t*>(mapped) + size_t(slot) * 512, sizeof counts);
+            const D3D12_RANGE none{0, 0};
+            g_present.hud_rb->Unmap(0, &none);
+            nr::asi::hudcap::chain_checked(g_present.hud_rb_image[slot], counts[0], g_present.hud_rb_total[slot]);
+        }
+        g_present.hud_rb_image[slot] = 0;
+    }
     // Which guide sets this Present may read: submitted and ordered before it (on its queue, or complete on another)
     bool ordered[kD12GuideSets] = {};
     {
@@ -1970,11 +2099,48 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
         nr::gpu::reset(l);
     }
     nr::gpu::Scope recording(nr::asi::hudcap::d3d12_recording(l));
+    nr::asi::hudcap::d3d12_use_chain(hud_cap);
     g_d12_uses.touch();
+    // The first layer, a RenoDX one, reads the back buffer itself (a shader resource view) and stores its answer
+    // into our copy, which then goes back as before - the copy of the back buffer into ours goes (4K RGBA16F 0.11 ms,
+    // 8-bit 0.03). Only where nothing else reads our copy before that layer: no HUD FIX, comparison, hold, F5 pair or
+    // frame generation hand-over, the back buffer in our copy's format, a device that takes it in place
+    // (d12_reads_in_place). Whatever reads our copy before the layer has written it fills it first (fill_target).
+    // NR_PRESENT_READ_BACK=0: the copy as before.
+    static const bool read_back_off = [] { const char* e = std::getenv("NR_PRESENT_READ_BACK"); return e && e[0] == '0'; }();
+    bool read_back = false;
+    if (!read_back_off && !at && bd.Format == format && renodx_layer(*runs.front().layer) && d12_reads_in_place(device) &&
+        !nr::pe::screenshot::wants_final()) {
+        std::vector<const Layer*> rl;
+        for (const Run& run : runs) rl.push_back(run.layer);
+        size_t a0 = 0, b0 = 0;
+        // a captured HUD-less frame the layers run on (HUD FIX, frame generation's) needs our copy first
+        const bool hud_any = hud_fg || (hud_cap.result == nr::asi::hudcap::Result::kCaptured && hud_cap.hudless);
+        const bool fg_any = hud_cap.fg.seen && hud_cap.fg.substitute && hud_cap.fg.copy && hud_cap.fg.game && !hud_fg;
+        read_back = !hud_any && !fg_any && !inspect_span(chain->inspect, rl, true, &a0, &b0) &&
+                    chosen_index(chain->inspect, rl) < 0 && !g_present.hold.held;
+    }
+    D3D12_RESOURCE_STATES back_now = D3D12_RESOURCE_STATE_COPY_SOURCE;   // where the back buffer is until the end
+    bool filled = !read_back;
+    if (read_back) {
+        back_now = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        transition(l, back, back_state, back_now);
+        transition(l, g_present.target, g_present.target_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    } else {
     transition(l, back, back_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
     transition(l, g_present.target, g_present.target_state, D3D12_RESOURCE_STATE_COPY_DEST);
     l->CopyResource(g_present.target, back);
     transition(l, g_present.target, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+    const auto fill_target = [&] {   // our copy made now, for whatever reads it before the first layer wrote it
+        if (filled) return;
+        filled = true;
+        transition(l, back, back_now, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        transition(l, g_present.target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+        l->CopyResource(g_present.target, back);
+        transition(l, g_present.target, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        transition(l, back, D3D12_RESOURCE_STATE_COPY_SOURCE, back_now);
+    };
     PresentShot shot;   // F5: the frame as the game presents it
     if (nr::pe::screenshot::wants_final()) {
         if (at)   // its pair needs our own submission's fence to read back
@@ -1987,7 +2153,7 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
     std::vector<GuideSet*> readable;
     auto read = [&](GuideSet* gs) {
         if (!gs || std::find(readable.begin(), readable.end(), gs) != readable.end()) return;
-        transition(l, gs->depth, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        if (gs->depth) transition(l, gs->depth, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         transition(l, gs->motion, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         readable.push_back(gs);
     };
@@ -2005,25 +2171,14 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
         g_present.hold.held = false;
     }
     // HUD FIX: the frame before the layers kept; composed after the last of them (before a final-picture comparison
-    // shows it). Captured (Auto's first choice): the layers run on the copy made before the HUD, the difference of the
-    // two is the HUD (source 2; Auto keeps the estimate's state too); else the estimate (Auto, Estimated).
-    const uint32_t hud_source = hud_captured ? 2u : hud_mode == 1 || hud_mode == 4 ? 4u : 0u;   // hud_captured: FG's too
-    const bool hud_estimate = hud_source == 4 || (hud_captured && hud_mode == 1);
+    // shows it). Captured (Auto's first choice) or frame generation's HUD-less frame: the layers run on that copy
+    // without the HUD, the difference of the two is the HUD (source 2); without one HUD FIX does nothing.
+    uint32_t hud_source = hud_captured ? (hud_chain_check ? 5u : 2u) : 0u;   // hud_captured: FG's too
     bool hud = false;
     if (hud_source && !runs.empty()) {
         PresentPath& P = g_present;
-        const auto desc_of = [](ID3D12Resource* r) { return r ? r->GetDesc() : D3D12_RESOURCE_DESC{}; };
-        if (desc_of(P.hud_back).Format != format || desc_of(P.hud_back).Width != w || desc_of(P.hud_back).Height != h)
-            P.hud_prev_valid = false;
-        if (desc_of(P.hud_alpha).Width != w || desc_of(P.hud_alpha).Height != h) P.hud_fresh = true;
-        if (hud_estimate && P.hud_estimated_at + 1 != P.presents) {   // after a gap: no stale confidence
-            P.hud_fresh = true;
-            P.hud_prev_valid = false;
-        }
         hud = ensure_texture(device, P.hud_back, P.hud_back_state, format, w, h) &&
-              ensure_texture(device, P.hud_prev, P.hud_prev_state, format, w, h) &&
-              ensure_texture(device, P.hud_alpha, P.hud_alpha_state, DXGI_FORMAT_R16G16B16A16_FLOAT, w, h) &&
-              ensure_texture(device, P.hud_stats, P.hud_stats_state, DXGI_FORMAT_R32_UINT, hud_stats_w(w), hud_stats_h(h));
+              ensure_texture(device, P.hud_stats, P.hud_stats_state, DXGI_FORMAT_R32_UINT, kHudStatsW, kHudStatsH);
         if (!hud && !P.hud_said) { P.hud_said = true; log("[nr] HUD FIX: its textures could not be made; it does not run"); }
         const auto copy = [&](ID3D12Resource* from, ID3D12Resource* to) {
             transition(l, from, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -2033,8 +2188,7 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
             transition(l, from, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         };
         if (hud) {
-            copy(P.target, P.hud_back);
-            if (!P.hud_prev_valid) { copy(P.target, P.hud_prev); P.hud_prev_valid = true; }
+            copy(P.target, P.hud_back);   // (HUD FIX runs only with a HUD-less frame: our copy is made, not read back)
             if (hud_fg && !hud_cap.fg.copied) {   // frame generation's HUD-less frame, valid until the present: copied now
                 transition(l, hud_cap.fg.game, hud_cap.fg.state, D3D12_RESOURCE_STATE_COPY_SOURCE);
                 transition(l, hud_cap.fg.copy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -2042,7 +2196,33 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
                 transition(l, hud_cap.fg.copy, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 transition(l, hud_cap.fg.game, D3D12_RESOURCE_STATE_COPY_SOURCE, hud_cap.fg.state);
             }
-            if (hud_captured) copy(hud_hudless, P.target);   // the layers run on the frame without its HUD
+            // Read alpha from a separately tagged UI only after the pairing/lifetime gate in hudcap.
+            // Copied to a typed texture in the UI's own format group (hudcap::ui_alpha_format: a TYPELESS source, DXGI 27
+            // in a game seen, or a BGRA8 / 10-bit one beside any SDR swap chain); an HDR back buffer keeps the RGB
+            // difference (the UI was blended before the PQ / scRGB encoding, its alpha does not hold there)
+            const DXGI_FORMAT ui_format = hud_fg && hud_cap.fg.ui ? nr::asi::hudcap::ui_alpha_format(hud_cap.fg.ui->GetDesc().Format)
+                                                                  : DXGI_FORMAT_UNKNOWN;
+            const bool sdr_back = w2_present_encoding(space, space_set, bd.Format) == 1u;
+            if (ui_format != DXGI_FORMAT_UNKNOWN && sdr_back &&
+                ensure_texture(device, P.hud_ui, P.hud_ui_state, ui_format, w, h)) {
+                transition(l, hud_cap.fg.ui, hud_cap.fg.ui_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                transition(l, P.hud_ui, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+                l->CopyResource(P.hud_ui, hud_cap.fg.ui);
+                transition(l, P.hud_ui, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                transition(l, hud_cap.fg.ui, D3D12_RESOURCE_STATE_COPY_SOURCE, hud_cap.fg.ui_state);
+                hud_source = 1; // existing HUD_COMPOSE UI.a path; no alpha estimation or dilation
+            }
+            if (hud_fg && P.hud_ui_report != int(hud_source == 1)) {
+                P.hud_ui_report = int(hud_source == 1);
+                log("[nr] HUD FIX alpha: %s (XeSS presentId %u)", hud_source == 1 ?
+                    "authored UI.a, paired full-frame SDR texture"
+                    : hud_cap.fg.ui && !sdr_back ? "the back buffer is HDR; RGB-difference fallback"
+                                                 : "no paired UI; RGB-difference fallback", hud_cap.fg.ui_frame);
+            }
+            if (hud_captured && !hud_chain_check) copy(hud_hudless, P.target);   // the layers run on the frame without its HUD
+            // the chain capture's copy where it fits the frame (else the frame: the composition then takes NR's answer
+            // whole), decided on the GPU before the layers; not recorded: the layers run on the frame
+            if (hud_chain_check) (void)nr::asi::hudfix_select_d3d12(l, device, P.hud_back, hud_hudless, P.hud_stats, P.target, w, h);
         }
     }
     // Frame generation reads the game's HUD-less frame at the present: FSR and XeSS frame generation interpolate the
@@ -2058,7 +2238,12 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
     bool fg_delta = hud_cap.fg.seen && hud_cap.fg.substitute && hud_cap.fg.copy && hud_cap.fg.game && !hud_fg;
     if (fg_delta) {
         const D3D12_RESOURCE_DESC gd = hud_cap.fg.game->GetDesc(), cd = hud_cap.fg.copy->GetDesc();
-        if (gd.Format != format || gd.Width != w || gd.Height != h || cd.Format != format || cd.Width != w || cd.Height != h) {
+        // the game's frame is only copied (CopyResource: one typeless group is enough; a game's RGBA8 HUD-less frame can
+        // be TYPELESS, DXGI 27, beside an R8G8B8A8_UNORM swap chain); the shader reads our copy, made in the swap chain's
+        // format. The same group rule as the capture's (hudcap fg_note), so the two can never disagree again.
+        using nr::asi::hudcap::copy_group;
+        if (copy_group(gd.Format) != copy_group(format) || gd.Width != w || gd.Height != h || cd.Format != format ||
+            cd.Width != w || cd.Height != h) {
             fg_delta = false;
             static uint32_t said = ~0u;
             if (said != uint32_t(gd.Format))
@@ -2074,8 +2259,8 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
         const bool ready = (hud || ensure_texture(device, P.fg_pre, P.fg_pre_state, format, w, h)) &&
                            ensure_texture(device, P.fg_out, P.fg_out_state, format, w, h) &&
                            ensure_texture(device, P.fg_zero, P.fg_zero_state, DXGI_FORMAT_R16G16B16A16_FLOAT, w, h) &&
-                           ensure_texture(device, P.hud_stats, P.hud_stats_state, DXGI_FORMAT_R32_UINT, hud_stats_w(w),
-                                          hud_stats_h(h));
+                           ensure_texture(device, P.hud_stats, P.hud_stats_state, DXGI_FORMAT_R32_UINT, kHudStatsW,
+                                          kHudStatsH);
         if (!ready) {
             if (!P.fg_said) {
                 P.fg_said = true;
@@ -2084,7 +2269,7 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
             }
         } else {
             if (hud) {
-                fg_before = P.hud_back;   // (the pointer: hud_end swaps the two roles afterwards)
+                fg_before = P.hud_back;
             } else {
                 transition(l, P.target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
                 transition(l, P.fg_pre, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -2105,23 +2290,9 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
     const auto hud_end = [&] {
         PresentPath& P = g_present;
         nr::asi::HudFixD3D12 r;
-        r.back = P.hud_back; r.frame = P.target; r.alpha = P.hud_alpha; r.stats = P.hud_stats; r.previous = P.hud_prev;
+        r.back = P.hud_back; r.frame = P.target; r.alpha = hud_source == 1 ? P.hud_ui : nullptr;
+        r.stats = P.hud_stats;
         r.hudless = hud_captured ? hud_hudless : nullptr;
-        // the estimate with the game's motion vectors: the newest fresh guides of the back buffer's aspect, their units
-        // in output pixels (low-resolution vectors: by the output's size over the render size) per present
-        if (hud_estimate && guides && guides->f.out_w && guides->f.render_w) {
-            read(guides);
-            const Frame& gf = guides->f;
-            const bool low = (gf.flags & kFlagMvLowRes) != 0;
-            const float sx = low ? float(gf.out_w) / float(gf.render_w) : 1.f, sy = low ? float(gf.out_h) / float(gf.render_h) : 1.f;
-            const float per = 1.0f / float(multiplier);
-            r.motion = guides->motion;
-            r.motion_scale_x = gf.mv_x * sx * per * float(w) / float(gf.out_w);
-            r.motion_scale_y = gf.mv_y * sy * per * float(h) / float(gf.out_h);
-            r.motion_x = gf.motion_rect.x; r.motion_y = gf.motion_rect.y;
-            r.motion_step_x = float(gf.motion_rect.width) / float(w);
-            r.motion_step_y = float(gf.motion_rect.height) / float(h);
-        }
         if (hud_fg && hud_cap.fg.substitute) {   // NR's answer on it handed to frame generation in its place
             transition(l, P.target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
             transition(l, hud_cap.fg.game, hud_cap.fg.state, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -2129,8 +2300,7 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
             transition(l, hud_cap.fg.game, D3D12_RESOURCE_STATE_COPY_DEST, hud_cap.fg.state);
             transition(l, P.target, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         }
-        if (!nr::asi::wilsjo2_hudfix(l, device, r, w, h, hud_source, chain->hud.show_mask, P.hud_fresh, P.hud_parity,
-                                     hud_estimate)) {
+        if (!nr::asi::hudfix_d3d12(l, device, r, w, h, hud_source, chain->hud.show_mask)) {
             if (hud_captured) {   // the layers ran on the copy without the HUD: the frame as the game drew it goes back
                 transition(l, P.hud_back, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
                 transition(l, P.target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -2148,15 +2318,36 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
             nr::pe::control::hud_facts("nothing this frame: its composition could not be recorded", nullptr, nullptr, nullptr);
             return;
         }
-        if (hud_estimate) {
-            P.hud_fresh = false;
-            P.hud_parity ^= 1u;
-            P.hud_estimated_at = P.presents;
+        // the chain capture's check: this frame's HUD count (hudfix.comp's u1.x) read back by this slot's list
+        if (hud_cap.chain && !hud_fg && !at) {
+            if (!P.hud_rb) {
+                D3D12_HEAP_PROPERTIES hp{};
+                hp.Type = D3D12_HEAP_TYPE_READBACK;
+                D3D12_RESOURCE_DESC bd{};
+                bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+                bd.Width = 512 * kPresentRing; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+                bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                           nullptr, IID_PPV_ARGS(&P.hud_rb))))
+                    P.hud_rb = nullptr;
+            }
+            if (P.hud_rb) {
+                transition(l, P.hud_stats, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                D3D12_TEXTURE_COPY_LOCATION to{}, from{};
+                to.pResource = P.hud_rb;
+                to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                to.PlacedFootprint.Offset = uint64_t(slot) * 512;
+                to.PlacedFootprint.Footprint = {DXGI_FORMAT_R32_UINT, 4, 1, 1, 256};
+                from.pResource = P.hud_stats;
+                from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                from.SubresourceIndex = 0;
+                const D3D12_BOX box{0, 0, 0, 4, 1, 1};
+                l->CopyTextureRegion(&to, 0, 0, 0, &from, &box);
+                transition(l, P.hud_stats, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                P.hud_rb_image[slot] = hud_cap.chain_image;
+                P.hud_rb_total[slot] = w * h;
+            }
         }
-        // this frame's kept frame becomes the next one's previous by swapping the two textures' roles (the next
-        // frame overwrites hud_back first) instead of copying it into hud_prev; both rest in UNORDERED_ACCESS
-        std::swap(P.hud_back, P.hud_prev);
-        std::swap(P.hud_back_state, P.hud_prev_state);
         ran = true;
     };
     for (size_t k = 0; k < runs.size(); ++k) {
@@ -2182,6 +2373,7 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
             return &held_set;
         };
 
+        if (!(k == 0 && renodx_layer(*run.layer))) fill_target();
         if (inspect && k == ia) inspect_copy(l, device, g_present.inspect_off, g_present.inspect_off_state, g_present.target);
         [&] {
         const Layer& layer = *run.layer;
@@ -2199,7 +2391,7 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
             GuideSet* g = nullptr;
             for (uint32_t k = 0; k < kD12GuideSets; ++k) {
                 GuideSet& gs = g_present.sets[k];
-                if (!ordered[k] || gs.serial <= pl.consumed || !fresh(gs) || (g && gs.serial < g->serial))
+                if (!ordered[k] || gs.serial <= pl.consumed || !fresh(gs) || (g && gs.serial < g->serial) || !gs.depth)
                     continue;
                 g = &gs;
             }
@@ -2213,9 +2405,20 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
                 held_set.depth = hi.guides[0]; held_set.motion = hi.guides[1];
                 g = &held_set;
             }
+            // A Present of frame generation between two game frames (no new capture since the last run): the last
+            // capture again, its motion 1/multiplier of a game frame, as RenoDX's layers run on every present
+            // (NRPresentFrames = 0). Frame generation interpolates from the game's frame without NR (a HUD-less one the
+            // game hands it, e.g. DLSS-G -> OptiScaler's XeFG): run once a game frame, every generated frame was shown
+            // without NR, so the alternating frames can show different NR strength.
+            bool generated = false;
+            if (!g && multiplier > 1u && pl.consumed && g_present.presents - pl.consumed_present <= multiplier + 1u)
+                for (uint32_t k = 0; k < kD12GuideSets; ++k) {
+                    GuideSet& gs = g_present.sets[k];
+                    if (gs.serial == pl.consumed && ordered[k] && fresh(gs) && gs.depth) { g = &gs; generated = true; }
+                }
             if (!g) {
-                // A Present of frame generation between two game frames: the last one was taken a moment ago (one
-                // capture, one run): nothing to say, the row stays as it is
+                // A Present of frame generation between two game frames whose capture can no longer be read: the last
+                // one was taken a moment ago (one capture, one run): nothing to say, the row stays as it is
                 if (pl.consumed && g_present.presents - pl.consumed_present <= multiplier + 1u)
                     return;
                 pl.w2_reset = true;
@@ -2223,9 +2426,17 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
                 return;
             }
             if (g != &held_set) read(g);
-            pl.consumed = g->serial;
-            pl.consumed_present = g_present.presents;
+            if (!generated) {
+                pl.consumed = g->serial;
+                pl.consumed_present = g_present.presents;
+            }
             nr::asi::Wilsjo2Frame wf = g->w2;
+            if (generated) {   // (the game's reset rode the first present of its frame)
+                const auto scale = [](float v) { return std::isfinite(v) && v != 0.0f ? v : 1.0f; };   // (as read)
+                wf.mv_x = scale(wf.mv_x) / float(multiplier);
+                wf.mv_y = scale(wf.mv_y) / float(multiplier);
+                wf.reset = false;
+            }
             wf.depth = g->depth; wf.motion = g->motion; wf.exposure = nullptr;
             wf.depth_state = wf.motion_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
             wf.hdr = run.encoding != 1;
@@ -2301,14 +2512,18 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
         rf.present_white_nits = run.white;
         route::begin_run(rf);
         route::note_encode(run.encoding == 3, w, h);
-        route::set_direct(g_present.target);
+        // the first layer reading the back buffer: colour = the back buffer (its state back_now), output = our
+        // copy, written by the stage's store (or the seed copy when the network does not run)
+        const bool from_back = !filled;
+        route::set_direct(from_back ? nullptr : g_present.target);
+        filled = true;
         {
             route::CallStyle style(true);
             route::CallSettings settings(&rs);
             route::CallNetwork network(layer.network);
             route::CallLayer number(row_number(layer));
             const Rect whole{0, 0, w, h};
-            nr::dlssnr::evaluate_d3d12(l, pl.nr, nullptr, g_present.target, g ? g->depth : nullptr,
+            nr::dlssnr::evaluate_d3d12(l, pl.nr, nullptr, from_back ? back : g_present.target, g ? g->depth : nullptr,
                                        g ? g->motion : nullptr, g_present.target, w, h, g ? g->f.depth_rect : whole,
                                        g ? g->f.motion_rect : whole, g ? ((g->f.flags & kFlagDepthInverted) ? 1 : 0) : 1,
                                        reset ? 1 : 0, nr::dlssnr::Controls6{}, g ? g->f.mv_x * share : 1.f,
@@ -2318,13 +2533,13 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
         if (g) pl.consumed = g->serial;
         ran = true;
             }();
-        if (hud && k + 1 == runs.size()) hud_end();
+        if (hud && k + 1 == runs.size()) { fill_target(); hud_end(); }
         if (inspect && k == ib)
             inspect_show(l, device, chain->inspect, g_present.inspect_off, g_present.inspect_off_state, g_present.inspect_on,
                          g_present.inspect_on_state, g_present.target);
     }
     for (GuideSet* gs : readable) {
-        transition(l, gs->depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+        if (gs->depth) transition(l, gs->depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
         transition(l, gs->motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     }
     int hud_given = 0;   // (counted at DLSS-G's evaluate) 1: DLSS-G's own HUD-less frame got NR's change, 2: another
@@ -2341,8 +2556,8 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
             static bool said = false;
             if (!said) {
                 said = true;
-                log("[nr] Present layers: %s's HUD-less frame gets NR's change (frame generation interpolates frames "
-                    "with NR)", hud_cap.fg.source);
+                log("[nr] Present layers: %s's %s gets NR's change (frame generation interpolates frames with NR)",
+                    hud_cap.fg.source, hud_cap.fg.hudless ? "HUD-less frame" : "frame it is dispatched from");
             }
         } else if (!P.fg_said) {
             P.fg_said = true;
@@ -2351,9 +2566,10 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
         }
     }
     if (at) ++(hud_given == 1 ? g_pacing.dlssg_hud_own : hud_given == 2 ? g_pacing.dlssg_hud_other : g_pacing.dlssg_hud_none);
+    if (ran) fill_target();   // (every run fills it; for certainty)
     shot.copy(l, g_present.target, 1);   // F5: the final picture
     transition(l, g_present.target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    transition(l, back, D3D12_RESOURCE_STATE_COPY_SOURCE, ran ? D3D12_RESOURCE_STATE_COPY_DEST : back_state);
+    transition(l, back, back_now, ran ? D3D12_RESOURCE_STATE_COPY_DEST : back_state);
     if (ran) {
         l->CopyResource(back, g_present.target);
         transition(l, back, D3D12_RESOURCE_STATE_COPY_DEST, back_state);
@@ -3890,7 +4106,11 @@ void hook_fg_library(HMODULE m) {
 struct LdrUnicode { USHORT length, maximum; PWSTR buffer; };
 struct LdrLoaded { ULONG flags; const LdrUnicode* full_name; const LdrUnicode* base_name; PVOID base; ULONG size; };
 VOID NTAPI fg_library_loaded(ULONG reason, const LdrLoaded* data, PVOID) {
+    ++g_module_changes;   // renodx_mod_white's module walk
     if (!data || !data->base_name || !data->base_name->buffer) return;
+    const std::wstring loaded_name(data->base_name->buffer,data->base_name->length/sizeof(wchar_t));
+    if (reason==1 && _wcsicmp(loaded_name.c_str(),L"d3d12.dll")==0)
+        nr::asi::hudcap::d3d12_module(static_cast<HMODULE>(data->base));
     if (!fg_library_name(std::wstring(data->base_name->buffer, data->base_name->length / sizeof(wchar_t)))) return;
     const auto lo = reinterpret_cast<uintptr_t>(data->base);
     if (reason == 2) { fg_range_set(lo, 0); return; }   // LDR_DLL_NOTIFICATION_REASON_UNLOADED
@@ -3906,6 +4126,8 @@ void hook_fg_libraries() {
     static PVOID cookie = nullptr;
     if (!reg || reg(0, &fg_library_loaded, nullptr, &cookie) != 0)
         log("[nr] Present layers: no loader notification; frame-generation libraries loaded later are not followed");
+    else
+        g_module_notified = true;
     {   // the frame-generation libraries already loaded: their ranges
         HMODULE mods[1024];
         DWORD bytes = 0;
@@ -4153,7 +4375,16 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_evaluate(ID3D12GraphicsCommandList* cmd, const 
     }
     const nr::asi::Wilsjo2Frame wf = wilsjo2_frame(p, f, st);
     g_present.wanted = present_wanted;
-    if (present_wanted) capture_guides(cmd, device, f, st, wf, h->Id);
+    if (present_wanted) {
+        bool depth_wanted = nr::pe::g_motion_without_depth_now.load() != 1 || chain->inspect.hold;
+        for (const Layer& l : chain->layers)
+            // (Passes (fast) Interleaved reads the depth itself - its anti-ghost's disocclusion test and vector
+            // dilation - whatever the network does: without the copy those tests never ran at Present)
+            depth_wanted |= present_layer(l) && (l.cfg.processing == nr::pe::Processing::kWilsjo2 ||
+                                                 (renodx_layer(l) && l.cfg.renodx.values.passes_mode == 1u &&
+                                                  l.cfg.renodx.values.fast_method == 0u));
+        capture_guides(cmd, device, f, st, wf, h->Id, depth_wanted);
+    }
 
     NVSDK_NGX_Result r;
     if (!before.empty()) {
@@ -4164,6 +4395,66 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_evaluate(ID3D12GraphicsCommandList* cmd, const 
         const uint32_t rx = before_renodx ? f.color_x : 0u, ry = before_renodx ? f.color_y : 0u;
         const uint32_t rw = before_renodx ? f.render_w : w2_aw, rh = before_renodx ? f.render_h : w2_ah;
         const DXGI_FORMAT format = f.color->GetDesc().Format;
+        // The first layer, a RenoDX one, reads the game's colour where it is and stores its answer into the mirror
+        // handed to the upscaler - no copy of the colour's region, no copy of the colour into the mirror, no copy of the
+        // region back (three render-size copies; t.copy not needed). Where the region is the whole colour and nothing
+        // reads the frame before that layer (no comparison, no held frame), on a device that takes it in place
+        // (d12_reads_in_place). NR_BEFORE_DIRECT=0: as before.
+        static const bool before_direct_off = [] { const char* e = std::getenv("NR_BEFORE_DIRECT"); return e && e[0] == '0'; }();
+        const D3D12_RESOURCE_DESC cdesc = f.color->GetDesc();
+        size_t ia0 = 0, ib0 = 0;
+        const bool before_direct = !before_direct_off && before.front()->cfg.processing == nr::pe::Processing::kRenoDX &&
+            d12_reads_in_place(device) &&
+            rx == 0 && ry == 0 && uint64_t(rw) == cdesc.Width && rh == cdesc.Height &&
+            !inspect_span(chain->inspect, before, after.empty() && !present_takes, &ia0, &ib0) &&
+            chosen_index(chain->inspect, before) < 0 && ensure_mirror(device, t.mirror, t.mirror_state, f.color);
+        if (before_direct) {
+            if (t.copy) release_resource(t.copy);   // (made for frames that went the other way)
+            transition(cmd, f.color, st.color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            transition(cmd, t.mirror, t.mirror_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            bool filled = false;
+            const Frame live_frame = f; const States live_states = st; const auto live_wf = wf;
+            for (size_t k = 0; k < before.size(); ++k) {
+                Frame f = live_frame; States st = live_states; auto wf = live_wf;
+                const Layer* l = before[k];
+                if (k > 0 && !filled) {   // the first could not run: the colour copied in for the rest
+                    transition(cmd, f.color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    transition(cmd, t.mirror, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+                    cmd->CopyResource(t.mirror, f.color);
+                    transition(cmd, t.mirror, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                    transition(cmd, f.color, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                    filled = true;
+                }
+                LayerState& ls = layer_state(t, *l);
+                if (l->cfg.processing == nr::pe::Processing::kRenoDX) {
+                    const bool ran = run_renodx(cmd, ls, *l, 1, f, t.mirror, rw, rh, st, k == 0 ? f.color : nullptr);
+                    if (k == 0) filled = ran;
+                } else if (nr_on) {
+                    if (!ls.w2[1]) ls.w2[1] = nr::asi::wilsjo2_owner();
+                    nr::pe::renodx_route::CallNetwork network(l->network);
+                    nr::pe::renodx_route::CallLayer number(row_number(*l));
+                    nr::asi::Wilsjo2Frame wr = wf;
+                    wr.reset = wr.reset || hold_released(row_number(*l));
+                    wr.out_w = f.out_w; wr.out_h = f.out_h;
+                    nr::asi::wilsjo2_run(cmd, device, *ls.w2[1], wr, l->w2, t.mirror, rw, rh, true);
+                }
+            }
+            transition(cmd, f.color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, st.color);
+            ID3D12Resource* handed = filled ? t.mirror : f.color;   // nothing ran: the game's own colour
+            if (filled) {
+                transition(cmd, t.mirror, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, st.color);
+                t.mirror_state = st.color;
+            } else {
+                t.mirror_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            }
+            guard.unlock();
+            if (handed != f.color) { if (f.color_as_resource) p->Set(f.color_key, handed); else p->Set(f.color_key, static_cast<void*>(handed)); }
+            if (tr) log("[nr] trace %d: the layers before the upscaler recorded; OptiScaler's evaluate next", tr);
+            r = real_evaluate(cmd, h, p, callback);
+            if (tr) log("[nr] trace %d: OptiScaler's evaluate returned %d", tr, int(r));
+            if (handed != f.color) { if (f.color_as_resource) p->Set(f.color_key, f.color); else p->Set(f.color_key, static_cast<void*>(f.color)); }
+            goto after_layers;
+        }
         if (!ensure_texture(device, t.copy, t.copy_state, format, rw, rh)) {
             // the layers before the upscaler cannot run this frame: the upscaler and the layers after it still do
             // (0.0.7 ran its after-SR NR on its own)
@@ -5947,8 +6238,6 @@ struct VkGuideSet {
     Rect depth_rect, motion_rect;
     bool inverted = false, reset = false;
     float mv_x = 1.0f, mv_y = 1.0f;
-    uint32_t render_w = 0, render_h = 0;    // the render extent, and whether the vectors are at it (HUD FIX's estimate)
-    bool low_res_mv = true;
     uint64_t serial = 0;                    // 0: empty
     uint64_t captured_at = 0;               // presents seen at the capture
     ULONGLONG captured_ms = 0;
@@ -5971,13 +6260,9 @@ struct VkPresentPath {
     OwnImage xfer;                          // the copy bridge's picture (a swap chain not shared with NR's family)
     bool said_xfer = false;
     OwnImage linear, encoded;               // wilsjo2's HDR10 finished picture (as D3D12's)
-    // HUD FIX (wilsjo2_hudfix.comp): the frame before the layers, the last one (the estimate's), the HUD's alpha and
-    // confidence (RG16F), the counts (R32_UINT 4 x 1)
-    OwnImage hud_back, hud_prev, hud_alpha, hud_stats;
-    bool hud_prev_valid = false, hud_fresh = true;
+    // HUD FIX (hudfix.comp): the frame before the layers and the counts (R32_UINT, kHudStatsW x kHudStatsH)
+    OwnImage hud_back, hud_stats;
     bool hud_said = false;
-    uint32_t hud_parity = 0;
-    uint64_t hud_estimated_at = ~0ull;   // the estimate's last Present: after a gap it starts afresh
     std::atomic<bool> wanted{false};        // the chain has Present layers (evaluates copy guides)
     std::atomic<uint64_t> served_ms{0};     // a present of the game's last reached the layers
     std::atomic<uint64_t> checked_ms{0};    // present_due's
@@ -6015,8 +6300,6 @@ void vk_guide_stamp(VkPresentPath& P, VkGuideSet& g, const VkFrame& f) {
     g.inverted = (f.flags & kFlagDepthInverted) != 0;
     g.reset = f.reset;
     g.mv_x = f.mv_x; g.mv_y = f.mv_y;
-    g.render_w = f.render_w; g.render_h = f.render_h;
-    g.low_res_mv = !f.flags_known || (f.flags & kFlagMvLowRes) != 0;
     g.serial = ++P.serial;
     g.captured_at = P.presents;
     g.captured_ms = GetTickCount64();
@@ -6077,51 +6360,34 @@ std::vector<VkPresentRun> present_runs(const std::vector<const Layer*>& layers, 
             layer_note(*l, 2, 3, "Present cannot serve this swap chain's colour format");
             continue;
         }
-        runs.push_back({l, e, present_white_of(rs, windows_white)});
+        runs.push_back({l, e, e == 1u ? 0.f : present_white_of(rs, windows_white)});
     }
     return runs;
 }
 
-// `frame` (ours, GENERAL, w x h, `format`): the runs on it in order, recorded into `cmd`. True when a layer changed it.
-// HUD FIX on these routes: the estimate (no HUD-less frame of the game's, no capture before its HUD here) - Mode Auto
-// or Estimated; Game / Captured run nothing (NR Control greys them out with the reason). 0: off.
-uint32_t vk_hud_source(const nr::pe::HudFixConfig& h) { return h.mode == 1 || h.mode == 4 ? 4u : 0u; }
 // This Present's HUD-less frame (HUD FIX's capture, nr_asi_hudcap.hpp; image null: none): the layers run on it and the
-// composition is against it (source 2); Auto keeps the estimate's state too.
+// composition is against it (source 2). Without one HUD FIX does nothing on these routes.
 struct VkHudless {
     nr::asi::Wilsjo2VkImage image;   // its layout as handed (copied from, left so)
-    bool estimate_too = false;
 };
 
-// The frame before the layers kept for HUD FIX (the images made, the alpha cleared when new).
+// The frame before the layers kept for HUD FIX (its images made), the HUD-less frame copied into `frame`.
 bool vk_hud_begin(VkCommandBuffer cmd, VkPresentPath& P, VkImage frame, VkFormat format, uint32_t w, uint32_t h,
                   const VkHudless& hl) {
-    if (!P.hud_alpha.image || P.hud_alpha.width != w || P.hud_alpha.height != h) P.hud_fresh = true;
-    if ((!hl.image.image || hl.estimate_too) && P.hud_estimated_at + 1 != P.presents) {   // after a gap: afresh
-        P.hud_fresh = true;
-        P.hud_prev_valid = false;
-    }
-    if (P.hud_back.format != format || P.hud_back.width != w || P.hud_back.height != h) P.hud_prev_valid = false;
-    if (!ensure_image(P.hud_back, format, w, h) || !ensure_image(P.hud_prev, format, w, h) ||
-        !ensure_image(P.hud_alpha, VK_FORMAT_R16G16B16A16_SFLOAT, w, h) ||
-        !ensure_image(P.hud_stats, VK_FORMAT_R32_UINT, hud_stats_w(w), hud_stats_h(h))) {
+    if (!ensure_image(P.hud_back, format, w, h) || !ensure_image(P.hud_stats, VK_FORMAT_R32_UINT, kHudStatsW, kHudStatsH)) {
         if (!P.hud_said) { P.hud_said = true; log("[nr] HUD FIX (%s): its images could not be made; it does not run", P.who); }
         return false;
     }
-    for (OwnImage* im : {&P.hud_back, &P.hud_prev, &P.hud_alpha, &P.hud_stats})
+    for (OwnImage* im : {&P.hud_back, &P.hud_stats})
         if (im->layout != VK_IMAGE_LAYOUT_GENERAL) {
             vk_barrier(cmd, im->image, im->layout, VK_IMAGE_LAYOUT_GENERAL);
             im->layout = VK_IMAGE_LAYOUT_GENERAL;
         }
-    const auto copy = [&](VkImage from, VkImage to) {
-        vk_barrier(cmd, from, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-        vk_barrier(cmd, to, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        vk_copy(cmd, from, 0, 0, to, 0, 0, w, h);
-        vk_barrier(cmd, to, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
-        vk_barrier(cmd, from, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
-    };
-    copy(frame, P.hud_back.image);
-    if (!P.hud_prev_valid) { copy(frame, P.hud_prev.image); P.hud_prev_valid = true; }   // the first: nothing moved
+    vk_barrier(cmd, frame, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    vk_barrier(cmd, P.hud_back.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    vk_copy(cmd, frame, 0, 0, P.hud_back.image, 0, 0, w, h);
+    vk_barrier(cmd, P.hud_back.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+    vk_barrier(cmd, frame, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
     if (hl.image.image) {   // the layers run on the frame without its HUD
         const VkImageLayout at = hl.image.layout;
         vk_barrier(cmd, hl.image.image, at, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
@@ -6132,37 +6398,16 @@ bool vk_hud_begin(VkCommandBuffer cmd, VkPresentPath& P, VkImage frame, VkFormat
     }
     return true;
 }
-// After the layers: the composition into `frame`, then this frame becomes the estimate's last.
+// After the layers: the composition into `frame`.
 void vk_hud_end(VkCommandBuffer cmd, VkPresentPath& P, const nr::pe::HudFixConfig& hud, VkImage frame, VkFormat format,
-                uint32_t w, uint32_t h, const VkHudless& hl, const VkGuideSet* guides, uint32_t multiplier) {
+                uint32_t w, uint32_t h, const VkHudless& hl) {
     nr::asi::HudFixVkImages im;
-    // the estimate with the game's motion vectors (as on D3D12): the guides this Present reads, their units in output
-    // pixels per present
-    if ((!hl.image.image || hl.estimate_too) && guides && guides->motion.image && guides->out_w && guides->render_w) {
-        const VkGuideSet& g = *guides;
-        const float sx = g.low_res_mv ? float(g.out_w) / float(g.render_w) : 1.f;
-        const float sy = g.low_res_mv ? float(g.out_h) / float(g.render_h) : 1.f;
-        const float per = 1.0f / float(std::max(multiplier, 1u));
-        im.motion.image = reinterpret_cast<VkImage>(g.motion.image);
-        im.motion.format = VkFormat(g.motion.format);
-        im.motion.width = g.motion.width; im.motion.height = g.motion.height;
-        im.motion.layout = VkImageLayout(g.motion.layout);
-        im.motion_scale_x = g.mv_x * sx * per * float(w) / float(g.out_w);
-        im.motion_scale_y = g.mv_y * sy * per * float(h) / float(g.out_h);
-        im.motion_x = g.motion_rect.x; im.motion_y = g.motion_rect.y;
-        im.motion_step_x = float(g.motion_rect.width) / float(w);
-        im.motion_step_y = float(g.motion_rect.height) / float(h);
-    }
     im.back = w2_of(P.hud_back);
-    im.previous = w2_of(P.hud_prev);
-    im.alpha = w2_of(P.hud_alpha);
     im.stats = w2_of(P.hud_stats);
     im.frame.image = frame; im.frame.format = format; im.frame.width = w; im.frame.height = h;
     im.frame.layout = VK_IMAGE_LAYOUT_GENERAL;
-    if (hl.image.image) im.hudless = hl.image;
-    const uint32_t source = hl.image.image ? 2u : 4u;
-    const bool estimate = source == 4 || hl.estimate_too;
-    if (!nr::asi::wilsjo2_hudfix_vk(cmd, im, w, h, source, hud.show_mask, P.hud_fresh, P.hud_parity, hl.estimate_too)) {
+    im.hudless = hl.image;
+    if (!nr::asi::hudfix_vk(cmd, im, w, h, 2u, hud.show_mask)) {
         if (hl.image.image) {   // the layers ran on the copy without the HUD: the frame as the game drew it goes back
             vk_barrier(cmd, P.hud_back.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
             vk_barrier(cmd, frame, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
@@ -6171,20 +6416,36 @@ void vk_hud_end(VkCommandBuffer cmd, VkPresentPath& P, const nr::pe::HudFixConfi
             vk_barrier(cmd, P.hud_back.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
         }
         nr::pe::control::hud_facts("nothing this frame: its composition could not be recorded", nullptr, nullptr, nullptr);
-        return;
     }
-    if (estimate) {
-        P.hud_fresh = false;
-        P.hud_parity ^= 1u;
-        P.hud_estimated_at = P.presents;
-    }
-    // the roles swapped instead of the copy (as on D3D12); both rest in GENERAL
-    std::swap(P.hud_back, P.hud_prev);
 }
 
+// `frame` (ours, GENERAL, w x h, `format`): the runs on it in order, recorded into `cmd`. True when a layer changed it.
+
+// `from`: when given, `frame` does not hold the picture yet - the first layer, a RenoDX one, reads it from
+// `from` (the game's back buffer, in its layout) and stores its answer into `frame`; anything that reads `frame` before
+// then has it copied in first. `*filled` (with `from`): whether `frame` holds the picture now.
 bool vk_present_run(VkCommandBuffer cmd, VkPresentPath& P, const std::shared_ptr<const Chain>& chain,
                     const std::vector<VkPresentRun>& runs, VkImage frame, VkFormat format, uint32_t w, uint32_t h,
-                    const VkHudless& hudless = VkHudless{}) {
+                    const VkHudless& hudless = VkHudless{}, const nr::dlssnr::VkImageRef* from = nullptr,
+                    bool* filled = nullptr) {
+    bool frame_filled = !from;
+    const auto fill_frame = [&] {
+        if (frame_filled) return;
+        frame_filled = true;
+        const VkImage src = reinterpret_cast<VkImage>(uintptr_t(from->image));
+        const VkImageLayout at = VkImageLayout(from->layout);
+        vk_barrier(cmd, src, at, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        vk_barrier(cmd, frame, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        vk_copy(cmd, src, 0, 0, frame, 0, 0, w, h);
+        vk_barrier(cmd, frame, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+        vk_barrier(cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, at);
+    };
+    struct Filled { bool* out; const bool& v; ~Filled() { if (out) *out = v; } } report_filled{filled, frame_filled};
+    // whatever reads the frame before the first layer (F5's pair, HUD FIX, a comparison, a held frame), or a first
+    // layer that is not RenoDX: the picture copied in now
+    if (from && (nr::pe::screenshot::wants_final() || hudless.image.image ||
+                 runs.empty() || !renodx_layer(*runs.front().layer) || chain->inspect.compare || chain->inspect.hold))
+        fill_frame();
     namespace route = nr::pe::renodx_route;
     // HUD FIX: the frame before the layers kept; the composition after the last of them (before a final-picture
     // comparison shows it)
@@ -6194,7 +6455,7 @@ bool vk_present_run(VkCommandBuffer cmd, VkPresentPath& P, const std::shared_ptr
             const uint8_t hdr = runs.front().encoding == 2 ? 2 : runs.front().encoding == 1 ? 0 : 1;
             shot_chain = s.capture_begin(cmd, frame, format, w, h, VK_IMAGE_LAYOUT_GENERAL, hdr, "present");
         });
-    const bool hud = (vk_hud_source(chain->hud) != 0 || hudless.image.image) && !runs.empty() &&
+    const bool hud = hudless.image.image && !runs.empty() &&
                      vk_hud_begin(cmd, P, frame, format, w, h, hudless);
     const ULONGLONG now = GetTickCount64();
     const auto fresh = [&](const VkGuideSet& gs) {
@@ -6259,6 +6520,7 @@ bool vk_present_run(VkCommandBuffer cmd, VkPresentPath& P, const std::shared_ptr
             return &held_set;
         };
 
+        if (k > 0) fill_frame();
         if (inspect && k == ia) vk_inspect_copy(cmd, P.vk.inspect_off, frame, format, w, h);
         VkPresentLayer& pl = P.layers[layer.cfg.number];
         VkLayerState& ls = P.vk.layers[layer.cfg.number];
@@ -6363,7 +6625,10 @@ bool vk_present_run(VkCommandBuffer cmd, VkPresentPath& P, const std::shared_ptr
                 route::CallNetwork network(layer.network);
                 route::CallLayer number(row_number(layer));
                 const Rect whole{0, 0, w, h};
-                nr::dlssnr::evaluate_vk_asi(cmd, feature, target, target, g ? g->depth : nr::dlssnr::VkImageRef{},
+                const bool first_from = !frame_filled;   // the back buffer read where it is, the answer into frame
+                frame_filled = true;
+                nr::dlssnr::evaluate_vk_asi(cmd, feature, first_from ? *from : target, target,
+                                            g ? g->depth : nr::dlssnr::VkImageRef{},
                                             g ? g->motion : nr::dlssnr::VkImageRef{}, w, h, g ? g->depth_rect : whole,
                                             g ? g->motion_rect : whole, g ? (g->inverted ? 1 : 0) : 1, reset ? 1 : 0,
                                             nr::dlssnr::Controls6{}, g ? g->mv_x : 1.f, g ? g->mv_y : 1.f, &recorded_run);
@@ -6372,7 +6637,7 @@ bool vk_present_run(VkCommandBuffer cmd, VkPresentPath& P, const std::shared_ptr
             if (g) pl.consumed = g->serial;
             ran |= recorded_run;
         }();
-        if (hud && k + 1 == runs.size()) vk_hud_end(cmd, P, chain->hud, frame, format, w, h, hudless, guides, 1u);   // (no frame-generation scaling here, as the RenoDX runs)
+        if (hud && k + 1 == runs.size()) vk_hud_end(cmd, P, chain->hud, frame, format, w, h, hudless);
         if (inspect && k == ib) vk_inspect_show(cmd, chain->inspect, P.vk, frame, format, w, h);
     }
     if (shot_chain) nr::dlssnr::with_vk_session([&](nr::pe::Session& s) {
@@ -7183,7 +7448,6 @@ const VkPresentInfoKHR* vk_present_one(VkQueue queue, const VkPresentInfoKHR* in
     VkHudless hudless;
     if (hud_captured) {
         hudless.image = w2_of(P.hudless);
-        hudless.estimate_too = hud_mode == 1;
     }
     const bool changed = vk_present_run(cmd, P, chain, runs, P.frame.image, ff, w, h, hudless);
     if (changed) {
@@ -7355,11 +7619,9 @@ const VkPresentInfoKHR* vk_present_layers(VkQueue queue, const VkPresentInfoKHR*
 
 void retire_present_path(VkPresentPath& P) {
     vk_forget(P.vk); P.layers.clear();
-    for (OwnImage* im : {&P.frame, &P.stage, &P.xfer, &P.hudless, &P.linear, &P.encoded, &P.hud_back, &P.hud_prev, &P.hud_alpha,
-                         &P.hud_stats})
+    for (OwnImage* im : {&P.frame, &P.stage, &P.xfer, &P.hudless, &P.linear, &P.encoded, &P.hud_back, &P.hud_stats})
         retire_image(*im);
     for (auto& set : P.sets) set = VkGuideSet{};
-    P.hud_prev_valid = false;
 }
 
 // The device goes (vk_route_teardown, its queues idle): everything of the Present layers on it.
@@ -7370,8 +7632,7 @@ void vk_present_forget() {
     for (VkGuideSet& g : P.sets) g = VkGuideSet{};
     retire_image(P.linear);
     retire_image(P.encoded);
-    for (OwnImage* im : {&P.hud_back, &P.hud_prev, &P.hud_alpha, &P.hud_stats}) retire_image(*im);
-    P.hud_prev_valid = false;
+    for (OwnImage* im : {&P.hud_back, &P.hud_stats}) retire_image(*im);
     retire_image(g_vk_frame);
     retire_image(g_vk_hudless);
     for (auto& set : g_vk_guides) for (OwnImage& im : set) retire_image(im);
@@ -8321,12 +8582,25 @@ void d11_present_layers(IDXGISwapChain* sc, ID3D11Device* device) {
     device->GetImmediateContext(&ctx);
     if (!ctx) return;
     struct Ctx { ID3D11DeviceContext* c; ~Ctx() { c->Release(); } } ctx_hold{ctx};
-    ctx->CopyResource(g_d11_target, back);
+    // The first layer reads the back buffer where it is (DXVK's image, sampled) and stores into our copy - the
+    // context's copy of the back buffer into ours goes; vk_present_run copies it in itself when something reads our copy
+    // first. Only for a back buffer in our copy's format that can be sampled, and not on the Vulkan bridge (every
+    // texture there is copied into a twin of its own: the back buffer's would only add one). NR_PRESENT_READ_BACK=0:
+    // as before.
+    static const bool read_back_off = [] { const char* e = std::getenv("NR_PRESENT_READ_BACK"); return e && e[0] == '0'; }();
+    D11Image back_img;
+    const bool read_back = !read_back_off && !g_d11.bdev && bd.Format == format && d11_image(back, back_img) &&
+                           (back_img.usage & VK_IMAGE_USAGE_SAMPLED_BIT) && back_img.ngx.Resource.ImageViewInfo.Width == w &&
+                           back_img.ngx.Resource.ImageViewInfo.Height == h;
+    nr::dlssnr::VkImageRef back_ref;
+    if (read_back) back_ref = vk_ref(&back_img.ngx, back_img.layout, false, back_img.usage);
+    else ctx->CopyResource(g_d11_target, back);
     const VkCommandBuffer cmd = d11_begin();
     if (!cmd) return;
     nr::gpu::Scope recording(nr::gpu::recording(cmd));
     g_native_uses.touch();
     d11_hold(g_d11_target, true);
+    if (read_back) d11_hold(back);
     for (auto& set : g_d11_guides) for (ID3D11Texture2D* t : set) d11_hold(t);
     const VkImage ti = reinterpret_cast<VkImage>(target.ngx.Resource.ImageViewInfo.Image);
     const VkFormat tf = VkFormat(target.ngx.Resource.ImageViewInfo.Format);
@@ -8336,13 +8610,14 @@ void d11_present_layers(IDXGISwapChain* sc, ID3D11Device* device) {
     if (hud_captured && d11_image(hud_cap.hudless, hl)) {
         d11_hold(hud_cap.hudless);
         hudless.image = w2_image(&hl.ngx, hl.layout);
-        hudless.estimate_too = hud_mode == 1;
     }
-    // Captured with no copy this frame: the layers' answer as it is (no estimate)
-    const bool changed = vk_present_run(cmd, P, chain, runs, ti, tf, w, h, hudless);
+    // Captured with no copy this frame: the layers' answer as it is
+    bool filled = true;
+    const bool changed = vk_present_run(cmd, P, chain, runs, ti, tf, w, h, hudless, read_back ? &back_ref : nullptr,
+                                        &filled);
     if (target.layout != VK_IMAGE_LAYOUT_GENERAL) vk_barrier(cmd, ti, VK_IMAGE_LAYOUT_GENERAL, target.layout);
     if (!d11_submit(cmd)) { d11_route_failed(); return; }
-    if (changed) ctx->CopyResource(back, g_d11_target);
+    if (changed && filled) ctx->CopyResource(back, g_d11_target);
 }
 
 NVSDK_NGX_Result NR_NGX_MSABI hk_d11_create(ID3D11DeviceContext* ctx, NVSDK_NGX_Feature feature, NVSDK_NGX_Parameter* p,
@@ -8606,6 +8881,30 @@ void watch_termination() {
         log("[nr] NtTerminateProcess could not be hooked: a game ended by TerminateProcess leaves no line here");
 }
 
+// HUD FIX wants the capture ([HudFix] Mode Auto / Captured) as the game makes its D3D12 device: read from the ini on its
+// own (no g_lock: a device can be made anywhere), for nr_asi_hudcap's view bookkeeping.
+bool hud_capture_wanted_at_start() {
+    nr::pe::ChainFile file;
+    nr::pe::ChainConfig config;
+    file.poll(std::string(nr::pe::module_folder()) + "\\dlssnr-amd.ini", config);
+    return config.hud.mode == 1 || config.hud.mode == 3;
+}
+// The game asking to quit (PostQuitMessage: its window closed, its main loop ending): the watchdog then holds its stall
+// reports - a closing game stops its frames for seconds while it tears down (nr_pe_watchdog.hpp quit_asked)
+using PFN_PostQuitMessage = void(WINAPI*)(int);
+PFN_PostQuitMessage real_post_quit = nullptr;
+void WINAPI hk_post_quit(int code) {
+    nr::pe::watchdog::quit_asked();
+    real_post_quit(code);
+}
+void watch_quit() {
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    void* fn = user32 ? reinterpret_cast<void*>(GetProcAddress(user32, "PostQuitMessage")) : nullptr;
+    if (!fn || MH_CreateHook(fn, reinterpret_cast<void*>(&hk_post_quit), reinterpret_cast<void**>(&real_post_quit)) != MH_OK ||
+        MH_EnableHook(fn) != MH_OK)
+        log("[nr] watchdog: PostQuitMessage could not be followed: a closing game is told by its windows going only");
+}
+
 // Called by OptiScaler from its DllMain, under the loader lock: hooks only.
 extern "C" __declspec(dllexport) void InitializeASI() {
     static bool done = false;
@@ -8618,6 +8917,7 @@ extern "C" __declspec(dllexport) void InitializeASI() {
     g_self_range = range_of(g_self);
     // frame generation's HUD-less hand-overs: the game's own only (not OptiScaler's own frame generation's calls)
     nr::asi::hudcap::set_game_caller(&game_fg_call);
+    nr::asi::hudcap::set_capture_wanted_query(&hud_capture_wanted_at_start);
     nr::pe::set_module(g_opti);   // dlssnr-amd.ini, dlssnr-amd\, the log and control.bin sit beside OptiScaler
     nr::pe::install_crash_watch();
     // an exception that leaves one of NR's threads ends the process through std::terminate: said in the log first
@@ -8635,6 +8935,23 @@ extern "C" __declspec(dllexport) void InitializeASI() {
     nr::pe::configure_network(nr::pe::module_folder());
     nr::pe::control::asi_facts(NR_BUILD_STAMP, nullptr);
     nr::pe::watchdog::start();   // its thread runs once OptiScaler's DllMain has returned
+    // The D3D12 passthrough (nr_d3d12_passthrough.hpp): dlssnr-amd.ini [D3D12Passthrough] Enabled. On: the D3D12
+    // evaluate offers it each frame first (its check runs on the game's device at the first one).
+    nr::pe::d3d12_passthrough::start();
+    if (nr::pe::d3d12_passthrough::enabled()) {
+        nr::pe::d3d12_passthrough::set_net_planner(
+            [](uint32_t w, uint32_t h, int model, bool experimental, nr::D3d12NetPlan* out, std::string* why) {
+                // RDNA3: its lowering, its stand-ins and records
+                return nr::plan_d3d12_network(nr::pe::module_folder(), w, h, experimental, out, why, model,
+                                              nr::pe::d3d12_passthrough::arch());
+            },
+            &nr::d3d12_net_controls, &nr::dlssnr::frame_network);
+        nr::dlssnr::set_d3d12_backend(&nr::pe::d3d12_passthrough::evaluate_backend);
+        // (the process flag that NR's network choice is the passthrough's, set_d3d12_native, is set by its check on a
+        // D3D12 game's RDNA4 device - a D3D11 or Vulkan game, OptiScaler's D3D11-with-D3D12 included, never sets it)
+    }
+    nr::pe::menu::set_extra_diagnostics(&nr::pe::d3d12_passthrough::draw_panel);
+    nr::pe::menu::set_extra_network(&nr::pe::d3d12_passthrough::draw_network);
     judge_executable();
     read_ini_barriers();
     nr::dlssnr::keep_caller_state();   // the RenoDX style is said per evaluate (renodx_route::CallStyle), not set here
@@ -8644,6 +8961,7 @@ extern "C" __declspec(dllexport) void InitializeASI() {
         return;
     }
     watch_termination();
+    watch_quit();
     const bool ok = hook("NVSDK_NGX_D3D12_EvaluateFeature", reinterpret_cast<void*>(&hk_evaluate),
                          reinterpret_cast<void**>(&real_evaluate), true) &&
                     hook("NVSDK_NGX_D3D12_CreateFeature", reinterpret_cast<void*>(&hk_create),
@@ -8683,6 +9001,7 @@ extern "C" __declspec(dllexport) void InitializeASI() {
     hook_present_beat();
     hook_game_dxgi();
     hook_fg_libraries();
+    nr::asi::hudcap::d3d12_module(GetModuleHandleW(L"d3d12.dll"));
     log("[nr] %s (Unreal Engine by the executable: %s)", ok ? "NR runs in OptiScaler's D3D12 evaluate"
                                                              : "OptiScaler's D3D12 evaluate could not be hooked: NR does not run",
         g_unreal_by_exe ? "yes" : "no");
@@ -8708,6 +9027,8 @@ BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID reserved) {
         nr::asi::wilsjo2_vk_abandon_at_exit();
         nr::pe::menu::abandon_at_exit();
         nr::pe::bridge::Device::abandon_at_exit();
+        // the D3D12 passthrough's network and stages (amdxc64.dll is detached by now)
+        nr::pe::d3d12_passthrough::abandon_at_exit();
     } else if (reason == DLL_PROCESS_DETACH) {
         nr::pe::remove_crash_watch();   // unloaded while the game runs: the handler must not outlive this module's code
     }

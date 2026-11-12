@@ -13,8 +13,8 @@ tmp=$(mktemp -d "${TMPDIR:-/tmp}/renodx.XXXXXX")
 trap 'rm -rf -- "$tmp"' EXIT
 mkdir -p -- "$out"
 for k in v6_linearize v6_autoscale v6_exposure_scale v6_encode v6_resolve v6_pedestal_reduce v6_pedestal_reduce_unshaped \
-         v6_commit v6_commit_exposure v6_resolve_commit \
-         legacy_encode legacy_decode legacy_reduce legacy_reduce_unshaped legacy_apply legacy_decode_reduce look_compose \
+         v6_commit v6_commit_exposure v6_resolve_commit v6_resolve_commit_up \
+         legacy_encode legacy_decode legacy_decode_up legacy_reduce legacy_reduce_unshaped legacy_apply legacy_decode_reduce look_compose \
          look_upsample look_band; do
     printf '#define RENODX_VULKAN 1\n#include "%s.cs_5_1.hlsl"\n' "$k" > "$tmp/vk_$k.comp.slang"
     shift_args=()
@@ -31,12 +31,15 @@ for k in v6_resolve v6_resolve_commit v6_pedestal_reduce_unshaped; do
 done
 # Preprocess on the RenoDX path (linux/shaders/renodx-prep, ours, glslang like every other pass): prep_math.glsl
 glslang=${NR_GLSLANG:-toolchain/glslang/bin/glslang}
+# renodx_prep_fused.spv: Preprocess with RenoDX's SDR encode and decode folded in
+"$glslang" -V --target-env vulkan1.3 -DPREP_FUSED -Ilinux/shaders/renodx-prep linux/shaders/renodx-prep/renodx_prep.comp \
+    -o "$out/renodx_prep_fused.spv" > "$tmp/log" || { cat "$tmp/log" >&2; exit 1; }
 for k in renodx_prep renodx_prep_encode renodx_debug; do
     "$glslang" -V --target-env vulkan1.3 -Ilinux/shaders/renodx-prep linux/shaders/renodx-prep/$k.comp -o "$out/$k.spv" \
         > "$tmp/log" || { cat "$tmp/log" >&2; exit 1; }
 done
 # Single-pass strengthening, shared by the two routes' RenoDX Stage.
-for k in st_fb_in st_prep st_box st_apply; do
+for k in st_fb_in st_prep st_box st_apply il il0 il_mv il_pp; do
     "$glslang" -V --target-env vulkan1.3 -Ilinux/shaders/renodx-fast linux/shaders/renodx-fast/$k.comp -o "$out/renodx_$k.spv" \
         > "$tmp/log" || { cat "$tmp/log" >&2; exit 1; }
 done

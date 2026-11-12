@@ -22,6 +22,7 @@ struct Recording {
     std::mutex mutex;
     bool sealed = false;
     bool unknown_submit = false;
+    bool ever_submitted = false;   // completed waits are removed; submission history must survive that cleanup
     std::chrono::steady_clock::time_point touched = std::chrono::steady_clock::now();
     uint64_t touched_at = submissions.load();
     bool fallback_due() const {
@@ -44,13 +45,58 @@ struct Recording {
         // A secondary can be reset while an executable primary still retains its earlier recording.
         return due || std::all_of(kept.begin(), kept.end(), [](const auto& p) { return p->ready(); });
     }
+    // HUD capture cannot treat elapsed time/submission count as a resource lifetime proof.
+    bool capture_ready() {
+        std::vector<std::shared_ptr<Recording>> owners;
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            waits.erase(std::remove_if(waits.begin(), waits.end(), [](auto& f) { return f(); }), waits.end());
+            if (!sealed || unknown_submit || !waits.empty()) return false;
+            for (const auto& p:parents) if (auto owner=p.lock()) owners.push_back(std::move(owner));
+        }
+        return std::all_of(owners.begin(),owners.end(),[](const auto& p){return p->capture_ready();});
+    }
+    // Every execution of it known so far has finished on the GPU (at least one; none unknown) - also while it is not
+    // sealed. HUD FIX's chain snapshots: a game that keeps its closed command lists without Reset never
+    // seals them, so capture_ready() never came and each copy made a new back-buffer-size image (23 MB at 3200x1800,
+    // ~190 MB/s) until RAM ran out and the frame rate collapsed. Only a later re-execution of the same closed list is not
+    // covered (as quiet_ready below).
+    bool ran_ready() {
+        std::lock_guard<std::mutex> guard(mutex);
+        waits.erase(std::remove_if(waits.begin(), waits.end(), [](auto& f) { return f(); }), waits.end());
+        return ever_submitted && !unknown_submit && waits.empty();
+    }
     void seal() { std::lock_guard<std::mutex> guard(mutex); sealed = true; }
+    // Strict form for a consumer that must never take the fallback as proof (the D3D12 passthrough): finished means
+    // sealed, and every submission's wait has answered. An unknown submission is never strict-ready.
+    // Sealed with no submission ever attached: the recording was closed and then Reset/Released without being
+    // executed - the original Runtime's "dropped recording", whose history can no longer be trusted.
+    bool never_submitted() {
+        std::lock_guard<std::mutex> guard(mutex);
+        return sealed && !ever_submitted;
+    }
+    bool strict_ready() {
+        std::lock_guard<std::mutex> guard(mutex);
+        waits.erase(std::remove_if(waits.begin(), waits.end(), [](auto& f) { return f(); }), waits.end());
+        return sealed && !unknown_submit && waits.empty();
+    }
+    // Not sealed, but nothing of it can still run on the GPU: every known execution has answered (or there was none),
+    // no submission was unknown, and it has been quiet for the fallback window. A command list a game keeps in a pool
+    // without Reset looks like this once it ran; strict_ready() alone waits for it forever (the D3D12
+    // passthrough's descriptor heap doubled until it overflowed, replaced stages were never released). Only a later
+    // re-execution of the same closed list, after the window, is not covered.
+    bool quiet_ready() {
+        std::lock_guard<std::mutex> guard(mutex);
+        waits.erase(std::remove_if(waits.begin(), waits.end(), [](auto& f) { return f(); }), waits.end());
+        return !unknown_submit && waits.empty() && fallback_due();
+    }
     void submitted(std::function<bool()> wait) {
         std::vector<std::shared_ptr<Recording>> kept;
         {
             std::lock_guard<std::mutex> guard(mutex);
             waits.erase(std::remove_if(waits.begin(), waits.end(), [](auto& f) { return f(); }), waits.end());
             kept = children;
+            ever_submitted = true;
             if (wait) waits.push_back(wait); else unknown_submit = true;
             touched = std::chrono::steady_clock::now();
             touched_at = ++submissions;

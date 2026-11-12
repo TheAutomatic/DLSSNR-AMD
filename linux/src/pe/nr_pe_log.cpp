@@ -167,6 +167,23 @@ constexpr ULONGLONG kGameStallMs = 3000;
 constexpr int kMaxGameReports = 2;
 std::atomic<int> g_reports{0};
 constexpr int kMaxReports = 4;
+// A game can stop presenting for seconds during normal teardown. Delay the detailed report while the process
+// is closing, rather than report every normal exit as a hang. Closing = it asked to quit (quit_asked: the .asi's
+// PostQuitMessage hook) or its windows are gone (it had one). Then the stacks are taken as always but written only if
+// the process still runs kClosingHoldMs later (a hang while closing is still reported); one line says so at once.
+std::atomic<ULONGLONG> g_quit_ms{0};
+constexpr ULONGLONG kClosingHoldMs = 30000;
+BOOL CALLBACK find_process_window(HWND h, LPARAM p) {
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    if (pid == GetCurrentProcessId() && IsWindowVisible(h)) { *reinterpret_cast<bool*>(p) = true; return FALSE; }
+    return TRUE;
+}
+bool any_window() {   // a visible top-level window of this process
+    bool found = false;
+    EnumWindows(find_process_window, reinterpret_cast<LPARAM>(&found));
+    return found;
+}
 std::mutex g_thread_lock;      // the watching thread's start and stop
 HANDLE g_stop = nullptr;       // the running watcher's stop event (null: none runs; g_thread_lock)
 std::atomic<bool> g_running{false};   // a watcher runs (beat() reads it without the lock)
@@ -341,14 +358,20 @@ std::string thread_name(HANDLE h) {
 constexpr size_t kStackCopy = 256 * 1024;
 uint8_t g_stack[kStackCopy];   // one thread's stack at a time, copied while it is suspended (nothing allocated then)
 
-void report(const char* why) {
-    if (g_reports.fetch_add(1) >= kMaxReports) return;
-    log("[nr] watchdog: %s; every thread of the process follows (stacks as return addresses found on them)", why);
+// The report's lines (written by the caller: at once, or held while the game closes). Empty past kMaxReports.
+std::vector<std::string> take_report(const char* why) {
+    std::vector<std::string> out;
+    if (g_reports.fetch_add(1) >= kMaxReports) return out;
+    char b[512];
+    std::snprintf(b, sizeof b, "[nr] watchdog: %s; every thread of the process follows (stacks as return addresses found on them)", why);
+    out.push_back(b);
     const ULONGLONG now = GetTickCount64();
     for (Slot& s : g_slots) {
         const char* what = s.what.load();
-        if (what) log("[nr] watchdog: thread %lu is in NR's step \"%s\" for %llu ms", (unsigned long)s.tid.load(), what,
-                      (unsigned long long)(now - s.since.load()));
+        if (!what) continue;
+        std::snprintf(b, sizeof b, "[nr] watchdog: thread %lu is in NR's step \"%s\" for %llu ms", (unsigned long)s.tid.load(),
+                      what, (unsigned long long)(now - s.since.load()));
+        out.push_back(b);
     }
     Modules mods;
     std::vector<DWORD> tids;
@@ -401,11 +424,15 @@ void report(const char* why) {
                            " at " + (have ? where(mods, ip) : std::string("? (no context)"));
         for (size_t i = 0; i < frames.size(); ++i) {
             line += (i ? " < " : "; called from ") + where(mods, frames[i]);
-            if (line.size() > 900) { log("%s", line.c_str()); line = "[nr] watchdog:   ..."; }
+            if (line.size() > 900) { out.push_back(line); line = "[nr] watchdog:   ..."; }
         }
-        log("%s", line.c_str());
+        out.push_back(line);
     }
-    log("[nr] watchdog: end of the report");
+    out.push_back("[nr] watchdog: end of the report");
+    return out;
+}
+void write_report(const std::vector<std::string>& lines) {
+    for (const std::string& l : lines) log("%s", l.c_str());
 }
 
 struct WatchStart { HANDLE stop; HMODULE self; };
@@ -423,6 +450,21 @@ DWORD WINAPI watch(void* param) {
     const ULONGLONG started = GetTickCount64();
     bool said_none = false, stalled = false, game_stalled = false;
     int game_reports = 0;
+    bool saw_window = false;            // the process had a visible window (its going is a sign of closing)
+    std::vector<std::string> held;      // reports taken while the game closes, written if it still runs kClosingHoldMs on
+    ULONGLONG held_at = 0;
+    // a stall's report: written at once, or held while the game is closing
+    const auto stall = [&](const char* why, ULONGLONG now) {
+        const char* closing = g_quit_ms.load() ? "it asked to quit"
+                              : saw_window && !any_window() ? "its windows are gone" : nullptr;
+        std::vector<std::string> lines = take_report(why);
+        if (lines.empty()) return;
+        if (!closing) { write_report(lines); return; }
+        log("[nr] watchdog: %s - the game is closing (%s): the threads' stacks are taken and written only if it still "
+            "runs in %llu s", why, closing, (unsigned long long)(kClosingHoldMs / 1000));
+        if (held.empty()) held_at = now;
+        held.insert(held.end(), lines.begin(), lines.end());
+    };
     // Frames stop while the game is not in front (minimised, the desktop in front): no stall then. The time without a
     // frame counts from the later of the last frame and the last second the game was not in front.
     ULONGLONG not_front = 0;
@@ -432,14 +474,21 @@ DWORD WINAPI watch(void* param) {
         return !w || !GetWindowThreadProcessId(w, &pid) || pid == GetCurrentProcessId();
     };
     while (WaitForSingleObject(stop, 1000) == WAIT_TIMEOUT) {
-        if (g_reports.load() >= kMaxReports) break;
         const ULONGLONG now = GetTickCount64();
+        if (!held.empty() && now - held_at >= kClosingHoldMs) {
+            log("[nr] watchdog: the game still runs %llu s after it began closing: the stacks taken then follow",
+                (unsigned long long)(kClosingHoldMs / 1000));
+            write_report(held);
+            held.clear();
+        }
+        if (g_reports.load() >= kMaxReports && held.empty()) break;
+        if (!saw_window && g_beats.load()) saw_window = any_window();
         if (!in_front()) not_front = now;
         const unsigned long long beats = g_beats.load();
         if (!beats) {
             if (!said_none && now - started >= 60000) {
                 said_none = true;
-                report("no frame (Present) in the minute since NR started");
+                write_report(take_report("no frame (Present) in the minute since NR started"));
             }
             continue;
         }
@@ -453,7 +502,7 @@ DWORD WINAPI watch(void* param) {
                 char why[160];
                 std::snprintf(why, sizeof why, "no frame of the game's own (its Present) for %llu ms while presents go on, "
                               "after %llu of them", (unsigned long long)game_gap, g_games.load());
-                report(why);
+                stall(why, now);
             }
         }
         if (gap < stall_ms()) { stalled = false; continue; }
@@ -461,7 +510,7 @@ DWORD WINAPI watch(void* param) {
         stalled = true;
         char why[128];
         std::snprintf(why, sizeof why, "no frame (Present) for %llu ms, after %llu frames", (unsigned long long)gap, beats);
-        report(why);
+        stall(why, now);
     }
     {
         std::lock_guard<std::mutex> guard(g_thread_lock);
@@ -514,6 +563,11 @@ void stop_and_wait() {
     // (ReShade then says the add-on "was not unregistered" and keeps it), which is better than a game that hangs here.
     WaitForSingleObject(t, 3000);
     CloseHandle(t);
+}
+
+void quit_asked() {
+    ULONGLONG zero = 0;
+    g_quit_ms.compare_exchange_strong(zero, GetTickCount64());
 }
 
 void game_beat() {

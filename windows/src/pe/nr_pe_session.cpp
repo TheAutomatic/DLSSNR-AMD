@@ -44,6 +44,21 @@
 #include <vector>
 
 namespace nr::pe {
+
+// The .asi's D3D12 passthrough is on for this process (set_d3d12_native): what can run is then not decided by
+// the bridge's Vulkan device alone. Turned off again when its canary does not hit (the bridge runs every frame): each
+// session then checks what can run once more (g_native_epoch).
+std::atomic<bool> g_d3d12_native{false};
+std::atomic<int> g_d3d12_native_arch{int(nr::arch::GpuArch::unknown)};   // the passthrough's GPU while it is on
+std::atomic<uint32_t> g_native_epoch{0};
+void set_d3d12_native(bool on, nr::arch::GpuArch arch) {
+    // on only for an architecture NR has a network for (the passthrough decides by it, nr_d3d12_passthrough.cpp)
+    if (on && !nr::arch::has_network(arch)) on = false;
+    const int want = on ? int(arch) : int(nr::arch::GpuArch::unknown);
+    const int prev_arch = g_d3d12_native_arch.exchange(want);
+    const bool prev_on = g_d3d12_native.exchange(on);
+    if (prev_on != on || prev_arch != want) ++g_native_epoch;
+}
 namespace {
 
 using nr::pe::log;
@@ -185,6 +200,7 @@ static int config_net(const RuntimeConfig& c) {
 }
 
 struct Session::Impl {
+    bool raw_call = false;   // Session::set_raw_call: the network plain this call (no Style grade)
     std::string root;
     std::string status;
     // ---- one built network per extent ----------------------------------------
@@ -457,6 +473,8 @@ struct Session::Impl {
     bool w2_stage_said{};
     float w2_fast_passes = 0.f;                 // the last wilsjo2 run: Passes (fast), Session::state()
     bool w2_fast_fallback = false, w2_motion = false;
+    uint8_t w2_il_missing = 0;
+    bool w2_fast_fallback_spatial = false;
     nr::wilsjo2::SpatialLayout w2_spatial{};    // the last wilsjo2 run's peripheral compression (Session::spatial_layout)
     bool w2_spatial_on = false;
     struct W2Retired { W2Surface* s; nr::gpu::Uses uses; uint64_t call; std::chrono::steady_clock::time_point at; };
@@ -1191,7 +1209,9 @@ struct Session::Impl {
     std::set<int> said_unavailable;
     // What can run in this run, checked once the game's device is known (NetworkSwitch::unavailable).
     bool availability_checked{};
+    uint32_t native_epoch{};   // g_native_epoch when availability was last checked
     void check_availability();
+    void recheck_availability();
     uint32_t build_w{}, build_h{};
     VkFormat build_format{VK_FORMAT_UNDEFINED};
     std::unique_ptr<Runtime> built;
@@ -2196,7 +2216,7 @@ bool Session::Impl::ensure_runtime(const Controls& controls, uint32_t w, uint32_
     last_ok = ok;
     last_w = w; last_h = h; last_format = format;
     if (ok && runtime) {
-        runtime->set_style_grade(net_switch.file().style_grade);   // [Network] Style Grade, live
+        runtime->set_style_grade(net_switch.file().style_grade && !raw_call);   // [Network] Style Grade, live (not on a raw call)
         runtime->set_history_f16(net_switch.file().history_f16);   // [Network] History Precision, live
         feature_slot[current_feature] = runtime->network_id();
         Runtime*& last = feature_runtime[current_feature];
@@ -2245,6 +2265,7 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
     if (last_call - residency_checked >= kResidencyCheck) residency(false, false);
     if (!retired.empty()) free_retired();
     if (cache.size() > kMaxResident) trim_cache();
+    recheck_availability();
     if (!availability_checked) check_availability();
     net_want = wanted_network();
     // Adopt a finished background build first.
@@ -2634,8 +2655,9 @@ HostDevice Session::Impl::make_host() const {
     host.queue = access.queue; host.queue_family = access.family;
     host.buffer_device_address = vkd3d_device || mode == Mode::Bridge ||
                                  vkdevice::network_features_added(handles.device);
-    // the network of the device's architecture (nr_gpu_arch.hpp): the bridge's, or what the device watch made it for
-    host.rdna3 = bdev ? bdev->rdna3() : vkdevice::runs_rdna3(handles.device);
+    // the network of the GPU's architecture (nr_gpu_arch.hpp): the bridge's device's, else the game's physical device
+    // asked directly - not inferred from whether the device watch added features to it
+    host.arch = bdev ? bdev->arch() : handles.physical ? nr::arch::of(handles.physical) : nr::arch::GpuArch::unknown;
     return host;
 }
 
@@ -2940,50 +2962,78 @@ bool Session::Impl::carry(VkCommandBuffer cmd, uint64_t feature) {
     return ok;
 }
 
+// The D3D12 passthrough is off again (its canary did not hit): what it ruled out is decided as on the bridge.
+void Session::Impl::recheck_availability() {
+    if (native_epoch == g_native_epoch.load()) return;
+    availability_checked = false;
+}
+
 // What can run in this run, from the files installed, this build and the game's device; a UI shows the reason
 // beside a network that cannot, and the hotkey skips it. A build that falls back later says more (network_note).
 void Session::Impl::check_availability() {
-    if (!handles.device) return;
+    if (!handles.device && !g_d3d12_native.load()) return;
+    native_epoch = g_native_epoch.load();
     availability_checked = true;
+    for (int i = 0; i < nr::kNetworkChoices; ++i) net_switch.unavailable(i, "");
     auto exists = [&](const char* rel) {
         const DWORD a = nr::u8::attributes((root + "\\" + rel).c_str());
         return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
     };
+    // CC_SMALL_FP8_EXPERIMENTAL and CC_SILVER_AARDWOLD_OPTIMIZED read their SPIR-V from dlssnr-amd/ (the Linux
+    // network's, RDNA4) and from the ACO bundle's own gfx11 builds on RDNA3 (nr_runtime.cpp): what is installed is
+    // the folder that arch reads.
+    const nr::arch::GpuArch arch = g_d3d12_native.load() ? nr::arch::GpuArch(g_d3d12_native_arch.load()) : make_host().arch;
+    const char* x_attention = nullptr;
+    const char* o_attention = nullptr;
+    switch (arch) {
+    case nr::arch::GpuArch::rdna4:
+        x_attention = "dlssnr-amd\\experimental\\shaders\\fixed-attention.txt";
+        o_attention = "dlssnr-amd\\optimized\\shaders\\fixed-attention.txt";
+        break;
+    case nr::arch::GpuArch::rdna3:
+        x_attention = "dlssnr-amd\\aco\\rdna3\\experimental\\shaders\\fixed-attention.txt";
+        o_attention = "dlssnr-amd\\aco\\rdna3\\optimized\\shaders\\fixed-attention.txt";
+        break;
+    case nr::arch::GpuArch::unknown: case nr::arch::GpuArch::rdna1: case nr::arch::GpuArch::rdna2: {
+        const std::string why = std::string("NR has no network for this GPU (") + nr::arch::name(arch) + ")";
+        for (int i = 0; i < nr::kNetworkChoices; ++i) net_switch.unavailable(i, why);
+        return;
+    }
+    }
+    const bool rdna3 = arch == nr::arch::GpuArch::rdna3;
     if (!exists("dlssnr-amd\\CC_SMALL_FP8.bin"))
         net_switch.unavailable(nr::kSmallFp8, "needs the model of the 310.9.16 nvngx_dlssnr.dll (install.ps1 -Dll)");
     if (!exists("dlssnr-amd\\CC_SILVER_AARDWOLD.bin"))
         net_switch.unavailable(nr::kSilverAardwold, "the model file is missing (run install.bat again)");
-    if (!exists("dlssnr-amd\\experimental\\shaders\\fixed-attention.txt"))
+    if (!exists(x_attention))
         net_switch.unavailable(nr::kSmallFp8Experimental, "not installed (run install.bat again)");
     else if (!exists("dlssnr-amd\\CC_SMALL_FP8_EXPERIMENTAL.bin"))
         net_switch.unavailable(nr::kSmallFp8Experimental, "needs the model of the 310.9.16 nvngx_dlssnr.dll (install.ps1 -Dll)");
-    else if (make_host().rdna3)
-        net_switch.unavailable(nr::kSmallFp8Experimental, "not on RDNA3 GPUs (RX 7000, Radeon 700M / 800M / 8000S)");
-    else if (nr::binary::directory().empty())
+    else if (!g_d3d12_native.load() && nr::binary::directory().empty())
         net_switch.unavailable(nr::kSmallFp8Experimental, nr::binary::disabled_why().empty()
             ? std::string("needs ACO Mode, which is off for this run")
             : "needs ACO Mode, which is off for this run: " + nr::binary::disabled_why());
-    else if (!nr::binary::enabled(handles.device))
+    else if (!g_d3d12_native.load() && !nr::binary::enabled(handles.device))
         net_switch.unavailable(nr::kSmallFp8Experimental, "the game's device has no pipeline binaries (ACO Mode)");
     // CC_SILVER_AARDWOLD_OPTIMIZED (Quality; ACO Mode only, as CC_SMALL_FP8_EXPERIMENTAL), then its int4 layers on top
     // (Balanced, then Performance, Ultra Performance)
     if (!exists("dlssnr-amd\\CC_SILVER_AARDWOLD.bin"))
         net_switch.unavailable(nr::kSilverAardwoldOptimizedFp8, "the model file is missing (run install.bat again)");
-    else if (!exists("dlssnr-amd\\optimized\\shaders\\fixed-attention.txt"))
+    else if (!exists(o_attention))
         net_switch.unavailable(nr::kSilverAardwoldOptimizedFp8, "not installed (run install.bat again)");
     else if (!exists("dlssnr-amd\\CC_SILVER_AARDWOLD_OPTIMIZED.bin"))
         net_switch.unavailable(nr::kSilverAardwoldOptimizedFp8, "its weights were not made at install (run install.bat again)");
-    else if (make_host().rdna3)
-        net_switch.unavailable(nr::kSilverAardwoldOptimizedFp8, "not on RDNA3 GPUs (RX 7000, Radeon 700M / 800M / 8000S)");
-    else if (nr::binary::directory().empty())
+    else if (!g_d3d12_native.load() && nr::binary::directory().empty())
         net_switch.unavailable(nr::kSilverAardwoldOptimizedFp8, nr::binary::disabled_why().empty()
             ? std::string("needs ACO Mode, which is off for this run")
             : "needs ACO Mode, which is off for this run: " + nr::binary::disabled_why());
-    else if (!nr::binary::enabled(handles.device))
+    else if (!g_d3d12_native.load() && !nr::binary::enabled(handles.device))
         net_switch.unavailable(nr::kSilverAardwoldOptimizedFp8, "the game's device has no pipeline binaries (ACO Mode)");
     if (!net_switch.reason(nr::kSilverAardwoldOptimizedFp8).empty())
         net_switch.unavailable(nr::kSilverAardwoldOptimized, net_switch.reason(nr::kSilverAardwoldOptimizedFp8));
 #if NR_INT4
+    else if (rdna3 && !exists("dlssnr-amd\\aco\\rdna3\\int4\\shaders\\shader-constants.txt"))   // RDNA3: the bundle's gfx11 int4 records
+        net_switch.unavailable(nr::kSilverAardwoldOptimized, "its RDNA3 int4 layers are not installed (run install.bat again)");
     else if (!exists("dlssnr-amd\\int4\\settings.txt"))
         net_switch.unavailable(nr::kSilverAardwoldOptimized, "its int4 layers are not installed (run install.bat again)");
     else if (!exists("dlssnr-amd\\CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin"))
@@ -3928,7 +3978,7 @@ Session::State Session::state() const {
     s.carried = m.carried;
     s.renodx_known = m.renodx_facts_known;
     s.renodx = m.renodx_facts;
-    s.wilsjo2_fast_passes = m.w2_fast_passes; s.wilsjo2_fast_fallback = m.w2_fast_fallback; s.wilsjo2_motion = m.w2_motion;
+    s.wilsjo2_fast_passes = m.w2_fast_passes; s.wilsjo2_fast_fallback = m.w2_fast_fallback; s.wilsjo2_il_missing = m.w2_il_missing; s.wilsjo2_fast_fallback_spatial = m.w2_fast_fallback_spatial; s.wilsjo2_motion = m.w2_motion;
     s.motion_without_depth = m.runtime ? m.runtime->motion_without_depth() : m.net_switch.file().motion_without_depth;
     s.building = m.building && !m.build_plan;   // a plan is no network to wait for
     if (m.handles.device) {
@@ -3956,6 +4006,19 @@ Session::State Session::state() const {
 }
 
 void Session::set_network(int n) { impl_->net_switch.set(n); }
+int Session::frame_network() {
+    auto& m = *impl_;
+    m.recheck_availability();
+    if (!m.availability_checked) m.check_availability();
+    m.net_want = m.wanted_network();
+    return m.net_want;
+}
+
+void Session::set_running_network(int net) {
+    impl_->running_net = net;
+}
+bool Session::history_f16() const { return impl_->net_switch.file().history_f16; }
+bool Session::style_grade() const { return impl_->net_switch.file().style_grade; }
 
 void Session::idle() {
     auto& m = *impl_;
@@ -4106,6 +4169,8 @@ ID3D12Resource* Session::run(ID3D12Device* device, ID3D12GraphicsCommandList* li
     if (resources.depth &&
         fill(&engine.depth, resource_handle(device, resources.depth, resources.depth_state)))
         apply_guide_subrect(&engine.depth, resources.depth_subrect, "depth", &engine.depth_x, &engine.depth_y);
+    // a wilsjo2 layer's Interleaved pass: the history it made (RGBA16F at the network's size, UNORDERED_ACCESS)
+    if (resources.history) fill(&engine.history, resource_handle(device, resources.history, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
 
     OwnOuterRun timing(*this, cmd, s.call_layer > 0 && !s.outer_open);
     try {
@@ -4152,6 +4217,12 @@ ID3D12Resource* Session::run(ID3D12Device* device, ID3D12GraphicsCommandList* li
     }
     return s.output;
 }
+
+void Session::set_raw_call(bool raw) {
+    impl_->raw_call = raw;
+    if (impl_->runtime) impl_->runtime->set_style_grade(impl_->net_switch.file().style_grade && !raw);
+}
+bool Session::style_grade_active() const { return impl_->net_switch.file().style_grade; }
 
 bool Session::run_after(ID3D12Device* device, ID3D12GraphicsCommandList* list,
                         ID3D12Resource* output, D3D12_RESOURCE_STATES output_state,
@@ -4250,6 +4321,8 @@ bool Session::run_after(ID3D12Device* device, ID3D12GraphicsCommandList* list,
     if (resources.depth &&
         fill(&engine.depth, s.lookup12(rec, resources.depth, resources.depth_state, false)))
         apply_guide_subrect(&engine.depth, resources.depth_subrect, "depth", &engine.depth_x, &engine.depth_y);
+    // a wilsjo2 layer's Interleaved pass: the history it made (RGBA16F at the network's size, UNORDERED_ACCESS)
+    if (resources.history) fill(&engine.history, resource_handle(device, resources.history, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
     if (input && !motion_vk) return false;   // the plain path works in place: the caller seeds
     if (s.resized(resources.feature, frame.width, frame.height) && !s.carry(cmd, resources.feature)) engine.reset = true;
     // Full memory barriers on either side of the network, because the caller's
@@ -4619,6 +4692,7 @@ bool Session::Impl::finish11(Recording11& rec) {
 
 // The RenoDX-style option, shared by every route: the network at the frame's extent on RenoDX's proxy
 // (RGBA16F, the DLL's own composition), ready or building in the background.
+std::atomic<int> g_motion_without_depth_now{-1};
 bool Session::Impl::renodx_runtime(const Controls& controls, uint32_t w, uint32_t h, Controls* c) {
     // The network sees RenoDX's proxy and answers into the stage's own image, one pass: what RenoDX's
     // feature 18 evaluate is. Preprocess runs inside RenoDX's processing (RenoDXFrame::preprocess), not here.
@@ -4630,6 +4704,7 @@ bool Session::Impl::renodx_runtime(const Controls& controls, uint32_t w, uint32_
     c->enabled = true;
     c->apply_model = true;
     const bool ok = ensure_runtime(*c, w, h, VK_FORMAT_R16G16B16A16_SFLOAT);
+    if (ok && runtime) g_motion_without_depth_now = runtime->motion_without_depth() ? 1 : 0;
     return ok && runtime->takes_target(*c);   // the model not applied: the frame stays as it is
 }
 
@@ -4794,6 +4869,7 @@ bool Session::Impl::record_renodx(VkCommandBuffer cmd, renodx::Stage& stage, con
     sf.motion = look_motion;
     sf.motion_x = engine.motion_x; sf.motion_y = engine.motion_y;
     sf.motion_scale_x = engine.motion_scale_x; sf.motion_scale_y = engine.motion_scale_y;
+    if (!neutral) { sf.depth = engine.depth; sf.depth_x = engine.depth_x; sf.depth_y = engine.depth_y; sf.depth_inverted = engine.depth_inverted; }
     if (exposure) sf.exposure = *exposure;
     sf.pre_exposure = rf.pre_exposure;
     sf.exposure_scale = rf.exposure_scale;
@@ -4808,12 +4884,14 @@ bool Session::Impl::record_renodx(VkCommandBuffer cmd, renodx::Stage& stage, con
     // Each pass on a history of its own. The ReShade routes run as feature 0, the runtime's own unnamed history,
     // which it neither saves nor restores around a named one: stacked there, pass 1 takes a name too (else passes 1
     // and 2 would read each other's history every frame).
+    // Passes (fast) Interleaved runs its legacy passes one a frame, each on its own history as legacy's.
     const uint64_t named = engine.feature ? engine.feature : kUnnamedStack;
-    const auto pass_feature = [&](uint32_t k) { return engine.feature || passes > 1 ? stack_feature(named, k) : 0; };
+    const uint32_t histories = rs.passes_mode == 1u && rs.fast_method == 0u ? std::clamp(rs.fast_interleaved_passes, 2u, 8u) : passes;
+    const auto pass_feature = [&](uint32_t k) { return engine.feature || histories > 1 ? stack_feature(named, k) : 0; };
     auto& entry = renodx[engine.feature];
-    for (uint32_t k = passes; k < entry.stack; ++k) release_everywhere(stack_feature(named, k));
-    if (!engine.feature && passes == 1 && entry.stack > 1) release_everywhere(named);
-    entry.stack = passes;
+    for (uint32_t k = histories; k < entry.stack; ++k) release_everywhere(stack_feature(named, k));
+    if (!engine.feature && histories == 1 && entry.stack > 1) release_everywhere(named);
+    entry.stack = histories;
     // RenoDX's guides: NRDepthMode overrides the game's depth direction, NRMVecScaleX / Y scale its motion vectors
     // (the network's and the look's).
     if (rs.depth_mode == 1u) engine.depth_inverted = false;
@@ -4821,6 +4899,8 @@ bool Session::Impl::record_renodx(VkCommandBuffer cmd, renodx::Stage& stage, con
     engine.motion_scale_x *= rs.mvec_scale_x;
     engine.motion_scale_y *= rs.mvec_scale_y;
     sf.motion_scale_x = engine.motion_scale_x; sf.motion_scale_y = engine.motion_scale_y;
+    sf.depth_inverted = engine.depth_inverted;
+    sf.style_grade = runtime && runtime->style_grade_active();
     // Pass k's controls, RenoDX's (the route's own do not apply with the option on): pass 1's, or pass k's once its
     // "Same as pass 1" is off (PassModel; the intensity is always the pass's own, PassIntensity); with
     // NRSkinIndependent and the Character mask on, Structure at most 1 and a stock Skin sent as 1 (SentSkinSteering).
@@ -4909,14 +4989,27 @@ bool Session::Impl::record_renodx(VkCommandBuffer cmd, renodx::Stage& stage, con
         e.target = neural;
         e.reset = reset;
         e.feature = pass_feature(k);
+        // Interleaved: the history the stage made for this pass (one frame old, the frame's own vectors)
+        const renodx::Stage::NetworkMotion nm = stage.network_motion();
+        if (nm.use) {
+            e.motion = nm.motion;
+            e.motion_scale_x = e.motion_scale_y = 1.0f;
+            e.motion_texture_width = nm.motion.width; e.motion_texture_height = nm.motion.height;
+            e.motion_x = e.motion_y = 0;
+        }
+        if (nm.history.image) e.history = nm.history;
         const bool time_net = timed && timed_passes < renodx::kMaxUnlockedPasses;
         Controls controls = pass_controls(k);
+        // Interleaved composes the passes itself: the network's own output, no Intensity compose, no grade (the Style
+        // stays: the network takes it as an input too)
+        if (nm.raw) { controls.intensity = 1.0f; runtime->set_style_grade(false); }
         if (time_net) controls.network_timestamp = [&](VkCommandBuffer c, bool begin) {
             vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, stage_timing,
                                 base + 2 + 2 * timed_passes + (begin ? 0u : 1u));
             if (!begin) ++timed_passes;
         };
         runtime->record_engine(cmd, e, controls);
+        if (nm.raw) runtime->set_style_grade(net_switch.file().style_grade);
         if (k == 0) {
             diag_copy(cmd, 2, proxy.image, proxy.format, proxy.width, proxy.height, proxy.usage, proxy.after,
                       proxy.after_stage, proxy.after_access);
@@ -5125,6 +5218,7 @@ public:
             case nr::wilsjo2::Fmt::kRG32F: f = VK_FORMAT_R32G32_SFLOAT; break;
             case nr::wilsjo2::Fmt::kF32: f = VK_FORMAT_R32G32B32A32_SFLOAT; break;
             case nr::wilsjo2::Fmt::kRG16F: f = VK_FORMAT_R16G16_SFLOAT; break;
+            case nr::wilsjo2::Fmt::kR16F: f = VK_FORMAT_R16_SFLOAT; break;
         }
         return {s_.w2_make(cmd_, f, w, h)};
     }
@@ -5170,6 +5264,8 @@ public:
     }
     bool has(nr::wilsjo2::Mode mode) const override { return s_.w2_stage && s_.w2_stage->has(mode); }
     bool has_fast() const override { return !s_.w2_stage || s_.w2_stage->has_fast(); }
+    bool has_il() const override { return !s_.w2_stage || s_.w2_stage->has_il(); }
+    bool style_graded() const override { return s_.net_switch.file().style_grade; }
     bool stage_failed() const override { return !s_.w2_stage; }
     nr::wilsjo2::PassReady pass(uint32_t, const nr::wilsjo2::PassControls&, uint32_t, uint32_t) override {
         return nr::wilsjo2::PassReady::kReady;   // the network runtime is made before the recording (wilsjo2_prepare)
@@ -5184,6 +5280,7 @@ public:
         e.target = out;
         e.reset = c.reset;
         e.feature = Impl::stack_feature(feature_, c.pass);
+        if (c.history) e.history = frame_of(c.history);   // Interleaved: the history it made for this pass (GENERAL)
         if (c.depth.h != &engine_.depth) {   // peripheral compression: the packed guides at the model extent
             e.depth = frame_of(c.depth);
             e.motion = frame_of(c.motion);
@@ -5206,7 +5303,10 @@ public:
         k.history_strength = settings_.history_strength;
         try {
             if (e.motion.image) {
+                // Interleaved with a Style / Intensity: the network plain (no Style grade; Intensity 1 came in controls)
+                if (c.raw) s_.runtime->set_style_grade(false);
                 s_.runtime->record_engine(cmd_, e, s_.capture_controls(k));
+                if (c.raw) s_.runtime->set_style_grade(s_.net_switch.file().style_grade);
             } else {
                 if (in.image != out.image) {
                     w2_everything(cmd_);
@@ -5232,6 +5332,8 @@ public:
     void passes_begin(const nr::wilsjo2::FlowFacts& x) override {
         s_.w2_fast_passes = x.fast_passes;
         s_.w2_fast_fallback = x.fast_fallback;
+        s_.w2_il_missing = x.il_missing;
+        s_.w2_fast_fallback_spatial = x.fast_fallback_spatial;
     }
     void spatial_ran(const nr::wilsjo2::SpatialLayout& layout) override {
         s_.w2_spatial = layout;
@@ -5405,7 +5507,7 @@ bool Session::Impl::record_wilsjo2(VkCommandBuffer cmd, const ColourFrame& colou
                        VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     }
     SessionW2Io io(*this, cmd, target, engine, net, *wf.settings, engine.feature, wf.estimate_motion);
-    w2_fast_passes = 0.f; w2_fast_fallback = false; w2_spatial_on = false;
+    w2_fast_passes = 0.f; w2_fast_fallback = false; w2_il_missing = 0; w2_fast_fallback_spatial = false; w2_spatial_on = false;
     w2_motion = engine.motion.image != VK_NULL_HANDLE && wf.fast_motion;
     nr::wilsjo2::FlowFrame ff;
     ff.target = io.target();
@@ -5495,6 +5597,8 @@ bool Session::run_renodx(ID3D12Device* device, ID3D12GraphicsCommandList* list,
     if (resources.depth &&
         fill(&engine.depth, s.lookup12(rec, resources.depth, resources.depth_state, false)))
         apply_guide_subrect(&engine.depth, resources.depth_subrect, "depth", &engine.depth_x, &engine.depth_y);
+    // a wilsjo2 layer's Interleaved pass: the history it made (RGBA16F at the network's size, UNORDERED_ACCESS)
+    if (resources.history) fill(&engine.history, resource_handle(device, resources.history, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
     // As run_after: full barriers on both sides, vkd3d's tracked compute state forgotten afterwards.
     const auto everything = [&](VkAccessFlags src_access, VkAccessFlags dst_access) {
         VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -6270,6 +6374,14 @@ VkImage Session::run_vulkan(const DeviceHandles& handles, VkCommandBuffer cmd,
         engine.motion.usage = frame.motion_usage;
         engine.motion_texture_width = engine.motion.width; engine.motion_texture_height = engine.motion.height;
         apply_guide_subrect(&engine.motion, frame.motion_subrect, "motion-vector", &engine.motion_x, &engine.motion_y);
+    }
+    if (frame.history) {   // a wilsjo2 layer's Interleaved pass: the history it made (GENERAL)
+        engine.history.image = frame.history;
+        engine.history.format = frame.history_format;
+        engine.history.width = frame.history_width;
+        engine.history.height = frame.history_height;
+        engine.history.before = engine.history.after = VK_IMAGE_LAYOUT_GENERAL;
+        engine.history.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
     }
     if (frame.depth) {
         engine.depth.image = frame.depth;

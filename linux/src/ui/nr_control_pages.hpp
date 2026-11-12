@@ -390,7 +390,7 @@ inline void draw_layer_status(const nr::control::Shared* s) {
         return;
     }
     const uint32_t now = uint32_t(GetTickCount64());
-    static const char* const kWhere[] = {NR_N("after upscaler"), NR_N("before upscaler"), NR_N("Present")};
+    static const char* const kWhere[] = {NR_N("after upscaler"), NR_N("before upscaler"), NR_N("present")};
     float total = 0.f, network = 0.f;
     int running = 0;
     const ImGuiTableFlags flags = ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH;
@@ -625,16 +625,34 @@ inline void nav_foot(const std::vector<FootRow>& rows, const std::vector<std::st
     std::vector<std::string> lines;
     const bool beside = nets.size() == 1 && text_width(nets[0].c_str()) <= ImGui::GetStyle().WindowPadding.x + wide - col;
     if (beside) lines = nets;
+    // broken after an underscore or a space; a piece wider than the sidebar on its own (a language without spaces) between
+    // its letters (UTF-8 code points), so that every letter is shown
+    const auto fits = [&](const std::string& t) { return text_width(t.c_str()) <= wide; };
     for (size_t k = 0; !beside && k < nets.size(); ++k) {
         std::string line, word;
-        const std::string& n = nets[k];
-        for (size_t i = 0; i <= n.size(); ++i) {
-            if (i < n.size()) word += n[i];
-            if (i < n.size() && n[i] != '_') continue;
-            if (!line.empty() && text_width((line + word).c_str()) > wide) { lines.push_back(line); line.clear(); }
+        const auto put = [&] {
+            if (!line.empty() && !fits(line + word)) { lines.push_back(line); line.clear(); }
+            while (!word.empty() && !fits(line + word)) {   // (line is empty here)
+                size_t cut = 0;
+                for (size_t i = 0; i < word.size();) {
+                    const unsigned char c = static_cast<unsigned char>(word[i]);
+                    const size_t len = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : (c >> 3) == 30 ? 4 : 1;
+                    if (cut && !fits(word.substr(0, i + len))) break;
+                    i = std::min(word.size(), i + len);
+                    cut = i;
+                }
+                lines.push_back(word.substr(0, cut));
+                word.erase(0, cut);
+            }
             line += word;
             word.clear();
+        };
+        const std::string& n = nets[k];
+        for (size_t i = 0; i < n.size(); ++i) {
+            word += n[i];
+            if (n[i] == '_' || n[i] == ' ') put();
         }
+        put();
         if (!line.empty()) lines.push_back(line);
     }
     const float h = float(rows.size() + 1 + (beside || lines.empty() ? 0 : lines.size())) * ImGui::GetTextLineHeightWithSpacing();
@@ -978,6 +996,7 @@ struct HotkeysMenu {
     bool menu_key = false;              // NR Control's own key ([NRControl] MenuKey; the .asi's menu)
     // keys something else here already uses, and what (OptiScaler's menu key, ReShade's overlay)
     std::vector<std::pair<std::string, std::string>> taken;
+    bool pass_opti_key = false;         // the PassOptiScalerKey box (the .asi's menu, OptiScaler's menu key)
 };
 // A virtual key as dlssnr-amd.ini writes keys ("End", "F7"); empty for one parse_hotkey cannot read.
 inline std::string vk_word(int vk) {
@@ -1093,6 +1112,14 @@ inline void draw_hotkeys(nr::ini_edit::Ini& ini, nr::ini_edit::KeyValues& renodx
             ImGui::PopID();
         }
         ImGui::EndTable();
+    }
+    if (m.pass_opti_key) {
+        bool pass = ini.get("NRControl", "PassOptiScalerKey", "0") == "1";
+        if (ImGui::Checkbox(tr("Pass OptiScaler's menu key through"), &pass)) ini.set("NRControl", "PassOptiScalerKey", pass ? "1" : "0");
+        help("[NRControl] PassOptiScalerKey. On: while NR Control is open, OptiScaler's menu key (Insert, or the key its "
+                "OptiScaler.ini sets) still reaches OptiScaler, so its menu opens and closes without closing this one "
+                "first. Off (default): NR Control keeps every key from the game while it is open. Applied within a "
+                "second.");
     }
 }
 
@@ -1414,11 +1441,15 @@ inline void draw_hudfix(nr::ini_edit::Ini& ini, const HudFixMenu& m) {
     static const char* const names[] = {NR_N("Off"), NR_N("Auto"), NR_N("Frame generation's HUD-less frame"),
                                         NR_N("Captured before the HUD"), NR_N("Estimated")};
     const int mode = hudfix_mode(ini, m.default_mode);
-    const bool unusable = mode >= 2 && !m.why[mode].empty();
+    // Estimated switched off (nr::control::kHudEstimated): not in the list; a file that asks for it runs HUD FIX off
+    const bool estimated_off = mode == 4 && !nr::control::kHudEstimated;
+    const bool unusable = mode >= 2 && !estimated_off && !m.why[mode].empty();
     std::string shown = tr(names[mode]);
     if (unusable) shown += tr(" (cannot run here)");
+    if (estimated_off) shown += tr(" (switched off in this version)");
     if (ImGui::BeginCombo(tr("Method##hud"), shown.c_str())) {
         for (int i = 0; i < 5; ++i) {
+            if (i == 4 && !nr::control::kHudEstimated) continue;
             const bool grey = i >= 2 && !m.why[i].empty();
             ImGui::BeginDisabled(grey);
             if (ImGui::Selectable(tr(names[i]), mode == i)) ini.set("HudFix", "Mode", keys[i]);
@@ -1441,8 +1472,9 @@ inline void draw_hudfix(nr::ini_edit::Ini& ini, const HudFixMenu& m) {
          "place. OptiScaler's own frame generation gets no "
          "such frame from the game: Captured serves those games. Captured before the HUD: "
          "the frame copied where the game starts drawing its HUD; NR runs on it and the HUD is put back as it was. "
-         "Estimated: pixels that stay put while the picture moves are taken for the HUD and kept (NR still sees the "
-         "HUD). A method that cannot run here is greyed out with its reason.");
+         "Where the game composes its HUD in its final pass, the picture that pass reads is taken instead, once it is "
+         "checked against the presented frame. A method that cannot run here is greyed out with its reason.");
+    if (estimated_off) ImGui::TextWrapped("%s", tr("Estimated is switched off in this version: HUD FIX is off."));
     if (unusable) ImGui::TextWrapped(tr("%s cannot run here: %s"), names[mode], tr_text(m.why[mode].c_str()));
     if (!m.now.empty()) text_dim_wrapped("Now: %s", tr_text(m.now.c_str()));
     ini_flag(ini, "Show mask##hud", "HudFix", "ShowMask", "0",
@@ -1542,11 +1574,13 @@ inline void draw_missing_data(const nr::control::LayerStatus* rows, uint32_t cou
     for (uint32_t i = 0; i < count; ++i)
         if (rows[i].number && rows[i].state == 1u && rows[i].updated && now - rows[i].updated < 1500) live.push_back(&rows[i]);
     std::sort(live.begin(), live.end(), [](auto* a, auto* b) { return a->number < b->number; });
-    const auto feedback = [&](uint32_t layer) {
-        if (!ini) return false;
+    const auto feedback = [&](uint32_t layer) -> int {   // 1 Feedback / Hybrid, 2 Interleaved
+        if (!ini) return 0;
         const std::string own = "Layer" + std::to_string(layer), sec = ini->has_section(own) ? own : "RenoDX";
-        const std::string mode = ini->get(sec, "NRPassesMode", "0"), method = ini->get(sec, "NRFastMethod", "0");
-        return (mode == "1" || mode == "fast") && (method == "1" || method == "2" || method == "Feedback" || method == "Hybrid");
+        const std::string mode = ini->get(sec, "NRPassesMode", "0"), method = ini->get(sec, "NRFastMethod", std::to_string(nr::fast::kDefaultMethod));
+        if (mode != "1" && mode != "fast") return 0;
+        if (method == "0" || method == "Interleaved") return 2;
+        return method == "2" || method == "3" || method == "Feedback" || method == "Hybrid" ? 1 : 0;
     };
     ImGui::PushTextWrapPos(0.0f);
     for (const nr::control::LayerStatus* r : live)
@@ -1560,7 +1594,8 @@ inline void draw_missing_data(const nr::control::LayerStatus* rows, uint32_t cou
             else if (what.rfind("Motion vectors:", 0) == 0)
                 ImGui::TextColored(warn, tr("Layer %u: no motion vectors -> NR runs without its frame history (less stable over "
                                    "time)%s"), r->number,
-                                   feedback(r->number) ? "; Passes (fast) Feedback / Hybrid run as Extrapolation" : "");
+                                   feedback(r->number) == 1 ? "; Passes (fast) Feedback / Hybrid cannot run (one network pass)"
+                                   : feedback(r->number) == 2 ? "; Passes (fast) Interleaved cannot run (one network pass)" : "");
             else if (what.rfind("Depth:", 0) == 0)
                 ImGui::TextColored(warn, tr("Layer %u: no depth from the game -> the motion lookup runs without depth"), r->number);
         }
@@ -1937,26 +1972,49 @@ struct ChainEditor {
         // Only the chosen mode's settings, no sub-headers; the other mode's are hidden, their values kept
         if (!fast) draw_wilsjo2_legacy(src, sec, put, num, flag_of, fmt, u, reset);
         else {
-            const uint32_t method = uint32_t(std::clamp(int(num("FastMethod", 0.f)), 0, 3));
-            const char* names[] = {NR_N("Extrapolation"), NR_N("Feedback"), NR_N("Hybrid"), NR_N("Edit strength")};
+            // FastMethod as a RenoDX layer's NRFastMethod: 0 Interleaved, 1 Extrapolation, 2 Feedback, 3 Hybrid, 4 Edit
+            // strength; where the file says none, the route's default
+            const uint32_t method = uint32_t(std::clamp(int(num("FastMethod", float(nr::fast::kDefaultMethod))), 0, 4));
+            const char* names[] = {NR_N("Interleaved"), NR_N("Extrapolation"), NR_N("Feedback"), NR_N("Hybrid"), NR_N("Edit strength")};
             ImGui::SetNextItemWidth(230 * u);
             if (ImGui::BeginCombo(tr("Method##w2f"), tr(names[method]))) {
-                for (uint32_t j = 0; j < 4; ++j) {
-                    ImGui::BeginDisabled((j == 1 || j == 2) && !have_motion);
+                for (uint32_t j = 0; j < 5; ++j) {
+                    ImGui::BeginDisabled((j == 0 || j == 2 || j == 3) && !have_motion);
                     if (ImGui::Selectable(tr(names[j]), method == j)) put("FastMethod", std::to_string(j));
                     ImGui::EndDisabled();
                 }
                 ImGui::EndCombo();
             }
-            help("FastMethod. Extrapolation pushes this frame's one-pass edit further along its own direction; no "
+            help("FastMethod. Interleaved runs the legacy passes one a frame in turn, each with its own history, "
+                 "and keeps each pass's change moved along the motion vectors: close to Passes (legacy) at one pass's "
+                 "cost; needs motion vectors and does not run with peripheral compression (then one network pass). "
+                 "Extrapolation pushes this frame's one-pass edit further along its own direction; no "
                  "motion vectors needed, works from the first frame. Feedback feeds the previous frame's edit, moved "
                  "by the motion vectors, back into the network input; needs motion vectors and builds up over the "
                  "first frames. Hybrid uses Feedback where history holds and Extrapolation on new surfaces, cuts and "
                  "edges. Edit strength scales the network's edit in stops, as Adjust NR's look's Edit strength does. "
                  "Each method keeps its own settings.");
-            if (!have_motion && (method == 1u || method == 2u)) ImGui::TextDisabled(tr("No motion vectors: Feedback / Hybrid use Extrapolation."));
-            // the chosen method's own settings (Fast<Method>Passes / HaloLimit / Fine; Edit strength its own)
-            if (method == 3u) {
+            if (!have_motion && (method == 2u || method == 3u)) ImGui::TextDisabled(tr("No motion vectors: Feedback / Hybrid cannot run (one network pass)."));
+            if (!have_motion && method == 0u) ImGui::TextDisabled(tr("No motion vectors: Interleaved cannot run (one network pass)."));
+            if (method == 0u || method == 2u || method == 3u)
+                ImGui::TextDisabled(tr("Interleaved / Feedback / Hybrid cannot run with peripheral compression (one network pass)."));
+            // the chosen method's own settings (Fast<Method>Passes / HaloLimit / Fine; Edit strength, Interleaved their own)
+            if (method == 0u) {
+                const int pr = std::clamp(int(num("FastInterleavedPreset", float(nr::fast::kDefaultInterleavedPreset))), 1, 2);
+                const char* presets[] = {NR_N("Preset 1"), NR_N("Preset 2")};
+                ImGui::SetNextItemWidth(230 * u);
+                if (ImGui::BeginCombo(tr("Interleaved preset##w2filp"), tr(presets[pr - 1]))) {
+                    for (int j = 1; j <= 2; ++j)
+                        if (ImGui::Selectable(tr(presets[j - 1]), pr == j) && pr != j) put("FastInterleavedPreset", std::to_string(j));
+                    ImGui::EndCombo();
+                }
+                help("FastInterleavedPreset. Interleaved's processing method.");
+                int n = std::clamp(int(num("FastInterleavedPasses", 3.f)), 2, 8);
+                ImGui::SetNextItemWidth(230 * u);
+                if (ImGui::SliderInt(tr("Passes (fast)##w2fil"), &n, 2, 8)) put("FastInterleavedPasses", std::to_string(n));
+                reset("w2f-il", "FastInterleavedPasses", "3");
+                help("FastInterleavedPasses. Interleaved: how many legacy passes (2 to 8) take turns, one each frame. Each pass more needs more video memory.");
+            } else if (method == 4u) {
                 float e = std::clamp(num("FastEditStrength", 2.f), 0.f, 4.f);
                 ImGui::SetNextItemWidth(250 * u);
                 if (ImGui::SliderFloat(tr("Edit strength##w2f"), &e, 0.f, 4.f, "%.2f")) put("FastEditStrength", fmt(e));
@@ -1964,7 +2022,7 @@ struct ChainEditor {
                 help("FastEditStrength. The network's edit in stops times this (1 as made, 0 none), as Adjust NR's look's Edit strength with a wider range.");
             } else {
                 const std::string pre = std::string("Fast") + names[method];
-                const std::string id = std::to_string(method);
+                const std::string id = std::to_string(method - 1u);
                 float n = std::clamp(num((pre + "Passes").c_str(), 3.f), 1.f, 8.f);
                 ImGui::SetNextItemWidth(230 * u);
                 if (ImGui::SliderFloat(tr(("Passes (fast)##w2f" + id).c_str()), &n, 1.f, 8.f, "%.2f")) put(pre + "Passes", fmt(n));
@@ -1973,12 +2031,12 @@ struct ChainEditor {
                 bool halo = flag_of((pre + "HaloLimit").c_str(), false);
                 if (ImGui::Checkbox(tr(("Limit added halos##w2f" + id).c_str()), &halo)) put(pre + "HaloLimit", halo ? "true" : "false");
                 help("Limits the halos this method adds.");
-                const float fine_def = method == 0u ? 0.f : 1.f;
+                const float fine_def = method == 1u ? 0.f : 1.f;
                 float fine = std::clamp(num((pre + "Fine").c_str(), fine_def), 0.f, 2.f);
                 ImGui::SetNextItemWidth(250 * u);
                 if (ImGui::SliderFloat(tr(("Fine detail##w2f" + id).c_str()), &fine, 0.f, 2.f, "%.2f")) put(pre + "Fine", fmt(fine));
-                reset(("w2f-fine" + id).c_str(), pre + "Fine", method == 0u ? "0" : "1");
-                help(method == 0u ? "How much of the network's fine detail change Extrapolation adds: 0 none (default), 1 as made, 2 twice. Raise it for more fine detail; the game's own film grain grows with it."
+                reset(("w2f-fine" + id).c_str(), pre + "Fine", method == 1u ? "0" : "1");
+                help(method == 1u ? "How much of the network's fine detail change Extrapolation adds: 0 none (default), 1 as made, 2 twice. Raise it for more fine detail; the game's own film grain grows with it."
                                   : "How much of the network's fine detail change this method adds: 1 as made (default), 0 none, 2 twice.");
             }
         }

@@ -35,6 +35,8 @@ struct Status {
     int layer = 0;                         // the .asi's NR-chain layer this run was (its row), 0 none
     float fast_passes = 0.f;
     bool motion = false, fast_fallback = false;
+    uint8_t il_missing = 0;                // Passes (fast) Interleaved chosen and not run: why (nr::control::il_missing_note)
+    bool fast_fallback_spatial = false;    // Feedback / Hybrid not run because of peripheral compression
     bool waiting = false;                  // the run passed its frame through, not building (`waiting_why`)
     bool ran = false;                      // this run's network ran (a switch builds behind the network before)
     std::string waiting_why;

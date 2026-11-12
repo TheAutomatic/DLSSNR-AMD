@@ -46,6 +46,8 @@ source linux/build/arch/rdna4.sh
 
 # ---- compile ----------------------------------------------------------------
 common=(-std=c++17 -O2 -DNDEBUG -Itoolchain/Vulkan-Headers/include -Ilinux/src -Ilinux/src/core -Ilinux/src/layer -Ilinux/src/pe -I"$out")
+# (NR_RESHADE_ROUTE: these are the ReShade add-on's objects, all of them - the route's defaults, nr_fast_passes.hpp)
+common+=(-DNR_RESHADE_ROUTE=1)
 [[ "${NR_INT4:-0}" == 1 ]] && common+=(-DNR_INT4=1)   # the build of the programs with the int4 layers (int4/ below)
 "$cxx" "${common[@]}" "${NR_PRODUCT_DEFINES[@]}" -c linux/src/core/nr_runtime.cpp -o "$out/nr_runtime.o"
 "$cxx" "${common[@]}" -c linux/src/core/nr_native_plan.cpp -o "$out/nr_native_plan.o"

@@ -10,10 +10,10 @@
 # ReShade's Add-ons page, or Ctrl+F11 to cycle). The choice only sets the one a game starts with ([Network] Model):
 #   -Model CC_SMALL_FP8                   the default network of NVIDIA's 310.9.16 (default)
 #   -Model CC_SMALL_FP8_EXPERIMENTAL      this project's experimental network: CC_SMALL_FP8 made faster; its weights
-#                                         are made from CC_SMALL_FP8's model at install; RX 9000 only
+#                                         are made from CC_SMALL_FP8's model at install; ACO Mode only
 #   -Model CC_SILVER_AARDWOLD             the network of 310.8.0 (also preset 1 of 310.9.16)
 #   -Model CC_SILVER_AARDWOLD_OPTIMIZED   this project's faster CC_SILVER_AARDWOLD; its weights are made from
-#                                         CC_SILVER_AARDWOLD's model at install; RX 9000 only. Optimized layers: Quality /
+#                                         CC_SILVER_AARDWOLD's model at install; ACO Mode only. Optimized layers: Quality /
 #                                         Balanced / Performance / Ultra Performance (default) ([Network] OptimizedLayers
 #                                         in dlssnr-amd.ini; a switch in game)
 # Without it, the installer asks once; Enter = CC_SMALL_FP8. The earlier choices still work: -Model new = CC_SMALL_FP8,
@@ -482,11 +482,10 @@ if (-not $Model) {
     else { Say '  1) CC_SMALL_FP8                    not available: needs the 310.9.16 nvngx_dlssnr.dll (install again with -Dll)' }
     if (-not $haveSmall) { Say '  2) CC_SMALL_FP8_EXPERIMENTAL       not available: needs the 310.9.16 nvngx_dlssnr.dll (install again with -Dll)' }
     elseif (-not $haveExperimental) { Say '  2) CC_SMALL_FP8_EXPERIMENTAL       not available: this package does not have it' }
-    else { Say '  2) CC_SMALL_FP8_EXPERIMENTAL       this project''s experimental network: 1) made faster (RX 9000)' }
+    else { Say '  2) CC_SMALL_FP8_EXPERIMENTAL       this project''s experimental network: 1) made faster' }
     Say '  3) CC_SILVER_AARDWOLD              the network of 310.8.0 (also preset 1 of 310.9.16)'
-    if ($haveOptimized) { Say '  4) CC_SILVER_AARDWOLD_OPTIMIZED    this project''s network: 3) made faster (RX 9000)' }
+    if ($haveOptimized) { Say '  4) CC_SILVER_AARDWOLD_OPTIMIZED    this project''s network: 3) made faster' }
     else { Say '  4) CC_SILVER_AARDWOLD_OPTIMIZED    not available: this package does not have it' }
-    Say 'RX 7000 and the Radeon 700M / 800M / 8000S graphics run 1) and 3).'
     Say 'Later: [Network] Model in dlssnr-amd.ini.'
     $pick = Read-Host "Start with which one? [1/2/3/4, Enter = $default]"
     if ($pick -eq '') { $pick = "$default" }

@@ -45,6 +45,11 @@ def split_args(s):
 
 # ---- member defaults of the structs ------------------------------------------------------------------------------------
 constants = {m.group(1): int(m.group(2)) for m in re.finditer(r"\b(k\w+)\s*=\s*(-?\d+)\b", headers)}
+# Passes (fast)'s default method is the route's (core/nr_fast_passes.hpp kDefaultMethod: 1 in the ReShade add-on's build,
+# else 0); the OptiScaler route's value here, the add-on's file is rendered with kAddonFastMethod below
+constants["kDefaultMethod"] = 0
+kAddonFastMethod = 1
+constants["kDefaultInterleavedPreset"] = 1   # (core/nr_fast_passes.hpp)
 
 
 def literal(v):
@@ -52,7 +57,7 @@ def literal(v):
     if v in ("true", "false"): return v == "true"
     if v.startswith('"'): return v[1:-1]
     if v.startswith("{"): return [literal(x) for x in split_args(v[1:-1])]
-    v = re.sub(r"^(?:nr::)+", "", v)
+    v = re.sub(r"^(?:\w+::)+", "", v)   # (a namespace's constant: nr::, fast::)
     if v in constants: return constants[v]
     m = re.fullmatch(r"(-?[\d.]+(?:e-?\d+)?)[fFuU]?", v)
     if not m: raise ValueError("member default not understood: " + v)
@@ -149,7 +154,8 @@ def value(expr, scope):
     if m and m.group(1) in tables: return tables[m.group(1)][value(m.group(2), scope)]
     m = re.fullmatch(r"([\w:]+)\((.+)\)", e)
     if m and m.group(1) in funcs: return funcs[m.group(1)](value(m.group(2), scope))
-    if re.fullmatch(r"-?[\d.]+[fF]?|\"[^\"]*\"|true|false", e): return literal(e)
+    if re.fullmatch(r"-?[\d.]+[fFuU]?|\"[^\"]*\"|true|false", e): return literal(e)
+    if re.fullmatch(r"(?:\w+::)*k\w+", e) and e.split("::")[-1] in constants: return constants[e.split("::")[-1]]
     path = re.findall(r"\w+|\[\d+\]", e)
     v = scope
     for p in path:
@@ -173,6 +179,10 @@ inspect = render("void write_inspect(", {"i": struct("InspectConfig")})[0]   # e
 hudfix = render("void write_hudfix(", {"h": struct("HudFixConfig")})[0]   # off (the struct's default)
 hudfix_addon = render("void write_hudfix(", {"h": dict(struct("HudFixConfig"), mode=0)})[0]   # off on the ReShade route
 nrcontrol = formats(body_of("void write_nrcontrol("))[0][0]   # NR Control's key (the OptiScaler route's menu)
+d3d12_default = re.search(r"kDefaultEnabled = (true|false);",
+                          (srcdir / "pe/nr_d3d12_passthrough.hpp").read_text(encoding="utf-8")).group(1) == "true"
+d3d12 = render("void write_d3d12(", {"enabled": d3d12_default})[0]   # [D3D12Passthrough] (the OptiScaler route)
+gpu = formats(body_of("void write_gpu("))[0][0]   # [GPU] Architecture = auto
 save = formats(body_of("void Config::save("))
 assert len(save) == 8, len(save)   # [DlssNr], six Pass<N> lines (none by default), own keys
 scope = dict(config, k=config["controls"], spatial=config["spatial"])
@@ -180,15 +190,19 @@ dlssnr = save[0][0] % tuple(value(a, scope) for a in save[0][1])
 own = save[-1][0] % tuple(value(a, scope) for a in save[-1][1])   # MotionVectors: install.ps1 -Lumenite on writes lumenite
 
 
-def renodx_section(enabled):
+def renodx_section(enabled, fast_method=0):
+    """[RenoDX] as the route's program writes it: NRFastMethod and its "(default)" mark are the route's"""
     r = dict(renodx_cfg, enabled=enabled)
-    return "".join(render("void write_renodx(", {"r": r, "v": r["values"]}))
+    r["values"] = dict(r["values"], fast_method=fast_method)
+    constants["kDefaultMethod"] = fast_method
+    try: return "".join(render("void write_renodx(", {"r": r, "v": r["values"]}))
+    finally: constants["kDefaultMethod"] = 0
 
 
 (out / "dlssnr-amd-optiscaler.ini").write_text(network + preprocess + renodx_section(False) + w2 + inspect + hudfix +
-                                                nrcontrol + logsec, encoding="utf-8")
+                                                nrcontrol + d3d12 + gpu + logsec, encoding="utf-8")
 (out / "dlssnr-amd-optiscaler-renodx.ini").write_text(network + preprocess + renodx_section(True) + w2 + inspect + hudfix +
-                                                      nrcontrol + logsec, encoding="utf-8")
-(out / "dlssnr-amd-addon.ini").write_text(dlssnr + own + "\n" + network + preprocess + renodx_section(False) + inspect + hudfix_addon + logsec,
+                                                      nrcontrol + d3d12 + gpu + logsec, encoding="utf-8")
+(out / "dlssnr-amd-addon.ini").write_text(dlssnr + own + "\n" + network + preprocess + renodx_section(False, kAddonFastMethod) + inspect + hudfix_addon + gpu + logsec,
                                           encoding="utf-8")
 print("wrote", out / "dlssnr-amd-optiscaler.ini", out / "dlssnr-amd-optiscaler-renodx.ini", out / "dlssnr-amd-addon.ini")

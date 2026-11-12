@@ -21,11 +21,20 @@ layout(set = 0, binding = 1, rgba16f) uniform image2D a;
 layout(set = 0, binding = 2, rgba16f) uniform image2D b;
 layout(set = 0, binding = 3, rgba16f) uniform image2D c;
 layout(set = 0, binding = 4) uniform texture2D Scale;   // RenoDX's same-frame scale (NORMALISE, divisor 0)
+#ifdef PREP_FUSED
+// renodx_prep_fused.spv: RenoDX's SDR encode and decode folded in (the frame at the network's extent, read and
+// written in place: F the frame sampled, O the frame stored).
+layout(set = 0, binding = 5) uniform texture2D F;
+layout(set = 0, binding = 6) writeonly uniform image2D O;
+#endif
 layout(push_constant) uniform Push {
     uint width, height, mode, flags, curve;
     float bias, contrast, saturation, k, cap;
     float dt;
     float divisor;   // NORMALISE: RenoDX's divisor, 0 = the scale texel
+#ifdef PREP_FUSED
+    float color_strength;   // legacy_decode's ColorStrength
+#endif
 } pc;
 
 const uint AUTO = 1u, UNKNEE = 2u, RESTORE = 4u, RESET = 8u, LINEAR = 16u, NORMALISE = 32u, RATIO = 64u, APART = 128u, RECOMPUTE = 256u;
@@ -49,6 +58,16 @@ vec3 light(vec3 P) { return linear_frame() ? max(P, vec3(0.0)) : dec(P); }
 vec3 reencode(vec3 v) { return linear_frame() ? v : enc(v); }
 vec3 light_at(vec3 P, ivec2 xy) { return light(P); }   // prep_math.glsl's meter: no kept frame here
 
+#ifdef PREP_FUSED
+// The proxy legacy_encode stores (an SDR frame at the network's extent: max(frame, 0) into RGBA16F, alpha 1), as the
+// image holds it: the store's rounding toward zero (half_rtz below, checked against the store for every float in [0, 1]).
+vec3 half_rtz_f(vec3 v) {
+    return mix(trunc(v * 16777216.0) * 5.9604644775390625e-08, uintBitsToFloat(floatBitsToUint(v) & 0xffffe000u),
+               greaterThanEqual(abs(v), vec3(6.103515625e-05)));
+}
+vec4 load_p(ivec2 xy) { return vec4(half_rtz_f(max(texelFetch(F, xy, 0).rgb, vec3(0.0))), 1.0); }
+#define PREP_FRAME 1
+#endif
 #include "prep_math.glsl"
 
 // The half an rgba16f store keeps of v on RDNA4 (its conversion is toward zero): normal halves keep 10 mantissa bits,
@@ -58,10 +77,32 @@ vec3 half_rtz(vec3 v) {
                greaterThanEqual(abs(v), vec3(6.103515625e-05)));
 }
 
+// Neutral SDR: the scene-linear cap alone does not bound visible errors in dark
+// channels. Limit the encoded residual too, with one RGB scale to retain its
+// direction. The budget uses the edit after fast-pass processing, before the
+// later look composition. Edits within the budget return unchanged.
+vec3 neutral_sdr_bound(vec3 original, vec3 resolved, vec3 nin, vec3 nout, float cap) {
+    const vec3 input_edit = abs(nout - nin);
+    const float limit = cap * max(input_edit.r, max(input_edit.g, input_edit.b));
+    const vec3 residual = resolved - original;
+    const vec3 magnitude = abs(residual);
+    const float peak = max(magnitude.r, max(magnitude.g, magnitude.b));
+    return peak > limit ? original + residual * (limit / peak) : resolved;
+}
+
 void main() {
     if (pc.mode == 0u) { meter(); return; }
     const ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
     if (xy.x >= int(pc.width) || xy.y >= int(pc.height)) return;
+#ifdef PREP_FUSED
+    if (pc.mode == 3u) {   // legacy_encode (SDR, the network at the frame's extent) and mode 1 with APART
+        const vec3 Pf = max(texelFetch(F, xy, 0).rgb, vec3(0.0));
+        imageStore(a, xy, vec4(Pf, 1.0));                  // the proxy, as legacy_encode stores it
+        const vec4 P = vec4(half_rtz(Pf), 1.0);            // ... and as mode 1 reads it back
+        imageStore(b, xy, finite(P.rgb) ? vec4(enc(forward(light(P.rgb))), P.a) : P);
+        return;
+    }
+#endif
     if (pc.mode == 1u) {
         const vec4 P = imageLoad(a, xy);
         if (linear_frame()) {
@@ -96,13 +137,29 @@ void main() {
             // [Preprocess] Inverse = 0: the change as its ratio in the picture the network was shown
             d = p * (clamp(max(dout, vec3(1.0 / 1024.0)) / max(din, vec3(1.0 / 1024.0)), 0.25, 4.0) - 1.0);
         } else {
-            d = backward(dout) - backward(din);
+            const vec3 w = forward(vec3(1.0));   // display white through the forward curve
+            d = backward(min(dout, vec3(max(w.r, max(w.g, w.b))))) - backward(din);
             const vec3 lim = pc.cap * abs(dout - din) / gain();
             d = clamp(d, -lim, lim);
         }
         M = max(P.rgb + reencode(max(p + d, vec3(0.0))) - reencode(p), vec3(0.0));
+        if (pc.curve == 1u && (pc.flags & RATIO) == 0u)
+            M = neutral_sdr_bound(P.rgb, M, nin.rgb, nout.rgb, pc.cap);
         if (!finite(M)) M = P.rgb;
     }
+#ifdef PREP_FUSED
+    if (pc.mode == 4u) {   // the answer as the neural image holds it, then legacy_decode's ResolvePixel (HdrMode 0)
+        const vec3 upgraded = half_rtz(M);
+        const vec4 source = texelFetch(F, xy, 0);
+        const vec3 original = source.rgb;
+        const float original_y = dot(original, vec3(0.212639, 0.715169, 0.072192));
+        const float upgraded_y = dot(upgraded, vec3(0.212639, 0.715169, 0.072192));
+        const float ratio = original_y == 0.0 ? 1.0 : clamp(upgraded_y / original_y, 0.0, 4.0);
+        const vec3 luminance_only = original * ratio;
+        imageStore(O, xy, vec4(mix(luminance_only, upgraded, pc.color_strength), source.a));
+        return;
+    }
+#endif
     imageStore(c, xy, vec4(M, nout.a));
     if ((pc.flags & RESTORE) != 0u) imageStore(a, xy, P);
 }

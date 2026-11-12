@@ -33,7 +33,6 @@ std::vector<Queue> queues;
 std::vector<uint32_t> requested_families;
 // Devices created with the network's features added (network_features_added).
 std::vector<VkDevice> augmented_devices;
-std::vector<VkDevice> rdna3_devices;   // augmented for RDNA3's network
 void (*device_callback)(VkDevice) = nullptr;
 
 using PFN_CreateInstance = VkResult(VKAPI_PTR*)(const VkInstanceCreateInfo*,
@@ -94,7 +93,7 @@ const char* const kNetworkExtensions[] = {
 };
 
 struct Augmented {
-    bool rdna3 = false;
+    nr::arch::GpuArch arch = nr::arch::GpuArch::unknown;   // the network the features were added for
     std::unique_ptr<nr::DeviceFeatures> features;
     std::vector<const char*> extensions;
     VkDeviceCreateInfo info{};
@@ -122,24 +121,28 @@ bool augment(VkPhysicalDevice physical, const VkDeviceCreateInfo* info, Augmente
             if (list[i] && std::strcmp(list[i], name) == 0) return true;
         return false;
     };
-    std::string how;
-    const nr::arch::GpuArch arch = nr::arch::of(physical, &how);
-    if (arch == nr::arch::GpuArch::unknown) {
-        log("[nr] device features left as the game asked: not an RDNA4 or RDNA3 GPU (%s)", how.c_str());
-        return false;
-    }
-    a->rdna3 = arch == nr::arch::GpuArch::rdna3;
-    log("[nr] the game's GPU is %s (%s)", nr::arch::name(arch), how.c_str());
-    if (a->rdna3) {
+    const nr::arch::Identity id = nr::arch::identify(physical);
+    log("[nr] the game's GPU is %s", nr::arch::describe(id).c_str());
+    std::vector<const char*> network(std::begin(kNetworkExtensions), std::end(kNetworkExtensions));
+    switch (id.arch) {
+    case nr::arch::GpuArch::rdna4:
+        network.push_back(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
+        break;
+    case nr::arch::GpuArch::rdna3: {
         std::string why;
         if (!nr::binary::use_rdna3(&why)) {
             log("[nr] device features left as the game asked: RDNA3 GPUs run NR as ACO's machine code only, and %s",
                 why.c_str());
             return false;
         }
+        break;
     }
-    std::vector<const char*> network(std::begin(kNetworkExtensions), std::end(kNetworkExtensions));
-    if (!a->rdna3) network.push_back(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
+    case nr::arch::GpuArch::unknown: case nr::arch::GpuArch::rdna1: case nr::arch::GpuArch::rdna2:
+        log("[nr] device features left as the game asked: NR has no network for this GPU (%s)",
+            nr::arch::name(id.arch));
+        return false;
+    }
+    a->arch = id.arch;
     for (const char* e : network) {
         bool found = false;
         for (const auto& h : have) found = found || std::strcmp(h.extensionName, e) == 0;
@@ -153,7 +156,7 @@ bool augment(VkPhysicalDevice physical, const VkDeviceCreateInfo* info, Augmente
     for (const char* e : network)
         if (!listed(e, a->extensions.data(), a->extensions.size())) a->extensions.push_back(e);
     a->features = std::make_unique<nr::DeviceFeatures>(info->pNext);
-    a->features->enable(a->rdna3);
+    a->features->enable(a->arch);
     auto* w = a->features->get<VkPhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR>(
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_FEATURES_KHR);
     w->workgroupMemoryExplicitLayout = w->workgroupMemoryExplicitLayout8BitAccess =
@@ -204,7 +207,6 @@ VkResult VKAPI_PTR hooked_create_device(VkPhysicalDevice physical, const VkDevic
             seen.physical = physical;
             seen.device = *out;
             if (added) augmented_devices.push_back(*out);
-            if (added && augmented.rdna3) rdna3_devices.push_back(*out);
         }
         log("[nr] Vulkan device created by the game");
         if (device_callback) device_callback(*out);
@@ -263,7 +265,6 @@ VkResult create_with_network(PFN_vkCreateDevice create, VkPhysicalDevice physica
         log("[nr] network features added to the game's device");
         std::lock_guard<std::mutex> guard(lock);
         augmented_devices.push_back(*out);
-        if (augmented.rdna3) rdna3_devices.push_back(*out);
     }
     return r;
 }
@@ -354,6 +355,11 @@ std::string driver_name() {
     }
     return name;
 }
+static std::string g_d3d12_gpu_name;
+void note_d3d12_gpu_name(const std::string& n) {
+    std::lock_guard<std::mutex> guard(lock);
+    if (!n.empty()) g_d3d12_gpu_name = n;
+}
 std::string gpu_name() {
     static std::string name;
     static VkPhysicalDevice named = VK_NULL_HANDLE;
@@ -365,7 +371,7 @@ std::string gpu_name() {
         name = props.deviceName;
         named = p;
     }
-    return name;
+    return !name.empty() ? name : g_d3d12_gpu_name;
 }
 
 void forget_device(VkDevice device) {
@@ -374,7 +380,6 @@ void forget_device(VkDevice device) {
     queues.erase(std::remove_if(queues.begin(), queues.end(), [device](const Queue& q) { return q.device == device; }),
                  queues.end());
     if (seen.device == device) { seen.device = VK_NULL_HANDLE; requested_families.clear(); }
-    rdna3_devices.erase(std::remove(rdna3_devices.begin(), rdna3_devices.end(), device), rdna3_devices.end());
     augmented_devices.erase(std::remove(augmented_devices.begin(), augmented_devices.end(), device), augmented_devices.end());
 }
 
@@ -406,12 +411,6 @@ bool family_of(VkQueue queue, uint32_t* family) {
     if (!queue || !family) return false;
     for (const auto& q : queues)
         if (q.queue == queue) { *family = q.family; return true; }
-    return false;
-}
-
-bool runs_rdna3(VkDevice device) {
-    std::lock_guard<std::mutex> guard(lock);
-    for (VkDevice d : rdna3_devices) if (d == device) return true;
     return false;
 }
 

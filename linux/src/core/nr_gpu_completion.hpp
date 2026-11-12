@@ -22,6 +22,7 @@ struct Recording {
     std::mutex mutex;
     bool sealed = false;
     bool unknown_submit = false;
+    bool ever_submitted = false;   // (ran_ready: at least one submission known)
     std::chrono::steady_clock::time_point touched = std::chrono::steady_clock::now();
     uint64_t touched_at = submissions.load();
     bool fallback_due() const {
@@ -44,6 +45,27 @@ struct Recording {
         // A secondary can be reset while an executable primary still retains its earlier recording.
         return due || std::all_of(kept.begin(), kept.end(), [](const auto& p) { return p->ready(); });
     }
+    // HUD capture cannot treat elapsed time/submission count as a resource lifetime proof.
+    bool capture_ready() {
+        std::vector<std::shared_ptr<Recording>> owners;
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            waits.erase(std::remove_if(waits.begin(), waits.end(), [](auto& f) { return f(); }), waits.end());
+            if (!sealed || unknown_submit || !waits.empty()) return false;
+            for (const auto& p:parents) if (auto owner=p.lock()) owners.push_back(std::move(owner));
+        }
+        return std::all_of(owners.begin(),owners.end(),[](const auto& p){return p->capture_ready();});
+    }
+    // Every execution of it known so far has finished on the GPU (at least one; none unknown) - also while it is not
+    // sealed. HUD FIX's chain snapshots: a game that keeps its closed command lists without Reset never
+    // seals them, so capture_ready() never came and each copy made a new back-buffer-size image (23 MB at 3200x1800,
+    // ~190 MB/s) until RAM ran out and the frame rate collapsed. Only a later re-execution of the same closed list is not
+    // covered.
+    bool ran_ready() {
+        std::lock_guard<std::mutex> guard(mutex);
+        waits.erase(std::remove_if(waits.begin(), waits.end(), [](auto& f) { return f(); }), waits.end());
+        return ever_submitted && !unknown_submit && waits.empty();
+    }
     void seal() { std::lock_guard<std::mutex> guard(mutex); sealed = true; }
     void submitted(std::function<bool()> wait) {
         std::vector<std::shared_ptr<Recording>> kept;
@@ -51,6 +73,7 @@ struct Recording {
             std::lock_guard<std::mutex> guard(mutex);
             waits.erase(std::remove_if(waits.begin(), waits.end(), [](auto& f) { return f(); }), waits.end());
             kept = children;
+            ever_submitted = true;
             if (wait) waits.push_back(wait); else unknown_submit = true;
             touched = std::chrono::steady_clock::now();
             touched_at = ++submissions;

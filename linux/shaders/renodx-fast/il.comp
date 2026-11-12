@@ -1,0 +1,676 @@
+#version 460
+// Passes (fast) Interleaved: one network pass a frame, the legacy passes in turn (slot = frame mod N, N 2..8, each with
+// its own history, as legacy's). Kept per slot: its increment (answer - its input) in the proxy's space, moved along
+// the motion vectors every frame. A still picture gives legacy N: every pass sees what it sees in legacy.
+//   mode 0 (before the network): (flags & 2) Hist := what this slot would have written last frame - last frame's Base
+//            + its increments up to this slot, before they move - the slot's network history, one frame old; then
+//            Base := the proxy (this frame's encoded colour); every increment moved by this frame's vectors (src ->
+//            dst; flags & 1, else copied); the proxy := Base + the increments of the slots before `slot`
+//   mode 1 (after the network):  dst[slot] := the answer - the proxy (the slot's input); the answer := Base + every
+//            increment; the proxy := Base (what the compose reads as the frame)
+//   (flags & 268435456, the proxy kept: the frame stays in the proxy - mode 0 / 4 read it there and write the slot's input
+//    into Base, which the network reads; mode 1 reads the input from Base and writes the frame into Base for the next
+//    frame's BasePrev; mode 3 is not run)
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_GOOGLE_include_directive : require
+#include "../rdna4/include/nr_style_grade.glsl"
+layout(local_size_x = 16, local_size_y = 16) in;
+// The step as a specialization constant: each step its own pipeline, compiled for its own path only (one pipeline for
+// all of them takes the registers of the heaviest - the fill's - and every step runs at its occupancy). Unspecialised:
+// the push block's mode.
+layout(constant_id = 0) const uint kStep = 0xFFFFu;
+#define STEP (kStep != 0xFFFFu ? kStep : pc.mode)
+layout(set = 0, binding = 0, rgba16f) uniform image2D Proxy;
+layout(set = 0, binding = 1, rgba16f) uniform image2D Answer;
+layout(set = 0, binding = 2, rgba16f) uniform image2D Base;
+layout(set = 0, binding = 3) uniform texture2D Motion;
+layout(set = 0, binding = 4) uniform texture2D S0;
+layout(set = 0, binding = 5) uniform texture2D S1;
+layout(set = 0, binding = 6) uniform texture2D S2;
+layout(set = 0, binding = 7) uniform texture2D S3;
+layout(set = 0, binding = 8) uniform texture2D S4;
+layout(set = 0, binding = 9) uniform texture2D S5;
+layout(set = 0, binding = 10) uniform texture2D S6;
+layout(set = 0, binding = 11) uniform texture2D S7;
+layout(set = 0, binding = 12, rgba16f) uniform image2D D0;
+layout(set = 0, binding = 13, rgba16f) uniform image2D D1;
+layout(set = 0, binding = 14, rgba16f) uniform image2D D2;
+layout(set = 0, binding = 15, rgba16f) uniform image2D D3;
+layout(set = 0, binding = 16, rgba16f) uniform image2D D4;
+layout(set = 0, binding = 17, rgba16f) uniform image2D D5;
+layout(set = 0, binding = 18, rgba16f) uniform image2D D6;
+layout(set = 0, binding = 19, rgba16f) uniform image2D D7;
+layout(set = 0, binding = 20, rgba16f) uniform writeonly image2D Hist;
+// last frame's Base (Base is a pair: this frame's is written while last frame's is read)
+layout(set = 0, binding = 21) uniform texture2D BasePrev;
+// how far the moved increments are to be trusted at this pixel (mode 0 -> mode 1)
+layout(set = 0, binding = 22, r16f) uniform image2D Trust;
+// (NR_IL_DEBUG=2: each test's own answer - Trust, vectors, box, depth; 1 x 1 unless that view is on)
+layout(set = 0, binding = 43, rgba16f) uniform image2D TrustDbg;
+// the fill's pyramid (il_pp.comp, flags & 64): levels 1..6, the slots side by side
+layout(set = 0, binding = 23) uniform texture2D L1;
+layout(set = 0, binding = 24) uniform texture2D L2;
+layout(set = 0, binding = 25) uniform texture2D L3;
+layout(set = 0, binding = 26) uniform texture2D L4;
+layout(set = 0, binding = 27) uniform texture2D L5;
+layout(set = 0, binding = 28) uniform texture2D L6;
+// the game's depth (flags & 256 / 512, research NR_IL_DEPTH): its region (dbase, dgrid) in DepthIn; this frame's and last
+// frame's nearness at this size (mode 5 writes DepthCur; nearness = depth, or 1 - depth when it is not inverted)
+layout(set = 0, binding = 29) uniform texture2D DepthIn;
+layout(set = 0, binding = 30, r32f) uniform image2D DepthCur;
+layout(set = 0, binding = 31) uniform texture2D DepthPrev;
+// last frame's vectors at this size, in pixels (il_mv.comp's ring; flags & 8388608, NR_IL_VPREV)
+layout(set = 0, binding = 36) uniform texture2D MvPrev;
+// the depth pyramid (il_pp.comp, flags & 67108864, research NR_IL_DFILL): levels 1..6, mean nearness x weight, mean weight
+layout(set = 0, binding = 37) uniform texture2D DP1;
+layout(set = 0, binding = 38) uniform texture2D DP2;
+layout(set = 0, binding = 39) uniform texture2D DP3;
+layout(set = 0, binding = 40) uniform texture2D DP4;
+layout(set = 0, binding = 41) uniform texture2D DP5;
+layout(set = 0, binding = 42) uniform texture2D DP6;
+// flags & 2048: the slots' networks ran plain (Standard, Intensity 1) and their increments are the network's own; each
+// pass's Intensity and Style grade are applied here, pass after pass, as the network's post block does on its answer:
+// styles = 2 bits a pass, inten = the Intensity, for passes 1..3 and 4 and later (the session's pass_controls)
+layout(push_constant) uniform Push { uvec2 size, mbase, mgrid; vec2 mscale; uint mode, slot, n, flags; float k0, k1; uvec2 dbase, dgrid;
+                                     uint styles, pad0; vec4 inten; } pc;
+// pass k's answer from its input `base` and its network's own output `rgb` (fswin_t.comp's compose + grade)
+vec3 post(uint k, vec3 base, vec3 rgb) {
+    if ((pc.flags & 2048u) == 0u) return rgb;
+    const uint kk = min(k, 3u), st = (pc.styles >> (2u * kk)) & 3u;
+    const float I = pc.inten[kk];
+    rgb = clamp(fma(vec3(min(I, 1.0)), rgb - base, base), vec3(0.0), vec3(1.0));
+    if (I > 1.0) {
+        const float fl = 1.0 / 512.0, guard = 2.0;
+        const vec3 luma_w = vec3(0.2126, 0.7152, 0.0722);
+        const float ratio = (dot(rgb, luma_w) + fl) / (dot(base, luma_w) + fl);
+        const float amp = clamp(pow(max(ratio, 1e-6), I), 1.0 / guard, guard);
+        rgb = clamp(rgb * (amp / max(ratio, 1e-6)), vec3(0.0), vec3(1.0));
+    }
+    if (st != 0u) rgb = nr_style_grade(st, base, rgb, I);
+    return rgb;
+}
+float near_at(uvec2 mt) {   // the game's nearness at motion texel mt (its place in the depth's region)
+    const uvec2 t = pc.dbase + min((mt - pc.mbase) * pc.dgrid / pc.mgrid, pc.dgrid - 1u);
+    const float d = texelFetch(DepthIn, ivec2(t), 0).r;
+    return (pc.flags & 1024u) != 0u ? d : 1.0 - d;
+}
+vec4 src(uint i, ivec2 c) {
+    switch (i) {
+        case 0u: return texelFetch(S0, c, 0); case 1u: return texelFetch(S1, c, 0);
+        case 2u: return texelFetch(S2, c, 0); case 3u: return texelFetch(S3, c, 0);
+        case 4u: return texelFetch(S4, c, 0); case 5u: return texelFetch(S5, c, 0);
+        case 6u: return texelFetch(S6, c, 0); default: return texelFetch(S7, c, 0);
+    }
+}
+vec3 bil(uint i, vec2 p) {   // bilinear at p (texel centres at +0.5), edges clamped
+    const vec2 f = p - 0.5, b0 = floor(f), w = f - b0;
+    const ivec2 i0 = ivec2(b0), hi = ivec2(pc.size) - 1;
+    const vec3 a = src(i, clamp(i0, ivec2(0), hi)).rgb, b = src(i, clamp(i0 + ivec2(1, 0), ivec2(0), hi)).rgb;
+    const vec3 c = src(i, clamp(i0 + ivec2(0, 1), ivec2(0), hi)).rgb, d = src(i, clamp(i0 + ivec2(1, 1), ivec2(0), hi)).rgb;
+    return mix(mix(a, b, w.x), mix(c, d, w.x), w.y);
+}
+vec3 prevb(vec2 p) {   // last frame's Base, bilinear at p, edges clamped
+    const vec2 f = p - 0.5, b0 = floor(f), w = f - b0;
+    const ivec2 i0 = ivec2(b0), hi = ivec2(pc.size) - 1;
+    const vec3 a = texelFetch(BasePrev, clamp(i0, ivec2(0), hi), 0).rgb, b = texelFetch(BasePrev, clamp(i0 + ivec2(1, 0), ivec2(0), hi), 0).rgb;
+    const vec3 c = texelFetch(BasePrev, clamp(i0 + ivec2(0, 1), ivec2(0), hi), 0).rgb, d = texelFetch(BasePrev, clamp(i0 + ivec2(1, 1), ivec2(0), hi), 0).rgb;
+    return mix(mix(a, b, w.x), mix(c, d, w.x), w.y);
+}
+vec3 ld(uint i, ivec2 p) {
+    switch (i) {
+        case 0u: return imageLoad(D0, p).rgb; case 1u: return imageLoad(D1, p).rgb;
+        case 2u: return imageLoad(D2, p).rgb; case 3u: return imageLoad(D3, p).rgb;
+        case 4u: return imageLoad(D4, p).rgb; case 5u: return imageLoad(D5, p).rgb;
+        case 6u: return imageLoad(D6, p).rgb; default: return imageLoad(D7, p).rgb;
+    }
+}
+void st(uint i, ivec2 p, vec3 v) {
+    const vec4 o = vec4(v, 0.0);
+    switch (i) {
+        case 0u: imageStore(D0, p, o); break; case 1u: imageStore(D1, p, o); break;
+        case 2u: imageStore(D2, p, o); break; case 3u: imageStore(D3, p, o); break;
+        case 4u: imageStore(D4, p, o); break; case 5u: imageStore(D5, p, o); break;
+        case 6u: imageStore(D6, p, o); break; default: imageStore(D7, p, o); break;
+    }
+}
+vec4 lv(uint l, ivec2 c) {
+    switch (l) {
+        case 1u: return texelFetch(L1, c, 0); case 2u: return texelFetch(L2, c, 0); case 3u: return texelFetch(L3, c, 0);
+        case 4u: return texelFetch(L4, c, 0); case 5u: return texelFetch(L5, c, 0); default: return texelFetch(L6, c, 0);
+    }
+}
+// slot i's usable increments around p: push-pull - from the coarsest level down, each level's usable part over the
+// coarser estimate (premultiplied: rgb + (1 - a) x below), so a hole fades into its surroundings with no level seams
+vec2 dlv(uint l, ivec2 c) {
+    switch (l) {
+        case 1u: return texelFetch(DP1, c, 0).rg; case 2u: return texelFetch(DP2, c, 0).rg; case 3u: return texelFetch(DP3, c, 0).rg;
+        case 4u: return texelFetch(DP4, c, 0).rg; case 5u: return texelFetch(DP5, c, 0).rg; default: return texelFetch(DP6, c, 0).rg;
+    }
+}
+// level l's four texels around full-size position p and their bilinear weights (t)
+void lvgeo(uint l, vec2 p, out ivec2 c[4], out int wx, out vec2 t) {
+    uvec2 w = pc.size;
+    for (uint k = 0u; k < l; ++k) w = (w + 1u) / 2u;
+    const vec2 f = p / float(1u << l) - 0.5, b0 = floor(f);
+    t = f - b0;
+    const ivec2 i0 = ivec2(b0), hi = ivec2(w) - 1;
+    c[0] = clamp(i0, ivec2(0), hi); c[1] = clamp(i0 + ivec2(1, 0), ivec2(0), hi);
+    c[2] = clamp(i0 + ivec2(0, 1), ivec2(0), hi); c[3] = clamp(i0 + ivec2(1, 1), ivec2(0), hi);
+    wx = int(w.x);
+}
+// near >= 0 (flags & 67108864): the four texels weighted also by how close their usable pixels' mean nearness is to this
+// pixel's (joint bilateral) - a hole the camera or a person uncovers is filled from what lies at its depth, not from the
+// person beside it. The weights are the same for every slot: made once a level (wb, their sum in w).
+vec4 lvw(uint l, vec2 p, float near) {
+    ivec2 c[4]; int wx; vec2 t;
+    lvgeo(l, p, c, wx, t);
+    vec4 wb = vec4((1.0 - t.x) * (1.0 - t.y), t.x * (1.0 - t.y), (1.0 - t.x) * t.y, t.x * t.y);
+    for (int k = 0; k < 4; ++k) {
+        const vec2 dn = dlv(l, c[k]);
+        const float nk = dn.y > 1e-6 ? dn.x / dn.y : -1.0;
+        const float rel = nk < 0.0 ? 1.0 : abs(nk - near) / max(max(nk, near), 1e-7);
+        wb[k] *= 1.0 - smoothstep(0.05, 0.2, rel);
+    }
+    return wb;
+}
+// level l of slot i at full-size position p: bilinear, or (bil) with the level's bilateral weights wb
+vec4 lvb(uint l, uint i, vec2 p, bool bil, vec4 wb) {
+    ivec2 c[4]; int wx; vec2 t;
+    lvgeo(l, p, c, wx, t);
+    const ivec2 off = ivec2(int(i) * wx, 0);
+    const vec4 a = lv(l, c[0] + off), b = lv(l, c[1] + off), cc = lv(l, c[2] + off), d = lv(l, c[3] + off);
+    if (!bil) return mix(mix(a, b, t.x), mix(cc, d, t.x), t.y);
+    const float sw = wb.x + wb.y + wb.z + wb.w;
+    return sw > 1e-4 ? (a * wb.x + b * wb.y + cc * wb.z + d * wb.w) / sw * min(sw * 4.0, 1.0) : vec4(0.0);
+}
+// slot i's usable increments around p, filled from the coarsest level down; wl[l - 1]: level l's bilateral weights
+vec3 pull(uint i, vec2 p, bool bil, const vec4 wl[6]) {
+    const vec4 top0 = lvb(6u, i, p, false, vec4(0.0)), topd = bil ? lvb(6u, i, p, true, wl[5]) : top0;
+    const vec4 top = topd.a > 1e-4 ? topd : top0;   // (nothing at its depth even at the top: the plain mean)
+    vec3 e = top.a > 1e-4 ? top.rgb / top.a : vec3(0.0);
+    for (uint l = 5u; l >= 1u; --l) {
+        const vec4 m = lvb(l, i, p, bil, wl[l - 1u]);
+        e = m.rgb + (1.0 - m.a) * e;
+    }
+    return e;
+}
+// the motion field's change over the move d around motion texel c (its gradient from 2 texels either side, in pixels here)
+vec2 grad_v(ivec2 c, vec2 d) {
+    const ivec2 lo = ivec2(pc.mbase), hi = ivec2(pc.mbase + pc.mgrid) - 1;
+    const vec2 step = 2.0 * vec2(pc.size) / vec2(pc.mgrid);
+    const vec2 mx = (texelFetch(Motion, clamp(c + ivec2(2, 0), lo, hi), 0).xy - texelFetch(Motion, clamp(c - ivec2(2, 0), lo, hi), 0).xy) * pc.mscale / (2.0 * step.x);
+    const vec2 my = (texelFetch(Motion, clamp(c + ivec2(0, 2), lo, hi), 0).xy - texelFetch(Motion, clamp(c - ivec2(0, 2), lo, hi), 0).xy) * pc.mscale / (2.0 * step.y);
+    return mx * d.x + my * d.y;
+}
+vec2 mvprev(vec2 p) {   // last frame's vector, bilinear at p, edges clamped
+    const vec2 f = p - 0.5, b0 = floor(f), w = f - b0;
+    const ivec2 i0 = ivec2(b0), hi = ivec2(pc.size) - 1;
+    const vec2 a = texelFetch(MvPrev, clamp(i0, ivec2(0), hi), 0).xy, b = texelFetch(MvPrev, clamp(i0 + ivec2(1, 0), ivec2(0), hi), 0).xy;
+    const vec2 c = texelFetch(MvPrev, clamp(i0 + ivec2(0, 1), ivec2(0), hi), 0).xy, d = texelFetch(MvPrev, clamp(i0 + ivec2(1, 1), ivec2(0), hi), 0).xy;
+    return mix(mix(a, b, w.x), mix(c, d, w.x), w.y);
+}
+vec2 clampl(vec2 x, float m) { const float l = length(x); return l > m ? x * (m / l) : x; }
+// Private P1 display stabilization, same16x16 workgroup as original il0.
+layout(set=0,binding=46) uniform texture2D StablePrev;
+layout(set=0,binding=47,rgba16f) uniform image2D StableCur;
+#ifndef STABLE_APPLY
+#define STABLE_APPLY 1
+#endif
+const float kMature0=30,kMature1=45,kKeep=.75,kCap=.02;
+#ifndef LEAD_GAIN
+#define LEAD_GAIN .75
+#endif
+#ifndef LEAD_HISTORY
+#define LEAD_HISTORY 0
+#endif
+float lead_age(float age){return smoothstep(3.5,5.5,age)*(1-smoothstep(12,24,age));}
+float g_prev_alpha=0;
+vec4 ld4(uint i,ivec2 p) {
+    switch(i) {
+        case 0u:return imageLoad(D0,p);case 1u:return imageLoad(D1,p);
+        case 2u:return imageLoad(D2,p);case 3u:return imageLoad(D3,p);
+        case 4u:return imageLoad(D4,p);case 5u:return imageLoad(D5,p);
+        case 6u:return imageLoad(D6,p);default:return imageLoad(D7,p);
+    }
+}
+void st_meta(uint i,ivec2 p,vec3 rgb,float meta) {
+    vec4 o=vec4(rgb,meta);
+    switch(i) {
+        case 0u:imageStore(D0,p,o);break;case 1u:imageStore(D1,p,o);break;
+        case 2u:imageStore(D2,p,o);break;case 3u:imageStore(D3,p,o);break;
+        case 4u:imageStore(D4,p,o);break;case 5u:imageStore(D5,p,o);break;
+        case 6u:imageStore(D6,p,o);break;default:imageStore(D7,p,o);break;
+    }
+}
+// Same four source reads and original RGB interpolation as bil(); alpha is the
+// previous frame's age, carried in THIS frame's current slot (last frame's next).
+vec3 bil_meta(uint i,vec2 p) {
+    const vec2 f=p-.5,b0=floor(f),w=f-b0;const ivec2 i0=ivec2(b0),hi=ivec2(pc.size)-1;
+    const vec4 aa=src(i,clamp(i0,ivec2(0),hi)),bb=src(i,clamp(i0+ivec2(1,0),ivec2(0),hi)),
+               cc=src(i,clamp(i0+ivec2(0,1),ivec2(0),hi)),dd=src(i,clamp(i0+ivec2(1,1),ivec2(0),hi));
+    const vec3 a=aa.rgb,b=bb.rgb,c=cc.rgb,d=dd.rgb;
+    g_prev_alpha=mix(mix(aa.a,bb.a,w.x),mix(cc.a,dd.a,w.x),w.y);
+    return mix(mix(a,b,w.x),mix(c,d,w.x),w.y);
+}
+vec3 stable_at(vec2 p) {
+    ivec2 grid=ivec2((pc.size+7u)/8u);vec2 f=p/8-.5,b=floor(f),w=f-b;ivec2 k=ivec2(b);
+    return mix(mix(imageLoad(StableCur,clamp(k,ivec2(0),grid-1)).rgb,imageLoad(StableCur,clamp(k+ivec2(1,0),ivec2(0),grid-1)).rgb,w.x),
+               mix(imageLoad(StableCur,clamp(k+ivec2(0,1),ivec2(0),grid-1)).rgb,imageLoad(StableCur,clamp(k+ivec2(1,1),ivec2(0),grid-1)).rgb,w.x),w.y);
+}
+float lead_at(vec2 p) {
+    ivec2 grid=ivec2((pc.size+7u)/8u);vec2 f=p/8-.5,b=floor(f),w=f-b;ivec2 k=ivec2(b);
+    return mix(mix(imageLoad(StableCur,ivec2(grid.x,0)+clamp(k,ivec2(0),grid-1)).r,imageLoad(StableCur,ivec2(grid.x,0)+clamp(k+ivec2(1,0),ivec2(0),grid-1)).r,w.x),
+               mix(imageLoad(StableCur,ivec2(grid.x,0)+clamp(k+ivec2(0,1),ivec2(0),grid-1)).r,imageLoad(StableCur,ivec2(grid.x,0)+clamp(k+ivec2(1,1),ivec2(0),grid-1)).r,w.x),w.y);
+}
+float history_lead_at(vec2 p) {
+    ivec2 grid=ivec2((pc.size+7u)/8u);vec2 f=p/8-.5,b=floor(f),w=f-b;ivec2 k=ivec2(b);
+    return mix(mix(imageLoad(StableCur,clamp(k,ivec2(0),grid-1)).a,imageLoad(StableCur,clamp(k+ivec2(1,0),ivec2(0),grid-1)).a,w.x),
+               mix(imageLoad(StableCur,clamp(k+ivec2(0,1),ivec2(0),grid-1)).a,imageLoad(StableCur,clamp(k+ivec2(1,1),ivec2(0),grid-1)).a,w.x),w.y);
+}
+
+#ifndef FILLED_CONFIDENCE
+#define FILLED_CONFIDENCE 1
+#endif
+const uint kRs=4u;
+const float kShownKeep = 0.75, kShownMax = 0.02, kShownV0 = 0.03, kShownV1 = 0.08, kShownA0 = 0.25, kShownA1 = 0.75;
+// Only the local part of what was held back is carried on: last frame's correction minus its mean over a wide area
+// around the place, 7 x 7 points kShownWide blocks apart (+-96 pixels)
+const int kShownWide = 4;
+// A place a figure has just walked past (uncovered FAST: most of a block at once, by the game's depth) is young for
+// kYoungN frames. There the edit is settling one way - the network's own history loop, one step a run, and a slot runs
+// only every N-th frame - so: the correction is off (held back, the change stayed behind as a patch with the outline's
+// stripes in it), the shown picture is led by the young places' jumps, and the lead goes into the next slot's network
+// history (the loop then starts from where the edit is going: Legacy's ~10 frames of settling instead of N times that).
+// An outline that moves a pixel or two a frame (hair) uncovers slivers: not young, the correction stays.
+const float kYoungN = 24.0, kYoungU0 = 0.3, kYoungU1 = 0.7, kYoungLead = 0.0;
+
+shared vec4 s_c17jump[256];shared vec2 s_c17stay[256];
+void stable_reduce(uvec2 px,bool live) {
+    uint li=gl_LocalInvocationIndex;uvec2 loc=gl_LocalInvocationID.xy;
+    vec4 j=vec4(0);vec2 st=vec2(0);
+    if(live && (loc.y&3u)==0u) {
+        ivec2 ip=ivec2(px);vec4 old=ld4(pc.slot,ip);
+        vec3 input_rgb=(pc.flags&268435456u)!=0u?imageLoad(Base,ip).rgb:imageLoad(Proxy,ip).rgb;
+        vec3 fresh=imageLoad(Answer,ip).rgb-input_rgb;
+        float weight=1;
+#if !FILLED_CONFIDENCE
+        weight=imageLoad(Trust,ip).r;
+#endif
+        j=weight*vec4(old.rgb-fresh,1);
+        st=vec2(old.a>.5?1:0,1); // P1 private metadata = current stay, not P2 confidence.
+    }
+    s_c17jump[li]=j;s_c17stay[li]=st;barrier();
+    if(live && (loc.x&7u)==0u && (loc.y&7u)==0u) {
+        vec4 qa=vec4(0);vec2 ta=vec2(0);uvec2 bo=px;
+        for(uint y=0u;y<8u;y+=4u)for(uint x=0u;x<8u;x++) {
+            qa+=s_c17jump[li+y*16u+x];ta+=s_c17stay[li+y*16u+x];
+        }
+                const float cnt = 64.0 / float(kRs);
+                vec3 j = qa.a > 1e-3 ? qa.rgb / qa.a : vec3(0.0);
+                j *= smoothstep(kShownA0, kShownA1, qa.a / cnt);
+                const ivec2 bc = min(ivec2(bo) + 4, ivec2(pc.size) - 1), g8 = (ivec2(pc.size) + 7) / 8;
+                const uvec2 mt = pc.mbase + min(uvec2((vec2(bc) + 0.5) * vec2(pc.mgrid) / vec2(pc.size)), pc.mgrid - 1u);
+                // (as far as the block's increments stay in place - a HUD - so does its correction, and the block is not in
+                // fast motion however fast the scene behind it moves)
+                const vec2 mv = (1.0 - ta.x / max(ta.y, 1.0)) * texelFetch(Motion, ivec2(mt), 0).xy * pc.mscale;
+                const vec2 q8 = (vec2(bc) + 0.5 + mv) / 8.0;
+                vec3 cp = vec3(0.0);
+                float jw = 0.0;   // (the wide mean of last frame's jumps, luma)
+                float jy = 0.0;   // (the same of the young places' jumps alone)
+                float ap = 1.0;   // (how long the place has been seen, 0 .. 1; without last frame's: seen)
+                if ((pc.flags & 16u) != 0u && all(greaterThanEqual(q8, vec2(0.0))) && all(lessThanEqual(q8, vec2(g8)))) {
+                    const vec2 f = q8 - 0.5, b0 = floor(f), w = f - b0;
+                    const ivec2 i0 = ivec2(b0);
+                    cp = mix(mix(texelFetch(StablePrev, clamp(i0, ivec2(0), g8 - 1), 0).rgb, texelFetch(StablePrev, clamp(i0 + ivec2(1, 0), ivec2(0), g8 - 1), 0).rgb, w.x),
+                             mix(texelFetch(StablePrev, clamp(i0 + ivec2(0, 1), ivec2(0), g8 - 1), 0).rgb, texelFetch(StablePrev, clamp(i0 + ivec2(1, 1), ivec2(0), g8 - 1), 0).rgb, w.x), w.y);
+                    // The wobble this correction steadies is local - a block's own. An edit that changes over hundreds
+                    // of pixels at once is a real change (the lift in camera motion; the wall a figure has just passed
+                    // settling, ~10 frames one way), and carrying it on kept the picture ~3 frames behind it: a faint
+                    // wide patch behind the figure, plain on a dark wall. With the wide mean taken out, what is left of
+                    // a wide change is its newest jump alone (and last frame's, see below).
+                    // (a young place's jump is kept with + 0.5, see the store: it is no part of what is held back, it is
+                    // what the young places around here are led by)
+                    vec3 cw = vec3(0.0);
+                    float nw = 0.0, aw = 0.0, ny = 0.0;
+                    for (int y = -3; y <= 3; ++y)
+                        for (int x = -3; x <= 3; ++x) {
+                            const ivec2 pw = ivec2(floor(q8)) + ivec2(x, y) * kShownWide;
+                            if (all(greaterThanEqual(pw, ivec2(0))) && all(lessThan(pw, g8))) {
+                                const vec4 c1 = texelFetch(StablePrev, pw, 0);
+                                cw += c1.rgb; nw += 1.0;
+                                if (c1.a > 0.25) { jy += c1.a - 0.5; ny += 1.0; } else aw += c1.a;
+                            }
+                        }
+                    cp -= cw / max(nw, 1.0);
+                    jw = aw / max(nw, 1.0);
+                    jy /= max(ny, 1.0);
+                    // the age: the second page of the correction image (every host makes the image 2 x g8 wide)
+                    {
+                        const ivec2 o2 = ivec2(g8.x, 0);
+                        ap = mix(mix(texelFetch(StablePrev, o2 + clamp(i0, ivec2(0), g8 - 1), 0).r, texelFetch(StablePrev, o2 + clamp(i0 + ivec2(1, 0), ivec2(0), g8 - 1), 0).r, w.x),
+                                 mix(texelFetch(StablePrev, o2 + clamp(i0 + ivec2(0, 1), ivec2(0), g8 - 1), 0).r, texelFetch(StablePrev, o2 + clamp(i0 + ivec2(1, 1), ivec2(0), g8 - 1), 0).r, w.x), w.y);
+                    }
+                }
+                float ts=1;
+#if !FILLED_CONFIDENCE
+                float mean_trust=0;
+                for(int ty=-1;ty<=1;ty++)for(int tx=-1;tx<=1;tx++)
+                    mean_trust+=texelFetch(DP3,clamp(ivec2(bo/8u)+ivec2(tx,ty),ivec2(0),g8-1),0).g;
+                ts=smoothstep(.3,.7,mean_trust/9);
+#endif
+                const float wg = 1.0 - smoothstep(kShownV0, kShownV1, length(mv) / float(pc.size.y));
+                vec3 cn = kShownKeep * wg * (ts * cp + j);
+                // The age starts over where last frame something NEARER stood at the place the scene's own vector points
+                // to (16 points of the block; under ~a third of them is a sliver and counts as nothing). Not the trust
+                // map: a flat wall fits itself in place, its moved increments pass every test. What comes in at the
+                // picture's edge counts as seen.
+                float unc = 0.0;
+                // Both depth maps are initialized. Without a game guide they
+                // contain equal constant nearness, so no uncover is detected.
+                if (true) {
+                    const ivec2 h2 = ivec2(pc.size) - 1;
+                    const vec2 mvs = texelFetch(Motion, ivec2(mt), 0).xy * pc.mscale;
+                    for (int k = 0; k < 16; ++k) {
+                        const ivec2 pk = min(ivec2(bo) + ivec2(1 + 2 * (k & 3), 1 + 2 * (k >> 2)), h2);
+                        const vec2 qk = vec2(pk) + 0.5 + mvs;
+                        if (any(lessThan(qk, vec2(0.0))) || any(greaterThanEqual(qk, vec2(pc.size)))) continue;
+                        const float nk = imageLoad(DepthCur, pk).r;
+                        unc += 0.0625 * smoothstep(0.05, 0.2, (texelFetch(DepthPrev, ivec2(qk), 0).r - nk) / max(nk, 1e-7));
+                    }
+                    unc = smoothstep(kYoungU0, kYoungU1, unc);
+                }
+                const float age = min(ap * (1.0 - unc) + 1.0 / kYoungN, 1.0), old = smoothstep(0.5, 1.0, age);
+                imageStore(StableCur, ivec2(bo / 8u) + ivec2(g8.x, 0), vec4(age, 0.0, 0.0, 0.0));
+                cn *= old;
+                // The lead: the running slot's jump is N frames of its own change, and the slots that did not run are
+                // 1 .. N - 1 frames behind - (N - 1) / 2 of such a jump together. Additive and signed (a ratio that only
+                // ever lowers the other slots took a third of a bright window's edit), from the wide mean of the young
+                // places' jumps (a block's own jump is mostly its wobble), not in a place's first frames (see the store).
+                cn -= kYoungLead * 0.5 * float(max(int(pc.n) - 1, 0)) * wg * jy * smoothstep(3.0 / kYoungN, 5.0 / kYoungN, age) * (1.0 - old);
+                cn *= min(1.0, kShownMax / max(max(abs(cn.r), max(abs(cn.g), abs(cn.b))), 1e-6));
+                // The wide part is held N frames, not one: a wide change that goes on (above) must pass, but a level
+                // that goes ROUND with the slots must not - each pass's answer a little lighter or darker over a wide
+                // area, period N, the jumps sum to 0. The mean of the last N shown levels is flat for a period of N
+                // and one frame behind a steady change: the newest jump x (N - 1) / N (kShownKeep stands for it) +
+                // last frame's x (N - 2) / N, from the wide mean of last frame's jumps (luma; this frame's is kept in
+                // the alpha for the next).
+                cn += wg * (float(max(int(pc.n) - 2, 0)) / float(max(pc.n, 1u))) * jw * old;
+                cn *= min(1.0, kShownMax / max(max(abs(cn.r), max(abs(cn.g), abs(cn.b))), 1e-6));
+                // The jump kept for the next frame (the alpha): a young place's with + 0.5 (while the correction is fully
+                // off there). A place's first N frames keep none: until every slot has answered there once its "old"
+                // increment is a stand-in's, the jump is the stand-in's error - always of one sign along an edge that
+                // goes on uncovering, neither a wobble to hold back nor a trend to lead by.
+                imageStore(StableCur, ivec2(bo / 8u), vec4(cn, age < (float(pc.n) + 0.5) / kYoungN ? 0.0 :
+                    clamp(dot(j, vec3(0.2126, 0.7152, 0.0722)), -0.2, 0.2) + (age < 0.5 ? 0.5 : 0.0)));
+    }
+}
+
+// (flags & 536870912, after step 0) the fill's pyramid's first level here, as il_pp.comp mode 0 makes it: each 2 x 2 block
+// of the moved increments weighted by Trust, the slots side by side in L1Out; (flags & 1073741824) its nearness level in
+// DP1Out - from the values as stored (read back after this invocation's own stores), summed in il_pp's order
+layout(set = 0, binding = 44, rgba16f) uniform writeonly image2D L1Out;
+layout(set = 0, binding = 45, rg32f) uniform writeonly image2D DP1Out;
+shared vec4 s_pp[256];
+shared vec2 s_dp[256];
+void pyr1(uvec2 px, bool live) {
+    const ivec2 ip = ivec2(px);
+    const uvec2 l = gl_LocalInvocationID.xy;
+    const uint li = gl_LocalInvocationIndex;
+    const bool lead = live && (l.x & 1u) == 0u && (l.y & 1u) == 0u;
+    const bool depth = (pc.flags & 1073741824u) != 0u;
+    const uint dw = (pc.size.x + 1u) / 2u;
+    const float w = live ? imageLoad(Trust, ip).r : 0.0;
+    for (uint i = 0u; i < pc.n; ++i) {
+        s_pp[li] = live ? vec4(ld(i, ip) * w, w) : vec4(0.0);
+        if (i == 0u && depth) s_dp[li] = live ? vec2(imageLoad(DepthCur, ip).r * w, w) : vec2(0.0);
+        barrier();
+        if (lead) {
+            vec4 s = vec4(0.0);
+            vec2 dn = vec2(0.0);
+            for (uint y = 0u; y < 2u; ++y)
+                for (uint x = 0u; x < 2u; ++x) {
+                    if (any(greaterThanEqual(px + uvec2(x, y), pc.size))) continue;
+                    s += s_pp[li + y * 16u + x];
+                    if (i == 0u && depth) dn += s_dp[li + y * 16u + x];
+                }
+            const ivec2 d = ip / 2;
+            imageStore(L1Out, ivec2(uint(d.x) + i * dw, d.y), s * 0.25);
+            if (i == 0u && depth) imageStore(DP1Out, d, vec4(dn * 0.25, 0.0, 0.0));
+        }
+        barrier();
+    }
+}
+void body(uvec2 px);
+void main() {
+    const uvec2 px = gl_GlobalInvocationID.xy;
+    const bool live = all(lessThan(px, pc.size));
+    if(STEP==6u){stable_reduce(px,live);return;}
+    if (STEP == 0u && (pc.flags & 536870912u) != 0u) {   // (every invocation of the group: the barriers)
+        if (live) body(px);
+        pyr1(px, live);
+        return;
+    }
+    if (live) body(px);
+}
+void body(uvec2 px) {
+    const ivec2 ip = ivec2(px);
+    if (STEP == 3u) { imageStore(Base, ip, imageLoad(Proxy, ip)); return; }   // this frame's Base, before mode 0 reads it around
+    if (STEP == 5u) {   // this frame's nearness at this size
+        const uvec2 mt = pc.mbase + min(uvec2((vec2(px) + 0.5) * vec2(pc.mgrid) / vec2(pc.size)), pc.mgrid - 1u);
+        imageStore(DepthCur, ip, vec4((pc.flags & 131072u) != 0u ? near_at(mt) : 1.0));
+        return;
+    }
+    if (STEP == 4u) {
+        // the fill (flags & 64, after mode 0 and the pyramid): increments not used are replaced by their usable
+        // neighbours' (the room around a hole, not what was in front of it); then the slot's input as in mode 0
+        const float trust = imageLoad(Trust, ip).r;
+        if (trust >= 1.0) return;   // (all used: mode 0's input and increments stand)
+        const bool bil = (pc.flags & 67108864u) != 0u;
+        vec4 wl[6];
+        if (bil) {
+            const float near = imageLoad(DepthCur, ip).r;
+            for (uint l = 1u; l <= 6u; ++l) wl[l - 1u] = lvw(l, vec2(px) + 0.5, near);
+        }
+        const bool keep = (pc.flags & 268435456u) != 0u;
+        vec3 z = keep ? imageLoad(Proxy, ip).rgb : imageLoad(Base, ip).rgb;
+        for (uint i = 0u; i < pc.n; ++i) {
+            const vec4 old=ld4(i,ip);
+            const vec3 v=mix(pull(i,vec2(px)+0.5,bil,wl),old.rgb,trust);
+            st_meta(i,ip,v,old.a);
+            if (i < pc.slot) z = post(i, z, z + v);
+        }
+        if (keep) imageStore(Base, ip, vec4(clamp(z, 0.0, 1.0), imageLoad(Proxy, ip).a));
+        else imageStore(Proxy, ip, vec4(clamp(z, 0.0, 1.0), imageLoad(Base, ip).a));
+        return;
+    }
+    if (STEP == 0u) {
+        const bool keep = (pc.flags & 268435456u) != 0u;
+        const vec4 b = keep ? imageLoad(Proxy, ip) : imageLoad(Base, ip);
+        if ((pc.flags & 2u) != 0u) {
+            vec3 h = texelFetch(BasePrev, ip, 0).rgb;
+            // (flags & 2048: the slot's network's own output - its input as the passes before made it, plus its increment)
+            for (uint i = 0u; i < pc.slot && i < pc.n; ++i) h = post(i, h, h + src(i, ip).rgb);
+            if (pc.slot < pc.n) h += src(pc.slot, ip).rgb;
+            // Previous frame's CURRENT slot carries only its display lead in alpha.
+            // The NEXT slot's alpha remains the independent geometric age.
+            const float prior_lead=src((pc.slot+pc.n-1u)%pc.n,ip).a;
+            // Reset initializes all N slots, but the first steady slot is1;
+            // previous-slot alpha can still be age (<=-1), not a lead (<.02).
+            h+=LEAD_HISTORY*vec3(abs(prior_lead)<.5?prior_lead:0);
+            imageStore(Hist, ip, vec4(clamp(h, 0.0, 1.0), 1.0));
+        }
+        vec2 q = vec2(px) + 0.5;
+        bool inside = true;
+        if ((pc.flags & 1u) != 0u) {
+            uvec2 t = pc.mbase + min(uvec2((vec2(px) + 0.5) * vec2(pc.mgrid) / vec2(pc.size)), pc.mgrid - 1u);
+            // vector dilation (flags & 256, FSR2/3): the vector of the nearest of the 3 x 3 motion texels, so an object's
+            // edge moves with the object, not with what is behind it
+            if ((pc.flags & 256u) != 0u) {
+                uvec2 best = t; float bn = near_at(t);
+                for (int y = -1; y <= 1; ++y)
+                    for (int x = -1; x <= 1; ++x) {
+                        const uvec2 c = uvec2(clamp(ivec2(t) + ivec2(x, y), ivec2(pc.mbase), ivec2(pc.mbase + pc.mgrid) - 1));
+                        const float nn = near_at(c);
+                        if (nn > bn) { bn = nn; best = c; }
+                    }
+                t = best;
+            }
+            q += texelFetch(Motion, ivec2(t), 0).xy * pc.mscale;
+            inside = all(greaterThanEqual(q, vec2(0.0))) && all(lessThanEqual(q, vec2(pc.size)));
+        }
+        // Overlays that do not move with the vectors (a HUD, a crosshair): where last frame's picture at this very place
+        // fits this pixel better than where the vector points, the increments stay where they are. (A still picture:
+        // both places are one; a moving scene: the moved place fits.)
+        const bool raw_inside=inside; float raw_depth=1;
+        float stay = 0.0, trust = 1.0;
+        float t_v = 1.0, t_b = 1.0, t_d = 1.0;   // (each test's own answer, kept in TrustDbg for NR_IL_DEBUG=2)
+        vec3 lo = vec3(1e9), hi = vec3(-1e9), pq = vec3(0.0);
+        if ((pc.flags & 1u) != 0u) {
+            // 3 x 3 means of luma (film grain does not trip it): this frame's, last frame's moved, last frame's in place
+            const vec3 lw = vec3(0.2126, 0.7152, 0.0722);
+            float l = 0.0, em = 0.0, es = 0.0;
+            for (int y = -1; y <= 1; ++y)
+                for (int x = -1; x <= 1; ++x) {
+                    const ivec2 c = clamp(ip + ivec2(x, y), ivec2(0), ivec2(pc.size) - 1);
+                    const vec3 cb = keep ? imageLoad(Proxy, c).rgb : imageLoad(Base, c).rgb, pm = prevb(q + vec2(x, y));
+                    l += dot(cb, lw);
+                    em += dot(pm, lw);
+                    es += dot(texelFetch(BasePrev, c, 0).rgb, lw);
+                    lo = min(lo, cb); hi = max(hi, cb);   // (the box test's range)
+                    if (x == 0 && y == 0) pq = pm;
+                }
+            em = abs(l - em) / 9.0; es = abs(l - es) / 9.0;
+            stay = smoothstep(0.0, 0.03, em - es);
+            if (stay > 0.0) inside = true;
+            // Neither fits (the vectors are wrong here: object edges, hair, disocclusion): the moved increments belong
+            // to what was here, not to this - not used (flags & 4); after the network this slot's own takes their place.
+            if ((pc.flags & 4u) != 0u) trust = 1.0 - smoothstep(0.015, 0.05, min(em, es));
+            // Disocclusion (flags & 8): what is now where this pixel's content was last frame moves differently from it
+            // (a character the camera follows, the room sliding out from behind it): last frame that place showed the
+            // other thing, so the increments moved from there belong to it - not used.
+            if ((pc.flags & 8u) != 0u) {
+                const vec2 v = q - (vec2(px) + 0.5), qc = clamp(q, vec2(0.0), vec2(pc.size) - 0.001);
+                const uvec2 t2 = pc.mbase + min(uvec2(qc * vec2(pc.mgrid) / vec2(pc.size)), pc.mgrid - 1u);
+                // (flags & 8388608, NR_IL_VPREV: the vector there LAST frame - how what was there moved then. This frame's
+                // vector there belongs to what is there now: under a person crossing, the wall behind, so the person's own
+                // increments were thrown away and the fill's wall / ground increments carried along with the person)
+                // (flags & 16777216, NR_IL_VPREV=2: the better of the two - this frame's there for a shaking camera, last
+                // frame's for what moves steadily across the picture; a disocclusion is the depth test's)
+                const bool vprev = (pc.flags & 8388608u) != 0u, vboth = (pc.flags & 16777216u) != 0u;
+                const vec2 vq = vprev ? mvprev(q) : texelFetch(Motion, ivec2(t2), 0).xy * pc.mscale;
+                float dv = length(vq - v);
+                if (vboth) dv = min(dv, length(mvprev(q) - v));
+                const float lv = length(v);
+                // (flags & 524288, research NR_IL_VLIN=1): a camera turn's flow is not uniform (a wide field of view: the
+                // edges move faster than the centre) - over a move of 100+ pixels the vectors there differ by more than
+                // the test allows on a still wall. The vector there is predicted from this pixel's by the field's local
+                // gradient (2 motion texels either side); only what that does not explain - an edge, a disocclusion -
+                // counts. (the correction kept under half the move: a gradient taken across an object's edge)
+                if ((pc.flags & 524288u) != 0u) {
+                    const ivec2 tc = ivec2(pc.mbase + min(uvec2((vec2(px) + 0.5) * vec2(pc.mgrid) / vec2(pc.size)), pc.mgrid - 1u));
+                    const vec2 gp = grad_v(tc, v);
+                    const float cmax = 0.5 * lv;
+                    dv = min(dv, length(vq - v - clampl(gp, cmax)));
+                    // (flags & 1048576, NR_IL_VLIN=2: the gradient there too, and the mean of both - a building's corner: the
+                    // flow bends there, one side's gradient does not reach across)
+                    if ((pc.flags & 1048576u) != 0u) {
+                        const vec2 gq = grad_v(ivec2(t2), v);
+                        dv = min(dv, min(length(vq - v - clampl(gq, cmax)), length(vq - v - clampl(0.5 * (gp + gq), cmax))));
+                    }
+                }
+                // (where they stay in place - a HUD - they did not come from there: not this test's)
+                t_v = mix(1.0 - smoothstep(0.5 + 0.05 * lv, 2.0 + 0.15 * lv, dv), 1.0, stay);
+                trust = min(trust, t_v);
+            }
+        }
+        // The content they were made on is not around here any more (flags & 128, FSR2's neighbourhood box turned into
+        // a test): last frame's picture where they come from lies outside this frame's 3 x 3 range - a HUD marker
+        // that moved off a still arm, what was in front of a disocclusion. Inside it: moving texture, grain, sub-pixel
+        // edges - kept.
+        if ((pc.flags & 129u) == 129u) {
+            // (where they stay in place - a HUD - last frame's picture in place is where they come from)
+            const vec3 pv = mix(pq, texelFetch(BasePrev, ip, 0).rgb, stay), o = max(pv - hi, lo - pv);
+            t_b = 1.0 - smoothstep(pc.k0, pc.k1, max(o.r, max(o.g, o.b)));
+            trust = min(trust, t_b);
+        }
+        // Disocclusion by depth (flags & 512, FSR2/3): last frame, where this pixel's content comes from, something nearer
+        // stood (the nearest of the 2 x 2 there) - what comes out from behind it now; the increments there were its.
+        if ((pc.flags & 512u) != 0u && (pc.flags & 1u) != 0u && inside) {
+            const ivec2 b0 = ivec2(floor(q - 0.5)), hi = ivec2(pc.size) - 1;
+            float np = 0.0;
+            for (int y = 0; y <= 1; ++y)
+                for (int x = 0; x <= 1; ++x) np = max(np, texelFetch(DepthPrev, clamp(b0 + ivec2(x, y), ivec2(0), hi), 0).r);
+            const float nc = imageLoad(DepthCur, ip).r, r = (np - nc) / max(nc, 1e-7);
+            raw_depth=1.0-smoothstep(0.05,0.2,r);
+            t_d = mix(1.0 - smoothstep(0.05, 0.2, r), 1.0, stay);
+            trust = min(trust, t_d);
+        }
+        // Content coming in from outside the picture (flags & 33554432, research NR_IL_EDGE): nothing was moved here (the
+        // increments are 0) - marked not used, so the fill continues the neighbours' into the strip instead of leaving
+        // it with this frame's slot alone (a bright band along the edge the camera turns or shakes towards)
+        if ((pc.flags & 33554433u) == 33554433u && !inside) trust = 0.0;
+        if ((pc.flags & 652u) != 0u) imageStore(Trust, ip, vec4(trust));
+        if ((pc.flags & 2097152u) != 0u) imageStore(TrustDbg, ip, vec4(trust, t_v, t_b, t_d));
+        vec3 z = b.rgb;
+        vec3 cached=!inside?vec3(0):(pc.flags&1u)!=0u?bil_meta(pc.slot,q):src(pc.slot,ip).rgb;
+        if((pc.flags&1u)==0u)g_prev_alpha=src(pc.slot,ip).a;
+        if(stay>0) {cached=mix(cached,src(pc.slot,ip).rgb,stay);g_prev_alpha=mix(g_prev_alpha,src(pc.slot,ip).a,stay);}
+        float age=kMature1;
+        if((pc.flags&2u)!=0u && inside) {
+            age=g_prev_alpha<-.5?min(-g_prev_alpha, kMature1):kMature1;
+            if((pc.flags&512u)!=0u && raw_depth<.5)age=0;
+        }
+        if((pc.flags&2u)!=0u && !raw_inside)age=0;
+        for (uint i = 0u; i < pc.n; ++i) {
+            // moved: bilinear at the previous position; off the picture: no increment (the pass starts over there)
+            vec3 v=i==pc.slot?cached:!inside?vec3(0):(pc.flags&1u)!=0u?bil(i,q):src(i,ip).rgb;
+            if(stay>0 && i!=pc.slot)v=mix(v,src(i,ip).rgb,stay);
+            st_meta(i,ip,v,i==pc.slot?stay:i==(pc.slot+1u)%pc.n?-(age+1):0);
+            if (i < pc.slot) z = post(i, z, z + trust * v);
+        }
+        if (keep) imageStore(Base, ip, vec4(clamp(z, 0.0, 1.0), b.a));
+        else imageStore(Proxy, ip, vec4(clamp(z, 0.0, 1.0), b.a));
+    } else {
+        const bool keep = (pc.flags & 268435456u) != 0u;
+        const vec4 a = imageLoad(Answer, ip), zin = keep ? imageLoad(Base, ip) : imageLoad(Proxy, ip),
+                   b = keep ? imageLoad(Proxy, ip) : imageLoad(Base, ip);
+        const vec3 fresh = a.rgb - zin.rgb;
+        // (flags & 65536: mode 0 wrote Trust this frame - mode 1 runs without the move flags; filled: used as they are)
+        float trust = (pc.flags & 65536u) != 0u && (pc.flags & 64u) == 0u ? imageLoad(Trust, ip).r : 1.0;
+        // The network as the judge (flags & 32): this slot's own increment, moved here like the others, against what the
+        // network makes of this pixel now. Where they disagree, what was moved here no longer belongs here - the network
+        // (which sees this frame and its history) has said so - and the other slots' moved increments are not used.
+        if ((pc.flags & 32u) != 0u) {
+            const vec3 old = ld(pc.slot, ip);
+            const float dl = length(fresh - old), r = dl / (max(length(fresh), length(old)) + 0.004);
+            trust = min(trust, 1.0 - smoothstep(pc.k0, pc.k1, r) * smoothstep(0.006, 0.02, dl));
+        }
+        float history_lead=0; // fresh store deferred; same RGB, lead metadata only
+        vec3 o = b.rgb;float display_age=kMature1;
+        for (uint i = 0u; i < pc.n; ++i) {
+            const vec4 value=i==pc.slot?vec4(fresh,0):ld4(i,ip);
+            vec3 v=value.rgb;
+            if(i==(pc.slot+1u)%pc.n)display_age=value.a<-.5?clamp(-value.a-1,0,kMature1):kMature1;
+            // kept: the next frames start clean
+            if (i != pc.slot && trust < 1.0) { v = mix(fresh, v, trust); st(i, ip, v); }
+            o = post(i, o, o + v);
+        }
+#if STABLE_APPLY
+        if((pc.flags&16u)!=0u)o+=stable_at(vec2(px)+.5);
+#endif
+        // (flags & 262144, research NR_IL_DEBUG=1: mode 0's trust shown - not used = red)
+        // (with flags & 2097152, NR_IL_DEBUG=2: each test in its colour - vectors red, box green, depth blue; flags & 4194304,
+        // NR_IL_DEBUG=3: the game's nearness as IL reads it, log scale, and last frame's at the moved place in red)
+        if ((pc.flags & 4194304u) != 0u) {
+            const float n = imageLoad(DepthCur, ip).r;
+            o = vec3(clamp(1.0 + log2(max(n, 1e-6)) / 12.0, 0.0, 1.0));
+        } else if ((pc.flags & 2097152u) != 0u) {
+            const vec4 t = imageLoad(TrustDbg, ip);
+            o = mix(o, vec3(1.0 - t.g, 1.0 - t.b, 1.0 - t.a), 0.7 * (1.0 - min(t.g, min(t.b, t.a))));
+        } else if ((pc.flags & 262144u) != 0u) o = mix(o, vec3(1.0, 0.0, 0.0), 0.7 * (1.0 - imageLoad(Trust, ip).r));
+        st_meta(pc.slot,ip,fresh,history_lead);
+        imageStore(Answer, ip, vec4(clamp(o, 0.0, 1.0), a.a));
+        if (keep) imageStore(Base, ip, b);
+        else imageStore(Proxy, ip, b);
+    }
+}

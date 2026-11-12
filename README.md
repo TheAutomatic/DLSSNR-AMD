@@ -1,9 +1,9 @@
 # DLSSNR-AMD
 
 Runs the neural rendering (NR) model of NVIDIA DLSS 5 in games on AMD Radeon RX 9000 (RDNA4)
-graphics cards.
+graphics cards. Windows also offers experimental support for the RDNA3 cards listed below.
 
-- The network is reimplemented as Vulkan compute shaders.
+- The network is reimplemented as compute shaders, with Vulkan and native D3D12 execution paths.
 - The model is not included. The installer extracts it from your own copy of `nvngx_dlssnr.dll`.
   Version 310.9.16 holds two models: `CC_SMALL_FP8`, its default and faster, and `CC_SILVER_AARDWOLD`, the model
   of 310.8.0, so from 310.9.16 alone the installer installs both. Since 0.0.6-linux-preview (Linux) and
@@ -33,8 +33,9 @@ graphics cards.
   settings). It loads the network as machine code that was made in advance with Mesa's ACO compiler (the Linux
   driver's compiler) and ships in the package, and comes close to Linux (see [Performance](#performance)); see
   [Windows](#windows).
-- **RX 7000 and Radeon 700M / 800M / 8000S graphics (RDNA3), Windows only, experimental:** `CC_SMALL_FP8` and
-  `CC_SILVER_AARDWOLD`, thanks to [TheAutomatic](https://github.com/TheAutomatic) and
+- **RX 7000 and Radeon 700M / 800M / 8000S graphics (RDNA3), Windows only, experimental:** `CC_SMALL_FP8`,
+  `CC_SMALL_FP8_EXPERIMENTAL`, `CC_SILVER_AARDWOLD` and `CC_SILVER_AARDWOLD_OPTIMIZED` (all four Optimized layers levels), thanks to
+  [TheAutomatic](https://github.com/TheAutomatic) and
   to [mauri870](https://github.com/mauri870), whose
   [DLSSNR-RDNA3](https://github.com/mauri870/DLSSNR-RDNA3) port it builds on. Tried on few machines; expect more
   problems than on RX 9000, and for now it may not match the stability and performance of DLSSNR-RDNA3 (see
@@ -78,9 +79,10 @@ these logs:
 | **Linux** (Steam / Proton) | Mesa 26.2 or newer, a recent Proton | The main version, used in games. |
 | **Windows** | AMD Software 26.9 or newer | The same features as Linux; close to Linux in speed with ACO's machine code. |
 
-Both need an RX 9000 series (RDNA4) card for every network. On Windows RX 7000 and Radeon 700M / 800M / 8000S
-graphics (RDNA3) run `CC_SMALL_FP8` and `CC_SILVER_AARDWOLD` (experimental); they lack the FP8 matrix
-instructions, and their network runs FP16 in place of FP8. Older cards are not supported.
+Linux requires an RX 9000 series (RDNA4) card. On Windows, supported RX 7000 and Radeon 700M / 800M / 8000S
+graphics (RDNA3) run `CC_SMALL_FP8`, `CC_SMALL_FP8_EXPERIMENTAL`, `CC_SILVER_AARDWOLD` and
+`CC_SILVER_AARDWOLD_OPTIMIZED` at all four Optimized layers levels (experimental); they lack the FP8 matrix instructions, and their
+network runs FP16 in place of FP8. Older cards are not supported.
 
 ## Performance
 
@@ -185,7 +187,7 @@ settings keep RenoDX's names, defaults and ranges:
 
 - **Network**: Intensity, Style, Local tone, Local structure, Skin structure, automatic mask, new noise every frame.
 - **Passes**: legacy (up to 4, or 30 unlocked; passes 2 and later with their own strengths and network settings) or
-  fast (the network runs once and its change is strengthened).
+  fast (Interleaved, Extrapolation, Feedback, Hybrid or Edit strength).
 - **Composition**: colour and transfer strength, chroma clamp, transfer mode, highlight guard, Detail stability (Off
   by default), black restore and pedestal, codec.
 - **Resolution**: the network's resolution, following the render resolution, upsampling.
@@ -214,6 +216,16 @@ keep OptiScaler-NR's `[DlssNr]` names, defaults and ranges:
   highlight protection. On the ReShade routes the picture is already exposed and tone mapped: the white point is set
   by hand only.
 - **Skin and environment**: skin protection, and how much detail and colour change is kept on skin and elsewhere.
+
+## Passes (fast): Interleaved
+
+Interleaved reuses the previous passes along the game's motion vectors, running one network pass per frame
+between history resets. It offers two presets; **Preset 1 is the default** on Linux and Windows. Preset 2
+adds another stabilization option. Choose by the picture and cost in the game.
+
+When Passes (fast) is selected, the OptiScaler route defaults to Interleaved; the ReShade routes default to
+Extrapolation. `NRFastMethod` / `FastMethod` now use 0 Interleaved, 1 Extrapolation, 2 Feedback, 3 Hybrid and
+4 Edit strength. Check these values when carrying a manually edited configuration over from an older release.
 
 ## Preprocess (optional)
 
@@ -255,8 +267,9 @@ The file itself explains every setting.
 
 `CC_SILVER_AARDWOLD` made faster by this project. Since 0.0.8.3 it replaces `CC_SILVER_AARDWOLD_INT4_MIXED`
 (a `dlssnr-amd.ini`, `--model` or `-Model` that still names that one gets `CC_SILVER_AARDWOLD_OPTIMIZED`); its picture
-is very close to `CC_SILVER_AARDWOLD`'s - much closer than int4 mixed's was - and it is faster. RX 9000 only; on Windows it runs as
-[ACO's machine code](#windows) only.
+is very close to `CC_SILVER_AARDWOLD`'s - much closer than int4 mixed's was - and it is faster. On Windows it runs as
+[ACO's machine code](#windows) only: all four levels are available on RX 9000 and on supported RDNA3 cards
+(RX 7000 and Radeon 700M / 800M / 8000S graphics, experimental).
 
 How it is made faster, at every level:
 - the Swin blocks' MLPs (all but the first block) use ReLU, their weights fitted to the original network's outputs;
@@ -292,7 +305,7 @@ to `CC_SILVER_AARDWOLD`'s; switching in game builds the network again in the bac
 ## CC_SMALL_FP8_EXPERIMENTAL (optional)
 
 `CC_SMALL_FP8` made faster by this project (see Performance). On Windows it runs as ACO's machine code only, on
-RX 9000. Its Swin blocks (all but the first)
+RX 9000 and RX 7000 / Radeon 700M / 800M / 8000S. Its Swin blocks (all but the first)
 use ReLU as the MLP activation, and some window-attention layers in the decoder use one fixed attention table per layer (no QK^T,
 no softmax) with the V and output projections merged. The weights of the changed layers were fitted to the original
 network's outputs. Its picture differs somewhat from
@@ -408,10 +421,13 @@ It takes the DLL itself (unpack it from the zip first) and writes `CC_SILVER_AAR
 It is built from the same code as the Linux version and changed only where the AMD Windows driver needs it.
 Since 0.0.8.1 it has everything the Linux version has. Some releases may be Linux only.
 
-DirectX 10/11/12 games keep the system's own D3D. NR runs on a Vulkan device of its own on the same
-card, and each frame is handed between the two through shared textures and a shared fence, on the
-GPU. Vulkan games: NR runs on the game's own device. DirectX 9 games run on Vulkan through DXVK, because D3D9
-cannot share a frame with another API.
+DirectX 10/11/12 games keep the system's own D3D. In DirectX 12 games, D3D12 passthrough can run NR on the
+game's own device. Its switch is on NR Control's Network page (`[D3D12Passthrough] Enabled` in the ini),
+and Diagnostics shows the active path and the device check.
+
+The Vulkan bridge runs NR on a Vulkan device on the same card and transfers frames through shared textures
+and a shared fence. Vulkan games run NR on their own device. DirectX 9 games run on Vulkan through DXVK,
+because D3D9 cannot share a frame with another API.
 
 **ACO's machine code (ACO Mode).** The package carries the network as machine code made in advance with Mesa's
 ACO compiler (the Linux driver's compiler), and the AMD driver loads that code instead of compiling the network;
@@ -422,8 +438,9 @@ the network compiled by the AMD driver instead (without `CC_SMALL_FP8_EXPERIMENT
 NR then. The imported machine code is kept in `dlssnr-amd\aco-cache` in the game's folder, so later starts are
 quicker.
 
-**RX 7000 and Radeon 700M / 800M / 8000S graphics (RDNA3), experimental.** `CC_SMALL_FP8` and
-`CC_SILVER_AARDWOLD` as ACO's machine code, made and tested by
+**RX 7000 and Radeon 700M / 800M / 8000S graphics (RDNA3), experimental.** `CC_SMALL_FP8`,
+`CC_SMALL_FP8_EXPERIMENTAL`, `CC_SILVER_AARDWOLD` and all four Optimized layers levels of
+`CC_SILVER_AARDWOLD_OPTIMIZED` use the packaged ACO machine code. The original RDNA3 integration was contributed by
 [TheAutomatic](https://github.com/TheAutomatic),
 building on [mauri870](https://github.com/mauri870)'s [DLSSNR-RDNA3](https://github.com/mauri870/DLSSNR-RDNA3).
 Tried on few machines: expect more problems than on RX 9000, and for now it may not match the stability and
@@ -445,7 +462,8 @@ Known issues:
   DirectX 10 game.
 - Games whose FSR runs in their own shaders never hand it to OptiScaler: pick the game's DLSS option
   instead, which OptiScaler offers.
-- The network pauses itself when video or system memory runs short.
+- Memory Guard is optional and off by default. When enabled, it can pause NR when the network cannot fit in the
+  available memory; Diagnostics shows the reason.
 - Without ACO's machine code the network is built by the AMD Windows driver's shader compiler, which rounds
   differently from the Linux version in places; on a 1080p test frame the two outputs are 48.5 dB
   PSNR apart.

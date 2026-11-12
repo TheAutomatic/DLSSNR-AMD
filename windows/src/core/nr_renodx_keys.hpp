@@ -2,6 +2,8 @@
 // [RenoDX]'s keys for the menus (NR Control on the OptiScaler routes, the ReShade Add-ons page): name, kind, range,
 // default, group, label, help and combo items. It agrees with nr_pe_config.cpp's writer and parser of [RenoDX]:
 // a key changed in one is changed in the other.
+#include "nr_fast_passes.hpp"   // (NRFastMethod's default: the route's)
+
 #include <cstdint>
 
 namespace nr::renodx_keys {
@@ -122,7 +124,7 @@ inline constexpr Key kKeys[] = {
     {"NRPresentFgSource", kUint, 0, 0.0f, 2.0f, 0.0f, "Guides", "Frame-generation multiplier", "NRPresentFgSource. RenoDX layers at Present on the OptiScaler route: Auto uses DLSSG.MultiFrameCount, then stable timing. Stable timing uses present intervals; Legacy timing uses the older timing rule.", "Auto\0Stable timing\0Legacy timing\0"},
     {"NRPassesMode", kUint, 0, 0.f, 1.f, 0.f, "Passes", "Passes mode", "NRPassesMode. Choose legacy network passes or fast strengthening after one network pass.", "legacy\0fast\0"},
     {"NRFastExtrapolationPasses", kFloat, 2, 1.f, 8.f, 3.f, "Passes", "Passes (fast)", "NRFastExtrapolationPasses. Extrapolation's strength, referred to legacy pass counts.", nullptr},
-    {"NRFastMethod", kUint, 0, 0.f, 3.f, 0.f, "Passes", "Method", "NRFastMethod. Extrapolation pushes this frame's one-pass edit further along its own direction; no motion vectors needed, works from the first frame. Feedback feeds the previous frame's edit, moved by the motion vectors, back into the network input; needs motion vectors and builds up over the first frames. Hybrid uses Feedback where history holds and Extrapolation on new surfaces, cuts and edges. Edit strength scales the network's edit in stops, as Adjust NR's look's Edit strength does. Each method keeps its own settings.", "Extrapolation\0Feedback\0Hybrid\0Edit strength\0"},
+    {"NRFastMethod", kUint, 0, 0.f, 4.f, float(nr::fast::kDefaultMethod), "Passes", "Method", "NRFastMethod. Extrapolation pushes this frame's one-pass edit further along its own direction; no motion vectors needed, works from the first frame. Feedback feeds the previous frame's edit, moved by the motion vectors, back into the network input; needs motion vectors and builds up over the first frames. Hybrid uses Feedback where history holds and Extrapolation on new surfaces, cuts and edges. Edit strength scales the network's edit in stops, as Adjust NR's look's Edit strength does. Interleaved runs the legacy passes one per frame in turn, each with its own history; a still picture looks as legacy's, moving pictures follow the motion vectors (needed: without them it does not run, one network pass). Each method keeps its own settings.", "Interleaved\0Extrapolation\0Feedback\0Hybrid\0Edit strength\0"},
     {"NRFastExtrapolationHaloLimit", kBool, 0, 0.f, 0.f, 0.f, "Passes", "Limit added halos", "NRFastExtrapolationHaloLimit. Limits the halos Extrapolation adds.", nullptr},
     {"NRFastExtrapolationFine", kFloat, 2, 0.f, 2.f, 0.f, "Passes", "Fine detail", "NRFastExtrapolationFine. How much of the network's fine detail change Extrapolation adds: 0 none (default), 1 as made, 2 twice. Raise it for more fine detail; the game's own film grain grows with it.", nullptr},
     {"NRFastEditStrength", kFloat, 2, 0.f, 4.f, 2.f, "Passes", "Edit strength", "NRFastEditStrength. The network's edit in stops times this (1 as made, 0 none), as Adjust NR's look's Edit strength with a wider range.", nullptr},
@@ -132,6 +134,8 @@ inline constexpr Key kKeys[] = {
     {"NRFastHybridPasses", kFloat, 2, 1.f, 8.f, 3.f, "Passes", "Passes (fast)", "NRFastHybridPasses. Hybrid's strength, referred to legacy pass counts.", nullptr},
     {"NRFastHybridHaloLimit", kBool, 0, 0.f, 0.f, 0.f, "Passes", "Limit added halos", "NRFastHybridHaloLimit. Limits the halos Hybrid adds.", nullptr},
     {"NRFastHybridFine", kFloat, 2, 0.f, 2.f, 1.f, "Passes", "Fine detail", "NRFastHybridFine. How much of the network's fine detail change Hybrid adds: 1 as made (default), 0 none, 2 twice.", nullptr},
+    {"NRFastInterleavedPasses", kUint, 0, 2.f, 8.f, 3.f, "Passes", "Passes (fast)", "NRFastInterleavedPasses. Interleaved: how many legacy passes (2 to 8) take turns, one each frame. Each pass more needs more video memory.", nullptr},
+    {"NRFastInterleavedPreset", kUint, 0, 1.f, 2.f, float(nr::fast::kDefaultInterleavedPreset), "Passes", "Interleaved preset", "NRFastInterleavedPreset. Interleaved's processing method.", "~Preset 1\0Preset 1\0Preset 2\0"},
 };
 inline constexpr int kCount = int(sizeof kKeys / sizeof kKeys[0]);
 }  // namespace nr::renodx_keys

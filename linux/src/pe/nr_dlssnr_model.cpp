@@ -293,6 +293,7 @@ void report_control(nr::pe::Session& session, const Feature* f, uint32_t route, 
     if (rs && ss.renodx_known && ran) {
         st.fast_passes = ss.renodx.fast_passes;
         st.fast_fallback = ss.renodx.fast_fallback;
+        st.il_missing = ss.renodx.il_missing;
     }
     // The engine-data panel
     {
@@ -345,7 +346,8 @@ void report_control(nr::pe::Session& session, const Feature* f, uint32_t route, 
         if (const auto* w = nr::pe::renodx_route::call_wilsjo2()) {
             // its passes on one runtime: the network's time is one pass's average times the passes
             st.passes = w->passes;
-            if (ran && w->fast_passes > 0.f) { st.fast_passes = w->fast_passes; st.fast_fallback = w->fast_fallback; }
+            if (ran && w->fast_passes > 0.f) { st.fast_passes = w->fast_passes; st.fast_fallback = w->fast_fallback; st.fast_fallback_spatial = w->fast_fallback_spatial; }
+            if (ran) st.il_missing = w->il_missing;
             // the layer's whole run, timed around all its passes (Session::outer_begin); until that reading is there,
             // nothing (a one-pass runtime average times the passes would mix two layers' and two configurations' times)
             if (!session.network_ms_whole_run()) st.network_ms = st.gpu_ms = 0.f;
@@ -1316,6 +1318,8 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
     resources.depth_inverted = (depth_inverted != 0) != (debug_depth() == DebugDepth::Flip);
     // The caller's flag and nothing else: every feature has its own history now.
     resources.reset = reset != 0;
+    // a wilsjo2 layer's Passes (fast) Interleaved pass: the history it made for this call
+    resources.history = static_cast<ID3D12Resource*>(nr::pe::renodx_route::call_history().d3d12);
     // Diagnostic (2026-09-16): NR_DEBUG_ALWAYS_RESET=1 suppresses history on every evaluate, to
     // separate "the second pass's history is wrong" from "the second pass's output is lost".
     {
@@ -1349,6 +1353,12 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
 
     auto& session = d3d12_session();
     session.set_call_network(nr::pe::renodx_route::call_network());   // an NR-chain layer's own network, else -1
+    // a wilsjo2 layer's Interleaved pass with a Style or an Intensity: the network plain (Intensity 1, no Style grade);
+    // the layer composes them (the pass's history must be the network's own output, or the grade comes round again)
+    const bool raw_call = nr::pe::renodx_route::call_history().raw;
+    if (raw_call) f->controls.intensity = 1.0f;
+    session.set_raw_call(raw_call);
+    struct RawEnd { nr::pe::Session& s; ~RawEnd() { s.set_raw_call(false); } } raw_end{session};
     session.set_call_layer(nr::pe::renodx_route::call_layer());
     // NR_DEBUG_SKIP_PASS: this feature's pass number is its rank among the live features.
     const int pass_number = pass_number_of(g_live_d3d12, f);
@@ -1848,6 +1858,11 @@ int evaluate_vk_asi(void* cmd_buffer, Feature* f, const VkImageRef& colour, cons
     frame.depth_inverted = (depth_inverted != 0) != (debug_depth() == DebugDepth::Flip);
     frame.feature = f->id;
     frame.reset = reset != 0;
+    if (const auto& h = nr::pe::renodx_route::call_history(); h.vk_image) {   // a wilsjo2 Interleaved pass's history
+        frame.history = (VkImage)(uintptr_t)h.vk_image;
+        frame.history_format = VkFormat(h.vk_format);
+        frame.history_width = h.width; frame.history_height = h.height;
+    }
     frame.motion_scale_x = normalized_mv_scale(
         mv_scale_x, motion_rect.width ? motion_rect.width : frame.motion_width ? frame.motion_width : frame.width);
     frame.motion_scale_y = normalized_mv_scale(
@@ -1864,6 +1879,12 @@ int evaluate_vk_asi(void* cmd_buffer, Feature* f, const VkImageRef& colour, cons
 
     auto& session = vk_session();
     session.set_call_network(nr::pe::renodx_route::call_network());   // an NR-chain layer's own network, else -1
+    // a wilsjo2 layer's Interleaved pass with a Style or an Intensity: the network plain (Intensity 1, no Style grade);
+    // the layer composes them (the pass's history must be the network's own output, or the grade comes round again)
+    const bool raw_call = nr::pe::renodx_route::call_history().raw;
+    if (raw_call) f->controls.intensity = 1.0f;
+    session.set_raw_call(raw_call);
+    struct RawEnd { nr::pe::Session& s; ~RawEnd() { s.set_raw_call(false); } } raw_end{session};
     session.set_call_layer(nr::pe::renodx_route::call_layer());
     // The RenoDX style, as the D3D12 route's direct path runs it: what the .asi told renodx_route of the frame.
     nr::pe::Session::RenoDXFrame rf;

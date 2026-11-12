@@ -63,8 +63,6 @@ void note_handles(VkInstance instance, VkPhysicalDevice physical, VkDevice devic
 // The watch added the network's features (nr::DeviceFeatures::enable, bufferDeviceAddress among
 // them) to this device's vkCreateDevice and the device was created with them.
 bool network_features_added(VkDevice device);
-// That device was made for RDNA3's network (nr_gpu_arch.hpp).
-bool runs_rdna3(VkDevice device);
 // A game's vkCreateDevice seen by someone other than the watcher (the .asi's wrap of the loader's vkCreateDevice): made
 // with the network's extensions and features, and ACO Mode's pipeline binaries, as the watcher makes it; made again as
 // the game asked when that fails. `added` says which it was.
@@ -79,6 +77,7 @@ void forget_device(VkDevice device);
 // The GPU NR runs on, as its Vulkan driver names it ("AMD Radeon RX 9070 XT (RADV GFX1201)"); empty before NR has seen
 // a device. For NR Control's header.
 std::string gpu_name();
+void note_d3d12_gpu_name(const std::string& name);
 // The physical device a network is built on (every route: a D3D game's comes through its translator's interop, not a
 // device seen being made)
 void note_gpu(VkPhysicalDevice physical);

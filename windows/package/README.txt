@@ -15,8 +15,8 @@ textures and a shared fence, all on the GPU. Only DX9 games are moved to Vulkan 
 Requirements
 ------------
 - RX 9000 series (RDNA4): every network
-- RX 7000 series, Radeon 700M / 800M / 8000S graphics (RDNA3 / RDNA3.5): CC_SMALL_FP8 and
-  CC_SILVER_AARDWOLD (see "ACO Mode")
+- RX 7000 series, Radeon 700M / 800M / 8000S graphics (RDNA3 / RDNA3.5): every network as well,
+  experimental (see "ACO Mode")
 - AMD Software 26.9 or newer
 - 64-bit games
 - Do not use it in online games with anti-cheat; start games with EasyAntiCheat with EAC off
@@ -56,18 +56,18 @@ CC_SILVER_AARDWOLD_OPTIMIZED are this project's). The installer asks which one a
 
     CC_SMALL_FP8                   the default network of 310.9.16 (default)
     CC_SMALL_FP8_EXPERIMENTAL      experimental: CC_SMALL_FP8 made faster; its picture differs
-                                   somewhat. RX 9000 only, with ACO Mode
+                                   somewhat. RX 9000 and RX 7000 / 700M - 8000S, with ACO Mode
     CC_SILVER_AARDWOLD             the network of 310.8.0 (also preset 1 of 310.9.16)
     CC_SILVER_AARDWOLD_OPTIMIZED   CC_SILVER_AARDWOLD made faster, its picture very close to it.
-                                   RX 9000 only, with ACO Mode
+                                   RX 9000 and RX 7000 / 700M - 8000S, with ACO Mode
 
 This only sets [Network] Model in dlssnr-amd.ini; the network can be switched in game at any time:
 the drop-down in NR Control (End) or on ReShade's Add-ons page, or Ctrl+F11 to cycle. The new network
 is prepared in the background, and the current one keeps running until it is ready. A network that
-cannot run is greyed out in the drop-down with the reason (on an RX 7000, for example, the two that
-need an RX 9000). The weights of CC_SMALL_FP8_EXPERIMENTAL and CC_SILVER_AARDWOLD_OPTIMIZED are made
-at install from your models; if that fails the other networks are installed and the one that failed
-is greyed out.
+cannot run is greyed out in the drop-down with the reason (without ACO Mode, for example,
+CC_SMALL_FP8_EXPERIMENTAL and CC_SILVER_AARDWOLD_OPTIMIZED). The weights of CC_SMALL_FP8_EXPERIMENTAL and
+CC_SILVER_AARDWOLD_OPTIMIZED are made at install from your models; if that fails the other networks
+are installed and the one that failed is greyed out.
 CC_SILVER_AARDWOLD_OPTIMIZED replaces CC_SILVER_AARDWOLD_INT4_MIXED of earlier versions (a
 dlssnr-amd.ini that names that one gets CC_SILVER_AARDWOLD_OPTIMIZED). Optimized layers (in NR
 Control under the network, [Network] OptimizedLayers) sets how many of its layers run in a faster form;
@@ -120,9 +120,20 @@ and options" in NR Control and on the Add-ons page and written to dlssnr-amd.log
     CC_SILVER_AARDWOLD_OPTIMIZED are greyed out then);
   - an RX 7000 / Radeon 700M - 8000S has no NR (their network exists as ACO's machine code only).
 The same place shows "ACO Mode: on in this run" and for which graphics while it is in use. A failure that
-is not ACO's own (video memory running short, for example) does not turn it off. The RDNA3 machine code was made
-and tested by TheAutomatic (https://github.com/TheAutomatic), building on mauri870's DLSSNR-RDNA3
-(https://github.com/mauri870/DLSSNR-RDNA3).
+is not ACO's own (video memory running short, for example) does not turn it off. The RDNA3 machine code builds on
+mauri870's DLSSNR-RDNA3 (https://github.com/mauri870/DLSSNR-RDNA3), its int4 included, and on TheAutomatic's
+(https://github.com/TheAutomatic) Windows port of it.
+
+D3D12 passthrough (experimental)
+--------------------------------
+On the optiscaler route in D3D12 games on an RX 9000 or RX 7000, the network runs on the game's own D3D12 device
+as the same ACO machine code, made into pipelines by AMD's driver (its D3D12 extension), instead of on a Vulkan
+device of NR's own with the frame handed across: no hand-over between the two devices. First implemented by
+TheAutomatic. It is on by default in this version: [D3D12Passthrough] Enabled in dlssnr-amd.ini (1 on, 0 off),
+or the checkbox on NR Control's Network page; either takes effect at the next game start. On an RX 9000 a small
+check runs on the game's device at the first frame; a game or GPU it cannot serve (another GPU, a driver without
+the extension, the check failing) runs through the Vulkan device as before. The Network page shows the check's
+result and how many frames ran each way, Diagnostics more; dlssnr-amd.log has the details ([d3d12] lines).
 
 Use
 ---
@@ -275,8 +286,9 @@ the default processing on every route (the NR settings page chooses it; with lay
   - Passes (NRPasses 1-4): each pass hands the previous pass's result to the network again; passes 2, 3
     and 4 each have their own settings. NRUnlockPasses = 1 allows up to 30 passes. Every pass runs the
     network once more, which lowers the frame rate a lot. Passes (fast): the network runs once a frame
-    and its change is strengthened instead (methods Extrapolation, Feedback, Hybrid, Edit strength,
-    each with its own settings).
+    and its change is strengthened instead (methods Interleaved - the default on the OptiScaler route -,
+    Extrapolation - the default on the ReShade route -, Feedback, Hybrid, Edit strength, each with its
+    own settings).
   - Adjust NR's look (NRLookMode and NRLook*): adjusts how much NR changed, directly on its result. Off
     by default; off leaves the picture unchanged.
   - Screenshot (F5, also a button in NR Control and on the Add-ons page): the same frame without and

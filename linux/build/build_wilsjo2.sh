@@ -8,7 +8,7 @@ out=$(realpath -m -- "${1:?usage: build_wilsjo2.sh <out dir>}")
 glslang=${NR_GLSLANG:-toolchain/glslang/bin/glslang}
 src=linux/shaders/wilsjo2
 mkdir -p -- "$out"
-rm -f -- "$out"/wilsjo2_*.spv   # only this tree's programs (a reused folder may hold another build's)
+rm -f -- "$out"/wilsjo2_*.spv "$out"/hudfix_*.spv   # only this tree's programs (a reused folder may hold another build's)
 log=$(mktemp "${TMPDIR:-/tmp}/wilsjo2.XXXXXX")
 trap 'rm -f -- "$log"' EXIT
 for k in encode resolve meter autoexposure finished clamp downsample os spatial inspect light; do
@@ -27,9 +27,9 @@ done
 # Enlargement Classic's scaler (FSR 1 EASU from linux/shaders/passes/include/fsr1, AMD, MIT)
 "$glslang" -V --target-env vulkan1.3 -I"$src" -Ilinux/shaders/passes/include "$src/wilsjo2_classic.comp" -o "$out/wilsjo2_classic.spv" > "$log" ||
     { cat "$log" >&2; exit 1; }
-# Passes (fast): the RenoDX-style stage's programs (linux/shaders/renodx-fast, the same sources as renodx_st_*.spv), and
-# the network's input in 16-bit float for them
-for k in st_fb_in st_prep st_box st_apply; do
+# Passes (fast): the RenoDX-style stage's programs (linux/shaders/renodx-fast, the same sources as renodx_st_*.spv and
+# renodx_il*.spv: Interleaved's too), and the network's input in 16-bit float for them
+for k in st_fb_in st_prep st_box st_apply il il0 il_pp; do
     "$glslang" -V --target-env vulkan1.3 -Ilinux/shaders/renodx-fast linux/shaders/renodx-fast/$k.comp -o "$out/wilsjo2_$k.spv" > "$log" ||
         { cat "$log" >&2; exit 1; }
 done
@@ -40,9 +40,9 @@ done
     { cat "$log" >&2; exit 1; }
 "$glslang" -V --target-env vulkan1.3 -I"$src" -DCOPY_LOAD "$src/wilsjo2_copy.comp" -o "$out/wilsjo2_copy_load.spv" > "$log" ||
     { cat "$log" >&2; exit 1; }
-# HUD FIX: one file, four programs
-for k in clear count estimate compose; do
-    "$glslang" -V --target-env vulkan1.3 -I"$src" -DHUD_${k^^} "$src/wilsjo2_hudfix.comp" -o "$out/wilsjo2_hudfix_$k.spv" > "$log" ||
+# HUD FIX (linux/shaders/hudfix, any processing's; it runs on this stage): one file, three programs
+for k in clear count compose; do
+    "$glslang" -V --target-env vulkan1.3 -DHUD_${k^^} linux/shaders/hudfix/hudfix.comp -o "$out/hudfix_$k.spv" > "$log" ||
         { cat "$log" >&2; exit 1; }
 done
-echo "$out: $(ls "$out"/wilsjo2_*.spv | wc -l) wilsjo2 shaders"
+echo "$out: $(ls "$out"/wilsjo2_*.spv | wc -l) wilsjo2 shaders, $(ls "$out"/hudfix_*.spv | wc -l) HUD FIX shaders"

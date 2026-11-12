@@ -1,0 +1,16 @@
+#version 460
+// The D3D12 passthrough's canary (nr_d3d12_passthrough.cpp): one small kernel, its ACO machine code made for every
+// architecture NR runs (windows/src/pe/nr_d3d12_canary_records.hpp) and run on the game's GPU the way the network's
+// kernels are - the same carrier ELF, prologue, root signature and binding table - so a hit says the network's own
+// route works there. Integer arithmetic only: the host compares every value exactly (aco_value).
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) readonly buffer In { uint v[]; } src;
+layout(set = 0, binding = 1) writeonly buffer Out { uint v[]; } dst;
+layout(push_constant) uniform Push { uint w[32]; } pc;   // [0] mul, [1] add, [2] count, [3] key, [4..31] mixing words
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.w[2]) return;
+    uint x = src.v[i] ^ (pc.w[3] + i);
+    for (uint k = 4u; k < 32u; ++k) x ^= pc.w[k] + (i << (k & 7u));
+    dst.v[i] = x * pc.w[0] + pc.w[1] + i;
+}

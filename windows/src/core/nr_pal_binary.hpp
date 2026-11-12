@@ -162,15 +162,16 @@ struct Arguments {
     std::vector<uint64_t> map=std::vector<uint64_t>(32,0xffffffff);
     std::vector<std::pair<int,int>> moves,loads;
     unsigned user=0;int spill=-1,grid=-1;
-    explicit Arguments(const Record& r,unsigned descriptor_slot=33) {
+    // push_base: the user-data entry of the first push-constant dword (XglLayout below; 1 in the plain layout)
+    explicit Arguments(const Record& r,unsigned descriptor_slot=33,unsigned push_base=1) {
         map[0]=0x10000000;map[1]=descriptor_slot;user=2;moves.emplace_back(r.set0,1);
         unsigned extra=(r.grid>=0?2:0)+(r.push>=0?1:0);
         bool spill_needed=r.push>=0 || user+r.inlines.size()+extra>16;
         // A spill slot replaces the push-pointer slot, or one inline slot.
         unsigned limit=16-(r.grid>=0?2:0)-(spill_needed?1:0);
         for(auto [dst,dw]:r.inlines) {
-            if(user<limit) {map[user]=dw+1;moves.emplace_back(dst,int(user++));}
-            else loads.emplace_back(dst,4*(dw+1));
+            if(user<limit) {map[user]=dw+push_base;moves.emplace_back(dst,int(user++));}
+            else loads.emplace_back(dst,4*(dw+push_base));
         }
         if(spill_needed) {spill=int(user);map[user++]=0x10000002;}
         if(r.grid>=0) {grid=int(user);map[user]=0x10000006;user+=2;}
@@ -190,8 +191,9 @@ inline bool is_gfx12(uint32_t m) {
 
 // Incoming pointers are saved before argument copies; the body keeps its
 // relative branch offsets and uses m0 for the 32-bit address high word.
-inline Bytes prologue(const Record& r, unsigned descriptor_slot = 33, uint32_t mach = 0x4e) {
-    Bytes b;Arguments a(r,descriptor_slot);
+inline Bytes prologue(const Record& r, unsigned descriptor_slot = 33, uint32_t mach = 0x4e, unsigned push_base = 1) {
+    require(push_base>=1 && 4*push_base<=64,"push base out of range");   // its byte offset an inline constant
+    Bytes b;Arguments a(r,descriptor_slot,push_base);
     auto mov=[&](unsigned dst,unsigned src){word(b,0xbe800000|(dst<<16)|src);};
     if(a.spill>=0)mov(96,a.spill);
     if(a.grid>=0) {mov(100,a.grid);mov(101,a.grid+1);}
@@ -228,7 +230,8 @@ inline Bytes prologue(const Record& r, unsigned descriptor_slot = 33, uint32_t m
         }
     }
     for(auto [reg,offset]:a.loads)ld(reg,96,offset);
-    if(r.push>=0) {word(b,0x80000000|(uint32_t(r.push)<<16)|(0x84<<8)|96);word(b,0xbf800002);}
+    // the push block's address: the spill table (s96) plus push_base entries (s_add_u32 with an inline constant)
+    if(r.push>=0) {word(b,0x80000000|(uint32_t(r.push)<<16)|((0x80+4*push_base)<<8)|96);word(b,0xbf800002);}
     if(r.grid>=0)for(unsigned j=0;j<3;++j)ld(r.grid+j,100,j*4);
     // The wait before the first use of the loaded arguments. gfx12 has the split waits
     // (s_wait_kmcnt 0); gfx11 has the classic one (s_waitcnt lgkmcnt(0)). The gfx12 word is
@@ -290,18 +293,59 @@ struct Elf {
         for(const auto& s:sections) {size_t p=out.size();out.resize(p+64);write(out,p,s);}return out;
     }
 };
+// The PAL metadata (the AMDGPU note of type 32) of a pipeline's .note section.
+inline Value pal_metadata(const Bytes& src) {
+    for(size_t pos=0;pos<src.size();) {
+        range(src,pos,12);
+        const auto ns=read<uint32_t>(src,pos),ds=read<uint32_t>(src,pos+4),type=read<uint32_t>(src,pos+8);
+        const size_t name=pos+12,desc=name+((uint64_t(ns)+3)&~uint64_t(3)),next=desc+((uint64_t(ds)+3)&~uint64_t(3));
+        range(src,name,next-name);
+        if(type==32) return unpack(Bytes(src.begin()+desc,src.begin()+desc+ds));
+        pos=next;
+    }
+    throw std::runtime_error("PAL metadata missing");
+}
+// Where XGL put the push constants and set 0's pointer in a compute pipeline's user data (compact layout,
+// icd/api/vk_pipeline_layout.cpp BuildCompactSchemeInfo): entry 0 the vertex-buffer table, then entries the device's
+// features reserve - one for the uber-fetch shader's constant buffer when VK_EXT_vertex_input_dynamic_state or
+// VK_EXT_graphics_pipeline_library is enabled (emulators, DXVK), one for transform feedback when
+// VK_EXT_transform_feedback is (DXVK), one for debug printf -, then the push constants, then set 0's pointer, the
+// last entry (.user_data_limit - 1). A plain device puts the push constants at entry 1. Anything else (ray tracing's
+// entries between the push constants and the set) is refused: the network then runs from the driver's compiler.
+// Reported with the uber-fetch case by Robert Bopko (GitLab issue 5, shadPS4).
+struct XglLayout { unsigned push_base, descriptor_slot; };
+inline XglLayout xgl_layout(const Value& meta,unsigned push_bytes) {
+    const auto& ps=meta.at("amdpal.pipelines");require(ps.kind==Value::Array && ps.items.size()==1,"PAL pipeline count");
+    const uint64_t limit=ps.items[0].at(".user_data_limit").number(),dwords=push_bytes/4;
+    require(limit>=dwords+2 && limit-1-dwords<=16,"unsupported XGL user-data layout");
+    const XglLayout l{unsigned(limit-1-dwords),unsigned(limit-1)};
+    if(l.push_base!=1) {   // entries before the push constants: the capture must show the push constants there
+        const auto& map=ps.items[0].at(".hardware_stages").at(".cs").at(".user_data_reg_map");
+        require(map.kind==Value::Array,"PAL user-data map");
+        bool push_seen=dwords==0;
+        for(const auto& v:map.items) {
+            const uint64_t x=v.number();
+            if(x>=0x10000000) continue;   // the global table, the spill table, the grid, unused
+            require(x>=l.push_base && x<=l.descriptor_slot,"unsupported XGL user-data layout");
+            push_seen=push_seen || x<l.descriptor_slot;
+        }
+        require(push_seen,"unsupported XGL user-data layout");
+    }
+    return l;
+}
 inline Bytes splice(const Bytes& binary,const Record& r,unsigned push_bytes=128,
                     std::array<uint32_t,3> workgroup={0,0,0}) {
     require(push_bytes<=128 && push_bytes%4==0 && r.push_bytes<=push_bytes,"unsupported pipeline push range");
-    const unsigned descriptor_slot=push_bytes/4+1;
     Elf e(binary);
-    if(r.mach!=0) {
-        bool compatible = (r.mach == e.mach) ||
-                          (is_gfx11(r.mach) && is_gfx11(e.mach)) ||
-                          (is_gfx12(r.mach) && is_gfx12(e.mach));
-        require(compatible, "record target architecture mismatch");
-    }
+    // The record's machine code must be for the GPU the template was compiled for (the driver compiles the template on
+    // this GPU: its machine is the GPU's). An NRPAL001 record names no machine: it is gfx12 code (the bundle's RDNA4
+    // records) and goes into a gfx12 template only; NRPAL002 names its machine, gfx11 into gfx11 and gfx12 into gfx12.
+    const uint32_t record_mach = r.mach != 0 ? r.mach : 0x4eu;
+    const bool compatible = (is_gfx11(record_mach) && is_gfx11(e.mach)) || (is_gfx12(record_mach) && is_gfx12(e.mach));
+    require(compatible, "record target architecture mismatch");
     auto text=e.find(".text"),note=e.find(".note"),sym=e.find(".symtab");
+    const XglLayout layout=xgl_layout(pal_metadata(e.data[note]),push_bytes);
+    const unsigned descriptor_slot=layout.descriptor_slot;
     require(e.sections[text].align==256 && e.sections[text].addr==0,"PAL entry alignment");
     // Exactly one compute entry, no relocations, no secondary functions/data.
     const auto& sy=e.sections[sym];require(sy.entsize==24 && sy.link<e.data.size() && e.data[sym].size()%24==0,"ELF symbols");
@@ -319,7 +363,7 @@ inline Bytes splice(const Bytes& binary,const Record& r,unsigned push_bytes=128,
         ++found;
     }
     require(found==1,"PAL compute entry count");
-    auto pre=prologue(r,descriptor_slot,e.mach);
+    auto pre=prologue(r,descriptor_slot,e.mach,layout.push_base);
     write(e.data[sym],cs_sym_pos+16,uint64_t(pre.size()+r.exec));
     e.data[text]=pre;
     e.data[text].insert(e.data[text].end(),r.code.begin(),r.code.end());
@@ -351,7 +395,7 @@ inline Bytes splice(const Bytes& binary,const Record& r,unsigned push_bytes=128,
         auto& map=cs.at(".user_data_reg_map");require(map.kind==Value::Array && map.items.size()==32 &&
                 map.items[0].number()==0x10000000,"PAL global table ABI");
         for(const auto& v:map.items) {auto x=v.number();require(x<=descriptor_slot || x==0xffffffff || x==0x10000000 || x==0x10000002 || x==0x10000006,"unhandled PAL user-data mapping");}
-        Arguments a(r,descriptor_slot);map.items.clear();for(auto x:a.map)map.items.emplace_back(x);
+        Arguments a(r,descriptor_slot,layout.push_base);map.items.clear();for(auto x:a.map)map.items.emplace_back(x);
         p.set(".spill_threshold",Value(a.spill>=0?1:65535));
         cs.set(".shader_spill_threshold",Value(a.spill>=0?1:65535));
         cs.set(".user_sgprs",Value(a.user));

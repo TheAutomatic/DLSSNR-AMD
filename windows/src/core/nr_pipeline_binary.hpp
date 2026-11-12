@@ -6,6 +6,7 @@
 #include <vulkan/vulkan.h>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include "nr_path_u8.hpp"   // UTF-8 paths (a game folder with any letters)
 #include <map>
@@ -290,10 +291,38 @@ inline VkPipeline create(VkDevice device,const VkComputePipelineCreateInfo& ci,c
     if(!cache_file.empty())save_cached(cache_file,key,blob);
     return pipeline;
 }
+// A record reference: SPIR-V that carries OpModuleProcessed "nr-aco-record <16 hex digits>" stands for the network
+// SPIR-V of that hash (RDNA3's network ships as ACO's machine code only: its SPIR-V files are interface shells that
+// name their record). 0: none.
+inline uint64_t record_reference(const uint32_t* code,size_t bytes) {
+    static const char tag[]="nr-aco-record ";
+    for(size_t p=5;p<bytes/4;) {
+        const uint32_t n=code[p]>>16,op=code[p]&65535u;
+        if(!n || n>bytes/4-p)return 0;
+        if(op==330 && n>=2) {   // OpModuleProcessed
+            const char* s=reinterpret_cast<const char*>(code+p+1);
+            const size_t len=strnlen(s,(n-1)*4);
+            if(len==sizeof tag-1+16 && std::memcmp(s,tag,sizeof tag-1)==0) {
+                uint64_t h=0;
+                for(size_t i=sizeof tag-1;i<len;++i) {
+                    const char c=s[i];
+                    const int d=c>='0'&&c<='9'?c-'0':c>='a'&&c<='f'?c-'a'+10:-1;
+                    if(d<0)return 0;
+                    h=(h<<4)|uint64_t(d);
+                }
+                return h;
+            }
+        }
+        if(op==54)break;   // OpFunction: past the debug section
+        p+=n;
+    }
+    return 0;
+}
 inline VkResult create_aco(VkDevice device,VkPipelineCache cache,const VkComputePipelineCreateInfo& ci,const std::string& dir,
                            const std::string& path,const uint32_t* code,size_t bytes,VkPipeline* out,uint32_t push_bytes) {
     pal::require(enabled(device),"binary mode was not enabled when this device was created");
-    auto h=pal::hash(code,bytes);
+    const uint64_t ref=record_reference(code,bytes);
+    auto h=ref?ref:pal::hash(code,bytes);
     const auto record_bytes=pal::load(dir+"/records/"+keyname(h));
     auto record=pal::Record::parse(record_bytes);
     pal::require(record.spv_hash==h,"SPIR-V record mismatch");
@@ -311,8 +340,11 @@ inline VkResult create_aco(VkDevice device,VkPipelineCache cache,const VkCompute
     // The PAL container comes from the driver's own compile of a template SPIR-V with the same interface:
     // the first shell directory holding the name (NR_ACO_SHELL_DIR, or the product's aco/shell then the
     // native network shaders), else the Linux SPIR-V itself.
-    std::string shell_path;
-    {
+    // A record-referencing stand-in is itself the carrier interface. Looking up a
+    // generic shell by filename can drop INT4 aliases (20/23) or use another
+    // variant's interface. Its bytes also enter the import-cache key below.
+    std::string shell_path = ref ? path : std::string();
+    if (!ref) {
         auto name=path.substr(path.find_last_of("/\\")+1);
         // The name itself, else the native shader that serves as its template (the bundle's alias list).
         // A temporal pre/post block's template is looked for in a temporal\ folder first (RDNA3's shells keep them there).

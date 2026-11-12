@@ -87,6 +87,8 @@ HMODULE dllModule = nullptr;
 
 namespace nr::pe::menu {
 namespace {
+std::atomic<void (*)()> g_extra_diagnostics{nullptr};   // set_extra_diagnostics
+std::atomic<void (*)()> g_extra_network{nullptr};       // set_extra_network
 using nr::lang::tr;
 using nr::lang::tr_text;
 
@@ -166,10 +168,16 @@ struct Input {
         s->wayland = 1;
         auto down = [&](unsigned vk) { return (s->keys[vk / 32] >> (vk % 32)) & 1u; };
         auto was = [&](unsigned vk) { return (keys_before[vk / 32] >> (vk % 32)) & 1u; };
+        // a press of `vk` since the last look, taken (also one that went down and up between two drawn frames)
+        auto pressed = [&](unsigned vk) {
+            const LONG bit = LONG(1u << (vk % 32));
+            return (InterlockedAnd(reinterpret_cast<volatile LONG*>(&s->pressed[vk / 32]), ~bit) & bit) != 0;
+        };
         if (!primed) {   // what was already held or typed before the first look is not input to the menu
             std::memcpy(keys_before, s->keys, sizeof keys_before);
             wheel_seen = s->wheel;
             chars_seen = s->chars_written;
+            for (auto& w : s->pressed) InterlockedExchange(reinterpret_cast<volatile LONG*>(&w), 0);   // (nor its presses)
             primed = true;
         }
         // the menu's key with its modifiers held (not while a field takes typing: a letter key would close the menu)
@@ -177,12 +185,14 @@ struct Input {
         const bool mods_held = (!(open_mods & MOD_CONTROL) || down(0x11)) && (!(open_mods & MOD_SHIFT) || down(0x10)) &&
                                (!(open_mods & MOD_ALT) || down(0x12));
         bool toggled = false;
-        if (open_vk && down(unsigned(open_vk)) && !was(unsigned(open_vk)) && mods_held && !(open && io.WantTextInput) &&
-            !taking) {
+        // (the press alone, not also the change since the last frame: one press, one toggle)
+        const bool open_hit = open_vk && pressed(unsigned(open_vk));
+        const bool esc_hit = pressed(0x1B);
+        if (open_hit && mods_held && !(open && io.WantTextInput) && !taking) {
             open = !open;
             toggled = true;
         }
-        if (open && down(0x1B) && !was(0x1B) && !io.WantTextInput && !taking) open = false;   // Esc
+        if (open && esc_hit && !io.WantTextInput && !taking) open = false;   // Esc
         s->menu_open = open ? 1 : 0;
         // the game hid its cursor (mouse look): the menu draws one
         io.MouseDrawCursor = open && !s->cursor_shown;
@@ -695,6 +705,7 @@ struct Menu {
         if (hotkeys_read && now - hotkeys_read < 1000) return hotkeys;
         hotkeys_read = now;
         hotkeys.menu_key = true;
+        hotkeys.pass_opti_key = true;
         hotkeys.taken.clear();
         const std::string path = std::string(nr::pe::module_folder()) + "\\OptiScaler.ini";
         const auto opti_key = [&](const char* key, int def, const char* what) {
@@ -744,6 +755,7 @@ struct Menu {
         nr::control_ui::draw_diag_package([s] { return diag_request(s); });
         ImGui::Separator();
         nr::control_ui::draw_session_stats();
+        if (auto draw = g_extra_diagnostics.load()) draw();
     }
     // The diagnostic package's request (Diagnostics' button; tests: NR_CONTROL_DIAG_AT)
     static nr::pe::diag::Request diag_request(const nr::control::Shared* s) {
@@ -951,6 +963,7 @@ struct Menu {
             }
             case kNetwork:
                 nr::control_ui::draw_network_options(ini, s, nr::control_ui::NetworkOptions{});
+                if (auto draw = g_extra_network.load()) draw();
                 // What the game hands NR, and who covers what it does not (the DLL's lines, nr_engine_panel.hpp)
                 if (s && s->route && s->panel_lines && !chain_rows(s) && nr::control_ui::section("Engine data")) {
                     nr::control_ui::engine_legend();
@@ -1747,6 +1760,10 @@ void draw_on(IDXGISwapChain* sc, UINT flags, IUnknown* known = nullptr) {
     else (void)lock.try_lock();
     const auto now = std::chrono::steady_clock::now();
     const bool menu_here = lock.owns_lock();
+    if (menu_here) {   // the menu's input is read from the window this swap chain presents to
+        DXGI_SWAP_CHAIN_DESC wd{};
+        if (SUCCEEDED(sc->GetDesc(&wd))) nr::pe::control::menu_window(wd.OutputWindow);
+    }
     // the system's Present while the game's own is seen: a new game frame's first presented frame does the bookkeeping
     struct SameFrame { bool was; bool on; ~SameFrame() { if (on) t_same_frame = was; } } same{t_same_frame, false};
     if (!known && menu_here && GetTickCount64() - g_game_present_ms.load() < 1000) {
@@ -2025,6 +2042,9 @@ void install_now() {
 }
 
 }  // namespace
+
+void set_extra_diagnostics(void (*draw)()) { g_extra_diagnostics = draw; }
+void set_extra_network(void (*draw)()) { g_extra_network = draw; }
 
 void abandon_at_exit() {
     for (auto& [k, v] : g_vulkan) (void)v.release();

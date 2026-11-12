@@ -20,6 +20,10 @@ void beat();
 // a stall of the game's frames alone of 3 s is reported too, at most twice a process.
 void game_beat();
 
+// The game asked to quit (the .asi's PostQuitMessage hook): a stall from now on is taken as the game closing - its
+// report is written only if the process still runs 30 s later.
+void quit_asked();
+
 // The watching thread ends and this waits until it has (it holds the module while it runs, and lets go as it ends):
 // before a module of ours is unloaded - ReShade calls the add-on's AddonUninit, outside the loader lock, before its
 // FreeLibrary when the game's last device goes. Never from DllMain. Nothing starts it again in this module's life.

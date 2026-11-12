@@ -13,6 +13,7 @@
 // features the network is measured with (nrvk::Context::create) plus the external-memory pair and
 // timeline semaphores.
 #include "nr_pe_interop.hpp"
+#include "nr_gpu_arch_ids.hpp"
 
 #include <windows.h>
 #include <d3d10.h>
@@ -70,8 +71,8 @@ class Device {
     // them.
     static void abandon_at_exit();
     const LUID& luid() const { return luid_; }
-    // The GPU runs RDNA3's network (nr_gpu_arch.hpp), as ACO's machine code from the bundle's rdna3 folder.
-    bool rdna3() const { return rdna3_; }
+    // The GPU's architecture (nr_gpu_arch.hpp), whose network the bridge's device was made for (RDNA4 or RDNA3).
+    nr::arch::GpuArch arch() const { return arch_; }
 
     DeviceHandles handles() const { return handles_; }
     VkQueue queue() const { return queue_; }
@@ -169,7 +170,8 @@ class Device {
     void drop_locked(Job* job, std::vector<std::function<void()>>& calls);
     bool done(Job* job);   // jobs_mutex_ held: submitted and its fence signalled
     LUID luid_{};
-    bool rdna3_{};
+    nr::arch::GpuArch arch_{nr::arch::GpuArch::unknown};
+    bool unidentified_ = false;   // refused only because AMD's driver could not be asked yet (Device::get asks again)
     struct Buried { IUnknown* d3d; uint64_t mark; IUnknown* queue; };   // `mark` on `queue`'s shared fence
     std::vector<Buried> buried_;   // under sync_mutex_
     void sweep_buried_locked();

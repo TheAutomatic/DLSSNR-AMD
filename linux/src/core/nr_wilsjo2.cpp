@@ -146,6 +146,7 @@ bool parse_key(Settings& s, const std::string& raw_key, const std::string& value
                                             "autoexposurehighlightprotection", "autoexposuretrimanchors", "skinprotection",
                                             "skindetail", "skincolour", "environmentdetail", "environmentcolour",
                                             "classicscaler", "downscale", "passesmode", "fastmethod", "fasteditstrength", "colourlimit",
+                                            "fastinterleavedpasses",
                                             "fastextrapolationpasses", "fastextrapolationhalolimit", "fastextrapolationfine",
                                             "fastfeedbackpasses", "fastfeedbackhalolimit", "fastfeedbackfine",
                                             "fasthybridpasses", "fasthybridhalolimit", "fasthybridfine"};
@@ -217,12 +218,25 @@ bool parse_key(Settings& s, const std::string& raw_key, const std::string& value
         else return false;
         return true;
     }
-    if (key == "fastmethod") {
-        if (v == "extrapolation" || v == "0") s.fast_method = 0;
-        else if (v == "feedback" || v == "1") s.fast_method = 1;
-        else if (v == "hybrid" || v == "2") s.fast_method = 2;
-        else if (v == "edit strength" || v == "editstrength" || v == "3") s.fast_method = 3;
+    if (key == "fastmethod") {   // RenoDX's numbering (NRFastMethod)
+        if (v == "interleaved" || v == "0") s.fast_method = 0;
+        else if (v == "extrapolation" || v == "1") s.fast_method = 1;
+        else if (v == "feedback" || v == "2") s.fast_method = 2;
+        else if (v == "hybrid" || v == "3") s.fast_method = 3;
+        else if (v == "edit strength" || v == "editstrength" || v == "4") s.fast_method = 4;
         else return false;
+        return true;
+    }
+    if (key == "fastinterleavedpasses") {   // 2..8
+        uint32_t n = 3;
+        if (!parse_uint(value, &n)) return false;
+        s.fast_interleaved_passes = std::clamp(n, 2u, 8u);
+        return true;
+    }
+    if (key == "fastinterleavedpreset") {   // 1 | 2
+        uint32_t n = fast::kDefaultInterleavedPreset;
+        if (!parse_uint(value, &n)) return false;
+        s.fast_interleaved_preset = n == 1u || n == 2u ? n : fast::kDefaultInterleavedPreset;
         return true;
     }
     // each method's own: Fast<Method>Passes (1..8) / HaloLimit / Fine (0..2), <Method> Extrapolation, Feedback, Hybrid
@@ -321,7 +335,8 @@ void work_extent(const Settings& s, float scale, uint32_t width, uint32_t height
 // ---- peripheral compression: nr_wilsjo2.hpp (inline: the ReShade route's runtime uses it too) ----
 
 uint32_t passes_requested(const Settings& s) {
-    if (s.passes_mode == 1) return 1;   // Passes (fast): one network pass
+    // Passes (fast): one network pass; Interleaved: one a frame, each of its legacy passes with its own model and history
+    if (s.passes_mode == 1) return s.fast_method == 0 ? std::clamp(s.fast_interleaved_passes, 2u, 8u) : 1;
     return std::clamp(s.passes, 1u, s.unlock_passes ? kMaxPasses : 3u);
 }
 
@@ -426,31 +441,17 @@ Constants resolve_constants(const Settings& s, Constants c, bool passthrough, ui
     return c;
 }
 
-Constants hudfix_constants(uint32_t mode, uint32_t w, uint32_t h, uint32_t source, bool show_mask, bool fresh,
-                           uint32_t parity) {
+Constants hudfix_constants(uint32_t mode, uint32_t w, uint32_t h, uint32_t source, bool show_mask) {
     Constants c{};
-    c.passthrough = fresh ? 1u : 0u;                          // Fresh
-    const uint32_t p = parity & 1u;
-    std::memcpy(&c.max_ratio, &p, sizeof p);                  // Parity (a uint in that slot)
     c.mode = mode;
     c.width = w;
     c.height = h;
     c.debug_view = show_mask ? 1u : 0u;                       // ShowMask
     c.guide_width = uint32_t(0.25 * double(w) * double(h));   // HudLimit
-    c.guide_height = 1u;                                      // Residual
-    c.compare_mode = source == 4 ? 3u : source;               // HudMode
+    c.guide_height = source == 5 ? 2u : 1u;                   // Residual (5: the chain capture under its check)
+    c.compare_mode = source == 5 ? 2u : source == 6 ? 5u : source;   // HudMode (6: the chain's pick)
     c.compare_split = 1.0f / 510.0f;                          // Epsilon
-    c.compare_zoom = 0.25f;                                   // Threshold
     return c;
-}
-
-void hudfix_motion(Constants& c, float scale_x, float scale_y, uint32_t x, uint32_t y, float step_x, float step_y) {
-    c.mv_scale_x = scale_x;                                   // MvScaleX / Y
-    c.mv_scale_y = scale_y;
-    c.compare_swap = 1u;                                      // MotionOn
-    c.transfer = (std::min(x, 0xffffu)) | (std::min(y, 0xffffu) << 16);   // MotionBase
-    c.debug_scale = step_x;                                   // MotionStepX
-    std::memcpy(&c.reversible_mode, &step_y, sizeof step_y);  // MotionStepY (a float in that slot)
 }
 
 Constants copy_constants(Mode mode, uint32_t sx, uint32_t sy, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h) {
@@ -474,7 +475,7 @@ static const char* mode_name(uint32_t mode) {
     case kOsEasu: return "os_easu"; case kClassicUp: return "classic"; case kInspect: return "inspect";
     case kLight: return "light"; case kPrepMeter: return "prep_meter"; case kPrepForward: return "prep_forward";
     case kPrepBack: return "prep_back"; case kHudClear: return "hud_clear"; case kHudCount: return "hud_count";
-    case kHudEstimate: return "hud_estimate"; case kHudCompose: return "hud_compose";
+    case kHudCompose: return "hud_compose";
     case kSpatialPack: return "spatial_pack"; case kSpatialGuides: return "spatial_guides";
     case kSpatialUnpack: return "spatial_unpack";
     default: return "other";
@@ -495,13 +496,19 @@ struct Stage::Impl {
                          uint32_t push_bytes = 0; };
     std::array<FastProgram, nr::fast::kProgramCount> fast{};
     bool fast_loaded = false;
+    // Passes (fast) Interleaved's: [0] il (preset 2; a pipeline per step, specialization constant 0), and preset 1's
+    // (0.0.8.4's method): [1] il_pp, [2] il0 with its own pipelines per step
+    std::array<FastProgram, 3> il{};
+    std::array<VkPipeline, 8> il0_steps{};
+    std::array<VkPipeline, 8> il_steps{};
+    bool il_loaded = false;
     // The views and sets of one recording, freed once 64 later recordings have passed AND 2 s (the game's image
     // handles can name another image once the game frees one, so nothing is kept across recordings). The recordings of
     // one frame are in command lists the game submits later: a fixed ring wrapped inside one frame with many passes and
     // layers (31 recordings a 30-pass layer) and reset sets still to run. The ring grows instead: the oldest slot is
     // taken only when free by both rules, else a new one goes in front of it; at kMaxSlots a recording that would need
     // one more is refused (record() throws: the frame is left as it came), never a slot still in use.
-    struct Slot { nr::gpu::Ticket gpu; VkDescriptorPool pool{}, fast_pool{}; std::vector<VkImageView> views; uint64_t recording = ~0ull;
+    struct Slot { nr::gpu::Ticket gpu; VkDescriptorPool pool{}, fast_pool{}, il_pool{}; std::vector<VkImageView> views; uint64_t recording = ~0ull;
                   std::chrono::steady_clock::time_point used{};
                   VkQueryPool prof_pool{}; std::vector<const char*> prof_names; };   // NR_WILSJO2_PROF's
     // NR_WILSJO2_PROF (a measurement aid, as NR_RENODX_PROF): a timestamp before and after every dispatch of a
@@ -590,7 +597,11 @@ struct Stage::Impl {
     }
 
     void load_fast(nr::fast::Program which, const std::string& path, uint32_t push_bytes) {
-        FastProgram& p = fast[which];
+        load_program(fast[which], path, push_bytes);
+    }
+    // `steps`: bit k - a pipeline for step k, specialization constant 0 = k (Interleaved's il)
+    void load_program(FastProgram& p, const std::string& path, uint32_t push_bytes, uint32_t steps = 0,
+                      VkPipeline* step_pipes = nullptr) {
         const auto code = read_spirv(path);
         p.bindings = reflect_images(code);
         p.push_bytes = push_bytes;
@@ -617,6 +628,25 @@ struct Stage::Impl {
         robustness.images = VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT;
         if (pipeline_robustness) ci.pNext = &robustness;
         check(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &ci, nullptr, &p.pipeline), path.c_str());
+        for (uint32_t k = 0; k < 8 && step_pipes; ++k) {
+            if (!(steps >> k & 1u)) continue;
+            const VkSpecializationMapEntry me{0, 0, sizeof(uint32_t)};
+            const VkSpecializationInfo sp{1, &me, sizeof(uint32_t), &k};
+            ci.stage.pSpecializationInfo = &sp;
+            check(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &ci, nullptr, &step_pipes[k]), path.c_str());
+        }
+    }
+    void il_clear() {
+        for (VkPipeline& q : il_steps) { if (q) vkDestroyPipeline(device, q, nullptr); q = VK_NULL_HANDLE; }
+        for (VkPipeline& q : il0_steps) { if (q) vkDestroyPipeline(device, q, nullptr); q = VK_NULL_HANDLE; }
+        for (FastProgram& p : il) {
+            if (p.pipeline) vkDestroyPipeline(device, p.pipeline, nullptr);
+            if (p.module) vkDestroyShaderModule(device, p.module, nullptr);
+            if (p.layout) vkDestroyPipelineLayout(device, p.layout, nullptr);
+            if (p.dsl) vkDestroyDescriptorSetLayout(device, p.dsl, nullptr);
+            p = {};
+        }
+        il_loaded = false;
     }
     void fast_clear() {
         for (FastProgram& p : fast) {
@@ -666,6 +696,7 @@ struct Stage::Impl {
             vkResetDescriptorPool(device, s->pool, 0);
         }
         if (s->fast_pool) vkResetDescriptorPool(device, s->fast_pool, 0);
+        if (s->il_pool) vkResetDescriptorPool(device, s->il_pool, 0);
         s->gpu = nr::gpu::current();
         s->recording = recordings;
         s->used = now;
@@ -790,6 +821,15 @@ Stage::Stage(const HostDevice& host, const std::string& shaders) : impl_(std::ma
         m.fast_clear();
         programs_clear(m, kHalfCopy);
     }
+    try {   // Passes (fast) Interleaved: optional (without them an Interleaved layer runs one plain network pass, and says so)
+        m.load_program(m.il[0], shaders + "/wilsjo2_il.spv", 96, 0x7Bu, m.il_steps.data());
+        m.load_program(m.il[1], shaders + "/wilsjo2_il_pp.spv", 28);
+        m.load_program(m.il[2], shaders + "/wilsjo2_il0.spv", 96, 0x3Bu, m.il0_steps.data());
+        m.il_loaded = m.fast_loaded;
+        if (!m.il_loaded) m.il_clear();
+    } catch (const std::exception&) {
+        m.il_clear();
+    }
     try {   // the .asi's Vulkan copies: optional (without them a copy a transfer cannot make does not happen)
         m.load(kCopy, shaders + "/wilsjo2_copy.spv");
         m.load(kCopyLoad, shaders + "/wilsjo2_copy_load.spv");
@@ -802,10 +842,9 @@ Stage::Stage(const HostDevice& host, const std::string& shaders) : impl_(std::ma
     } catch (const std::exception&) {
     }
     try {   // HUD FIX: optional too (without it HUD FIX says it is unavailable)
-        m.load(kHudClear, shaders + "/wilsjo2_hudfix_clear.spv");
-        m.load(kHudCount, shaders + "/wilsjo2_hudfix_count.spv");
-        m.load(kHudEstimate, shaders + "/wilsjo2_hudfix_estimate.spv");
-        m.load(kHudCompose, shaders + "/wilsjo2_hudfix_compose.spv");
+        m.load(kHudClear, shaders + "/hudfix_clear.spv");
+        m.load(kHudCount, shaders + "/hudfix_count.spv");
+        m.load(kHudCompose, shaders + "/hudfix_compose.spv");
     } catch (const std::exception&) {
     }
 }
@@ -816,9 +855,11 @@ Stage::~Stage() {
         for (VkImageView v : s->views) vkDestroyImageView(m.device, v, nullptr);
         if (s->pool) vkDestroyDescriptorPool(m.device, s->pool, nullptr);
         if (s->fast_pool) vkDestroyDescriptorPool(m.device, s->fast_pool, nullptr);
+        if (s->il_pool) vkDestroyDescriptorPool(m.device, s->il_pool, nullptr);
         if (s->prof_pool) vkDestroyQueryPool(m.device, s->prof_pool, nullptr);
     }
     m.fast_clear();
+    m.il_clear();
     for (auto& p : m.programs) {
         if (p.pipeline) vkDestroyPipeline(m.device, p.pipeline, nullptr);
         if (p.module) vkDestroyShaderModule(m.device, p.module, nullptr);
@@ -918,6 +959,59 @@ void Stage::record_fast(VkCommandBuffer cmd, uint32_t program, const FastImage* 
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0,
                          nullptr);
     m.prof_mark(s, cmd, nr::fast::program_name(nr::fast::Program(program)), true);
+}
+
+bool Stage::has_il() const { return impl_->il_loaded; }
+
+void Stage::record_il(VkCommandBuffer cmd, uint32_t program, uint32_t step, const FastImage* images, uint32_t count,
+                      const void* push, uint32_t bytes, uint32_t gx, uint32_t gy) {
+    Impl& m = *impl_;
+    if (!m.il_loaded || program > 2u) throw std::runtime_error("wilsjo2 stage: no Interleaved program");
+    const Impl::FastProgram& pr = m.il[program];
+    Impl::Slot& s = m.slot();
+    if (!s.il_pool) {   // a recording's Interleaved work: up to 8 sets (il binds 21 sampled and 18 storage images)
+        const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 8 * 28}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 8 * 20}};
+        VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        pi.maxSets = 8; pi.poolSizeCount = 2; pi.pPoolSizes = sizes;
+        check(vkCreateDescriptorPool(m.device, &pi, nullptr, &s.il_pool), "Interleaved descriptor pool");
+    }
+    VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    ai.descriptorPool = s.il_pool; ai.descriptorSetCount = 1; ai.pSetLayouts = &pr.dsl;
+    VkDescriptorSet set{};
+    check(vkAllocateDescriptorSets(m.device, &ai, &set), "Interleaved descriptor set");
+    std::vector<VkDescriptorImageInfo> info(pr.bindings.size());
+    std::vector<VkWriteDescriptorSet> w(pr.bindings.size());
+    for (size_t i = 0; i < pr.bindings.size(); ++i) {
+        const auto [binding, type] = pr.bindings[i];
+        const Image* im = nullptr;
+        for (uint32_t j = 0; j < count; ++j)
+            if (images[j].binding == binding) im = &images[j].image;
+        if (!im || !*im) throw std::runtime_error("wilsjo2 stage: an Interleaved program's image is missing");
+        const bool sampled = type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        info[i].imageView = m.view(s, *im, sampled ? VK_IMAGE_USAGE_SAMPLED_BIT : VK_IMAGE_USAGE_STORAGE_BIT);
+        info[i].imageLayout = im->layout;
+        w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w[i].dstSet = set; w[i].dstBinding = binding; w[i].descriptorCount = 1;
+        w[i].descriptorType = type;
+        w[i].pImageInfo = &info[i];
+    }
+    vkUpdateDescriptorSets(m.device, uint32_t(w.size()), w.data(), 0, nullptr);
+    const VkPipeline pipe = program == 0u && step < 8u && m.il_steps[step] ? m.il_steps[step]
+                          : program == 2u && step < 8u && m.il0_steps[step] ? m.il0_steps[step] : pr.pipeline;
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pr.layout, 0, 1, &set, 0, nullptr);
+    vkCmdPushConstants(cmd, pr.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, std::min(bytes, pr.push_bytes), push);
+    static const char* const names[] = {"il0", "il1", "il2", "il3", "il4", "il5", "il6", "il7"};
+    const char* name = program == 1u ? "il_pp" : names[std::min(step, 7u)];
+    m.prof_mark(s, cmd, name, false);
+    vkCmdDispatch(cmd, gx, gy, 1);
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0,
+                         nullptr);
+    m.prof_mark(s, cmd, name, true);
 }
 
 void Stage::end_recording() { ++impl_->recordings; }
