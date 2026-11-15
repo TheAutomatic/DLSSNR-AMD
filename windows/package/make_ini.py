@@ -190,10 +190,10 @@ dlssnr = save[0][0] % tuple(value(a, scope) for a in save[0][1])
 own = save[-1][0] % tuple(value(a, scope) for a in save[-1][1])   # MotionVectors: install.ps1 -Lumenite on writes lumenite
 
 
-def renodx_section(enabled, fast_method=0):
+def renodx_section(enabled, fast_method=0, present_guides=0):
     """[RenoDX] as the route's program writes it: NRFastMethod and its "(default)" mark are the route's"""
     r = dict(renodx_cfg, enabled=enabled)
-    r["values"] = dict(r["values"], fast_method=fast_method)
+    r["values"] = dict(r["values"], fast_method=fast_method, present_guides=present_guides)
     constants["kDefaultMethod"] = fast_method
     try: return "".join(render("void write_renodx(", {"r": r, "v": r["values"]}))
     finally: constants["kDefaultMethod"] = 0
@@ -203,6 +203,8 @@ def renodx_section(enabled, fast_method=0):
                                                 nrcontrol + d3d12 + gpu + logsec, encoding="utf-8")
 (out / "dlssnr-amd-optiscaler-renodx.ini").write_text(network + preprocess + renodx_section(True) + w2 + inspect + hudfix +
                                                       nrcontrol + d3d12 + gpu + logsec, encoding="utf-8")
+(out / "dlssnr-amd-standalone.ini").write_text(network + preprocess + renodx_section(True, 1, 2) + w2 + inspect + hudfix +
+                                               nrcontrol + d3d12 + gpu + logsec, encoding="utf-8")
 (out / "dlssnr-amd-addon.ini").write_text(dlssnr + own + "\n" + network + preprocess + renodx_section(False, kAddonFastMethod) + inspect + hudfix_addon + gpu + logsec,
                                           encoding="utf-8")
-print("wrote", out / "dlssnr-amd-optiscaler.ini", out / "dlssnr-amd-optiscaler-renodx.ini", out / "dlssnr-amd-addon.ini")
+print("wrote", out / "dlssnr-amd-optiscaler.ini", out / "dlssnr-amd-optiscaler-renodx.ini", out / "dlssnr-amd-standalone.ini", out / "dlssnr-amd-addon.ini")

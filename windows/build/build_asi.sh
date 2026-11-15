@@ -87,6 +87,11 @@ done
 "$cxx" -std=c++17 -O2 -DNDEBUG -municode windows/src/pe/nr_present_probe.cpp -o "$out/nr_present_probe.exe" \
     -ldxgi -static -static-libgcc -static-libstdc++
 
+# dxgi-standalone.dll (standalone\dxgi.dll): loads System32\dxgi.dll + dlssnr-amd.asi for apps without OptiScaler.
+"$cxx" -std=c++20 -O2 -DNDEBUG -shared -o "$out/dxgi-standalone.dll" \
+    windows/src/pe/nr_dxgi_standalone.cpp windows/src/pe/nr_dxgi_standalone.def \
+    -lkernel32 -static -static-libgcc -static-libstdc++
+
 objs=("$out/asi_main.o" "$out/d3d12_passthrough.o" "$out/d3d12_passthrough_backend.o" "$out/d3d12_passthrough_net.o"
       "$out/renodx_d3d12.o" "$out/d3d12_passthrough_panel.o" "$out/asi_wilsjo2.o" "$out/asi_wilsjo2_vk.o"
       "$out/nr_wilsjo2.o" "$out/asi_hudcap.o" "$out/menu.o"
@@ -107,5 +112,5 @@ if [[ ${NR_TOOLS:-0} == 1 ]]; then
         "$out/vulkan_lazy_c.o" "${ldflags[@]}" -lgdi32 -luuid -lpsapi -lshlwapi -ldwmapi
 fi
 
-echo "built $out/dlssnr-amd.asi ($(stat -c %s "$out/dlssnr-amd.asi") bytes, $count Vulkan entry points at run time), $out/nr_present_probe.exe and $out/shaders/wilsjo2"
-echo "exports: $("$objdump" -p "$out/dlssnr-amd.asi" | grep -c 'InitializeASI')  imports: $("$objdump" -p "$out/dlssnr-amd.asi" | grep 'DLL Name' | awk '{print $3}' | tr '\n' ' ')"
+echo "built $out/dlssnr-amd.asi ($(stat -c %s "$out/dlssnr-amd.asi") bytes, $count Vulkan entry points at run time), $out/dxgi-standalone.dll, $out/nr_present_probe.exe and $out/shaders/wilsjo2"
+echo "exports: $("$objdump" -p "$out/dlssnr-amd.asi" | grep -c 'InitializeASI')  standalone: NR_Standalone_DXGI=$("$objdump" -p "$out/dxgi-standalone.dll" | grep -c 'NR_Standalone_DXGI') CreateDXGIFactory1=$("$objdump" -p "$out/dxgi-standalone.dll" | grep -c 'CreateDXGIFactory1')  imports: $("$objdump" -p "$out/dlssnr-amd.asi" | grep 'DLL Name' | awk '{print $3}' | tr '\n' ' ')"

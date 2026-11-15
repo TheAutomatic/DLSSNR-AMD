@@ -311,6 +311,12 @@ bool dlssnr_key(Config& c, int& passes, const std::string& key, const std::strin
         if (v == "vort") c.motion_vectors = 0;
         else if (v == "lumenite") c.motion_vectors = 1;
     }
+    else if (!layer && key == "directpresent") {
+        const std::string v = lower(value);
+        if (v == "off" || v == "false" || v == "0") c.direct_present = 0;
+        else if (v == "auto" || v == "1") c.direct_present = 1;
+        else if (v == "always" || v == "true" || v == "2") c.direct_present = 2;
+    }
     else if (key.rfind("pass", 0) == 0 && key.size() > 5 && std::isdigit(static_cast<unsigned char>(key[4]))) {
         // Pass<N><Field>, or the old pass<N>_<field>.
         size_t end = 4;
@@ -2311,8 +2317,11 @@ void Config::save(const std::string& path, bool whole) {
         "; Where the ReShade routes' motion vectors come from: vort (in this package) or lumenite (LumeniteFX Kernel by\n"
         "; Afzaal, installed from its author's GitHub with install.bat (LumeniteFX: y); when it is missing or cannot be used,\n"
         "; vort runs and dlssnr-amd.log says why)\n"
-        "MotionVectors=%s\n",
-        history, white_point, flag(k.noise_every_frame), motion_vectors == 1 ? "lumenite" : "vort");
+        "MotionVectors=%s\n"
+        "; Direct ReShade Present without DLSS5_Feed.fx: auto (default: run guide-less when DLSS5_Feed is not loaded), always (run at Present whenever DLSS5_Feed did not run this frame), or off\n"
+        "DirectPresent=%s\n",
+        history, white_point, flag(k.noise_every_frame), motion_vectors == 1 ? "lumenite" : "vort",
+        direct_present == 0 ? "off" : direct_present == 2 ? "always" : "auto");
     std::fputs("\n", f);
     write_network(f, network);
     write_preprocess(f, preprocess);

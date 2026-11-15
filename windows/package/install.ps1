@@ -1,7 +1,7 @@
-# DLSSNR-AMD Windows installer (run by install.bat)
+﻿# DLSSNR-AMD Windows installer (run by install.bat)
 #
 #   install.bat                      a window asks for the game's exe, then for the route
-#   install.bat <game exe or its folder> [optiscaler|reshade-feeder|reshade-feeder-dx9|reshade-feeder-vulkan|remove|logs]
+#   install.bat <game exe or its folder> [optiscaler|standalone|reshade-feeder|reshade-feeder-dx9|reshade-feeder-vulkan|remove|logs]
 #               [-Dll <nvngx_dlssnr.dll or its zip>] [-Model <network>] [-RenoDX on|off] [-Lumenite on|off]
 #
 # Unreal Engine games: the folder is <project>\Binaries\Win64 (the *-Shipping.exe), not the top folder with the launcher.
@@ -96,15 +96,17 @@ if (-not $Route) {
     Say "Game folder: $game"
     Say 'Choose a route:'
     Say '  1) optiscaler             the game has a DLSS, FSR or XeSS option (DX11 / DX12, OptiScaler)'
-    Say '  2) reshade-feeder         other DX10/11/12 games (ReShade)'
-    Say '  3) reshade-feeder-dx9     old DX9 games (ReShade)'
-    Say '  4) reshade-feeder-vulkan  Vulkan games (ReShade)'
-    Say '  5) Uninstall'
-    Say '  6) Collect logs           when something goes wrong; the zip goes to the desktop'
-    $pick = Read-Host '1-6'
+    Say '  2) standalone             any DX11 / DX12 app, video player, Magpie or capture viewer (no upscaler or ReShade)'
+    Say '  3) reshade-feeder         other DX10/11/12 games (ReShade)'
+    Say '  4) reshade-feeder-dx9     old DX9 games (ReShade)'
+    Say '  5) reshade-feeder-vulkan  Vulkan games (ReShade)'
+    Say '  6) Uninstall'
+    Say '  7) Collect logs           when something goes wrong; the zip goes to the desktop'
+    $pick = Read-Host '1-7'
     switch ($pick) {
-        '1' { $Route = 'optiscaler' } '2' { $Route = 'reshade-feeder' } '3' { $Route = 'reshade-feeder-dx9' }
-        '4' { $Route = 'reshade-feeder-vulkan' } '5' { $Route = 'remove' } '6' { $Route = 'logs' }
+        '1' { $Route = 'optiscaler' } '2' { $Route = 'standalone' } '3' { $Route = 'reshade-feeder' }
+        '4' { $Route = 'reshade-feeder-dx9' } '5' { $Route = 'reshade-feeder-vulkan' } '6' { $Route = 'remove' }
+        '7' { $Route = 'logs' }
         default { Fail 'Invalid choice.' }
     }
 }
@@ -112,7 +114,7 @@ if (-not $Route) {
 $renamed = @{ 'reshade' = 'reshade-feeder'; 'dx9' = 'reshade-feeder-dx9'; 'vulkan' = 'reshade-feeder-vulkan' }
 if ($renamed.ContainsKey($Route)) { Fail "Unknown route: $Route (this route is now called $($renamed[$Route]))" }
 if ($Route -eq 'optiscaler-renodx') { $Route = 'optiscaler'; if (-not $RenoDX) { $RenoDX = 'on' } }
-if ('optiscaler', 'reshade-feeder', 'reshade-feeder-dx9', 'reshade-feeder-vulkan', 'remove', 'logs' -notcontains $Route) {
+if ('optiscaler', 'standalone', 'reshade-feeder', 'reshade-feeder-dx9', 'reshade-feeder-vulkan', 'remove', 'logs' -notcontains $Route) {
     Fail "Unknown route: $Route"
 }
 
@@ -133,7 +135,12 @@ $haveExperimental = Test-Path -LiteralPath (Join-Path $here 'experimental\dlssnr
 $haveOptimized = Test-Path -LiteralPath (Join-Path $here 'optimized\dlssnr-optimized.delta') -PathType Leaf
 
 # ---- the processing before and after NR --------------------------------------------------------
-if ($Route -ne 'remove' -and $Route -ne 'logs' -and -not $RenoDX) {
+if ($Route -eq 'standalone') {
+    if ($RenoDX -eq 'off') {
+        Fail 'The standalone route runs guide-less RenoDX at Present (-RenoDX off is not supported; use reshade-feeder for wilsjo2).'
+    }
+    $RenoDX = 'on'
+} elseif ($Route -ne 'remove' -and $Route -ne 'logs' -and -not $RenoDX) {
     Say ''
     Say 'The processing before and after NR (the NR network itself is the same):'
     Say '  1) RenoDX style: processed the way RenoDX''s DLSS5 add-on does it (default)'
@@ -163,8 +170,8 @@ if ($Route -like 'reshade-feeder*' -and -not $Lumenite) {
 }
 if (-not $Lumenite) { $Lumenite = 'off' }
 if ('on', 'off' -notcontains $Lumenite) { Fail "Unknown LumeniteFX choice: $Lumenite (on or off)" }
-if ($Lumenite -eq 'on' -and $Route -eq 'optiscaler') {
-    Fail 'LumeniteFX is for the ReShade routes only (the OptiScaler route uses the game''s own motion vectors).'
+if ($Lumenite -eq 'on' -and ($Route -eq 'optiscaler' -or $Route -eq 'standalone')) {
+    Fail 'LumeniteFX is for the ReShade routes only.'
 }
 
 # ---- games under Program Files need administrator rights -------------------------------------
@@ -746,6 +753,14 @@ if ($Route -eq 'optiscaler') {
     }
     [System.IO.File]::WriteAllText($ini, ($lines -join $newline))
     foreach ($key in $wanted.Keys) { if (-not $seen.ContainsKey($key)) { Fail "OptiScaler.ini has no $key; this OptiScaler is not the one this package was made with." } }
+} elseif ($Route -eq 'standalone') {
+    # Any DX11 / DX12 app, player or capture viewer without OptiScaler or ReShade: our standalone dxgi.dll loads
+    # dlssnr-amd.asi beside it, NR runs guide-less RenoDX at DXGI Present, and NR Control's probe + licences go into dlssnr-amd\.
+    Put-File (Join-Path $here 'standalone\dxgi.dll') 'dxgi.dll'
+    Put-File (Join-Path $here 'standalone\dlssnr-amd.asi') 'dlssnr-amd.asi'
+    Copy-Item -LiteralPath (Join-Path $here 'standalone\nr_present_probe.exe') -Destination (Join-Path $game 'dlssnr-amd') -Force
+    Copy-Item -LiteralPath (Join-Path $here 'standalone\Inter-LICENSE.txt') -Destination (Join-Path $game 'dlssnr-amd') -Force
+    Copy-Item -LiteralPath (Join-Path $here 'standalone\DearImGui-LICENSE.txt') -Destination (Join-Path $game 'dlssnr-amd') -Force
 } elseif ($Route -eq 'reshade-feeder') {
     # DX10/11/12 games keep the system's own D3D; ReShade goes in as dxgi.dll.
     Put-ReShade $false
@@ -786,21 +801,22 @@ if ($lumeniteFx) {
 # again). Uninstall deletes it.
 if ($Route -eq 'optiscaler' -and $RenoDX -eq 'on') { $iniSrc = 'ini\dlssnr-amd-optiscaler-renodx.ini' }
 elseif ($Route -eq 'optiscaler') { $iniSrc = 'ini\dlssnr-amd-optiscaler.ini' }
+elseif ($Route -eq 'standalone') { $iniSrc = 'ini\dlssnr-amd-standalone.ini' }
 else { $iniSrc = 'ini\dlssnr-amd-addon.ini' }
 $iniDst = Join-Path $game 'dlssnr-amd.ini'
-# The RenoDX style ([RenoDX] Enabled = 1 on the ReShade routes; the OptiScaler route has a file of its own), the
+# The RenoDX style ([RenoDX] Enabled = 1 on the ReShade routes; the OptiScaler and standalone routes have files of their own), the
 # network a game starts with ([Network] Model).
 $lines = [System.IO.File]::ReadAllLines((Join-Path $here $iniSrc), [System.Text.Encoding]::UTF8)
 $section = ''; $done = @{}
 for ($i = 0; $i -lt $lines.Count; $i++) {
     if ($lines[$i] -match '^\[([^\]]+)\]') { $section = $Matches[1]; continue }
-    if ($section -eq 'RenoDX' -and $Route -ne 'optiscaler' -and $RenoDX -eq 'on' -and $lines[$i] -eq 'Enabled = 0') {
+    if ($section -eq 'RenoDX' -and ($Route -notin @('optiscaler', 'standalone')) -and $RenoDX -eq 'on' -and $lines[$i] -eq 'Enabled = 0') {
         $lines[$i] = 'Enabled = 1'; $done['renodx'] = 1
     } elseif ($section -eq 'Network' -and $lines[$i] -match '^Model = ') { $lines[$i] = "Model = $Model"; $done['model'] = 1 }
     elseif ($lumeniteFx -and $lines[$i] -ceq 'MotionVectors=vort') { $lines[$i] = 'MotionVectors=lumenite'; $done['lumenite'] = 1 }
 }
 if ($lumeniteFx -and -not $done['lumenite']) { Fail 'dlssnr-amd.ini: could not set MotionVectors=lumenite.' }
-if (-not $done['model'] -or ($Route -ne 'optiscaler' -and $RenoDX -eq 'on' -and -not $done['renodx'])) {
+if (-not $done['model'] -or (($Route -notin @('optiscaler', 'standalone')) -and $RenoDX -eq 'on' -and -not $done['renodx'])) {
     Fail 'The package''s dlssnr-amd.ini is not as expected; unpack the package again.'
 }
 [System.IO.File]::WriteAllText($iniDst, (($lines -join "`r`n") + "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
@@ -814,9 +830,9 @@ Say ''
 $style = if ($RenoDX -eq 'on') { 'RenoDX style' } else { 'wilsjo2 style' }
 Say "Installed the $Route route into: $game ($style)"
 Say "Networks installed: $(if ($haveSmall) { 'CC_SMALL_FP8, ' })$(if ($expModelFrom) { 'CC_SMALL_FP8_EXPERIMENTAL, ' })CC_SILVER_AARDWOLD$(if ($optModelFrom) { ', CC_SILVER_AARDWOLD_OPTIMIZED' + $(if (-not $int4ModelFrom) { ' (without its int4 layers)' }) }); games start with $Model."
-Say "Switch the network in game at any time: the drop-down in $(if ($Route -eq 'optiscaler') { 'NR Control (End)' } else { 'ReShade''s Add-ons page' }), or Ctrl+F11 to cycle; settings: [Network] in dlssnr-amd.ini."
+Say "Switch the network in game at any time: the drop-down in $(if ($Route -in @('optiscaler', 'standalone')) { 'NR Control (End)' } else { 'ReShade''s Add-ons page' }), or Ctrl+F11 to cycle; settings: [Network] in dlssnr-amd.ini."
 Say 'The network runs as machine code made in advance by the ACO compiler (ACO Mode). When your driver cannot take it,'
-Say "$(if ($Route -eq 'optiscaler') { 'NR Control' } else { 'ReShade''s Add-ons page' }) and dlssnr-amd.log say why; an RX 9000 then runs the network compiled by the AMD driver"
+Say "$(if ($Route -in @('optiscaler', 'standalone')) { 'NR Control' } else { 'ReShade''s Add-ons page' }) and dlssnr-amd.log say why; an RX 9000 then runs the network compiled by the AMD driver"
 Say '(without CC_SMALL_FP8_EXPERIMENTAL and CC_SILVER_AARDWOLD_OPTIMIZED); RX 7000 and Radeon 700M / 800M / 8000S graphics have no NR then.'
 if ($Route -eq 'optiscaler') {
     Say 'In game, turn on DLSS, FSR or XeSS in the game''s settings. End opens NR Control (DirectX 11 / 12 and Vulkan games: every'
@@ -824,6 +840,9 @@ if ($Route -eq 'optiscaler') {
     Say 'If NR Control keeps waiting for the game''s upscaler, set [Spoofing] Dxgi=false in OptiScaler.ini and try again.'
     Say 'If colours turn green or grainy after NR (007 First Light, for example), try [Preprocess] in dlssnr-amd.ini, or press Ctrl+F10 in the game.'
     Say 'F5 takes screenshots (the same frame without and with NR) into NR Screenshots in the game folder.'
+} elseif ($Route -eq 'standalone') {
+    Say 'In the program or game, NR runs automatically at DXGI Present (no DLSS, FSR, XeSS or ReShade needed).'
+    Say 'End opens NR Control (network, Passes, processing, Compare); F6 turns NR off/on; F5 saves screenshots into NR Screenshots.'
 } else {
     Say 'In the game, Home opens ReShade; the settings are on the Add-ons page, or edit dlssnr-amd.ini directly.'
     if ($lumeniteFx) {
@@ -839,5 +858,5 @@ if ($Route -eq 'optiscaler') {
     Say 'For stacking use Passes on the Add-ons page. F5 takes screenshots (the same frame without and with NR) into NR Screenshots in the game folder.'
 }
 Say 'The first time NR runs in a game the network has to compile; it takes effect after about a minute. This happens once for each game.'
-Say 'Uninstall: run install.bat again and choose 5.'
+Say 'Uninstall: run install.bat again and choose 6.'
 Finish 0

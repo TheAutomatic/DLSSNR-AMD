@@ -10,6 +10,7 @@
 #   experimental/   CC_SMALL_FP8_EXPERIMENTAL's weights as a difference from CC_SMALL_FP8's (install.ps1 applies it)
 #   optimized/      CC_SILVER_AARDWOLD_OPTIMIZED's weights as a difference from CC_SILVER_AARDWOLD's (the same)
 #   optiscaler/     OptiScaler (the official nightly, unmodified) and our NR plugin for it
+#   standalone/     dxgi.dll + dlssnr-amd.asi for any DX11/12 app without OptiScaler or ReShade
 #   reshade/        ReShade + our add-on: dxgi.dll in DX10/11/12 games, a Vulkan layer otherwise
 #   dxvk/           D3D9 -> Vulkan, for the DX9 route only
 #   vulkan/         the Khronos loader the Vulkan-layer routes put beside the game
@@ -87,7 +88,7 @@ common+=(-DNR_RESHADE_ROUTE=1)
 "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_config.cpp -o "$out/config.o"
 "$cxx" "${common[@]}" -c windows/src/pe/nr_screenshot.cpp -o "$out/screenshot.o"
 # ReShade's headers include <Windows.h>; the case shim maps that onto mingw's.
-"$cxx" "${common[@]}" -Iwindows/src/pe/reshade_compat -I"$reshade_inc" -I"$minhook/include" \
+"$cxx" "${common[@]}" -idirafter windows/src/pe/reshade_compat -I"$reshade_inc" -I"$minhook/include" \
     -Iartifacts/ref/DLSS5-Feeder/external/imgui -Iwindows/src/ui -c windows/src/pe/nr_reshade_addon.cpp -o "$out/reshade_addon.o"
 for unit in hook buffer trampoline; do
     "$cc" -O2 -I"$minhook/include" -I"$minhook/src" -c "$minhook/src/$unit.c" -o "$out/mh_$unit.o"
@@ -308,6 +309,15 @@ cp -- "${NR_MENU_FONT_LICENSE:-toolchain/fonts/inter-4.1/LICENSE.txt}" "$op/asi/
 cp -- "${NR_IMGUI_ROOT:-toolchain/imgui-nr}/LICENSE.txt" "$op/asi/DearImGui-LICENSE.txt"
 cmp -s <(cd artifacts/windows/asi/shaders/wilsjo2 && sha256sum -- *.spv) <(cd "$pkg/dlssnr-amd/shaders/wilsjo2" && sha256sum -- *.spv) ||
     { echo "the plugin's wilsjo2 shaders are not dlssnr-amd/shaders/wilsjo2's" >&2; exit 1; }
+
+# standalone/: DX11 / DX12 apps without OptiScaler or ReShade (video players, Magpie, capture viewers, older games):
+# dxgi-standalone.dll as dxgi.dll + dlssnr-amd.asi beside the exe, nr_present_probe.exe and licences in dlssnr-amd\.
+st="$pkg/standalone"
+mkdir -p -- "$st"
+cp -- artifacts/windows/asi/dxgi-standalone.dll "$st/dxgi.dll"
+cp -- artifacts/windows/asi/dlssnr-amd.asi artifacts/windows/asi/nr_present_probe.exe "$st/"
+cp -- "${NR_MENU_FONT_LICENSE:-toolchain/fonts/inter-4.1/LICENSE.txt}" "$st/Inter-LICENSE.txt"
+cp -- "${NR_IMGUI_ROOT:-toolchain/imgui-nr}/LICENSE.txt" "$st/DearImGui-LICENSE.txt"
 
 # experimental/: what install.ps1 makes CC_SMALL_FP8_EXPERIMENTAL's weights with - the difference of its fitted weights
 # from the small model's (linux/data/experimental: each changed entry XOR the small model's, so it holds none of NVIDIA's

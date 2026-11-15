@@ -105,7 +105,8 @@ using nr::dlssnr::Feature;
 using nr::dlssnr::Rect;
 
 HMODULE g_self = nullptr;
-HMODULE g_opti = nullptr;   // OptiScaler: the module that called InitializeASI
+HMODULE g_opti = nullptr;   // OptiScaler: the module that called InitializeASI (or standalone dxgi.dll)
+bool g_standalone = false;  // true when loaded by our standalone dxgi.dll (NR_Standalone_DXGI), no OptiScaler/upscaler host
 
 // The DLSS flags (NVSDK_NGX_DLSS_Feature_Flags) this module reads.
 constexpr uint32_t kFlagIsHdr = 1u << 0, kFlagMvLowRes = 1u << 1, kFlagDepthInverted = 1u << 3,
@@ -566,6 +567,12 @@ std::shared_ptr<const Chain> chain_now() {
     }();
     static std::shared_ptr<const Chain> current;
     if (!file.poll(std::string(nr::pe::module_folder()) + "\\dlssnr-amd.ini", config) && current) return current;
+    if (g_standalone) {
+        for (nr::pe::LayerConfig& lc : config.layers) {
+            lc.placement = nr::pe::Placement::kPresent;
+            if (lc.processing == nr::pe::Processing::kRenoDX) lc.renodx.values.present_guides = 2u;
+        }
+    }
     auto next = std::make_shared<Chain>();
     Chain& chain = *next;
     chain.version = current ? current->version : 0;
@@ -3650,14 +3657,19 @@ void adopt_swapchain(IUnknown* device, IDXGISwapChain* sc) {
             if (slot) slot->Release();
             slot = d11;
         }
-        bool hooked = hook_slot(sc, 8, kDetourPresent);
-        IDXGISwapChain1* sc1 = nullptr;
-        if (SUCCEEDED(sc->QueryInterface(IID_PPV_ARGS(&sc1))) && sc1) {
-            hooked = hook_slot(sc1, 22, kDetourPresent1) && hooked;
-            sc1->Release();
+        bool hooked = false;
+        if (!g_standalone) {
+            hooked = hook_slot(sc, 8, kDetourPresent);
+            IDXGISwapChain1* sc1 = nullptr;
+            if (SUCCEEDED(sc->QueryInterface(IID_PPV_ARGS(&sc1))) && sc1) {
+                hooked = hook_slot(sc1, 22, kDetourPresent1) && hooked;
+                sc1->Release();
+            }
         }
         log("[nr] Present layers: the game's D3D11 swap chain %p found%s", static_cast<void*>(sc),
-            hooked ? "; they run at its Present, before OptiScaler's" : ", but its Present is not hooked (above)");
+            g_standalone ? "; they run at DXGI Present"
+            : hooked     ? "; they run at its Present, before OptiScaler's"
+                         : ", but its Present is not hooked (above)");
         return;
     }
     {
@@ -3692,13 +3704,19 @@ void adopt_swapchain(IUnknown* device, IDXGISwapChain* sc) {
                      "under it"
                    : "is not frame generation's: the layers may also run at the system's Present again");
     }
-    bool hooked = hook_slot(sc, 8, kDetourPresent);
-    IDXGISwapChain1* sc1 = nullptr;
-    if (SUCCEEDED(sc->QueryInterface(IID_PPV_ARGS(&sc1))) && sc1) {
-        hooked = hook_slot(sc1, 22, kDetourPresent1) && hooked;
-        sc1->Release();
+    bool hooked = false;
+    if (!g_standalone) {
+        hooked = hook_slot(sc, 8, kDetourPresent);
+        IDXGISwapChain1* sc1 = nullptr;
+        if (SUCCEEDED(sc->QueryInterface(IID_PPV_ARGS(&sc1))) && sc1) {
+            hooked = hook_slot(sc1, 22, kDetourPresent1) && hooked;
+            sc1->Release();
+        }
     }
-    if (hooked)
+    if (g_standalone)
+        log("[nr] Present layers: the game's swap chain %p (presenting on queue %p) found via standalone DXGI; they run at "
+            "DXGI Present", static_cast<void*>(sc), static_cast<void*>(queue));
+    else if (hooked)
         log("[nr] Present layers: the game's swap chain %p (presenting on queue %p) found; they run at its Present, "
             "before OptiScaler's", static_cast<void*>(sc), static_cast<void*>(queue));
     else
@@ -3743,7 +3761,7 @@ HRESULT WINAPI hk_create_factory2(UINT flags, REFIID riid, void** out) {
 
 // From InitializeASI: the factory creation of the dxgi.dll the game loads (OptiScaler itself when it is dxgi.dll).
 void hook_game_dxgi() {
-    HMODULE dxgi = GetModuleHandleW(L"dxgi.dll");
+    HMODULE dxgi = g_standalone ? g_opti : GetModuleHandleW(L"dxgi.dll");
     if (!dxgi) {
         log("[nr] Present layers: no dxgi.dll loaded with OptiScaler; they run under OptiScaler's Present (after its "
             "frame generation)");
@@ -8843,6 +8861,7 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_d11_evaluate(ID3D11DeviceContext* ctx, const NV
 }
 
 bool hook(const char* name, void* detour, void** real, bool required) {
+    if (g_standalone) return false;
     void* fn = reinterpret_cast<void*>(GetProcAddress(g_opti, name));
     if (!fn) {
         if (required) log("[nr] OptiScaler exports no %s", name);
@@ -8913,6 +8932,7 @@ extern "C" __declspec(dllexport) void InitializeASI() {
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                        reinterpret_cast<LPCWSTR>(__builtin_return_address(0)), &g_opti);
     if (!g_opti) g_opti = GetModuleHandleW(nullptr);
+    g_standalone = GetProcAddress(g_opti, "NR_Standalone_DXGI") != nullptr;
     g_opti_range = range_of(g_opti);
     g_self_range = range_of(g_self);
     // frame generation's HUD-less hand-overs: the game's own only (not OptiScaler's own frame generation's calls)
@@ -8997,13 +9017,22 @@ extern "C" __declspec(dllexport) void InitializeASI() {
          reinterpret_cast<void**>(&real_init_project_id), false);
     hook("NVSDK_NGX_D3D12_Init_with_ProjectID", reinterpret_cast<void*>(&hk_init_with_project_id),
          reinterpret_cast<void**>(&real_init_with_project_id), false);
+    if (g_standalone) {
+        nr::pe::menu::on_d3d11_present(&on_present11);
+        nr::pe::menu::on_d3d12_present(&on_present);
+        nr::pe::menu::on_d3d12_shown(&on_shown);
+        nr::pe::menu::on_execute(&on_execute);
+        nr::pe::menu::install();
+    }
     hook_device_creation();
     hook_present_beat();
     hook_game_dxgi();
     hook_fg_libraries();
     nr::asi::hudcap::d3d12_module(GetModuleHandleW(L"d3d12.dll"));
-    log("[nr] %s (Unreal Engine by the executable: %s)", ok ? "NR runs in OptiScaler's D3D12 evaluate"
-                                                             : "OptiScaler's D3D12 evaluate could not be hooked: NR does not run",
+    log("[nr] %s (Unreal Engine by the executable: %s)",
+        g_standalone ? "NR runs standalone on DXGI Present (no OptiScaler/upscaler host)"
+        : ok         ? "NR runs in OptiScaler's D3D12 evaluate"
+                     : "OptiScaler's D3D12 evaluate could not be hooked: NR does not run",
         g_unreal_by_exe ? "yes" : "no");
 }
 
