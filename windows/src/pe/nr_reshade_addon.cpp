@@ -4276,7 +4276,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         chain.hud.mode = 0;
         if (!reshade::register_addon(module)) return FALSE;
         previous_filter = SetUnhandledExceptionFilter(&crash_filter);
-        nr::pe::install_crash_watch();
+        nr::pe::install_crash_watch(reshade::internal::get_reshade_module_handle());
         log("[nr] ---------------------------------------------------------------");
         log("[nr] ReShade add-on loaded from %s (build %s)", nr::pe::module_folder(), NR_BUILD_STAMP);
         nr::pe::watchdog::start();

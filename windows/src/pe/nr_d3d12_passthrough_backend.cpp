@@ -862,6 +862,7 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
         const bool touched = e.stage->cmd_touched();
         release_renodx_feature(f.feature);
         if (touched) {
+            note_backend_produced(false);
             note_backend("dropped partial RenoDX D3D12 frame (bridge skipped)", true);
             return true;
         }
@@ -910,19 +911,19 @@ bool wilsjo2_ready(ID3D12Device* device, ID3D12GraphicsCommandList* cmd, uint32_
     std::string& y = why ? *why : w_;
     if (!enabled()) { y = "the D3D12 passthrough is off (dlssnr-amd.ini [D3D12Passthrough] Enabled = 0)"; return false; }
     if (!device || !cmd) { y = "no device or command list"; return false; }
-    // A list state not known yet (the hooks came after its Reset) and a canary not run / still running are waits,
-    // not the bridge; permanent hook or canary failure takes the bridge.
-    bool wait_reset = false;
-    if (!nr::pe::d3d12_direct::ready(device, cmd, &y, &wait_reset)) {
-        if (building && wait_reset) *building = true;
-        y = "the command list's state is not known (" + y + ")";
-        return false;
-    }
+    // Canary runs before installing Direct state hooks, so unsupported adapters or failed canaries never leave hooks behind.
     on_device(device);   // the canary, once
     const Canary c = canary();
     if (c != Canary::kHit) {
         if (building && (c == Canary::kNotRun || c == Canary::kRunning)) *building = true;
         y = std::string("canary ") + canary_name(c);
+        return false;
+    }
+    // A list state not known yet (the hooks came after its Reset) waits rather than falling back to the bridge.
+    bool wait_reset = false;
+    if (!nr::pe::d3d12_direct::ready(device, cmd, &y, &wait_reset)) {
+        if (building && wait_reset) *building = true;
+        y = "the command list's state is not known (" + y + ")";
         return false;
     }
     if (!ensure_backend(device, &y)) return false;
@@ -939,13 +940,13 @@ bool copy_depth_r32(ID3D12Device* device, ID3D12GraphicsCommandList* cmd, ID3D12
                     ID3D12Resource* dst, std::string* why) {
     if (!enabled()) { if (why) *why = "the D3D12 passthrough is off"; return false; }
     if (!device || !cmd || !src || !dst) { if (why) *why = "depth copy: missing device, list, or texture"; return false; }
-    if (!nr::pe::d3d12_direct::ready(device, cmd, why)) return false;
     on_device(device);
     const Canary c = canary();
     if (c != Canary::kHit) {
         if (why) *why = std::string("canary ") + canary_name(c);
         return false;
     }
+    if (!nr::pe::d3d12_direct::ready(device, cmd, why)) return false;
     if (!ensure_backend(device, why)) return false;
     if (!g.outer_rs || !g.k_copy_depth_r32.pso) {
         if (why) *why = "copy_depth_r32 outer kernel is not built";
@@ -1009,16 +1010,16 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
         note_backend(("not run yet: " + y + " (frames pass through with no NR; the bridge is not used)").c_str(), false, true);
         return false;
     };
-    bool wait_reset = false;
-    if (!nr::pe::d3d12_direct::ready(f.device, f.cmd, &why, &wait_reset)) {
-        if (f.waiting && wait_reset) return wait("the command list's state is not known (" + why + ")");
-        return fallback("the command list's state is not known (" + why + ")");
-    }
     on_device(f.device);   // the canary, once
     const Canary c = canary();
     if (c != Canary::kHit) {
         if (f.waiting && (c == Canary::kNotRun || c == Canary::kRunning)) return wait(std::string("canary ") + canary_name(c));
         return fallback(std::string("canary ") + canary_name(c));
+    }
+    bool wait_reset = false;
+    if (!nr::pe::d3d12_direct::ready(f.device, f.cmd, &why, &wait_reset)) {
+        if (f.waiting && wait_reset) return wait("the command list's state is not known (" + why + ")");
+        return fallback("the command list's state is not known (" + why + ")");
     }
     if (!ensure_backend(f.device, &why)) return fallback(why);
     g.network->history_f16(f.history_f16 != 0);   // [Network] History Precision, live

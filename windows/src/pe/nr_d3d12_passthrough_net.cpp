@@ -843,17 +843,21 @@ public:
         // Controls::noise_every_frame, then a separate per-feature counter across no-MV frames.
         bool gate = false;
         uint32_t pre_seed = 0;
+        static const bool diag_seed0 = [] {
+            const char* e = std::getenv("NR_DIAG_SEED0");
+            return e && e[0] && e[0] != '0';
+        }();
         if (temporal_.have_motion) {
             const bool domain_changed = fs->latch && fs->domain != controls_.reversible;
             gate = fs->latch && !temporal_.reset && !domain_changed;
             if (!fs->latch || temporal_.reset || domain_changed) fs->seed = 0;
             fs->domain = controls_.reversible;
             pre_seed = fs->seed++;
-            if (controls_.seed_fixed) pre_seed = 0;
+            if (controls_.seed_fixed || diag_seed0) pre_seed = 0;
         } else {
             uint32_t& seed = temporal_.feature ? plain_seeds_[temporal_.feature] : plain_seed_;
             if (temporal_.reset) seed = 0;
-            if (controls_.noise_every_frame && !controls_.seed_fixed) pre_seed = seed++;
+            if (controls_.noise_every_frame && !controls_.seed_fixed && !diag_seed0) pre_seed = seed++;
             else seed = 0;
         }
 

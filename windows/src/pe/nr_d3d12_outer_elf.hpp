@@ -493,10 +493,12 @@ private:
 
     // Confirm CPU-only SRDs match SHADER_VISIBLE SRDs bit-for-bit before trusting them for GPU execution.
     bool verify_srd_layout(std::string* why) const {
+#ifdef NR_TOOLS_BUILD
         if (const char* f = std::getenv("NR_TEST_FAIL_SRD_PROBE"); f && f[0] == '1') {
             if (why) *why = "forced SRD probe failure (NR_TEST_FAIL_SRD_PROBE=1)";
             return false;
         }
+#endif
         D3D12_DESCRIPTOR_HEAP_DESC hd{};
         hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         hd.NumDescriptors = 1;

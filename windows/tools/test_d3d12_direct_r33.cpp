@@ -436,9 +436,43 @@ int run_sub_no_canary_hooks() {
         D3D12CreateDevice(warp, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&warp_dev));
     }
     if (warp_dev) {
-        nr::pe::d3d12_passthrough::on_device(warp_dev);
-        for (int i = 0; i < 100 && nr::pe::d3d12_passthrough::canary() == nr::pe::d3d12_passthrough::Canary::kRunning; ++i)
-            Sleep(20);
+        ID3D12CommandAllocator* w_alloc = nullptr;
+        ID3D12GraphicsCommandList* w_cl = nullptr;
+        ID3D12Resource* w_in = make_tex2d(warp_dev, 16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, true,
+                                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        ID3D12Resource* w_out = make_tex2d(warp_dev, 16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, true,
+                                           D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (SUCCEEDED(warp_dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&w_alloc))) &&
+            SUCCEEDED(warp_dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, w_alloc, nullptr,
+                                                  IID_PPV_ARGS(&w_cl)))) {
+            std::string w_why;
+            bool w_build = false;
+            nr::pe::d3d12_passthrough::wilsjo2_ready(warp_dev, w_cl, 16, 16, &w_why, &w_build);
+            if (nr::pe::d3d12_direct::hooks_installed()) {
+                std::fprintf(stderr, "FAIL: hooks installed by wilsjo2_ready before canary settled\n");
+                return 1;
+            }
+            for (int i = 0; i < 100 && nr::pe::d3d12_passthrough::canary() == nr::pe::d3d12_passthrough::Canary::kRunning; ++i)
+                Sleep(20);
+            int w_waiting = 0;
+            nr::dlssnr::D3d12BackendFrame w_bf{};
+            w_bf.device = warp_dev;
+            w_bf.cmd = w_cl;
+            w_bf.color = w_in;
+            w_bf.color_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            w_bf.output = w_out;
+            w_bf.output_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            w_bf.width = 16;
+            w_bf.height = 16;
+            w_bf.waiting = &w_waiting;
+            nr::pe::d3d12_passthrough::evaluate_backend(w_bf);
+            nr::pe::d3d12_passthrough::wilsjo2_ready(warp_dev, w_cl, 16, 16, &w_why, &w_build);
+            w_cl->Close();
+            w_cl->Release();
+            w_alloc->Release();
+        }
+        if (w_out) w_out->Release();
+        if (w_in) w_in->Release();
         if (nr::pe::d3d12_direct::hooks_installed()) {
             std::fprintf(stderr, "FAIL: hooks installed on non-RDNA3/4 WARP adapter after failed canary\n");
             return 1;
@@ -1448,7 +1482,8 @@ int main(int argc, char** argv) {
         const nr::arch::Identity id3 = nr::arch::identify(desc3.AdapterLuid, "dxgi", desc3.VendorId, desc3.DeviceId);
         std::printf("[INFO] Case C candidate: %ls (DeviceId=0x%04x, arch=%s)\n",
                     desc3.Description, static_cast<unsigned>(desc3.DeviceId), nr::arch::name(id3.arch));
-        if (id3.arch == nr::arch::GpuArch::rdna3) saw_rdna3_hw = true;
+        if (id3.arch != nr::arch::GpuArch::rdna3) continue;
+        saw_rdna3_hw = true;
         ID3D12Device* dev3 = nullptr;
         if (FAILED(D3D12CreateDevice(a3, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&dev3))) || !dev3) continue;
         D3D12_COMMAND_QUEUE_DESC qd3{D3D12_COMMAND_LIST_TYPE_DIRECT};
@@ -1485,7 +1520,11 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "FAIL: Case C RDNA3 hardware adapter was enumerated but hw_dispatch == 0\n");
         return 1;
     }
-    std::printf("[PASS] Case C: d3dcompiler_47.dll=nullptr, RDNA3 archive verified (hw_dispatch=%d)\n", rdna3_hw);
+    std::printf("[PASS] Case C (archive): d3dcompiler_47.dll=nullptr, RDNA3 NRD12OUT archive verified\n");
+    if (rdna3_hw)
+        std::printf("[PASS] Case C (RDNA3 hw): Secondary RDNA3 hardware dispatch verified\n");
+    else
+        std::printf("[SKIP] Case C (RDNA3 hw): No secondary RDNA3 hardware adapter present\n");
 
     // ---- Case D: ReShade-style command list vtable wrapper safety ----
     {
@@ -1625,14 +1664,15 @@ int main(int argc, char** argv) {
             wait_gpu();
             return res;
         };
-        SetEnvironmentVariableA("NR_STAGE_FAIL_AT", nullptr);
+        using RenoStage = nr::pe::d3d12_passthrough::renodx12::Stage;
+        RenoStage::set_test_fail_dispatch_at(0);
         if (!run_e_eval()) {
             std::fprintf(stderr, "FAIL: Case E evaluate_backend warmup frame returned false\n");
             return 1;
         }
-        SetEnvironmentVariableA("NR_STAGE_FAIL_AT", "1");
+        RenoStage::set_test_fail_dispatch_at(1);
         const bool pre_res = run_e_eval();
-        SetEnvironmentVariableA("NR_STAGE_FAIL_AT", nullptr);
+        RenoStage::set_test_fail_dispatch_at(0);
         if (pre_res) {
             std::fprintf(stderr, "FAIL: Case E pre-recording failure unexpectedly returned true\n");
             return 1;
@@ -1641,15 +1681,17 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "FAIL: Case E evaluate_backend re-prime after pre-recording failure returned false\n");
             return 1;
         }
-        SetEnvironmentVariableA("NR_STAGE_FAIL_AT", "2");
+        RenoStage::set_test_fail_dispatch_at(2);
         const bool post_res = run_e_eval();
-        SetEnvironmentVariableA("NR_STAGE_FAIL_AT", nullptr);
+        const bool post_produced = nr::pe::d3d12_passthrough::backend_produced();
+        RenoStage::set_test_fail_dispatch_at(0);
         const std::string post_line = nr::pe::d3d12_passthrough::status().backend;
-        if (!post_res || post_line.find("dropped partial RenoDX D3D12 frame") == std::string::npos) {
-            std::fprintf(stderr, "FAIL: Case E post-dispatch failure post_res=%d line=%s\n", post_res, post_line.c_str());
+        if (!post_res || post_produced || post_line.find("dropped partial RenoDX D3D12 frame") == std::string::npos) {
+            std::fprintf(stderr, "FAIL: Case E post-dispatch failure post_res=%d produced=%d line=%s\n",
+                         post_res, post_produced ? 1 : 0, post_line.c_str());
             return 1;
         }
-        if (!run_e_eval()) {
+        if (!run_e_eval() || !nr::pe::d3d12_passthrough::backend_produced()) {
             std::fprintf(stderr, "FAIL: Case E evaluate_backend recovery frame failed\n");
             return 1;
         }
@@ -1703,15 +1745,15 @@ int main(int argc, char** argv) {
         const bool a2_sealed_after_fa2 = t_a2 && t_a2->sealed;
         fc->Reset(fa2, nullptr);
 
-        // Real Queue::ExecuteCommandLists Signal failure via NR_TEST_FAIL_QUEUE_SIGNAL=1
+        // Real Queue::ExecuteCommandLists Signal failure via test hook
         const nr::gpu::Ticket t_sig = nr::pe::d3d12_direct::book(fc);
         fc->Close();
-        SetEnvironmentVariableA("NR_TEST_FAIL_QUEUE_SIGNAL", "1");
+        nr::pe::d3d12_direct::set_test_fail_queue_signal(true);
         {
             ID3D12CommandList* ls[] = {fc};
             queue->ExecuteCommandLists(1, ls);
         }
-        SetEnvironmentVariableA("NR_TEST_FAIL_QUEUE_SIGNAL", nullptr);
+        nr::pe::d3d12_direct::set_test_fail_queue_signal(false);
         fc->Reset(fa2, nullptr);
         wait_gpu();
         const bool sig_unk_ok = t_sig && t_sig->unknown_submit && !t_sig->strict_ready() && !nr::pe::d3d12_direct::completed(t_sig);
@@ -1769,8 +1811,15 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (FakeHook::remove_raw(reinterpret_cast<void*>(&fake_mh_target), &fake_mh_detour, &g_fake_real) != MH_OK ||
-            g_fake_real != nullptr || fake_mh_target(&dummy) != 1) {
+            fake_mh_target(&dummy) != 1 || g_fake_real == nullptr || g_fake_real(&dummy) != 1) {
             std::fprintf(stderr, "FAIL: Case G MethodHook remove_raw cleanup failed\n");
+            return 1;
+        }
+        if (FakeHook::install_raw(reinterpret_cast<void*>(&fake_mh_target), &fake_mh_detour, &g_fake_real) != MH_OK ||
+            fake_mh_target(&dummy) != 2 ||
+            FakeHook::remove_raw(reinterpret_cast<void*>(&fake_mh_target), &fake_mh_detour, &g_fake_real) != MH_OK ||
+            fake_mh_target(&dummy) != 1) {
+            std::fprintf(stderr, "FAIL: Case G MethodHook disabled-slot re-install failed\n");
             return 1;
         }
 
@@ -1909,6 +1958,10 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "FAIL: Case F2 split::cut: %s\n", why.c_str());
             return 1;
         }
+        if (nr::pe::d3d12_direct::ready(device, cut_cl, &why)) {
+            std::fprintf(stderr, "FAIL: Case F2 d3d12_direct::ready succeeded on actively cut command list\n");
+            return 1;
+        }
         cut_cl->Close();
         dir_cl->Close();
         {
@@ -1931,6 +1984,27 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "FAIL: Case F2 mixed batch did not complete after fence signaled (cut=%d dir=%d)\n",
                          nr::pe::d3d12_direct::completed(t_cut), nr::pe::d3d12_direct::completed(t_dir));
             return 1;
+        }
+        if (!nr::pe::d3d12_direct::ready(device, dir_cl, &why)) {
+            std::fprintf(stderr, "FAIL: Case F2 d3d12_direct::ready rejected split-patched command list: %s\n", why.c_str());
+            return 1;
+        }
+        {
+            int w_f2 = 0;
+            nr::dlssnr::D3d12BackendFrame f_f2 = fill_plain_frame(&w_f2);
+            f_f2.cmd = dir_cl;
+            const bool eval_f2 = nr::pe::d3d12_passthrough::evaluate_backend(f_f2);
+            dir_cl->Close();
+            ID3D12CommandList* ls_f2[] = {dir_cl};
+            queue->ExecuteCommandLists(1, ls_f2);
+            wait_gpu();
+            ma2_b->Reset();
+            dir_cl->Reset(ma2_b, nullptr);
+            if (!eval_f2 || !nr::pe::d3d12_passthrough::backend_produced()) {
+                std::fprintf(stderr, "FAIL: Case F2 Direct->Bridge->Direct evaluate_backend failed (eval=%d produced=%d)\n",
+                             eval_f2, nr::pe::d3d12_passthrough::backend_produced() ? 1 : 0);
+                return 1;
+            }
         }
 
         // Repeat submission of held cut_cl without Reset

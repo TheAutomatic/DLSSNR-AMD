@@ -6,6 +6,7 @@ import json
 import pathlib
 import struct
 import sys
+import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 MANIFEST = ROOT / 'windows' / 'data' / 'aco' / 'd3d12_outer.manifest.json'
@@ -18,11 +19,13 @@ INPUT_DIRS = (
     'windows/shaders/renodx-prep',
     'windows/shaders/renodx-fast',
     'windows/shaders/wilsjo2',
+    'windows/shaders/rdna4/include',
     'windows/shaders/passes/include',
     'windows/shaders/hudfix',
 )
 INPUT_FILES = (
     'windows/build/build_d3d12_outer_aco.py',
+    'windows/build/outer_aco_capture.cpp',
 )
 GFX11_MACHS = {0x41, 0x43, 0x44, 0x46, 0x47, 0x4A, 0x55, 0x58}
 
@@ -56,7 +59,8 @@ def collect_inputs() -> dict[str, str]:
     return dict(sorted(out.items()))
 
 
-def validate_archive(label: str, path: pathlib.Path, expect_rdna3: bool) -> dict[str, object]:
+def validate_archive(label: str, path: pathlib.Path, expect_rdna3: bool,
+                     spv_hashes_out: dict[str, int] | None = None) -> dict[str, object]:
     if not path.is_file():
         raise FileNotFoundError(f'missing outer ACO archive ({label}): {path.relative_to(ROOT)}')
     raw = path.read_bytes()
@@ -116,7 +120,9 @@ def validate_archive(label: str, path: pathlib.Path, expect_rdna3: bool) -> dict
         pos += nrp_len
         if rec[:8] not in (b'NRPAL001', b'NRPAL002'):
             raise ValueError(f'{label}: invalid NRP magic in {name}')
-        code_hash = struct.unpack_from('<Q', rec, 16)[0]
+        spv_hash, code_hash = struct.unpack_from('<QQ', rec, 8)
+        if spv_hashes_out is not None:
+            spv_hashes_out[name] = spv_hash
         ninl, csz = struct.unpack_from('<II', rec, 68)
         if 96 + 8 * ninl + csz != nrp_len:
             raise ValueError(f'{label}: NRP size mismatch in {name}')
@@ -145,9 +151,48 @@ def build_manifest() -> dict[str, object]:
     }
 
 
+def verify_spv_hashes() -> None:
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    import build_d3d12_outer_aco as builder
+
+    for tool in (builder.SLANGC, builder.GLSLANG):
+        if not tool.is_file():
+            raise FileNotFoundError(f'missing shader compiler for --verify-spv: {tool}')
+
+    with tempfile.TemporaryDirectory(prefix='check_outer_spv_') as td:
+        tmp = pathlib.Path(td)
+        renodx_glsl, il_list, w2_list = builder.build_glsl_sets(tmp)
+        for label, path, expect_rdna3 in ARCHIVES:
+            align = 256 if expect_rdna3 else 128
+            sub = tmp / label
+            sub.mkdir()
+            jobs = (builder.build_backend_hlsl(sub, align) +
+                    builder.build_renodx_hlsl(sub, align) +
+                    renodx_glsl +
+                    builder.build_renodx_aux_hlsl(sub, align))
+            compiled = {k: builder.fnv64(spv.read_bytes()) for k, spv, _ in jobs}
+            for k, spv, _ in il_list:
+                compiled[k] = builder.fnv64(spv.read_bytes())
+            for k, spv, _ in w2_list:
+                compiled[k] = builder.fnv64(spv.read_bytes())
+            recorded: dict[str, int] = {}
+            validate_archive(label, path, expect_rdna3, recorded)
+            if set(compiled) != set(recorded):
+                raise ValueError(f'{label}: compiled kernel set differs from archive')
+            diffs = [k for k in sorted(recorded) if compiled[k] != recorded[k]]
+            if diffs:
+                raise ValueError(
+                    f'{label}: {len(diffs)} SPIR-V hash mismatch(es) (first: {diffs[0]} '
+                    f'compiled=0x{compiled[diffs[0]]:016x} vs nra=0x{recorded[diffs[0]]:016x})'
+                )
+
+
 def main(argv: list[str]) -> int:
     write = '--write-manifest' in argv
+    verify_spv = '--verify-spv' in argv or write
     current = build_manifest()
+    if verify_spv:
+        verify_spv_hashes()
     if write:
         MANIFEST.parent.mkdir(parents=True, exist_ok=True)
         MANIFEST.write_text(json.dumps(current, indent=2, sort_keys=True) + '\n', encoding='utf-8')

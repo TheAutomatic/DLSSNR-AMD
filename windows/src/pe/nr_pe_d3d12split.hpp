@@ -100,4 +100,10 @@ bool cut(ID3D12GraphicsCommandList* list, Job job, const std::shared_ptr<Snapsho
 // thread that has just executed its frame on that queue.
 ID3D12CommandQueue* last_direct_queue();
 
+// Read-only introspection for Direct passthrough coexistence (both orders).
+bool is_split_list(ID3D12GraphicsCommandList* list, bool* active_cut = nullptr);
+void* orig_list_method(void** vt, unsigned slot);
+void* orig_device_create_cl(void** dvt);
+void* orig_queue_execute(void** qvt);
+
 }  // namespace nr::pe::split

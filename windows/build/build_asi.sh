@@ -113,8 +113,20 @@ if [[ ${NR_TOOLS:-0} == 1 ]]; then
     "$cxx" "${common[@]}" -c windows/tools/test_d3d12_offline.cpp -o "$out/test_d3d12_offline.o"
     "$cxx" -o "$out/test_d3d12_offline.exe" "$out/test_d3d12_offline.o" "${objs[@]:1}" "$out/vulkan_lazy_s.o" \
         "$out/vulkan_lazy_c.o" "${ldflags[@]}" -lgdi32 -luuid -lpsapi -lshlwapi -ldwmapi
-    "$cxx" "${common[@]}" -I"$minhook/include" -c windows/tools/test_d3d12_direct_r33.cpp -o "$out/test_d3d12_direct_r33.o"
-    "$cxx" -o "$out/test_d3d12_direct_r33.exe" "$out/test_d3d12_direct_r33.o" "${objs[@]:1}" "$out/vulkan_lazy_s.o" \
+    "$cxx" "${common[@]}" -DNR_TOOLS_BUILD=1 -I"$minhook/include" -c windows/src/pe/nr_d3d12_direct_state.cpp -o "$out/d3d12_direct_state_t.o"
+    "$cxx" "${common[@]}" -DNR_TOOLS_BUILD=1 -c windows/src/pe/nr_renodx_d3d12.cpp -o "$out/renodx_d3d12_t.o"
+    r33_objs=()
+    for obj in "${objs[@]:1}"; do
+        if [[ "$obj" == "$out/d3d12_direct_state.o" ]]; then
+            r33_objs+=("$out/d3d12_direct_state_t.o")
+        elif [[ "$obj" == "$out/renodx_d3d12.o" ]]; then
+            r33_objs+=("$out/renodx_d3d12_t.o")
+        else
+            r33_objs+=("$obj")
+        fi
+    done
+    "$cxx" "${common[@]}" -DNR_TOOLS_BUILD=1 -I"$minhook/include" -c windows/tools/test_d3d12_direct_r33.cpp -o "$out/test_d3d12_direct_r33.o"
+    "$cxx" -o "$out/test_d3d12_direct_r33.exe" "$out/test_d3d12_direct_r33.o" "${r33_objs[@]}" "$out/vulkan_lazy_s.o" \
         "$out/vulkan_lazy_c.o" "${ldflags[@]}" -lgdi32 -luuid -lpsapi -lshlwapi -ldwmapi
 fi
 

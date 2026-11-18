@@ -80,8 +80,7 @@ template<class R, class... A> struct MethodHook<R(STDMETHODCALLTYPE*)(A...)> {
         return install_at(target, nullptr, detour, out_next);
     }
 
-    static MH_STATUS remove_raw(void* target, Fn detour, Fn* out_next) {
-        if (out_next) *out_next = nullptr;
+    static MH_STATUS remove_raw(void* target, Fn detour, Fn* /*out_next*/) {
         if (!target || !detour) return MH_OK;
         std::lock_guard<std::mutex> lock(mutex);
         for (Slot& s : slots) {
@@ -89,14 +88,18 @@ template<class R, class... A> struct MethodHook<R(STDMETHODCALLTYPE*)(A...)> {
             const size_t d = s.depth.load(std::memory_order_relaxed);
             for (size_t k = 0; k < d; ++k) {
                 if (s.stages[k].raw != detour) continue;
-                for (size_t j = k; j + 1 < d; ++j) s.stages[j] = s.stages[j + 1];
-                s.stages[d - 1] = {};
-                s.depth.store(d - 1, std::memory_order_release);
                 if (d == 1) {
                     MH_DisableHook(target);
-                    MH_RemoveHook(target);
-                    s.target = nullptr;
-                    s.original = nullptr;
+                    s.depth.store(0, std::memory_order_release);
+                    s.stages[0] = {};
+                    // Keep s.target, s.original, the MinHook trampoline, and caller *out_next intact
+                    // so any thread already mid-detour finishes safely and re-installs reuse this slot.
+                } else {
+                    if (k + 1 != d) {
+                        for (size_t j = k; j + 1 < d; ++j) s.stages[j] = s.stages[j + 1];
+                    }
+                    s.depth.store(d - 1, std::memory_order_release);
+                    s.stages[d - 1] = {};
                 }
                 return MH_OK;
             }
@@ -139,6 +142,15 @@ private:
             if (out_next) *out_next = next_fn;
             s.stages[d] = Stage{handler, detour};
             s.depth.store(d + 1, std::memory_order_release);
+            if (d == 0) {
+                const MH_STATUS st = MH_EnableHook(target);
+                if (st != MH_OK) {
+                    s.depth.store(0, std::memory_order_release);
+                    s.stages[0] = {};
+                    if (out_next) *out_next = nullptr;
+                    return st;
+                }
+            }
             return MH_OK;
         }
 

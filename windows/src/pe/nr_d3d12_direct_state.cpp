@@ -293,6 +293,9 @@ std::atomic<bool> g_booked{false};
 std::atomic<uint64_t> g_host_table_replays{0};
 std::atomic<uint64_t> g_nr_heap_sets{0};
 std::atomic<uint64_t> g_nr_table_sets{0};
+#ifdef NR_TOOLS_BUILD
+std::atomic<bool> g_test_fail_queue_signal{false};
+#endif
 
 thread_local ID3D12CommandQueue* t_last_seen = nullptr;
 thread_local ID3D12CommandQueue* t_last_direct = nullptr;
@@ -331,9 +334,11 @@ void stamp_bookings_locked(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* con
     }
     if (!any) return;
     QueueFence* f = completion_fence_locked(q);
-    char fail_env[8]{};
-    const bool fail_sig = GetEnvironmentVariableA("NR_TEST_FAIL_QUEUE_SIGNAL", fail_env, sizeof fail_env) > 0 &&
-                          fail_env[0] == '1';
+#ifdef NR_TOOLS_BUILD
+    const bool fail_sig = g_test_fail_queue_signal.load(std::memory_order_relaxed);
+#else
+    constexpr bool fail_sig = false;
+#endif
     const bool signalled = !fail_sig && f && f->fence && SUCCEEDED(q->Signal(f->fence, f->value + 1));
     if (signalled) ++f->value;
     for (UINT i = 0; i < n; ++i) {
@@ -413,6 +418,7 @@ std::atomic<bool> g_hooks_installed{false};
 std::atomic<bool> g_hooks_ok{false};
 std::atomic<void*> g_failed_device{nullptr};
 thread_local int t_in_direct_record = 0;
+thread_local bool t_in_direct_restore = false;
 
 const GUID kIID_List4 = {0x8754318e, 0xd3a9, 0x4541, {0x98, 0xcf, 0x64, 0x5b, 0x50, 0xdc, 0x48, 0x74}};
 const GUID kIID_Dev4 = {0xe865df17, 0xa9ee, 0x46f9, {0xa4, 0x63, 0x30, 0x98, 0x31, 0x5a, 0xa2, 0xe5}};
@@ -563,6 +569,8 @@ void STDMETHODCALLTYPE hk_cl_set_heaps(ID3D12GraphicsCommandList* cl, UINT count
         }
         s->heap_count = n;
         for (UINT i = 0; i < n; ++i) s->heaps[i] = heaps ? heaps[i] : nullptr;
+    } else if (cl && t_in_direct_record) {
+        g_nr_heap_sets.fetch_add(1, std::memory_order_relaxed);
     }
     real_cl_set_heaps(cl, count, heaps);
 }
@@ -574,6 +582,7 @@ void STDMETHODCALLTYPE hk_cl_set_compute_rs(ID3D12GraphicsCommandList* cl, ID3D1
 
 void STDMETHODCALLTYPE hk_cl_set_compute_table(ID3D12GraphicsCommandList* cl, UINT index, D3D12_GPU_DESCRIPTOR_HANDLE h) {
     if (cl && !t_in_direct_record) direct_state_of(cl)->compute_root.set(index, 1, h.ptr);
+    else if (cl && t_in_direct_record && !t_in_direct_restore) g_nr_table_sets.fetch_add(1, std::memory_order_relaxed);
     real_cl_set_compute_table(cl, index, h);
 }
 
@@ -691,6 +700,7 @@ bool restore_direct_state(ID3D12GraphicsCommandList* cmd) {
     if (!s || !s->valid || s->unknown) return false;
 
     ++t_in_direct_record;
+    t_in_direct_restore = true;
     const DirectRootArgs& r = s->compute_root;
     if (r.rs_set && r.rs) {
         cmd->SetComputeRootSignature(r.rs);
@@ -729,6 +739,7 @@ bool restore_direct_state(ID3D12GraphicsCommandList* cmd) {
     } else if (s->pso_set && s->pso) {
         cmd->SetPipelineState(s->pso);
     }
+    t_in_direct_restore = false;
     --t_in_direct_record;
     return true;
 }
@@ -740,10 +751,12 @@ bool install_core_method_fn(void* fn, Fn detour, Fn* real, const char* name,
         if (why) *why = std::string("direct state hook failed: null slot for ") + name;
         return false;
     }
+#ifdef NR_TOOLS_BUILD
     if (const char* inject = std::getenv("NR_TEST_FAIL_HOOK_SLOT"); inject && std::strcmp(inject, name) == 0) {
         if (why) *why = std::string("injected direct state hook failure on ") + name;
         return false;
     }
+#endif
     std::string mod;
     if (!in_d3d12_core_module(fn, &mod)) {
         if (why) *why = std::string("direct state hook refused: ") + name + " outside D3D12 module (" + mod + ")";
@@ -764,6 +777,12 @@ bool install_core_method(void* obj, unsigned slot, Fn detour, Fn* real, const ch
     if (!obj) return false;
     void* fn = (*reinterpret_cast<void***>(obj))[slot];
     return install_core_method_fn(fn, detour, real, name, undo, why);
+}
+
+template <class Fn>
+bool install_list_method(void** clvt, unsigned slot, Fn detour, Fn* real, const char* name,
+                         std::vector<std::function<void()>>& undo, std::string* why) {
+    return install_core_method_fn(nr::pe::split::orig_list_method(clvt, slot), detour, real, name, undo, why);
 }
 
 }  // namespace
@@ -816,6 +835,8 @@ bool install_hooks(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, std::string
     void** clvt = *reinterpret_cast<void***>(cl);
     void** qvt = *reinterpret_cast<void***>(temp_q);
     void** dvt = *reinterpret_cast<void***>(dev);
+    void* close_fn = nr::pe::split::orig_list_method(clvt, 9);
+    void* reset_fn = nr::pe::split::orig_list_method(clvt, 10);
 
     bool ok = true;
     ok = ok && install_core_method_fn(cavt[8], &hk_ca_reset, &real_ca_reset, "Allocator::Reset", undo, why);
@@ -826,37 +847,38 @@ bool install_hooks(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, std::string
     ok = ok && install_core_method(dev, 41, &hk_dev_create_cmd_sig, &real_dev_create_cmd_sig, "CreateCommandSignature", undo, why);
     if (ok) {
         std::string close_mod;
-        if (!in_d3d12_core_module(clvt[9], &close_mod)) {
+        if (!in_d3d12_core_module(close_fn, &close_mod)) {
             if (why) *why = "direct state hook refused: Close outside D3D12 module (" + close_mod + ")";
             ok = false;
         }
     }
-    ok = ok && install_core_method(cl, 10, &hk_cl_reset, &real_cl_reset, "Reset", undo, why);
-    ok = ok && install_core_method(cl, 11, &hk_cl_clear_state, &real_cl_clear_state, "ClearState", undo, why);
-    ok = ok && install_core_method(cl, 25, &hk_cl_set_pso, &real_cl_set_pso, "SetPipelineState", undo, why);
-    ok = ok && install_core_method(cl, 27, &hk_cl_exec_bundle, &real_cl_exec_bundle, "ExecuteBundle", undo, why);
-    ok = ok && install_core_method(cl, 28, &hk_cl_set_heaps, &real_cl_set_heaps, "SetDescriptorHeaps", undo, why);
-    ok = ok && install_core_method(cl, 29, &hk_cl_set_compute_rs, &real_cl_set_compute_rs, "SetComputeRootSignature", undo, why);
-    ok = ok && install_core_method(cl, 31, &hk_cl_set_compute_table, &real_cl_set_compute_table, "SetComputeRootDescriptorTable", undo, why);
-    ok = ok && install_core_method(cl, 33, &hk_cl_set_compute_const, &real_cl_set_compute_const, "SetComputeRoot32BitConstant", undo, why);
-    ok = ok && install_core_method(cl, 35, &hk_cl_set_compute_consts, &real_cl_set_compute_consts, "SetComputeRoot32BitConstants", undo, why);
-    ok = ok && install_core_method(cl, 37, &hk_cl_set_compute_cbv, &real_cl_set_compute_cbv, "SetComputeRootConstantBufferView", undo, why);
-    ok = ok && install_core_method(cl, 39, &hk_cl_set_compute_srv, &real_cl_set_compute_srv, "SetComputeRootShaderResourceView", undo, why);
-    ok = ok && install_core_method(cl, 41, &hk_cl_set_compute_uav, &real_cl_set_compute_uav, "SetComputeRootUnorderedAccessView", undo, why);
-    ok = ok && install_core_method(cl, 59, &hk_cl_exec_indirect, &real_cl_exec_indirect, "ExecuteIndirect", undo, why);
-    if (ok && clvt[2] != g_hooked_ca_release_fn) {
-        ok = install_core_method_fn(clvt[2], &hk_cl_release, &real_cl_release, "CommandList::Release", undo, why);
-        if (ok) g_hooked_cl_release_fn = clvt[2];
+    ok = ok && install_list_method(clvt, 10, &hk_cl_reset, &real_cl_reset, "Reset", undo, why);
+    ok = ok && install_list_method(clvt, 11, &hk_cl_clear_state, &real_cl_clear_state, "ClearState", undo, why);
+    ok = ok && install_list_method(clvt, 25, &hk_cl_set_pso, &real_cl_set_pso, "SetPipelineState", undo, why);
+    ok = ok && install_list_method(clvt, 27, &hk_cl_exec_bundle, &real_cl_exec_bundle, "ExecuteBundle", undo, why);
+    ok = ok && install_list_method(clvt, 28, &hk_cl_set_heaps, &real_cl_set_heaps, "SetDescriptorHeaps", undo, why);
+    ok = ok && install_list_method(clvt, 29, &hk_cl_set_compute_rs, &real_cl_set_compute_rs, "SetComputeRootSignature", undo, why);
+    ok = ok && install_list_method(clvt, 31, &hk_cl_set_compute_table, &real_cl_set_compute_table, "SetComputeRootDescriptorTable", undo, why);
+    ok = ok && install_list_method(clvt, 33, &hk_cl_set_compute_const, &real_cl_set_compute_const, "SetComputeRoot32BitConstant", undo, why);
+    ok = ok && install_list_method(clvt, 35, &hk_cl_set_compute_consts, &real_cl_set_compute_consts, "SetComputeRoot32BitConstants", undo, why);
+    ok = ok && install_list_method(clvt, 37, &hk_cl_set_compute_cbv, &real_cl_set_compute_cbv, "SetComputeRootConstantBufferView", undo, why);
+    ok = ok && install_list_method(clvt, 39, &hk_cl_set_compute_srv, &real_cl_set_compute_srv, "SetComputeRootShaderResourceView", undo, why);
+    ok = ok && install_list_method(clvt, 41, &hk_cl_set_compute_uav, &real_cl_set_compute_uav, "SetComputeRootUnorderedAccessView", undo, why);
+    ok = ok && install_list_method(clvt, 59, &hk_cl_exec_indirect, &real_cl_exec_indirect, "ExecuteIndirect", undo, why);
+    void* cl_rel_fn = nr::pe::split::orig_list_method(clvt, 2);
+    if (ok && cl_rel_fn != g_hooked_ca_release_fn) {
+        ok = install_core_method_fn(cl_rel_fn, &hk_cl_release, &real_cl_release, "CommandList::Release", undo, why);
+        if (ok) g_hooked_cl_release_fn = cl_rel_fn;
     }
 
     ID3D12GraphicsCommandList4* cl4 = nullptr;
     if (ok && SUCCEEDED(cl->QueryInterface(kIID_List4, reinterpret_cast<void**>(&cl4))) && cl4) {
         void** vt4 = *reinterpret_cast<void***>(cl4);
-        ok = install_core_method_fn(vt4[75], &hk_cl_set_pso1, &real_cl_set_pso1, "SetPipelineState1", undo, why);
+        ok = install_core_method_fn(nr::pe::split::orig_list_method(vt4, 75), &hk_cl_set_pso1, &real_cl_set_pso1, "SetPipelineState1", undo, why);
         cl4->Release();
     }
 
-    ok = ok && install_core_method_fn(dvt[12], &hk_dev_create_cl, &real_dev_create_cl, "CreateCommandList", undo, why);
+    ok = ok && install_core_method_fn(nr::pe::split::orig_device_create_cl(dvt), &hk_dev_create_cl, &real_dev_create_cl, "CreateCommandList", undo, why);
     IUnknown* dev4 = nullptr;
     if (ok && SUCCEEDED(dev->QueryInterface(kIID_Dev4, reinterpret_cast<void**>(&dev4))) && dev4) {
         void** dvt4 = *reinterpret_cast<void***>(dev4);
@@ -864,7 +886,7 @@ bool install_hooks(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, std::string
         dev4->Release();
     }
 
-    ok = ok && install_core_method(temp_q, 10, &hk_queue_execute, &real_queue_execute, "ExecuteCommandLists", undo, why);
+    ok = ok && install_core_method_fn(nr::pe::split::orig_queue_execute(qvt), &hk_queue_execute, &real_queue_execute, "ExecuteCommandLists", undo, why);
     if (ok && qvt[2] != g_hooked_ca_release_fn && qvt[2] != g_hooked_cl_release_fn) {
         ok = install_core_method_fn(qvt[2], &hk_queue_release, &real_queue_release, "CommandQueue::Release", undo, why);
     }
@@ -881,8 +903,8 @@ bool install_hooks(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, std::string
         return false;
     }
 
-    g_hooked_cl_close_fn = clvt[9];
-    g_hooked_cl_reset_fn = clvt[10];
+    g_hooked_cl_close_fn = close_fn;
+    g_hooked_cl_reset_fn = reset_fn;
     g_failed_device.store(nullptr, std::memory_order_release);
     g_hooks_ok.store(true, std::memory_order_relaxed);
     g_hooks_installed.store(true, std::memory_order_release);
@@ -899,7 +921,14 @@ bool ready(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, std::string* why, b
         return false;
     }
     void** vt = *reinterpret_cast<void***>(cl);
-    if (!vt || ((vt[9] != g_hooked_cl_close_fn || vt[10] != g_hooked_cl_reset_fn) &&
+    bool split_cut_active = false;
+    const bool split_vt = vt && nr::pe::split::is_split_list(cl, &split_cut_active);
+    if (split_vt && split_cut_active) {
+        if (why) *why = "the command list has an active bridge cut";
+        return false;
+    }
+    if (!vt || (!split_vt &&
+                (vt[9] != g_hooked_cl_close_fn || vt[10] != g_hooked_cl_reset_fn) &&
                 (!in_d3d12_core_module(vt[9]) || !in_d3d12_core_module(vt[10])))) {
         if (why) *why = "the command list vtable is wrapped outside D3D12 module";
         return false;
@@ -1006,5 +1035,10 @@ size_t tracked_queue_fence_count() {
     std::lock_guard<std::mutex> lock(d.track_mutex);
     return d.queue_fences.size();
 }
+#ifdef NR_TOOLS_BUILD
+void set_test_fail_queue_signal(bool fail) {
+    g_test_fail_queue_signal.store(fail, std::memory_order_relaxed);
+}
+#endif
 
 }  // namespace nr::pe::d3d12_direct

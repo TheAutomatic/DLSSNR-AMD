@@ -30,6 +30,10 @@ namespace nr::pe::d3d12_passthrough::renodx12 {
 using Settings = nr::renodx::Settings;   // RenoDX's own (nr_renodx.hpp)
 namespace {
 
+#ifdef NR_TOOLS_BUILD
+std::atomic<uint32_t> g_test_fail_dispatch_at{0};
+#endif
+
 void release(IUnknown* p) { if (p) p->Release(); }
 
 DXGI_FORMAT srv_format_of(DXGI_FORMAT f) {
@@ -748,16 +752,15 @@ struct Stage::Impl {
         if (limit && dispatches_done >= limit) return;
         ++dispatches_done;
         ++frame_dispatches_;
+#ifdef NR_TOOLS_BUILD
         {
-            char fail_at[16]{};
-            if (GetEnvironmentVariableA("NR_STAGE_FAIL_AT", fail_at, sizeof fail_at) && fail_at[0]) {
-                const uint32_t target_idx = uint32_t(std::strtoul(fail_at, nullptr, 10));
-                if (target_idx > 0u && frame_dispatches_ == target_idx) {
-                    record_ok_ = false;
-                    return;
-                }
+            const uint32_t target_idx = g_test_fail_dispatch_at.load(std::memory_order_relaxed);
+            if (target_idx > 0u && frame_dispatches_ == target_idx) {
+                record_ok_ = false;
+                return;
             }
         }
+#endif
 
         const d3d12_outer::OuterKernel& k = kernels[p];
         if (!k.pso || !rs_outer) {
@@ -2553,6 +2556,7 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
         View uav[14] = {};
         uav[4] = tv(result, true);
         dispatch(cmd, kDebug, srv, uav, dv, 5, gx, gy);
+        if (!record_ok_) return 0;
     }
     // 4. The result into the output: a store through float (bit-exact where the formats match).
     {
@@ -2566,6 +2570,7 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
         ensure(cmd, f.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         dispatch(cmd, kCopyOut, srv, uav, &c, 8, (W + 7) / 8, (H + 7) / 8,
                  f.output_state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (!record_ok_) return 0;
         ensure(cmd, f.output, f.output_state);
     }
     return ran;
@@ -2645,6 +2650,12 @@ Stage::Facts Stage::facts() const { return impl_->facts; }
 void Stage::set_retire(std::function<void(IUnknown*)> f) {
     if (impl_) impl_->retire = std::move(f);
 }
+
+#ifdef NR_TOOLS_BUILD
+void Stage::set_test_fail_dispatch_at(uint32_t dispatch_index) {
+    g_test_fail_dispatch_at.store(dispatch_index, std::memory_order_relaxed);
+}
+#endif
 
 void prewarm_shaders(const std::wstring& /*shaders*/) {
     static std::atomic<bool> started{false};

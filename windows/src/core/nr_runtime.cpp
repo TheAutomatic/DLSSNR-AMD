@@ -2967,8 +2967,16 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         pre_seed = counter++;
         if (c.seed_fixed) pre_seed = 0;
         // diagnostics (wrong picture): price the per-frame noise and the history.
-        if (std::getenv("NR_DIAG_SEED0")) pre_seed = 0;
-        if (std::getenv("NR_DIAG_TGATE0")) gate = false;
+        static const bool diag_seed0 = [] {
+            const char* e = std::getenv("NR_DIAG_SEED0");
+            return e && e[0] && e[0] != '0';
+        }();
+        static const bool diag_tgate0 = [] {
+            const char* e = std::getenv("NR_DIAG_TGATE0");
+            return e && e[0] && e[0] != '0';
+        }();
+        if (diag_seed0) pre_seed = 0;
+        if (diag_tgate0) gate = false;
         const uint32_t p = fs ? fs->parity : t.parity;
         if (engine) {
             // Engine motion: sampled in place (mv_direct, put back after the
@@ -3138,8 +3146,12 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
     }
     if (!temporal && !mask) {
         // No motion source: the seed is 0 unless Controls::noise_every_frame, then the DLL's counter.
+        static const bool diag_seed0 = [] {
+            const char* e = std::getenv("NR_DIAG_SEED0");
+            return e && e[0] && e[0] != '0';
+        }();
         uint32_t& seed = c.feature ? impl_->plain_seeds[c.feature] : impl_->plain_seed;
-        if (c.noise_every_frame && !c.seed_fixed) pre_seed = seed++;
+        if (c.noise_every_frame && !c.seed_fixed && !diag_seed0) pre_seed = seed++;
         else seed = 0;
     }
     // Bind this feature's history: copy the previously bound feature's state out

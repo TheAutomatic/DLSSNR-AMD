@@ -251,11 +251,13 @@ int main(int argc, char** argv) {
     bool hdr_mode = false;
     bool plain_mode = false;
     bool wilsjo2_mode = false;
+    bool fixed_seed = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--vulkan") == 0) vulkan_bridge = true;
         else if (std::strcmp(argv[i], "--hdr") == 0) hdr_mode = true;
         else if (std::strcmp(argv[i], "--plain") == 0) plain_mode = true;
         else if (std::strcmp(argv[i], "--wilsjo2") == 0) wilsjo2_mode = true;
+        else if (std::strcmp(argv[i], "--fixed-seed") == 0) fixed_seed = true;
         else if (std::strcmp(argv[i], "--width") == 0 && i + 1 < argc) W = uint32_t(std::atoi(argv[++i]));
         else if (std::strcmp(argv[i], "--height") == 0 && i + 1 < argc) H = uint32_t(std::atoi(argv[++i]));
         else if (std::strcmp(argv[i], "--warmup") == 0 && i + 1 < argc) warmup_arg = std::atoi(argv[++i]);
@@ -296,6 +298,7 @@ int main(int argc, char** argv) {
 
     HMODULE self_exe = GetModuleHandleW(nullptr);
     nr::pe::set_module(self_exe);   // the game folder: this program sits in it
+    if (fixed_seed) _putenv_s("NR_DIAG_SEED0", "1");
     {
         const std::string ini = std::string(nr::pe::module_folder()) + "\\dlssnr-amd.ini";
         if (model_arg) write_network_key(ini, "Model", model_arg);
@@ -380,13 +383,30 @@ int main(int argc, char** argv) {
             std::printf("FAIL: queue->Signal failed\n");
             std::exit(1);
         }
-        if (fence->GetCompletedValue() < fence_val) {
+        uint64_t comp = fence->GetCompletedValue();
+        if (comp == UINT64_MAX) {
+            std::printf("FAIL: fence->GetCompletedValue() == UINT64_MAX (device removed: 0x%08lX)\n",
+                        static_cast<unsigned long>(device->GetDeviceRemovedReason()));
+            std::exit(1);
+        }
+        if (comp < fence_val) {
             if (FAILED(fence->SetEventOnCompletion(fence_val, fence_event)) ||
-                WaitForSingleObject(fence_event, 10000) != WAIT_OBJECT_0 ||
-                fence->GetCompletedValue() < fence_val) {
-                std::printf("FAIL: fence wait timed out or did not advance\n");
+                WaitForSingleObject(fence_event, 10000) != WAIT_OBJECT_0) {
+                std::printf("FAIL: fence wait timed out\n");
                 std::exit(1);
             }
+            comp = fence->GetCompletedValue();
+            if (comp == UINT64_MAX || comp < fence_val) {
+                std::printf("FAIL: fence did not advance (completed=%llu, reason=0x%08lX)\n",
+                            static_cast<unsigned long long>(comp),
+                            static_cast<unsigned long>(device->GetDeviceRemovedReason()));
+                std::exit(1);
+            }
+        }
+        if (FAILED(device->GetDeviceRemovedReason())) {
+            std::printf("FAIL: device removed after wait (0x%08lX)\n",
+                        static_cast<unsigned long>(device->GetDeviceRemovedReason()));
+            std::exit(1);
         }
     };
 
@@ -399,18 +419,6 @@ int main(int argc, char** argv) {
         cmd->Reset(alloc, nullptr);
         if (!nr::pe::split::prepare(cmd, &why)) {
             std::printf("FAIL: split::prepare after Reset: %s\n", why.c_str());
-            return 1;
-        }
-    } else {
-        if (!nr::pe::d3d12_direct::install_hooks(device, cmd, &why)) {
-            std::printf("FAIL: d3d12_direct::install_hooks: %s\n", why.c_str());
-            return 1;
-        }
-        cmd->Close();
-        alloc->Reset();
-        cmd->Reset(alloc, nullptr);
-        if (!nr::pe::d3d12_direct::ready(device, cmd, &why)) {
-            std::printf("FAIL: d3d12_direct::ready after Reset: %s\n", why.c_str());
             return 1;
         }
     }
@@ -446,7 +454,10 @@ int main(int argc, char** argv) {
     std::vector<uint32_t> init_pixels(W * H);
     {
         uint8_t* mapped = nullptr;
-        upload->Map(0, nullptr, reinterpret_cast<void**>(&mapped));
+        if (FAILED(upload->Map(0, nullptr, reinterpret_cast<void**>(&mapped))) || !mapped) {
+            std::printf("FAIL: upload->Map failed\n");
+            return 1;
+        }
         for (uint32_t y = 0; y < H; ++y) {
             auto* row = reinterpret_cast<uint32_t*>(mapped + uint64_t(y) * fp.Footprint.RowPitch);
             for (uint32_t x = 0; x < W; ++x) {
@@ -528,6 +539,7 @@ int main(int argc, char** argv) {
     rs.color_strength = 1.0f;
     rs.transfer_strength = 1.0f;
     rs.detail_stability = 1;
+    if (fixed_seed) rs.noise_every_frame = false;
 
     nr::asi::Wilsjo2Owner* w2_owner = wilsjo2_mode ? nr::asi::wilsjo2_owner() : nullptr;
     if (w2_owner) nr::asi::wilsjo2_owner_at_present(*w2_owner);
@@ -550,6 +562,13 @@ int main(int argc, char** argv) {
             nr::wilsjo2::Settings ws{};
             ws.passes = uint32_t(passes_arg);
             ws.unlock_passes = passes_arg > 4;
+            if (preset_arg == 1 || preset_arg == 2) {
+                ws.passes_mode = 1;
+                ws.fast_method = 0;
+                ws.fast_interleaved_passes = uint32_t(std::clamp(passes_arg, 2, 8));
+                ws.fast_interleaved_preset = uint32_t(preset_arg);
+            }
+            if (fixed_seed) ws.noise_every_frame = false;
             ws.white_point_source = 3;
             nr::asi::wilsjo2_run(cmd, device, *w2_owner, wf, ws, target, W, H, false);
             nr::dlssnr::set_d3d12_native_call(false);
@@ -619,7 +638,10 @@ int main(int argc, char** argv) {
         wait_gpu();
 
         uint8_t* mapped = nullptr;
-        readback->Map(0, nullptr, reinterpret_cast<void**>(&mapped));
+        if (FAILED(readback->Map(0, nullptr, reinterpret_cast<void**>(&mapped))) || !mapped) {
+            std::printf("FAIL: check_target_modified readback->Map failed\n");
+            std::exit(1);
+        }
         uint64_t changed = 0;
         for (uint32_t y = 0; y < H; y += 16) {
             const auto* row = reinterpret_cast<const uint32_t*>(mapped + uint64_t(y) * fp.Footprint.RowPitch);
@@ -671,7 +693,10 @@ int main(int argc, char** argv) {
     // Full readback check
     {
         uint8_t* mapped = nullptr;
-        readback->Map(0, nullptr, reinterpret_cast<void**>(&mapped));
+        if (FAILED(readback->Map(0, nullptr, reinterpret_cast<void**>(&mapped))) || !mapped) {
+            std::printf("FAIL: check_target_modified readback->Map failed\n");
+            std::exit(1);
+        }
         std::vector<uint32_t> out_pixels(size_t(W) * H);
         for (uint32_t y = 0; y < H; ++y)
             std::memcpy(out_pixels.data() + size_t(y) * W, mapped + uint64_t(y) * fp.Footprint.RowPitch, size_t(W) * 4);
@@ -777,11 +802,30 @@ int main(int argc, char** argv) {
     std::printf("  - Pure Network GPU avg (internal):           %.3f ms\n", vk_net_ms);
     std::printf("  - RenoDX Stage + Network GPU avg (internal): %.3f ms\n", vk_stage_ms);
     std::printf("CPU evaluate_d3d12 recording time:             avg %.3f ms\n", cpu_sum / cpu_ms_list.size());
+    if (vulkan_bridge) {
+        std::printf("Actual backend executed: Vulkan Bridge (split=%d)\n", nr::pe::split::disabled() ? 0 : 1);
+    } else {
+        const auto pt_st = nr::pe::d3d12_passthrough::status();
+        const bool hooks_ok = nr::pe::d3d12_direct::hooks_installed();
+        std::printf("Actual backend executed: Direct ELF (runs=%llu, fallbacks=%llu, hooks=%d)\n",
+                    static_cast<unsigned long long>(pt_st.runs),
+                    static_cast<unsigned long long>(pt_st.fallbacks),
+                    hooks_ok ? 1 : 0);
+        if (!hooks_ok || pt_st.runs == 0 || (!wilsjo2_mode && pt_st.fallbacks > 0)) {
+            std::printf("FAIL: Direct ELF route did not stay on Direct (hooks=%d runs=%llu fallbacks=%llu status=%s)\n",
+                        hooks_ok ? 1 : 0, static_cast<unsigned long long>(pt_st.runs),
+                        static_cast<unsigned long long>(pt_st.fallbacks), pt_st.backend.c_str());
+            return 1;
+        }
+    }
 
     if (dump_steady || ref_steady) {
         check_target_modified();
         uint8_t* mapped = nullptr;
-        readback->Map(0, nullptr, reinterpret_cast<void**>(&mapped));
+        if (FAILED(readback->Map(0, nullptr, reinterpret_cast<void**>(&mapped))) || !mapped) {
+            std::printf("FAIL: check_target_modified readback->Map failed\n");
+            std::exit(1);
+        }
         std::vector<uint32_t> steady_pixels(size_t(W) * H);
         for (uint32_t y = 0; y < H; ++y)
             std::memcpy(steady_pixels.data() + size_t(y) * W, mapped + uint64_t(y) * fp.Footprint.RowPitch, size_t(W) * 4);

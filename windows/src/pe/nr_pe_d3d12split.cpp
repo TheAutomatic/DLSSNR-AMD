@@ -34,6 +34,13 @@ bool cut(ID3D12GraphicsCommandList*, Job, const std::shared_ptr<Snapshot>&, std:
     *why = "the command-list cut is x86-64 only";
     return false;
 }
+bool is_split_list(ID3D12GraphicsCommandList*, bool* active_cut) {
+    if (active_cut) *active_cut = false;
+    return false;
+}
+void* orig_list_method(void** vt, unsigned slot) { return vt ? vt[slot] : nullptr; }
+void* orig_device_create_cl(void** dvt) { return dvt ? dvt[12] : nullptr; }
+void* orig_queue_execute(void** qvt) { return qvt ? qvt[10] : nullptr; }
 #else
 
 namespace {
@@ -1438,13 +1445,14 @@ HRESULT STDMETHODCALLTYPE hk_CreateCommandList(ID3D12Device* d, UINT mask, D3D12
     return hr;
 }
 
-bool patch_device_class(ID3D12Device* device, std::string* why) {
+bool patch_device_class(ID3D12Device* device, std::string* why, bool* wrapped_refusal = nullptr) {
     void** vt = *reinterpret_cast<void***>(device);
     const int n = g_device_count.load();
     for (int i = 0; i < n; ++i) if (g_device_classes[i].vtable == vt) return true;
     std::string mod;
     if (!in_d3d12_module(vt[kDeviceCreateCommandList], &mod)) {
         *why = "the device vtable is outside D3D12 module (" + mod + ")";
+        if (wrapped_refusal) *wrapped_refusal = true;
         return false;
     }
     if (n >= 8) { *why = "too many device classes"; return false; }
@@ -1459,7 +1467,8 @@ bool patch_device_class(ID3D12Device* device, std::string* why) {
     return true;
 }
 
-bool patch_queue_classes(ID3D12Device* device, D3D12_COMMAND_LIST_TYPE type, std::string* why) {
+bool patch_queue_classes(ID3D12Device* device, D3D12_COMMAND_LIST_TYPE type, std::string* why,
+                         bool* wrapped_refusal = nullptr) {
     D3D12_COMMAND_QUEUE_DESC desc{};
     desc.Type = type;
     ID3D12CommandQueue* q = nullptr;
@@ -1476,6 +1485,7 @@ bool patch_queue_classes(ID3D12Device* device, D3D12_COMMAND_LIST_TYPE type, std
     if (!known && !in_d3d12_module(vt[kQueueExecute], &mod)) {
         ok = false;
         *why = "the command queue vtable is outside D3D12 module (" + mod + ")";
+        if (wrapped_refusal) *wrapped_refusal = true;
     } else if (!known && n >= 8) { ok = false; *why = "too many command queue classes"; }
     else if (!known) {
         g_queue_classes[n] = {vt, vt[kQueueExecute]};
@@ -1512,11 +1522,15 @@ bool prepare(List* list, std::string* why) {
             *why = "the command list has no device";
             return false;
         }
-        const bool ok = patch_queue_classes(device, D3D12_COMMAND_LIST_TYPE_DIRECT, why) &&
-                        patch_queue_classes(device, D3D12_COMMAND_LIST_TYPE_COMPUTE, why) &&
-                        patch_device_class(device, why);
+        bool q_wrapped = false;
+        const bool ok = patch_queue_classes(device, D3D12_COMMAND_LIST_TYPE_DIRECT, why, &q_wrapped) &&
+                        patch_queue_classes(device, D3D12_COMMAND_LIST_TYPE_COMPUTE, why, &q_wrapped) &&
+                        patch_device_class(device, why, &q_wrapped);
         device->Release();
-        if (!ok) { g_disabled = true; g_disabled_why = *why; return false; }
+        if (!ok) {
+            if (!q_wrapped) { g_disabled = true; g_disabled_why = *why; }
+            return false;
+        }
         queues_done.push_back(vt);
     }
     const ListState* st = state_of(list);
@@ -1658,6 +1672,50 @@ bool cut(List* list, Job job, const std::shared_ptr<Snapshot>& state, std::strin
 bool disabled() {
     std::lock_guard<std::recursive_mutex> guard(g_mutex);
     return g_disabled;
+}
+
+bool is_split_list(ID3D12GraphicsCommandList* list, bool* active_cut) {
+    if (active_cut) *active_cut = false;
+    if (!list) return false;
+    void** vt = *reinterpret_cast<void***>(list);
+    if (!vt) return false;
+    ListClass* cls = class_by_vtable(vt);
+    if (!cls || vt[kClose] != cls->entry[kClose] || vt[kReset] != cls->entry[kReset]) return false;
+    if (active_cut) {
+        bool cut_now = (target_of(list) != list);
+        if (!cut_now && g_pending.load(std::memory_order_acquire) != 0) {
+            std::lock_guard<std::recursive_mutex> guard(g_mutex);
+            cut_now = (g_cuts.find(list) != g_cuts.end());
+        }
+        *active_cut = cut_now;
+    }
+    return true;
+}
+
+void* orig_list_method(void** vt, unsigned slot) {
+    if (!vt) return nullptr;
+    if (ListClass* cls = class_by_vtable(vt)) {
+        return (slot < cls->slots) ? cls->orig[slot] : vt[slot];
+    }
+    return vt[slot];
+}
+
+void* orig_device_create_cl(void** dvt) {
+    if (!dvt) return nullptr;
+    const int n = g_device_count.load(std::memory_order_acquire);
+    for (int i = 0; i < n; ++i) {
+        if (g_device_classes[i].vtable == dvt) return g_device_classes[i].create;
+    }
+    return dvt[kDeviceCreateCommandList];
+}
+
+void* orig_queue_execute(void** qvt) {
+    if (!qvt) return nullptr;
+    const int n = g_queue_count.load(std::memory_order_acquire);
+    for (int i = 0; i < n; ++i) {
+        if (g_queue_classes[i].vtable == qvt) return g_queue_classes[i].execute;
+    }
+    return qvt[kQueueExecute];
 }
 
 #endif

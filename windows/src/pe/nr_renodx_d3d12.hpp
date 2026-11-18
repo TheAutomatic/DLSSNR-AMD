@@ -119,6 +119,9 @@ public:
     // Where a resource this stage drops goes: the caller retires it (its own completion watermark), because a stage
     // may replace a surface while earlier frames that used it are still in flight. Unset: dropped at once.
     void set_retire(std::function<void(IUnknown*)> f);
+#ifdef NR_TOOLS_BUILD
+    static void set_test_fail_dispatch_at(uint32_t dispatch_index);
+#endif
 
 private:
     Stage() = default;

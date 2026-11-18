@@ -1592,7 +1592,7 @@ void capture_guides(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, const 
     // (the full barrier only where the depth is copied - the race it closes was the depth's; a motion-only copy, the
     // usual Present layer (Motion Without Depth), takes the transitions alone, as 0.0.8.3: no GPU-wide wait a frame)
     if (depth_wanted) guide_copy_barrier(cmd);
-    bool depth_copied = !depth_by_pass;
+    bool depth_copied = depth_wanted;
     if (depth_by_pass && !depth_read_into(cmd, device, f.depth, st.depth, target->depth)) {
         static bool depth_fail_said = false;
         if (!depth_fail_said) {

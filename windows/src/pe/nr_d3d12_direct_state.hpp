@@ -70,5 +70,8 @@ void reset_counters();
 size_t tracked_list_count();
 size_t tracked_recording_count();
 size_t tracked_queue_fence_count();
+#ifdef NR_TOOLS_BUILD
+void set_test_fail_queue_signal(bool fail);
+#endif
 
 }  // namespace nr::pe::d3d12_direct
