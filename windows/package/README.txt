@@ -192,7 +192,8 @@ standalone: DX11 / DX12 programs, video players, Magpie or capture viewers witho
 reshade-feeder routes: Home opens ReShade; the NR settings are on the Add-ons page, laid out as NR
             Control:
             - Direct Present ([DlssNr] DirectPresent = auto, default): when DLSS5_Feed.fx is not installed
-              or enabled, ReShade runs guide-less NR directly at Present without motion-vector shaders.
+              (or set DirectPresent = always when DLSS5_Feed is loaded but disabled), ReShade runs guide-less
+              NR directly at Present without motion-vector shaders.
             - The same pages as NR Control (NR settings, Network with the Layers switch, Preprocess, HUD FIX,
               Hotkeys, Screenshot, Compare, Diagnostics, Status), plus Motion vectors (VORT or LumeniteFX
               Kernel) and Language (with Text size); the menu's size and font are ReShade's own settings.

@@ -184,7 +184,7 @@ std::atomic<ULONGLONG> g_last_beat{0};
 std::atomic<unsigned long long> g_beats{0};
 std::atomic<ULONGLONG> g_last_game{0};
 std::atomic<unsigned long long> g_games{0};
-constexpr ULONGLONG kGameStallMs = 3000;
+constexpr ULONGLONG kGameStallMs = 8000;
 constexpr int kMaxGameReports = 2;
 std::atomic<int> g_reports{0};
 constexpr int kMaxReports = 4;
@@ -392,6 +392,14 @@ std::vector<std::string> take_report(const char* why) {
         std::snprintf(b, sizeof b, "[nr] watchdog: thread %lu is in NR's step \"%s\" for %llu ms", (unsigned long)s.tid.load(),
                       what, (unsigned long long)(now - s.since.load()));
         out.push_back(b);
+    }
+    static const bool capture_stacks = [] {
+        char v[8] = {};
+        return GetEnvironmentVariableA("NR_WATCHDOG_STACKS", v, sizeof v) && v[0] == '1';
+    }();
+    if (!capture_stacks) {
+        out.push_back("[nr] watchdog: thread stacks skipped (set NR_WATCHDOG_STACKS=1 to capture)");
+        return out;
     }
     Modules mods;
     std::vector<DWORD> tids;

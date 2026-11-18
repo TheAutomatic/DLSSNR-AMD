@@ -44,6 +44,7 @@ fi
 cd -- "$(dirname -- "$0")/../.."
 bash windows/build/check_paths.sh   # UTF-8 paths only (a game folder with any letters)
 bash windows/build/check_imgui.sh   # ReShade's ImGui is MSVC's: no ImVec2-returning call from the add-on's code
+python3 windows/build/check_outer_aco.py > /dev/null
 out=$(realpath -m -- "${1:-artifacts/windows/package-build}")
 case "$out" in "$(pwd)"/*) ;; *) echo 'build directory must be in the project' >&2; exit 2;; esac
 mkdir -p -- "$out"

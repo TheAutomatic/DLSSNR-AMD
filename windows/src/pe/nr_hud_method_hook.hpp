@@ -80,11 +80,41 @@ template<class R, class... A> struct MethodHook<R(STDMETHODCALLTYPE*)(A...)> {
         return install_at(target, nullptr, detour, out_next);
     }
 
+    static MH_STATUS remove_raw(void* target, Fn detour, Fn* out_next) {
+        if (out_next) *out_next = nullptr;
+        if (!target || !detour) return MH_OK;
+        std::lock_guard<std::mutex> lock(mutex);
+        for (Slot& s : slots) {
+            if (s.target != target) continue;
+            const size_t d = s.depth.load(std::memory_order_relaxed);
+            for (size_t k = 0; k < d; ++k) {
+                if (s.stages[k].raw != detour) continue;
+                for (size_t j = k; j + 1 < d; ++j) s.stages[j] = s.stages[j + 1];
+                s.stages[d - 1] = {};
+                s.depth.store(d - 1, std::memory_order_release);
+                if (d == 1) {
+                    MH_DisableHook(target);
+                    MH_RemoveHook(target);
+                    s.target = nullptr;
+                    s.original = nullptr;
+                }
+                return MH_OK;
+            }
+        }
+        return MH_OK;
+    }
+
 private:
     static MH_STATUS install_at(void* target, Handler handler, Fn detour, Fn* out_next) {
-        if (!target || (!handler && !detour)) return MH_ERROR_NOT_CREATED;
+        if (!target || (!handler && !detour)) {
+            if (out_next) *out_next = nullptr;
+            return MH_ERROR_NOT_CREATED;
+        }
         const MH_STATUS init = ensure_init();
-        if (init != MH_OK) return init;
+        if (init != MH_OK) {
+            if (out_next) *out_next = nullptr;
+            return init;
+        }
 
         std::lock_guard<std::mutex> lock(mutex);
         constexpr auto entries = entry_detours(std::make_index_sequence<kMaxSlots>{});
@@ -101,7 +131,10 @@ private:
                     return MH_OK;
                 }
             }
-            if (d >= kMaxStages) return MH_ERROR_MEMORY_ALLOC;
+            if (d >= kMaxStages) {
+                if (out_next) *out_next = nullptr;
+                return MH_ERROR_MEMORY_ALLOC;
+            }
             const Fn next_fn = (d == 0) ? s.original : stages_tbl[i][d - 1];
             if (out_next) *out_next = next_fn;
             s.stages[d] = Stage{handler, detour};
@@ -117,6 +150,7 @@ private:
                                              reinterpret_cast<void**>(&s.original));
             if (status != MH_OK) {
                 s.stages[0] = {};
+                if (out_next) *out_next = nullptr;
                 return status;
             }
             if (out_next) *out_next = s.original;
@@ -127,11 +161,13 @@ private:
                 s.depth.store(0, std::memory_order_release);
                 s.stages[0] = {};
                 s.original = nullptr;
+                if (out_next) *out_next = nullptr;
                 return status;
             }
             s.target = target;
             return MH_OK;
         }
+        if (out_next) *out_next = nullptr;
         return MH_ERROR_MEMORY_ALLOC;
     }
 };

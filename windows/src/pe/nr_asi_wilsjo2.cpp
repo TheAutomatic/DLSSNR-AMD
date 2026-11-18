@@ -269,7 +269,7 @@ w2::Stage* programs(ID3D12Device* device, std::string* why) {
 w2::Stage* programs_wait(ID3D12Device* device, std::string* why) {
     if (w2::Stage* st = programs(device, why)) return st;
     std::unique_lock<std::mutex> l(g_programs.m);
-    g_programs.cv.wait_for(l, std::chrono::seconds(5), [&] {
+    g_programs.cv.wait_for(l, std::chrono::milliseconds(250), [&] {
         return g_programs.device != device || g_programs.state != 1;
     });
     if (g_programs.device == device && g_programs.state == 2) return g_programs.stage.get();

@@ -21,6 +21,7 @@ command -v "$cxx" >/dev/null || { echo "no mingw cross compiler ($cxx)" >&2; exi
 minhook=artifacts/ref/DLSS5-Feeder/external/minhook
 [[ -d "$minhook" ]] || { echo "missing reference headers: $minhook" >&2; exit 1; }
 [[ -d toolchain/Vulkan-Headers/include ]] || { echo "missing toolchain/Vulkan-Headers" >&2; exit 1; }
+python3 windows/build/check_outer_aco.py > /dev/null
 
 stamp=${NR_STAMP:-$(bash windows/build/version.sh)}
 # pNext sizes for the device watcher, which adds the network's features to the game's Vulkan device.
@@ -112,7 +113,7 @@ if [[ ${NR_TOOLS:-0} == 1 ]]; then
     "$cxx" "${common[@]}" -c windows/tools/test_d3d12_offline.cpp -o "$out/test_d3d12_offline.o"
     "$cxx" -o "$out/test_d3d12_offline.exe" "$out/test_d3d12_offline.o" "${objs[@]:1}" "$out/vulkan_lazy_s.o" \
         "$out/vulkan_lazy_c.o" "${ldflags[@]}" -lgdi32 -luuid -lpsapi -lshlwapi -ldwmapi
-    "$cxx" "${common[@]}" -c windows/tools/test_d3d12_direct_r33.cpp -o "$out/test_d3d12_direct_r33.o"
+    "$cxx" "${common[@]}" -I"$minhook/include" -c windows/tools/test_d3d12_direct_r33.cpp -o "$out/test_d3d12_direct_r33.o"
     "$cxx" -o "$out/test_d3d12_direct_r33.exe" "$out/test_d3d12_direct_r33.o" "${objs[@]:1}" "$out/vulkan_lazy_s.o" \
         "$out/vulkan_lazy_c.o" "${ldflags[@]}" -lgdi32 -luuid -lpsapi -lshlwapi -ldwmapi
 fi

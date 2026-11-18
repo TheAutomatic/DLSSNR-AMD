@@ -672,6 +672,17 @@ if ($Lumenite -eq 'on') {
 }
 if (Test-Path -LiteralPath $manifest) { Say 'Found a previous installation, removing it first.'; Remove-Installed }
 
+$otherProxies = @()
+foreach ($dllName in @('winmm.dll', 'version.dll', 'dwmapi.dll', 'dinput8.dll', 'dsound.dll', 'ReShade64.dll')) {
+    if (Test-Path -LiteralPath (Join-Path $game $dllName)) { $otherProxies += $dllName }
+}
+if ($Route -notin @('optiscaler', 'standalone', 'reshade-feeder') -and (Test-Path -LiteralPath (Join-Path $game 'dxgi.dll'))) {
+    $otherProxies += 'dxgi.dll'
+}
+if ($otherProxies.Count -gt 0) {
+    Say ("Note: existing injector/proxy DLL(s) detected in ${game}: $($otherProxies -join ', '). Chaining multiple overlays or Present hooks (e.g., winmm mod loaders or external ReShade) alongside this route can conflict; remove extras or set [NRControl] SystemPresentHook = 0 if startup crashes.")
+}
+
 Set-Content -LiteralPath $manifest -Value "F $ManifestName" -Encoding UTF8
 Put-Tree (Join-Path $here 'dlssnr-amd') 'dlssnr-amd'
 if ($modelFrom -ne $modelPath) { Copy-Item -LiteralPath $modelFrom -Destination (Join-Path $game 'dlssnr-amd\CC_SILVER_AARDWOLD.bin') -Force }

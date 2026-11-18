@@ -91,6 +91,8 @@ public:
     uint32_t record(ID3D12GraphicsCommandList* cmd, const Frame& f, const Frame::Net& net);
     // False when the last record() could not make a surface it needed: 0 passes then is not a copy-through.
     bool record_ok() const;
+    // True when the last record() wrote barriers, copies, or dispatches into `cmd`.
+    bool cmd_touched() const;
     // True when this frame's network call actually ran (the stage copied through otherwise).
     bool net_ran() const;
     // Answers whether the frame with this number has finished on the GPU; a descriptor slot is rewritten only then.

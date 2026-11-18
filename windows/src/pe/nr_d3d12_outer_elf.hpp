@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -46,6 +47,10 @@ struct OuterBinding {
 struct OuterKernel {
     ID3D12PipelineState* pso = nullptr;
     uint32_t wg[3]{1, 1, 1};
+    uint32_t root_push_dwords = 0;
+    uint32_t desc_zero_bytes = kOuterPushOff;
+    bool needs_slot_push = true;
+    bool needs_slot_grid = true;
     std::vector<OuterBinding> bindings;
 
     const OuterBinding* find_binding(uint32_t binding) const {
@@ -68,7 +73,7 @@ struct KernelEntry {
 };
 
 inline bool create_outer_root_signature(ID3D12Device* device, ID3D12RootSignature** out_rs, std::string* why) {
-    return elf::create_carrier_root_signature(device, 1, out_rs, why);
+    return elf::create_carrier_root_signature(device, elf::kOuterRootConstants, out_rs, why);
 }
 
 class OuterArchive {
@@ -121,6 +126,11 @@ public:
             pos += name_len;
             std::memcpy(e.wg, raw.data() + pos, 12);
             pos += 12;
+            const uint64_t wg_total = uint64_t(e.wg[0]) * e.wg[1] * e.wg[2];
+            if (!e.wg[0] || !e.wg[1] || !e.wg[2] || wg_total > 1024ull) {
+                if (why) *why = "outer archive kernel workgroup size is invalid: " + e.name;
+                return false;
+            }
             uint16_t nb = 0;
             std::memcpy(&nb, raw.data() + pos, 2);
             pos += 2;
@@ -137,6 +147,37 @@ public:
                 std::memcpy(&b.offset, raw.data() + pos + 4, 2);
                 std::memcpy(&b.stride, raw.data() + pos + 6, 2);
                 pos += 8;
+                if (b.kind != kSrvTex && b.kind != kUavTex && b.kind != kBuf) {
+                    if (why) *why = "outer archive kernel has unsupported binding kind: " + e.name;
+                    return false;
+                }
+                if (b.pad != 0) {
+                    if (why) *why = "outer archive kernel has non-zero binding pad: " + e.name;
+                    return false;
+                }
+                const bool stride_ok =
+                    (b.kind == kSrvTex && (b.stride == 32u || b.stride == 64u)) ||
+                    (b.kind == kUavTex && b.stride == 32u) ||
+                    (b.kind == kBuf && b.stride == 16u);
+                if (!stride_ok) {
+                    if (why) *why = "outer archive kernel binding stride mismatch: " + e.name;
+                    return false;
+                }
+                const uint32_t bytes = b.kind == kBuf ? 16u : 32u;
+                const uint32_t align = b.kind == kBuf ? 4u : 32u;
+                if ((b.offset % align) != 0 || uint32_t(b.offset) + bytes > kOuterPushOff) {
+                    if (why) *why = "outer archive kernel binding offset out of bounds or unaligned: " + e.name;
+                    return false;
+                }
+                for (uint16_t k = 0; k < j; ++k) {
+                    const uint32_t k_bytes = e.bindings[k].kind == kBuf ? 16u : 32u;
+                    const uint32_t a0 = b.offset, a1 = uint32_t(b.offset) + bytes;
+                    const uint32_t b0 = e.bindings[k].offset, b1 = uint32_t(e.bindings[k].offset) + k_bytes;
+                    if (a0 < b1 && b0 < a1) {
+                        if (why) *why = "outer archive kernel has overlapping descriptor bindings: " + e.name;
+                        return false;
+                    }
+                }
             }
             const uint32_t nrp_len = elf::ru32(raw.data(), pos);
             pos += 4;
@@ -146,6 +187,10 @@ public:
             }
             e.nrp.assign(raw.begin() + pos, raw.begin() + pos + nrp_len);
             pos += nrp_len;
+            if (by_name_.count(e.name)) {
+                if (why) *why = "duplicate outer archive kernel: " + e.name;
+                return false;
+            }
             by_name_[e.name] = entries_.size();
             entries_.push_back(std::move(e));
         }
@@ -180,9 +225,11 @@ public:
         }
         elf::Bytes binary;
         uint32_t dims[3]{};
+        elf::OuterElfLayout layout;
         std::string err;
         if (!elf::build_model_elf_from_nrp(entry.nrp.data(), entry.nrp.size(), entry.wg,
-                                           &binary, dims, &err, gfx11, kOuterPushOff, kOuterGridOff)) {
+                                           &binary, dims, &err, gfx11, kOuterPushOff, kOuterGridOff,
+                                           elf::kOuterRootConstants, &layout)) {
             if (why) *why = name + ": " + err;
             return false;
         }
@@ -193,8 +240,17 @@ public:
             return false;
         }
         if (gfx11 && mach_used) d3d12_passthrough::set_gfx11_mach(mach_used);
+        uint32_t desc_end = 0;
+        for (const auto& b : entry.bindings) {
+            const uint32_t sz = b.kind == kBuf ? 16u : 32u;
+            desc_end = (std::max)(desc_end, uint32_t(b.offset) + sz);
+        }
         out->pso = pso;
         std::memcpy(out->wg, dims, sizeof dims);
+        out->root_push_dwords = layout.root_push_dwords;
+        out->desc_zero_bytes = desc_end;
+        out->needs_slot_push = layout.needs_slot_push;
+        out->needs_slot_grid = layout.needs_slot_grid;
         out->bindings = std::move(entry.bindings);
         return true;
     }
@@ -235,8 +291,12 @@ struct OuterSlot {
     uint64_t gpu_va = 0;
     uintptr_t srd_cpu = 0;
     std::mutex* srd_mu = nullptr;
+    mutable uint32_t rc[elf::kOuterRootConstants]{};
 
-    void zero() const { std::memset(cpu, 0, kSlotBytes); }
+    void zero(uint32_t bytes = kSlotBytes) const {
+        const uint32_t n = (std::min)(bytes, kSlotBytes);
+        if (n) std::memset(cpu, 0, n);
+    }
 
     void write_srv_tex(ID3D12Device* dev, const OuterBinding* b, ID3D12Resource* res, DXGI_FORMAT fmt,
                        uint32_t most_detailed_mip = 0, uint32_t mip_levels = 1) const {
@@ -271,16 +331,26 @@ struct OuterSlot {
         elf::put_buf(reinterpret_cast<uint32_t*>(cpu + b->offset), va, sz);
     }
 
-    void write_push(const void* data, uint32_t bytes) const {
-        if (data && bytes) std::memcpy(cpu + kOuterPushOff, data, (std::min)(bytes, kMaxPushBytes));
+    void write_push(const void* data, uint32_t bytes, const OuterKernel* k = nullptr) const {
+        if (!data || !bytes) return;
+        const uint32_t rc_n = k ? k->root_push_dwords : elf::kOuterRootConstants;
+        if (rc_n) {
+            std::memset(rc, 0, sizeof(uint32_t) * rc_n);
+            std::memcpy(rc, data, (std::min)(bytes, rc_n * 4u));
+        }
+        if (!k || k->needs_slot_push)
+            std::memcpy(cpu + kOuterPushOff, data, (std::min)(bytes, kMaxPushBytes));
     }
 
     void dispatch(ID3D12GraphicsCommandList* cmd, ID3D12RootSignature* rs_outer, const OuterKernel& k,
                   uint32_t gx, uint32_t gy = 1, uint32_t gz = 1, bool set_rs = true) const {
-        const uint32_t grid[3] = {gx, gy, gz};
-        std::memcpy(cpu + kOuterGridOff, grid, sizeof grid);
+        if (k.needs_slot_grid) {
+            const uint32_t grid[3] = {gx, gy, gz};
+            std::memcpy(cpu + kOuterGridOff, grid, sizeof grid);
+        }
         if (set_rs) cmd->SetComputeRootSignature(rs_outer);
         cmd->SetPipelineState(k.pso);
+        if (k.root_push_dwords) cmd->SetComputeRoot32BitConstants(0, k.root_push_dwords, rc, 0);
         cmd->SetComputeRootUnorderedAccessView(1, gpu_va);
         cmd->Dispatch(gx, gy, gz);
     }
@@ -367,12 +437,13 @@ public:
         }
         srd_cpu_ = 0;
         device_ = nullptr;
+        peak_blocks_ = 0;
     }
 
-    OuterSlot acquire(const nr::gpu::Ticket& ticket, std::string* why = nullptr) {
+    OuterSlot acquire(const nr::gpu::Ticket& ticket, std::string* why = nullptr, uint32_t zero_bytes = kSlotBytes) {
         for (Block& b : blocks_) {
             OuterSlot s;
-            if (try_claim(b, ticket, &s)) return s;
+            if (try_claim(b, ticket, &s, zero_bytes)) return s;
         }
         std::string err;
         if (!add_block(&err)) {
@@ -380,12 +451,23 @@ public:
             return {};
         }
         OuterSlot s;
-        if (try_claim(blocks_.back(), ticket, &s)) return s;
+        if (try_claim(blocks_.back(), ticket, &s, zero_bytes)) return s;
         if (why) *why = "outer descriptor pool: fresh block has no aligned slot";
         return {};
     }
 
+    bool reserve(uint32_t count, std::string* why = nullptr) {
+        uint32_t free_slots = count_free_slots();
+        while (free_slots < count) {
+            if (!add_block(why)) return false;
+            free_slots = count_free_slots();
+        }
+        return true;
+    }
+
+    void set_max_blocks(uint32_t max_blocks) { max_blocks_ = (std::max)(max_blocks, 1u); }
     size_t block_count() const { return blocks_.size(); }
+    size_t peak_blocks() const { return peak_blocks_; }
 
 private:
     struct Block {
@@ -411,6 +493,10 @@ private:
 
     // Confirm CPU-only SRDs match SHADER_VISIBLE SRDs bit-for-bit before trusting them for GPU execution.
     bool verify_srd_layout(std::string* why) const {
+        if (const char* f = std::getenv("NR_TEST_FAIL_SRD_PROBE"); f && f[0] == '1') {
+            if (why) *why = "forced SRD probe failure (NR_TEST_FAIL_SRD_PROBE=1)";
+            return false;
+        }
         D3D12_DESCRIPTOR_HEAP_DESC hd{};
         hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         hd.NumDescriptors = 1;
@@ -419,6 +505,12 @@ private:
         HRESULT hr = device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&vis));
         if (FAILED(hr) || !vis) {
             if (why) *why = "CreateDescriptorHeap(SRD probe) " + elf::hr_hex(hr);
+            return false;
+        }
+        const uintptr_t vis_cpu = uintptr_t(vis->GetCPUDescriptorHandleForHeapStart().ptr);
+        if (!readable_ptr(vis_cpu, 32u)) {
+            vis->Release();
+            if (why) *why = "shader-visible descriptor heap handle is opaque";
             return false;
         }
         D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
@@ -430,31 +522,50 @@ private:
         td.MipLevels = 1;
         td.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         td.SampleDesc.Count = 1;
-        ID3D12Resource* probe = nullptr;
+        td.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        ID3D12Resource* probe_tex = nullptr;
         hr = device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COMMON,
-                                              nullptr, IID_PPV_ARGS(&probe));
-        if (FAILED(hr) || !probe) {
+                                              nullptr, IID_PPV_ARGS(&probe_tex));
+        td.Format = DXGI_FORMAT_R32_TYPELESS;
+        td.Flags = D3D12_RESOURCE_FLAG_NONE;
+        ID3D12Resource* probe_depth = nullptr;
+        HRESULT hr_d = device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COMMON,
+                                                        nullptr, IID_PPV_ARGS(&probe_depth));
+        if (FAILED(hr) || !probe_tex || FAILED(hr_d) || !probe_depth) {
+            if (probe_tex) probe_tex->Release();
+            if (probe_depth) probe_depth->Release();
             vis->Release();
-            if (why) *why = "CreateCommittedResource(SRD probe) " + elf::hr_hex(hr);
+            if (why) *why = "CreateCommittedResource(SRD probe) " + elf::hr_hex(FAILED(hr) ? hr : hr_d);
             return false;
         }
-        const uintptr_t vis_cpu = uintptr_t(vis->GetCPUDescriptorHandleForHeapStart().ptr);
-        if (!readable_ptr(vis_cpu, 32u)) {
-            probe->Release();
-            vis->Release();
-            if (why) *why = "shader-visible descriptor heap handle is opaque";
-            return false;
-        }
+        auto matches = [&]() -> bool {
+            return std::memcmp(reinterpret_cast<const void*>(srd_cpu_),
+                               reinterpret_cast<const void*>(vis_cpu), 32u) == 0;
+        };
         D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
         srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         srv.Texture2D.MipLevels = 1;
-        device_->CreateShaderResourceView(probe, &srv, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(srd_cpu_)});
-        device_->CreateShaderResourceView(probe, &srv, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(vis_cpu)});
-        const bool same = std::memcmp(reinterpret_cast<const void*>(srd_cpu_),
-                                      reinterpret_cast<const void*>(vis_cpu), 32u) == 0;
-        probe->Release();
+        device_->CreateShaderResourceView(probe_tex, &srv, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(srd_cpu_)});
+        device_->CreateShaderResourceView(probe_tex, &srv, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(vis_cpu)});
+        bool same = matches();
+        if (same) {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+            uav.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            device_->CreateUnorderedAccessView(probe_tex, nullptr, &uav, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(srd_cpu_)});
+            device_->CreateUnorderedAccessView(probe_tex, nullptr, &uav, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(vis_cpu)});
+            same = matches();
+        }
+        if (same) {
+            srv.Format = DXGI_FORMAT_R32_FLOAT;
+            device_->CreateShaderResourceView(probe_depth, &srv, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(srd_cpu_)});
+            device_->CreateShaderResourceView(probe_depth, &srv, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(vis_cpu)});
+            same = matches();
+        }
+        probe_depth->Release();
+        probe_tex->Release();
         vis->Release();
         if (!same) {
             if (why) *why = "CPU and shader-visible hardware SRD encodings differ";
@@ -463,7 +574,28 @@ private:
         return true;
     }
 
+    uint32_t count_free_slots() const {
+        uint32_t n_free = 0;
+        for (const Block& b : blocks_) {
+            for (uint32_t idx = 0; idx < slots_per_block_; ++idx) {
+                const uint64_t va = b.gpu_base + uint64_t(idx) * kSlotBytes;
+                if ((va >> 32) != ((va + kSlotBytes - 1u) >> 32)) continue;
+                if (b.used[idx]) {
+                    if (!b.owners[idx]) continue;
+                    const bool done = completed_ ? completed_(b.owners[idx]) : b.owners[idx]->ready();
+                    if (!done) continue;
+                }
+                ++n_free;
+            }
+        }
+        return n_free;
+    }
+
     bool add_block(std::string* why) {
+        if (blocks_.size() >= max_blocks_) {
+            if (why) *why = "outer descriptor pool reached max block cap (" + std::to_string(max_blocks_) + ")";
+            return false;
+        }
         D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_UPLOAD};
         D3D12_RESOURCE_DESC rd{};
         rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -495,10 +627,11 @@ private:
         b.owners.resize(slots_per_block_);
         b.used.assign(slots_per_block_, 0u);
         blocks_.push_back(std::move(b));
+        peak_blocks_ = (std::max)(peak_blocks_, blocks_.size());
         return true;
     }
 
-    bool try_claim(Block& b, const nr::gpu::Ticket& ticket, OuterSlot* out) {
+    bool try_claim(Block& b, const nr::gpu::Ticket& ticket, OuterSlot* out, uint32_t zero_bytes) {
         for (uint32_t n = 0; n < slots_per_block_; ++n) {
             const uint32_t idx = (b.next + n) % slots_per_block_;
             const uint64_t va = b.gpu_base + uint64_t(idx) * kSlotBytes;
@@ -516,7 +649,7 @@ private:
             out->gpu_va = va;
             out->srd_cpu = srd_cpu_;
             out->srd_mu = &srd_mutex_;
-            out->zero();
+            out->zero(zero_bytes);
             return true;
         }
         return false;
@@ -527,6 +660,8 @@ private:
     uintptr_t srd_cpu_ = 0;
     std::mutex srd_mutex_;
     uint32_t slots_per_block_ = 512;
+    uint32_t max_blocks_ = 64;
+    size_t peak_blocks_ = 0;
     CompletedFn completed_;
     RetireFn retire_;
     std::vector<Block> blocks_;

@@ -220,9 +220,9 @@ public:
             ensure_(r, write ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             binds.push_back({b, r, f, write});
         }
-        const d3d12_outer::OuterSlot slot = acquire_slot();
+        const d3d12_outer::OuterSlot slot = acquire_slot(k.desc_zero_bytes);
         d3d12_il::write_outer_binds(device_, slot, k, binds.data(), binds.size());
-        slot.write_push(push, bytes);
+        slot.write_push(push, bytes, &k);
         slot.dispatch(cmd_, rs_outer_, k, gx, gy, 1u, true);
         D3D12_RESOURCE_BARRIER b{};
         b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
@@ -255,7 +255,7 @@ public:
         for (const w2::Image* ri : reads)
             if (!is_copy(resource(*ri))) ensure_(resource(*ri), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
-        const d3d12_outer::OuterSlot slot = acquire_slot();
+        const d3d12_outer::OuterSlot slot = acquire_slot(k.desc_zero_bytes);
         for (UINT i = 0; i < 4; ++i) {
             ID3D12Resource* r = resource(*reads[i]);
             const D3D12_RESOURCE_DESC rd = r->GetDesc();
@@ -277,7 +277,7 @@ public:
             if (const auto* ob = k.find_binding(4u + i))
                 slot.write_uav_tex(device_, ob, r, fmt, 0);
         }
-        slot.write_push(&d.constants, sizeof(w2::Constants));
+        slot.write_push(&d.constants, sizeof(w2::Constants), &k);
 
         const uint32_t gx = mode == w2::kMeter ? d.constants.width : mode == w2::kPrepMeter ? 1u : (d.constants.width + 7u) / 8u;
         const uint32_t gy = mode == w2::kMeter ? d.constants.height : mode == w2::kPrepMeter ? 1u : (d.constants.height + 7u) / 8u;
@@ -314,7 +314,7 @@ public:
             else ensure_(r, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         }
 
-        const d3d12_outer::OuterSlot slot = acquire_slot();
+        const d3d12_outer::OuterSlot slot = acquire_slot(k.desc_zero_bytes);
         for (uint32_t i = 0; i < count; ++i) {
             const uint32_t b = images[i].binding;
             if (b >= 8u) continue;
@@ -336,7 +336,7 @@ public:
                     slot.write_srv_tex(device_, ob, r, fmt, images[i].image.mip, 1);
             }
         }
-        slot.write_push(push, bytes);
+        slot.write_push(push, bytes, &k);
         slot.dispatch(cmd_, rs_outer_, k, gx, gy, 1u, true);
 
         D3D12_RESOURCE_BARRIER b{};
@@ -382,13 +382,13 @@ private:
         }
         u.tickets.swap(keep);
     }
-    d3d12_outer::OuterSlot acquire_slot() {
+    d3d12_outer::OuterSlot acquire_slot(uint32_t zero_bytes = d3d12_outer::kSlotBytes) {
         const nr::gpu::Ticket ticket = ticket_here();
         prune(uses_);
         if (ticket && std::find(uses_.tickets.begin(), uses_.tickets.end(), ticket) == uses_.tickets.end())
             uses_.tickets.push_back(ticket);
         std::string err;
-        d3d12_outer::OuterSlot slot = outer_pool_.acquire(ticket, &err);
+        d3d12_outer::OuterSlot slot = outer_pool_.acquire(ticket, &err, zero_bytes);
         if (!slot.cpu)
             throw std::runtime_error("wilsjo2 stage (D3D12): " + (err.empty() ? "no outer descriptor slot" : err));
         return slot;

@@ -666,6 +666,8 @@ def main() -> int:
         targets = [t for t in targets if t[0] in wanted]
     for amdgpu_id, mach, align, out_path in targets:
         build_archive(amdgpu_id, mach, align, out_path)
+    if len(sys.argv) <= 1:
+        run_checked([sys.executable, str(ROOT / 'windows' / 'build' / 'check_outer_aco.py'), '--write-manifest'])
     return 0
 
 

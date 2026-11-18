@@ -2497,6 +2497,8 @@ void on_reloaded_effects(effect_runtime* rt) {
     if (bound && rt != bound) return;
     bound = rt;
     resolve(rt);
+    frame_fed = false;
+    effects_seen = false;
     // A reload recompiles the provider, which writes zero vectors until its
     // own history refills; do not smear history built on those forward.
     need_reset = true;
@@ -2507,6 +2509,8 @@ void on_destroy_effect_runtime(effect_runtime* rt) {
     if (rt != bound) return;
     bound = nullptr;
     technique = {}; mv_var = {}; depth_var = {};
+    frame_fed = false;
+    effects_seen = false;
 }
 
 // The Vulkan self-test: with no display to present on (a headless box), the
@@ -4105,9 +4109,9 @@ void on_finish_effects(effect_runtime* rt, command_list* cl, resource_view rtv, 
     std::lock_guard<std::mutex> guard(lock);
     if (!bound) { bound = rt; resolve(rt); }
     if (rt != bound) return;
-    effects_seen = true;
-    if (!frame_fed && direct_wanted_now() && cl && rtv.handle) {
-        feed_direct(rt, cl, rtv);
+    if (cl && rtv.handle) {
+        effects_seen = true;
+        if (!frame_fed && direct_wanted_now()) feed_direct(rt, cl, rtv);
     }
 }
 

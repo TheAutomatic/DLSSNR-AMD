@@ -1592,9 +1592,15 @@ void capture_guides(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, const 
     // (the full barrier only where the depth is copied - the race it closes was the depth's; a motion-only copy, the
     // usual Present layer (Motion Without Depth), takes the transitions alone, as 0.0.8.3: no GPU-wide wait a frame)
     if (depth_wanted) guide_copy_barrier(cmd);
+    bool depth_copied = !depth_by_pass;
     if (depth_by_pass && !depth_read_into(cmd, device, f.depth, st.depth, target->depth)) {
-        target->serial = 0;
-        return;
+        static bool depth_fail_said = false;
+        if (!depth_fail_said) {
+            depth_fail_said = true;
+            log("[nr] Present layers: Direct depth readback failed; continuing with motion only");
+        }
+        release_resource(target->depth);
+        depth_copied = false;
     }
     for (const auto& pr : pairs) {
         if (!pr.first) continue;
@@ -1603,6 +1609,7 @@ void capture_guides(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, const 
         transition(cmd, pr.second.first, D3D12_RESOURCE_STATE_COPY_SOURCE, pr.second.second);
     }
     target->f = f;
+    if (!depth_copied) target->f.depth = nullptr;
     target->w2 = wf;
     target->serial = ++g_present.serial;
     target->captured_at = g_present.presents;
@@ -8959,7 +8966,7 @@ extern "C" __declspec(dllexport) void InitializeASI() {
     nr::asi::hudcap::set_game_caller(&game_fg_call);
     nr::asi::hudcap::set_capture_wanted_query(&hud_capture_wanted_at_start);
     nr::pe::set_module(g_opti);   // dlssnr-amd.ini, dlssnr-amd\, the log and control.bin sit beside OptiScaler
-    nr::pe::install_crash_watch();
+    nr::pe::install_crash_watch(reinterpret_cast<void*>(g_opti));
     // an exception that leaves one of NR's threads ends the process through std::terminate: said in the log first
     std::set_terminate([] {
         log("[nr] std::terminate: an exception left one of NR's threads; the process ends");

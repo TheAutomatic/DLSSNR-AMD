@@ -16,6 +16,7 @@
 #include <d3d12.h>
 #include <dxgi1_6.h>
 
+#include "nr_asi_wilsjo2.hpp"
 #include "nr_d3d12_direct_state.hpp"
 #include "nr_d3d12_passthrough.hpp"
 #include "nr_d3d12_passthrough_backend.hpp"
@@ -24,9 +25,11 @@
 #include "nr_dlssnr_model.hpp"
 #include "nr_ini_int4.hpp"
 #include "nr_ini_network.hpp"
+#include "nr_pe_bridge.hpp"
 #include "nr_pe_config.hpp"
 #include "nr_pe_d3d12split.hpp"
 #include "nr_pe_log.hpp"
+#include "nr_pe_menu.hpp"
 #include "nr_pe_renodx_route.hpp"
 #include "nr_pe_session.hpp"
 #include "nr_renodx.hpp"
@@ -142,9 +145,89 @@ static int compare_dumps(const char* a, const char* b) {
             worst = std::max(worst, std::abs(d));
         }
     const double mse = se / (3.0 * double(x.size()));
+    if (!std::isfinite(se) || !std::isfinite(mse)) {
+        std::printf("FAIL: non-finite MSE during dump comparison\n");
+        return 1;
+    }
     std::printf("%s vs %s: PSNR %.2f dB, largest difference %d / 1023\n", a, b,
                 mse > 0 ? 10.0 * std::log10(1023.0 * 1023.0 / mse) : 999.0, worst);
     return 0;
+}
+
+static bool check_pixels_vs_ref(const std::vector<uint32_t>& got, const std::vector<uint32_t>& in_px,
+                                uint32_t w, uint32_t h, const char* ref_path, const char* tag,
+                                double min_psnr, double max_diff) {
+    const double total_px = double(w) * h;
+    uint64_t changed = 0, black = 0;
+    double diff_sum = 0.0;
+    for (size_t i = 0; i < got.size(); ++i) {
+        const uint32_t out_p = got[i] & 0x3fffffffu;
+        const uint32_t in_p = in_px[i] & 0x3fffffffu;
+        if (out_p != in_p) ++changed;
+        if (out_p == 0) ++black;
+        const int dr = int(got[i] & 1023u) - int(in_px[i] & 1023u);
+        const int dg = int((got[i] >> 10) & 1023u) - int((in_px[i] >> 10) & 1023u);
+        const int db = int((got[i] >> 20) & 1023u) - int((in_px[i] >> 20) & 1023u);
+        diff_sum += (std::abs(dr) + std::abs(dg) + std::abs(db)) / (3.0 * 1023.0);
+    }
+    const double mean_diff = total_px > 0.0 ? diff_sum / total_px : 0.0;
+    const double black_pct = total_px > 0.0 ? 100.0 * double(black) / total_px : 0.0;
+    const double changed_pct = total_px > 0.0 ? 100.0 * double(changed) / total_px : 0.0;
+    if (!std::isfinite(diff_sum) || total_px <= 0.0) {
+        std::printf("FAIL (%s): non-finite readback metric\n", tag);
+        return false;
+    }
+    std::printf("Readback %s (%ux%u): %.2f%% modified, mean |diff| = %.5f, black = %.2f%%\n",
+                tag, w, h, changed_pct, mean_diff, black_pct);
+    if (mean_diff > max_diff || black_pct > 5.0) {
+        std::printf("FAIL (%s): image quality gate failed (mean |diff|=%.5f > %.5f or black=%.2f%% > 5.0%%)\n",
+                    tag, mean_diff, max_diff, black_pct);
+        return false;
+    }
+    if (!ref_path) return true;
+    std::vector<uint32_t> ref;
+    FILE* f = std::fopen(ref_path, "rb");
+    if (!f) {
+        std::printf("FAIL (%s): cannot open ref %s\n", tag, ref_path);
+        return false;
+    }
+    std::fseek(f, 0, SEEK_END);
+    const long n = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    ref.resize(size_t(n > 0 ? n : 0) / 4);
+    const bool ok = n > 0 && std::fread(ref.data(), 4, ref.size(), f) == ref.size();
+    std::fclose(f);
+    if (!ok || ref.size() != got.size()) {
+        std::printf("FAIL (%s): ref size mismatch (%zu vs %zu)\n", tag, ref.size(), got.size());
+        return false;
+    }
+    double se = 0.0;
+    int worst = 0;
+    uint32_t wx = 0, wy = 0;
+    for (uint32_t y = 0; y < h; ++y) {
+        for (uint32_t x = 0; x < w; ++x) {
+            const size_t idx = size_t(y) * w + x;
+            for (int c = 0; c < 3; ++c) {
+                const int d = int((got[idx] >> (10 * c)) & 1023u) - int((ref[idx] >> (10 * c)) & 1023u);
+                se += double(d) * d;
+                const int ad = std::abs(d);
+                if (ad > worst) { worst = ad; wx = x; wy = y; }
+            }
+        }
+    }
+    const double mse = se / (3.0 * double(got.size()));
+    const double psnr = mse > 0.0 ? 10.0 * std::log10(1023.0 * 1023.0 / mse) : 999.0;
+    if (!std::isfinite(psnr)) {
+        std::printf("FAIL (%s): non-finite PSNR\n", tag);
+        return false;
+    }
+    std::printf("Ref check %s vs %s: PSNR %.2f dB, worst %d / 1023 at (%u, %u)\n",
+                tag, ref_path, psnr, worst, wx, wy);
+    if (psnr < min_psnr) {
+        std::printf("FAIL (%s): PSNR %.2f dB < min %.2f dB\n", tag, psnr, min_psnr);
+        return false;
+    }
+    return true;
 }
 
 int main(int argc, char** argv) {
@@ -152,29 +235,46 @@ int main(int argc, char** argv) {
     if (argc == 4 && std::strcmp(argv[1], "--compare") == 0) return compare_dumps(argv[2], argv[3]);
     uint32_t W = 3840, H = 2160;
     const char* dump = nullptr;
+    const char* dump_steady = nullptr;
+    const char* ref_path = nullptr;
+    const char* ref_steady = nullptr;
+    double min_psnr = 30.0;
+    double max_diff = 0.25;
     const char *model_arg = nullptr, *layers_arg = nullptr;
     int adapter_arg = -1;
     int total_frames = argc > 1 && argv[1][0] != '-' ? std::atoi(argv[1]) : 60;
     int warmup_arg = -1;
     int frames_arg = -1;
+    int passes_arg = 1;
+    int preset_arg = 0;
     bool vulkan_bridge = false;
     bool hdr_mode = false;
     bool plain_mode = false;
+    bool wilsjo2_mode = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--vulkan") == 0) vulkan_bridge = true;
         else if (std::strcmp(argv[i], "--hdr") == 0) hdr_mode = true;
         else if (std::strcmp(argv[i], "--plain") == 0) plain_mode = true;
+        else if (std::strcmp(argv[i], "--wilsjo2") == 0) wilsjo2_mode = true;
         else if (std::strcmp(argv[i], "--width") == 0 && i + 1 < argc) W = uint32_t(std::atoi(argv[++i]));
         else if (std::strcmp(argv[i], "--height") == 0 && i + 1 < argc) H = uint32_t(std::atoi(argv[++i]));
         else if (std::strcmp(argv[i], "--warmup") == 0 && i + 1 < argc) warmup_arg = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--frames") == 0 && i + 1 < argc) frames_arg = std::atoi(argv[++i]);
+        else if (std::strcmp(argv[i], "--passes") == 0 && i + 1 < argc) passes_arg = (std::max)(1, std::atoi(argv[++i]));
+        else if (std::strcmp(argv[i], "--preset") == 0 && i + 1 < argc) preset_arg = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--adapter") == 0 && i + 1 < argc) adapter_arg = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--model") == 0 && i + 1 < argc) model_arg = argv[++i];
         else if (std::strcmp(argv[i], "--layers") == 0 && i + 1 < argc) layers_arg = argv[++i];
         else if (std::strcmp(argv[i], "--dump") == 0 && i + 1 < argc) dump = argv[++i];
+        else if (std::strcmp(argv[i], "--dump-steady") == 0 && i + 1 < argc) dump_steady = argv[++i];
+        else if (std::strcmp(argv[i], "--ref") == 0 && i + 1 < argc) ref_path = argv[++i];
+        else if (std::strcmp(argv[i], "--ref-steady") == 0 && i + 1 < argc) ref_steady = argv[++i];
+        else if (std::strcmp(argv[i], "--min-psnr") == 0 && i + 1 < argc) min_psnr = std::atof(argv[++i]);
+        else if (std::strcmp(argv[i], "--max-diff") == 0 && i + 1 < argc) max_diff = std::atof(argv[++i]);
     }
-    const int warmup_frames = warmup_arg >= 0 ? warmup_arg : std::min(5, std::max(0, total_frames - 1));
-    if (frames_arg >= 0) total_frames = (warmup_arg >= 0 ? warmup_frames : 0) + frames_arg;
+    const int warmup_frames = warmup_arg >= 0 ? warmup_arg
+                                              : (frames_arg >= 0 ? 0 : std::min(5, std::max(0, total_frames - 1)));
+    if (frames_arg >= 0) total_frames = warmup_frames + frames_arg;
     if (model_arg) {
         const int mv = nr::network_value(model_arg);
         const int lv = layers_arg ? nr::optimized_layers_value(layers_arg) : nr::kLayersDefault;
@@ -183,10 +283,10 @@ int main(int argc, char** argv) {
                        : nr::kSilverAardwold;
     }
 
-    std::printf("=== Offline D3D12 %s Test (%s) ===\n", vulkan_bridge ? "Vulkan Bridge" : "Direct ELF",
-                plain_mode ? "Plain backend" : hdr_mode ? "HDR v6" : "SDR legacy");
-    std::printf("Target: CC_SILVER_AARDWOLD_OPTIMIZED (ultra performance), %ux%u %s\n", W, H,
-                plain_mode ? "plain backend" : "RenoDX Present stage");
+    const char* route_label = wilsjo2_mode ? "wilsjo2" : plain_mode ? "Plain backend" : hdr_mode ? "HDR v6" : "SDR legacy";
+    std::printf("=== Offline D3D12 %s Test (%s) ===\n", vulkan_bridge ? "Vulkan Bridge" : "Direct ELF", route_label);
+    std::printf("Target: CC_SILVER_AARDWOLD_OPTIMIZED (ultra performance), %ux%u %s (passes=%d preset=%d)\n",
+                W, H, route_label, passes_arg, preset_arg);
 
     HMODULE sys_dxgi = LoadLibraryW(L"C:\\Windows\\System32\\dxgi.dll");
     using PFN_CreateDXGIFactory1 = HRESULT(WINAPI*)(REFIID, void**);
@@ -276,10 +376,17 @@ int main(int argc, char** argv) {
     HANDLE fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     uint64_t fence_val = 0;
     auto wait_gpu = [&]() {
-        queue->Signal(fence, ++fence_val);
+        if (FAILED(queue->Signal(fence, ++fence_val))) {
+            std::printf("FAIL: queue->Signal failed\n");
+            std::exit(1);
+        }
         if (fence->GetCompletedValue() < fence_val) {
-            fence->SetEventOnCompletion(fence_val, fence_event);
-            WaitForSingleObject(fence_event, 10000);
+            if (FAILED(fence->SetEventOnCompletion(fence_val, fence_event)) ||
+                WaitForSingleObject(fence_event, 10000) != WAIT_OBJECT_0 ||
+                fence->GetCompletedValue() < fence_val) {
+                std::printf("FAIL: fence wait timed out or did not advance\n");
+                std::exit(1);
+            }
         }
     };
 
@@ -408,14 +515,46 @@ int main(int argc, char** argv) {
     nr::renodx::Settings rs{};
     rs.nr_enabled = true;
     rs.intensity = 1.0f;
-    rs.passes = 1;
+    rs.passes = uint32_t(passes_arg);
+    rs.unlock_passes = passes_arg > 4;
+    if (preset_arg == 1 || preset_arg == 2) {
+        rs.passes_mode = 1;
+        rs.fast_method = 0;
+        rs.fast_interleaved_passes = uint32_t(std::clamp(passes_arg, 2, 8));
+        rs.fast_interleaved_preset = uint32_t(preset_arg);
+    }
     rs.look_mode = 0;
     rs.hook_point = 2;
     rs.color_strength = 1.0f;
     rs.transfer_strength = 1.0f;
     rs.detail_stability = 1;
 
+    nr::asi::Wilsjo2Owner* w2_owner = wilsjo2_mode ? nr::asi::wilsjo2_owner() : nullptr;
+    if (w2_owner) nr::asi::wilsjo2_owner_at_present(*w2_owner);
+
     auto run_one_eval = [&](int reset) {
+        if (wilsjo2_mode) {
+            nr::dlssnr::set_d3d12_native_call(true);
+            nr::pe::renodx_route::CallStyle style(false);
+            nr::pe::renodx_route::CallNetwork network(g_model_choice);
+            nr::pe::renodx_route::CallLayer number(1);
+            nr::asi::Wilsjo2Frame wf{};
+            wf.depth = depth;
+            wf.depth_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            wf.motion = motion;
+            wf.motion_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            wf.hdr = hdr_mode;
+            wf.reset = reset != 0;
+            wf.depth_rect = {0, 0, W, H};
+            wf.motion_rect = {0, 0, W, H};
+            nr::wilsjo2::Settings ws{};
+            ws.passes = uint32_t(passes_arg);
+            ws.unlock_passes = passes_arg > 4;
+            ws.white_point_source = 3;
+            nr::asi::wilsjo2_run(cmd, device, *w2_owner, wf, ws, target, W, H, false);
+            nr::dlssnr::set_d3d12_native_call(false);
+            return;
+        }
         if (plain_mode) {
             nr::dlssnr::set_d3d12_native_call(true);
             nr::pe::renodx_route::CallStyle style(false);
@@ -492,6 +631,17 @@ int main(int argc, char** argv) {
         return double(changed);
     };
 
+    struct AbandonAtExitGuard {
+        ~AbandonAtExitGuard() {
+            nr::dlssnr::abandon_at_exit();
+            nr::asi::wilsjo2_abandon_at_exit();
+            nr::asi::wilsjo2_vk_abandon_at_exit();
+            nr::pe::menu::abandon_at_exit();
+            nr::pe::bridge::Device::abandon_at_exit();
+            nr::pe::d3d12_passthrough::abandon_at_exit();
+        }
+    } abandon_guard;
+
     // Trigger background build and wait until first frame produces NR output
     const auto t_build_start = std::chrono::steady_clock::now();
     bool built = false;
@@ -522,32 +672,19 @@ int main(int argc, char** argv) {
     {
         uint8_t* mapped = nullptr;
         readback->Map(0, nullptr, reinterpret_cast<void**>(&mapped));
-        uint64_t changed = 0, black = 0;
-        double diff_sum = 0.0;
-        for (uint32_t y = 0; y < H; ++y) {
-            const auto* row = reinterpret_cast<const uint32_t*>(mapped + uint64_t(y) * fp.Footprint.RowPitch);
-            for (uint32_t x = 0; x < W; ++x) {
-                uint32_t out_px = row[x];
-                uint32_t in_px = init_pixels[size_t(y) * W + x];
-                if ((out_px & 0x3fffffffu) != (in_px & 0x3fffffffu)) ++changed;
-                if ((out_px & 0x3fffffffu) == 0) ++black;
-                int dr = int(out_px & 1023u) - int(in_px & 1023u);
-                int dg = int((out_px >> 10) & 1023u) - int((in_px >> 10) & 1023u);
-                int db = int((out_px >> 20) & 1023u) - int((in_px >> 20) & 1023u);
-                diff_sum += (std::abs(dr) + std::abs(dg) + std::abs(db)) / (3.0 * 1023.0);
-            }
-        }
+        std::vector<uint32_t> out_pixels(size_t(W) * H);
+        for (uint32_t y = 0; y < H; ++y)
+            std::memcpy(out_pixels.data() + size_t(y) * W, mapped + uint64_t(y) * fp.Footprint.RowPitch, size_t(W) * 4);
         if (dump) {
             if (FILE* f = std::fopen(dump, "wb")) {
-                for (uint32_t y = 0; y < H; ++y) std::fwrite(mapped + uint64_t(y) * fp.Footprint.RowPitch, 4, W, f);
+                std::fwrite(out_pixels.data(), 4, out_pixels.size(), f);
                 std::fclose(f);
                 std::printf("Output written to %s\n", dump);
             }
         }
         readback->Unmap(0, nullptr);
-        const double total_px = double(W) * H;
-        std::printf("Readback check (%ux%u): %.2f%% pixels modified by NR, mean |diff| = %.5f, black pixels = %.2f%%\n",
-                    W, H, 100.0 * double(changed) / total_px, diff_sum / total_px, 100.0 * double(black) / total_px);
+        if (!check_pixels_vs_ref(out_pixels, init_pixels, W, H, ref_path, "first-frame", min_psnr, max_diff))
+            return 1;
     }
 
     // Run timed loop for `total_frames` frames
@@ -588,10 +725,17 @@ int main(int argc, char** argv) {
 
         uint64_t t[2] = {};
         void* m = nullptr;
-        ts_buf->Map(0, nullptr, &m);
+        if (FAILED(ts_buf->Map(0, nullptr, &m)) || !m) {
+            std::printf("FAIL: ts_buf->Map failed\n");
+            return 1;
+        }
         std::memcpy(t, m, 16);
         ts_buf->Unmap(0, nullptr);
         const double gpu_ms = double(t[1] - t[0]) * 1000.0 / double(freq);
+        if (!std::isfinite(gpu_ms) || !std::isfinite(wall_ms) || !std::isfinite(cpu_ms)) {
+            std::printf("FAIL: non-finite timing sample\n");
+            return 1;
+        }
         // Print per-frame progression for the first 10 frames and last 5 frames
         if (f < 10 || f >= total_frames - 5) {
             std::printf("  frame %2d: D3D12 GPU span = %6.3f ms, Submit+Wait wall = %6.3f ms, CPU rec = %5.3f ms\n",
@@ -633,5 +777,24 @@ int main(int argc, char** argv) {
     std::printf("  - Pure Network GPU avg (internal):           %.3f ms\n", vk_net_ms);
     std::printf("  - RenoDX Stage + Network GPU avg (internal): %.3f ms\n", vk_stage_ms);
     std::printf("CPU evaluate_d3d12 recording time:             avg %.3f ms\n", cpu_sum / cpu_ms_list.size());
+
+    if (dump_steady || ref_steady) {
+        check_target_modified();
+        uint8_t* mapped = nullptr;
+        readback->Map(0, nullptr, reinterpret_cast<void**>(&mapped));
+        std::vector<uint32_t> steady_pixels(size_t(W) * H);
+        for (uint32_t y = 0; y < H; ++y)
+            std::memcpy(steady_pixels.data() + size_t(y) * W, mapped + uint64_t(y) * fp.Footprint.RowPitch, size_t(W) * 4);
+        if (dump_steady) {
+            if (FILE* f = std::fopen(dump_steady, "wb")) {
+                std::fwrite(steady_pixels.data(), 4, steady_pixels.size(), f);
+                std::fclose(f);
+                std::printf("Steady output written to %s\n", dump_steady);
+            }
+        }
+        readback->Unmap(0, nullptr);
+        if (!check_pixels_vs_ref(steady_pixels, init_pixels, W, H, ref_steady, "steady-state", min_psnr, max_diff))
+            return 1;
+    }
     return 0;
 }

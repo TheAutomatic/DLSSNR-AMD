@@ -1144,7 +1144,7 @@ public:
             cmd->SetComputeRootUnorderedAccessView(1, table_va + uint64_t(i) * kTableBytes);
             cmd->Dispatch(grid[0], grid[1], grid[2]);
             const bool nobar = i >= base && (i - base) < b->plan.disp.size() && b->plan.disp[i - base].no_barrier_after;
-            if (!nobar) uav_barrier(cmd);
+            if (!nobar || i + 1u == b->tables) uav_barrier(cmd);
         }
         if (first) {
             b->retargeted = true;

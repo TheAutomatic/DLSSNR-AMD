@@ -64,6 +64,7 @@ HMODULE g_sys = nullptr;
 HMODULE g_asi = nullptr;
 INIT_ONCE g_init_once = INIT_ONCE_STATIC_INIT;
 std::atomic<bool> g_hooks_enabled{false};
+std::atomic<DWORD> g_init_tid{0};
 thread_local bool t_dispatching = false;
 
 void load_system_dxgi() {
@@ -102,9 +103,11 @@ void* g_dxgi_procs[kProcCount] = {};
 
 void nr_standalone_init() {
     if (g_hooks_enabled.load(std::memory_order_acquire)) return;
+    if (g_init_tid.load(std::memory_order_acquire) == GetCurrentThreadId()) return;
     InitOnceExecuteOnce(
         &g_init_once,
         [](PINIT_ONCE, PVOID, PVOID*) -> BOOL {
+            g_init_tid.store(GetCurrentThreadId(), std::memory_order_release);
             load_system_dxgi();
             if (g_sys) {
                 for (int i = 0; i < kProcCount; ++i)
@@ -118,6 +121,7 @@ void nr_standalone_init() {
                 OutputDebugStringA("[nr] standalone dxgi.dll: dlssnr-amd.asi was not found next to dxgi.dll\n");
             }
             g_hooks_enabled.store(true, std::memory_order_release);
+            g_init_tid.store(0, std::memory_order_release);
             return TRUE;
         },
         nullptr, nullptr);
@@ -132,14 +136,17 @@ using DebugInterface1Fn = HRESULT(WINAPI*)(UINT, REFIID, void**);
 
 template <class Fn, class... Args>
 HRESULT forward_factory(const char* name, int proc_index, Args... args) {
-    const bool hooked_before = g_hooks_enabled.load(std::memory_order_acquire);
-    nr_standalone_init();
-    if (!hooked_before && !t_dispatching && g_self) {
-        if (auto self_fn = reinterpret_cast<Fn>(GetProcAddress(g_self, name))) {
-            t_dispatching = true;
-            const HRESULT hr = self_fn(args...);
-            t_dispatching = false;
-            return hr;
+    const bool reentrant = g_init_tid.load(std::memory_order_acquire) == GetCurrentThreadId();
+    if (!reentrant) {
+        const bool hooked_before = g_hooks_enabled.load(std::memory_order_acquire);
+        nr_standalone_init();
+        if (!hooked_before && !t_dispatching && g_self) {
+            if (auto self_fn = reinterpret_cast<Fn>(GetProcAddress(g_self, name))) {
+                t_dispatching = true;
+                const HRESULT hr = self_fn(args...);
+                t_dispatching = false;
+                return hr;
+            }
         }
     }
     auto sys_fn = reinterpret_cast<Fn>(g_dxgi_procs[proc_index]);
@@ -176,7 +183,7 @@ __attribute__((noinline)) HRESULT WINAPI DXGIGetDebugInterface1(UINT flags, REFI
 // then tail-jump into System32\dxgi.dll.
 __asm__(
     ".text\n"
-    ".macro NR_DXGI_FWD name, idx\n"
+    ".macro NR_DXGI_FWD name, idx, fail_ret\n"
     ".globl \\name\n"
     "\\name:\n"
     "    movq g_dxgi_procs + 8*\\idx(%rip), %rax\n"
@@ -208,33 +215,30 @@ __asm__(
     "    jz 2f\n"
     "    jmpq *%rax\n"
     "2:\n"
-    "    xorl %eax, %eax\n"
+    "    movl $\\fail_ret, %eax\n"
     "    ret\n"
     ".endm\n"
-    "NR_DXGI_FWD ApplyCompatResolutionQuirking, 0\n"
-    "NR_DXGI_FWD CompatString, 1\n"
-    "NR_DXGI_FWD CompatValue, 2\n"
-    "NR_DXGI_FWD DXGIDumpJournal, 3\n"
-    "NR_DXGI_FWD PIXBeginCapture, 4\n"
-    "NR_DXGI_FWD PIXEndCapture, 5\n"
-    "NR_DXGI_FWD PIXGetCaptureState, 6\n"
-    "NR_DXGI_FWD SetAppCompatStringPointer, 7\n"
-    "NR_DXGI_FWD UpdateHMDEmulationStatus, 8\n"
-    "NR_DXGI_FWD DXGID3D10CreateDevice, 12\n"
-    "NR_DXGI_FWD DXGID3D10CreateLayeredDevice, 13\n"
-    "NR_DXGI_FWD DXGID3D10GetLayeredDeviceSize, 14\n"
-    "NR_DXGI_FWD DXGID3D10RegisterLayers, 15\n"
-    "NR_DXGI_FWD DXGIDeclareAdapterRemovalSupport, 16\n"
-    "NR_DXGI_FWD DXGIDisableVBlankVirtualization, 17\n"
-    "NR_DXGI_FWD DXGIReportAdapterConfiguration, 19\n");
+    "NR_DXGI_FWD ApplyCompatResolutionQuirking, 0, 0x80004001\n"
+    "NR_DXGI_FWD CompatString, 1, 0x80004001\n"
+    "NR_DXGI_FWD CompatValue, 2, 0\n"
+    "NR_DXGI_FWD DXGIDumpJournal, 3, 0\n"
+    "NR_DXGI_FWD PIXBeginCapture, 4, 0x80004001\n"
+    "NR_DXGI_FWD PIXEndCapture, 5, 0x80004001\n"
+    "NR_DXGI_FWD PIXGetCaptureState, 6, 0\n"
+    "NR_DXGI_FWD SetAppCompatStringPointer, 7, 0x80004001\n"
+    "NR_DXGI_FWD UpdateHMDEmulationStatus, 8, 0x80004001\n"
+    "NR_DXGI_FWD DXGID3D10CreateDevice, 12, 0x80004001\n"
+    "NR_DXGI_FWD DXGID3D10CreateLayeredDevice, 13, 0x80004001\n"
+    "NR_DXGI_FWD DXGID3D10GetLayeredDeviceSize, 14, 0\n"
+    "NR_DXGI_FWD DXGID3D10RegisterLayers, 15, 0x80004001\n"
+    "NR_DXGI_FWD DXGIDeclareAdapterRemovalSupport, 16, 0x80004001\n"
+    "NR_DXGI_FWD DXGIDisableVBlankVirtualization, 17, 0x80004001\n"
+    "NR_DXGI_FWD DXGIReportAdapterConfiguration, 19, 0x80004001\n");
 
-BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
+BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID /*reserved*/) {
     if (reason == DLL_PROCESS_ATTACH) {
         g_self = inst;
         DisableThreadLibraryCalls(inst);
-    } else if (reason == DLL_PROCESS_DETACH && !reserved) {
-        if (g_asi) { FreeLibrary(g_asi); g_asi = nullptr; }
-        if (g_sys) { FreeLibrary(g_sys); g_sys = nullptr; }
     }
     return TRUE;
 }

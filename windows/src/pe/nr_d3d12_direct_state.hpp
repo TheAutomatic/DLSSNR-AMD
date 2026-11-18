@@ -53,10 +53,22 @@ private:
 nr::gpu::Ticket book(ID3D12CommandList* list);
 bool completed(const nr::gpu::Ticket& ticket);
 void note_execution(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists);
+void begin_split_execution();
+void end_split_execution(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists);
 void seal(const nr::gpu::Ticket& ticket);
 void invalidate(const nr::gpu::Ticket& ticket);
 
 // Most recent DIRECT command queue observed by ExecuteCommandLists on the current thread.
 ID3D12CommandQueue* last_direct_queue();
+
+// Read-only diagnostics for telemetry and regression tests.
+bool hooks_installed();
+uint64_t host_table_replays();
+uint64_t nr_set_heap_count();
+uint64_t nr_set_table_count();
+void reset_counters();
+size_t tracked_list_count();
+size_t tracked_recording_count();
+size_t tracked_queue_fence_count();
 
 }  // namespace nr::pe::d3d12_direct

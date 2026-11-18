@@ -859,7 +859,12 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
     if (!e.stage->record_ok()) {
         // The frame is dropped after part of it was recorded: its history can no longer be trusted (the original
         // Runtime's rule for a dropped recording), so this feature's state goes rather than a stale latch surviving.
+        const bool touched = e.stage->cmd_touched();
         release_renodx_feature(f.feature);
+        if (touched) {
+            note_backend("dropped partial RenoDX D3D12 frame (bridge skipped)", true);
+            return true;
+        }
         return fallback("the RenoDX stage could not make a surface this frame needs");
     }
     char line[200];
@@ -978,13 +983,13 @@ bool copy_depth_r32(ID3D12Device* device, ID3D12GraphicsCommandList* cmd, ID3D12
         if (why) *why = "outer descriptor pool is not built";
         return false;
     }
-    d3d12_outer::OuterSlot slot = g.outer_pool->acquire(ticket, why);
+    d3d12_outer::OuterSlot slot = g.outer_pool->acquire(ticket, why, g.k_copy_depth_r32.desc_zero_bytes);
     if (!slot.cpu) return false;
     g.recordings.push_back({int64_t(g.frames), 0u, ticket});
     const UINT push[2] = {w, h};
     slot.write_srv_tex(device, b_src, src, sf, 0, 1);
     slot.write_uav_tex(device, b_dst, dst, df, 0);
-    slot.write_push(push, sizeof push);
+    slot.write_push(push, sizeof push, &g.k_copy_depth_r32);
     nr::pe::d3d12_direct::Scope direct_scope(cmd);
     slot.dispatch(cmd, g.outer_rs, g.k_copy_depth_r32, (w + 7u) / 8u, (h + 7u) / 8u, 1u, true);
     return true;
@@ -1233,12 +1238,16 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
     if (!ticket) return fallback("the command list could not be booked");
     // Acquire all outer descriptor slots before emitting the first barrier or dispatch so any failure leaves `cmd` clean.
     if (!g.outer_pool) return fallback("outer descriptor pool is not built");
+    const uint32_t need_slots = 3u + (have_depth ? 1u : 0u) + (hist_bytes ? 1u : 0u);
     std::string slot_why;
-    const d3d12_outer::OuterSlot s_in = g.outer_pool->acquire(ticket, &slot_why);
-    const d3d12_outer::OuterSlot s_mv = g.outer_pool->acquire(ticket, &slot_why);
-    const d3d12_outer::OuterSlot s_depth = have_depth ? g.outer_pool->acquire(ticket, &slot_why) : d3d12_outer::OuterSlot{};
-    const d3d12_outer::OuterSlot s_hist = hist_bytes ? g.outer_pool->acquire(ticket, &slot_why) : d3d12_outer::OuterSlot{};
-    const d3d12_outer::OuterSlot s_out = g.outer_pool->acquire(ticket, &slot_why);
+    if (!g.outer_pool->reserve(need_slots, &slot_why)) {
+        return fallback(slot_why.empty() ? "no outer descriptor slot available" : slot_why);
+    }
+    const d3d12_outer::OuterSlot s_in = g.outer_pool->acquire(ticket, &slot_why, g.k_to_linear.desc_zero_bytes);
+    const d3d12_outer::OuterSlot s_mv = g.outer_pool->acquire(ticket, &slot_why, g.k_to_motion.desc_zero_bytes);
+    const d3d12_outer::OuterSlot s_depth = have_depth ? g.outer_pool->acquire(ticket, &slot_why, g.k_to_depth.desc_zero_bytes) : d3d12_outer::OuterSlot{};
+    const d3d12_outer::OuterSlot s_hist = hist_bytes ? g.outer_pool->acquire(ticket, &slot_why, k_hist.desc_zero_bytes) : d3d12_outer::OuterSlot{};
+    const d3d12_outer::OuterSlot s_out = g.outer_pool->acquire(ticket, &slot_why, g.k_from_linear.desc_zero_bytes);
     if (!s_in.cpu || !s_mv.cpu || (have_depth && !s_depth.cpu) || (hist_bytes && !s_hist.cpu) || !s_out.cpu) {
         return fallback(slot_why.empty() ? "no outer descriptor slot available" : slot_why);
     }
@@ -1248,25 +1257,25 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
 
     s_in.write_srv_tex(f.device, b_in_tex, f.color, sf, 0, 1);
     s_in.write_buf(b_in_buf, g.lin_in, in.bytes);
-    s_in.write_push(constants, sizeof constants);
+    s_in.write_push(constants, sizeof constants, &g.k_to_linear);
 
     s_mv.write_srv_tex(f.device, b_mv_tex, motion_res, mf, 0, 1);
     s_mv.write_buf(b_mv_buf, g.lin_mv, uint64_t(p8) * h * 8);
-    s_mv.write_push(mv_constants, sizeof mv_constants);
+    s_mv.write_push(mv_constants, sizeof mv_constants, &g.k_to_motion);
 
     if (have_depth) {
         s_depth.write_srv_tex(f.device, b_depth_tex, f.depth, depth_view, 0, 1);
         s_depth.write_buf(b_depth_buf, g.lin_depth, uint64_t(p16) * h * 16);
-        s_depth.write_push(depth_constants, sizeof depth_constants);
+        s_depth.write_push(depth_constants, sizeof depth_constants, &g.k_to_depth);
     }
     if (hist_bytes) {
         const UINT hist_constants[8] = {w, h, lin_pitch(w, hist_bytes), 0u, 0u, 0u, 0u, 0u};
         s_hist.write_srv_tex(f.device, b_hist_tex, f.history, DXGI_FORMAT_R16G16B16A16_FLOAT, 0, 1);
         s_hist.write_buf(b_hist_buf, set->hist, uint64_t(hist_constants[2]) * h * hist_bytes);
-        s_hist.write_push(hist_constants, sizeof hist_constants);
+        s_hist.write_push(hist_constants, sizeof hist_constants, &k_hist);
     }
     s_out.write_uav_tex(f.device, b_from_tex, f.output, df, 0);
-    s_out.write_push(constants, sizeof constants);
+    s_out.write_push(constants, sizeof constants, &g.k_from_linear);
 
     const UINT gx = (w + 7) / 8, gy = (h + 7) / 8;
     auto* cmd = f.cmd;

@@ -9,7 +9,7 @@
 // First-chance: an exception the game later handles is logged too, which is
 // why the count is small and the log says "exception", not "crash".
 namespace nr::pe {
-void install_crash_watch();
+void install_crash_watch(void* host_addr = nullptr);
 void remove_crash_watch();
 // "module+0xoffset" of an address, or the bare address when it is in no module.
 std::string where_address(const void* at);

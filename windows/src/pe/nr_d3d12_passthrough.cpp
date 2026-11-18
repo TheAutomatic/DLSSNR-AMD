@@ -303,6 +303,11 @@ DWORD WINAPI canary_thread(void* p) {
     delete static_cast<CanaryJob*>(p);
     std::string line;
     const Canary result = run_canary(job.device, job.queue, job.arch, &line);
+    if (result == Canary::kHit) {
+        std::string hook_why;
+        if (!nr::pe::d3d12_direct::install_hooks(job.device, nullptr, &hook_why) && !hook_why.empty())
+            log("[d3d12] %s", hook_why.c_str());
+    }
     job.queue->Release();
     finish_canary(result, line);
     job.device->Release();
@@ -417,7 +422,6 @@ constexpr int kAskTimes = 6;   // (then refused as before: a GPU nothing can ide
 
 void on_device(ID3D12Device* device) {
     if (!g_enabled || !device) return;
-    nr::pe::d3d12_direct::install_hooks(device);
     if (g_canary_started.load()) return;
     if (const uint64_t at = g_ask_again_ms.load(); at && GetTickCount64() < at) return;
     std::string name;

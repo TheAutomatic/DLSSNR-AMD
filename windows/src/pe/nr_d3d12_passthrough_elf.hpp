@@ -482,36 +482,122 @@ inline void emit_add_lit(Bytes& o, uint32_t dst, uint32_t src, uint32_t lit) {
     put_u32(o, 0x80000000u | (dst << 16) | (255u << 8) | src);
     put_u32(o, lit);
 }
-inline void emit_load_b32(Bytes& o, uint32_t dst, uint32_t base, uint32_t byte_off) {
+// SMEM scalar load: op 0 = s_load_b32, 1 = s_load_b64 (even dst), 2 = s_load_b128 (4-aligned dst).
+// GFX11 encodes SMEM opcode at bits [25:18]; GFX12 encodes SMEM opcode at bits [19:13].
+inline void emit_load_smem(Bytes& o, uint32_t op, uint32_t dst, uint32_t base, uint32_t byte_off, bool gfx11) {
     require((base & 1u) == 0, "s_load base is odd");
-    put_u32(o, 0xF4000000u | (dst << 6) | (base >> 1));
+    require(byte_off < 0x80000u && (byte_off & 3u) == 0, "s_load offset out of range or unaligned");
+    const uint32_t align = op == 2u ? 3u : op == 1u ? 1u : 0u;
+    require((dst & align) == 0, "s_load dst misaligned");
+    const uint32_t op_shift = gfx11 ? 18u : 13u;
+    put_u32(o, 0xF4000000u | (op << op_shift) | (dst << 6) | (base >> 1));
     put_u32(o, 0xF8000000u | byte_off);
 }
 
-struct UavSgpr { uint32_t lo = 0, hi = 0; };
+struct SmemLoad {
+    uint32_t dst = 0;
+    uint32_t byte_off = 0;
+};
 
-inline UavSgpr find_uav_sgpr(const Mp& map) {
-    require(map.kind == Mp::Arr, "user_data_reg_map is not an array");
-    std::vector<uint32_t> v(map.items.size(), 0xffffffffu);
-    for (size_t i = 0; i < map.items.size(); ++i)
-        if (map.items[i].kind == Mp::UInt && map.items[i].u != 0xffffffffull)
-            v[i] = uint32_t(map.items[i].u);
-    struct Run { uint32_t begin, len; };
-    std::vector<Run> runs;
-    for (size_t i = 0; i < v.size();) {
-        if (v[i] == 0xffffffffu) { ++i; continue; }
-        size_t j = i;
-        while (j + 1 < v.size() && v[j + 1] != 0xffffffffu && v[j + 1] == v[j] + 1) ++j;
-        uint32_t len = uint32_t(j - i + 1);
-        if (len >= 2) runs.push_back({uint32_t(i), len});
-        i = j + 1;
+inline void emit_merged_smem(Bytes& o, std::vector<SmemLoad> loads, uint32_t base, bool gfx11) {
+    std::sort(loads.begin(), loads.end(), [](const SmemLoad& a, const SmemLoad& b) {
+        return a.byte_off < b.byte_off || (a.byte_off == b.byte_off && a.dst < b.dst);
+    });
+    size_t i = 0;
+    while (i < loads.size()) {
+        if (i + 3 < loads.size() && (loads[i].dst & 3u) == 0 && loads[i].dst + 3u < 96u &&
+            loads[i + 1].dst == loads[i].dst + 1u && loads[i + 1].byte_off == loads[i].byte_off + 4u &&
+            loads[i + 2].dst == loads[i].dst + 2u && loads[i + 2].byte_off == loads[i].byte_off + 8u &&
+            loads[i + 3].dst == loads[i].dst + 3u && loads[i + 3].byte_off == loads[i].byte_off + 12u) {
+            emit_load_smem(o, 2u, loads[i].dst, base, loads[i].byte_off, gfx11);
+            i += 4;
+            continue;
+        }
+        if (i + 1 < loads.size() && (loads[i].dst & 1u) == 0 && loads[i].dst + 1u < 96u &&
+            loads[i + 1].dst == loads[i].dst + 1u && loads[i + 1].byte_off == loads[i].byte_off + 4u) {
+            emit_load_smem(o, 1u, loads[i].dst, base, loads[i].byte_off, gfx11);
+            i += 2;
+            continue;
+        }
+        emit_load_smem(o, 0u, loads[i].dst, base, loads[i].byte_off, gfx11);
+        ++i;
     }
-    require(runs.size() == 1, "expected one user-dword run containing the root UAV");
-    uint32_t hi = runs[0].begin + runs[0].len - 1;
-    return {hi - 1, hi};
 }
 
-inline void apply_pal(Mp& root, const NrRecord& rec) {
+inline constexpr uint32_t kOuterRootConstants = 12u;
+
+struct OuterElfLayout {
+    uint32_t root_push_dwords = 0;
+    bool needs_slot_push = true;
+    bool needs_slot_grid = true;
+};
+
+struct UavSgpr { uint32_t lo = 0, hi = 0; };
+
+struct PalUserPlan {
+    UavSgpr uav{};
+    std::vector<uint32_t> reg_map;
+    std::vector<std::pair<int, int>> smem_inlines;
+    OuterElfLayout outer{};
+};
+
+inline PalUserPlan plan_pal_user_data(const NrRecord& rec, uint32_t inline_root_consts) {
+    PalUserPlan p;
+    p.reg_map.assign(32u, 0xffffffffu);
+    if (inline_root_consts == 0) {
+        p.uav = rec.user < 5u ? UavSgpr{0u, 1u} : UavSgpr{3u, 4u};
+        p.reg_map[p.uav.lo] = 5u;
+        p.reg_map[p.uav.hi] = 6u;
+        if (p.uav.lo >= 2u) p.reg_map[p.uav.lo - 1u] = 4u;
+        p.smem_inlines = rec.inlines;
+        p.outer.needs_slot_push = rec.push >= 0 || !p.smem_inlines.empty();
+        p.outer.needs_slot_grid = rec.grid >= 0;
+        return p;
+    }
+    require(rec.user <= 16u, "NRPAL user_sgprs exceeds 16");
+    const uint32_t rc_cap = (std::min)(inline_root_consts, kOuterRootConstants);
+    p.uav = (rec.user + 2u <= 16u) ? UavSgpr{rec.user, rec.user + 1u} : UavSgpr{0u, 1u};
+    p.reg_map[p.uav.lo] = 4u + rc_cap;
+    p.reg_map[p.uav.hi] = 4u + rc_cap + 1u;
+    for (const auto& [dst_i, dw_i] : rec.inlines) {
+        const bool clash_special =
+            dst_i == rec.set0 || dst_i == rec.push ||
+            (rec.grid >= 0 && dst_i >= rec.grid && dst_i < rec.grid + 3);
+        const bool can_inline =
+            dw_i >= 0 && uint32_t(dw_i) < rc_cap &&
+            dst_i >= 0 && uint32_t(dst_i) < rec.user && uint32_t(dst_i) < 16u &&
+            uint32_t(dst_i) != p.uav.lo && uint32_t(dst_i) != p.uav.hi &&
+            !clash_special && p.reg_map[uint32_t(dst_i)] == 0xffffffffu;
+        if (can_inline) {
+            p.reg_map[uint32_t(dst_i)] = 4u + uint32_t(dw_i);
+            p.outer.root_push_dwords = (std::max)(p.outer.root_push_dwords, uint32_t(dw_i) + 1u);
+        } else {
+            p.smem_inlines.emplace_back(dst_i, dw_i);
+        }
+    }
+    p.outer.needs_slot_push = rec.push >= 0 || !p.smem_inlines.empty();
+    p.outer.needs_slot_grid = rec.grid >= 0;
+    return p;
+}
+
+inline void sync_pal_registers(Mp& cs, const Mp& reg_map) {
+    Mp* regs = mp_field(cs, ".registers");
+    if (!regs || regs->kind != Mp::Map || reg_map.kind != Mp::Arr) return;
+    std::vector<std::pair<Mp, Mp>> kept;
+    kept.reserve(regs->fields.size() + 16u);
+    for (auto& f : regs->fields) {
+        if (f.first.kind == Mp::UInt && f.first.u >= 0x2e40ull && f.first.u <= 0x2e4full) continue;
+        kept.push_back(std::move(f));
+    }
+    const size_t n = (std::min)(reg_map.items.size(), size_t(16u));
+    for (size_t s = 0; s < n; ++s) {
+        if (reg_map.items[s].kind == Mp::UInt && reg_map.items[s].u != 0xffffffffull)
+            kept.emplace_back(Mp::uint(0x2e40ull + s), reg_map.items[s]);
+    }
+    regs->fields.swap(kept);
+}
+
+inline void apply_pal(Mp& root, const NrRecord& rec, const PalUserPlan& plan, uint32_t inline_root_consts) {
     Mp& pipes = mp_need(root, "amdpal.pipelines");
     require(pipes.kind == Mp::Arr && pipes.items.size() == 1, "pipeline count");
     Mp& pipe = pipes.items[0];
@@ -524,13 +610,27 @@ inline void apply_pal(Mp& root, const NrRecord& rec) {
         if (cur->kind == Mp::UInt && cur->u > sgpr) sgpr = cur->u;
     mp_set_uint(cs, ".sgpr_count", sgpr);
     Mp& reg_map = mp_need(cs, ".user_data_reg_map");
-    if (rec.user < 5u && reg_map.kind == Mp::Arr && reg_map.items.size() >= 5u) {
-        reg_map.items[0] = Mp::uint(5);
-        reg_map.items[1] = Mp::uint(6);
-        for (size_t i = 2; i < reg_map.items.size(); ++i) reg_map.items[i] = Mp::uint(0xffffffffu);
+    require(reg_map.kind == Mp::Arr && reg_map.items.size() >= plan.reg_map.size(), "user_data_reg_map too small");
+    for (size_t i = 0; i < plan.reg_map.size(); ++i) reg_map.items[i] = Mp::uint(plan.reg_map[i]);
+    for (size_t i = plan.reg_map.size(); i < reg_map.items.size(); ++i) reg_map.items[i] = Mp::uint(0xffffffffu);
+    sync_pal_registers(pipe, reg_map);
+    sync_pal_registers(cs, reg_map);
+    if (inline_root_consts > 0) {
+        const uint32_t rc_cap = (std::min)(inline_root_consts, kOuterRootConstants);
+        mp_set_uint(pipe, ".user_data_limit", 4u + rc_cap + 2u);
+        if (Mp* uic = mp_field(cs, ".unused_imm_const"); uic && uic->kind == Mp::Arr && !uic->items.empty()) {
+            uint32_t used_rc_mask = 0;
+            for (size_t s = 0; s < plan.reg_map.size(); ++s) {
+                const uint32_t v = plan.reg_map[s];
+                if (v >= 4u && v < 4u + rc_cap)
+                    used_rc_mask |= (1u << (v - 4u));
+            }
+            uic->items[0] = Mp::uint((~used_rc_mask) & 0xffffffffu);
+            for (size_t k = 1; k < uic->items.size(); ++k)
+                uic->items[k] = Mp::uint(0xffffffffu);
+        }
     }
-    const UavSgpr uav = find_uav_sgpr(reg_map);
-    mp_set_uint(cs, ".user_sgprs", (std::max)(rec.user, uav.hi + 1u));
+    mp_set_uint(cs, ".user_sgprs", (std::max)(rec.user, plan.uav.hi + 1u));
     uint32_t vgpr = ((rec.rsrc1 & 63u) + 1u) * 8u;
     mp_set_uint(cs, ".vgpr_count", vgpr);
     mp_set_uint(cs, ".vgpr_count_max", vgpr);
@@ -558,20 +658,38 @@ inline void apply_pal(Mp& root, const NrRecord& rec) {
     mp_set_bool(cr, ".tgid_z_en", ((rec.rsrc2 >> 9) & 1u) != 0);
     mp_set_bool(cr, ".tg_size_en", ((rec.rsrc2 >> 10) & 1u) != 0);
     mp_set_uint(cr, ".tidig_comp_cnt", (rec.rsrc2 >> 11) & 3u);
+    const uint32_t spill = (inline_root_consts > 0 || rec.push < 0) ? 65535u : 1u;
     if (mp_field(pipe, ".spill_threshold"))
-        mp_set_uint(pipe, ".spill_threshold", rec.push >= 0 ? 1u : 65535u);
+        mp_set_uint(pipe, ".spill_threshold", spill);
     if (mp_field(cs, ".shader_spill_threshold"))
-        mp_set_uint(cs, ".shader_spill_threshold", rec.push >= 0 ? 1u : 65535u);
+        mp_set_uint(cs, ".shader_spill_threshold", spill);
+    uint64_t ph_buf[35]{};
+    ph_buf[0] = rec.code_hash;
+    ph_buf[1] = rec.spv_hash;
+    ph_buf[2] = inline_root_consts;
+    for (size_t i = 0; i < 32u && i < plan.reg_map.size(); ++i) ph_buf[3u + i] = plan.reg_map[i];
+    const uint64_t pipe_hash = fnv_hash(reinterpret_cast<const uint8_t*>(ph_buf), sizeof ph_buf);
+    const uint64_t pipe_hash_hi = (rec.spv_hash ^ (rec.code_hash * 0x9e3779b97f4a7c15ull)) ^ 0xd6e8feb86659fd93ull;
+    if (mp_field(pipe, ".resource_hash"))
+        mp_set_uint(pipe, ".resource_hash", pipe_hash ^ 0xa0761d6478bd642full);
     Mp hash_arr;
     hash_arr.kind = Mp::Arr;
-    hash_arr.items = {Mp::uint(rec.code_hash), Mp::uint(rec.spv_hash)};
+    hash_arr.items = {Mp::uint(pipe_hash), Mp::uint(pipe_hash_hi)};
     if (mp_field(pipe, ".internal_pipeline_hash"))
         mp_need(pipe, ".internal_pipeline_hash") = hash_arr;
     if (mp_field(cs, ".checksum_value"))
-        mp_set_uint(cs, ".checksum_value", uint32_t(rec.code_hash));
+        mp_set_uint(cs, ".checksum_value", uint32_t(pipe_hash));
+    if (Mp* shaders = mp_field(pipe, ".shaders")) {
+        if (Mp* comp = mp_field(*shaders, ".compute")) {
+            if (Mp* ash = mp_field(*comp, ".api_shader_hash")) {
+                ash->kind = Mp::Arr;
+                ash->items = {Mp::uint(pipe_hash), Mp::uint(pipe_hash_hi ^ 0x9e3779b97f4a7c15ull)};
+            }
+        }
+    }
 }
 
-inline bool retarget_metadata(Bytes& blob, const NrRecord& rec) {
+inline bool retarget_metadata(Bytes& blob, const NrRecord& rec, const PalUserPlan& plan, uint32_t inline_root_consts) {
     if (blob.size() < 12) return false;
     size_t pos = 0;
     bool found = false;
@@ -592,7 +710,7 @@ inline bool retarget_metadata(Bytes& blob, const NrRecord& rec) {
             size_t p = 0;
             Mp root = mp_decode(blob.data() + desc_off, ds, p);
             require(p == ds, "metadata did not consume the note");
-            apply_pal(root, rec);
+            apply_pal(root, rec, plan, inline_root_consts);
             Bytes md;
             mp_encode(md, root);
             put_u32(out, ns);
@@ -628,7 +746,7 @@ inline void put_buf(uint32_t* d, uint64_t va, uint64_t bytes) {
     d[3] = 0x30014facu;
 }
 
-inline Bytes build_prefix(const NrRecord& rec, UavSgpr uav, bool gfx11 = false,
+inline Bytes build_prefix(const NrRecord& rec, const PalUserPlan& plan, bool gfx11 = false,
                           uint32_t push_off = kTablePushOff, uint32_t grid_off = kTableGridOff) {
     Bytes o;
     if (!gfx11) put_u32(o, 0xB0802009u);  // s_version (gfx12's; gfx11 takes none)
@@ -637,29 +755,40 @@ inline Bytes build_prefix(const NrRecord& rec, UavSgpr uav, bool gfx11 = false,
         put_u32(o, 0x000003FFu);
         put_u32(o, 0xBF870001u);  // s_delay_alu instid0(VALU_DEP_1)
     }
-    emit_mov(o, 96, uav.lo);
-    emit_mov(o, 97, uav.hi);
-    const uint32_t eff_user = (std::max)(rec.user, uav.hi + 1u);
+    emit_mov(o, 96, plan.uav.lo);
+    emit_mov(o, 97, plan.uav.hi);
+    const uint32_t eff_user = (std::max)(rec.user, plan.uav.hi + 1u);
     if (eff_user > rec.user) {
-        const uint32_t n_sys = ((rec.rsrc2 >> 7) & 1u) + ((rec.rsrc2 >> 8) & 1u) +
-                               ((rec.rsrc2 >> 9) & 1u) + ((rec.rsrc2 >> 10) & 1u);
-        for (uint32_t j = 0; j < n_sys; ++j)
-            emit_mov(o, rec.user + j, eff_user + j);
+        if (gfx11) {
+            const uint32_t n_sys = ((rec.rsrc2 >> 7) & 1u) + ((rec.rsrc2 >> 8) & 1u) +
+                                   ((rec.rsrc2 >> 9) & 1u) + ((rec.rsrc2 >> 10) & 1u);
+            for (uint32_t j = 0; j < n_sys; ++j)
+                emit_mov(o, rec.user + j, eff_user + j);
+        } else if ((rec.rsrc2 >> 10) & 1u) {
+            // GFX12 receives tgid_x/y/z in ttmp registers; only tg_size_en occupies s[eff_user].
+            emit_mov(o, rec.user, eff_user);
+        }
     }
     if (rec.set0 == 0) emit_mov(o, 0, 96);
     emit_mov(o, 125, 97);  // m0: shared address32 high word
     if (rec.push >= 0)
         emit_add_lit(o, uint32_t(rec.push), 96, push_off);
     put_u32(o, 0xBF800002u);
-    for (auto [reg, dw] : rec.inlines)
-        emit_load_b32(o, uint32_t(reg), 96, push_off + uint32_t(dw) * 4);
-    if (rec.grid >= 0)
-        for (uint32_t j = 0; j < 3; ++j)
-            emit_load_b32(o, uint32_t(rec.grid) + j, 96, grid_off + j * 4);
-    // the wait before the loaded arguments are used: gfx12's split wait (s_wait_kmcnt 0); gfx11 has the classic one,
-    // s_waitcnt lgkmcnt(0) - the gfx12 word is an illegal instruction there (nr_pal_binary.hpp's prologue)
-    put_u32(o, gfx11 ? 0xBF89FC07u : 0xBFC70000u);
-    put_u32(o, 0xBF800003u);
+    std::vector<SmemLoad> loads;
+    loads.reserve(plan.smem_inlines.size() + 3u);
+    for (auto [reg, dw] : plan.smem_inlines)
+        loads.push_back({uint32_t(reg), push_off + uint32_t(dw) * 4u});
+    if (rec.grid >= 0) {
+        for (uint32_t j = 0; j < 3u; ++j)
+            loads.push_back({uint32_t(rec.grid) + j, grid_off + j * 4u});
+    }
+    if (!loads.empty()) {
+        emit_merged_smem(o, std::move(loads), 96u, gfx11);
+        // the wait before the loaded arguments are used: gfx12's split wait (s_wait_kmcnt 0); gfx11 has the classic one,
+        // s_waitcnt lgkmcnt(0) - the gfx12 word is an illegal instruction there (nr_pal_binary.hpp's prologue)
+        put_u32(o, gfx11 ? 0xBF89FC07u : 0xBFC70000u);
+        put_u32(o, 0xBF800003u);
+    }
     return o;
 }
 
@@ -768,7 +897,8 @@ inline constexpr uint8_t kCarrierTemplateElf[2332] = {
 // 0: RDNA4's template as it is.
 inline bool build_model_elf_from_nrp(const uint8_t* nrp, size_t nrp_bytes, const uint32_t spv_dims[3],
                                      Bytes* out_elf, uint32_t out_dims[3], std::string* why, uint32_t gfx11_mach = 0,
-                                     uint32_t push_off = kTablePushOff, uint32_t grid_off = kTableGridOff) {
+                                     uint32_t push_off = kTablePushOff, uint32_t grid_off = kTableGridOff,
+                                     uint32_t inline_root_consts = 0, OuterElfLayout* out_layout = nullptr) {
     try {
         NrRecord rec = parse_nrpal001(nrp, nrp_bytes);
         if (spv_dims && spv_dims[0] && spv_dims[0] * spv_dims[1] * spv_dims[2] == rec.wg) {
@@ -784,20 +914,13 @@ inline bool build_model_elf_from_nrp(const uint8_t* nrp, size_t nrp_bytes, const
             rec.dims[1] = 8;
             rec.dims[2] = 1;
         }
+        const PalUserPlan plan = plan_pal_user_data(rec, inline_root_consts);
         ElfView e = parse_elf(kCarrierTemplateElf, sizeof kCarrierTemplateElf);
         ElfView::Sec* text = find_sec(e, ".text");
         ElfView::Sec* note = find_sec(e, ".note");
         require(text && note, "carrier ELF is missing .text or .note");
-        require(retarget_metadata(note->data, rec), "carrier note is not AMDGPU metadata");
-        uint32_t ns = rd_u32(note->data.data());
-        uint32_t ds = rd_u32(note->data.data() + 4);
-        size_t desc = 12 + ((size_t(ns) + 3) & ~size_t(3));
-        size_t p = 0;
-        Mp root = mp_decode(note->data.data() + desc, ds, p);
-        require(p == ds, "retargeted note did not round-trip");
-        Mp& cs = mp_need(mp_need(mp_need(root, "amdpal.pipelines").items[0], ".hardware_stages"), ".cs");
-        UavSgpr uav = find_uav_sgpr(mp_need(cs, ".user_data_reg_map"));
-        Bytes prefix = build_prefix(rec, uav, gfx11_mach != 0, push_off, grid_off);
+        require(retarget_metadata(note->data, rec, plan, inline_root_consts), "carrier note is not AMDGPU metadata");
+        Bytes prefix = build_prefix(rec, plan, gfx11_mach != 0, push_off, grid_off);
         text->data = std::move(prefix);
         text->data.insert(text->data.end(), rec.code.begin(), rec.code.end());
         patch_symbol_size(e, text->data.size() - (rec.code.size() - rec.exec));
@@ -806,6 +929,7 @@ inline bool build_model_elf_from_nrp(const uint8_t* nrp, size_t nrp_bytes, const
         out_dims[0] = rec.dims[0];
         out_dims[1] = rec.dims[1];
         out_dims[2] = rec.dims[2];
+        if (out_layout) *out_layout = plan.outer;
         return true;
     } catch (const std::exception& x) {
         *why = x.what();

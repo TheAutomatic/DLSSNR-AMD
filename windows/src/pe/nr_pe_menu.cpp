@@ -1963,6 +1963,15 @@ template <int N> HRESULT STDMETHODCALLTYPE colour_space_hook(IDXGISwapChain3* sc
 // The methods as nr_present_probe.exe found them in a process of its own (see there), hooked in the same modules here.
 void install_now() {
     const std::string folder = nr::pe::module_folder();
+    {
+        char v[16] = {};
+        const std::string ini_path = folder + "\\dlssnr-amd.ini";
+        nr::u8::profile("NRControl", "SystemPresentHook", "1", v, sizeof v, ini_path.c_str());
+        if (v[0] == '0' && v[1] == '\0') {
+            say("[NRControl] SystemPresentHook = 0 in dlssnr-amd.ini; skipping System32\\dxgi.dll Present hooks");
+            return;
+        }
+    }
     std::wstring probe, out;
     {
         probe = nr::u8::wide(folder + "\\dlssnr-amd\\nr_present_probe.exe");
@@ -2028,8 +2037,15 @@ void install_now() {
         char here[33] = {};
         for (int i = 0; i < 16; ++i) std::snprintf(here + 2 * i, 3, "%02x", static_cast<const unsigned char*>(fn)[i]);
         if (bytes != here) say(name + " in " + path + " is already patched in this process (another hook); hooked over it");
-        if (MH_CreateHook(fn, t->detour[t->used], t->real[t->used]) != MH_OK || MH_EnableHook(fn) != MH_OK) {
+        if (MH_CreateHook(fn, t->detour[t->used], t->real[t->used]) != MH_OK) {
+            *t->real[t->used] = nullptr;
             say(name + " could not be hooked");
+            continue;
+        }
+        if (MH_EnableHook(fn) != MH_OK) {
+            MH_RemoveHook(fn);
+            *t->real[t->used] = nullptr;
+            say(name + " could not be enabled");
             continue;
         }
         ++t->used;

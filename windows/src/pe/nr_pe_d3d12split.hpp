@@ -63,6 +63,9 @@ void invalidate(const std::shared_ptr<nr::gpu::Recording>& rec);
 // succeeded - public so a test can drive the same path without the hooks.
 void note_execution(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists);
 void seal(const std::shared_ptr<nr::gpu::Recording>& rec);
+using SplitBeginFn = void (*)();
+using SplitEndFn = void (*)(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists);
+void set_split_execution_hooks(SplitBeginFn begin_fn, SplitEndFn end_fn);
 
 // Hooks the list's class (once per class) and its queues'. False when lists of this class cannot be
 // cut, or when this list's state since its last Reset is not known yet - the hooks were installed

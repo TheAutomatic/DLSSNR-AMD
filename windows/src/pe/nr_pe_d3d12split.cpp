@@ -18,6 +18,9 @@
 
 namespace nr::pe::split {
 
+std::atomic<SplitBeginFn> g_split_begin{nullptr};
+std::atomic<SplitEndFn> g_split_end{nullptr};
+
 #if !defined(_M_X64) && !defined(__x86_64__)
 bool prepare(ID3D12GraphicsCommandList*, std::string* why) {
     *why = "the command-list cut is x86-64 only";
@@ -547,7 +550,7 @@ void forget_list(void* self) {
     if (it != g_states.end()) it->second->valid = false;
 }
 
-bool patch_list_class(List* list, std::string* why);
+bool patch_list_class(List* list, std::string* why, bool* wrapped_refusal = nullptr);
 
 // ---- the hooks ---------------------------------------------------------------------------------------
 #define NR_TARGET(self) static_cast<List*>(tl_forward)
@@ -1125,7 +1128,14 @@ void execute_cut(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists,
             if (held != g_held.end()) work.push_back({i, Cut{}, held->second});
         }
     }
-    if (work.empty()) return execute(q, n, lists);
+    if (work.empty()) {
+        execute(q, n, lists);
+        if (g_booked.load(std::memory_order_acquire)) {
+            std::lock_guard<std::recursive_mutex> guard(g_mutex);
+            stamp_bookings_locked(q, n, lists);
+        }
+        return;
+    }
     // The first executions of cut lists, step by step (PBZ: the game ended right after the first frame with a layer
     // before the upscaler, with nothing logged)
     static std::atomic<int> traced{0};
@@ -1135,6 +1145,14 @@ void execute_cut(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists,
     if (tr) log("[nr] trace: lists with %zu cut(s) executed on queue %p (%u lists), thread %lu", segments,
                 static_cast<void*>(q), n, GetCurrentThreadId());
     static bool said_again = false;
+    struct SplitBookGuard {
+        ID3D12CommandQueue* queue;
+        UINT count;
+        ID3D12CommandList* const* lists;
+        SplitEndFn end_fn;
+        ~SplitBookGuard() { if (end_fn) end_fn(queue, count, lists); }
+    } split_book{q, n, lists, g_split_end.load(std::memory_order_acquire)};
+    if (const auto begin_fn = g_split_begin.load(std::memory_order_acquire)) begin_fn();
     std::vector<ID3D12CommandList*> batch;
     std::vector<Cont*> ran;
     size_t next = 0;
@@ -1161,10 +1179,14 @@ void execute_cut(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists,
     QueueFence* f = completion_fence(q);
     const bool signalled = f && SUCCEEDED(q->Signal(f->fence, f->value + 1));
     if (signalled) ++f->value;
-    if (signalled && !g_recordings.empty()) {
+    if (!g_recordings.empty()) {
         for (UINT i = 0; i < n; ++i) {
             auto it = g_recordings.find(lists[i]);
             if (it == g_recordings.end() || !it->second || it->second->sealed) continue;
+            if (!signalled) {
+                it->second->submitted(nullptr);
+                continue;
+            }
             ID3D12Fence* fence = f->fence;
             fence->AddRef();
             const uint64_t value = f->value;
@@ -1236,7 +1258,30 @@ bool add_vtable(void** vt, ListClass* cls, bool hooked, std::string* why) {
     return true;
 }
 
-bool patch_list_class(List* list, std::string* why) {
+bool in_d3d12_module(const void* fn, std::string* out_mod = nullptr) {
+    if (!fn) return false;
+    HMODULE mod = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(fn), &mod) || !mod) {
+        if (out_mod) *out_mod = "private memory";
+        return false;
+    }
+    wchar_t path[MAX_PATH]{};
+    if (!GetModuleFileNameW(mod, path, MAX_PATH)) return false;
+    const wchar_t* base = std::wcsrchr(path, L'\\');
+    base = base ? base + 1 : path;
+    if (out_mod) {
+        char buf[MAX_PATH]{};
+        const int n = WideCharToMultiByte(CP_UTF8, 0, base, -1, buf, int(sizeof buf), nullptr, nullptr);
+        *out_mod = n > 0 ? buf : "";
+    }
+    if (_wcsnicmp(base, L"d3d12", 5) == 0) return true;
+    for (const wchar_t* p = base; *p; ++p)
+        if (_wcsnicmp(p, L"vkd3d", 5) == 0) return true;
+    return false;
+}
+
+bool patch_list_class(List* list, std::string* why, bool* wrapped_refusal) {
     void** vt = *reinterpret_cast<void***>(list);
     if (ListClass* known = class_by_vtable(vt)) {
         // Hooked already - unless the vtable holds its class's originals again: a per-object copy that
@@ -1260,6 +1305,18 @@ bool patch_list_class(List* list, std::string* why) {
         bool same = c->slots == slots;
         for (unsigned k = 0; same && k < slots; ++k) same = vt[k] == c->orig[k];
         if (same) return add_vtable(vt, g_classes[i], false, why);
+    }
+    std::string mod;
+    if (!in_d3d12_module(vt[kReset], &mod) || !in_d3d12_module(vt[kClose], &mod)) {
+        *why = "the command list vtable is outside D3D12 module (" + mod + ")";
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            log("[nr] bridge: refusing to patch wrapped command list vtable %p (%s)",
+                static_cast<void*>(vt), mod.c_str());
+        }
+        if (wrapped_refusal) *wrapped_refusal = true;
+        return false;
     }
     if (n >= 32) { *why = "too many command list classes"; return false; }
     auto* cls = new ListClass();
@@ -1385,6 +1442,11 @@ bool patch_device_class(ID3D12Device* device, std::string* why) {
     void** vt = *reinterpret_cast<void***>(device);
     const int n = g_device_count.load();
     for (int i = 0; i < n; ++i) if (g_device_classes[i].vtable == vt) return true;
+    std::string mod;
+    if (!in_d3d12_module(vt[kDeviceCreateCommandList], &mod)) {
+        *why = "the device vtable is outside D3D12 module (" + mod + ")";
+        return false;
+    }
     if (n >= 8) { *why = "too many device classes"; return false; }
     g_device_classes[n] = {vt, vt[kDeviceCreateCommandList]};
     g_device_count.store(n + 1, std::memory_order_release);
@@ -1410,7 +1472,11 @@ bool patch_queue_classes(ID3D12Device* device, D3D12_COMMAND_LIST_TYPE type, std
     const int n = g_queue_count.load();
     for (int i = 0; i < n; ++i) known = known || g_queue_classes[i].vtable == vt;
     bool ok = true;
-    if (!known && n >= 8) { ok = false; *why = "too many command queue classes"; }
+    std::string mod;
+    if (!known && !in_d3d12_module(vt[kQueueExecute], &mod)) {
+        ok = false;
+        *why = "the command queue vtable is outside D3D12 module (" + mod + ")";
+    } else if (!known && n >= 8) { ok = false; *why = "too many command queue classes"; }
     else if (!known) {
         g_queue_classes[n] = {vt, vt[kQueueExecute]};
         g_queue_count.store(n + 1, std::memory_order_release);
@@ -1431,7 +1497,11 @@ struct Snapshot {
 bool prepare(List* list, std::string* why) {
     std::lock_guard<std::recursive_mutex> guard(g_mutex);
     if (g_disabled) { *why = g_disabled_why; return false; }
-    if (!patch_list_class(list, why)) { g_disabled = true; g_disabled_why = *why; return false; }
+    bool wrapped_refusal = false;
+    if (!patch_list_class(list, why, &wrapped_refusal)) {
+        if (!wrapped_refusal) { g_disabled = true; g_disabled_why = *why; }
+        return false;
+    }
     void** vt = *reinterpret_cast<void***>(list);
     static std::vector<void**> queues_done;
     bool done = false;
@@ -1631,6 +1701,11 @@ void seal(const std::shared_ptr<nr::gpu::Recording>& rec) { if (rec) rec->seal()
 
 void invalidate(const std::shared_ptr<nr::gpu::Recording>& rec) {
     if (rec) rec->seal();   // no further submissions; the waits it already has are still waited on
+}
+
+void set_split_execution_hooks(SplitBeginFn begin_fn, SplitEndFn end_fn) {
+    g_split_begin.store(begin_fn, std::memory_order_release);
+    g_split_end.store(end_fn, std::memory_order_release);
 }
 
 }  // namespace nr::pe::split

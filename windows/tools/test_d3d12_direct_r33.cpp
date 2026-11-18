@@ -19,15 +19,21 @@
 #include "nr_d3d12_passthrough_backend.hpp"
 #include "nr_d3d12_passthrough_net.hpp"
 #include "nr_dlssnr_model.hpp"
+#include "nr_gpu_arch.hpp"
+#include "nr_hud_method_hook.hpp"
 #include "nr_pe_config.hpp"
+#include "nr_pe_crash.hpp"
+#include "nr_pe_d3d12split.hpp"
 #include "nr_pe_log.hpp"
 #include "nr_pe_session.hpp"
 #include "nr_renodx.hpp"
+#include "nr_renodx_d3d12.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -55,7 +61,8 @@ ID3D12Resource* make_tex2d(ID3D12Device* dev, uint32_t w, uint32_t h, DXGI_FORMA
     return res;
 }
 
-ID3D12Resource* make_buf(ID3D12Device* dev, D3D12_HEAP_TYPE type, uint64_t bytes, D3D12_RESOURCE_STATES state) {
+ID3D12Resource* make_buf(ID3D12Device* dev, D3D12_HEAP_TYPE type, uint64_t bytes, D3D12_RESOURCE_STATES state,
+                         bool uav = false) {
     D3D12_HEAP_PROPERTIES hp{type};
     D3D12_RESOURCE_DESC rd{};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -66,10 +73,36 @@ ID3D12Resource* make_buf(ID3D12Device* dev, D3D12_HEAP_TYPE type, uint64_t bytes
     rd.Format = DXGI_FORMAT_UNKNOWN;
     rd.SampleDesc.Count = 1;
     rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    rd.Flags = uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
     ID3D12Resource* res = nullptr;
     if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, state, nullptr, IID_PPV_ARGS(&res))))
         return nullptr;
     return res;
+}
+
+uint16_t float_to_f16(float x) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &x, sizeof bits);
+    const uint32_t sign = (bits >> 16) & 0x8000u;
+    const int32_t exp = int32_t((bits >> 23) & 0xFFu) - 127;
+    uint32_t mant = bits & 0x007FFFFFu;
+    if (exp == 128) return uint16_t(sign | 0x7C00u | (mant ? 0x0200u : 0u));
+    if (exp > 15) return uint16_t(sign | 0x7C00u);
+    if (exp < -14) return uint16_t(sign);
+    return uint16_t(sign | uint32_t(exp + 15) << 10 | (mant >> 13));
+}
+
+float f16_to_float(uint16_t h) {
+    const uint32_t sign = uint32_t(h & 0x8000u) << 16;
+    const uint32_t exp = (h >> 10) & 0x1Fu;
+    const uint32_t mant = h & 0x03FFu;
+    uint32_t bits = 0;
+    if (exp == 0) bits = mant ? 0u : sign;   // sufficient for normalized/zero test inputs
+    else if (exp == 31) bits = sign | 0x7F800000u | (mant << 13);
+    else bits = sign | ((exp + 112u) << 23) | (mant << 13);
+    float out = 0.0f;
+    std::memcpy(&out, &bits, sizeof out);
+    return out;
 }
 
 void barrier_transition(ID3D12GraphicsCommandList* cmd, ID3D12Resource* r, D3D12_RESOURCE_STATES from,
@@ -97,6 +130,8 @@ ID3D12RootSignature* g_last_comp_rs = nullptr;
 ID3D12PipelineState* g_last_pso = nullptr;
 D3D12_GPU_VIRTUAL_ADDRESS g_last_comp_uav[8]{};
 uint32_t g_last_comp_const[8]{};
+uint32_t g_last_comp_param2 = 0;
+D3D12_GPU_DESCRIPTOR_HANDLE g_last_comp_table{};
 
 void reset_probes() {
     g_probe_set_heaps = 0;
@@ -107,6 +142,8 @@ void reset_probes() {
     g_probe_comp_table = 0;
     g_last_comp_rs = nullptr;
     g_last_pso = nullptr;
+    g_last_comp_table = {};
+    g_last_comp_param2 = 0;
     std::memset(g_last_comp_uav, 0, sizeof g_last_comp_uav);
     std::memset(g_last_comp_const, 0, sizeof g_last_comp_const);
 }
@@ -148,6 +185,7 @@ void STDMETHODCALLTYPE probe_set_gfx_rs(ID3D12GraphicsCommandList* cl, ID3D12Roo
 
 void STDMETHODCALLTYPE probe_set_comp_table(ID3D12GraphicsCommandList* cl, UINT idx, D3D12_GPU_DESCRIPTOR_HANDLE h) {
     ++g_probe_comp_table;
+    if (idx == 0) g_last_comp_table = h;
     reinterpret_cast<PFN_SetTable>(g_orig_vt[31])(cl, idx, h);
 }
 
@@ -157,7 +195,8 @@ void STDMETHODCALLTYPE probe_set_gfx_table(ID3D12GraphicsCommandList* cl, UINT i
 }
 
 void STDMETHODCALLTYPE probe_set_comp_const(ID3D12GraphicsCommandList* cl, UINT idx, UINT data, UINT off) {
-    if (idx < 8u && off == 0u) g_last_comp_const[idx] = data;
+    if (idx == 0u && off < 8u) g_last_comp_const[off] = data;
+    if (idx == 2u && off == 0u) g_last_comp_param2 = data;
     reinterpret_cast<PFN_SetConst>(g_orig_vt[33])(cl, idx, data, off);
 }
 
@@ -167,7 +206,13 @@ void STDMETHODCALLTYPE probe_set_gfx_const(ID3D12GraphicsCommandList* cl, UINT i
 }
 
 void STDMETHODCALLTYPE probe_set_comp_consts(ID3D12GraphicsCommandList* cl, UINT idx, UINT count, const void* data, UINT off) {
-    if (idx < 8u && data && off == 0u && count >= 1u) std::memcpy(&g_last_comp_const[idx], data, 4u);
+    if (idx == 0u && data) {
+        const auto* v = static_cast<const uint32_t*>(data);
+        for (UINT k = 0; k < count && off + k < 8u; ++k) g_last_comp_const[off + k] = v[k];
+    }
+    if (idx == 2u && data && off == 0u && count >= 1u) {
+        g_last_comp_param2 = static_cast<const uint32_t*>(data)[0];
+    }
     reinterpret_cast<PFN_SetConsts>(g_orig_vt[35])(cl, idx, count, data, off);
 }
 
@@ -288,10 +333,161 @@ bool make_gfx_test_rs(ID3D12Device* dev, ID3D12RootSignature** out_rs) {
     return SUCCEEDED(hr) && *out_rs;
 }
 
+bool wait_queue_strict(ID3D12CommandQueue* q, ID3D12Fence* fence, uint64_t val, HANDLE ev, const char* label) {
+    if (FAILED(q->Signal(fence, val))) {
+        std::fprintf(stderr, "FAIL: %s queue->Signal failed\n", label);
+        return false;
+    }
+    if (fence->GetCompletedValue() < val) {
+        if (FAILED(fence->SetEventOnCompletion(val, ev))) {
+            std::fprintf(stderr, "FAIL: %s fence->SetEventOnCompletion failed\n", label);
+            return false;
+        }
+        if (WaitForSingleObject(ev, 10000) != WAIT_OBJECT_0) {
+            std::fprintf(stderr, "FAIL: %s WaitForSingleObject timed out\n", label);
+            return false;
+        }
+    }
+    const uint64_t got = fence->GetCompletedValue();
+    if (got == UINT64_MAX || got < val) {
+        std::fprintf(stderr, "FAIL: %s fence completed=%llu < %llu\n", label,
+                     static_cast<unsigned long long>(got), static_cast<unsigned long long>(val));
+        return false;
+    }
+    return true;
+}
+
+int run_sub_hook_rollback() {
+    HMODULE sys_dxgi = LoadLibraryW(L"C:\\Windows\\System32\\dxgi.dll");
+    using PFN_Fac = HRESULT(WINAPI*)(REFIID, void**);
+    auto fn_fac = sys_dxgi ? reinterpret_cast<PFN_Fac>(reinterpret_cast<void*>(GetProcAddress(sys_dxgi, "CreateDXGIFactory1"))) : nullptr;
+    IDXGIFactory4* fac = nullptr;
+    if (!fn_fac || FAILED(fn_fac(IID_PPV_ARGS(&fac))) || !fac) return 1;
+    IDXGIAdapter1* ad = nullptr;
+    for (UINT i = 0; fac->EnumAdapters1(i, &ad) != DXGI_ERROR_NOT_FOUND; ++i) {
+        DXGI_ADAPTER_DESC1 d{};
+        ad->GetDesc1(&d);
+        if (d.VendorId == 0x1002 && !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) break;
+        ad->Release();
+        ad = nullptr;
+    }
+    if (!ad) { fac->Release(); return 1; }
+    IDXGIAdapter1* warp = nullptr;
+    if (FAILED(fac->EnumWarpAdapter(IID_PPV_ARGS(&warp))) || !warp) {
+        ad->Release();
+        fac->Release();
+        return 1;
+    }
+    ID3D12Device *dev1 = nullptr, *dev2 = nullptr;
+    if (FAILED(D3D12CreateDevice(ad, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&dev1))) || !dev1 ||
+        FAILED(D3D12CreateDevice(warp, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&dev2))) || !dev2 ||
+        dev1 == dev2) {
+        if (dev1) dev1->Release();
+        if (dev2) dev2->Release();
+        warp->Release();
+        ad->Release();
+        fac->Release();
+        return 1;
+    }
+    std::string why;
+    _putenv_s("NR_TEST_FAIL_HOOK_SLOT", "ExecuteCommandLists");
+    const bool r1 = nr::pe::d3d12_direct::install_hooks(dev1, nullptr, &why);
+    if (r1 || nr::pe::d3d12_direct::hooks_installed()) {
+        std::fprintf(stderr, "FAIL: hook rollback did not trigger on ExecuteCommandLists failure\n");
+        return 1;
+    }
+    _putenv_s("NR_TEST_FAIL_HOOK_SLOT", "");
+    const bool r_same = nr::pe::d3d12_direct::install_hooks(dev1, nullptr, &why);
+    if (r_same) {
+        std::fprintf(stderr, "FAIL: failed device was retried unexpectedly\n");
+        return 1;
+    }
+    const bool r2 = nr::pe::d3d12_direct::install_hooks(dev2, nullptr, &why);
+    if (!r2 || !nr::pe::d3d12_direct::hooks_installed()) {
+        std::fprintf(stderr, "FAIL: clean device retry failed after hook rollback: %s\n", why.c_str());
+        return 1;
+    }
+    dev2->Release();
+    dev1->Release();
+    warp->Release();
+    ad->Release();
+    fac->Release();
+    std::printf("[PASS] Subprocess hook-rollback: failed slot rolled back cleanly, retry on rebuilt device succeeded\n");
+    return 0;
+}
+
+int run_sub_no_canary_hooks() {
+    HMODULE self = GetModuleHandleW(nullptr);
+    nr::pe::set_module(self);
+    nr::pe::configure_network(nr::pe::module_folder());
+    nr::pe::d3d12_passthrough::start();
+    if (nr::pe::d3d12_direct::hooks_installed()) {
+        std::fprintf(stderr, "FAIL: hooks installed prematurely before canary\n");
+        return 1;
+    }
+    HMODULE sys_dxgi = LoadLibraryW(L"C:\\Windows\\System32\\dxgi.dll");
+    using PFN_Fac = HRESULT(WINAPI*)(REFIID, void**);
+    auto fn_fac = sys_dxgi ? reinterpret_cast<PFN_Fac>(reinterpret_cast<void*>(GetProcAddress(sys_dxgi, "CreateDXGIFactory1"))) : nullptr;
+    IDXGIFactory4* fac = nullptr;
+    if (!fn_fac || FAILED(fn_fac(IID_PPV_ARGS(&fac))) || !fac) return 1;
+    IDXGIAdapter1* warp = nullptr;
+    ID3D12Device* warp_dev = nullptr;
+    if (SUCCEEDED(fac->EnumWarpAdapter(IID_PPV_ARGS(&warp))) && warp) {
+        D3D12CreateDevice(warp, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&warp_dev));
+    }
+    if (warp_dev) {
+        nr::pe::d3d12_passthrough::on_device(warp_dev);
+        for (int i = 0; i < 100 && nr::pe::d3d12_passthrough::canary() == nr::pe::d3d12_passthrough::Canary::kRunning; ++i)
+            Sleep(20);
+        if (nr::pe::d3d12_direct::hooks_installed()) {
+            std::fprintf(stderr, "FAIL: hooks installed on non-RDNA3/4 WARP adapter after failed canary\n");
+            return 1;
+        }
+        warp_dev->Release();
+    }
+    if (warp) warp->Release();
+    fac->Release();
+    std::printf("[PASS] Subprocess no-canary-hooks: 0 hooks installed before hit or on non-AMD WARP device\n");
+    return 0;
+}
+
+static DWORD g_uef_seen_err = 0;
+static int g_uef_calls = 0;
+static LONG WINAPI test_prev_uef(EXCEPTION_POINTERS*) {
+    g_uef_seen_err = GetLastError();
+    ++g_uef_calls;
+    SetLastError(0x13579BDFu);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+static DWORD g_veh_seen_err = 0;
+static int g_veh_calls = 0;
+static LONG CALLBACK test_veh_catcher(EXCEPTION_POINTERS* ep) {
+    if (ep && ep->ExceptionRecord && ep->ExceptionRecord->ExceptionCode == 0xE0123456u) {
+        g_veh_seen_err = GetLastError();
+        ++g_veh_calls;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+__attribute__((noinline)) static int STDMETHODCALLTYPE fake_mh_target(void* p) {
+    volatile uintptr_t v = reinterpret_cast<uintptr_t>(p);
+    return (v != 0 && (v ^ 0x55u) != 0x55u) ? 1 : 0;
+}
+__attribute__((noinline)) static int STDMETHODCALLTYPE fake_mh_detour(void* p) {
+    volatile uintptr_t v = reinterpret_cast<uintptr_t>(p);
+    return (v != 0 && (v ^ 0x55u) != 0x55u) ? 2 : 0;
+}
+using PFN_FakeTarget = int(STDMETHODCALLTYPE*)(void*);
+static PFN_FakeTarget g_fake_real = nullptr;
+static HRESULT STDMETHODCALLTYPE mock_wrap_reset(ID3D12GraphicsCommandList*, ID3D12CommandAllocator*, ID3D12PipelineState*) { return S_OK; }
+static HRESULT STDMETHODCALLTYPE mock_wrap_close(ID3D12GraphicsCommandList*) { return S_OK; }
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    if (argc > 1 && std::strcmp(argv[1], "--test-hook-rollback") == 0) return run_sub_hook_rollback();
+    if (argc > 1 && std::strcmp(argv[1], "--test-no-canary-hooks") == 0) return run_sub_no_canary_hooks();
     if (GetModuleHandleW(L"d3dcompiler_47.dll") != nullptr) {
         std::fprintf(stderr, "FAIL: R33 pre-check found d3dcompiler_47.dll already loaded\n");
         return 1;
@@ -377,12 +573,19 @@ int main() {
     HANDLE fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     uint64_t fence_val = 0;
     auto wait_gpu = [&]() {
-        queue->Signal(fence, ++fence_val);
-        if (fence->GetCompletedValue() < fence_val) {
-            fence->SetEventOnCompletion(fence_val, fence_event);
-            WaitForSingleObject(fence_event, 10000);
-        }
+        if (!wait_queue_strict(queue, fence, ++fence_val, fence_event, "primary")) std::exit(1);
     };
+
+    // Create an untracked bundle before installing Direct hooks for Case G invalidation verification.
+    ID3D12CommandAllocator* bundle_alloc = nullptr;
+    ID3D12GraphicsCommandList* untracked_bundle = nullptr;
+    if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_BUNDLE, IID_PPV_ARGS(&bundle_alloc))) ||
+        FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_BUNDLE, bundle_alloc, nullptr,
+                                         IID_PPV_ARGS(&untracked_bundle))) ||
+        FAILED(untracked_bundle->Close())) {
+        std::fprintf(stderr, "FAIL: untracked bundle creation\n");
+        return 1;
+    }
 
     std::string why;
     if (!nr::pe::d3d12_direct::install_hooks(device, cmd, &why)) {
@@ -564,7 +767,7 @@ int main() {
     const UINT host_push[2] = {CW, CH};
     host_slot.write_srv_tex(device, k_host.find_binding(0), host_src, DXGI_FORMAT_R32_FLOAT, 0, 1);
     host_slot.write_uav_tex(device, k_host.find_binding(2), host_dst, DXGI_FORMAT_R32_FLOAT, 0);
-    host_slot.write_push(host_push, sizeof host_push);
+    host_slot.write_push(host_push, sizeof host_push, &k_host);
 
     // Pre-bind host [ResourceDescriptorHeap, SamplerDescriptorHeap], Graphics state, and Compute state.
     cmd->SetDescriptorHeaps(2, host_heaps);
@@ -575,13 +778,15 @@ int main() {
 
     cmd->SetComputeRootSignature(rs_host_comp);
     cmd->SetPipelineState(k_host.pso);
-    cmd->SetComputeRoot32BitConstant(0, 0x13572468u, 0);
+    cmd->SetComputeRoot32BitConstants(0, 2, host_push, 0);
+    cmd->SetComputeRoot32BitConstant(0, 0x13572468u, 4);
     cmd->SetComputeRootUnorderedAccessView(1, host_slot.gpu_va);
 
     attach_probe(cmd);
     reinterpret_cast<PFN_SetHeaps>(g_copied_vt[28])(cmd, 0, nullptr);
     const int self_check = g_probe_set_heaps;
     reset_probes();
+    nr::pe::d3d12_direct::reset_counters();
     if (self_check != 1) {
         std::fprintf(stderr, "FAIL: Probe self-check failed (%d)\n", self_check);
         detach_probe(cmd);
@@ -666,23 +871,28 @@ int main() {
     }
 
     if (g_probe_set_heaps != 0 || g_probe_gfx_rs != 0 || g_probe_gfx_table != 0 ||
-        g_probe_gfx_other != 0 || g_probe_clear_uav != 0) {
+        g_probe_gfx_other != 0 || g_probe_clear_uav != 0 ||
+        nr::pe::d3d12_direct::nr_set_heap_count() != 0 || nr::pe::d3d12_direct::nr_set_table_count() != 0) {
         std::fprintf(stderr,
                      "FAIL: R33 Case A host mutation: SetDescriptorHeaps=%d SetGraphicsRS=%d SetGraphicsTable=%d "
-                     "SetGraphicsOther=%d ClearUAV=%d\n",
-                     g_probe_set_heaps, g_probe_gfx_rs, g_probe_gfx_table, g_probe_gfx_other, g_probe_clear_uav);
+                     "SetGraphicsOther=%d ClearUAV=%d nrHeaps=%llu nrTables=%llu\n",
+                     g_probe_set_heaps, g_probe_gfx_rs, g_probe_gfx_table, g_probe_gfx_other, g_probe_clear_uav,
+                     static_cast<unsigned long long>(nr::pe::d3d12_direct::nr_set_heap_count()),
+                     static_cast<unsigned long long>(nr::pe::d3d12_direct::nr_set_table_count()));
         detach_probe(cmd);
         return 1;
     }
     if (g_last_comp_rs != rs_host_comp || g_last_pso != k_host.pso ||
-        g_last_comp_uav[1] != host_slot.gpu_va || g_last_comp_const[0] != 0x13572468u) {
+        g_last_comp_uav[1] != host_slot.gpu_va ||
+        g_last_comp_const[0] != CW || g_last_comp_const[1] != CH || g_last_comp_const[4] != 0x13572468u) {
         std::fprintf(stderr,
                      "FAIL: R33 Case A Compute state mismatch: rs=%p (exp %p) pso=%p (exp %p) uav=0x%llx (exp 0x%llx) "
-                     "c0=0x%08x\n",
+                     "c0=0x%08x c1=0x%08x c4=0x%08x\n",
                      static_cast<void*>(g_last_comp_rs), static_cast<void*>(rs_host_comp),
                      static_cast<void*>(g_last_pso), static_cast<void*>(k_host.pso),
                      static_cast<unsigned long long>(g_last_comp_uav[1]),
-                     static_cast<unsigned long long>(host_slot.gpu_va), g_last_comp_const[0]);
+                     static_cast<unsigned long long>(host_slot.gpu_va),
+                     g_last_comp_const[0], g_last_comp_const[1], g_last_comp_const[4]);
         detach_probe(cmd);
         return 1;
     }
@@ -715,12 +925,21 @@ int main() {
     }
     {
         uint8_t* m = nullptr;
-        host_rb->Map(0, nullptr, reinterpret_cast<void**>(&m));
+        if (FAILED(host_rb->Map(0, nullptr, reinterpret_cast<void**>(&m))) || !m) {
+            std::fprintf(stderr, "FAIL: Case A host_rb->Map failed\n");
+            return 1;
+        }
         double max_err = 0.0;
         for (uint32_t y = 0; y < CH; ++y) {
             const auto* row = reinterpret_cast<const float*>(m + uint64_t(y) * host_fp.Footprint.RowPitch);
-            for (uint32_t x = 0; x < CW; ++x)
+            for (uint32_t x = 0; x < CW; ++x) {
+                if (!std::isfinite(row[x])) {
+                    host_rb->Unmap(0, nullptr);
+                    std::fprintf(stderr, "FAIL: Case A non-finite float readback (%g)\n", double(row[x]));
+                    return 1;
+                }
                 max_err = std::max(max_err, std::abs(double(row[x]) - double(expected[size_t(y) * CW + x])));
+            }
         }
         host_rb->Unmap(0, nullptr);
         if (max_err > 1e-6) {
@@ -728,9 +947,10 @@ int main() {
             return 1;
         }
     }
-    std::printf("[PASS] Case A: SetDescriptorHeaps=0, Graphics=0, ClearUAV=0, Compute state restored and GPU-verified\n");
+    std::printf("[PASS] Case A: SetDescriptorHeaps=0 (nr=%llu), Graphics=0, ClearUAV=0, Compute state restored & verified\n",
+                static_cast<unsigned long long>(nr::pe::d3d12_direct::nr_set_heap_count()));
 
-    // ---- Case B: Read-only SetDescriptorHeaps observer invalidates stale kind==1 Compute Descriptor Table ----
+    // ---- Case B & B2: Stale Compute Table Invalidation & Valid Compute Table Restore ----
     ID3D12DescriptorHeap* alt_heap = nullptr;
     {
         D3D12_DESCRIPTOR_HEAP_DESC hd{};
@@ -771,7 +991,7 @@ int main() {
     }
     if (!ok_caseb || g_probe_set_heaps != 0 || g_probe_comp_table != 0 ||
         g_last_comp_rs != rs_table || g_last_comp_uav[1] != caseb_slot.gpu_va ||
-        g_last_comp_const[2] != 0xCAFEBABEu || g_last_pso != k_host.pso) {
+        g_last_comp_param2 != 0xCAFEBABEu || g_last_pso != k_host.pso) {
         std::fprintf(stderr,
                      "FAIL: Case B stale-table invalidation: ok=%d heaps=%d comp_table=%d rs=%p (exp %p) "
                      "uav=0x%llx (exp 0x%llx) c2=0x%08x pso=%p (exp %p)\n",
@@ -779,11 +999,433 @@ int main() {
                      static_cast<void*>(g_last_comp_rs), static_cast<void*>(rs_table),
                      static_cast<unsigned long long>(g_last_comp_uav[1]),
                      static_cast<unsigned long long>(caseb_slot.gpu_va),
-                     g_last_comp_const[2], static_cast<void*>(g_last_pso), static_cast<void*>(k_host.pso));
+                     g_last_comp_param2, static_cast<void*>(g_last_pso), static_cast<void*>(k_host.pso));
         return 1;
     }
     std::printf("[PASS] Case B: Mid-list SetDescriptorHeaps invalidated Compute table (replayed=%d), RS/UAV/Const/PSO restored\n",
                 g_probe_comp_table);
+
+    // ---- Case B2: Unchanged Compute Descriptor Table restored once without SetDescriptorHeaps ----
+    alloc->Reset();
+    cmd->Reset(alloc, nullptr);
+    const nr::gpu::Ticket caseb2_ticket = nr::pe::d3d12_direct::book(cmd);
+    const nr::pe::d3d12_outer::OuterSlot caseb2_slot = host_pool.acquire(caseb2_ticket, &why, k_host.desc_zero_bytes);
+    if (!caseb2_slot.cpu) {
+        std::fprintf(stderr, "FAIL: Case B2 host_pool.acquire: %s\n", why.c_str());
+        return 1;
+    }
+    const D3D12_GPU_DESCRIPTOR_HANDLE tbl_h = host_heaps[0]->GetGPUDescriptorHandleForHeapStart();
+    cmd->SetDescriptorHeaps(1, &host_heaps[0]);
+    cmd->SetComputeRootSignature(rs_table);
+    cmd->SetComputeRootDescriptorTable(0, tbl_h);
+    cmd->SetComputeRootUnorderedAccessView(1, caseb2_slot.gpu_va);
+    cmd->SetComputeRoot32BitConstant(2, 0xFACE1234u, 0);
+    cmd->SetPipelineState(k_host.pso);
+
+    attach_probe(cmd);
+    reset_probes();
+    nr::pe::d3d12_direct::reset_counters();
+    const bool ok_caseb2 = nr::pe::d3d12_passthrough::copy_depth_r32(device, cmd, host_src, host_dst, &why);
+    detach_probe(cmd);
+    cmd->Close();
+    {
+        ID3D12CommandList* ls[] = {cmd};
+        queue->ExecuteCommandLists(1, ls);
+        wait_gpu();
+    }
+    if (!ok_caseb2 || g_probe_set_heaps != 0 || g_probe_comp_table != 1 ||
+        g_last_comp_table.ptr != tbl_h.ptr || g_last_comp_rs != rs_table ||
+        g_last_comp_uav[1] != caseb2_slot.gpu_va || g_last_comp_param2 != 0xFACE1234u ||
+        g_last_pso != k_host.pso || nr::pe::d3d12_direct::host_table_replays() < 1 ||
+        nr::pe::d3d12_direct::nr_set_heap_count() != 0 || nr::pe::d3d12_direct::nr_set_table_count() != 0) {
+        std::fprintf(stderr,
+                     "FAIL: Case B2 valid-table restore: ok=%d heaps=%d comp_table=%d replays=%llu tbl=0x%llx (exp 0x%llx) "
+                     "rs=%p uav=0x%llx c2=0x%08x pso=%p nrH=%llu nrT=%llu\n",
+                     ok_caseb2, g_probe_set_heaps, g_probe_comp_table,
+                     static_cast<unsigned long long>(nr::pe::d3d12_direct::host_table_replays()),
+                     static_cast<unsigned long long>(g_last_comp_table.ptr),
+                     static_cast<unsigned long long>(tbl_h.ptr),
+                     static_cast<void*>(g_last_comp_rs),
+                     static_cast<unsigned long long>(g_last_comp_uav[1]),
+                     g_last_comp_param2, static_cast<void*>(g_last_pso),
+                     static_cast<unsigned long long>(nr::pe::d3d12_direct::nr_set_heap_count()),
+                     static_cast<unsigned long long>(nr::pe::d3d12_direct::nr_set_table_count()));
+        return 1;
+    }
+    std::printf("[PASS] Case B2: Valid Compute descriptor table restored once (replays=%llu), zero SetDescriptorHeaps\n",
+                static_cast<unsigned long long>(nr::pe::d3d12_direct::host_table_replays()));
+
+    // ---- D01: SRD probe rejection/recovery + RGBA16F & R32_TYPELESS roundtrip helper ----
+    {
+        nr::pe::d3d12_outer::OuterHeapPool probe_pool;
+        _putenv_s("NR_TEST_FAIL_SRD_PROBE", "1");
+        const bool bad_init = probe_pool.init(device, 16, nullptr, nullptr, &why);
+        _putenv_s("NR_TEST_FAIL_SRD_PROBE", "");
+        if (bad_init) {
+            std::fprintf(stderr, "FAIL: D01 SRD probe failure injection did not fail pool init\n");
+            return 1;
+        }
+        if (!probe_pool.init(device, 16, nullptr, nullptr, &why)) {
+            std::fprintf(stderr, "FAIL: D01 SRD probe recovery init failed: %s\n", why.c_str());
+            return 1;
+        }
+        probe_pool.reset();
+    }
+
+    auto run_outer_roundtrip = [&](ID3D12Device* dev, ID3D12CommandQueue* q, ID3D12CommandAllocator* ca,
+                                   ID3D12GraphicsCommandList* cl, ID3D12Fence* f, HANDLE ev, uint64_t& fv,
+                                   const std::shared_ptr<nr::pe::d3d12_outer::OuterArchive>& oa, bool is_rdna3,
+                                   const char* label) -> bool {
+        ID3D12RootSignature* rs = nullptr;
+        nr::pe::d3d12_outer::OuterKernel k_tl{}, k_fl{}, k_dp{}, k_wc{}, k_il5{}, k_il3{};
+        nr::pe::d3d12_outer::OuterHeapPool pool;
+        std::string rwhy;
+        if (!nr::pe::d3d12_outer::create_outer_root_signature(dev, &rs, &rwhy) ||
+            !oa->build_kernel(dev, "backend/to_linear", &k_tl, &rwhy) ||
+            !oa->build_kernel(dev, "backend/from_linear", &k_fl, &rwhy) ||
+            !oa->build_kernel(dev, "backend/copy_depth_r32", &k_dp, &rwhy) ||
+            !oa->build_kernel(dev, "wilsjo2/copy", &k_wc, &rwhy) ||
+            !oa->build_kernel(dev, "il/il0_5", &k_il5, &rwhy) ||
+            !oa->build_kernel(dev, "il/il0_3", &k_il3, &rwhy) ||
+            !pool.init(dev, 16, nullptr, nullptr, &rwhy)) {
+            std::fprintf(stderr, "FAIL: %s outer kernel setup: %s\n", label, rwhy.c_str());
+            if (k_tl.pso) k_tl.pso->Release();
+            if (k_fl.pso) k_fl.pso->Release();
+            if (k_dp.pso) k_dp.pso->Release();
+            if (k_wc.pso) k_wc.pso->Release();
+            if (k_il5.pso) k_il5.pso->Release();
+            if (k_il3.pso) k_il3.pso->Release();
+            if (rs) rs->Release();
+            return false;
+        }
+        const auto* b_tl_tex = k_tl.find_binding(0);
+        const auto* b_tl_buf = k_tl.find_binding(3, nr::pe::d3d12_outer::kBuf);
+        const auto* b_fl_buf = k_fl.find_binding(1, nr::pe::d3d12_outer::kBuf);
+        const auto* b_fl_tex = k_fl.find_binding(2);
+        const auto* b_dp_srv = k_dp.find_binding(0);
+        const auto* b_dp_uav = k_dp.find_binding(2);
+        const auto* b_wc_srv = k_wc.find_binding(0);
+        const auto* b_wc_uav = k_wc.find_binding(4);
+        const auto* b_il5_d  = k_il5.find_binding(29);
+        const auto* b_il5_dc = k_il5.find_binding(30);
+        const auto* b_il3_p  = k_il3.find_binding(0);
+        const auto* b_il3_b  = k_il3.find_binding(2);
+        if (!b_tl_tex || !b_tl_buf || !b_fl_buf || !b_fl_tex || !b_dp_srv || !b_dp_uav || !b_wc_srv || !b_wc_uav ||
+            !b_il5_d || !b_il5_dc || !b_il3_p || !b_il3_b) {
+            std::fprintf(stderr, "FAIL: %s outer kernel bindings incomplete\n", label);
+            pool.reset();
+            if (k_tl.pso) k_tl.pso->Release();
+            if (k_fl.pso) k_fl.pso->Release();
+            if (k_dp.pso) k_dp.pso->Release();
+            if (k_wc.pso) k_wc.pso->Release();
+            if (k_il5.pso) k_il5.pso->Release();
+            if (k_il3.pso) k_il3.pso->Release();
+            rs->Release();
+            return false;
+        }
+        ID3D12Resource* f16_in = make_tex2d(dev, CW, CH, DXGI_FORMAT_R16G16B16A16_FLOAT, false, D3D12_RESOURCE_STATE_COPY_DEST);
+        ID3D12Resource* f16_out = make_tex2d(dev, CW, CH, DXGI_FORMAT_R16G16B16A16_FLOAT, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        ID3D12Resource* il_base = make_tex2d(dev, CW, CH, DXGI_FORMAT_R16G16B16A16_FLOAT, true, D3D12_RESOURCE_STATE_COPY_DEST);
+        ID3D12Resource* d32_in = make_tex2d(dev, CW, CH, DXGI_FORMAT_R32_TYPELESS, false, D3D12_RESOURCE_STATE_COPY_DEST);
+        ID3D12Resource* d32_out = make_tex2d(dev, CW, CH, DXGI_FORMAT_R32_FLOAT, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        ID3D12Resource* d32_il_out = make_tex2d(dev, CW, CH, DXGI_FORMAT_R32_FLOAT, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        const uint32_t align = is_rdna3 ? 256u : 128u;
+        const uint32_t pitch8 = (CW * 8u + align - 1u) / align * align / 8u;
+        ID3D12Resource* lin_buf = make_buf(dev, D3D12_HEAP_TYPE_DEFAULT, uint64_t(pitch8) * CH * 8u,
+                                           D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
+
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT f16_fp{};
+        UINT rows16 = 0;
+        UINT64 rowb16 = 0, tot16 = 0;
+        const D3D12_RESOURCE_DESC fd16 = f16_out->GetDesc();
+        dev->GetCopyableFootprints(&fd16, 0, 1, 0, &f16_fp, &rows16, &rowb16, &tot16);
+        ID3D12Resource* f16_up = make_buf(dev, D3D12_HEAP_TYPE_UPLOAD, tot16, D3D12_RESOURCE_STATE_GENERIC_READ);
+        ID3D12Resource* f16_rb = make_buf(dev, D3D12_HEAP_TYPE_READBACK, tot16, D3D12_RESOURCE_STATE_COPY_DEST);
+        ID3D12Resource* il_up = make_buf(dev, D3D12_HEAP_TYPE_UPLOAD, tot16, D3D12_RESOURCE_STATE_GENERIC_READ);
+        ID3D12Resource* il_rb = make_buf(dev, D3D12_HEAP_TYPE_READBACK, tot16, D3D12_RESOURCE_STATE_COPY_DEST);
+
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT d32_fp{};
+        UINT rows32 = 0;
+        UINT64 rowb32 = 0, tot32 = 0;
+        const D3D12_RESOURCE_DESC fd32 = d32_out->GetDesc();
+        dev->GetCopyableFootprints(&fd32, 0, 1, 0, &d32_fp, &rows32, &rowb32, &tot32);
+        ID3D12Resource* d32_up = make_buf(dev, D3D12_HEAP_TYPE_UPLOAD, tot32, D3D12_RESOURCE_STATE_GENERIC_READ);
+        ID3D12Resource* d32_rb = make_buf(dev, D3D12_HEAP_TYPE_READBACK, tot32, D3D12_RESOURCE_STATE_COPY_DEST);
+
+        bool ok = f16_in && f16_out && il_base && d32_in && d32_out && d32_il_out && lin_buf &&
+                  f16_up && f16_rb && il_up && il_rb && d32_up && d32_rb;
+        std::vector<float> exp_f16(size_t(CW) * CH * 4u);
+        std::vector<float> exp_d32(size_t(CW) * CH);
+        if (ok) {
+            uint8_t* m16 = nullptr;
+            f16_up->Map(0, nullptr, reinterpret_cast<void**>(&m16));
+            for (uint32_t y = 0; y < CH; ++y) {
+                auto* row = reinterpret_cast<uint16_t*>(m16 + uint64_t(y) * f16_fp.Footprint.RowPitch);
+                for (uint32_t x = 0; x < CW; ++x) {
+                    for (uint32_t c = 0; c < 4u; ++c) {
+                        const float v = (c == 3u) ? 1.0f : (0.125f + float((x + y * 5u + c * 3u) & 31u) * 0.03125f);
+                        const uint16_t h = float_to_f16(v);
+                        row[size_t(x) * 4u + c] = h;
+                        exp_f16[(size_t(y) * CW + x) * 4u + c] = f16_to_float(h);
+                    }
+                }
+            }
+            f16_up->Unmap(0, nullptr);
+
+            uint8_t* mi = nullptr;
+            il_up->Map(0, nullptr, reinterpret_cast<void**>(&mi));
+            for (uint32_t y = 0; y < CH; ++y) {
+                auto* row = reinterpret_cast<uint16_t*>(mi + uint64_t(y) * f16_fp.Footprint.RowPitch);
+                for (uint32_t x = 0; x < CW; ++x) {
+                    row[size_t(x) * 4u + 0] = float_to_f16(0.0625f);
+                    row[size_t(x) * 4u + 1] = float_to_f16(0.8750f);
+                    row[size_t(x) * 4u + 2] = float_to_f16(0.1250f);
+                    row[size_t(x) * 4u + 3] = float_to_f16(0.5000f);
+                }
+            }
+            il_up->Unmap(0, nullptr);
+
+            uint8_t* m32 = nullptr;
+            d32_up->Map(0, nullptr, reinterpret_cast<void**>(&m32));
+            for (uint32_t y = 0; y < CH; ++y) {
+                auto* row = reinterpret_cast<float*>(m32 + uint64_t(y) * d32_fp.Footprint.RowPitch);
+                for (uint32_t x = 0; x < CW; ++x) {
+                    const float v = 0.1f + float((x * 7u + y * 11u) & 127u) * 0.005f;
+                    row[x] = v;
+                    exp_d32[size_t(y) * CW + x] = v;
+                }
+            }
+            d32_up->Unmap(0, nullptr);
+
+            ca->Reset();
+            cl->Reset(ca, nullptr);
+            D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+            dst.pResource = f16_in;
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            src.pResource = f16_up;
+            src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            src.PlacedFootprint = f16_fp;
+            cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+            dst.pResource = d32_in;
+            src.pResource = d32_up;
+            src.PlacedFootprint = d32_fp;
+            cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+            dst.pResource = il_base;
+            src.pResource = il_up;
+            src.PlacedFootprint = f16_fp;
+            cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+            barrier_transition(cl, f16_in, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            barrier_transition(cl, d32_in, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            barrier_transition(cl, il_base, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+            auto rec = std::make_shared<nr::gpu::Recording>();
+            const auto slot_tl = pool.acquire(rec, &rwhy, k_tl.desc_zero_bytes);
+            const auto slot_fl = pool.acquire(rec, &rwhy, k_fl.desc_zero_bytes);
+            const auto slot_wc = pool.acquire(rec, &rwhy, k_wc.desc_zero_bytes);
+            const auto slot_dp = pool.acquire(rec, &rwhy, k_dp.desc_zero_bytes);
+            const auto slot_il5 = pool.acquire(rec, &rwhy, k_il5.desc_zero_bytes);
+            const auto slot_il3 = pool.acquire(rec, &rwhy, k_il3.desc_zero_bytes);
+            ok = slot_tl.cpu && slot_fl.cpu && slot_wc.cpu && slot_dp.cpu && slot_il5.cpu && slot_il3.cpu;
+            if (ok) {
+                const UINT lin_push[8] = {CW, CH, pitch8, 0u, 0u, 0u, 0u, 0u};
+                slot_tl.write_srv_tex(dev, b_tl_tex, f16_in, DXGI_FORMAT_R16G16B16A16_FLOAT, 0, 1);
+                slot_tl.write_buf(b_tl_buf, lin_buf, uint64_t(pitch8) * CH * 8u);
+                slot_tl.write_push(lin_push, sizeof lin_push, &k_tl);
+                slot_tl.dispatch(cl, rs, k_tl, (CW + 7u) / 8u, (CH + 7u) / 8u, 1u, true);
+
+                D3D12_RESOURCE_BARRIER uavb{};
+                uavb.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                uavb.UAV.pResource = lin_buf;
+                cl->ResourceBarrier(1, &uavb);
+
+                slot_fl.write_buf(b_fl_buf, lin_buf, uint64_t(pitch8) * CH * 8u);
+                slot_fl.write_uav_tex(dev, b_fl_tex, f16_out, DXGI_FORMAT_R16G16B16A16_FLOAT, 0);
+                slot_fl.write_push(lin_push, sizeof lin_push, &k_fl);
+                slot_fl.dispatch(cl, rs, k_fl, (CW + 7u) / 8u, (CH + 7u) / 8u, 1u, false);
+
+                D3D12_RESOURCE_BARRIER wc_uavb{};
+                wc_uavb.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                wc_uavb.UAV.pResource = f16_out;
+                cl->ResourceBarrier(1, &wc_uavb);
+
+                UINT wc_push[13]{};
+                wc_push[2] = 16u;
+                wc_push[3] = 16u;
+                wc_push[11] = 8u | (4u << 16);
+                wc_push[12] = 12u | (6u << 16);
+                slot_wc.write_srv_tex(dev, b_wc_srv, f16_in, DXGI_FORMAT_R16G16B16A16_FLOAT, 0, 1);
+                slot_wc.write_uav_tex(dev, b_wc_uav, f16_out, DXGI_FORMAT_R16G16B16A16_FLOAT, 0);
+                slot_wc.write_push(wc_push, sizeof wc_push, &k_wc);
+                slot_wc.dispatch(cl, rs, k_wc, 2u, 2u, 1u, false);
+
+                const UINT dp_push[2] = {CW, CH};
+                slot_dp.write_srv_tex(dev, b_dp_srv, d32_in, DXGI_FORMAT_R32_FLOAT, 0, 1);
+                slot_dp.write_uav_tex(dev, b_dp_uav, d32_out, DXGI_FORMAT_R32_FLOAT, 0);
+                slot_dp.write_push(dp_push, sizeof dp_push, &k_dp);
+                slot_dp.dispatch(cl, rs, k_dp, (CW + 7u) / 8u, (CH + 7u) / 8u, 1u, false);
+
+                D3D12_RESOURCE_BARRIER il_uavb{};
+                il_uavb.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                cl->ResourceBarrier(1, &il_uavb);
+
+                struct IlPushRec {
+                    uint32_t size[2], mbase[2], mgrid[2];
+                    float mscale[2];
+                    uint32_t mode, slot, n, flags;
+                    float k0, k1;
+                    uint32_t dbase[2], dgrid[2], styles;
+                    float pad0, inten[4];
+                };
+                IlPushRec ip{{CW, CH}, {0u, 0u}, {CW, CH}, {1.f, 1.f}, 5u, 0u, 2u, 0u, 0.02f, 0.06f,
+                             {0u, 0u}, {CW, CH}, 0u, 0.f, {1.f, 1.f, 1.f, 1.f}};
+                slot_il5.write_srv_tex(dev, b_il5_d, d32_in, DXGI_FORMAT_R32_FLOAT, 0, 1);
+                slot_il5.write_uav_tex(dev, b_il5_dc, d32_il_out, DXGI_FORMAT_R32_FLOAT, 0);
+                slot_il5.write_push(&ip, sizeof ip, &k_il5);
+                slot_il5.dispatch(cl, rs, k_il5, (CW + 15u) / 16u, (CH + 15u) / 16u, 1u, false);
+
+                cl->ResourceBarrier(1, &il_uavb);
+
+                ip.mode = 3u;
+                slot_il3.write_uav_tex(dev, b_il3_p, f16_out, DXGI_FORMAT_R16G16B16A16_FLOAT, 0);
+                slot_il3.write_uav_tex(dev, b_il3_b, il_base, DXGI_FORMAT_R16G16B16A16_FLOAT, 0);
+                slot_il3.write_push(&ip, sizeof ip, &k_il3);
+                slot_il3.dispatch(cl, rs, k_il3, (CW + 15u) / 16u, (CH + 15u) / 16u, 1u, false);
+
+                barrier_transition(cl, f16_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                barrier_transition(cl, d32_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                barrier_transition(cl, il_base, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+                dst.pResource = f16_rb;
+                dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                dst.PlacedFootprint = f16_fp;
+                src.pResource = f16_out;
+                src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+                dst.pResource = il_rb;
+                src.pResource = il_base;
+                cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+                dst.pResource = d32_rb;
+                dst.PlacedFootprint = d32_fp;
+                src.pResource = d32_out;
+                cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+                cl->Close();
+                ID3D12CommandList* ls[] = {cl};
+                q->ExecuteCommandLists(1, ls);
+                ok = wait_queue_strict(q, f, ++fv, ev, label);
+                rec->seal();
+                if (ok && FAILED(dev->GetDeviceRemovedReason())) {
+                    std::fprintf(stderr, "FAIL: %s device removed (0x%08lx)\n", label,
+                                 static_cast<unsigned long>(dev->GetDeviceRemovedReason()));
+                    ok = false;
+                }
+                if (ok) {
+                    double err16 = 0.0;
+                    f16_rb->Map(0, nullptr, reinterpret_cast<void**>(&m16));
+                    for (uint32_t y = 0; y < CH && ok; ++y) {
+                        const auto* row = reinterpret_cast<const uint16_t*>(m16 + uint64_t(y) * f16_fp.Footprint.RowPitch);
+                        for (uint32_t x = 0; x < CW; ++x) {
+                            for (uint32_t c = 0; c < 4u; ++c) {
+                                const float got = f16_to_float(row[size_t(x) * 4u + c]);
+                                if (!std::isfinite(got)) {
+                                    std::fprintf(stderr, "FAIL: %s non-finite RGBA16F readback\n", label);
+                                    ok = false;
+                                    break;
+                                }
+                                const bool in_wc = (x >= 12u && x < 28u && y >= 6u && y < 22u);
+                                const uint32_t sx = in_wc ? (x - 4u) : x;
+                                const uint32_t sy = in_wc ? (y - 2u) : y;
+                                err16 = std::max(err16, std::abs(double(got) - double(exp_f16[(size_t(sy) * CW + sx) * 4u + c])));
+                            }
+                            if (!ok) break;
+                        }
+                    }
+                    f16_rb->Unmap(0, nullptr);
+
+                    double err32 = 0.0;
+                    d32_rb->Map(0, nullptr, reinterpret_cast<void**>(&m32));
+                    for (uint32_t y = 0; y < CH && ok; ++y) {
+                        const auto* row = reinterpret_cast<const float*>(m32 + uint64_t(y) * d32_fp.Footprint.RowPitch);
+                        for (uint32_t x = 0; x < CW; ++x) {
+                            if (!std::isfinite(row[x])) {
+                                std::fprintf(stderr, "FAIL: %s non-finite R32_TYPELESS depth readback (%g)\n",
+                                             label, double(row[x]));
+                                ok = false;
+                                break;
+                            }
+                            err32 = std::max(err32, std::abs(double(row[x]) - double(exp_d32[size_t(y) * CW + x])));
+                        }
+                    }
+                    d32_rb->Unmap(0, nullptr);
+
+                    if (ok && (err16 > 1e-3 || err32 > 1e-6)) {
+                        std::fprintf(stderr, "FAIL: %s pixel mismatch (f16_err=%g, d32_err=%g)\n", label, err16, err32);
+                        ok = false;
+                    }
+                    double err_il3 = 0.0;
+                    il_rb->Map(0, nullptr, reinterpret_cast<void**>(&m16));
+                    for (uint32_t y = 0; y < CH && ok; ++y) {
+                        const auto* row = reinterpret_cast<const uint16_t*>(m16 + uint64_t(y) * f16_fp.Footprint.RowPitch);
+                        for (uint32_t x = 0; x < CW; ++x) {
+                            for (uint32_t c = 0; c < 4u; ++c) {
+                                const float got = f16_to_float(row[size_t(x) * 4u + c]);
+                                if (!std::isfinite(got)) {
+                                    std::fprintf(stderr, "FAIL: %s non-finite il0_3 UAV read+write readback\n", label);
+                                    ok = false;
+                                    break;
+                                }
+                                const bool in_wc = (x >= 12u && x < 28u && y >= 6u && y < 22u);
+                                const uint32_t sx = in_wc ? (x - 4u) : x;
+                                const uint32_t sy = in_wc ? (y - 2u) : y;
+                                err_il3 = std::max(err_il3, std::abs(double(got) - double(exp_f16[(size_t(sy) * CW + sx) * 4u + c])));
+                            }
+                            if (!ok) break;
+                        }
+                    }
+                    il_rb->Unmap(0, nullptr);
+                    if (ok && err_il3 > 1e-3) {
+                        std::fprintf(stderr, "FAIL: %s il0_5->il0_3 RGBA16F UAV read+write mismatch (err=%g)\n", label, err_il3);
+                        ok = false;
+                    }
+                    if (ok) {
+                        std::printf("[PASS] D01 (%s): RGBA16F SRV/UAV (err=%g) + il0_5->il0_3 UAV R+W (err=%g) + Depth SRV (err=%g)\n",
+                                    label, err16, err_il3, err32);
+                    }
+                }
+            }
+        }
+        if (d32_rb) d32_rb->Release();
+        if (d32_up) d32_up->Release();
+        if (il_rb) il_rb->Release();
+        if (il_up) il_up->Release();
+        if (f16_rb) f16_rb->Release();
+        if (f16_up) f16_up->Release();
+        if (lin_buf) lin_buf->Release();
+        if (d32_il_out) d32_il_out->Release();
+        if (d32_out) d32_out->Release();
+        if (d32_in) d32_in->Release();
+        if (il_base) il_base->Release();
+        if (f16_out) f16_out->Release();
+        if (f16_in) f16_in->Release();
+        pool.reset();
+        if (k_il3.pso) k_il3.pso->Release();
+        if (k_il5.pso) k_il5.pso->Release();
+        if (k_wc.pso) k_wc.pso->Release();
+        if (k_dp.pso) k_dp.pso->Release();
+        if (k_fl.pso) k_fl.pso->Release();
+        if (k_tl.pso) k_tl.pso->Release();
+        rs->Release();
+        return ok;
+    };
+
+    if (!run_outer_roundtrip(device, queue, alloc, cmd, fence, fence_event, fence_val, arch, false, "RDNA4 primary")) {
+        return 1;
+    }
 
     // ---- Case C: Zero d3dcompiler_47.dll + RDNA3 NRD12OUT archive & secondary iGPU check ----
     if (GetModuleHandleW(L"d3dcompiler_47.dll") != nullptr) {
@@ -799,110 +1441,583 @@ int main() {
     }
 
     int rdna3_hw = 0;
+    bool saw_rdna3_hw = false;
     for (IDXGIAdapter1* a3 : secondary_amd) {
         DXGI_ADAPTER_DESC1 desc3{};
         a3->GetDesc1(&desc3);
+        const nr::arch::Identity id3 = nr::arch::identify(desc3.AdapterLuid, "dxgi", desc3.VendorId, desc3.DeviceId);
+        std::printf("[INFO] Case C candidate: %ls (DeviceId=0x%04x, arch=%s)\n",
+                    desc3.Description, static_cast<unsigned>(desc3.DeviceId), nr::arch::name(id3.arch));
+        if (id3.arch == nr::arch::GpuArch::rdna3) saw_rdna3_hw = true;
         ID3D12Device* dev3 = nullptr;
         if (FAILED(D3D12CreateDevice(a3, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&dev3))) || !dev3) continue;
-        ID3D12RootSignature* rs3 = nullptr;
-        nr::pe::d3d12_outer::OuterKernel k3{};
-        nr::pe::d3d12_outer::OuterHeapPool pool3;
-        std::string why3;
-        if (nr::pe::d3d12_outer::create_outer_root_signature(dev3, &rs3, &why3) &&
-            rdna3_arch->build_kernel(dev3, "backend/copy_depth_r32", &k3, &why3) &&
-            pool3.init(dev3, 16, nullptr, nullptr, &why3)) {
-            D3D12_COMMAND_QUEUE_DESC qd3{D3D12_COMMAND_LIST_TYPE_DIRECT};
-            ID3D12CommandQueue* q3 = nullptr;
-            ID3D12CommandAllocator* ca3 = nullptr;
-            ID3D12GraphicsCommandList* cl3 = nullptr;
-            ID3D12Fence* f3 = nullptr;
-            dev3->CreateCommandQueue(&qd3, IID_PPV_ARGS(&q3));
-            dev3->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&ca3));
-            dev3->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, ca3, nullptr, IID_PPV_ARGS(&cl3));
-            dev3->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f3));
-            ID3D12Resource* s3 = make_tex2d(dev3, CW, CH, DXGI_FORMAT_R32_FLOAT, false, D3D12_RESOURCE_STATE_COPY_DEST);
-            ID3D12Resource* d3 = make_tex2d(dev3, CW, CH, DXGI_FORMAT_R32_FLOAT, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            ID3D12Resource* up3 = make_buf(dev3, D3D12_HEAP_TYPE_UPLOAD, host_total, D3D12_RESOURCE_STATE_GENERIC_READ);
-            ID3D12Resource* rb3 = make_buf(dev3, D3D12_HEAP_TYPE_READBACK, host_total, D3D12_RESOURCE_STATE_COPY_DEST);
-            if (q3 && ca3 && cl3 && f3 && s3 && d3 && up3 && rb3) {
-                uint8_t* m = nullptr;
-                up3->Map(0, nullptr, reinterpret_cast<void**>(&m));
-                for (uint32_t y = 0; y < CH; ++y) {
-                    auto* row = reinterpret_cast<float*>(m + uint64_t(y) * host_fp.Footprint.RowPitch);
-                    for (uint32_t x = 0; x < CW; ++x) row[x] = expected[size_t(y) * CW + x];
-                }
-                up3->Unmap(0, nullptr);
-                D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
-                dst.pResource = s3;
-                dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-                src.pResource = up3;
-                src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-                src.PlacedFootprint = host_fp;
-                cl3->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-                barrier_transition(cl3, s3, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                auto rec3 = std::make_shared<nr::gpu::Recording>();
-                const auto slot3 = pool3.acquire(rec3, &why3);
-                if (slot3.cpu) {
-                    slot3.write_srv_tex(dev3, k3.find_binding(0), s3, DXGI_FORMAT_R32_FLOAT, 0, 1);
-                    slot3.write_uav_tex(dev3, k3.find_binding(2), d3, DXGI_FORMAT_R32_FLOAT, 0);
-                    slot3.write_push(host_push, sizeof host_push);
-                    slot3.dispatch(cl3, rs3, k3, (CW + 7u) / 8u, (CH + 7u) / 8u, 1u, true);
-                    barrier_transition(cl3, d3, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-                    dst.pResource = rb3;
-                    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-                    dst.PlacedFootprint = host_fp;
-                    src.pResource = d3;
-                    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-                    cl3->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-                    cl3->Close();
-                    ID3D12CommandList* ls3[] = {cl3};
-                    q3->ExecuteCommandLists(1, ls3);
-                    HANDLE ev3 = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-                    q3->Signal(f3, 1);
-                    if (f3->GetCompletedValue() < 1) {
-                        f3->SetEventOnCompletion(1, ev3);
-                        WaitForSingleObject(ev3, 10000);
-                    }
-                    CloseHandle(ev3);
-                    rec3->seal();
-                    double err3 = 0.0;
-                    rb3->Map(0, nullptr, reinterpret_cast<void**>(&m));
-                    for (uint32_t y = 0; y < CH; ++y) {
-                        const auto* row = reinterpret_cast<const float*>(m + uint64_t(y) * host_fp.Footprint.RowPitch);
-                        for (uint32_t x = 0; x < CW; ++x)
-                            err3 = std::max(err3, std::abs(double(row[x]) - double(expected[size_t(y) * CW + x])));
-                    }
-                    rb3->Unmap(0, nullptr);
-                    if (err3 > 1e-6 || FAILED(dev3->GetDeviceRemovedReason())) {
-                        std::fprintf(stderr, "FAIL: Case C RDNA3 hardware readback err=%g removed=0x%08lx\n",
-                                     err3, static_cast<unsigned long>(dev3->GetDeviceRemovedReason()));
-                        return 1;
-                    }
-                    rdna3_hw = 1;
-                    std::printf("[PASS] Case C (RDNA3 secondary adapter %ls): copy_depth_r32 exact match (err=%g)\n",
-                                desc3.Description, err3);
-                }
-            }
-            if (rb3) rb3->Release();
-            if (up3) up3->Release();
-            if (d3) d3->Release();
-            if (s3) s3->Release();
-            if (f3) f3->Release();
-            if (cl3) cl3->Release();
-            if (ca3) ca3->Release();
-            if (q3) q3->Release();
-            pool3.reset();
-        } else {
-            std::printf("[INFO] Case C: secondary AMD adapter %ls skipped (%s)\n", desc3.Description, why3.c_str());
+        D3D12_COMMAND_QUEUE_DESC qd3{D3D12_COMMAND_LIST_TYPE_DIRECT};
+        ID3D12CommandQueue* q3 = nullptr;
+        ID3D12CommandAllocator* ca3 = nullptr;
+        ID3D12GraphicsCommandList* cl3 = nullptr;
+        ID3D12Fence* f3 = nullptr;
+        HANDLE ev3 = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        uint64_t fv3 = 0;
+        dev3->CreateCommandQueue(&qd3, IID_PPV_ARGS(&q3));
+        dev3->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&ca3));
+        dev3->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, ca3, nullptr, IID_PPV_ARGS(&cl3));
+        dev3->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f3));
+        bool ok3 = false;
+        if (q3 && ca3 && cl3 && f3 && ev3) {
+            cl3->Close();
+            char lbl[96];
+            std::snprintf(lbl, sizeof lbl, "RDNA3 DevId=0x%04x %s",
+                          static_cast<unsigned>(desc3.DeviceId), nr::arch::name(id3.arch));
+            ok3 = run_outer_roundtrip(dev3, q3, ca3, cl3, f3, ev3, fv3, rdna3_arch, true, lbl);
         }
-        if (k3.pso) k3.pso->Release();
-        if (rs3) rs3->Release();
+        if (ev3) CloseHandle(ev3);
+        if (f3) f3->Release();
+        if (cl3) cl3->Release();
+        if (ca3) ca3->Release();
+        if (q3) q3->Release();
         dev3->Release();
-        if (rdna3_hw) break;
+        if (ok3) {
+            rdna3_hw = 1;
+            break;
+        }
+    }
+    if (saw_rdna3_hw && rdna3_hw == 0) {
+        std::fprintf(stderr, "FAIL: Case C RDNA3 hardware adapter was enumerated but hw_dispatch == 0\n");
+        return 1;
     }
     std::printf("[PASS] Case C: d3dcompiler_47.dll=nullptr, RDNA3 archive verified (hw_dispatch=%d)\n", rdna3_hw);
 
+    // ---- Case D: ReShade-style command list vtable wrapper safety ----
+    {
+        ID3D12CommandAllocator* ma = nullptr;
+        ID3D12GraphicsCommandList* mc = nullptr;
+        if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&ma))) ||
+            FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, ma, nullptr, IID_PPV_ARGS(&mc)))) {
+            std::fprintf(stderr, "FAIL: Case D mock command list setup\n");
+            return 1;
+        }
+        void** orig_mock_vt = *reinterpret_cast<void***>(mc);
+        void* mock_vt[86]{};
+        std::memcpy(mock_vt, orig_mock_vt, sizeof mock_vt);
+        mock_vt[9] = reinterpret_cast<void*>(&mock_wrap_close);
+        mock_vt[10] = reinterpret_cast<void*>(&mock_wrap_reset);
+        *reinterpret_cast<void***>(mc) = mock_vt;
+
+        std::string sp_why, dr_why;
+        const bool sp_ok = nr::pe::split::prepare(mc, &sp_why);
+        const bool dr_ok = nr::pe::d3d12_direct::ready(device, mc, &dr_why);
+        *reinterpret_cast<void***>(mc) = orig_mock_vt;
+        mc->Close();
+        mc->Release();
+        ma->Release();
+
+        if (sp_ok || dr_ok ||
+            mock_vt[9] != reinterpret_cast<void*>(&mock_wrap_close) ||
+            mock_vt[10] != reinterpret_cast<void*>(&mock_wrap_reset)) {
+            std::fprintf(stderr, "FAIL: Case D wrapper safety sp_ok=%d dr_ok=%d\n", sp_ok, dr_ok);
+            return 1;
+        }
+        std::printf("[PASS] Case D: External vtable wrapper safely declined (split=%d direct=%d, vtable intact)\n",
+                    sp_ok, dr_ok);
+    }
+
+    // ---- Case E: Bounded OuterHeapPool (max_blocks=2) + Stage::cmd_touched ----
+    {
+        bool allow_reuse = false;
+        nr::pe::d3d12_outer::OuterHeapPool bpool;
+        if (!bpool.init(device, 16, [&](const nr::gpu::Ticket&) { return allow_reuse; }, nullptr, &why)) {
+            std::fprintf(stderr, "FAIL: Case E bounded pool init: %s\n", why.c_str());
+            return 1;
+        }
+        bpool.set_max_blocks(2);
+        auto fake_t = std::make_shared<nr::gpu::Recording>();
+        for (int i = 0; i < 32; ++i) {
+            const auto sl = bpool.acquire(fake_t, &why);
+            if (!sl.cpu) {
+                std::fprintf(stderr, "FAIL: Case E bounded pool acquire #%d failed early: %s\n", i, why.c_str());
+                return 1;
+            }
+        }
+        if (bpool.block_count() != 2 || bpool.peak_blocks() != 2 || bpool.reserve(1, &why) ||
+            bpool.acquire(fake_t, &why).cpu != nullptr) {
+            std::fprintf(stderr, "FAIL: Case E bounded pool did not cap at max_blocks=2 (blocks=%zu peak=%zu)\n",
+                         bpool.block_count(), bpool.peak_blocks());
+            return 1;
+        }
+        allow_reuse = true;
+        if (!bpool.reserve(1, &why) || !bpool.acquire(fake_t, &why).cpu ||
+            bpool.block_count() != 2 || bpool.peak_blocks() != 2) {
+            std::fprintf(stderr, "FAIL: Case E bounded pool did not reuse completed slots (%s)\n", why.c_str());
+            return 1;
+        }
+        bpool.reset();
+
+        nr::pe::d3d12_passthrough::renodx12::Stage::Config scfg{};
+        scfg.device = device;
+        scfg.width = CW;
+        scfg.height = CH;
+        scfg.nr_width = CW;
+        scfg.nr_height = CH;
+        scfg.frame_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        scfg.settings.nr_enabled = false;
+        auto st = nr::pe::d3d12_passthrough::renodx12::Stage::make(scfg, &why);
+        if (!st) {
+            std::fprintf(stderr, "FAIL: Case E Stage::make: %s\n", why.c_str());
+            return 1;
+        }
+        ID3D12Resource* sin = make_tex2d(device, CW, CH, DXGI_FORMAT_R8G8B8A8_UNORM, true, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        ID3D12Resource* sout = make_tex2d(device, CW, CH, DXGI_FORMAT_R8G8B8A8_UNORM, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        nr::pe::d3d12_passthrough::renodx12::Frame rf{};
+        rf.colour = sin;
+        rf.output = sout;
+        auto noop_net = [](uint32_t, uint64_t, const nr::D3d12NetControls&,
+                           const nr::pe::d3d12_passthrough::NetTemporal&,
+                           ID3D12Resource*, ID3D12Resource*) { return false; };
+        st->record(nullptr, rf, noop_net);
+        if (st->record_ok() || st->cmd_touched()) {
+            std::fprintf(stderr, "FAIL: Case E Stage::record(nullptr) ok=%d touched=%d\n", st->record_ok(), st->cmd_touched());
+            return 1;
+        }
+        alloc->Reset();
+        cmd->Reset(alloc, nullptr);
+        st->record(cmd, rf, noop_net);
+        const bool ok_st = st->record_ok();
+        const bool touched_st = st->cmd_touched();
+        cmd->Close();
+        {
+            ID3D12CommandList* ls[] = {cmd};
+            queue->ExecuteCommandLists(1, ls);
+            wait_gpu();
+        }
+        st.reset();
+        sout->Release();
+        sin->Release();
+        if (!ok_st || !touched_st) {
+            std::fprintf(stderr, "FAIL: Case E Stage::record(cmd) ok=%d touched=%d\n", ok_st, touched_st);
+            return 1;
+        }
+
+        // D02 evaluate_backend failure branches: pre-recording vs post-dispatch partial cleanup & recovery
+        nr::renodx::Settings r_e{};
+        r_e.nr_enabled = true;
+        r_e.passes = 1;
+        r_e.codec_mode = 1;
+        r_e.transfer_strength = 0.8f;   // force non-fast_lin path: dispatch #1 = kEncodeL, dispatch #2 = kDecodeL
+        int wait_e = 0;
+        auto make_e_frame = [&]() {
+            nr::dlssnr::D3d12BackendFrame bf = fill_plain_frame(&wait_e);
+            bf.feature = 0x55AAu;
+            bf.motion = nullptr; bf.motion_w = 0; bf.motion_h = 0;
+            bf.depth = nullptr; bf.depth_w = 0; bf.depth_h = 0;
+            bf.renodx_route = 1;
+            bf.renodx_present = 1;
+            bf.renodx_white_nits = 203.0f;
+            bf.renodx_settings = &r_e;
+            return bf;
+        };
+        auto run_e_eval = [&]() -> bool {
+            alloc->Reset();
+            cmd->Reset(alloc, nullptr);
+            const bool res = nr::pe::d3d12_passthrough::evaluate_backend(make_e_frame());
+            cmd->Close();
+            ID3D12CommandList* ls[] = {cmd};
+            queue->ExecuteCommandLists(1, ls);
+            wait_gpu();
+            return res;
+        };
+        SetEnvironmentVariableA("NR_STAGE_FAIL_AT", nullptr);
+        if (!run_e_eval()) {
+            std::fprintf(stderr, "FAIL: Case E evaluate_backend warmup frame returned false\n");
+            return 1;
+        }
+        SetEnvironmentVariableA("NR_STAGE_FAIL_AT", "1");
+        const bool pre_res = run_e_eval();
+        SetEnvironmentVariableA("NR_STAGE_FAIL_AT", nullptr);
+        if (pre_res) {
+            std::fprintf(stderr, "FAIL: Case E pre-recording failure unexpectedly returned true\n");
+            return 1;
+        }
+        if (!run_e_eval()) {
+            std::fprintf(stderr, "FAIL: Case E evaluate_backend re-prime after pre-recording failure returned false\n");
+            return 1;
+        }
+        SetEnvironmentVariableA("NR_STAGE_FAIL_AT", "2");
+        const bool post_res = run_e_eval();
+        SetEnvironmentVariableA("NR_STAGE_FAIL_AT", nullptr);
+        const std::string post_line = nr::pe::d3d12_passthrough::status().backend;
+        if (!post_res || post_line.find("dropped partial RenoDX D3D12 frame") == std::string::npos) {
+            std::fprintf(stderr, "FAIL: Case E post-dispatch failure post_res=%d line=%s\n", post_res, post_line.c_str());
+            return 1;
+        }
+        if (!run_e_eval()) {
+            std::fprintf(stderr, "FAIL: Case E evaluate_backend recovery frame failed\n");
+            return 1;
+        }
+        std::printf("[PASS] Case E: Bounded OuterHeapPool + Stage::cmd_touched + evaluate_backend pre/post fail recovery verified\n");
+    }
+
+    // ---- Case F: Delayed-fence completed() false->true, allocator swap, & Queue Signal failure ----
+    {
+        ID3D12Fence* delay_f = nullptr;
+        ID3D12CommandAllocator* fa = nullptr;
+        ID3D12CommandAllocator* fa2 = nullptr;
+        ID3D12GraphicsCommandList* fc = nullptr;
+        if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&delay_f))) ||
+            FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&fa))) ||
+            FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&fa2))) ||
+            FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, fa, nullptr, IID_PPV_ARGS(&fc)))) {
+            std::fprintf(stderr, "FAIL: Case F setup\n");
+            return 1;
+        }
+        const nr::gpu::Ticket tf = nr::pe::d3d12_direct::book(fc);
+        queue->Wait(delay_f, 1);
+        fc->Close();
+        {
+            ID3D12CommandList* ls[] = {fc};
+            queue->ExecuteCommandLists(1, ls);
+        }
+        fc->Reset(fa2, nullptr);
+        if (nr::pe::d3d12_direct::completed(tf)) {
+            delay_f->Signal(1);
+            wait_gpu();
+            std::fprintf(stderr, "FAIL: Case F completed() returned true before delayed fence signaled\n");
+            return 1;
+        }
+        delay_f->Signal(1);
+        wait_gpu();
+        const bool done_after = nr::pe::d3d12_direct::completed(tf);
+        fc->Close();
+        fa->Reset();
+        fc->Reset(fa, nullptr);
+
+        // Allocator swap + Reset(fa2, nullptr) tracking
+        const nr::gpu::Ticket t_a1 = nr::pe::d3d12_direct::book(fc);
+        fc->Close();
+        fc->Reset(fa2, nullptr);
+        const bool a1_sealed = t_a1 && t_a1->sealed;
+        const nr::gpu::Ticket t_a2 = nr::pe::d3d12_direct::book(fc);
+        fc->Close();
+        fa->Reset();   // old allocator Reset must NOT seal ticket recorded against fa2
+        const bool a2_kept_after_fa = t_a2 && !t_a2->sealed;
+        fa2->Reset();  // owning allocator Reset MUST seal t_a2
+        const bool a2_sealed_after_fa2 = t_a2 && t_a2->sealed;
+        fc->Reset(fa2, nullptr);
+
+        // Real Queue::ExecuteCommandLists Signal failure via NR_TEST_FAIL_QUEUE_SIGNAL=1
+        const nr::gpu::Ticket t_sig = nr::pe::d3d12_direct::book(fc);
+        fc->Close();
+        SetEnvironmentVariableA("NR_TEST_FAIL_QUEUE_SIGNAL", "1");
+        {
+            ID3D12CommandList* ls[] = {fc};
+            queue->ExecuteCommandLists(1, ls);
+        }
+        SetEnvironmentVariableA("NR_TEST_FAIL_QUEUE_SIGNAL", nullptr);
+        fc->Reset(fa2, nullptr);
+        wait_gpu();
+        const bool sig_unk_ok = t_sig && t_sig->unknown_submit && !t_sig->strict_ready() && !nr::pe::d3d12_direct::completed(t_sig);
+
+        auto unk = std::make_shared<nr::gpu::Recording>();
+        unk->seal();
+        unk->submitted(nullptr);
+        const bool unk_ok = unk->unknown_submit && !unk->strict_ready() && !nr::pe::d3d12_direct::completed(unk);
+        fc->Close();
+        fc->Release();
+        fa2->Release();
+        fa->Release();
+        delay_f->Release();
+        if (!done_after || !a1_sealed || !a2_kept_after_fa || !a2_sealed_after_fa2 || !sig_unk_ok || !unk_ok) {
+            std::fprintf(stderr,
+                         "FAIL: Case F done_after=%d a1_sealed=%d a2_kept=%d a2_sealed=%d sig_unk=%d unk=%d\n",
+                         done_after, a1_sealed, a2_kept_after_fa, a2_sealed_after_fa2, sig_unk_ok, unk_ok);
+            return 1;
+        }
+        std::printf("[PASS] Case F: Delayed fence, allocator swap Reset(fa2), & Queue Signal fail unknown_submit verified\n");
+    }
+
+    // ---- Case G: Untracked bundle, MethodHook rollback/remove, 32x lifecycle cleanup, and hook subprocesses ----
+    {
+        alloc->Reset();
+        cmd->Reset(alloc, nullptr);
+        if (!nr::pe::d3d12_direct::ready(device, cmd, &why)) {
+            std::fprintf(stderr, "FAIL: Case G ready before ExecuteBundle: %s\n", why.c_str());
+            return 1;
+        }
+        cmd->ExecuteBundle(untracked_bundle);
+        if (nr::pe::d3d12_direct::ready(device, cmd, &why)) {
+            std::fprintf(stderr, "FAIL: Case G untracked ExecuteBundle did not invalidate Compute state\n");
+            return 1;
+        }
+        cmd->Close();
+        alloc->Reset();
+        cmd->Reset(alloc, nullptr);
+        if (!nr::pe::d3d12_direct::ready(device, cmd, &why)) {
+            std::fprintf(stderr, "FAIL: Case G ready did not recover after Reset: %s\n", why.c_str());
+            return 1;
+        }
+        cmd->Close();
+
+        using FakeHook = nr::hudcap::MethodHook<PFN_FakeTarget>;
+        g_fake_real = reinterpret_cast<PFN_FakeTarget>(uintptr_t(0x1234));
+        if (FakeHook::install_raw(nullptr, &fake_mh_detour, &g_fake_real) == MH_OK || g_fake_real != nullptr) {
+            std::fprintf(stderr, "FAIL: Case G MethodHook::install_raw(nullptr) did not clean out_next\n");
+            return 1;
+        }
+        int dummy = 42;
+        if (FakeHook::install_raw(reinterpret_cast<void*>(&fake_mh_target), &fake_mh_detour, &g_fake_real) != MH_OK ||
+            fake_mh_target(&dummy) != 2) {
+            std::fprintf(stderr, "FAIL: Case G MethodHook retry install/call failed\n");
+            return 1;
+        }
+        if (FakeHook::remove_raw(reinterpret_cast<void*>(&fake_mh_target), &fake_mh_detour, &g_fake_real) != MH_OK ||
+            g_fake_real != nullptr || fake_mh_target(&dummy) != 1) {
+            std::fprintf(stderr, "FAIL: Case G MethodHook remove_raw cleanup failed\n");
+            return 1;
+        }
+
+        wait_gpu();
+        const size_t base_lists = nr::pe::d3d12_direct::tracked_list_count();
+        const size_t base_recs = nr::pe::d3d12_direct::tracked_recording_count();
+        const size_t base_queues = nr::pe::d3d12_direct::tracked_queue_fence_count();
+        HANDLE tev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        for (int i = 0; i < 32; ++i) {
+            ID3D12CommandQueue* tq = nullptr;
+            ID3D12CommandAllocator* ta = nullptr;
+            ID3D12GraphicsCommandList* tl = nullptr;
+            ID3D12Fence* tf = nullptr;
+            if (FAILED(device->CreateCommandQueue(&qd, IID_PPV_ARGS(&tq))) ||
+                FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&ta))) ||
+                FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, ta, nullptr, IID_PPV_ARGS(&tl))) ||
+                FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&tf)))) {
+                std::fprintf(stderr, "FAIL: Case G 32x resource creation at %d\n", i);
+                return 1;
+            }
+            (void)nr::pe::d3d12_direct::book(tl);
+            tl->Close();
+            ID3D12CommandList* ls[] = {tl};
+            tq->ExecuteCommandLists(1, ls);
+            if (!wait_queue_strict(tq, tf, 1, tev, "caseg_32x")) return 1;
+            tf->Release();
+            tl->Release();
+            ta->Release();
+            tq->Release();
+        }
+        CloseHandle(tev);
+        const size_t end_lists = nr::pe::d3d12_direct::tracked_list_count();
+        const size_t end_recs = nr::pe::d3d12_direct::tracked_recording_count();
+        const size_t end_queues = nr::pe::d3d12_direct::tracked_queue_fence_count();
+        if (end_lists != base_lists || end_recs != base_recs || end_queues != base_queues) {
+            std::fprintf(stderr,
+                         "FAIL: Case G 32x lifecycle leak: lists %zu->%zu, recs %zu->%zu, queues %zu->%zu\n",
+                         base_lists, end_lists, base_recs, end_recs, base_queues, end_queues);
+            return 1;
+        }
+
+        wchar_t exe_path[MAX_PATH]{};
+        GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
+        for (const wchar_t* flag : {L"--test-hook-rollback", L"--test-no-canary-hooks"}) {
+            std::wstring cmdline = std::wstring(L"\"") + exe_path + L"\" " + flag;
+            STARTUPINFOW si{};
+            si.cb = sizeof si;
+            PROCESS_INFORMATION pi{};
+            if (!CreateProcessW(exe_path, cmdline.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+                std::fprintf(stderr, "FAIL: Case G CreateProcessW(%ls) err=%lu\n", flag, GetLastError());
+                return 1;
+            }
+            const DWORD w = WaitForSingleObject(pi.hProcess, 30000);
+            DWORD code = 1;
+            GetExitCodeProcess(pi.hProcess, &code);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            if (w != WAIT_OBJECT_0 || code != 0) {
+                std::fprintf(stderr, "FAIL: Case G subprocess %ls failed (wait=%lu code=%lu)\n", flag, w, code);
+                return 1;
+            }
+        }
+
+        // T01 OuterArchive::load negative test: stride=0 & pad!=0 rejection
+        {
+            const std::wstring src_nra = nr::pe::d3d12_passthrough::aco_folder() + L"\\d3d12_outer.nra";
+            nr::pe::d3d12_passthrough::elf::Bytes nra_bytes;
+            if (!nr::pe::d3d12_passthrough::elf::read_file_w(src_nra, &nra_bytes) || nra_bytes.size() < 64) {
+                std::fprintf(stderr, "FAIL: Case G cannot read d3d12_outer.nra for stride validation check\n");
+                return 1;
+            }
+            uint16_t nlen = 0;
+            std::memcpy(&nlen, nra_bytes.data() + 24, 2);
+            const size_t bind0_off = 24u + 2u + size_t(nlen) + 14u;
+            if (bind0_off + 8u > nra_bytes.size()) {
+                std::fprintf(stderr, "FAIL: Case G nra layout offset out of range\n");
+                return 1;
+            }
+            wchar_t tmp_dir[MAX_PATH]{};
+            GetTempPathW(MAX_PATH, tmp_dir);
+            const std::wstring bad_path = std::wstring(tmp_dir) + L"nr_test_bad_outer.nra";
+            auto check_reject = [&](size_t mut_off, uint8_t mut_val, const char* what) -> bool {
+                nr::pe::d3d12_passthrough::elf::Bytes mut = nra_bytes;
+                mut[mut_off] = mut_val;
+                if (mut_off == bind0_off + 6u) mut[mut_off + 1u] = 0;
+                FILE* tfp = _wfopen(bad_path.c_str(), L"wb");
+                if (!tfp) return false;
+                std::fwrite(mut.data(), 1, mut.size(), tfp);
+                std::fclose(tfp);
+                nr::pe::d3d12_outer::OuterArchive bad_arch;
+                std::string bwhy;
+                const bool loaded = bad_arch.load(bad_path, 0u, &bwhy);
+                DeleteFileW(bad_path.c_str());
+                if (loaded) {
+                    std::fprintf(stderr, "FAIL: Case G OuterArchive::load accepted invalid %s\n", what);
+                    return false;
+                }
+                return true;
+            };
+            if (!check_reject(bind0_off + 6u, 0u, "stride=0") || !check_reject(bind0_off + 3u, 1u, "pad=1")) return 1;
+        }
+        std::printf("[PASS] Case G: Untracked bundle, MethodHook, 32x cleanup (%zu/%zu/%zu), OuterArchive stride/pad reject, & hook subprocesses\n",
+                    end_lists, end_recs, end_queues);
+    }
+
+    // ---- Case F2: Mixed Split + Direct batch submission & repeat submission without Reset ----
+    {
+        ID3D12Fence* mf = nullptr;
+        ID3D12CommandAllocator *ma1 = nullptr, *ma2 = nullptr, *ma1_b = nullptr, *ma2_b = nullptr, *ma1_c = nullptr;
+        ID3D12GraphicsCommandList *cut_cl = nullptr, *dir_cl = nullptr;
+        if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&mf))) ||
+            FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&ma1))) ||
+            FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&ma2))) ||
+            FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&ma1_b))) ||
+            FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&ma2_b))) ||
+            FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&ma1_c))) ||
+            FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, ma1, nullptr, IID_PPV_ARGS(&cut_cl))) ||
+            FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, ma2, nullptr, IID_PPV_ARGS(&dir_cl)))) {
+            std::fprintf(stderr, "FAIL: Case F2 mixed split+direct setup\n");
+            return 1;
+        }
+        // Hook command list/queue class with split, then Close+Reset so cut_cl state is clean.
+        nr::pe::split::prepare(cut_cl, &why);
+        cut_cl->Close();
+        ma1->Reset();
+        cut_cl->Reset(ma1, nullptr);
+        if (!nr::pe::split::prepare(cut_cl, &why)) {
+            std::fprintf(stderr, "FAIL: Case F2 split::prepare after Reset: %s\n", why.c_str());
+            return 1;
+        }
+        const nr::gpu::Ticket t_cut = nr::pe::d3d12_direct::book(cut_cl);
+        const nr::gpu::Ticket t_dir = nr::pe::d3d12_direct::book(dir_cl);
+        auto snap = nr::pe::split::snapshot(cut_cl);
+        nr::pe::split::Job job{[&](ID3D12CommandQueue* qq) { qq->Wait(mf, 2); }, [] {}};
+        if (!snap || !nr::pe::split::cut(cut_cl, std::move(job), snap, &why)) {
+            std::fprintf(stderr, "FAIL: Case F2 split::cut: %s\n", why.c_str());
+            return 1;
+        }
+        cut_cl->Close();
+        dir_cl->Close();
+        {
+            ID3D12CommandList* mix[2] = {cut_cl, dir_cl};
+            queue->ExecuteCommandLists(2, mix);
+        }
+        cut_cl->Reset(ma1_b, nullptr);
+        dir_cl->Reset(ma2_b, nullptr);
+        Sleep(50);
+        if (nr::pe::d3d12_direct::completed(t_cut) || nr::pe::d3d12_direct::completed(t_dir)) {
+            mf->Signal(2);
+            wait_gpu();
+            std::fprintf(stderr, "FAIL: Case F2 mixed batch completed early before continuation fence signaled (cut=%d dir=%d)\n",
+                         nr::pe::d3d12_direct::completed(t_cut), nr::pe::d3d12_direct::completed(t_dir));
+            return 1;
+        }
+        mf->Signal(2);
+        wait_gpu();
+        if (!nr::pe::d3d12_direct::completed(t_cut) || !nr::pe::d3d12_direct::completed(t_dir)) {
+            std::fprintf(stderr, "FAIL: Case F2 mixed batch did not complete after fence signaled (cut=%d dir=%d)\n",
+                         nr::pe::d3d12_direct::completed(t_cut), nr::pe::d3d12_direct::completed(t_dir));
+            return 1;
+        }
+
+        // Repeat submission of held cut_cl without Reset
+        const nr::gpu::Ticket t_rep = nr::pe::d3d12_direct::book(cut_cl);
+        auto snap2 = nr::pe::split::snapshot(cut_cl);
+        nr::pe::split::Job job2{[](ID3D12CommandQueue*) {}, [] {}};
+        if (!snap2 || !nr::pe::split::cut(cut_cl, std::move(job2), snap2, &why)) {
+            std::fprintf(stderr, "FAIL: Case F2 repeat split::cut: %s\n", why.c_str());
+            return 1;
+        }
+        cut_cl->Close();
+        {
+            ID3D12CommandList* ls[] = {cut_cl};
+            queue->ExecuteCommandLists(1, ls);
+            wait_gpu();
+            queue->Wait(mf, 3);
+            queue->ExecuteCommandLists(1, ls);
+        }
+        cut_cl->Reset(ma1_c, nullptr);
+        Sleep(40);
+        if (nr::pe::d3d12_direct::completed(t_rep)) {
+            mf->Signal(3);
+            wait_gpu();
+            std::fprintf(stderr, "FAIL: Case F2 repeat submission completed before 2nd fence signaled\n");
+            return 1;
+        }
+        mf->Signal(3);
+        wait_gpu();
+        if (!nr::pe::d3d12_direct::completed(t_rep)) {
+            std::fprintf(stderr, "FAIL: Case F2 repeat submission did not complete after 2nd fence signaled\n");
+            return 1;
+        }
+        cut_cl->Close();
+        dir_cl->Close();
+        dir_cl->Release();
+        cut_cl->Release();
+        ma1_c->Release();
+        ma2_b->Release();
+        ma1_b->Release();
+        ma2->Release();
+        ma1->Release();
+        mf->Release();
+        std::printf("[PASS] Case F2: Mixed split+Direct batch & repeat cut submission tracking verified\n");
+    }
+
+    // ---- Case H: Crash watch LastError/UEF preservation + dxgi-standalone export check ----
+    {
+        LPTOP_LEVEL_EXCEPTION_FILTER orig_uef = SetUnhandledExceptionFilter(&test_prev_uef);
+        nr::pe::install_crash_watch(nullptr);
+        HANDLE catcher = AddVectoredExceptionHandler(0, &test_veh_catcher);
+        g_veh_seen_err = 0;
+        g_veh_calls = 0;
+        SetLastError(0x0BADF00Du);
+        RaiseException(0xE0123456u, 0, 0, nullptr);
+        const DWORD err_after = GetLastError();
+        RemoveVectoredExceptionHandler(catcher);
+        nr::pe::remove_crash_watch();
+        LPTOP_LEVEL_EXCEPTION_FILTER restored_uef = SetUnhandledExceptionFilter(orig_uef);
+        if (err_after != 0x0BADF00Du || g_veh_calls != 1 || g_veh_seen_err != 0x0BADF00Du ||
+            restored_uef != &test_prev_uef) {
+            std::fprintf(stderr, "FAIL: Case H crash watch preservation err=0x%lx calls=%d seen=0x%lx uef=%d\n",
+                         err_after, g_veh_calls, g_veh_seen_err, restored_uef == &test_prev_uef);
+            return 1;
+        }
+
+        int standalone_ok = 0;
+        wchar_t exe_dir[MAX_PATH]{};
+        GetModuleFileNameW(nullptr, exe_dir, MAX_PATH);
+        if (wchar_t* slash = std::wcsrchr(exe_dir, L'\\')) *(slash + 1) = L'\0';
+        const std::wstring standalone_path = std::wstring(exe_dir) + L"dxgi-standalone.dll";
+        if (GetFileAttributesW(standalone_path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            HMODULE hs = LoadLibraryW(standalone_path.c_str());
+            if (!hs || !GetProcAddress(hs, "CreateDXGIFactory") ||
+                !GetProcAddress(hs, "CreateDXGIFactory1") || !GetProcAddress(hs, "CreateDXGIFactory2")) {
+                if (hs) FreeLibrary(hs);
+                std::fprintf(stderr, "FAIL: Case H dxgi-standalone.dll load/export check failed\n");
+                return 1;
+            }
+            FreeLibrary(hs);
+            standalone_ok = 1;
+        }
+        std::printf("[PASS] Case H: Crash watch LastError & UEF preserved, dxgi-standalone=%d\n", standalone_ok);
+    }
+
     // Clean exit after GPU completion.
+    untracked_bundle->Release();
+    bundle_alloc->Release();
     alt_heap->Release();
     host_pool.reset();
     if (k_host.pso) k_host.pso->Release();
