@@ -6,7 +6,7 @@
 #include "nr_gpu_arch.hpp"
 #include "nr_pipeline_binary.hpp"
 #include "nr_path_u8.hpp"
-#include "nr_pe_d3d12split.hpp"
+#include "nr_d3d12_direct_state.hpp"
 #include "nr_pe_log.hpp"
 #include "nr_pe_session.hpp"
 #include "nr_pe_vkdevice.hpp"
@@ -416,7 +416,9 @@ constexpr uint64_t kAskAgainMs = 10000;
 constexpr int kAskTimes = 6;   // (then refused as before: a GPU nothing can identify is not asked about all game long)
 
 void on_device(ID3D12Device* device) {
-    if (!g_enabled || !device || g_canary_started.load()) return;
+    if (!g_enabled || !device) return;
+    nr::pe::d3d12_direct::install_hooks(device);
+    if (g_canary_started.load()) return;
     if (const uint64_t at = g_ask_again_ms.load(); at && GetTickCount64() < at) return;
     std::string name;
     const nr::arch::Identity id = adapter_arch(device, &name);
@@ -433,7 +435,7 @@ void on_device(ID3D12Device* device) {
     { std::lock_guard<std::mutex> g(g_lock); g_adapter = name + " (" + nr::arch::name(id.arch) + ")"; }
     // The game's direct queue when this thread has handed it frames (as NR's Present layers find it); otherwise a
     // queue of ours on the game's device. Never a device of ours.
-    ID3D12CommandQueue* queue = nr::pe::split::last_direct_queue();
+    ID3D12CommandQueue* queue = nr::pe::d3d12_direct::last_direct_queue();
     if (queue) {
         ID3D12Device* owner = nullptr;
         if (FAILED(queue->GetDevice(IID_PPV_ARGS(&owner))) || !owner) queue = nullptr;

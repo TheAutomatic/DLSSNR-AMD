@@ -131,6 +131,7 @@ rm -rf -- "$out/aco-shaders"
 python3 linux/build/build_network.py rdna4 --out "$out/aco-shaders" > /dev/null
 cp -r -- "$out/aco-shaders" "$aco/shaders"
 cp -- windows/data/aco/records/*.nrp "$aco/records/"
+cp -- windows/data/aco/d3d12_outer.nra "$aco/"
 cp -- windows/data/aco/shell-aliases.txt "$aco/"
 # CC_SMALL_FP8_EXPERIMENTAL (ACO Mode only): the Linux network built with its changes (linux/build/build_network.py
 # --experimental); its records are with the others in aco/records (found by the SPIR-V's hash), its SPIR-V in
@@ -156,6 +157,7 @@ cp -r -- windows/data/aco/rdna3/shaders "$aco/rdna3/shaders"
 cp -r -- windows/data/aco/rdna3/experimental/shaders "$aco/rdna3/experimental/shaders"
 cp -r -- windows/data/aco/rdna3/optimized/shaders "$aco/rdna3/optimized/shaders"
 cp -- windows/data/aco/rdna3/records/*.nrp "$aco/rdna3/records/"
+cp -- windows/data/aco/rdna3/d3d12_outer.nra "$aco/rdna3/"
 cp -r -- windows/data/aco/rdna3/shells "$aco/rdna3/shells"
 cp -- windows/data/aco/rdna3/shell-aliases.txt "$aco/rdna3/"
 if [[ "${NR_INT4:-1}" == 1 ]]; then

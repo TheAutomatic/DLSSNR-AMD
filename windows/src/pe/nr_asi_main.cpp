@@ -32,6 +32,7 @@
 #include "nr_path_win.hpp"
 #include "MinHook.h"
 #include "nr_asi_wilsjo2.hpp"
+#include "nr_d3d12_direct_state.hpp"
 #include "nr_d3d12_passthrough.hpp"
 #include "nr_d3d12_passthrough_backend.hpp"
 #include "nr_d3d12_shot.hpp"
@@ -1087,15 +1088,27 @@ bool depth_twin_of(ID3D12Device* device, ID3D12Resource*& twin, ID3D12Resource* 
 bool depth_read_into(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, ID3D12Resource* depth, D3D12_RESOURCE_STATES from,
                      ID3D12Resource* twin) {
     GuideDepth& g = g_guide_depth;
-    if (g.device != device) { g.pass.reset(new nr::pe::bridge::DepthCopyD3D12()); g.device = device; g.said = false; }
+    const auto kRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    const D3D12_RESOURCE_STATES read = (from & kRead) ? from : depth_read_only(from) ? (from | kRead) : kRead;
     std::string why;
+    const bool direct_depth = nr::pe::d3d12_passthrough::enabled() &&
+                              nr::pe::d3d12_passthrough::canary() == nr::pe::d3d12_passthrough::Canary::kHit &&
+                              nr::pe::d3d12_direct::ready(device, cmd, &why);
+    if (direct_depth) {
+        transition(cmd, depth, from, read);
+        transition(cmd, twin, kRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        const bool ok = nr::pe::d3d12_passthrough::copy_depth_r32(device, cmd, depth, twin, &why);
+        transition(cmd, twin, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kRead);
+        transition(cmd, depth, read, from);
+        if (!ok && !g.said) { g.said = true; log("[nr] Present layers: the game's depth was not read (%s)", why.c_str()); }
+        return ok;
+    }
+    if (g.device != device) { g.pass.reset(new nr::pe::bridge::DepthCopyD3D12()); g.device = device; g.said = false; }
     if (!g.pass->ready(device, &why)) {
         if (!g.said) { g.said = true; log("[nr] Present layers: the game's depth cannot be read by our pass (%s): it is copied as it is", why.c_str()); }
         return false;
     }
     // a read state gains the compute-read bit; a write state (or none) becomes the compute read alone (as the bridge)
-    const auto kRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    const D3D12_RESOURCE_STATES read = (from & kRead) ? from : depth_read_only(from) ? (from | kRead) : kRead;
     transition(cmd, depth, from, read);
     transition(cmd, twin, kRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     const bool ok = g.pass->record(device, cmd, depth, twin, &why);
@@ -1552,10 +1565,17 @@ void capture_guides(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, const 
     std::string depth_why;
     bool depth_by_pass = false;
     if (depth_wanted) {
-        if (g_guide_depth.device != device) { g_guide_depth.pass.reset(new nr::pe::bridge::DepthCopyD3D12()); g_guide_depth.device = device; g_guide_depth.said = false; }
-        depth_by_pass = g_guide_depth.pass->ready(device, &depth_why) &&
-                        nr::pe::bridge::depth_view_format(f.depth->GetDesc().Format) != DXGI_FORMAT_UNKNOWN &&
-                        !(f.depth->GetDesc().Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE);
+        const bool direct_depth = nr::pe::d3d12_passthrough::enabled() &&
+                                  nr::pe::d3d12_passthrough::canary() == nr::pe::d3d12_passthrough::Canary::kHit &&
+                                  nr::pe::d3d12_direct::ready(device, cmd, &depth_why);
+        const bool fmt_ok = nr::pe::bridge::depth_view_format(f.depth->GetDesc().Format) != DXGI_FORMAT_UNKNOWN &&
+                            !(f.depth->GetDesc().Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE);
+        if (direct_depth) {
+            depth_by_pass = fmt_ok;
+        } else {
+            if (g_guide_depth.device != device) { g_guide_depth.pass.reset(new nr::pe::bridge::DepthCopyD3D12()); g_guide_depth.device = device; g_guide_depth.said = false; }
+            depth_by_pass = g_guide_depth.pass->ready(device, &depth_why) && fmt_ok;
+        }
         if (!depth_by_pass && !g_guide_depth.said) {
             g_guide_depth.said = true;
             log("[nr] Present layers: the game's depth (DXGI format %u) cannot be read by our pass%s%s: it is copied as it is",

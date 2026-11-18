@@ -1,7 +1,7 @@
 // Offline D3D12 benchmark and check of the D3D12 passthrough against the Vulkan bridge, with no game:
 // CC_SILVER_AARDWOLD_OPTIMIZED (layers: ultra performance), a 3840x2160 RenoDX Present stage.
 // Put it in a game folder where the OptiScaler route is installed (beside dlssnr-amd.ini and dlssnr-amd\) and run
-//   test_d3d12_offline.exe [frames] [--vulkan] [--hdr] [--model NAME] [--layers LEVEL] [--dump FILE]
+//   test_d3d12_offline.exe [frames] [--vulkan] [--hdr] [--plain] [--width W] [--height H] [--warmup N] [--model NAME] [--layers LEVEL] [--dump FILE]
 //   test_d3d12_offline.exe --compare A B
 // once without and once with --vulkan (SDR; again with --hdr for HDR10): the two runs print the GPU times and the
 // output's statistics. --model / --layers pick the network on the bridge (DLSSNR_MODEL / DLSSNR_INT4: a codename;
@@ -16,6 +16,7 @@
 #include <d3d12.h>
 #include <dxgi1_6.h>
 
+#include "nr_d3d12_direct_state.hpp"
 #include "nr_d3d12_passthrough.hpp"
 #include "nr_d3d12_passthrough_backend.hpp"
 #include "nr_d3d12_passthrough_net.hpp"
@@ -149,21 +150,31 @@ static int compare_dumps(const char* a, const char* b) {
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc == 4 && std::strcmp(argv[1], "--compare") == 0) return compare_dumps(argv[2], argv[3]);
-    const uint32_t W = 3840, H = 2160;
+    uint32_t W = 3840, H = 2160;
     const char* dump = nullptr;
     const char *model_arg = nullptr, *layers_arg = nullptr;
     int adapter_arg = -1;
-    const int total_frames = argc > 1 && argv[1][0] != '-' ? std::atoi(argv[1]) : 60;
+    int total_frames = argc > 1 && argv[1][0] != '-' ? std::atoi(argv[1]) : 60;
+    int warmup_arg = -1;
+    int frames_arg = -1;
     bool vulkan_bridge = false;
     bool hdr_mode = false;
+    bool plain_mode = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--vulkan") == 0) vulkan_bridge = true;
-        if (std::strcmp(argv[i], "--hdr") == 0) hdr_mode = true;
-        if (std::strcmp(argv[i], "--adapter") == 0 && i + 1 < argc) adapter_arg = std::atoi(argv[++i]);
+        else if (std::strcmp(argv[i], "--hdr") == 0) hdr_mode = true;
+        else if (std::strcmp(argv[i], "--plain") == 0) plain_mode = true;
+        else if (std::strcmp(argv[i], "--width") == 0 && i + 1 < argc) W = uint32_t(std::atoi(argv[++i]));
+        else if (std::strcmp(argv[i], "--height") == 0 && i + 1 < argc) H = uint32_t(std::atoi(argv[++i]));
+        else if (std::strcmp(argv[i], "--warmup") == 0 && i + 1 < argc) warmup_arg = std::atoi(argv[++i]);
+        else if (std::strcmp(argv[i], "--frames") == 0 && i + 1 < argc) frames_arg = std::atoi(argv[++i]);
+        else if (std::strcmp(argv[i], "--adapter") == 0 && i + 1 < argc) adapter_arg = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--model") == 0 && i + 1 < argc) model_arg = argv[++i];
         else if (std::strcmp(argv[i], "--layers") == 0 && i + 1 < argc) layers_arg = argv[++i];
         else if (std::strcmp(argv[i], "--dump") == 0 && i + 1 < argc) dump = argv[++i];
     }
+    const int warmup_frames = warmup_arg >= 0 ? warmup_arg : std::min(5, std::max(0, total_frames - 1));
+    if (frames_arg >= 0) total_frames = (warmup_arg >= 0 ? warmup_frames : 0) + frames_arg;
     if (model_arg) {
         const int mv = nr::network_value(model_arg);
         const int lv = layers_arg ? nr::optimized_layers_value(layers_arg) : nr::kLayersDefault;
@@ -173,8 +184,9 @@ int main(int argc, char** argv) {
     }
 
     std::printf("=== Offline D3D12 %s Test (%s) ===\n", vulkan_bridge ? "Vulkan Bridge" : "Direct ELF",
-                hdr_mode ? "HDR v6" : "SDR legacy");
-    std::printf("Target: CC_SILVER_AARDWOLD_OPTIMIZED (ultra performance), %ux%u RenoDX Present stage\n", W, H);
+                plain_mode ? "Plain backend" : hdr_mode ? "HDR v6" : "SDR legacy");
+    std::printf("Target: CC_SILVER_AARDWOLD_OPTIMIZED (ultra performance), %ux%u %s\n", W, H,
+                plain_mode ? "plain backend" : "RenoDX Present stage");
 
     HMODULE sys_dxgi = LoadLibraryW(L"C:\\Windows\\System32\\dxgi.dll");
     using PFN_CreateDXGIFactory1 = HRESULT(WINAPI*)(REFIID, void**);
@@ -271,15 +283,29 @@ int main(int argc, char** argv) {
         }
     };
 
-    // Hook command list / queue class via split::prepare, then Close + Reset so state is valid
     std::string why;
-    nr::pe::split::prepare(cmd, &why);
-    cmd->Close();
-    alloc->Reset();
-    cmd->Reset(alloc, nullptr);
-    if (!nr::pe::split::prepare(cmd, &why)) {
-        std::printf("FAIL: split::prepare after Reset: %s\n", why.c_str());
-        return 1;
+    if (vulkan_bridge) {
+        // Hook command list / queue class via split::prepare, then Close + Reset so state is valid.
+        nr::pe::split::prepare(cmd, &why);
+        cmd->Close();
+        alloc->Reset();
+        cmd->Reset(alloc, nullptr);
+        if (!nr::pe::split::prepare(cmd, &why)) {
+            std::printf("FAIL: split::prepare after Reset: %s\n", why.c_str());
+            return 1;
+        }
+    } else {
+        if (!nr::pe::d3d12_direct::install_hooks(device, cmd, &why)) {
+            std::printf("FAIL: d3d12_direct::install_hooks: %s\n", why.c_str());
+            return 1;
+        }
+        cmd->Close();
+        alloc->Reset();
+        cmd->Reset(alloc, nullptr);
+        if (!nr::pe::d3d12_direct::ready(device, cmd, &why)) {
+            std::printf("FAIL: d3d12_direct::ready after Reset: %s\n", why.c_str());
+            return 1;
+        }
     }
 
     if (!vulkan_bridge) {
@@ -299,7 +325,7 @@ int main(int argc, char** argv) {
     ID3D12Resource* motion = make_tex2d(device, W, H, DXGI_FORMAT_R16G16_FLOAT, false, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     ID3D12Resource* depth  = make_tex2d(device, W, H, DXGI_FORMAT_R32_FLOAT, false, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     if (!target || !init_tex || !motion || !depth) {
-        std::printf("FAIL: Could not allocate 3840x2160 test textures\n");
+        std::printf("FAIL: Could not allocate %ux%u test textures\n", W, H);
         return 1;
     }
 
@@ -390,6 +416,26 @@ int main(int argc, char** argv) {
     rs.detail_stability = 1;
 
     auto run_one_eval = [&](int reset) {
+        if (plain_mode) {
+            nr::dlssnr::set_d3d12_native_call(true);
+            nr::pe::renodx_route::CallStyle style(false);
+            nr::pe::renodx_route::CallNetwork network(g_model_choice);
+            nr::pe::renodx_route::CallLayer number(1);
+            D3D12_RESOURCE_BARRIER to_srv{};
+            to_srv.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            to_srv.Transition.pResource = init_tex;
+            to_srv.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            to_srv.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            to_srv.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            cmd->ResourceBarrier(1, &to_srv);
+            const nr::dlssnr::Rect whole{0, 0, W, H};
+            nr::dlssnr::evaluate_d3d12(cmd, feat, nullptr, init_tex, depth, motion, target, W, H, whole, whole, 1, reset,
+                                       nr::dlssnr::Controls6{}, 1.0f, 1.0f);
+            std::swap(to_srv.Transition.StateBefore, to_srv.Transition.StateAfter);
+            cmd->ResourceBarrier(1, &to_srv);
+            nr::dlssnr::set_d3d12_native_call(false);
+            return;
+        }
         nr::pe::renodx_route::Frame rf{};
         rf.known = true;
         rf.present = hdr_mode ? 3 : 1;
@@ -500,8 +546,8 @@ int main(int argc, char** argv) {
         }
         readback->Unmap(0, nullptr);
         const double total_px = double(W) * H;
-        std::printf("Readback check (3840x2160): %.2f%% pixels modified by NR, mean |diff| = %.5f, black pixels = %.2f%%\n",
-                    100.0 * double(changed) / total_px, diff_sum / total_px, 100.0 * double(black) / total_px);
+        std::printf("Readback check (%ux%u): %.2f%% pixels modified by NR, mean |diff| = %.5f, black pixels = %.2f%%\n",
+                    W, H, 100.0 * double(changed) / total_px, diff_sum / total_px, 100.0 * double(black) / total_px);
     }
 
     // Run timed loop for `total_frames` frames
@@ -551,7 +597,7 @@ int main(int argc, char** argv) {
             std::printf("  frame %2d: D3D12 GPU span = %6.3f ms, Submit+Wait wall = %6.3f ms, CPU rec = %5.3f ms\n",
                         f, gpu_ms, wall_ms, cpu_ms);
         }
-        if (f >= 5) {
+        if (f >= warmup_frames) {
             gpu_ms_list.push_back(gpu_ms);
             cpu_ms_list.push_back(cpu_ms);
             wall_ms_list.push_back(wall_ms);
@@ -579,8 +625,8 @@ int main(int argc, char** argv) {
         vk_net_ms = ns.gpu_ms;
     }
 
-    std::printf("\n=== Benchmark Summary [%s] (%zu measured frames after 5 warmup) ===\n",
-                vulkan_bridge ? "Vulkan Bridge" : "Direct ELF", gpu_ms_list.size());
+    std::printf("\n=== Benchmark Summary [%s] (%zu measured frames after %d warmup) ===\n",
+                vulkan_bridge ? "Vulkan Bridge" : "Direct ELF", gpu_ms_list.size(), warmup_frames);
     std::printf("D3D12 Queue End-to-End GPU span:               avg %.3f ms (min %.3f ms, max %.3f ms)\n",
                 gpu_sum / gpu_ms_list.size(), gpu_min, gpu_max);
     std::printf("Submit + Fence Wait Wall Time:                 avg %.3f ms\n", wall_sum / wall_ms_list.size());

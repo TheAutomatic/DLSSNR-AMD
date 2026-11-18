@@ -33,6 +33,7 @@
 #include <map>
 #include <memory>
 #include "nr_pe_log.hpp"
+#include "nr_pe_menu.hpp"
 #include "nr_path_u8.hpp"
 #include "nr_vram_ledger.hpp"
 
@@ -1227,6 +1228,16 @@ bool hook(void* object, int slot, void* detour, void** real, const char* name) {
     }
     return true;
 }
+template <class Fn>
+bool hook_method(void* object, int slot, Fn detour, Fn* real, const char* name) {
+    if (*real) return true;
+    const MH_STATUS st = nr::hudcap::MethodHook<Fn>::install_raw_method(object, slot, detour, real);
+    if (st != MH_OK) {
+        log("[nr] HUD FIX capture: %s could not be hooked (%s)", name, MH_StatusToString(st));
+        return false;
+    }
+    return true;
+}
 template <class F> void* as(F f) { return reinterpret_cast<void*>(f); }
 
 using PFN_CreateCbv = void(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_CONSTANT_BUFFER_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
@@ -1393,49 +1404,50 @@ bool hook_lists(ID3D12Device* device, ID3D12CommandQueue* queue) {
         alloc->Release();
         return false;
     }
-    bool ok = hook(l, 10, as(&hk_reset), reinterpret_cast<void**>(&real_reset), "Reset") &&
-              hook(l, 12, as(&hk_draw), reinterpret_cast<void**>(&real_draw), "DrawInstanced") &&
-              hook(l, 13, as(&hk_draw_indexed), reinterpret_cast<void**>(&real_draw_indexed), "DrawIndexedInstanced") &&
-              hook(l, 16, as(&hk_copy_region), reinterpret_cast<void**>(&real_copy_region), "CopyTextureRegion") &&
-              hook(l, 17, as(&hk_copy_resource), reinterpret_cast<void**>(&real_copy_resource), "CopyResource") &&
-              hook(l, 19, as(&hk_resolve), reinterpret_cast<void**>(&real_resolve), "ResolveSubresource") &&
-              hook(l, 21, as(&hk_viewports), reinterpret_cast<void**>(&real_viewports), "RSSetViewports") &&
-              hook(l, 22, as(&hk_scissors), reinterpret_cast<void**>(&real_scissors), "RSSetScissorRects") &&
-              hook(l, 25, as(&hk_set_pipeline), reinterpret_cast<void**>(&real_set_pipeline), "SetPipelineState") &&
-              hook(l, 26, as(&hk_barrier), reinterpret_cast<void**>(&real_barrier), "ResourceBarrier") &&
-              hook(l, 28, as(&hk_set_heaps), reinterpret_cast<void**>(&real_set_heaps), "SetDescriptorHeaps") &&
-              hook(l, 30, as(&hk_set_root_sig), reinterpret_cast<void**>(&real_set_root_sig), "SetGraphicsRootSignature") &&
-              hook(l, 32, as(&hk_set_table), reinterpret_cast<void**>(&real_set_table), "SetGraphicsRootDescriptorTable") &&
-              hook(l, 27, as(&hk_execute_bundle), reinterpret_cast<void**>(&real_execute_bundle), "ExecuteBundle") &&
-              hook(l, 46, as(&hk_set_targets), reinterpret_cast<void**>(&real_set_targets), "OMSetRenderTargets") &&
-              hook(l, 48, as(&hk_clear_target), reinterpret_cast<void**>(&real_clear_target), "ClearRenderTargetView") &&
-              hook(l, 59, as(&hk_execute_indirect), reinterpret_cast<void**>(&real_execute_indirect), "ExecuteIndirect");
+    bool ok = hook_method(l, 10, &hk_reset, &real_reset, "Reset") &&
+              hook_method(l, 12, &hk_draw, &real_draw, "DrawInstanced") &&
+              hook_method(l, 13, &hk_draw_indexed, &real_draw_indexed, "DrawIndexedInstanced") &&
+              hook_method(l, 16, &hk_copy_region, &real_copy_region, "CopyTextureRegion") &&
+              hook_method(l, 17, &hk_copy_resource, &real_copy_resource, "CopyResource") &&
+              hook_method(l, 19, &hk_resolve, &real_resolve, "ResolveSubresource") &&
+              hook_method(l, 21, &hk_viewports, &real_viewports, "RSSetViewports") &&
+              hook_method(l, 22, &hk_scissors, &real_scissors, "RSSetScissorRects") &&
+              hook_method(l, 25, &hk_set_pipeline, &real_set_pipeline, "SetPipelineState") &&
+              hook_method(l, 26, &hk_barrier, &real_barrier, "ResourceBarrier") &&
+              hook_method(l, 28, &hk_set_heaps, &real_set_heaps, "SetDescriptorHeaps") &&
+              hook_method(l, 30, &hk_set_root_sig, &real_set_root_sig, "SetGraphicsRootSignature") &&
+              hook_method(l, 32, &hk_set_table, &real_set_table, "SetGraphicsRootDescriptorTable") &&
+              hook_method(l, 27, &hk_execute_bundle, &real_execute_bundle, "ExecuteBundle") &&
+              hook_method(l, 46, &hk_set_targets, &real_set_targets, "OMSetRenderTargets") &&
+              hook_method(l, 48, &hk_clear_target, &real_clear_target, "ClearRenderTargetView") &&
+              hook_method(l, 59, &hk_execute_indirect, &real_execute_indirect, "ExecuteIndirect");
     if (trace().enabled) {
-        const bool diagnostic_hooks = hook(l, 14, as(&hk_trace_dispatch), reinterpret_cast<void**>(&real_trace_dispatch), "HUD trace Dispatch") &&
-            hook(l, 29, as(&hk_trace_root), reinterpret_cast<void**>(&real_trace_root), "HUD trace ComputeRoot") &&
-            hook(l, 31, as(&hk_trace_table), reinterpret_cast<void**>(&real_trace_table), "HUD trace ComputeTable");
+        const bool diagnostic_hooks = hook_method(l, 14, &hk_trace_dispatch, &real_trace_dispatch, "HUD trace Dispatch") &&
+            hook_method(l, 29, &hk_trace_root, &real_trace_root, "HUD trace ComputeRoot") &&
+            hook_method(l, 31, &hk_trace_table, &real_trace_table, "HUD trace ComputeTable");
         if (!diagnostic_hooks) log("[nr] HUD trace: compute hooks incomplete");
     }
     static const GUID kList4 = {0x8754318e, 0xd3a9, 0x4541, {0x98, 0xcf, 0x64, 0x5b, 0x50, 0xdc, 0x48, 0x74}};
     IUnknown* l4 = nullptr;
     if (SUCCEEDED(l->QueryInterface(kList4, reinterpret_cast<void**>(&l4))) && l4) {
-        ok = hook(l4, 68, as(&hk_begin_pass), reinterpret_cast<void**>(&real_begin_pass), "BeginRenderPass") &&
-             hook(l4, 69, as(&hk_end_pass), reinterpret_cast<void**>(&real_end_pass), "EndRenderPass") && ok;
+        ok = hook_method(l4, 68, &hk_begin_pass, &real_begin_pass, "BeginRenderPass") &&
+             hook_method(l4, 69, &hk_end_pass, &real_end_pass, "EndRenderPass") && ok;
         l4->Release();
     }
     {   // (a device without enhanced barriers: no list can call them)
         static const GUID kList7 = {0xdd171223, 0x8b61, 0x4769, {0x90, 0xe3, 0x16, 0x0c, 0xcd, 0xe4, 0xe2, 0xc1}};
         IUnknown* l7 = nullptr;
         if (SUCCEEDED(l->QueryInterface(kList7, reinterpret_cast<void**>(&l7))) && l7) {
-            if (!hook(l7, 80, as(&hk_barrier7), reinterpret_cast<void**>(&real_barrier7), "Barrier (enhanced)")) {
+            if (!hook_method(l7, 80, &hk_barrier7, &real_barrier7, "Barrier (enhanced)")) {
                 g.enhanced_unhooked.store(true);
                 log("[nr] HUD FIX capture: enhanced barriers are not followed: no back buffer state is proven from a list");
             }
             l7->Release();
         }
     }
-    if (queue) {   // MH_ERROR_ALREADY_CREATED (NR Control's hook, the usual case): its observer reports to us
-        ok = hook(queue, 10, as(&hk_execute), reinterpret_cast<void**>(&real_execute), "ExecuteCommandLists") && ok;
+    if (queue) {
+        if (!nr::pe::menu::queue_hooked())
+            ok = hook_method(queue, 10, &hk_execute, &real_execute, "ExecuteCommandLists") && ok;
     } else {
         ok = false;
         log("[nr] HUD FIX capture: the swap chain's queue was not found");
@@ -1904,7 +1916,7 @@ void fg_hook_libraries() {
 nr::gpu::Ticket d3d12_recording(ID3D12GraphicsCommandList* list) {
     static const GUID key = {0x709ae383, 0x15a8, 0x4e89, {0xb5, 0x8c, 0x3a, 0x6a, 0xde, 0x2d, 0xa1, 0x7f}};
     if (auto t = nr::gpu::find(list)) return t;
-    if (!hook(list, 10, as(&hk_reset), reinterpret_cast<void**>(&real_reset), "Reset")) return {};
+    if (!hook_method(list, 10, &hk_reset, &real_reset, "Reset")) return {};
     struct Lifetime final : IUnknown {
         std::atomic<ULONG> refs{1}; const void* key; nr::gpu::Ticket ticket; bool attached=false;
         Lifetime(const void* k, nr::gpu::Ticket t) : key(k), ticket(std::move(t)) {}

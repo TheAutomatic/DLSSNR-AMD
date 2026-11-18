@@ -22,7 +22,7 @@
 #include "tinlayout.hpp"
 #include "nr_ini_network.hpp"
 #include "nr_pe_log.hpp"
-#include "nr_pe_d3d12split.hpp"
+#include "nr_d3d12_direct_state.hpp"
 #include "nr_vram_ledger.hpp"
 
 #include <windows.h>
@@ -50,13 +50,13 @@ template <class T> void release(T*& p) { if (p) { p->Release(); p = nullptr; } }
 void touch_recording(nr::gpu::Uses& uses, const nr::gpu::Ticket& rec) {
     auto& tickets = uses.tickets;
     tickets.erase(std::remove_if(tickets.begin(), tickets.end(), [](const auto& t) {
-        return split::completed(t);
+        return d3d12_direct::completed(t);
     }), tickets.end());
     if (rec && std::find(tickets.begin(), tickets.end(), rec) == tickets.end()) tickets.push_back(rec);
 }
 bool recordings_done(const nr::gpu::Uses& uses) {
     return std::all_of(uses.tickets.begin(), uses.tickets.end(), [](const auto& t) {
-        return split::completed(t);
+        return d3d12_direct::completed(t);
     });
 }
 
@@ -922,10 +922,10 @@ public:
         }
         Built::Upload* slot_buf = nullptr;
         uint32_t slot_i = 0;
-        const nr::gpu::Ticket record_ticket = split::book(cmd);
+        const nr::gpu::Ticket record_ticket = d3d12_direct::book(cmd);
         for (auto& u : b->upload) {
             for (uint32_t i = 0; i < kRing; ++i) {
-                const bool free = u.uses[i] ? split::completed(u.uses[i])
+                const bool free = u.uses[i] ? d3d12_direct::completed(u.uses[i])
                                                   : (u.owner[i] == ~uint64_t(0) ||
                                                      (b->copied >= 0 && u.owner[i] <= uint64_t(b->copied)));
                 if (free) { slot_buf = &u; slot_i = i; break; }
@@ -1113,7 +1113,7 @@ public:
         uint32_t ts = kRing;
         if (stamps_map_) {
             for (uint32_t i = 0; i < kRing; ++i) {
-                if (stamp_uses_[i] && split::completed(stamp_uses_[i])) {
+                if (stamp_uses_[i] && d3d12_direct::completed(stamp_uses_[i])) {
                     uint64_t t2[2];
                     std::memcpy(t2, stamps_map_ + i * 16, 16);
                     if (t2[1] > t2[0]) note_gpu(double(t2[1] - t2[0]) * 1000.0 / hz_);
@@ -1122,7 +1122,7 @@ public:
                 if (!stamp_uses_[i] && ts == kRing) ts = i;
             }
         }
-        const auto recording = ts < kRing ? split::book(cmd) : nr::gpu::Ticket{};
+        const auto recording = ts < kRing ? d3d12_direct::book(cmd) : nr::gpu::Ticket{};
         const bool timed = bool(recording);
         if (timed) {
             stamp_uses_[ts] = recording;

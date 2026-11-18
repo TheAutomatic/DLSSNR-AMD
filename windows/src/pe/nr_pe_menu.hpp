@@ -39,6 +39,7 @@ void set_extra_network(void (*draw)());
 // Learns which queue a D3D12 swap chain presents on (DXVK's DXGI gives its device only): hooks ExecuteCommandLists of
 // the queue class of `device` (the game's). Once per process; not from DllMain.
 void watch_queues(ID3D12Device* device);
+bool queue_hooked();
 // Called on every Present of a D3D12 swap chain the menu sees, before it draws (whether or not it draws): the swap
 // chain, the queue it presents on and its encoding as the menu judges it (0 SDR, 1 an sRGB format, 2 scRGB, 3 HDR10).
 // The .asi's final-picture screenshot runs NR on the back buffer there.

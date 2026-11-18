@@ -97,8 +97,10 @@ public:
     virtual void release_feature(uint64_t) {}
 };
 
-// An HLSL compute shader (cs_5_0) through d3dcompiler_47.dll; null and why when it does not compile.
-ID3DBlob* compile_cs(const char* source, size_t bytes, const char* entry, std::string* why);
+// Copies a depth-stencil or R32/R16 texture to an R32_FLOAT UAV texture without touching descriptor heaps.
+// Caller keeps `src` shader-readable and `dst` in UNORDERED_ACCESS; restores host compute state.
+bool copy_depth_r32(ID3D12Device* device, ID3D12GraphicsCommandList* cmd, ID3D12Resource* src,
+                    ID3D12Resource* dst, std::string* why);
 
 // The wilsjo2 layer on the native runtime, before anything of its frame is recorded: whether its network calls
 // will run on this backend - the passthrough enabled, its check passed, the backend made on `device`, the command list's state

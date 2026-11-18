@@ -68,6 +68,7 @@ glslang=${NR_GLSLANG:-toolchain/glslang/bin/glslang}
 "$glslang" -V --target-env vulkan1.0 --vn kMenuComposeFrag windows/shaders/control/menu_compose.frag -o "$out/menu_compose_frag.h" > /dev/null
 "$cxx" "${common[@]}" -I"$minhook/include" -I"$imgui" -Iwindows/src/ui -c windows/src/pe/nr_pe_menu.cpp -o "$out/menu.o"
 # the D3D12 passthrough (dlssnr-amd.ini [D3D12Passthrough] Enabled)
+"$cxx" "${common[@]}" -I"$minhook/include" -c windows/src/pe/nr_d3d12_direct_state.cpp -o "$out/d3d12_direct_state.o"
 "$cxx" "${common[@]}" -c windows/src/pe/nr_d3d12_passthrough.cpp -o "$out/d3d12_passthrough.o"
 "$cxx" "${common[@]}" -c windows/src/pe/nr_d3d12_passthrough_backend.cpp -o "$out/d3d12_passthrough_backend.o"
 "$cxx" "${common[@]}" -c windows/src/pe/nr_d3d12_passthrough_net.cpp -o "$out/d3d12_passthrough_net.o"
@@ -92,7 +93,8 @@ done
     windows/src/pe/nr_dxgi_standalone.cpp windows/src/pe/nr_dxgi_standalone.def \
     -lkernel32 -static -static-libgcc -static-libstdc++
 
-objs=("$out/asi_main.o" "$out/d3d12_passthrough.o" "$out/d3d12_passthrough_backend.o" "$out/d3d12_passthrough_net.o"
+objs=("$out/asi_main.o" "$out/d3d12_direct_state.o" "$out/d3d12_passthrough.o" "$out/d3d12_passthrough_backend.o"
+      "$out/d3d12_passthrough_net.o"
       "$out/renodx_d3d12.o" "$out/d3d12_passthrough_panel.o" "$out/asi_wilsjo2.o" "$out/asi_wilsjo2_vk.o"
       "$out/nr_wilsjo2.o" "$out/asi_hudcap.o" "$out/menu.o"
       "$out"/im_*.o "$out/model.o" "$out/session.o" "$out/bridge.o" "$out/d3d12split.o" "$out/config.o" "$out/interop.o"
@@ -104,11 +106,14 @@ ldflags=(-ld3d12 -ld3d11 -ldxgi -lole32 -lversion -static -static-libgcc -static
 count=$(bash windows/build/vulkan_lazy.sh "$out" "$cxx" -shared "${objs[@]}" "${ldflags[@]}" | grep -o '[0-9]*$')
 "$cxx" -shared -o "$out/dlssnr-amd.asi" "${objs[@]}" "$out/vulkan_lazy_s.o" "$out/vulkan_lazy_c.o" "${ldflags[@]}"
 
-# NR_TOOLS=1: test_d3d12_offline.exe (windows/tools/test_d3d12_offline.cpp, not in the package): the D3D12 passthrough
-# and the bridge on a synthetic frame without a game, the plugin's objects without its entry point
+# NR_TOOLS=1: test_d3d12_offline.exe and test_d3d12_direct_r33.exe (not in the package): standalone Direct ELF
+# benchmarks and automated host-state preservation checks, linked against the plugin's objects without its entry point.
 if [[ ${NR_TOOLS:-0} == 1 ]]; then
     "$cxx" "${common[@]}" -c windows/tools/test_d3d12_offline.cpp -o "$out/test_d3d12_offline.o"
     "$cxx" -o "$out/test_d3d12_offline.exe" "$out/test_d3d12_offline.o" "${objs[@]:1}" "$out/vulkan_lazy_s.o" \
+        "$out/vulkan_lazy_c.o" "${ldflags[@]}" -lgdi32 -luuid -lpsapi -lshlwapi -ldwmapi
+    "$cxx" "${common[@]}" -c windows/tools/test_d3d12_direct_r33.cpp -o "$out/test_d3d12_direct_r33.o"
+    "$cxx" -o "$out/test_d3d12_direct_r33.exe" "$out/test_d3d12_direct_r33.o" "${objs[@]:1}" "$out/vulkan_lazy_s.o" \
         "$out/vulkan_lazy_c.o" "${ldflags[@]}" -lgdi32 -luuid -lpsapi -lshlwapi -ldwmapi
 fi
 

@@ -20,6 +20,7 @@
 #include "nr_vram_ledger.hpp"
 
 #include "MinHook.h"
+#include "nr_hud_method_hook.hpp"
 #include "imgui.h"
 #include "imgui_impl_dx11.h"
 #include "imgui_impl_dx12.h"
@@ -1672,6 +1673,7 @@ struct D3D12Overlay {
 // hooked to know it (watch_queues).
 using ExecuteFn = void(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
 ExecuteFn g_execute = nullptr;
+std::atomic<bool> g_queue_hooked{false};
 std::atomic<ExecuteObserver> g_execute_observer{nullptr};   // on_execute
 thread_local ID3D12CommandQueue* t_last_direct = nullptr;
 thread_local ID3D12CommandQueue* t_last_seen = nullptr;
@@ -2160,13 +2162,14 @@ void watch_queues(ID3D12Device* device) {
         // ExecuteCommandLists
         void* fn = (*reinterpret_cast<void***>(q))[10];
         q->Release();
-        const MH_STATUS init = MH_Initialize();
-        if ((init != MH_OK && init != MH_ERROR_ALREADY_INITIALIZED) ||
-            MH_CreateHook(fn, reinterpret_cast<void*>(&execute_hook), reinterpret_cast<void**>(&g_execute)) != MH_OK ||
-            MH_EnableHook(fn) != MH_OK)
+        if (nr::hudcap::MethodHook<ExecuteFn>::install_raw(fn, &execute_hook, &g_execute) == MH_OK)
+            g_queue_hooked.store(true, std::memory_order_release);
+        else
             say("ExecuteCommandLists could not be hooked; no menu over D3D12 swap chains");
     });
 }
+
+bool queue_hooked() { return g_queue_hooked.load(std::memory_order_acquire); }
 
 void on_d3d12_present(D3D12PresentHook hook) { g_d3d12_hook.store(hook); }
 void on_d3d12_shown(D3D12ShownHook hook) { g_d3d12_shown.store(hook); }

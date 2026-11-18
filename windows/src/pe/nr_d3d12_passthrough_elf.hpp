@@ -465,7 +465,7 @@ inline NrRecord parse_nrpal001(const uint8_t* b, size_t size) {
     require(fnv_hash(r.code.data(), r.code.size()) == r.code_hash, "NRPAL001 code checksum");
     require(r.exec && r.exec <= sz && r.exec % 4 == 0, "NRPAL001 exec size");
     require(r.wg && r.wg <= 1024, "NRPAL001 workgroup size");
-    require(r.set0 == 0, "NRPAL001 descriptor base is not s0");
+    require(r.set0 == 0 || r.set0 == -1, "NRPAL001 descriptor base is not s0 or unused");
     require(!(r.rsrc2 & ~0x00ff9fbfu) && !(r.rsrc3 & ~0xfffu), "NRPAL001 unsupported rsrc bits");
     require(r.user == ((r.rsrc2 >> 1) & 31u), "NRPAL001 user_sgprs does not match rsrc2");
     require(r.shared <= r.lds_hw(), "NRPAL001 LDS does not match rsrc2");
@@ -523,7 +523,14 @@ inline void apply_pal(Mp& root, const NrRecord& rec) {
     if (Mp* cur = mp_field(cs, ".sgpr_count"))
         if (cur->kind == Mp::UInt && cur->u > sgpr) sgpr = cur->u;
     mp_set_uint(cs, ".sgpr_count", sgpr);
-    mp_set_uint(cs, ".user_sgprs", rec.user);
+    Mp& reg_map = mp_need(cs, ".user_data_reg_map");
+    if (rec.user < 5u && reg_map.kind == Mp::Arr && reg_map.items.size() >= 5u) {
+        reg_map.items[0] = Mp::uint(5);
+        reg_map.items[1] = Mp::uint(6);
+        for (size_t i = 2; i < reg_map.items.size(); ++i) reg_map.items[i] = Mp::uint(0xffffffffu);
+    }
+    const UavSgpr uav = find_uav_sgpr(reg_map);
+    mp_set_uint(cs, ".user_sgprs", (std::max)(rec.user, uav.hi + 1u));
     uint32_t vgpr = ((rec.rsrc1 & 63u) + 1u) * 8u;
     mp_set_uint(cs, ".vgpr_count", vgpr);
     mp_set_uint(cs, ".vgpr_count_max", vgpr);
@@ -621,26 +628,34 @@ inline void put_buf(uint32_t* d, uint64_t va, uint64_t bytes) {
     d[3] = 0x30014facu;
 }
 
-inline Bytes build_prefix(const NrRecord& rec, UavSgpr uav, bool gfx11 = false) {
+inline Bytes build_prefix(const NrRecord& rec, UavSgpr uav, bool gfx11 = false,
+                          uint32_t push_off = kTablePushOff, uint32_t grid_off = kTableGridOff) {
     Bytes o;
     if (!gfx11) put_u32(o, 0xB0802009u);  // s_version (gfx12's; gfx11 takes none)
-    if (rec.tidig() == 0) {
+    if (rec.tidig() == 0 && rec.dims[1] <= 1u && rec.dims[2] <= 1u) {
         put_u32(o, 0x360000FFu);  // v_and_b32 v0, 0x3ff, v0
         put_u32(o, 0x000003FFu);
         put_u32(o, 0xBF870001u);  // s_delay_alu instid0(VALU_DEP_1)
     }
     emit_mov(o, 96, uav.lo);
     emit_mov(o, 97, uav.hi);
-    emit_mov(o, 0, 96);
+    const uint32_t eff_user = (std::max)(rec.user, uav.hi + 1u);
+    if (eff_user > rec.user) {
+        const uint32_t n_sys = ((rec.rsrc2 >> 7) & 1u) + ((rec.rsrc2 >> 8) & 1u) +
+                               ((rec.rsrc2 >> 9) & 1u) + ((rec.rsrc2 >> 10) & 1u);
+        for (uint32_t j = 0; j < n_sys; ++j)
+            emit_mov(o, rec.user + j, eff_user + j);
+    }
+    if (rec.set0 == 0) emit_mov(o, 0, 96);
     emit_mov(o, 125, 97);  // m0: shared address32 high word
     if (rec.push >= 0)
-        emit_add_lit(o, uint32_t(rec.push), 96, kTablePushOff);
+        emit_add_lit(o, uint32_t(rec.push), 96, push_off);
     put_u32(o, 0xBF800002u);
     for (auto [reg, dw] : rec.inlines)
-        emit_load_b32(o, uint32_t(reg), 96, kTablePushOff + uint32_t(dw) * 4);
+        emit_load_b32(o, uint32_t(reg), 96, push_off + uint32_t(dw) * 4);
     if (rec.grid >= 0)
         for (uint32_t j = 0; j < 3; ++j)
-            emit_load_b32(o, uint32_t(rec.grid) + j, 96, kTableGridOff + j * 4);
+            emit_load_b32(o, uint32_t(rec.grid) + j, 96, grid_off + j * 4);
     // the wait before the loaded arguments are used: gfx12's split wait (s_wait_kmcnt 0); gfx11 has the classic one,
     // s_waitcnt lgkmcnt(0) - the gfx12 word is an illegal instruction there (nr_pal_binary.hpp's prologue)
     put_u32(o, gfx11 ? 0xBF89FC07u : 0xBFC70000u);
@@ -752,7 +767,8 @@ inline constexpr uint8_t kCarrierTemplateElf[2332] = {
 // `gfx11_mach` (an EF_AMDGPU_MACH of gfx11, RDNA3's records): the ELF says that machine and the prefix is gfx11's;
 // 0: RDNA4's template as it is.
 inline bool build_model_elf_from_nrp(const uint8_t* nrp, size_t nrp_bytes, const uint32_t spv_dims[3],
-                                     Bytes* out_elf, uint32_t out_dims[3], std::string* why, uint32_t gfx11_mach = 0) {
+                                     Bytes* out_elf, uint32_t out_dims[3], std::string* why, uint32_t gfx11_mach = 0,
+                                     uint32_t push_off = kTablePushOff, uint32_t grid_off = kTableGridOff) {
     try {
         NrRecord rec = parse_nrpal001(nrp, nrp_bytes);
         if (spv_dims && spv_dims[0] && spv_dims[0] * spv_dims[1] * spv_dims[2] == rec.wg) {
@@ -781,7 +797,7 @@ inline bool build_model_elf_from_nrp(const uint8_t* nrp, size_t nrp_bytes, const
         require(p == ds, "retargeted note did not round-trip");
         Mp& cs = mp_need(mp_need(mp_need(root, "amdpal.pipelines").items[0], ".hardware_stages"), ".cs");
         UavSgpr uav = find_uav_sgpr(mp_need(cs, ".user_data_reg_map"));
-        Bytes prefix = build_prefix(rec, uav, gfx11_mach != 0);
+        Bytes prefix = build_prefix(rec, uav, gfx11_mach != 0, push_off, grid_off);
         text->data = std::move(prefix);
         text->data.insert(text->data.end(), rec.code.begin(), rec.code.end());
         patch_symbol_size(e, text->data.size() - (rec.code.size() - rec.exec));

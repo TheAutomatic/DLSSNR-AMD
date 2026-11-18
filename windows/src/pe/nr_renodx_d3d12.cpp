@@ -1,38 +1,29 @@
-#include "nr_d3dcompiler.hpp"
-#include "nr_path_u8.hpp"
-// The RenoDX stage on the D3D12 passthrough (nr_renodx_d3d12.hpp). The host logic is nr_renodx.cpp's
-// (the Vulkan stage) line for line where it decides what the shaders are given; the shaders are RenoDX's
-// own D3D12 ones (windows/shaders/renodx *.cs_5_1.hlsl), compiled at runtime with d3dcompiler_47 as they are,
-// RENODX_VULKAN not defined. The frame is always taken whole - the colour copied in, the answer stored into the
-// output - which is the Vulkan stage's copied path (its in-place reading and storing are scheduling only, "the same
-// values"); the network runs between the encode and the resolve through the backend's D3D12 network over linear
-// buffers, its guides resampled onto the network's extent (to_motion / to_depth, the frame path's own shaders).
+// The RenoDX stage on the D3D12 passthrough (nr_renodx_d3d12.hpp): host orchestration mirrors nr_renodx.cpp,
+// while outer compute shaders run as pre-captured PAL ELFs from d3d12_outer.nra via mapped upload slots (zero
+// SetDescriptorHeaps calls and zero d3dcompiler_47 dependency).
 #include "nr_renodx_d3d12.hpp"
+#include "nr_d3d12_direct_state.hpp"
 #include "nr_d3d12_il.hpp"
+#include "nr_d3d12_outer_elf.hpp"
 #include "renodx/codec_gain.hpp"   // the codec's divisors and anchors (dlssnr.hpp's, as nr_renodx.cpp includes it)
 #include "nr_d3d12_passthrough.hpp"
 #include "nr_pe_log.hpp"
 #include "nr_vram_ledger.hpp"
 #include <cstdarg>
 #include <cmath>
-#include <fstream>
-#include <iterator>
 
-#include <d3dcompiler.h>
 #include <windows.h>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
-#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <map>
-#include <atomic>
 #include <mutex>
-#include <thread>
-#include <filesystem>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace nr::pe::d3d12_passthrough::renodx12 {
@@ -40,127 +31,6 @@ using Settings = nr::renodx::Settings;   // RenoDX's own (nr_renodx.hpp)
 namespace {
 
 void release(IUnknown* p) { if (p) p->Release(); }
-
-// ---- the inline HLSL: the stage's own plumbing (register layout: t0.. for reads, u0.. for writes, b0 the constants)
-
-
-
-// The plumbing: proxy texture <-> linear buffer (the network's buffers), the stored picture into the output, and the
-// game's guides onto the network's extent (nr_d3d12_passthrough_backend.cpp kShaders' to_motion / to_depth, the same
-// mapping).
-const char kAuxShaders[] = R"hlsl(
-cbuffer AuxC : register(b0) {
-    uint a_w;
-    uint a_h;
-    uint a_what;
-    uint a_pad0;
-    float4 a_region;
-};
-
-Texture2D<float4> aux_tex : register(t0);
-SamplerState aux_linear_clamp : register(s0);
-ByteAddressBuffer aux_raw_in : register(t0);
-ByteAddressBuffer aux_raw_neural : register(t1);
-RWByteAddressBuffer aux_raw_out : register(u0);
-RWStructuredBuffer<float4> aux_out : register(u0);
-RWTexture2D<float4> aux_dst : register(u0);
-
-uint2 pack_f16x4(float4 v) {
-    uint4 h = f32tof16(v);
-    return uint2(h.x | (h.y << 16), h.z | (h.w << 16));
-}
-float4 unpack_f16x4(uint2 p) {
-    return f16tof32(uint4(p.x & 0xffffu, p.x >> 16, p.y & 0xffffu, p.y >> 16));
-}
-
-[numthreads(8, 8, 1)]
-void tex_to_buf(uint3 id : SV_DispatchThreadID) {
-    // a_what 1: RGBA32F texels at lp16 rows (Passes (fast) Interleaved's slot history for an RGBA32F network history)
-    if (id.x < a_w && id.y < a_h) {
-        if (a_what == 1u) aux_raw_out.Store4((id.y * lp16(a_w) + id.x) * 16, asuint(aux_tex.Load(int3(id.xy, 0))));
-        else aux_raw_out.Store2((id.y * a_w + id.x) * 8, pack_f16x4(aux_tex.Load(int3(id.xy, 0))));
-    }
-}
-
-[numthreads(8, 8, 1)]
-void sdr_encode_lin(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= a_w || id.y >= a_h) return;
-    const uint2 src_sz = max(uint2(asuint(a_region.xy)), uint2(1, 1));
-    const uint2 src_px = uint2(asuint(a_region.zw)) + min(uint2(((float2(id.xy) + 0.5f) * float2(src_sz)) / float2(a_w, a_h)), src_sz - 1);
-    const float3 p = max(aux_tex.Load(int3(src_px, 0)).rgb, 0.0f);
-    aux_raw_out.Store2((id.y * a_w + id.x) * 8, pack_f16x4(float4(p, 1.0f)));
-}
-
-[numthreads(8, 8, 1)]
-void sdr_decode_lin(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= a_w || id.y >= a_h) return;
-    const float4 src = a_pad0 != 0 ? aux_dst[id.xy] : aux_tex.Load(int3(id.xy, 0));
-    const uint2 n_sz = max(uint2(asuint(a_region.xy)), uint2(1, 1));
-    const uint2 n_px = min(uint2(((float2(id.xy) + 0.5f) * float2(n_sz)) / float2(a_w, a_h)), n_sz - 1);
-    const float3 neural = unpack_f16x4(aux_raw_neural.Load2((n_px.y * n_sz.x + n_px.x) * 8)).rgb;
-    const float orig_y = dot(src.rgb, float3(0.212639f, 0.715169f, 0.072192f));
-    const float upg_y = dot(neural, float3(0.212639f, 0.715169f, 0.072192f));
-    const float ratio = orig_y == 0.0f ? 1.0f : clamp(upg_y / orig_y, 0.0f, 4.0f);
-    const float3 result = lerp(src.rgb * ratio, neural, asfloat(a_what));
-    aux_dst[id.xy] = float4(result, src.a);
-}
-
-[numthreads(8, 8, 1)]
-void buf_to_tex(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= a_w || id.y >= a_h) return;
-    aux_dst[id.xy] = unpack_f16x4(aux_raw_in.Load2((id.y * a_w + id.x) * 8));
-}
-
-[numthreads(8, 8, 1)]
-void copy_out(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= a_w || id.y >= a_h) return;
-    aux_dst[id.xy] = aux_tex.Load(int3(id.xy, 0));
-}
-
-[numthreads(8, 8, 1)]
-void to_motion(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= a_w || id.y >= a_h) return;
-    const float2 uv = (float2(id.xy) + 0.5f) / float2(a_w, a_h);
-    const float2 mv = aux_tex.SampleLevel(aux_linear_clamp, uv * a_region.xy + a_region.zw, 0).xy;
-    const uint2 h = f32tof16(mv);
-    aux_raw_out.Store2((id.y * a_w + id.x) * 8, uint2(h.x | (h.y << 16), 0u));
-}
-
-[numthreads(8, 8, 1)]
-void to_depth(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= a_w || id.y >= a_h) return;
-    const float2 s = floor((float2(id.xy) + 0.5f) * a_region.xy / float2(a_w, a_h));
-    const int2 t = min(int2(s), int2(a_region.xy) - 1);
-    aux_out[id.y * a_w + id.x] = float4(aux_tex.Load(int3(t + int2(a_region.zw), 0)).r, 0, 0, 0);
-}
-)hlsl";
-
-// The network reads the linear buffers as images whose rows are lin_pitch's (nr_d3d12_passthrough.hpp: RDNA4 128-byte,
-// RDNA3 256-byte aligned), so these programs address rows of lp8 / lp16 texels on both architectures.
-std::string lin_pitch_hlsl() {   // lin_pitch in HLSL (the architecture's row alignment)
-    const std::string m = std::to_string(nr::pe::d3d12_passthrough::lin_row_align() - 1u) + "u";
-    return "uint lp8(uint w) { return ((w * 8u + " + m + ") & ~" + m + ") / 8u; }\n"
-           "uint lp16(uint w) { return ((w * 16u + " + m + ") & ~" + m + ") / 16u; }\n";
-}
-void replace_every(std::string& t, const std::string& a, const std::string& b) {
-    for (size_t at = t.find(a); at != std::string::npos; at = t.find(a, at + b.size())) t.replace(at, a.size(), b);
-}
-// kAuxShaders over rows of lin_pitch texels (both architectures; the alignment is the architecture's)
-std::string aux_shaders_pitched() {
-    std::string t(kAuxShaders, sizeof kAuxShaders - 1);
-    {
-        replace_every(t, "uint2 pack_f16x4(float4 v) {", lin_pitch_hlsl() + "uint2 pack_f16x4(float4 v) {");
-        replace_every(t, "(id.y * a_w + id.x) * 8", "(id.y * lp8(a_w) + id.x) * 8");
-        replace_every(t, "(n_px.y * n_sz.x + n_px.x) * 8", "(n_px.y * lp8(n_sz.x) + n_px.x) * 8");
-        replace_every(t, "aux_out[id.y * a_w + id.x]", "aux_out[id.y * lp16(a_w) + id.x]");
-    }
-    return t;
-}
-// NR_LIN_IO's store of the encoded proxy (both trees of programs below)
-std::string lin_io_store() {
-    return "{ uint4 h = f32tof16(float4(SrgbEncode(proxy), 1.0)); "
-           "OutputLin.Store2((pixel.y * lp8(max(Size.x, 1u)) + pixel.x) * 8u, uint2(h.x | (h.y << 16), h.z | (h.w << 16))); }";
-}
 
 DXGI_FORMAT srv_format_of(DXGI_FORMAT f) {
     switch (f) {
@@ -185,199 +55,6 @@ DXGI_FORMAT uav_format_of(DXGI_FORMAT f) {
         case DXGI_FORMAT_R32G32B32A32_TYPELESS: return DXGI_FORMAT_R32G32B32A32_FLOAT;
         default: return f;
     }
-}
-
-// RenoDX's own files, read from the installed shaders folder (their #includes resolved there).
-std::string read_text(const std::wstring& path) {
-    std::string out;
-    if (FILE* f = _wfopen(path.c_str(), L"rb")) {
-        char buf[16384];
-        size_t n;
-        while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) out.append(buf, n);
-        std::fclose(f);
-    }
-    return out;
-}
-
-struct FolderInclude final : ID3DInclude {
-    std::vector<std::wstring> dirs;
-    static void replace_all(std::string& s, const char* from, const char* to) {
-        const size_t flen = std::strlen(from), tlen = std::strlen(to);
-        size_t pos = 0;
-        while ((pos = s.find(from, pos)) != std::string::npos) {
-            s.replace(pos, flen, to);
-            pos += tlen;
-        }
-    }
-    STDMETHOD(Open)(D3D_INCLUDE_TYPE, LPCSTR name, LPCVOID, LPCVOID* data, UINT* bytes) override {
-        const std::string n(name);
-        std::wstring w(n.begin(), n.end());
-        for (const std::wstring& d : dirs) {
-            std::string text = read_text(d + L"\\" + w);
-            if (text.empty()) continue;
-            if (n == "v6_common.hlsli") {
-                // The file's own texel reads first, through the helpers below (each sits in a function with a
-                // tex_size): done after inserting them, the helpers' own `Proxy.Load(c)` became a call with no
-                // tex_size in scope and every program without NR_LIN_IO failed to compile (X3004) - no HDR stage.
-                replace_all(text, "Proxy.Load(", "LoadProxyTexel(tex_size.x, ");
-                replace_all(text, "Neural.Load(", "LoadNeuralTexel(tex_size.x, ");
-                const char* row = "lp8(max(w, 1u))";   // the rows are lin_pitch's
-                const std::string lin_io =
-                    std::string("#ifdef NR_LIN_IO\nByteAddressBuffer Proxy : register(t1);\nByteAddressBuffer Neural : register(t2);\n"
-                                "RWByteAddressBuffer OutputLin : register(u1);\n") +
-                    lin_pitch_hlsl() +
-                    "float4 LoadProxyTexel(uint w, int3 c) { uint2 p = Proxy.Load2((uint(c.y) * " + row + " + uint(c.x)) * 8u); "
-                    "return f16tof32(uint4(p.x & 0xffffu, p.x >> 16, p.y & 0xffffu, p.y >> 16)); }\n"
-                    "float4 LoadNeuralTexel(uint w, int3 c) { uint2 p = Neural.Load2((uint(c.y) * " + row + " + uint(c.x)) * 8u); "
-                    "return f16tof32(uint4(p.x & 0xffffu, p.x >> 16, p.y & 0xffffu, p.y >> 16)); }\n"
-                    "#else\nVK_BINDING(1) Texture2D<float4> Proxy : register(t1);";
-                replace_all(text, "VK_BINDING(1) Texture2D<float4> Proxy : register(t1);", lin_io.c_str());
-                replace_all(text, "VK_BINDING(2) Texture2D<float4> Neural : register(t2);",
-                            "VK_BINDING(2) Texture2D<float4> Neural : register(t2);\n"
-                            "float4 LoadProxyTexel(uint w, int3 c) { return Proxy.Load(c); }\n"
-                            "float4 LoadNeuralTexel(uint w, int3 c) { return Neural.Load(c); }\n#endif");
-            }
-            auto* copy = new char[text.size()];
-            std::memcpy(copy, text.data(), text.size());
-            *data = copy;
-            *bytes = UINT(text.size());
-            return S_OK;
-        }
-        return E_FAIL;
-    }
-    STDMETHOD(Close)(LPCVOID data) override { delete[] static_cast<const char*>(data); return S_OK; }
-};
-
-ID3DBlob* compile_hlsl(const char* source, size_t bytes, const char* entry, std::string* why, FolderInclude* inc,
-                       const D3D_SHADER_MACRO* macros = nullptr) {
-    using PFN = HRESULT(WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO*, ID3DInclude*, LPCSTR, LPCSTR,
-                                 UINT, UINT, ID3DBlob**, ID3DBlob**);
-    using PFN_CreateBlob = HRESULT(WINAPI*)(SIZE_T, ID3DBlob**);
-    static HMODULE d3dcomp = nr::pe::system_d3dcompiler();   // System32's, not a game's (an old one lacks cs_5_1)
-    static PFN fn = d3dcomp ? reinterpret_cast<PFN>(reinterpret_cast<void*>(GetProcAddress(d3dcomp, "D3DCompile"))) : nullptr;
-    static std::mutex g_compile_mu;
-    std::lock_guard<std::mutex> compile_lk(g_compile_mu);
-    static PFN_CreateBlob fn_blob = d3dcomp ? reinterpret_cast<PFN_CreateBlob>(reinterpret_cast<void*>(GetProcAddress(d3dcomp, "D3DCreateBlob"))) : nullptr;
-    if (!fn) { *why = "d3dcompiler_47.dll (D3DCompile) is not available"; return nullptr; }
-    auto fnv = [](uint64_t h, const void* p, size_t n) {
-        const auto* b = static_cast<const uint8_t*>(p);
-        for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; }
-        return h;
-    };
-    uint64_t h = fnv(1469598103934665603ull, "NR_RENODX_DXBC_V4", 17);
-    h = fnv(h, source, bytes);
-    // Every .hlsli the include handler can hand out (the folders' texts, read once a run): a change to an include
-    // alone (prep_resolve.hlsli's neutral inverse in 0.0.8.4) must not find the old DXBC - the top-level text stays.
-    if (inc) {
-        static std::mutex g_inc_mu;
-        static std::map<std::wstring, uint64_t> g_inc_hash;
-        std::wstring dirs_key;
-        for (const std::wstring& d : inc->dirs) dirs_key += d + L"|";
-        std::lock_guard<std::mutex> lk(g_inc_mu);
-        auto it = g_inc_hash.find(dirs_key);
-        if (it == g_inc_hash.end()) {
-            uint64_t ih = 1469598103934665603ull;
-            for (const std::wstring& d : inc->dirs) {
-                std::vector<std::filesystem::path> files;
-                std::error_code ec;
-                for (const auto& e : std::filesystem::directory_iterator(d, ec))
-                    if (e.path().extension() == L".hlsli") files.push_back(e.path());
-                std::sort(files.begin(), files.end());
-                for (const auto& p : files) {
-                    const std::string name = p.filename().string(), text = read_text(p.wstring());
-                    ih = fnv(ih, name.data(), name.size() + 1);
-                    ih = fnv(ih, text.data(), text.size());
-                }
-            }
-            it = g_inc_hash.emplace(dirs_key, ih).first;
-        }
-        h = fnv(h, &it->second, sizeof it->second);
-    }
-    h = fnv(h, entry, std::strlen(entry) + 1);
-    if (macros && macros[0].Name) {
-        h = fnv(h, macros[0].Name, std::strlen(macros[0].Name) + 1);
-        if (macros[0].Definition) h = fnv(h, macros[0].Definition, std::strlen(macros[0].Definition) + 1);
-    }
-    // The include handler's v6_common.hlsli text carries the architecture's row alignment (lin_pitch_hlsl)
-    {
-        const uint32_t align = nr::pe::d3d12_passthrough::lin_row_align();
-        h = fnv(h, &align, sizeof align);
-    }
-    static std::mutex g_dxbc_mu;
-    static std::map<uint64_t, std::vector<uint8_t>> g_dxbc_mem;
-    static std::wstring g_cache_dir = [] {
-        const char* mf = nr::pe::module_folder();
-        if (!mf || !*mf) return std::wstring{};
-        const int n = MultiByteToWideChar(CP_UTF8, 0, mf, -1, nullptr, 0);
-        if (n <= 1) return std::wstring{};
-        std::wstring w(size_t(n) - 1, L'\0');
-        MultiByteToWideChar(CP_UTF8, 0, mf, -1, w.data(), n);
-        std::wstring dir = w + L"\\dlssnr-amd\\aco-cache";
-        std::error_code ec;
-        std::filesystem::create_directories(dir, ec);
-        return dir;
-    }();
-    wchar_t disk_path[MAX_PATH] = {};
-    if (!g_cache_dir.empty())
-        std::swprintf(disk_path, MAX_PATH, L"%ls\\renodx_%016llx.dxbc", g_cache_dir.c_str(), (unsigned long long)h);
-    if (fn_blob) {
-        std::vector<uint8_t> cached;
-        {
-            std::lock_guard<std::mutex> lk(g_dxbc_mu);
-            auto it = g_dxbc_mem.find(h);
-            if (it != g_dxbc_mem.end()) cached = it->second;
-        }
-        if (cached.empty() && disk_path[0]) {
-            if (FILE* f = _wfopen(disk_path, L"rb")) {
-                std::fseek(f, 0, SEEK_END);
-                const long sz = std::ftell(f);
-                std::fseek(f, 0, SEEK_SET);
-                if (sz > 32) {
-                    cached.resize(size_t(sz));
-                    if (std::fread(cached.data(), 1, cached.size(), f) == cached.size()) {
-                        std::lock_guard<std::mutex> lk(g_dxbc_mu);
-                        g_dxbc_mem[h] = cached;
-                    } else {
-                        cached.clear();
-                    }
-                }
-                std::fclose(f);
-            }
-        }
-        if (!cached.empty()) {
-            ID3DBlob* blob = nullptr;
-            if (SUCCEEDED(fn_blob(cached.size(), &blob)) && blob) {
-                std::memcpy(blob->GetBufferPointer(), cached.data(), cached.size());
-                return blob;
-            }
-        }
-    }
-    ID3DBlob *code = nullptr, *errors = nullptr;
-    const UINT flags = 1u << 15;
-    const HRESULT hr = fn(source, bytes, entry, macros, inc, entry, "cs_5_1", flags, 0, &code, &errors);
-    if (FAILED(hr) || !code) {
-        *why = std::string("the ") + entry + " shader did not compile";
-        if (errors) { *why += ": "; *why += static_cast<const char*>(errors->GetBufferPointer()); }
-        release(errors);
-        release(code);
-        return nullptr;
-    }
-    release(errors);
-    if (code->GetBufferSize() > 32) {
-        const auto* ptr = static_cast<const uint8_t*>(code->GetBufferPointer());
-        std::vector<uint8_t> vec(ptr, ptr + code->GetBufferSize());
-        {
-            std::lock_guard<std::mutex> lk(g_dxbc_mu);
-            g_dxbc_mem[h] = vec;
-        }
-        if (disk_path[0]) {
-            if (FILE* f = _wfopen(disk_path, L"wb")) {
-                std::fwrite(vec.data(), 1, vec.size(), f);
-                std::fclose(f);
-            }
-        }
-    }
-    return code;
 }
 
 // ---- look_stage.hpp's host side, verbatim from nr_renodx.cpp (device-independent) ------------------------
@@ -878,21 +555,11 @@ struct Stage::Impl {
              kSdrEncodeLin, kSdrDecodeLin,
              kCount };
     bool codec_sig(P p) const { return p <= kDebug; }
-    ID3D12RootSignature* rs_codec = nullptr;
-    ID3D12RootSignature* rs_aux = nullptr;
-    ID3D12PipelineState* pso[kCount] = {};
-    ID3D12DescriptorHeap* heap = nullptr;          // shader-visible, the dispatches' views
-    ID3D12DescriptorHeap* clear_heap = nullptr;    // one descriptor, for the prep state's zeroing clear
-    UINT inc = 0, slot = 0;
-    static constexpr UINT kSlots = 4096;   // the first heap: one dispatch a slot (20 descriptors); a frame uses tens
-    UINT slots = kSlots;                   // this heap's slots (grows when a frame would outrun completion)
-    UINT kClearSlot = kSlots * 20;          // the clear descriptors at the end of this heap
-    // Each slot carries the frame that last wrote it. A slot is rewritten only when the caller says that frame has
-    // finished on the GPU; otherwise the frame fails to the Vulkan bridge rather than overwriting descriptors a
-    // recorded dispatch still reads.
-    std::vector<uint64_t> slot_frame;
-    static constexpr uint64_t kNoFrame = ~uint64_t(0);   // a slot never written (frame 0 is a real frame)
-    uint64_t frame_no = 0;
+    ID3D12RootSignature* rs_outer = nullptr;
+    d3d12_outer::OuterKernel kernels[kCount]{};
+    d3d12_outer::OuterHeapPool outer_pool;
+    ID3D12Resource* zero_upload = nullptr;   // 512-byte zeroed UPLOAD buffer for CopyBufferRegion / CopyTextureRegion clears
+    nr::gpu::Ticket current_ticket;
     uint64_t pinned = 0;   // the caller's frame number for this record (its own completion watermark's unit)
     std::function<bool(uint64_t)> completed;
 
@@ -996,58 +663,6 @@ struct Stage::Impl {
         nr::vram::track_d3d12(device, t.res, nr::vram::kRenoDX);
         return t;
     }
-    // This frame's slot budget, from its configuration (a pass is tens of dispatches: the stage's encode/decode,
-    // look and fast programs), grown here before the frame's first command. Not an admission cap: the heap simply
-    // keeps the frames' slots larger than any one frame needs.
-    UINT frame_budget = 128;
-    UINT frame_used = 0;
-    bool reserve_frame_slots() {
-        for (int tries = 0; tries < 12; ++tries) {
-            if (slot_frame.size() != slots) slot_frame.assign(slots, kNoFrame);
-            // The run must be within one wrap: a heap smaller than the budget cannot carry a frame.
-            bool free_run = slots >= frame_budget;
-            for (UINT i = 0; i < frame_budget && free_run; ++i) {
-                const UINT at = (slot + i) % slots;
-                if (slot_frame[at] != kNoFrame && !completed(slot_frame[at])) free_run = false;
-            }
-            if (free_run) return true;
-            if (!grow_slots()) return false;
-        }
-        return false;
-    }
-    // A new shader-visible heap of twice the slots, its clear descriptors made, the old one retired through the
-    // caller's watermark (a recorded dispatch may still read it).
-    bool grow_slots() {
-        const UINT grown = slots * 2;
-        D3D12_DESCRIPTOR_HEAP_DESC hd{};
-        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        hd.NumDescriptors = grown * 20 + 2;
-        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-        ID3D12DescriptorHeap* nh = nullptr;
-        if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&nh))) || !nh) return false;
-        const UINT ni = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-        ID3D12DescriptorHeap* old = heap;
-        const UINT old_slots = slots;
-        heap = nh;
-        inc = ni;
-        slots = grown;
-        kClearSlot = grown * 20;
-        // The prep state's clear descriptors of the new heap, as creation made them.
-        D3D12_UNORDERED_ACCESS_VIEW_DESC d{};
-        d.Format = DXGI_FORMAT_UNKNOWN;
-        d.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-        d.Buffer.NumElements = 1;
-        d.Buffer.StructureByteStride = 16;
-        if (prep_state) device->CreateUnorderedAccessView(prep_state, nullptr, &d, main_cpu(kClearSlot));
-        slot_frame.assign(slots, kNoFrame);
-        slot = 0;
-        nr::pe::log("[nr] RenoDX stage: descriptor heap grown to %u slots (was %u; the old one retires on completion; frame %llu)",
-                    grown, old_slots, static_cast<unsigned long long>(pinned));
-        if (old) {
-            if (retire) retire(old);
-        }
-        return true;
-    }
     ID3D12Resource* make_buffer(uint64_t bytes, std::string* why) {
         D3D12_HEAP_PROPERTIES hp{};
         hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -1106,150 +721,65 @@ struct Stage::Impl {
     // HDR resolves pass k into the work images, SDR into the decoded ones.
     Tex& stack_out(uint32_t pass) { return hdr ? ((pass & 1u) ? work_b : work_a) : ((pass & 1u) ? decoded_alt : decoded); }
 
-    // ClearUnorderedAccessView* reads its GPU handle from the heap bound right now and its CPU handle from a heap the
-    // driver reads beside it (D3D12's signature: ViewGPUHandleInCurrentHeap, ViewCPUHandle). The dispatch slots rotate,
-    // so the clears get two slots of their own after them: a recorded clear must keep the view it was given.
-    // The prep state's clear descriptors sit after the dispatch slots of this heap (a member: a grown heap moves them).
-    D3D12_CPU_DESCRIPTOR_HANDLE main_cpu(UINT i) const {
-        D3D12_CPU_DESCRIPTOR_HANDLE h = heap->GetCPUDescriptorHandleForHeapStart();
-        h.ptr += SIZE_T(i) * inc;
-        return h;
-    }
-    D3D12_GPU_DESCRIPTOR_HANDLE main_gpu(UINT i) const {
-        D3D12_GPU_DESCRIPTOR_HANDLE h = heap->GetGPUDescriptorHandleForHeapStart();
-        h.ptr += UINT64(i) * inc;
-        return h;
-    }
-    D3D12_CPU_DESCRIPTOR_HANDLE clear_cpu(UINT i) const {
-        D3D12_CPU_DESCRIPTOR_HANDLE h = clear_heap->GetCPUDescriptorHandleForHeapStart();
-        h.ptr += SIZE_T(i) * inc;
-        return h;
-    }
-    void bind_heap(ID3D12GraphicsCommandList* cmd) const {
-        ID3D12DescriptorHeap* heaps[1] = {heap};
-        cmd->SetDescriptorHeaps(1, heaps);
-    }
-    // One dispatch. `srv` / `uav` hold the register-numbered slots (t0.. / u0..); a null slot takes the first
-    // non-null one's view (a binding the stage leaves out is one the program never reads, and D3D12 never
-    // validates an unaccessed descriptor).
-    // NR_STAGE_DISPATCH_LIMIT=<n>: record only the first n dispatches of a run (0/unset: all). Bisecting which one
-    // loses the device offline, without the game and without guessing.
     static uint32_t dispatch_limit() {
         static const uint32_t v = [] {
-            char b[16] = {};
-            const DWORD n = GetEnvironmentVariableA("NR_STAGE_DISPATCH_LIMIT", b, sizeof b);
-            return n && n < sizeof b ? uint32_t(std::atoi(b)) : 0u;
+            wchar_t b[16] = {};
+            const DWORD n = GetEnvironmentVariableW(L"NR_STAGE_DISPATCH_LIMIT", b, 16);
+            return n && n < 16 ? uint32_t(std::wcstoul(b, nullptr, 10)) : 0u;
         }();
         return v;
     }
     uint32_t dispatches_done = 0;
     void dispatch(ID3D12GraphicsCommandList* cmd, P p, View srv[8], View uav[14], const void* push,
                   uint32_t dwords, uint32_t gx, uint32_t gy) {
-        // NR_STAGE_ONLY=<program>: record only that program's dispatches (bisecting a single one in isolation).
         static const int only = [] {
-            char b[16] = {};
-            const DWORD n = GetEnvironmentVariableA("NR_STAGE_ONLY", b, sizeof b);
-            return n && n < sizeof b ? std::atoi(b) : -1;
+            wchar_t b[16] = {};
+            const DWORD n = GetEnvironmentVariableW(L"NR_STAGE_ONLY", b, 16);
+            return n && n < 16 ? std::stoi(std::wstring(b)) : -1;
         }();
-        if (only >= 0 && int(p) != only) {
-            return;
-        }
+        if (only >= 0 && int(p) != only) return;
         const uint32_t limit = dispatch_limit();
-        if (limit && dispatches_done >= limit) {
-            return;
-        }
+        if (limit && dispatches_done >= limit) return;
         ++dispatches_done;
-        const bool codec = codec_sig(p);
-        const UINT n_srv = codec ? 6 : 8, n_uav = codec ? 14 : 8;
-        // The slot first, on the heap record() reserved the frame's whole budget on: no growth happens here, so no
-        // dispatch can be dropped or written into a heap that was replaced after it was bound.
-        if (frame_used++ >= frame_budget) {
+
+        const d3d12_outer::OuterKernel& k = kernels[p];
+        if (!k.pso || !rs_outer) {
             record_ok_ = false;
-            nr::pe::log("[nr] RenoDX stage: a frame needs more than its %u-slot budget; failing it", frame_budget);
+            nr::pe::log("[nr] RenoDX stage: outer kernel %d is missing", int(p));
             return;
         }
-        UINT take = slot % slots;
-        slot_frame[take] = pinned;
-        slot = (slot + 1) % slots;
-        bind_heap(cmd);
-        D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap->GetCPUDescriptorHandleForHeapStart();
-        D3D12_GPU_DESCRIPTOR_HANDLE gpu = heap->GetGPUDescriptorHandleForHeapStart();
-        cpu.ptr += SIZE_T(take) * 20 * inc;
-        gpu.ptr += UINT64(take) * 20 * inc;
-        const auto fill = [&](View* views, UINT n, bool write) {
-            View first{};
-            for (UINT i = 0; i < n; ++i)
-                if (views[i].res) { first = views[i]; break; }
-            for (UINT i = 0; i < n; ++i) {
-                View v = views[i].res ? views[i] : first;
-                if (!v.res) continue;
-                if (v.buffer) {
-                    ensure(cmd, v.res, write ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
-                                             : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                    D3D12_CPU_DESCRIPTOR_HANDLE h = cpu;
-                    if (v.write) {
-                        D3D12_UNORDERED_ACCESS_VIEW_DESC d{};
-                        d.Format = DXGI_FORMAT_UNKNOWN;
-                        d.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-                        if (v.raw) {
-                            d.Buffer.NumElements = UINT(v.bytes / 4);
-                            d.Format = DXGI_FORMAT_R32_TYPELESS;
-                            d.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
-                        } else {
-                            d.Buffer.NumElements = UINT(v.bytes / 16);
-                            d.Buffer.StructureByteStride = 16;
-                        }
-                        h.ptr += SIZE_T(n_srv + i) * inc;
-                        device->CreateUnorderedAccessView(v.res, nullptr, &d, h);
-                    } else {
-                        D3D12_SHADER_RESOURCE_VIEW_DESC d{};
-                        d.Format = DXGI_FORMAT_UNKNOWN;
-                        d.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
-                        d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-                        if (v.raw) {
-                            d.Buffer.NumElements = UINT(v.bytes / 4);
-                            d.Format = DXGI_FORMAT_R32_TYPELESS;
-                            d.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
-                        } else {
-                            d.Buffer.NumElements = UINT(v.bytes / 16);
-                            d.Buffer.StructureByteStride = 16;
-                        }
-                        h.ptr += SIZE_T(i) * inc;
-                        device->CreateShaderResourceView(v.res, &d, h);
-                    }
-                    continue;
-                }
-                ensure(cmd, v.res, write ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
-                                         : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                if (v.write) {
-                    D3D12_UNORDERED_ACCESS_VIEW_DESC d{};
-                    d.Format = v.fmt;
-                    d.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-                    D3D12_CPU_DESCRIPTOR_HANDLE h = cpu;
-                    h.ptr += SIZE_T(n_srv + i) * inc;
-                    device->CreateUnorderedAccessView(v.res, nullptr, &d, h);
-                } else {
-                    D3D12_SHADER_RESOURCE_VIEW_DESC d{};
-                    d.Format = v.fmt;
-                    d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-                    d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-                    d.Texture2D.MipLevels = 1;
-                    D3D12_CPU_DESCRIPTOR_HANDLE h = cpu;
-                    h.ptr += SIZE_T(i) * inc;
-                    device->CreateShaderResourceView(v.res, &d, h);
-                }
+        std::string slot_err;
+        d3d12_outer::OuterSlot s = outer_pool.acquire(current_ticket, &slot_err);
+        if (!s.cpu) {
+            record_ok_ = false;
+            nr::pe::log("[nr] RenoDX stage: %s", slot_err.empty() ? "no outer descriptor slot" : slot_err.c_str());
+            return;
+        }
+
+        const bool glsl = (p == kPrepEncode) || (p >= kDebug && p <= kPrep);
+        const bool aux_hlsl = p >= kTexToBuf;
+        const uint32_t uav_shift = glsl ? 0u : (aux_hlsl ? 8u : 6u);
+        const UINT n_srv = codec_sig(p) ? 6u : 8u;
+        const UINT n_uav = codec_sig(p) ? 14u : 8u;
+
+        for (UINT i = 0; i < n_srv; ++i) {
+            if (!srv[i].res) continue;
+            ensure(cmd, srv[i].res, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            if (const auto* ob = k.find_binding(i)) {
+                if (srv[i].buffer) s.write_buf(ob, srv[i].res, srv[i].bytes);
+                else s.write_srv_tex(device, ob, srv[i].res, srv[i].fmt, 0, 1);
             }
-        };
-        fill(srv, n_srv, false);
-        fill(uav, n_uav, true);
-        D3D12_GPU_DESCRIPTOR_HANDLE gpu_uav = gpu;
-        gpu_uav.ptr += UINT64(n_srv) * inc;
-        cmd->SetComputeRootSignature(codec ? rs_codec : rs_aux);
-        cmd->SetPipelineState(pso[p]);
-        cmd->SetComputeRoot32BitConstants(0, dwords, push, 0);
-        cmd->SetComputeRootDescriptorTable(1, gpu);
-        cmd->SetComputeRootDescriptorTable(2, gpu_uav);
-        cmd->Dispatch(gx, gy, 1);
+        }
+        for (UINT j = 0; j < n_uav; ++j) {
+            if (!uav[j].res) continue;
+            ensure(cmd, uav[j].res, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            if (const auto* ob = k.find_binding(uav_shift + j)) {
+                if (uav[j].buffer) s.write_buf(ob, uav[j].res, uav[j].bytes);
+                else s.write_uav_tex(device, ob, uav[j].res, uav[j].fmt, 0);
+            }
+        }
+        s.write_push(push, dwords * 4u);
+        s.dispatch(cmd, rs_outer, k, gx, gy, 1u, true);
         uav_barrier(cmd);
     }
 
@@ -1338,9 +868,8 @@ struct Stage::Impl {
 
     // ---- Passes (fast) Interleaved (nr_renodx.cpp's il_*: the same programs, as HLSL - nr_d3d12_il.hpp) ----
     static constexpr uint32_t kIlSlots = 8;
-    d3d12_il::Layout il_lay[2], ilpp_lay;
-    ID3D12PipelineState* il_pso[2][7] = {};   // P1 carrier, P2 carrier + display step6
-    ID3D12PipelineState* ilpp_pso = nullptr;
+    d3d12_outer::OuterKernel il_kernels[2][7]{};   // preset 0 (P1) and preset 1 (P2)
+    d3d12_outer::OuterKernel ilpp_kernel{};
     bool il_loaded = false;
     Tex il_base, il_base2, il_trust, il_tdbg, il_hist, il_inc[2][kIlSlots], il_pyr[6], il_dpyr[6], il_depth[2];
     Tex il_lf[2];
@@ -1357,46 +886,14 @@ struct Stage::Impl {
     ID3D12Resource* lin_hist = nullptr;   // a slot's history in the network's history layout (NetTemporal::history_va)
     uint32_t il_slots = 0, il_pyr_slots = 0, il_cur = 0, il_bcur = 0, il_dcur = 0, il_frame = 0, il_last[kIlSlots] = {};
     bool il_valid = false, il_graded_last = false, il_missing_logged = false, il_depth_logged = false;
-    // The programs (renodx_il.hlsl's steps, renodx_il_pp.hlsl), from the package's d3d12\renodx folder. Missing or not
-    // compiling: Interleaved cannot run (said once; the stage itself runs).
-    bool load_il(const std::wstring& ours, std::string* why) {
-        const auto program = [&](const char* name, uint32_t dwords, d3d12_il::Layout* lay) -> std::string {
-            const std::string text = read_text(ours + std::wstring(name, name + std::strlen(name)) + L".hlsl");
-            if (text.empty()) { *why = std::string(name) + ".hlsl is missing"; return {}; }
-            d3d12_il::registers(text, lay);
-            lay->dwords = dwords;
-            if (!d3d12_il::make_root_signature(device, lay, why)) return {};
-            return text;
-        };
-        const auto pipeline = [&](const std::string& text, const d3d12_il::Layout& lay, uint32_t step, ID3D12PipelineState** out) {
-            std::string err;
-            char value[16];
-            std::snprintf(value, sizeof value, "%uu", step);
-            const D3D_SHADER_MACRO macros[] = {{"SPIRV_CROSS_CONSTANT_ID_0", value}, {nullptr, nullptr}};
-            ID3DBlob* blob = compile_hlsl(text.data(), text.size(), "main", &err, nullptr, step == ~0u ? nullptr : macros);
-            if (!blob) { *why = "Interleaved: " + err; return false; }
-            D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
-            pd.pRootSignature = lay.rs;
-            pd.CS.pShaderBytecode = blob->GetBufferPointer();
-            pd.CS.BytecodeLength = blob->GetBufferSize();
-            const HRESULT hr = device->CreateComputePipelineState(&pd, IID_PPV_ARGS(out));
-            release(blob);
-            if (FAILED(hr) || !*out) { *why = "Interleaved: a program does not make a pipeline"; return false; }
-            return true;
-        };
-        for (uint32_t preset = 0; preset < 2; ++preset) {
-            const std::string text = program(preset == 0 ? "renodx_il0" : "renodx_il", 24, &il_lay[preset]);
-            if (text.empty()) return false;
-            if (il_lay[preset].srv.empty() || il_lay[preset].uav.empty()) {
-                *why = "Interleaved: a program declares no reads or no writes"; return false;
-            }
-            for (uint32_t step : {0u, 1u, 3u, 4u, 5u, 6u}) {
-                if (preset == 0 && step == 6) continue;
-                if (!pipeline(text, il_lay[preset], step, &il_pso[preset][step])) return false;
-            }
+    bool load_il(d3d12_outer::OuterArchive& arch, std::string* why) {
+        for (uint32_t step : {0u, 1u, 3u, 4u, 5u}) {
+            if (!arch.build_kernel(device, "il/il0_" + std::to_string(step), &il_kernels[0][step], why)) return false;
         }
-        const std::string pp = program("renodx_il_pp", 7, &ilpp_lay);
-        if (pp.empty() || !pipeline(pp, ilpp_lay, ~0u, &ilpp_pso)) return false;
+        for (uint32_t step : {0u, 1u, 3u, 4u, 5u, 6u}) {
+            if (!arch.build_kernel(device, "il/il_" + std::to_string(step), &il_kernels[1][step], why)) return false;
+        }
+        if (!arch.build_kernel(device, "il/il_pp", &ilpp_kernel, why)) return false;
         il_loaded = true;
         return true;
     }
@@ -1464,38 +961,26 @@ struct Stage::Impl {
         }
         return true;
     }
-    // One Interleaved dispatch: its program's descriptors (layout.descriptors(), packed - nr_d3d12_il.hpp) in as many
-    // contiguous 20-descriptor slots as they take, from the frame's reserved run (a run that would wrap past the heap's
-    // end starts again at slot 0, the slots skipped counted as used).
-    void dispatch_il(ID3D12GraphicsCommandList* cmd, const d3d12_il::Layout& lay, ID3D12PipelineState* pso,
-                     const std::vector<d3d12_il::Bind>& binds, const void* push, uint32_t gx, uint32_t gy) {
-        const UINT k = (lay.descriptors() + 19) / 20;
-        const UINT at = slot % slots;
-        const UINT skip = at + k > slots ? slots - at : 0;
-        if (frame_used + skip + k > frame_budget) {
+    void dispatch_il(ID3D12GraphicsCommandList* cmd, const d3d12_outer::OuterKernel& k,
+                     const std::vector<d3d12_il::Bind>& binds, const void* push, uint32_t dwords,
+                     uint32_t gx, uint32_t gy) {
+        if (!k.pso || !rs_outer) {
             record_ok_ = false;
-            nr::pe::log("[nr] RenoDX stage: a frame needs more than its %u-slot budget; failing it", frame_budget);
+            nr::pe::log("[nr] RenoDX stage (D3D12): Interleaved outer kernel missing");
             return;
         }
-        for (UINT i = 0; i < skip; ++i) slot_frame[(at + i) % slots] = pinned;
-        frame_used += skip + k;
-        const UINT take = (at + skip) % slots;
-        for (UINT i = 0; i < k; ++i) slot_frame[take + i] = pinned;
-        slot = (take + k) % slots;
+        std::string slot_err;
+        d3d12_outer::OuterSlot s = outer_pool.acquire(current_ticket, &slot_err);
+        if (!s.cpu) {
+            record_ok_ = false;
+            nr::pe::log("[nr] RenoDX stage (D3D12): %s", slot_err.empty() ? "no outer descriptor slot" : slot_err.c_str());
+            return;
+        }
         for (const auto& b : binds)
             if (b.res) ensure(cmd, b.res, b.write ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        bind_heap(cmd);
-        if (!d3d12_il::write_descriptors(device, main_cpu(take * 20), inc, lay, binds.data(), binds.size())) {
-            record_ok_ = false;
-            nr::pe::log("[nr] RenoDX stage (D3D12): Interleaved bound a binding its program does not declare");
-            return;
-        }
-        cmd->SetComputeRootSignature(lay.rs);
-        cmd->SetPipelineState(pso);
-        cmd->SetComputeRoot32BitConstants(0, lay.dwords, push, 0);
-        cmd->SetComputeRootDescriptorTable(1, main_gpu(take * 20));
-        cmd->SetComputeRootDescriptorTable(2, main_gpu(take * 20 + UINT(lay.srv.size())));
-        cmd->Dispatch(gx, gy, 1);
+        d3d12_il::write_outer_binds(device, s, k, binds.data(), binds.size());
+        s.write_push(push, dwords * 4u);
+        s.dispatch(cmd, rs_outer, k, gx, gy, 1u, true);
         uav_barrier(cmd);
     }
     // The frame's Interleaved work around the network (nr_renodx.cpp's il_on branch, the product path): one slot a frame
@@ -1506,7 +991,6 @@ struct Stage::Impl {
         const uint32_t NW = cfg.nr_width, NH = cfg.nr_height, nx = (NW + 15) / 16, ny = (NH + 15) / 16;
         const uint32_t n = il_slots, pi = il_preset - 1u;
         const bool stable = il_preset == 2u;
-        const d3d12_il::Layout& lay = il_lay[pi];
         // the game's depth for the disocclusion test, the vector dilation and the depth-aware fill (as on Vulkan)
         ID3D12Resource* depth = f.depth;
         DXGI_FORMAT dfmt = DXGI_FORMAT_UNKNOWN;
@@ -1572,15 +1056,12 @@ struct Stage::Impl {
                 rd(4 + i, il_inc[o][i < n ? i : 0]);
                 wr(12 + i, il_inc[d][i < n ? i : 0]);
             }
-            // (only what the step declares: its own pipeline's registers; the rest are the other steps')
+            const auto& k = il_kernels[pi][mode];
             std::vector<d3d12_il::Bind> used;
             for (const auto& x : b) {
-                const auto& v = x.write ? lay.uav : lay.srv;
-                if (std::find(v.begin(), v.end(), x.binding) != v.end()) used.push_back(x);
+                if (d3d12_il::has_binding(k, x.binding, x.write)) used.push_back(x);
             }
-            // (one resource is never both read and written by a dispatch here - D3D12 has no state for that: the reads
-            // are last frame's / the other slots' images, the writes this frame's)
-            dispatch_il(cmd, lay, il_pso[pi][mode], used, &ip, nx, ny);
+            dispatch_il(cmd, k, used, &ip, 24u, nx, ny);
         };
         const auto pyramid = [&] {
             uint32_t sw = NW, sh = NH;
@@ -1600,10 +1081,9 @@ struct Stage::Impl {
                 b.push_back({13, il_dpyr[l].res, uav_format_of(il_dpyr[l].format), true});
                 std::vector<d3d12_il::Bind> used;
                 for (const auto& x : b) {
-                    const auto& v = x.write ? ilpp_lay.uav : ilpp_lay.srv;
-                    if (std::find(v.begin(), v.end(), x.binding) != v.end()) used.push_back(x);
+                    if (d3d12_il::has_binding(ilpp_kernel, x.binding, x.write)) used.push_back(x);
                 }
-                dispatch_il(cmd, ilpp_lay, ilpp_pso, used, pp, (dw2 * n + 15) / 16, (dh2 + 15) / 16);
+                dispatch_il(cmd, ilpp_kernel, used, pp, 7u, (dw2 * n + 15) / 16, (dh2 + 15) / 16);
                 sw = dw2; sh = dh2;
             }
         };
@@ -1663,186 +1143,88 @@ struct Stage::Impl {
 };
 
 bool Stage::Impl::build(std::string* why) {
-    // The codec root signature (RenoDX's own layout): 40 root constants at b0, reads t0..t5, writes u0..u13.
-    {
-        D3D12_DESCRIPTOR_RANGE rsrv{}, ruav{};
-        rsrv.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        rsrv.NumDescriptors = 6;
-        ruav.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-        ruav.NumDescriptors = 14;
-        D3D12_ROOT_PARAMETER p[3]{};
-        p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        p[0].Constants.ShaderRegister = 0;
-        p[0].Constants.Num32BitValues = 40;
-        p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        p[1].DescriptorTable.NumDescriptorRanges = 1;
-        p[1].DescriptorTable.pDescriptorRanges = &rsrv;
-        p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        p[2].DescriptorTable.NumDescriptorRanges = 1;
-        p[2].DescriptorTable.pDescriptorRanges = &ruav;
-        for (auto& x : p) x.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        D3D12_ROOT_SIGNATURE_DESC rd{};
-        rd.NumParameters = 3; rd.pParameters = p;
-        ID3DBlob *blob = nullptr, *errors = nullptr;
-        HRESULT hr = D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors);
-        release(errors);
-        if (FAILED(hr) || !blob) { *why = "renodx: D3D12SerializeRootSignature(codec) failed"; return false; }
-        hr = device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&rs_codec));
-        release(blob);
-        if (FAILED(hr)) { *why = "renodx: CreateRootSignature(codec) failed"; return false; }
-    }
-    // The aux one (Passes (fast)' layout): the same constants, reads t0..t7, writes u0..u7, one linear-clamp sampler.
-    {
-        D3D12_DESCRIPTOR_RANGE rsrv{}, ruav{};
-        rsrv.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        rsrv.NumDescriptors = 8;
-        ruav.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-        ruav.NumDescriptors = 8;
-        D3D12_ROOT_PARAMETER p[3]{};
-        p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        p[0].Constants.ShaderRegister = 0;
-        p[0].Constants.Num32BitValues = 40;
-        p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        p[1].DescriptorTable.NumDescriptorRanges = 1;
-        p[1].DescriptorTable.pDescriptorRanges = &rsrv;
-        p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        p[2].DescriptorTable.NumDescriptorRanges = 1;
-        p[2].DescriptorTable.pDescriptorRanges = &ruav;
-        for (auto& x : p) x.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        D3D12_STATIC_SAMPLER_DESC ss{};
-        ss.Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;   // to_motion's sampler: the frame path's linear clamp
-        ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-        ss.MaxLOD = 0.0f;
-        ss.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        D3D12_ROOT_SIGNATURE_DESC rd{};
-        rd.NumParameters = 3; rd.pParameters = p;
-        rd.NumStaticSamplers = 1; rd.pStaticSamplers = &ss;
-        ID3DBlob *blob = nullptr, *errors = nullptr;
-        HRESULT hr = D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors);
-        release(errors);
-        if (FAILED(hr) || !blob) { *why = "renodx: D3D12SerializeRootSignature(aux) failed"; return false; }
-        hr = device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&rs_aux));
-        release(blob);
-        if (FAILED(hr)) { *why = "renodx: CreateRootSignature(aux) failed"; return false; }
-    }
-    // RenoDX's own programs, from the installed folder (their #include resolved there, and beside it for the prep
-    // resolve's - the HDR builds).
-    FolderInclude includer;
-    includer.dirs = {cfg.shaders, cfg.shaders + L"\\renodx-prep"};
-    struct File { P p; const char* name; const char* macro; };
-    const File files[] = {
-        {kEncodeL, "legacy_encode", nullptr}, {kDecodeL, "legacy_decode", nullptr},
-        {kReduceL, "legacy_reduce", nullptr}, {kReduceLU, "legacy_reduce_unshaped", nullptr},
-        {kApplyL, "legacy_apply", nullptr}, {kDecodeReduceL, "legacy_decode_reduce", nullptr},
-        {kCompose, "look_compose", nullptr}, {kUpsample, "look_upsample", nullptr}, {kBand, "look_band", nullptr},
+    if (!d3d12_outer::create_outer_root_signature(device, &rs_outer, why)) return false;
+    auto arch = d3d12_outer::shared_archive(why);
+    if (!arch) return false;
+
+    struct Entry { P p; const char* key; };
+    const Entry common[] = {
+        {kEncodeL, "renodx/legacy_encode"}, {kDecodeL, "renodx/legacy_decode"},
+        {kReduceL, "renodx/legacy_reduce"}, {kReduceLU, "renodx/legacy_reduce_unshaped"},
+        {kApplyL, "renodx/legacy_apply"}, {kDecodeReduceL, "renodx/legacy_decode_reduce"},
+        {kCompose, "renodx/look_compose"}, {kUpsample, "renodx/look_upsample"}, {kBand, "renodx/look_band"},
+        {kDebug, "renodx/renodx_debug"}, {kPrep, "renodx/renodx_prep"},
+        {kStFbIn, "renodx/renodx_st_fb_in"}, {kStPrep, "renodx/renodx_st_prep"},
+        {kStBox, "renodx/renodx_st_box"}, {kStApply, "renodx/renodx_st_apply"},
+        {kTexToBuf, "renodx_aux/tex_to_buf"}, {kBufToTex, "renodx_aux/buf_to_tex"},
+        {kCopyOut, "renodx_aux/copy_out"}, {kToMotion, "renodx_aux/to_motion"},
+        {kToDepth, "renodx_aux/to_depth"}, {kSdrEncodeLin, "renodx_aux/sdr_encode_lin"},
+        {kSdrDecodeLin, "renodx_aux/sdr_decode_lin"},
     };
-    const File files6[] = {
-        {kLinearize, "v6_linearize", nullptr}, {kAutoscale, "v6_autoscale", nullptr},
-        {kExposureScale, "v6_exposure_scale", nullptr}, {kEncode6, "v6_encode", nullptr},
-        {kResolve6, "v6_resolve", nullptr}, {kReduce6, "v6_pedestal_reduce", nullptr},
-        {kReduce6U, "v6_pedestal_reduce_unshaped", nullptr}, {kCommit6, "v6_commit", nullptr},
-        {kCommitExposure, "v6_commit_exposure", nullptr}, {kResolveCommit6, "v6_resolve_commit", nullptr},
-        // the resolve when [Preprocess] made the proxy (v6_common.hlsli under NR_PREP_RESOLVE)
-        {kResolve6Prep, "v6_resolve", "NR_PREP_RESOLVE"},
-        {kResolveCommit6Prep, "v6_resolve_commit", "NR_PREP_RESOLVE"},
-        {kReduce6UPrep, "v6_pedestal_reduce_unshaped", "NR_PREP_RESOLVE"},
-        {kEncode6Lin, "v6_encode", "NR_LIN_IO"},
-        {kResolve6Lin, "v6_resolve", "NR_LIN_IO"},
-        {kResolveCommit6Lin, "v6_resolve_commit", "NR_LIN_IO"},
+    const Entry hdr_only[] = {
+        {kLinearize, "renodx/v6_linearize"}, {kAutoscale, "renodx/v6_autoscale"},
+        {kExposureScale, "renodx/v6_exposure_scale"}, {kEncode6, "renodx/v6_encode"},
+        {kResolve6, "renodx/v6_resolve"}, {kReduce6, "renodx/v6_pedestal_reduce"},
+        {kReduce6U, "renodx/v6_pedestal_reduce_unshaped"}, {kCommit6, "renodx/v6_commit"},
+        {kCommitExposure, "renodx/v6_commit_exposure"}, {kResolveCommit6, "renodx/v6_resolve_commit"},
+        {kResolve6Prep, "renodx/v6_resolve_prep"},
+        {kResolveCommit6Prep, "renodx/v6_resolve_commit_prep"},
+        {kReduce6UPrep, "renodx/v6_pedestal_reduce_unshaped_prep"},
+        {kEncode6Lin, "renodx/v6_encode_lin"},
+        {kResolve6Lin, "renodx/v6_resolve_lin"},
+        {kResolveCommit6Lin, "renodx/v6_resolve_commit_lin"},
+        {kPrepEncode, "renodx/renodx_prep_encode"},
     };
-    const auto make_file_pso = [&](const File& f) -> bool {
-        std::string text = read_text(cfg.shaders + L"\\" + std::wstring(f.name, f.name + std::strlen(f.name)) +
-                                     L".cs_5_1.hlsl");
-        if (text.empty()) { *why = std::string("renodx: ") + f.name + " is missing"; return false; }
-        if (f.macro && std::strcmp(f.macro, "NR_LIN_IO") == 0) {
-            FolderInclude::replace_all(
-                text, "Output[pixel] = float4(SrgbEncode(proxy), 1.0);", lin_io_store().c_str());
+    for (const Entry& e : common) {
+        if (!arch->build_kernel(device, e.key, &kernels[e.p], why)) return false;
+    }
+    if (hdr) {
+        for (const Entry& e : hdr_only) {
+            if (!arch->build_kernel(device, e.key, &kernels[e.p], why)) return false;
         }
-        const D3D_SHADER_MACRO macros[] = {{f.macro, "1"}, {nullptr, nullptr}};
-        ID3DBlob* code = compile_hlsl(text.data(), text.size(), "main", why, &includer, f.macro ? macros : nullptr);
-        if (!code) return false;
-        D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
-        pd.pRootSignature = rs_codec;
-        pd.CS.pShaderBytecode = code->GetBufferPointer();
-        pd.CS.BytecodeLength = code->GetBufferSize();
-        const HRESULT hr = device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso[f.p]));
-        release(code);
-        if (FAILED(hr) || !pso[f.p]) { *why = std::string("renodx: ") + f.name + " does not make a pipeline"; return false; }
-        return true;
-    };
-    for (const File& f : files)
-        if (!make_file_pso(f)) return false;
-    if (hdr)
-        for (const File& f : files6)
-            if (!make_file_pso(f)) return false;
+    }
     // The transport folded into the decode / the last resolve (nr_renodx.cpp's; NR_RDX_UP_FUSED=0: apart). Optional:
     // without them the stage runs look_upsample into P_up / N'_up as before.
     static const bool up_fused_off = [] { const char* e = std::getenv("NR_RDX_UP_FUSED"); return e && e[0] == '0'; }();
     if (!up_fused_off) {
         std::string up_why;
-        const File up = hdr ? File{kResolveCommit6Up, "v6_resolve_commit_up", nullptr} : File{kDecodeUpL, "legacy_decode_up", nullptr};
-        if (!make_file_pso(up)) {
-            nr::pe::log("[nr] RenoDX stage (D3D12): %s not made (%s); the transport runs apart", up.name, why->c_str());
-            why->clear();
+        const Entry up = hdr ? Entry{kResolveCommit6Up, "renodx/v6_resolve_commit_up"}
+                             : Entry{kDecodeUpL, "renodx/legacy_decode_up"};
+        if (!arch->build_kernel(device, up.key, &kernels[up.p], &up_why)) {
+            nr::pe::log("[nr] RenoDX stage (D3D12): %s not made (%s); the transport runs apart", up.key, up_why.c_str());
         }
     }
-    // NR's own programs, the package's SPIR-V as HLSL (dlssnr-amd\shaders\d3d12\renodx, build_d3d12_hlsl.sh):
-    // Preprocess's encode and the debug views on the codec signature, Preprocess and Passes (fast) on the aux one;
-    // their registers are the SPIR-V's bindings (texture N -> tN, image / buffer N -> uN), the push block cbuffer b0.
-    // Then the plumbing of this route (kAuxShaders).
+    std::string il_why;
+    if (!load_il(*arch, &il_why)) {
+        nr::pe::log("[nr] RenoDX stage (D3D12): Interleaved's programs are not available (%s): Interleaved cannot run",
+                    il_why.c_str());
+    }
+    if (!outer_pool.init(
+            device, 512,
+            [](const nr::gpu::Ticket& t) { return nr::pe::d3d12_direct::completed(t); },
+            [this](IUnknown* r) { if (retire) retire(r); else release(r); }, why)) {
+        return false;
+    }
     {
-        const size_t up = cfg.shaders.find_last_of(L"\\/");
-        const std::wstring ours = (up == std::wstring::npos ? cfg.shaders : cfg.shaders.substr(0, up)) + L"\\d3d12\\renodx\\";
-        std::string err;
-        const struct { P p; const char* name; } programs[] = {
-            {kPrepEncode, "renodx_prep_encode"}, {kDebug, "renodx_debug"}, {kPrep, "renodx_prep"},
-            {kStFbIn, "renodx_st_fb_in"}, {kStPrep, "renodx_st_prep"}, {kStBox, "renodx_st_box"}, {kStApply, "renodx_st_apply"},
-        };
-        for (const auto& pr : programs) {
-            if (pr.p == kPrepEncode && !hdr) continue;   // (HDR only, as the files6 programs)
-            const std::string text = read_text(ours + std::wstring(pr.name, pr.name + std::strlen(pr.name)) + L".hlsl");
-            if (text.empty()) { *why = std::string("renodx: d3d12\\renodx\\") + pr.name + ".hlsl is missing"; return false; }
-            ID3DBlob* blob = compile_hlsl(text.data(), text.size(), "main", &err, nullptr, nullptr);
-            if (!blob) { *why = std::string("renodx: ") + pr.name + ": " + err; return false; }
-            D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
-            pd.pRootSignature = codec_sig(pr.p) ? rs_codec : rs_aux;
-            pd.CS.pShaderBytecode = blob->GetBufferPointer();
-            pd.CS.BytecodeLength = blob->GetBufferSize();
-            const HRESULT hr = device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso[pr.p]));
-            release(blob);
-            if (FAILED(hr) || !pso[pr.p]) { *why = std::string("renodx: ") + pr.name + " does not make a pipeline"; return false; }
+        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_UPLOAD};
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = 512; rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1; rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                                   nullptr, IID_PPV_ARGS(&zero_upload))) || !zero_upload) {
+            *why = "renodx: the zero upload buffer could not be made";
+            return false;
         }
-        const struct { P p; const char* entry; } aux[] = {
-            {kTexToBuf, "tex_to_buf"}, {kBufToTex, "buf_to_tex"}, {kCopyOut, "copy_out"}, {kToMotion, "to_motion"},
-            {kToDepth, "to_depth"}, {kSdrEncodeLin, "sdr_encode_lin"}, {kSdrDecodeLin, "sdr_decode_lin"},
-        };
-        for (const auto& a : aux) {
-            const std::string aux = aux_shaders_pitched();
-            ID3DBlob* blob = compile_hlsl(aux.data(), aux.size(), a.entry, &err, nullptr);
-            if (!blob) { *why = "renodx: " + err; return false; }
-            D3D12_COMPUTE_PIPELINE_STATE_DESC ad{};
-            ad.pRootSignature = rs_aux;
-            ad.CS.pShaderBytecode = blob->GetBufferPointer();
-            ad.CS.BytecodeLength = blob->GetBufferSize();
-            const HRESULT hr = device->CreateComputePipelineState(&ad, IID_PPV_ARGS(&pso[a.p]));
-            release(blob);
-            if (FAILED(hr) || !pso[a.p]) { *why = std::string("renodx: ") + a.entry + " does not make a pipeline"; return false; }
+        void* zm = nullptr;
+        if (FAILED(zero_upload->Map(0, nullptr, &zm)) || !zm) {
+            *why = "renodx: the zero upload buffer could not be mapped";
+            return false;
         }
-        // Passes (fast) Interleaved's programs: without them Interleaved cannot run (NR Control says so), the rest does
-        std::string il_why;
-        if (!load_il(ours, &il_why))
-            nr::pe::log("[nr] RenoDX stage (D3D12): Interleaved's programs are not available (%s): Interleaved cannot run",
-                        il_why.c_str());
+        std::memset(zm, 0, 512);
+        zero_upload->Unmap(0, nullptr);
+        nr::vram::track_d3d12(device, zero_upload, nr::vram::kRenoDX);
     }
-    D3D12_DESCRIPTOR_HEAP_DESC hd{};
-    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = slots * 20 + 2;   // + the two clear slots (kClearSlot)
-    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)))) { *why = "renodx: the descriptor heap failed"; return false; }
-    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
-    hd.NumDescriptors = 2;   // one per cleared resource, beside the GPU ones
-    if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&clear_heap)))) { *why = "renodx: the clear heap failed"; return false; }
-    Impl::inc = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
     const uint32_t W = cfg.width, H = cfg.height, NW = cfg.nr_width, NH = cfg.nr_height;
     const DXGI_FORMAT frame = cfg.frame_format;
@@ -2057,31 +1439,12 @@ void Stage::Impl::copy_frame(ID3D12GraphicsCommandList* cmd, const Frame& f) {
 uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, const Frame::Net& net) {
     record_ok_ = true;
     net_ran_ = false;
-    ++frame_no;
-    // Every slot this frame may use is made free before its first command: a frame that would outrun completion
-    // grows the heap here, and a frame that cannot is not recorded at all (rather than losing a dispatch halfway).
-    {
-        // The frame's own stack (Stage::set updates `settings`, not the construction snapshot): the passes it runs,
-        // and per pass the most dispatches any branch of this stage issues: encode (1), tex_to_buf (1), buf_to_tex
-        // (1), decode (legacy 1 + black-level 2 | v6 1 + resolve 1), look (compose 1, upsample 1 when it upsamples,
-        // band 2 when it bands), preprocess (forward 1, inverse 1, meter 1), fast (prep 1, fb_in 1, apply 1) - 16 at
-        // the most in the current code, so 32 is a factor-two margin; plus the fixed per-frame programs (copy_in,
-        // copy_out, commit, pedestal, the clears) counted in the 64.
-        const uint32_t passes = std::max(1u, std::min<uint32_t>(stack_passes(settings), nr::renodx::kMaxUnlockedPasses));
-        frame_budget = 64 + 32 * passes;
-        // Passes (fast) Interleaved: a reset frame runs every slot (3 il dispatches, the network's 2 copies and the
-        // history's), a frame one slot (8 il dispatches); an il dispatch takes up to 3 slots, + 3 a wrap
-        if (settings.passes_mode == 1u && settings.fast_method == 0u) {
-            const uint32_t n = std::clamp(settings.fast_interleaved_passes, 2u, kIlSlots);
-            frame_budget += (4u * n + 12u) * 3u + 3u * n + 3u;
-        }
-        frame_used = 0;
-    }
-    if (completed && !reserve_frame_slots()) {
+    current_ticket = nr::pe::d3d12_direct::book(cmd);
+    if (!current_ticket) {
         record_ok_ = false;
-        nr::pe::log("[nr] RenoDX stage: no slot budget for this frame (fails before any command)");
         return 0;
     }
+    nr::pe::d3d12_direct::Scope direct_scope(cmd);
     const Settings& s = settings;
     const uint32_t W = cfg.width, H = cfg.height, NW = cfg.nr_width, NH = cfg.nr_height;
     const uint32_t gx = (W + 15) / 16, gy = (H + 15) / 16, nx = (NW + 15) / 16, ny = (NH + 15) / 16;
@@ -2234,8 +1597,8 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
     const bool transport_now = (NW < W || NH < H) && look::transport_wanted(ls, NW, NH, W, H);
     const bool prep_resolve_now = prep_on && hdr && pp.inverse;
     const bool up_fused = transport_now && !debug_show &&
-        (hdr ? pso[kResolveCommit6Up] && !fuse_off_env() && !frame_pedestal_removal(s, hdr, units) && passes == 1 && !prep_resolve_now
-             : pso[kDecodeUpL] && !sdr_restore);
+        (hdr ? kernels[kResolveCommit6Up].pso && !fuse_off_env() && !frame_pedestal_removal(s, hdr, units) && passes == 1 && !prep_resolve_now
+             : kernels[kDecodeUpL].pso && !sdr_restore);
     {
         std::string why;
         const bool motion_wanted = (ls.stabilize == 2u && have_motion && look::dispatched(ls, false)) || fast_feedback || il_on;
@@ -2297,20 +1660,12 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
         }
     }
 
-    // Preprocess's state cleared when it is new - after every allocation above, the frame's first command
+    // Preprocess's state cleared when it is new - after every allocation above, the frame's first command.
     if (prep_on) {
         if (prep_state_fresh) {
-            D3D12_UNORDERED_ACCESS_VIEW_DESC d{};
-            d.Format = DXGI_FORMAT_UNKNOWN;
-            d.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-            d.Buffer.NumElements = 1;
-            d.Buffer.StructureByteStride = 16;
-            device->CreateUnorderedAccessView(prep_state, nullptr, &d, main_cpu(kClearSlot));
-            device->CreateUnorderedAccessView(prep_state, nullptr, &d, clear_cpu(0));
-            ensure(cmd, prep_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);   // the clear writes it
-            bind_heap(cmd);                                                   // the GPU handle's heap
-            const UINT zero[4] = {};
-            cmd->ClearUnorderedAccessViewUint(main_gpu(kClearSlot), clear_cpu(0), prep_state, zero, 0, nullptr);
+            ensure(cmd, prep_state, D3D12_RESOURCE_STATE_COPY_DEST);
+            cmd->CopyBufferRegion(prep_state, 0, zero_upload, 0, 16);
+            ensure(cmd, prep_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             uav_barrier(cmd);
             prep_state_fresh = false;
         }
@@ -2543,15 +1898,22 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
         if (!units.absolute && !prep_exposure) {
             // 2b. this frame's scale texel: the v1 meter and the governor (feed v1).
             if (!commit_cleared) {
-                D3D12_UNORDERED_ACCESS_VIEW_DESC d{};
-                d.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
-                d.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-                device->CreateUnorderedAccessView(commit.res, nullptr, &d, main_cpu(kClearSlot + 1));
-                device->CreateUnorderedAccessView(commit.res, nullptr, &d, clear_cpu(1));
-                ensure(cmd, commit.res, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);   // the clear writes it
-                bind_heap(cmd);                                                   // the GPU handle's heap
-                const float zero[4] = {};
-                cmd->ClearUnorderedAccessViewFloat(main_gpu(kClearSlot + 1), clear_cpu(1), commit.res, zero, 0, nullptr);
+                ensure(cmd, commit.res, D3D12_RESOURCE_STATE_COPY_DEST);
+                D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+                dst.pResource = commit.res;
+                dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                dst.SubresourceIndex = 0;
+                src.pResource = zero_upload;
+                src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                src.PlacedFootprint.Offset = 0;
+                src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+                src.PlacedFootprint.Footprint.Width = 1;
+                src.PlacedFootprint.Footprint.Height = 1;
+                src.PlacedFootprint.Footprint.Depth = 1;
+                src.PlacedFootprint.Footprint.RowPitch = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+                const D3D12_BOX box{0, 0, 0, 1, 1, 1};
+                cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+                ensure(cmd, commit.res, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 uav_barrier(cmd);
                 commit_cleared = true;
             }
@@ -3148,20 +2510,18 @@ Stage::~Stage() {
         m.drop(*t);
     m.drop_buf(m.trace);
     m.drop_buf(m.prep_state);
+    m.drop_buf(m.zero_upload);
     m.drop_buf(m.lin_proxy);
     m.drop_buf(m.lin_neural);
     m.drop_buf(m.lin_mv);
     m.drop_buf(m.lin_depth);
     for (auto& pl : m.looks) { m.drop_buf(pl.history[0]); m.drop_buf(pl.history[1]); }
     m.drop_il();
-    for (auto& bank : m.il_pso) for (auto& p : bank) release(p);
-    for (auto& lay : m.il_lay) release(lay.rs);
-    release(m.ilpp_pso); release(m.ilpp_lay.rs);
-    for (auto& p : m.pso) release(p);
-    release(m.rs_codec);
-    release(m.rs_aux);
-    release(m.heap);
-    release(m.clear_heap);
+    m.outer_pool.reset();
+    for (auto& bank : m.il_kernels) for (auto& k : bank) release(k.pso);
+    release(m.ilpp_kernel.pso);
+    for (auto& k : m.kernels) release(k.pso);
+    release(m.rs_outer);
 }
 
 bool Stage::set(const Settings& s) {
@@ -3196,52 +2556,10 @@ void Stage::set_retire(std::function<void(IUnknown*)> f) {
     if (impl_) impl_->retire = std::move(f);
 }
 
-void prewarm_shaders(const std::wstring& shaders) {
+void prewarm_shaders(const std::wstring& /*shaders*/) {
     static std::atomic<bool> started{false};
     if (started.exchange(true)) return;
-    std::thread([shaders] {
-        FolderInclude includer;
-        includer.dirs = {shaders, shaders + L"\\renodx-prep"};
-        struct File { const char* name; const char* macro; };
-        const File files[] = {
-            {"legacy_encode", nullptr}, {"legacy_decode", nullptr},
-            {"legacy_reduce", nullptr}, {"legacy_reduce_unshaped", nullptr},
-            {"legacy_apply", nullptr}, {"legacy_decode_reduce", nullptr},
-            {"look_compose", nullptr}, {"look_upsample", nullptr}, {"look_band", nullptr},
-            {"v6_linearize", nullptr}, {"v6_autoscale", nullptr},
-            {"v6_exposure_scale", nullptr}, {"v6_encode", nullptr},
-            {"v6_resolve", nullptr}, {"v6_pedestal_reduce", nullptr},
-            {"v6_pedestal_reduce_unshaped", nullptr}, {"v6_commit", nullptr},
-            {"v6_commit_exposure", nullptr}, {"v6_resolve_commit", nullptr},
-            {"v6_resolve", "NR_PREP_RESOLVE"},
-            {"v6_resolve_commit", "NR_PREP_RESOLVE"},
-            {"v6_pedestal_reduce_unshaped", "NR_PREP_RESOLVE"},
-            {"v6_encode", "NR_LIN_IO"},
-            {"v6_resolve", "NR_LIN_IO"},
-            {"v6_resolve_commit", "NR_LIN_IO"},
-        };
-        std::string why;
-        for (const auto& f : files) {
-            std::string text = read_text(shaders + L"\\" + std::wstring(f.name, f.name + std::strlen(f.name)) + L".cs_5_1.hlsl");
-            if (text.empty()) continue;
-            if (f.macro && std::strcmp(f.macro, "NR_LIN_IO") == 0) {
-                FolderInclude::replace_all(
-                    text, "Output[pixel] = float4(SrgbEncode(proxy), 1.0);", lin_io_store().c_str());
-            }
-            const D3D_SHADER_MACRO macros[] = {{f.macro, "1"}, {nullptr, nullptr}};
-            release(compile_hlsl(text.data(), text.size(), "main", &why, &includer, f.macro ? macros : nullptr));
-        }
-        const size_t up = shaders.find_last_of(L"\\/");
-        const std::wstring ours = (up == std::wstring::npos ? shaders : shaders.substr(0, up)) + L"\\d3d12\\renodx\\";
-        for (const char* name : {"renodx_prep_encode", "renodx_debug", "renodx_prep", "renodx_st_fb_in",
-                                 "renodx_st_prep", "renodx_st_box", "renodx_st_apply"}) {
-            const std::string text = read_text(ours + std::wstring(name, name + std::strlen(name)) + L".hlsl");
-            if (!text.empty()) release(compile_hlsl(text.data(), text.size(), "main", &why, nullptr, nullptr));
-        }
-        const std::string aux = aux_shaders_pitched();
-        for (const char* entry : {"tex_to_buf", "buf_to_tex", "copy_out", "to_motion", "to_depth", "sdr_encode_lin", "sdr_decode_lin"})
-            release(compile_hlsl(aux.data(), aux.size(), entry, &why, nullptr));   // the text build() compiles
-    }).detach();
+    std::thread([] { (void)d3d12_outer::shared_archive(nullptr); }).detach();
 }
 
 }  // namespace nr::pe::d3d12_passthrough::renodx12
