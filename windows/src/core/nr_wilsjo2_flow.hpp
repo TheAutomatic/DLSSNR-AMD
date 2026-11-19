@@ -48,6 +48,7 @@ struct NetCall {
     // last frame, made from the slots' increments; 16-bit float RGBA at the model's extent, Access::kWrite); empty: its own
     Surf history;
     bool raw = false;   // (Interleaved with a Style / Intensity) the network plain: no Style grade (Intensity 1 in controls)
+    bool external_history = false;   // Interleaved owns the pass's history across frames (no internal ping-pong pair needed)
 };
 
 // What NR Control is told of a run (the route forwards it).
@@ -429,6 +430,7 @@ inline bool il_run1(FlowIo& io, FlowState& o, const FlowFrame& f, const Settings
         c.raw = graded;
         c.last = true;
         c.history = history ? L.hist : Surf{};
+        c.external_history = true;
         return io.network(c) == 0;
     };
     if (depth) { L.dcur ^= 1u; if (!il(5u, 0u, false)) return false; L.depth_const = false; }
@@ -537,7 +539,7 @@ inline bool flow_run(FlowIo& io, FlowState& o, const FlowFrame& f, const Setting
     const bool half = flow_model_half(s, spatial, io.has_fast());
     const Fmt model_format = half ? Fmt::kHalf : Fmt::kFrame;
     if (o.w != w || o.h != h || o.frame_format_key != format_key || o.scale != scale || o.spatial != spatial ||
-        o.half != half || o.model_w != model_w || o.model_h != model_h || !o.proxy || !o.keep || !o.answer) {
+        o.half != half || o.model_w != model_w || o.model_h != model_h) {
         if (o.frame_format_key != format_key || o.scale != scale || o.spatial != spatial || o.half != half)
             flow_detail::release_from(io, o, 0);
         flow_detail::release_fast(io, o);
@@ -546,10 +548,7 @@ inline bool flow_run(FlowIo& io, FlowState& o, const FlowFrame& f, const Setting
                         &o.p_light_m, &o.p_in, &o.p_out, &o.p_scratch, &o.p_clamp, &o.p_m, &o.small_raw, &o.small_keep,
                         &o.classic})
             io.retire(*r);
-        o.proxy = io.make(Fmt::kFrame, w, h);
-        o.keep = io.make(Fmt::kFrame, w, h);
-        o.answer = io.make(model_format, model_w, model_h);
-        bool made = o.proxy && o.keep && o.answer;
+        bool made = true;
         if (spatial) {
             o.sp_colour = io.make(Fmt::kHalf, model_w, model_h);
             o.sp_depth = io.make(Fmt::kR32F, model_w, model_h);
@@ -610,7 +609,10 @@ inline bool flow_run(FlowIo& io, FlowState& o, const FlowFrame& f, const Setting
             break;
         }
     if (o.built.size() > requested) flow_detail::release_from(io, o, requested);
-    if (requested == 1) { io.retire(o.scratch); io.retire(o.clamp); }
+    if (requested == 1 || il_on) {
+        io.retire(o.scratch); io.retire(o.clamp);
+        io.retire(o.p_scratch); io.retire(o.p_clamp);
+    }
     uint32_t ready = 0;
     for (uint32_t k = 0; k < requested; ++k) {
         if (k < o.failed.size() && o.failed[k]) break;
@@ -645,7 +647,7 @@ inline bool flow_run(FlowIo& io, FlowState& o, const FlowFrame& f, const Setting
         ++ready;
     }
     if (!ready) return false;
-    if (ready > 1 && (!o.scratch || !o.clamp)) {   // the textures between passes, made at first use
+    if (ready > 1 && !il_on && (!o.scratch || !o.clamp)) {   // the textures between passes, made at first use
         if (!o.scratch) o.scratch = io.make(model_format, model_w, model_h);
         if (!o.clamp) o.clamp = io.make(model_format, model_w, model_h);
         if (!o.scratch || !o.clamp) {
@@ -662,6 +664,19 @@ inline bool flow_run(FlowIo& io, FlowState& o, const FlowFrame& f, const Setting
     static const bool w2_direct_off = [] { const char* e = std::getenv("NR_W2_DIRECT"); return e && e[0] == '0'; }();
     const bool direct = !w2_direct_off && passthrough && f.unorm && f.direct_ok && !spatial && !reduced && !super;
     { static bool said = false; if (direct && !said) { said = true; io.say("the SDR frame read where it is (no encode)"); } }
+    if (direct) {
+        io.retire(o.proxy);
+        io.retire(o.keep);
+    } else {
+        if (!o.proxy) o.proxy = io.make(Fmt::kFrame, w, h);
+        if (!o.keep) o.keep = io.make(Fmt::kFrame, w, h);
+        if (!o.proxy || !o.keep) {
+            io.retire(o.proxy);
+            io.retire(o.keep);
+            once(io, o.said, 2, "its textures could not be made; NR skips the frame");
+            return false;
+        }
+    }
     bool measure = false;
     const bool automatic = s.white_point_source == 3;
     if (!passthrough && s.white_point_source == 1 && f.exposure) measure = f.exposure_valid;
@@ -680,15 +695,20 @@ inline bool flow_run(FlowIo& io, FlowState& o, const FlowFrame& f, const Setting
     // Step 8: the encode (8.5) - the frame into the proxy and the kept original.
     Constants exposure{};
     io.use(f.target, Access::kWrite);
-    io.use(o.proxy, Access::kWrite);
-    io.use(o.keep, Access::kWrite);
+    if (!direct) {
+        io.use(o.proxy, Access::kWrite);
+        io.use(o.keep, Access::kWrite);
+    }
     if (automatic && o.meter) io.use(o.meter, Access::kWrite);
     const bool encoded = io.record([&](VkCommandBuffer vk, Stage& stage, const FlowIo::ImageOf& image_of) {
         Dispatch d;
         d.t0 = image_of(f.target);
-        d.u0 = image_of(o.proxy);
-        d.u1 = image_of(o.keep);
-        if (!d.t0.format || !d.u0.format || !d.u1.format) return false;
+        if (!d.t0.format) return false;
+        if (!direct) {
+            d.u0 = image_of(o.proxy);
+            d.u1 = image_of(o.keep);
+            if (!d.u0.format || !d.u1.format) return false;
+        }
         bool measured = measure;
         if (measured) {
             d.t3 = image_of(exposure_texture);
@@ -742,11 +762,11 @@ inline bool flow_run(FlowIo& io, FlowState& o, const FlowFrame& f, const Setting
         if (light_m_needed && !o.p_light_m) o.p_light_m = io.make(Fmt::kF32, model_w, model_h);
         for (Surf* r : {&o.p_in, &o.p_out, &o.p_m})
             if (!*r) *r = io.make(Fmt::kF32, model_w, model_h);
-        if (ready > 1) for (Surf* r : {&o.p_scratch, &o.p_clamp})
+        if (ready > 1 && !il_on) for (Surf* r : {&o.p_scratch, &o.p_clamp})
             if (!*r) *r = io.make(Fmt::kF32, model_w, model_h);
         if (!o.p_state) o.p_state = io.make(Fmt::kF32, 1, 1);
         prep = o.p_light && (!light_m_needed || o.p_light_m) && o.p_in && o.p_out && o.p_m && o.p_state &&
-               (ready < 2 || (o.p_scratch && o.p_clamp));
+               (ready < 2 || il_on || (o.p_scratch && o.p_clamp));
     }
     // [Preprocess]'s programs or textures unavailable: NR runs without it (not the runtime's proxy-domain Preprocess,
     // which would bring back the encoding errors this layer's Preprocess avoids).
@@ -964,6 +984,15 @@ inline bool flow_run(FlowIo& io, FlowState& o, const FlowFrame& f, const Setting
     // Interleaved (and a frame it cannot run on) works in the values the network is shown: no mapped domain.
     const bool fast_map = fast_on && !plain && passthrough && !f.unorm && !prep;
     if (fast_on && !fast_map) { io.retire(o.f_net); io.retire(o.f_ans); }
+    if (il_on || fast_on || prep) {
+        io.retire(o.answer);
+    } else if (!o.answer) {
+        o.answer = io.make(model_format, model_w, model_h);
+        if (!o.answer) {
+            once(io, o.said, 2, "its textures could not be made; NR skips the frame");
+            return false;
+        }
+    }
     if (fast_on) {
         const uint32_t lw = nr::fast::low(model_w), lh = nr::fast::low(model_h);
         if (!o.f_in) o.f_in = io.make(Fmt::kHalf, model_w, model_h);
@@ -1312,7 +1341,7 @@ inline bool flow_run(FlowIo& io, FlowState& o, const FlowFrame& f, const Setting
     // copy), against the pass-0 input (the proxy). Direct: the frame is the proxy and the original, read and written.
     io.use(resolve_proxy, Access::kRead);
     io.use(resolve_answer, Access::kRead);
-    io.use(o.keep, Access::kRead);
+    if (!direct) io.use(o.keep, Access::kRead);
     io.use(f.target, Access::kWrite);
     const bool resolved = io.record([&](VkCommandBuffer vk, Stage& stage, const FlowIo::ImageOf& image_of) {
         Dispatch d;

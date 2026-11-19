@@ -29,8 +29,8 @@ games it is under Binaries\Win64, not the launcher outside), then pick a route:
   1) optiscaler             the game has a DLSS, FSR or XeSS option (DX11 / DX12 / Vulkan). OptiScaler
                             does the upscaling and frame generation (the original OptiScaler, its files
                             unchanged); this project's NR runs as an OptiScaler plugin.
-  2) standalone             any DX11 / DX12 app, video player, Magpie or capture viewer without
-                            an upscaler or ReShade (runs guide-less RenoDX NR at DXGI Present).
+  2) standalone             any DX11 / DX12 / Vulkan app, video player, Magpie or capture viewer without
+                            an upscaler or ReShade (runs guide-less RenoDX NR at DXGI / Vulkan Present).
   3) reshade-feeder         other DX10/11/12 games (ReShade + VORT, or the optional LumeniteFX, provide the
                             motion vectors; or DirectPresent without DLSS5_Feed.fx)
   4) reshade-feeder-dx9     old DX9 games (ReShade)
@@ -186,9 +186,10 @@ optiscaler: turn on DLSS, FSR or XeSS in the game's settings; Insert opens the O
             A layer placed at Present runs only at Present, never moved before or after the upscaler;
             when Present cannot serve it (for example a screen colour format it does not support), the
             layer does not run and its line in the menu says why.
-standalone: DX11 / DX12 programs, video players, Magpie or capture viewers without an upscaler or ReShade.
-            dxgi.dll beside the executable loads dlssnr-amd.asi and runs guide-less RenoDX NR directly at
-            DXGI Present. End opens NR Control; F6 toggles NR; F5 takes comparison screenshots.
+standalone: DX11 / DX12 / Vulkan programs, video players, Magpie or capture viewers without an upscaler
+            or ReShade. dxgi.dll beside the executable loads dlssnr-amd.asi (DX11/DX12), and vulkan-1.dll
+            loads it via vk-override\ (Vulkan), running guide-less RenoDX NR directly at Present. End opens NR
+            Control; F6 toggles NR; F5 takes comparison screenshots.
 reshade-feeder routes: Home opens ReShade; the NR settings are on the Add-ons page, laid out as NR
             Control:
             - Direct Present ([DlssNr] DirectPresent = auto, default): when DLSS5_Feed.fx is not installed

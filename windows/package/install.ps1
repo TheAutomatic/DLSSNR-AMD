@@ -96,7 +96,7 @@ if (-not $Route) {
     Say "Game folder: $game"
     Say 'Choose a route:'
     Say '  1) optiscaler             the game has a DLSS, FSR or XeSS option (DX11 / DX12, OptiScaler)'
-    Say '  2) standalone             any DX11 / DX12 app, video player, Magpie or capture viewer (no upscaler or ReShade)'
+    Say '  2) standalone             any DX11 / DX12 / Vulkan app, video player, Magpie or capture viewer (no upscaler or ReShade)'
     Say '  3) reshade-feeder         other DX10/11/12 games (ReShade)'
     Say '  4) reshade-feeder-dx9     old DX9 games (ReShade)'
     Say '  5) reshade-feeder-vulkan  Vulkan games (ReShade)'
@@ -765,10 +765,13 @@ if ($Route -eq 'optiscaler') {
     [System.IO.File]::WriteAllText($ini, ($lines -join $newline))
     foreach ($key in $wanted.Keys) { if (-not $seen.ContainsKey($key)) { Fail "OptiScaler.ini has no $key; this OptiScaler is not the one this package was made with." } }
 } elseif ($Route -eq 'standalone') {
-    # Any DX11 / DX12 app, player or capture viewer without OptiScaler or ReShade: our standalone dxgi.dll loads
-    # dlssnr-amd.asi beside it, NR runs guide-less RenoDX at DXGI Present, and NR Control's probe + licences go into dlssnr-amd\.
+    # Any DX11 / DX12 / Vulkan app, player or capture viewer without OptiScaler or ReShade: our standalone dxgi.dll
+    # loads dlssnr-amd.asi for DX11 / DX12, vulkan-1.dll loads dlssnr-amd.asi as an implicit layer (vk-override\) for
+    # Vulkan, NR runs guide-less RenoDX at Present, and NR Control's probe + licences go into dlssnr-amd\.
     Put-File (Join-Path $here 'standalone\dxgi.dll') 'dxgi.dll'
     Put-File (Join-Path $here 'standalone\dlssnr-amd.asi') 'dlssnr-amd.asi'
+    Put-File (Join-Path $here 'vulkan\vulkan-1.dll') 'vulkan-1.dll'
+    Put-Tree (Join-Path $here 'standalone\vk-override') 'vk-override'
     Copy-Item -LiteralPath (Join-Path $here 'standalone\nr_present_probe.exe') -Destination (Join-Path $game 'dlssnr-amd') -Force
     Copy-Item -LiteralPath (Join-Path $here 'standalone\Inter-LICENSE.txt') -Destination (Join-Path $game 'dlssnr-amd') -Force
     Copy-Item -LiteralPath (Join-Path $here 'standalone\DearImGui-LICENSE.txt') -Destination (Join-Path $game 'dlssnr-amd') -Force

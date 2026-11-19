@@ -599,7 +599,12 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
     if (sd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || dd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
         sd.DepthOrArraySize != 1 || dd.DepthOrArraySize != 1 || sd.SampleDesc.Count != 1 || dd.SampleDesc.Count != 1)
         return fallback("the RenoDX route: colour or output is not a single-sampled 2D texture");
-    const DXGI_FORMAT sf = view_format(sd.Format), df = view_format(dd.Format);
+    const DXGI_FORMAT df = view_format(dd.Format);
+    const DXGI_FORMAT srgb_unorm = sd.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ? DXGI_FORMAT_R8G8B8A8_UNORM
+                                 : sd.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ? DXGI_FORMAT_B8G8R8A8_UNORM
+                                 : DXGI_FORMAT_UNKNOWN;
+    const DXGI_FORMAT sf = (f.color != f.output && srgb_unorm != DXGI_FORMAT_UNKNOWN && srgb_unorm == df)
+                           ? srgb_unorm : view_format(sd.Format);
     if (sf == DXGI_FORMAT_UNKNOWN || df == DXGI_FORMAT_UNKNOWN) return fallback("the RenoDX route: an sRGB format");
     if (!(dd.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) || !typed_uav(f.device, df))
         return fallback("the RenoDX route: the output's format has no typed UAV store");
@@ -1170,6 +1175,10 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
         nt.motion_f16 = true;
         // Interleaved's pass history (wilsjo2 on the D3D12 flow): copied below into the network's history layout and read
         // in place of the feature's own (the Vulkan runtime's EngineFrame::history blit)
+        if (f.external_history && nt.reset && !f.history) {
+            const uint32_t hb = g.network->history_texel_bytes();
+            if (hb == 8u || hb == 16u) nt.external_history = true;
+        }
         if (f.history && have_motion) {
             const D3D12_RESOURCE_DESC hd = f.history->GetDesc();
             const uint32_t hb = g.network->history_texel_bytes();
@@ -1177,8 +1186,13 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
                 const uint64_t need = uint64_t(lin_pitch(w, hb)) * h * hb;
                 if (set->hist && set->hist->GetDesc().Width < need) { retire(set->hist); set->hist = nullptr; }
                 if (!set->hist) set->hist = linear_buffer(f.device, need);
-                if (set->hist) { hist_bytes = hb; nt.history_va = set->hist->GetGPUVirtualAddress(); }
-                else nr::pe::log("[d3d12] Interleaved: the pass history's buffer could not be made; its network runs on its own history");
+                if (set->hist) {
+                    hist_bytes = hb;
+                    nt.history_va = set->hist->GetGPUVirtualAddress();
+                    nt.external_history = f.external_history != 0;
+                } else {
+                    nr::pe::log("[d3d12] Interleaved: the pass history's buffer could not be made; its network runs on its own history");
+                }
             }
         }
         g.network->temporal(nt);

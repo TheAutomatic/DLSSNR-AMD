@@ -55,8 +55,12 @@ inline DXGI_FORMAT uav_format(DXGI_FORMAT f) {
     switch (f) {
         case DXGI_FORMAT_R32_TYPELESS: return DXGI_FORMAT_R32_FLOAT;
         case DXGI_FORMAT_R16_TYPELESS: return DXGI_FORMAT_R16_FLOAT;
-        default: { const DXGI_FORMAT s = srv_format(f); return s == DXGI_FORMAT_R24_UNORM_X8_TYPELESS ||
-                                                         s == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS ? DXGI_FORMAT_UNKNOWN : s; }
+        default: {
+            const DXGI_FORMAT s = srv_format(f);
+            return s == DXGI_FORMAT_R24_UNORM_X8_TYPELESS || s == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS ||
+                           s == DXGI_FORMAT_B8G8R8X8_UNORM
+                       ? DXGI_FORMAT_UNKNOWN : s;
+        }
     }
 }
 

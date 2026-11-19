@@ -4,19 +4,19 @@
       "kernels": 83,
       "mach": "0x44",
       "path": "windows/data/aco/rdna3/d3d12_outer.nra",
-      "sha256": "520a85495c0b514d424e616f8d09518bf04ce186af8a57c76f7e6ceb6ef67ecf",
-      "size": 588335
+      "sha256": "174a0d7dcb66648bd2c2de71c0584fd195ece8b4dba9b502cf3f640433ea81ee",
+      "size": 588619
     },
     "rdna4": {
       "kernels": 83,
       "mach": "0x4E",
       "path": "windows/data/aco/d3d12_outer.nra",
-      "sha256": "c9fe9526b1458bf6d4381e4f4b98ac107e5ed617d241c52f430c815806cf1754",
-      "size": 599815
+      "sha256": "31052826125412f4aa698cb01d38ea761223c7b5595771e78d28ba27789414ec",
+      "size": 600107
     }
   },
   "inputs": {
-    "windows/build/build_d3d12_outer_aco.py": "7c63ee5dafa9a2948d0ca4abc76a36b4a4cd6bb4bc14cd3d32976bb971e25b59",
+    "windows/build/build_d3d12_outer_aco.py": "ddafa9e3490bf3a54d64cd0842e01a2525eb2a06ff54527da304a65efc16360d",
     "windows/build/outer_aco_capture.cpp": "163782636d056835855ae1a8731c7cdd739a82311fd9b33c9a7e30f7a47ab2b4",
     "windows/shaders/hudfix/hudfix.comp": "f37890f41c1f5d0dc3415ce1e1478d0b76cbe9cfed2a3a4a9b0d7bb9eb9e8583",
     "windows/shaders/passes/include/fsr1/LICENSE.txt": "db089274ce766da70f5b7d791029c3486f9f9e27c8c79c652689603d3192e802",

@@ -162,6 +162,7 @@ struct D3d12BackendFrame {
     // (Intensity 1 already in `intensity`, no Style grade)
     ID3D12Resource* history;
     int no_grade;
+    int external_history;
     // (out, may be null): set to 1 by a backend that returns false only because its network for this extent is still
     // being made - it will take such frames; evaluate_d3d12 then passes the frame through (output := colour) with no NR
     // and does not start the Vulkan bridge's network for them.

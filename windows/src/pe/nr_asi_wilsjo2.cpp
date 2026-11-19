@@ -446,7 +446,10 @@ namespace {
 // model through nr::dlssnr::evaluate_d3d12.
 DXGI_FORMAT dxgi_of(w2::Fmt f, DXGI_FORMAT frame) {
     switch (f) {
-        case w2::Fmt::kFrame: return frame;
+        case w2::Fmt::kFrame: {
+            const DXGI_FORMAT u = native::uav_format(frame);
+            return u != DXGI_FORMAT_UNKNOWN ? u : frame;
+        }
         case w2::Fmt::kHalf: return DXGI_FORMAT_R16G16B16A16_FLOAT;
         case w2::Fmt::kR32F: return DXGI_FORMAT_R32_FLOAT;
         case w2::Fmt::kRG32F: return DXGI_FORMAT_R32G32_FLOAT;
@@ -565,6 +568,7 @@ public:
         route::HistoryRef hist;
         hist.d3d12 = c.history.h;   // (Interleaved: our resource, in UNORDERED_ACCESS)
         hist.raw = c.raw;
+        hist.external = c.external_history;
         route::CallHistory history(hist);
         const int result = nr::dlssnr::evaluate_d3d12(
             cmd_, o_.models[c.pass], nullptr, static_cast<ID3D12Resource*>(c.input.h), static_cast<ID3D12Resource*>(c.depth.h),
@@ -839,7 +843,9 @@ bool wilsjo2_run(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, Wilsjo2Ow
     w2::FlowFrame ff;
     ff.target = {target};
     ff.width = w; ff.height = h;
-    const DXGI_FORMAT format = io.frame_format();
+    const DXGI_FORMAT raw_fmt = io.frame_format();
+    const DXGI_FORMAT uav_fmt = native::uav_format(raw_fmt);
+    const DXGI_FORMAT format = uav_fmt != DXGI_FORMAT_UNKNOWN ? uav_fmt : raw_fmt;
     switch (format) {
         case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8X8_UNORM:
         case DXGI_FORMAT_R10G10B10A2_UNORM: case DXGI_FORMAT_R16G16B16A16_UNORM:

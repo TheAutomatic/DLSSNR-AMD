@@ -83,7 +83,8 @@ int call_network();
 // image (GENERAL); none outside such a call.
 struct HistoryRef {
     void* d3d12 = nullptr; uint64_t vk_image = 0; uint32_t vk_format = 0, width = 0, height = 0;
-    bool raw = false;   // the network plain (Intensity 1, no Style grade): the layer composes them
+    bool raw = false;        // the network plain (Intensity 1, no Style grade): the layer composes them
+    bool external = false;   // Interleaved owns every frame's history for this feature
 };
 struct CallHistory {
     explicit CallHistory(const HistoryRef& h);

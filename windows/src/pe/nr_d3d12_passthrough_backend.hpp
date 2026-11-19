@@ -63,6 +63,7 @@ struct NetTemporal {
     // history as Interleaved made it), a linear buffer laid out as the feature's history images (rows of lin_pitch
     // texels, history_texel_bytes() a texel); 0 the feature's own. Read only where the history is (the gate open).
     uint64_t history_va = 0;
+    bool external_history = false;
 };
 
 // What the ACO network becomes on this side: records into the game's list. Both buffers arrive in UNORDERED_ACCESS

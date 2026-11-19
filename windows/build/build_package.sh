@@ -313,14 +313,33 @@ cp -- "${NR_IMGUI_ROOT:-toolchain/imgui-nr}/LICENSE.txt" "$op/asi/DearImGui-LICE
 cmp -s <(cd artifacts/windows/asi/shaders/wilsjo2 && sha256sum -- *.spv) <(cd "$pkg/dlssnr-amd/shaders/wilsjo2" && sha256sum -- *.spv) ||
     { echo "the plugin's wilsjo2 shaders are not dlssnr-amd/shaders/wilsjo2's" >&2; exit 1; }
 
-# standalone/: DX11 / DX12 apps without OptiScaler or ReShade (video players, Magpie, capture viewers, older games):
-# dxgi-standalone.dll as dxgi.dll + dlssnr-amd.asi beside the exe, nr_present_probe.exe and licences in dlssnr-amd\.
+# standalone/: DX11 / DX12 / Vulkan apps without OptiScaler or ReShade (video players, Magpie, capture viewers, older games):
+# dxgi-standalone.dll as dxgi.dll + dlssnr-amd.asi + vk-override/ (+ vulkan/vulkan-1.dll at install) beside the exe,
+# nr_present_probe.exe and licences in dlssnr-amd\.
 st="$pkg/standalone"
-mkdir -p -- "$st"
+mkdir -p -- "$st/vk-override/implicit_layer"
 cp -- artifacts/windows/asi/dxgi-standalone.dll "$st/dxgi.dll"
 cp -- artifacts/windows/asi/dlssnr-amd.asi artifacts/windows/asi/nr_present_probe.exe "$st/"
 cp -- "${NR_MENU_FONT_LICENSE:-toolchain/fonts/inter-4.1/LICENSE.txt}" "$st/Inter-LICENSE.txt"
 cp -- "${NR_IMGUI_ROOT:-toolchain/imgui-nr}/LICENSE.txt" "$st/DearImGui-LICENSE.txt"
+cat > "$st/vk-override/implicit_layer/dlssnr_standalone.json" <<'JSON'
+{
+  "file_format_version": "1.0.0",
+  "layer": {
+    "name": "VK_LAYER_DLSSNR_standalone",
+    "type": "GLOBAL",
+    "library_path": "..\\..\\dlssnr-amd.asi",
+    "api_version": "1.3.0",
+    "implementation_version": "1",
+    "description": "DLSSNR-AMD standalone layer",
+    "functions": {
+      "vkGetInstanceProcAddr": "NR_Layer_GetInstanceProcAddr",
+      "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion"
+    },
+    "disable_environment": { "NR_DISABLE_VK_STANDALONE": "1" }
+  }
+}
+JSON
 
 # experimental/: what install.ps1 makes CC_SMALL_FP8_EXPERIMENTAL's weights with - the difference of its fitted weights
 # from the small model's (linux/data/experimental: each changed entry XOR the small model's, so it holds none of NVIDIA's

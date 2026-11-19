@@ -239,7 +239,9 @@ int64_t now_ns() {
 uint8_t infer_hdr_mode_dxgi(DXGI_FORMAT f) {
     switch (f) {
         case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        case DXGI_FORMAT_R16G16B16A16_TYPELESS:
         case DXGI_FORMAT_R32G32B32A32_FLOAT:
+        case DXGI_FORMAT_R32G32B32A32_TYPELESS:
         case DXGI_FORMAT_R11G11B10_FLOAT:
             return 1;
         case DXGI_FORMAT_R10G10B10A2_UNORM:
@@ -1011,7 +1013,8 @@ struct Stage::Impl {
     // (every slot in order on a reset = legacy N), its input the frame + the earlier slots' moved increments, the answer
     // the frame + every increment. `in`: the network's input image (the proxy, or SDR Preprocess's image apart).
     template <class NetFn>
-    bool il_run(ID3D12GraphicsCommandList* cmd, const Frame& f, const Settings& s, bool reset, Tex& in, const NetFn& pass_net) {
+    bool il_run(ID3D12GraphicsCommandList* cmd, const Frame& f, const Settings& s, bool reset, Tex& in,
+                bool motion_direct, uint32_t m_rx, uint32_t m_ry, uint32_t m_rw, uint32_t m_rh, const NetFn& pass_net) {
         const uint32_t NW = cfg.nr_width, NH = cfg.nr_height, nx = (NW + 15) / 16, ny = (NH + 15) / 16;
         const uint32_t n = il_slots, pi = il_preset - 1u;
         const bool stable = il_preset == 2u;
@@ -1035,7 +1038,8 @@ struct Stage::Impl {
         }
         struct { uint32_t size[2], mbase[2], mgrid[2]; float mscale[2]; uint32_t mode, slot, n, flags; float k0, k1;
                  uint32_t dbase[2], dgrid[2]; uint32_t styles; float pad0; float inten[4]; } ip{
-            {NW, NH}, {0u, 0u}, {f.motion_w, f.motion_h},
+            {NW, NH}, {motion_direct ? m_rx : 0u, motion_direct ? m_ry : 0u},
+            {motion_direct ? m_rw : f.motion_w, motion_direct ? m_rh : f.motion_h},
             {f.motion_scale_x * s.mvec_scale_x * float(NW), f.motion_scale_y * s.mvec_scale_y * float(NH)}, 0u, 0u, n, 0u,
             0.02f, 0.06f, {f.depth_x, f.depth_y}, {dw, dh}, 0u, 0.f, {1.f, 1.f, 1.f, 1.f}};
         static_assert(sizeof ip == 96, "il's push block");
@@ -1052,15 +1056,16 @@ struct Stage::Impl {
         if (graded != il_graded_last) { il_valid = false; il_graded_last = graded; }
         bool moved = false;
         const auto il = [&](uint32_t mode, uint32_t slot, bool move) {
-            if (mode == 3u) il_bcur ^= 1u;
+            if (mode == 3u) { il_bcur ^= 1u; return; }   // (the proxy kept, il.comp flags & 268435456: no Base copy - the pair's turn only)
             if (mode == 0u) il_cur ^= 1u;
             Tex& base = il_bcur ? il_base2 : il_base;
             Tex& base_prev = il_bcur ? il_base : il_base2;
             const uint32_t d = il_cur, o = d ^ 1u;
             ip.mode = mode; ip.slot = slot;
             // the product's flags (nr_renodx.cpp: fresh history, vector test with its gradient prediction, box test, depth
-            // disocclusion and dilation, edge, the fill and its depth-aware pyramid)
-            ip.flags = (move ? 1u : 0u) | (mode == 0u && move ? 2u : 0u) | (move ? 8u : 0u) | (moved ? 64u : 0u) |
+            // disocclusion and dilation, edge, the fill and its depth-aware pyramid, the proxy kept, step 0's pyr1)
+            ip.flags = (move ? 1u : 0u) | (mode == 0u && move ? 2u : 0u) | 268435456u | (move ? 8u : 0u) | (moved ? 64u : 0u) |
+                       (mode == 0u && move ? 536870912u : 0u) | (mode == 0u && move && depth ? 1073741824u : 0u) |
                        (move ? 128u : 0u) | (depth && move ? 768u : 0u) | (inverted ? 1024u : 0u) | (graded ? 2048u : 0u) |
                        (mode == 1u && moved ? 65536u : 0u) | (move ? 524288u | 1048576u : 0u) | (move ? 33554432u : 0u) |
                        (mode == 4u && depth ? 67108864u : 0u) |
@@ -1070,9 +1075,16 @@ struct Stage::Impl {
             const auto rd = [&](uint32_t binding, const Tex& t) { b.push_back({binding, t.res, srv_format_of(t.format), false}); };
             const auto wr = [&](uint32_t binding, const Tex& t) { b.push_back({binding, t.res, uav_format_of(t.format), true}); };
             wr(0, in); wr(1, neural); wr(2, base);
-            rd(3, motion);
+            if (motion_direct) b.push_back({3, f.motion, srv_format_of(f.motion->GetDesc().Format), false});
+            else rd(3, motion);
             wr(20, il_hist); rd(21, base_prev); wr(22, il_trust); wr(43, il_tdbg);
-            for (uint32_t l = 0; l < 6; ++l) { rd(23 + l, il_pyr[l]); rd(37 + l, il_dpyr[l]); }
+            if (mode != 0u) {
+                for (uint32_t l = 0; l < 6; ++l) { rd(23 + l, il_pyr[l]); rd(37 + l, il_dpyr[l]); }
+            }
+            if (mode == 0u) {
+                wr(44, il_pyr[0]);
+                wr(45, il_dpyr[0]);
+            }
             if (stable) { rd(46, il_lf[il_lfcur ^ 1u]); wr(47, il_lf[il_lfcur]); }
             if (depth) b.push_back({29, depth, dfmt, false});
             wr(30, il_depth[il_dcur]); rd(31, il_depth[il_dcur ^ 1u]);
@@ -1091,6 +1103,7 @@ struct Stage::Impl {
             uint32_t sw = NW, sh = NH;
             for (uint32_t l = 0; l < 6; ++l) {
                 const uint32_t dw2 = (sw + 1) / 2, dh2 = (sh + 1) / 2;
+                if (l == 0) { sw = dw2; sh = dh2; continue; }   // (step 0's pyr1 already made the first level)
                 const uint32_t pp[7] = {sw, sh, dw2, dh2, l ? 1u : 0u, n, depth ? 1u : 0u};
                 std::vector<d3d12_il::Bind> b;
                 b.push_back({0, il_trust.res, srv_format_of(il_trust.format), false});
@@ -1139,11 +1152,13 @@ struct Stage::Impl {
             il_depth_const = true;
         }
         if (!record_ok_) return false;
+        const bool ext_hist_ok = f.net_history_bytes == 8u || f.net_history_bytes == 16u;
         if (reset || !il_valid) {
             il_lf_valid = false;
             for (uint32_t j = 0; j < n; ++j) {
                 il(3u, j, false); il(0u, j, false);
-                if (!record_ok_ || !pass_net(j, true, graded, 0)) return false;
+                Tex& slot_in = il_bcur ? il_base2 : il_base;
+                if (!record_ok_ || !pass_net(slot_in, j, true, graded, 0, ext_hist_ok)) return false;
                 il(1u, j, false);
                 il_last[j] = 0;
             }
@@ -1157,7 +1172,9 @@ struct Stage::Impl {
             pyramid();
             il(4u, slot, true);
             if (!record_ok_) return false;
-            if (!pass_net(slot, false, graded, history())) return false;
+            const uint64_t hva = history();
+            Tex& slot_in = il_bcur ? il_base2 : il_base;
+            if (!pass_net(slot_in, slot, false, graded, hva, hva != 0)) return false;
             if (stable) { il_lfcur ^= 1u; il(6u, slot, false); il_lf_valid = true; }
             il(1u, slot, false);
             il_last[slot] = il_frame++;
@@ -1255,11 +1272,9 @@ bool Stage::Impl::build(std::string* why) {
     decoded_storage = typed_uav(frame);
     decoded_load = typed_uav_load(frame);
     if (!decoded_storage) decoded = make_tex(W, H, DXGI_FORMAT_R16G16B16A16_FLOAT, true, why);
-    proxy = make_tex(NW, NH, DXGI_FORMAT_R16G16B16A16_FLOAT, true, why);
-    neural = make_tex(NW, NH, DXGI_FORMAT_R16G16B16A16_FLOAT, true, why);
     block_mean = make_tex((W + 31) / 32, (H + 31) / 32, DXGI_FORMAT_R32G32B32A32_FLOAT, true, why);
-    // (P_up / N'_up: made when a frame first wants the transport apart - record(); 4K: 2 x 63 MiB)
-    if ((!decoded_storage && !decoded.res) || !proxy.res || !neural.res || !block_mean.res) {
+    // (proxy / neural: made on demand when a path other than fast_lin runs; P_up / N'_up: record())
+    if ((!decoded_storage && !decoded.res) || !block_mean.res) {
         *why = "renodx: a stage texture could not be made";
         return false;
     }
@@ -1627,14 +1642,35 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
     const bool up_fused = transport_now && !debug_show &&
         (hdr ? kernels[kResolveCommit6Up].pso && !fuse_off_env() && !frame_pedestal_removal(s, hdr, units) && passes == 1 && !prep_resolve_now
              : kernels[kDecodeUpL].pso && !sdr_restore);
+    D3D12_RESOURCE_DESC motion_desc{};
+    uint32_t motion_rx = 0, motion_ry = 0, motion_rw = 0, motion_rh = 0;
+    if (have_motion) {
+        motion_desc = f.motion->GetDesc();
+        motion_rx = std::min(f.motion_x, uint32_t(motion_desc.Width));
+        motion_ry = std::min(f.motion_y, uint32_t(motion_desc.Height));
+        motion_rw = std::min(f.motion_w, uint32_t(motion_desc.Width) - motion_rx);
+        motion_rh = std::min(f.motion_h, uint32_t(motion_desc.Height) - motion_ry);
+    }
+    const bool il_motion_direct = il_on && motion_rw > 0 && motion_rh > 0 &&
+                                  srv_format_of(motion_desc.Format) != DXGI_FORMAT_UNKNOWN &&
+                                  f.motion != f.colour && f.motion != f.output && (!f.depth || f.motion != f.depth);
+    const bool motion_wanted = (ls.stabilize == 2u && have_motion && look::dispatched(ls, false)) ||
+                               fast_feedback || (il_on && !il_motion_direct);
+    const D3D12_RESOURCE_DESC src_desc = f.colour->GetDesc();
+    const DXGI_FORMAT src_fmt = srv_format_of(src_desc.Format);
+    const bool in_srgb = src_fmt == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || src_fmt == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    const bool linear_float_src = (src_fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ||
+                                   src_fmt == DXGI_FORMAT_R11G11B10_FLOAT ||
+                                   src_fmt == DXGI_FORMAT_R32G32B32A32_FLOAT) &&
+                                  src_desc.Width >= W && src_desc.Height >= H;
     {
         std::string why;
-        const bool motion_wanted = (ls.stabilize == 2u && have_motion && look::dispatched(ls, false)) || fast_feedback || il_on;
         if (motion_wanted && have_motion) {
-            const D3D12_RESOURCE_DESC md = f.motion->GetDesc();
-            if (motion.res && (motion.w != f.motion_w || motion.h != f.motion_h || motion.format != md.Format)) drop(motion);
-            if (!motion.res) motion = make_tex(f.motion_w, f.motion_h, md.Format, false, &why);
+            if (motion.res && (motion.w != f.motion_w || motion.h != f.motion_h || motion.format != motion_desc.Format)) drop(motion);
+            if (!motion.res) motion = make_tex(f.motion_w, f.motion_h, motion_desc.Format, false, &why);
             if (!motion.res) { record_ok_ = false; return 0; }
+        } else if (!motion_wanted && motion.res) {
+            drop(motion);
         }
         // Passes (fast)'s work sets (nr_renodx.cpp ensure_st): made here, before the frame's first command, so that a
         // failure leaves the caller's list as it came; the feedback's go when the method is not Feedback / Hybrid.
@@ -1662,8 +1698,7 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
             float t0 = 0.f, c0 = 0.f;
             strengths(settings, 0, &t0, &c0);
             const bool fuse_now = hdr && !fuse_off_env() && !frame_pedestal_removal(s, hdr, units);
-            const bool w0_now = hdr && f.colour != f.output && !prep_on && f6.encoding == 1u &&
-                                cfg.frame_format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+            const bool w0_now = hdr && f.colour != f.output && !prep_on && f6.encoding == 1u && linear_float_src;
             if (hdr && !w0_now && !work0.res) work0 = make_tex(W, H, DXGI_FORMAT_R16G16B16A16_FLOAT, true, &why);
             if (hdr && !w0_now && !work0.res) { record_ok_ = false; return 0; }
             if (hdr && (passes > 1 || !fuse_now || !(t0 > 0.f || c0 > 0.f)) && !work_a.res)
@@ -1695,7 +1730,18 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
         const bool area_enc_pre = ls.upsample == look::kUpsampleAreaInput && transport_now;
         const bool sdr_fast_lin_pre = !v6 && passes == 1 && !prep_on && !fast && !il_on && !look_wanted_pre && !sdr_restore && !debug_show &&
                                       !area_enc_pre && (s.codec_mode == 0u || s.transfer_strength == 1.0f) && NW == W && NH == H;
-        const bool direct_in_pre = f.colour != f.output || v6 || (sdr_fast_lin_pre && decoded_load);
+        const bool v6_fast_lin_pre = v6 && !prep_on && !fast && !il_on && !look_wanted_pre && !debug_show;
+        const bool fast_lin_pre = sdr_fast_lin_pre || v6_fast_lin_pre;
+        if (!fast_lin_pre) {
+            if (!proxy.res) proxy = make_tex(NW, NH, DXGI_FORMAT_R16G16B16A16_FLOAT, true, &why);
+            if (!neural.res) neural = make_tex(NW, NH, DXGI_FORMAT_R16G16B16A16_FLOAT, true, &why);
+            if (!proxy.res || !neural.res) { drop(proxy); drop(neural); record_ok_ = false; return 0; }
+        } else if (proxy.res || neural.res) {
+            drop(proxy);
+            drop(neural);
+        }
+        const bool direct_in_pre = in_srgb ? (f.colour != f.output && sdr_fast_lin_pre)
+                                           : (f.colour != f.output || v6 || sdr_fast_lin_pre);
         if (!direct_in_pre && !original.res) {
             original = make_tex(W, H, cfg.frame_format, false, &why);
             if (!original.res) { record_ok_ = false; return 0; }
@@ -1780,12 +1826,10 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
         st_valid = false;
     }
 
-    // The game's motion vectors, for Detail stability: the subrect copied to the origin of an image of ours
-    // (the Vulkan stage's copy; its in-place read is scheduling only).
+    // The game's motion vectors, for Detail stability / Passes (fast) Feedback / Interleaved fallback: the subrect copied
+    // to the origin of `motion.res` when needed (Interleaved normally reads `f.motion` in place via mbase/mgrid).
     bool motion_copied = false;
-    const bool motion_wanted = (ls.stabilize == 2u && have_motion && look::dispatched(ls, false)) || fast_feedback || il_on;
     if (motion_wanted && have_motion) {
-        const D3D12_RESOURCE_DESC md = f.motion->GetDesc();
         ensure(cmd, f.motion, D3D12_RESOURCE_STATE_COPY_SOURCE);
         ensure(cmd, motion.res, D3D12_RESOURCE_STATE_COPY_DEST);
         D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
@@ -1796,15 +1840,13 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
         dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         dst.SubresourceIndex = 0;
         // The caller reports the region; a box outside the source, or an empty one, is not a copy D3D12 accepts.
-        const uint32_t mx = std::min(f.motion_x, uint32_t(md.Width)), my = std::min(f.motion_y, uint32_t(md.Height));
-        const uint32_t mw = std::min(f.motion_w, uint32_t(md.Width) - mx), mh = std::min(f.motion_h, uint32_t(md.Height) - my);
         D3D12_BOX box{};
-        box.left = mx;
-        box.top = my;
-        box.right = mx + mw;
-        box.bottom = my + mh;
+        box.left = motion_rx;
+        box.top = motion_ry;
+        box.right = motion_rx + motion_rw;
+        box.bottom = motion_ry + motion_rh;
         box.back = 1;
-        if (!mw || !mh) {
+        if (!motion_rw || !motion_rh) {
             // An empty or out-of-bounds region is not a copy D3D12 accepts: skip it and let the look run without motion.
             static bool said = false;
             if (!said) { said = true; nr::pe::log("[nr] RenoDX stage (D3D12): the motion region is outside the guide; the look runs without motion"); }
@@ -1912,11 +1954,12 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
     const bool v6_fast_lin = v6 && !prep_on && !fast && !il_on && !look_wanted && !debug_show;
     const bool fast_lin = sdr_fast_lin || v6_fast_lin;
 
-    // 1. The frame input: read in place when colour != output, on v6 (where linearize copies into work0 first), or on
-    // the SDR linear-buffer fast path when the output supports typed UAV loads; otherwise copied into `original` so SDR
-    // decode can read `original` while writing `f.output`.
-    const bool direct_in = f.colour != f.output || v6 || (sdr_fast_lin && decoded_load);
-    Tex in_src{f.colour, W, H, cfg.frame_format};
+    // 1. The frame input: read in place when colour != output (including _SRGB on sdr_fast_lin), on v6 (where
+    // linearize copies into work0 first), or on the SDR linear-buffer fast path; otherwise copied into `original`
+    // so SDR decode / multi-pass / look can read `original`.
+    const bool direct_in = in_srgb ? (f.colour != f.output && sdr_fast_lin)
+                                   : (f.colour != f.output || v6 || sdr_fast_lin);
+    Tex in_src{f.colour, W, H, src_fmt};
     if (!direct_in) {
         in_src = original;
         transition(cmd, f.colour, f.colour_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -1939,8 +1982,7 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
         ensure(cmd, original.res, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
 
-    const bool w0_frame = v6 && f.colour != f.output && !prep_on && f6.encoding == 1u &&
-                          cfg.frame_format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+    const bool w0_frame = v6 && f.colour != f.output && !prep_on && f6.encoding == 1u && linear_float_src;
     Tex& w0 = w0_frame ? in_src : work0;
 
     if (v6) {
@@ -2077,11 +2119,22 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
         Tex& ref = k == 0 ? (v6 ? w0 : in_src) : stack_out(k - 1);
         Tex& write = stack_out(k);
         if (v6 && transfer <= 0.f && color <= 0.f) {
-            // An explicit zero-strength pass carries the running image across exactly.
-            ensure(cmd, ref.res, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            ensure(cmd, write.res, D3D12_RESOURCE_STATE_COPY_DEST);
-            cmd->CopyResource(write.res, ref.res);
-            uav_barrier(cmd);
+            // An explicit zero-strength pass carries the running image across (kCopyOut if source format/size differs, e.g. w0_frame).
+            const D3D12_RESOURCE_DESC rd = ref.res->GetDesc(), wd = write.res->GetDesc();
+            if (rd.Format == wd.Format && rd.Width == wd.Width && rd.Height == wd.Height) {
+                ensure(cmd, ref.res, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                ensure(cmd, write.res, D3D12_RESOURCE_STATE_COPY_DEST);
+                cmd->CopyResource(write.res, ref.res);
+                uav_barrier(cmd);
+            } else {
+                struct { uint32_t w, h, what, pad; float region[4]; } c{W, H, 0, 0, {}};
+                View srv[8] = {};
+                srv[0] = tv(ref, false);
+                View uav[14] = {};
+                uav[0] = tv(write, true);
+                dispatch(cmd, kCopyOut, srv, uav, &c, 8, (W + 7) / 8, (H + 7) / 8);
+                if (!record_ok_) return 0;
+            }
             ensure(cmd, write.res, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             executed = int32_t(k);
             final_transfer = final_color = 0.f;
@@ -2118,7 +2171,7 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
                 }
             }
         } else if (sdr_fast_lin) {
-            struct { uint32_t w, h, what, pad; uint32_t region[4]; } c{NW, NH, 0, 0, {W, H, 0, 0}};
+            struct { uint32_t w, h, what, pad; uint32_t region[4]; } c{NW, NH, 0, (k == 0 && direct_in && in_srgb) ? 1u : 0u, {W, H, 0, 0}};
             View srv[8] = {};
             srv[0] = tv(ref, false);
             View uav[14] = {};
@@ -2177,14 +2230,14 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
         // 3b. the network: the input into a linear buffer, the D3D12 network, its answer back into `neural` (`kk` the pass
         // whose controls and history it runs with; Interleaved runs it once a slot, `hist_va` that slot's history, `raw`
         // plain - Intensity 1, no Style grade)
-        const auto pass_net = [&](uint32_t kk, bool reset, bool raw, uint64_t hist_va) -> bool {
+        const auto pass_net = [&](Tex& net_in, uint32_t kk, bool reset, bool raw, uint64_t hist_va, bool ext_hist) -> bool {
             if (!record_ok_) return false;
             if (!fast_lin) {
                 if ((NW & 31u) == 0) {
-                    ensure(cmd, fast_input.res, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    ensure(cmd, net_in.res, D3D12_RESOURCE_STATE_COPY_SOURCE);
                     ensure(cmd, lin_proxy, D3D12_RESOURCE_STATE_COPY_DEST);
                     D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
-                    src.pResource = fast_input.res;
+                    src.pResource = net_in.res;
                     src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
                     src.SubresourceIndex = 0;
                     dst.pResource = lin_proxy;
@@ -2199,7 +2252,7 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
                 } else {
                     struct { uint32_t w, h, what, pad; float region[4]; } c{NW, NH, 0, 0, {1.f, 1.f, 0.f, 0.f}};
                     View srv[8] = {};
-                    srv[0] = tv(fast_input, false);
+                    srv[0] = tv(net_in, false);
                     View uav[14] = {};
                     uav[0] = bv(lin_proxy, uint64_t(lin_pitch(NW, 8)) * NH * 8, true, true);
                     dispatch(cmd, kTexToBuf, srv, uav, &c, 8, (NW + 7) / 8, (NH + 7) / 8, false);
@@ -2241,6 +2294,7 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
             // (Interleaved: each slot its own feature, as each legacy pass has its own history)
             nt.feature = (cfg.feature || passes > 1 || il_on) ? stack_feature(cfg.feature ? cfg.feature : kUnnamedStack, kk) : 0;
             nt.history_va = hist_va;
+            nt.external_history = ext_hist;
             nt.have_motion = true;
             // The net reaches these by raw address: lin_proxy and the guides are read (UAV), lin_neural is written (UAV).
             // A real barrier each frame entry - the table is not evidence that the GPU moved.
@@ -2292,9 +2346,11 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
             return true;
         };
         const bool reset = reset_all || (k > 0 && !s.chained_history);
-        // (Interleaved moves its increments by the vectors copied above: a region outside the guide leaves none - the
-        // plain pass then, as on Vulkan)
-        if (il_on && motion_copied ? !il_run(cmd, f, s, reset, fast_input, pass_net) : !pass_net(k, reset, false, 0)) {
+        // (Interleaved reads f.motion in place when safe or falls back to the copied subrect; a region outside leaves
+        // none - the plain pass then, as on Vulkan)
+        const bool il_motion_ok = il_motion_direct || motion_copied;
+        if (il_on && il_motion_ok ? !il_run(cmd, f, s, reset, fast_input, il_motion_direct, motion_rx, motion_ry, motion_rw, motion_rh, pass_net)
+                                  : !pass_net(fast_input, k, reset, false, 0, false)) {
             if (!record_ok_) return 0;
             net_ok = false;
             break;
@@ -2432,10 +2488,13 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
         } else if (sdr_fast_lin) {
             Tex& dst_tex = (direct_out && k + 1 == passes) ? out_target : write;
             const bool inplace_uav = ref.res == dst_tex.res;
-            struct { uint32_t w, h, what, pad; uint32_t region[4]; } c{W, H, bits(color), inplace_uav ? 1u : 0u, {pw, ph, 0, 0}};
+            const bool proxy_src = (k == 0 && direct_in && in_srgb) || (inplace_uav && !decoded_load);
+            const uint32_t src_mode = proxy_src ? 2u : (inplace_uav ? 1u : 0u);
+            struct { uint32_t w, h, what, pad; uint32_t region[4]; } c{W, H, bits(color), src_mode, {pw, ph, 0, 0}};
             View srv[8] = {};
-            if (!inplace_uav) srv[0] = tv(ref, false);
+            if (src_mode == 0u) srv[0] = tv(ref, false);
             srv[1] = bv(lin_neural, uint64_t(lin_pitch(NW, 8)) * NH * 8, true, false);
+            if (src_mode == 2u) srv[2] = bv(lin_proxy, uint64_t(lin_pitch(NW, 8)) * NH * 8, true, false);
             View uav[14] = {};
             uav[0] = tv(dst_tex, true);
             const bool tail_bar = !(direct_out && k + 1 == passes) || f.output_state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS;

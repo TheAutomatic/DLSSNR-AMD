@@ -801,11 +801,45 @@ public:
                         f16 ? "RGBA16F" : "RGBA32F", f16 ? "16" : "32");
         }
         b->hist_f16 = int(f16);
+        const bool ext_hist = temporal_.external_history && (temporal_.reset || temporal_.history_va != 0);
+        const auto alloc_hist = [&](FeatureState& st) -> bool {
+            nr::vram::Scope s_hist(nr::vram::kUnset, b->net);
+            for (auto& hh : st.hist) {
+                if (!hh) {
+                    hh = buffer(device_, D3D12_HEAP_TYPE_DEFAULT,
+                                uint64_t(lin_pitch(b->w, f16 ? 8 : 16)) * b->h * (f16 ? 8 : 16),   // (rows of lin_pitch texels)
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
+                    nr::vram::track_d3d12(device_, hh, nr::vram::kUnset);
+                }
+            }
+            if (!st.hist[0] || !st.hist[1]) {
+                release(st.hist[0]);
+                release(st.hist[1]);
+                return false;
+            }
+            return true;
+        };
         // This frame's feature (Runtime::record_all): its state, made on its first frame. A feature whose history is
         // in the other format starts afresh (Runtime::Impl::switch_history: a switch is a cut, as a network switch is).
         FeatureState* fs = nullptr;
         if (auto it = b->features.find(temporal_.feature); it != b->features.end() && it->second && it->second->f16 == f16) {
             fs = it->second.get();
+            if (ext_hist && (fs->hist[0] || fs->hist[1])) {
+                auto drop_holder = std::make_shared<FeatureState>();
+                drop_holder->hist[0] = fs->hist[0];
+                drop_holder->hist[1] = fs->hist[1];
+                fs->hist[0] = fs->hist[1] = nullptr;
+                RetiredUse r;
+                r.net = current_shared_;
+                r.frame = fs->last_frame;
+                r.uses = fs->gpu;
+                r.hold = std::move(drop_holder);
+                retired_features_.push_back(std::move(r));
+            } else if (!ext_hist && (!fs->hist[0] || !fs->hist[1])) {
+                if (!alloc_hist(*fs)) { *why = "the history images could not be made"; return false; }
+                fs->latch = false;
+                fs->hcur = 0;
+            }
         } else {
             if (it != b->features.end()) {
                 RetiredUse r;
@@ -822,16 +856,7 @@ public:
             // history of a feature that still exists.
             auto fresh = std::make_shared<FeatureState>();
             fresh->f16 = f16;
-            {
-                nr::vram::Scope s_hist(nr::vram::kUnset, b->net);
-                for (auto& hh : fresh->hist) {
-                    hh = buffer(device_, D3D12_HEAP_TYPE_DEFAULT,
-                                uint64_t(lin_pitch(b->w, f16 ? 8 : 16)) * b->h * (f16 ? 8 : 16),   // (rows of lin_pitch texels)
-                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
-                    nr::vram::track_d3d12(device_, hh, nr::vram::kUnset);
-                }
-            }
-            if (!fresh->hist[0] || !fresh->hist[1]) { *why = "the history images could not be made"; return false; }
+            if (!ext_hist && !alloc_hist(*fresh)) { *why = "the history images could not be made"; return false; }
             fs = fresh.get();
             b->features[temporal_.feature] = std::move(fresh);
         }
@@ -868,10 +893,11 @@ public:
         const uint64_t stand_va = b->stand->GetGPUVirtualAddress();
         const uint64_t table_va = b->table->GetGPUVirtualAddress();
         const uint64_t params_va = table_va + uint64_t(b->tables) * kTableBytes;
-        // (Passes (fast) Interleaved: the pass's history as it made it, read in place of the feature's; the post block still
-        // stores into the feature's other image, the next frame's history)
-        const uint64_t hist_va = temporal_.history_va ? temporal_.history_va : fs->hist[fs->hcur]->GetGPUVirtualAddress();
-        const uint64_t store_va = fs->hist[fs->hcur ^ 1u]->GetGPUVirtualAddress();
+        // (Passes (fast) Interleaved: the pass's history as it made it, read in place of the feature's; with external
+        // history, HIST_STORE binds the 1x1 stand-in so temporal_post discards out-of-bounds stores without touching VRAM)
+        const uint64_t hist_va = temporal_.history_va ? temporal_.history_va
+                               : (ext_hist || !fs->hist[fs->hcur] ? stand_va : fs->hist[fs->hcur]->GetGPUVirtualAddress());
+        const uint64_t store_va = (ext_hist || !fs->hist[fs->hcur ^ 1u]) ? stand_va : fs->hist[fs->hcur ^ 1u]->GetGPUVirtualAddress();
         NetControlsPatch patch = g_patch.load();
         // [Network] Style Grade as the caller last said (style_grade), the plan's ini value before that (the Vulkan
         // runtime's style_grade && style_grade_on)
@@ -1032,8 +1058,14 @@ public:
                 case SURF0: put_img(d, out.va, b->w, b->h, out_format); break;
                 case SURF1: put_img(d, stand_va, 1, 1, kFormatRgba32f); break;
                 case FLOW: put_img(d, temporal_.motion_va, b->w, b->h, mv_format); break;
-                case HIST: put_img(d, hist_va, b->w, b->h, hist_format); break;
-                case HIST_STORE: put_img(d, store_va, b->w, b->h, hist_format); break;
+                case HIST:
+                    if (ext_hist && !gate) put_img(d, stand_va, 1, 1, hist_format);
+                    else put_img(d, hist_va, b->w, b->h, hist_format);
+                    break;
+                case HIST_STORE:
+                    if (ext_hist) put_img(d, stand_va, 1, 1, hist_format);
+                    else put_img(d, store_va, b->w, b->h, hist_format);
+                    break;
                 case DEPTH:
                     if (temporal_.depth_va) put_img(d, temporal_.depth_va, b->w, b->h, kFormatRgba32f);
                     else put_img(d, stand_va, 1, 1, kFormatRgba32f);
@@ -1177,7 +1209,7 @@ public:
                               b->exec_token, token_off, 8);
         if (temporal_.have_motion) {
             fs->latch = true;
-            fs->hcur ^= 1u;
+            if (!ext_hist) fs->hcur ^= 1u;
         }
         ++frames_;
         if (temporal_.reset) ++resets_;

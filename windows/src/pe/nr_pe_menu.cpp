@@ -1689,6 +1689,7 @@ ID3D12CommandQueue* last_direct_queue() { return t_last_direct; }
 std::atomic<D3D12PresentHook> g_d3d12_hook{nullptr};   // on_d3d12_present
 std::atomic<D3D11PresentHook> g_d3d11_hook{nullptr};   // on_d3d11_present
 std::atomic<D3D12ShownHook> g_d3d12_shown{nullptr};    // on_d3d12_shown
+std::atomic<bool> g_dxgi_suppressed{false};            // native Vulkan swap chain active
 
 // ---- the hooks ----
 std::mutex g_mutex;   // one Present at a time draws the menu
@@ -1749,6 +1750,7 @@ std::atomic<ULONGLONG> g_system_drawn_ms{0};   // NR Control drawn at the system
 // has not drawn the menu for a second (it is not hooked, or sees no presents) - the menu drawn there, no hooks run;
 // null: the system's Present - the hooks run, and the menu is drawn.
 void draw_on(IDXGISwapChain* sc, UINT flags, IUnknown* known = nullptr) {
+    if (g_dxgi_suppressed.load(std::memory_order_acquire)) return;
     if (!known) ++g_presents;
     if (t_inside || (flags & DXGI_PRESENT_TEST)) return;
     t_inside = true;
@@ -2206,6 +2208,7 @@ void note_swapchain_queue(IDXGISwapChain* swap_chain, ID3D12CommandQueue* queue)
     g_created.push_back({swap_chain, queue});
 }
 void draw_game(IDXGISwapChain* swap_chain, IUnknown* device, bool new_frame) {
+    if (g_dxgi_suppressed.load(std::memory_order_acquire)) return;
     if (!swap_chain || !device) return;
     const ULONGLONG now = GetTickCount64();
     g_game_present_ms = now;
@@ -2236,6 +2239,8 @@ bool colour_space_of(IDXGISwapChain* swap_chain, int* space) {
     *space = int(it->second);
     return true;
 }
+
+void set_dxgi_suppressed(bool suppressed) { g_dxgi_suppressed.store(suppressed, std::memory_order_release); }
 
 void install() {
     static std::once_flag once;

@@ -1445,6 +1445,7 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
             const auto ch = nr::pe::renodx_route::call_history();
             frame.history = static_cast<ID3D12Resource*>(ch.d3d12);
             frame.no_grade = ch.raw ? 1 : 0;
+            frame.external_history = ch.external ? 1 : 0;
             if (ch.raw) frame.intensity = 1.0f;
         }
         const auto* w2 = nr::pe::renodx_route::call_wilsjo2();

@@ -341,6 +341,7 @@ public:
             hist.vk_image = h.image; hist.vk_format = h.format; hist.width = h.width; hist.height = h.height;
         }
         hist.raw = c.raw;
+        hist.external = c.external_history;
         route::CallHistory history(hist);
         const auto evaluate = o_.bridge12 ? nr::dlssnr::evaluate_bridge12 : [](void* cmd, nr::dlssnr::Feature* f,
             const nr::dlssnr::VkImageRef& a, const nr::dlssnr::VkImageRef& b, const nr::dlssnr::VkImageRef& d,
