@@ -73,8 +73,15 @@ jobs:
 
       - name: Install build tools
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ca-certificates git curl cmake ninja-build mingw-w64 g++ python3 p7zip-full openssl osslsigncode
+          if [[ -f /etc/apt/apt-mirrors.txt ]] && grep -q 'ec2\.archive\.ubuntu\.com' /etc/apt/apt-mirrors.txt; then
+            printf 'https://mirrors.edge.kernel.org/ubuntu/\nhttp://archive.ubuntu.com/ubuntu/\n' | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+          fi
+          pkgs=(g++-mingw-w64-x86-64-win32 osslsigncode)
+          for pair in cmake:cmake ninja:ninja-build g++:g++ python3:python3 7z:p7zip-full openssl:openssl curl:curl git:git; do
+            command -v "${pair%%:*}" >/dev/null || pkgs+=("${pair#*:}")
+          done
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 install -y --no-install-recommends "${pkgs[@]}"
 
       # GE-Proton's tarball is cached, its unpacked copy (1.6 GB) is not.
       - name: Cache pinned dependencies
