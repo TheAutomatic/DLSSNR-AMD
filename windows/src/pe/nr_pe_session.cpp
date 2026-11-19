@@ -5281,7 +5281,7 @@ public:
         e.reset = c.reset;
         e.feature = Impl::stack_feature(feature_, c.pass);
         if (c.history) e.history = frame_of(c.history);   // Interleaved: the history it made for this pass (GENERAL)
-        if (c.depth.h != &engine_.depth) {   // peripheral compression: the packed guides at the model extent
+        if (c.depth.h && c.depth.h != &engine_.depth) {   // peripheral compression: the packed guides at the model extent
             e.depth = frame_of(c.depth);
             e.motion = frame_of(c.motion);
             e.depth_x = e.depth_y = e.motion_x = e.motion_y = 0;
@@ -5350,6 +5350,7 @@ public:
 private:
     ColourFrame frame_of(nr::wilsjo2::Surf x) const {
         ColourFrame f{};
+        if (!x) return f;
         if (x.h == &target_) {
             f = target_;
             f.before = f.after = target_now_;
