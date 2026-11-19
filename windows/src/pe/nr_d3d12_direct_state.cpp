@@ -117,7 +117,7 @@ struct DirectListState {
     DirectRootArgs compute_root{};
     ID3D12PipelineState* pso = nullptr;
     bool pso_set = false;
-    ID3D12StateObject* state_object = nullptr;
+    IUnknown* state_object = nullptr;
     bool so_set = false;
     bool so_last = false;
 
@@ -427,7 +427,7 @@ using PFN_CL_Release = ULONG(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*);
 using PFN_CL_Reset = HRESULT(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12CommandAllocator*, ID3D12PipelineState*);
 using PFN_CL_ClearState = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12PipelineState*);
 using PFN_CL_SetPso = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12PipelineState*);
-using PFN_CL_SetPso1 = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList4*, ID3D12StateObject*);
+using PFN_CL_SetPso1 = void(STDMETHODCALLTYPE*)(void*, IUnknown*);
 using PFN_CL_ExecBundle = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12GraphicsCommandList*);
 using PFN_CL_SetHeaps = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, ID3D12DescriptorHeap* const*);
 using PFN_CL_SetComputeRs = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12RootSignature*);
@@ -515,7 +515,7 @@ void STDMETHODCALLTYPE hk_cl_set_pso(ID3D12GraphicsCommandList* cl, ID3D12Pipeli
     real_cl_set_pso(cl, pso);
 }
 
-void STDMETHODCALLTYPE hk_cl_set_pso1(ID3D12GraphicsCommandList4* cl, ID3D12StateObject* so) {
+void STDMETHODCALLTYPE hk_cl_set_pso1(void* cl, IUnknown* so) {
     if (cl && !t_in_direct_record) {
         DirectListState* s = direct_state_of(cl);
         s->state_object = so;
@@ -731,9 +731,10 @@ bool restore_direct_state(ID3D12GraphicsCommandList* cmd) {
         }
     }
     if (s->so_last && s->so_set && s->state_object) {
-        ID3D12GraphicsCommandList4* cl4 = nullptr;
+        IUnknown* cl4 = nullptr;
         if (SUCCEEDED(cmd->QueryInterface(kIID_List4, reinterpret_cast<void**>(&cl4))) && cl4) {
-            cl4->SetPipelineState1(s->state_object);
+            auto set_pso1 = reinterpret_cast<PFN_CL_SetPso1>((*reinterpret_cast<void***>(cl4))[75]);
+            set_pso1(cl4, s->state_object);
             cl4->Release();
         }
     } else if (s->pso_set && s->pso) {
@@ -871,7 +872,7 @@ bool install_hooks(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, std::string
         if (ok) g_hooked_cl_release_fn = cl_rel_fn;
     }
 
-    ID3D12GraphicsCommandList4* cl4 = nullptr;
+    IUnknown* cl4 = nullptr;
     if (ok && SUCCEEDED(cl->QueryInterface(kIID_List4, reinterpret_cast<void**>(&cl4))) && cl4) {
         void** vt4 = *reinterpret_cast<void***>(cl4);
         ok = install_core_method_fn(nr::pe::split::orig_list_method(vt4, 75), &hk_cl_set_pso1, &real_cl_set_pso1, "SetPipelineState1", undo, why);
