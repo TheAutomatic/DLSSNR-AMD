@@ -18,7 +18,13 @@
 #include "nr_ini_int4.hpp"
 #endif
 #ifdef _WIN32
-extern "C" __declspec(dllimport) unsigned long __stdcall GetEnvironmentVariableA(const char*, char*, unsigned long);
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include "nr_path_win.hpp"
 #endif
 
 // Arena reuse: byte-identical to one value one slot at 16 extents, first and fourth
@@ -26,6 +32,33 @@ extern "C" __declspec(dllimport) unsigned long __stdcall GetEnvironmentVariableA
 constexpr bool kArenaReuseDefault = true;
 
 namespace nr {
+
+namespace {
+std::filesystem::path writable_cache_base(const std::filesystem::path& preferred) {
+#ifdef _WIN32
+    bool fb = false;
+    const std::string resolved = nr::u8::writable_cache_root(preferred.string(), &fb);
+    if (fb) {
+        static std::once_flag once;
+        std::call_once(once, [&] {
+            nr::logf("[nr] cache folder '%s' is read-only; storing pipeline caches in '%s'",
+                     preferred.string().c_str(), resolved.c_str());
+        });
+    }
+    return std::filesystem::path(resolved);
+#else
+    return preferred;
+#endif
+}
+
+std::string writable_ini_file(const std::filesystem::path& folder) {
+#ifdef _WIN32
+    return nr::u8::writable_ini_path(nr::u8::text(folder));
+#else
+    return (folder / "dlssnr-amd.ini").string();
+#endif
+}
+}  // namespace
 
 // What Runtime::act_arena / RuntimeConfig::act_arena pass around (GraphAct).
 struct ActArenaRef { std::shared_ptr<GraphAct> act; };
@@ -1450,7 +1483,7 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         if (env.empty()) if (const char* e = std::getenv("DLSSNR_MODEL")) env = e;
         const int ev = env.empty() ? -1 : nr::network_value(env);
         if (!env.empty() && ev < 0) nr::logf("[nr] DLSSNR_MODEL=%s is not a network's codename: ignored", env.c_str());
-        const int iv = config.network >= 0 || ev >= 0 ? -1 : nr::ini_network((data.parent_path() / "dlssnr-amd.ini").string());
+        const int iv = config.network >= 0 || ev >= 0 ? -1 : nr::ini_network(writable_ini_file(data.parent_path()));
         const char* from = config.network >= 0 ? "caller" : ev >= 0 ? "DLSSNR_MODEL" : iv >= 0 ? "dlssnr-amd.ini" : "default";
         const int v = config.network >= 0 ? config.network : ev >= 0 ? ev : iv;
         if (v == 0) network = NetworkModel::Original;
@@ -1518,7 +1551,7 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     // panning disc with jittered vectors: 43.6 dB, against 33.6 with the pick). 0: the depth picks where the vector
     // is read when there is one.
     {
-        std::string v = nr::ini_network_key((data.parent_path() / "dlssnr-amd.ini").string(), "motion without depth");
+        std::string v = nr::ini_network_key(writable_ini_file(data.parent_path()), "motion without depth");
         for (auto& ch : v) ch = char(std::tolower(static_cast<unsigned char>(ch)));
         impl_->motion_without_depth = !(v == "0" || v == "false" || v == "off" || v == "no");
         if (!impl_->motion_without_depth)
@@ -1527,7 +1560,7 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     // [Network] History Precision: 16 (the default) the history images RGBA16F, 32 RGBA32F (live afterwards:
     // Runtime::set_history_f16). NR_HIST16 in the environment wins.
     {
-        std::string v = nr::ini_network_key((data.parent_path() / "dlssnr-amd.ini").string(), "history precision");
+        std::string v = nr::ini_network_key(writable_ini_file(data.parent_path()), "history precision");
         for (auto& ch : v) ch = char(std::tolower(static_cast<unsigned char>(ch)));
         impl_->temporal.h16_want = !(v == "32" || v == "fp32" || v == "full" || v == "rgba32f");
         if (const char* e = std::getenv("NR_HIST16")) impl_->temporal.h16_want = std::atoi(e) != 0;
@@ -1616,7 +1649,7 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     if (config.layers < 0 && int4_env.empty()) {
         // no OptimizedLayers: Ultra Performance (nr_ini_int4.hpp) - but only an installed tree has int4 data; a development
         // tree stays at Quality
-        const int iv = nr::ini_optimized_layers((data.parent_path() / "dlssnr-amd.ini").string());
+        const int iv = nr::ini_optimized_layers(writable_ini_file(data.parent_path()));
         level = iv >= 0 ? iv : installed ? nr::kLayersDefault : nr::kLayersQuality;
     }
     if (level < 0) level = nr::kLayersQuality;   // DLSSNR_INT4 neither a level nor a level's word
@@ -1653,8 +1686,10 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
             if (std::filesystem::is_directory(i4root / "swin", ec)) int4_cfg["NR_SWI4_DIR"] = (i4root / "swin").string();
             int4_cfg["NR_I4_WEIGHTS"] = i4weights.string();
             // the rewritten pipeline binaries (nrvk.hpp create_iu4), keyed by driver like pipeline.cache
-            std::filesystem::create_directories(i4root / "pipeline-binaries", ec);
-            if (!ec) int4_cfg["NR_I4_CACHE"] = (i4root / "pipeline-binaries").string();
+            const std::filesystem::path cache_data = writable_cache_base(data);
+            const std::filesystem::path cache_i4 = (cache_data == data) ? i4root : (cache_data / i4root.filename());
+            std::filesystem::create_directories(cache_i4 / "pipeline-binaries", ec);
+            if (!ec) int4_cfg["NR_I4_CACHE"] = (cache_i4 / "pipeline-binaries").string();
             const auto t = slurp((i4root / "settings.txt").string());
             nr::int4_settings(std::string(t.begin(), t.end()), int4_cfg);
             nr::logf("[nr] CC_SILVER_AARDWOLD_OPTIMIZED (layers: %s) (%s)", nr::layers_word(level), int4_from);
@@ -1684,26 +1719,42 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         const char* e = std::getenv("NR_ARENA_REUSE");
         return e && *e ? std::atoi(e) != 0 : kArenaReuseDefault;
     };
+    const std::filesystem::path cache_data = installed ? writable_cache_base(data) : data;
+    const std::filesystem::path cache_file = installed
+        ? (cache_data / "pipeline.cache")
+        : (writable_cache_base(root) / "dlssnr-amd.pipelinecache");
+    {
+        std::error_code cec;
+        std::filesystem::create_directories(cache_file.parent_path(), cec);
+    }
     std::vector<std::string> arguments = {"nr_runtime", "--plan", plan_name,
         "--unpacked", (installed ? data / "model" : root / "artifacts").string(),
         "--spv-dir", network_shaders.string(),
         "--host-boundary", arena_reuse() ? "--reuse" : "--no-reuse", "--source-width", std::to_string(mw),
         "--source-height", std::to_string(mh), "--accumulation", config.accumulation,
-        "--pipeline-cache", (installed ? data / "pipeline.cache" : root / "dlssnr-amd.pipelinecache").string(),
+        "--pipeline-cache", cache_file.string(),
         "--lazy-images"};
     if (experimental || optimized) {   // CC_SMALL_FP8_EXPERIMENTAL, CC_SILVER_AARDWOLD_OPTIMIZED: their own shaders (ACO SPIR-V: kept with ACO Mode on) and pipeline caches
+        const std::filesystem::path& var_root = experimental ? xroot : oroot;
+        const std::filesystem::path var_cache = ((cache_data == data) ? var_root : (cache_data / var_root.filename())) / "pipeline.cache";
+        std::error_code cec;
+        std::filesystem::create_directories(var_cache.parent_path(), cec);
         for (size_t i = 0; i + 1 < arguments.size(); ++i) {
-            if (arguments[i] == "--spv-dir") arguments[i + 1] = ((experimental ? xroot : oroot) / "shaders").string();
-            if (arguments[i] == "--pipeline-cache") arguments[i + 1] = ((experimental ? xroot : oroot) / "pipeline.cache").string();
+            if (arguments[i] == "--spv-dir") arguments[i + 1] = (var_root / "shaders").string();
+            if (arguments[i] == "--pipeline-cache") arguments[i + 1] = var_cache.string();
         }
         arguments.push_back("--spv-dir-aco");
     }
 #if NR_INT4
-    if (int4)   // with the int4 layers: their own shaders and pipeline cache
+    if (int4) {   // with the int4 layers: their own shaders and pipeline cache
+        const std::filesystem::path i4_cache = ((cache_data == data) ? i4root : (cache_data / i4root.filename())) / "pipeline.cache";
+        std::error_code cec;
+        std::filesystem::create_directories(i4_cache.parent_path(), cec);
         for (size_t i = 0; i + 1 < arguments.size(); ++i) {
             if (arguments[i] == "--spv-dir") arguments[i + 1] = i4spv.string();
-            if (arguments[i] == "--pipeline-cache") arguments[i + 1] = (i4root / "pipeline.cache").string();
+            if (arguments[i] == "--pipeline-cache") arguments[i + 1] = i4_cache.string();
         }
+    }
 #endif
     // The weights as one file (windows/build/pack_model.py); the names inside are
     // the relative paths the graph asks for under --unpacked.
@@ -3473,7 +3524,7 @@ bool plan_d3d12_network(const std::string& root_in, uint32_t mw, uint32_t mh, bo
         const auto root = std::filesystem::canonical(nr::u8::path(root_in));
         const auto data = std::filesystem::is_directory(root / "dlssnr-amd") ? root / "dlssnr-amd" : root;
         if (data == root) { *why = "no dlssnr-amd folder in " + root.string(); return false; }
-        const std::string ini = (data.parent_path() / "dlssnr-amd.ini").string();
+        const std::string ini = writable_ini_file(data.parent_path());
         std::string aco = nr::binary::directory();
         if (aco.empty()) {
             *why = "ACO Mode is off" + (nr::binary::disabled_why().empty() ? std::string()
@@ -3613,26 +3664,39 @@ bool plan_d3d12_network(const std::string& root_in, uint32_t mw, uint32_t mh, bo
         };
         // --lazy-images as the runtime builds: the pre push says "no noise table" until frames keep seed 0 and the table
         // is made (Runtime::Impl::make_noise; the D3D12 side does the same).
+        const std::filesystem::path cache_data = writable_cache_base(data);
+        const std::filesystem::path cache_file = cache_data / "pipeline.cache";
+        {
+            std::error_code cec;
+            std::filesystem::create_directories(cache_file.parent_path(), cec);
+        }
         std::vector<std::string> arguments = {"nr_runtime", "--plan", "compiled native descriptor",
             "--unpacked", (data / "model").string(),
             "--spv-dir", network_shaders.string(),
             "--host-boundary", arena_reuse() ? "--reuse" : "--no-reuse", "--source-width", std::to_string(mw),
             "--source-height", std::to_string(mh), "--accumulation", "fp32",
-            "--pipeline-cache", (data / "pipeline.cache").string(), "--lazy-images"};
+            "--pipeline-cache", cache_file.string(), "--lazy-images"};
         // This planner has already selected the architecture's ACO folder. Do not let
         // network_spv_dir replace RDNA3's base shaders with a process-global directory.
         if (rdna3) arguments.push_back("--spv-dir-aco");
         if (experimental || optimized) {
+            const std::filesystem::path& var_root = experimental ? xroot : oroot;
+            const std::filesystem::path var_cache = ((cache_data == data) ? var_root : (cache_data / var_root.filename())) / "pipeline.cache";
+            std::error_code cec;
+            std::filesystem::create_directories(var_cache.parent_path(), cec);
             for (size_t i = 0; i + 1 < arguments.size(); ++i) {
-                if (arguments[i] == "--spv-dir") arguments[i + 1] = ((experimental ? xroot : oroot) / "shaders").string();
-                if (arguments[i] == "--pipeline-cache") arguments[i + 1] = ((experimental ? xroot : oroot) / "pipeline.cache").string();
+                if (arguments[i] == "--spv-dir") arguments[i + 1] = (var_root / "shaders").string();
+                if (arguments[i] == "--pipeline-cache") arguments[i + 1] = var_cache.string();
             }
             arguments.push_back("--spv-dir-aco");
         }
         if (int4) {
+            const std::filesystem::path i4_cache = ((cache_data == data) ? i4root : (cache_data / i4root.filename())) / "pipeline.cache";
+            std::error_code cec;
+            std::filesystem::create_directories(i4_cache.parent_path(), cec);
             for (size_t i = 0; i + 1 < arguments.size(); ++i) {
                 if (arguments[i] == "--spv-dir") arguments[i + 1] = i4spv().string();
-                if (arguments[i] == "--pipeline-cache") arguments[i + 1] = (i4root / "pipeline.cache").string();
+                if (arguments[i] == "--pipeline-cache") arguments[i + 1] = i4_cache.string();
             }
         }
         {

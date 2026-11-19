@@ -6,6 +6,7 @@
 #include "nr_gpu_arch.hpp"
 #include "nr_pipeline_binary.hpp"
 #include "nr_path_u8.hpp"
+#include "nr_path_win.hpp"
 #include "nr_d3d12_direct_state.hpp"
 #include "nr_pe_log.hpp"
 #include "nr_pe_session.hpp"

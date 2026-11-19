@@ -35,6 +35,7 @@
 #include "nr_d3d12_direct_state.hpp"
 #include "nr_d3d12_passthrough.hpp"
 #include "nr_d3d12_passthrough_backend.hpp"
+#include "nr_d3d11_d3d12_bridge.hpp"
 #include "nr_d3d12_shot.hpp"
 #include "nr_d3d12_passthrough_net.hpp"
 #include "nr_d3d12_net_plan.hpp"
@@ -573,7 +574,7 @@ std::shared_ptr<const Chain> chain_now() {
         return c;
     }();
     static std::shared_ptr<const Chain> current;
-    if (!file.poll(std::string(nr::pe::module_folder()) + "\\dlssnr-amd.ini", config) && current) return current;
+    if (!file.poll(nr::u8::writable_ini_path(nr::pe::module_folder()), config) && current) return current;
     if (g_standalone) {
         for (nr::pe::LayerConfig& lc : config.layers) {
             lc.placement = nr::pe::Placement::kPresent;
@@ -1390,6 +1391,8 @@ struct PresentPath {
     // HUD FIX (hudfix.comp): the frame before the layers and the counts (R32_UINT, kHudStatsW x kHudStatsH);
     // UNORDERED_ACCESS between uses
     ID3D12Resource *hud_back = nullptr, *hud_stats = nullptr;
+    ID3D12Resource* hud_d11_copy = nullptr;
+    D3D12_RESOURCE_STATES hud_d11_copy_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     ID3D12Resource* hud_ui = nullptr; // typed copy of the game's authored UI; UNORDERED_ACCESS between uses
     D3D12_RESOURCE_STATES hud_ui_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     int hud_ui_report = -1;
@@ -1438,6 +1441,8 @@ struct PresentPath {
     bool dlssg_menu_frame = false;             // the next taken present is the first of a game frame (for NR Control)
 };
 PresentPath g_present;                         // under g_lock, but the submission fields of `sets`
+nr::pe::d11_bridge::Bridge g_d11_d3d12;        // D3D11 Present -> D3D12 passthrough bridge (locks before g_lock)
+std::atomic<bool> g_d12_present_seen{false};   // native D3D12 Present layers observed (exclude D3D11 sub-chains)
 std::mutex g_capture_lock;                     // GuideSet's submission fields; never held across ExecuteCommandLists
 std::map<ID3D12CommandQueue*, std::pair<ID3D12Fence*, uint64_t>> g_trackers;   // our fence on each queue (g_capture_lock)
 
@@ -1714,6 +1719,26 @@ float sdr_white(IDXGISwapChain* sc) {
 
 bool ensure_ring(ID3D12Device* device) {
     if (g_present.device == device && g_present.list) return true;
+    if (g_present.device && g_present.device != device) {
+        release_resource(g_present.target); g_present.target_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        release_resource(g_present.linear); g_present.linear_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        release_resource(g_present.encoded); g_present.encoded_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        release_resource(g_present.hud_back); g_present.hud_back_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        release_resource(g_present.hud_stats); g_present.hud_stats_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        release_resource(g_present.hud_ui); g_present.hud_ui_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        release_resource(g_present.hud_d11_copy); g_present.hud_d11_copy_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        release_resource(g_present.fg_pre); g_present.fg_pre_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        release_resource(g_present.fg_out); g_present.fg_out_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        release_resource(g_present.fg_zero); g_present.fg_zero_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        release_resource(g_present.inspect_off); g_present.inspect_off_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        release_resource(g_present.inspect_on); g_present.inspect_on_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        for (auto& kv : g_present.layers) {
+            if (kv.second.nr) nr::dlssnr::release_d3d12(kv.second.nr);
+            if (kv.second.w2) nr::asi::wilsjo2_release(kv.second.w2);
+        }
+        g_present.layers.clear();
+        g_present.held = false;
+    }
     if (g_present.list) { g_present.list->Release(); g_present.list = nullptr; }
     for (auto*& a : g_present.allocators) if (a) { a->Release(); a = nullptr; }
     if (g_present.fence) { g_present.fence->Release(); g_present.fence = nullptr; }
@@ -1888,8 +1913,10 @@ struct DlssgAt {
 
 // `sc` / `queue`: the game's swap chain and the queue it presents on; `at`: at DLSS-G's evaluate instead (sc null,
 // `queue` the one the game's swap chain presents on, for the guides' order).
-void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, const DlssgAt* at = nullptr) {
+void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, const DlssgAt* at = nullptr,
+                    nr::pe::d11_bridge::FrameContext* d11_at = nullptr) {
     nr::pe::watchdog::Phase phase(at ? "Present layers (at DLSS-G's evaluate)" : "Present layers");
+    if (!d11_at) g_d12_present_seen.store(true, std::memory_order_relaxed);
     const nr::asi::hudcap::Own own;   // its commands pass HUD FIX's capture hooks unseen
     std::unique_lock<std::mutex> guard(g_lock);
     tick_retired();
@@ -1918,16 +1945,26 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
     }
     g_present.held = !g_present.layers.empty();
     if (layers.empty()) {
-        nr::asi::hudcap::d3d12_present(nullptr, nullptr, nullptr, nullptr, DXGI_FORMAT_UNKNOWN, 0, 0, false);
-        hud_report(false, true);
+        if (!d11_at) {
+            nr::asi::hudcap::d3d12_present(nullptr, nullptr, nullptr, nullptr, DXGI_FORMAT_UNKNOWN, 0, 0, false);
+            hud_report(false, true);
+        }
         return;
     }
     ID3D12Device* device = nullptr;
-    if (FAILED(at ? at->list->GetDevice(IID_PPV_ARGS(&device)) : queue->GetDevice(IID_PPV_ARGS(&device))) || !device)
+    if (d11_at && d11_at->device) {
+        device = d11_at->device;
+        device->AddRef();
+    } else if (FAILED(at ? at->list->GetDevice(IID_PPV_ARGS(&device)) : queue->GetDevice(IID_PPV_ARGS(&device))) || !device) {
         return;
+    }
     struct Dev { ID3D12Device* d; ~Dev() { d->Release(); } } hold{device};
     ID3D12Resource* back = nullptr;
-    if (at) {
+    if (d11_at) {
+        back = d11_at->back;
+        if (!back) return;
+        back->AddRef();
+    } else if (at) {
         back = at->back;
         back->AddRef();
     } else {
@@ -1939,7 +1976,7 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
     }
     struct Back { ID3D12Resource* r; ~Back() { r->Release(); } } back_hold{back};
     // the back buffer's state where the layers find it and leave it
-    const D3D12_RESOURCE_STATES back_state = at ? at->back_state : D3D12_RESOURCE_STATE_PRESENT;
+    const D3D12_RESOURCE_STATES back_state = d11_at ? d11_at->back_state : at ? at->back_state : D3D12_RESOURCE_STATE_PRESENT;
     const D3D12_RESOURCE_DESC bd = back->GetDesc();
     const uint32_t w = uint32_t(bd.Width), h = bd.Height;
     const DXGI_FORMAT format = writable(bd.Format);
@@ -1996,22 +2033,29 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
     g_present.served_ms = GetTickCount64();   // a Present of the game's reached its layers (evaluates: Present is alive)
     // HUD FIX's capture (nr_asi_hudcap.hpp): armed for Auto and Captured, its verdict on this frame
     const uint32_t hud_mode = chain->hud.mode;
-    nr::asi::hudcap::set_capture_wanted(hud_mode == 1 || hud_mode == 3);   // (its view bookkeeping: only then)
+    if (!d11_at) nr::asi::hudcap::set_capture_wanted(hud_mode == 1 || hud_mode == 3);   // (its view bookkeeping: only then)
     // and frame generation's HUD-less frame (Auto's first choice, Game): what the game handed it this frame
-    const nr::asi::hudcap::Frame hud_cap = nr::asi::hudcap::d3d12_present(
-        device, sc, queue, back, format, w, h, !runs.empty() && (hud_mode == 1 || hud_mode == 3),
-        !runs.empty(),   // (every mode: fg_delta below)
-        hud_mode == 1 || hud_mode == 2);   // copies on the hand-over's own command list only for HUD FIX (as 0.0.8.1)
-    const bool hud_fg = hud_cap.fg.seen && hud_cap.fg.copy && hud_cap.fg.hudless && (hud_mode == 1 || hud_mode == 2);
-    const bool hud_captured = hud_fg || (hud_cap.result == nr::asi::hudcap::Result::kCaptured && hud_cap.hudless);
-    ID3D12Resource* const hud_hudless = hud_fg ? hud_cap.fg.copy : hud_cap.hudless;
+    nr::asi::hudcap::Frame hud_cap{};
+    if (d11_at) {
+        if (d11_at->hudless) hud_cap.result = nr::asi::hudcap::Result::kCaptured;
+    } else {
+        hud_cap = nr::asi::hudcap::d3d12_present(
+            device, sc, queue, back, format, w, h, !runs.empty() && (hud_mode == 1 || hud_mode == 3),
+            !runs.empty(),   // (every mode: fg_delta below)
+            hud_mode == 1 || hud_mode == 2);   // copies on the hand-over's own command list only for HUD FIX (as 0.0.8.1)
+    }
+    const bool hud_fg = !d11_at && hud_cap.fg.seen && hud_cap.fg.copy && hud_cap.fg.hudless && (hud_mode == 1 || hud_mode == 2);
+    bool hud_captured = hud_fg || (hud_cap.result == nr::asi::hudcap::Result::kCaptured && (hud_cap.hudless || (d11_at && d11_at->hudless)));
+    ID3D12Resource* hud_hudless = hud_fg ? hud_cap.fg.copy : hud_cap.hudless;
     // (the chain capture: the copy of the final pass's input; until it is trusted the layers run on the frame itself and
     // the copy only says where the HUD is - source 5)
-    const bool hud_chain_check = hud_captured && !hud_fg && hud_cap.chain;   // (checked on the GPU every frame: source 5 / 6)
-    hud_report(!runs.empty(), true, hud_captured && !hud_fg, hud_cap.why, true, hud_fg, hud_cap.fg.why, hud_cap.fg.source,
-               hud_cap.broken, hud_cap.fg.offered || (hud_cap.fg.seen && hud_cap.fg.hudless),
-               hud_cap.result == nr::asi::hudcap::Result::kCaptured && hud_cap.hudless,
-               !hud_cap.chain || hud_fg ? nullptr : NR_N("captured: the final pass's input"));
+    const bool hud_chain_check = !d11_at && hud_captured && !hud_fg && hud_cap.chain;   // (checked on the GPU every frame: source 5 / 6)
+    if (!d11_at) {
+        hud_report(!runs.empty(), true, hud_captured && !hud_fg, hud_cap.why, true, hud_fg, hud_cap.fg.why, hud_cap.fg.source,
+                   hud_cap.broken, hud_cap.fg.offered || (hud_cap.fg.seen && hud_cap.fg.hudless),
+                   hud_cap.result == nr::asi::hudcap::Result::kCaptured && hud_cap.hudless,
+                   !hud_cap.chain || hud_fg ? nullptr : NR_N("captured: the final pass's input"));
+    }
     if (runs.empty()) return;
     // Frame generation (present_path.hpp RunPresentPath): a matching DLSS-G declaration is authoritative; without one
     // the cadence of presents against fresh captures, over windows (nr_present_cadence.hpp)
@@ -2143,7 +2187,7 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
         nr::gpu::reset(l);
     }
     nr::gpu::Scope recording(nr::asi::hudcap::d3d12_recording(l));
-    nr::asi::hudcap::d3d12_use_chain(hud_cap);
+    if (!d11_at) nr::asi::hudcap::d3d12_use_chain(hud_cap);
     g_d12_uses.touch();
     // The first layer, a RenoDX one, reads the back buffer itself (a shader resource view) and stores its answer
     // into our copy, which then goes back as before - the copy of the back buffer into ours goes (4K RGBA16F 0.11 ms,
@@ -2156,7 +2200,7 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
     const bool srgb_back = bd.Format != format;
     const bool pt_direct = nr::pe::d3d12_passthrough::enabled() &&
                            nr::pe::d3d12_passthrough::canary() == nr::pe::d3d12_passthrough::Canary::kHit;
-    if (!read_back_off && !at && (bd.Format == format || (srgb_back && pt_direct)) && renodx_layer(*runs.front().layer) &&
+    if (!read_back_off && !at && !d11_at && (bd.Format == format || (srgb_back && pt_direct)) && renodx_layer(*runs.front().layer) &&
         d12_reads_in_place(device) && !nr::pe::screenshot::wants_final()) {
         std::vector<const Layer*> rl;
         for (const Run& run : runs) rl.push_back(run.layer);
@@ -2178,6 +2222,22 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
     transition(l, g_present.target, g_present.target_state, D3D12_RESOURCE_STATE_COPY_DEST);
     l->CopyResource(g_present.target, back);
     transition(l, g_present.target, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+    if (d11_at && d11_at->hudless) {
+        if (ensure_texture(device, g_present.hud_d11_copy, g_present.hud_d11_copy_state, format, w, h)) {
+            transition(l, d11_at->hudless, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            transition(l, g_present.hud_d11_copy, g_present.hud_d11_copy_state, D3D12_RESOURCE_STATE_COPY_DEST);
+            l->CopyResource(g_present.hud_d11_copy, d11_at->hudless);
+            transition(l, g_present.hud_d11_copy, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            transition(l, d11_at->hudless, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+            g_present.hud_d11_copy_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            hud_cap.hudless = g_present.hud_d11_copy;
+            hud_hudless = g_present.hud_d11_copy;
+        } else {
+            hud_cap.result = nr::asi::hudcap::Result::kOff;
+            hud_captured = false;
+            hud_hudless = nullptr;
+        }
     }
     const auto fill_target = [&] {   // our copy made now, for whatever reads it before the first layer wrote it
         if (filled) return;
@@ -2546,6 +2606,10 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
         const float share = g && rs.present_frames == 0u ? 1.0f / float(multiplier) : 1.0f;
         if (pl.nr && (pl.w != w || pl.h != h)) { nr::dlssnr::release_d3d12(pl.nr); pl.nr = nullptr; }
         if (!pl.nr) {
+            if (!nr::dlssnr::nr_on_now() && !rs.debug_view && !inspect && !rs.look_mode) {
+                layer_note(layer, 2, 3, "NR is off (toggle key)");
+                return;
+            }
             int rc = 0;
             pl.nr = nr::dlssnr::create_d3d12(device, l, nullptr, w, h, 0, 1, nr::dlssnr::Controls6{}, &rc);
             if (!pl.nr) { layer_note(layer, 2, 3, "its NR could not be made (see the log)"); return; }
@@ -2635,6 +2699,12 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
     queue->ExecuteCommandLists(1, lists);
     shot.submitted = true;
     const HRESULT signalled = queue->Signal(g_present.fence, value);
+    if (d11_at) {
+        d11_at->submitted = true;
+        if (d11_at->signal_out_fence && *d11_at->signal_out_fence) {
+            d11_at->signalled = SUCCEEDED(queue->Signal(*d11_at->signal_out_fence, d11_at->signal_out_val));
+        }
+    }
     std::lock_guard<std::mutex> relock(g_lock);
     static bool said_signal = false;
     if (FAILED(signalled) && !said_signal) {   // (a lost device): the slot waits time out, and Presents stop waiting
@@ -8680,6 +8750,11 @@ bool d11_present_due() { return vk_present_due(g_d11_present); }
 
 void d11_present_layers(IDXGISwapChain* sc, ID3D11Device* device) {
     nr::pe::watchdog::Phase phase("Present layers (D3D11)");
+    static thread_local bool t_in_d11_present = false;
+    if (t_in_d11_present) return;
+    t_in_d11_present = true;
+    struct Reentry { bool& b; ~Reentry() { b = false; } } reentry{t_in_d11_present};
+
     std::unique_lock<std::mutex> guard(g_lock);
     const nr::asi::hudcap::Own own;   // its commands pass HUD FIX's capture hooks unseen
     VkPresentPath& P = g_d11_present;
@@ -8696,11 +8771,6 @@ void d11_present_layers(IDXGISwapChain* sc, ID3D11Device* device) {
         return;
     }
     if (GetTickCount64() - g_present.evaluate_ms.load() > 1000) nr::dlssnr::frame_keys();   // as on D3D12
-    if (!d11_route_ready(device)) {
-        for (const Layer* l : layers) layer_note(*l, 2, 3, "NR cannot run on this D3D11 device (see the log)");
-        P.served_ms = GetTickCount64();
-        return;
-    }
     ID3D11Texture2D* back = nullptr;
     if (FAILED(sc->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&back))) || !back) return;
     struct Back { ID3D11Texture2D* t; ~Back() { t->Release(); } } back_hold{back};
@@ -8731,6 +8801,29 @@ void d11_present_layers(IDXGISwapChain* sc, ID3D11Device* device) {
     const bool hud_captured = hud_cap.result == nr::asi::hudcap::Result::kCaptured && hud_cap.hudless;
     hud_report(!runs.empty(), true, hud_captured, hud_cap.why, false, false, std::string(), "", hud_cap.broken);
     if (runs.empty()) return;
+
+    bool has_guides = false;
+    for (uint32_t k = 0; k < kPresentGuideSets; ++k) {
+        if (P.sets[k].serial) { has_guides = true; break; }
+    }
+    const bool d12_game_active = g_d12_present_seen.load(std::memory_order_relaxed) || g_present.evaluate_ms.load() != 0;
+    if (!has_guides && !d12_game_active) {
+        ID3D11Texture2D* const hud11 = hud_captured ? hud_cap.hudless : nullptr;
+        guard.unlock();
+        const auto status = g_d11_d3d12.execute(device, back, hud11, [&](nr::pe::d11_bridge::FrameContext& fc) {
+            present_layers(sc, fc.queue, false, nullptr, &fc);
+        });
+        if (status == nr::pe::d11_bridge::Status::kRan || status == nr::pe::d11_bridge::Status::kPassthrough) {
+            return;
+        }
+        guard.lock();
+    }
+
+    if (!d11_route_ready(device)) {
+        for (const Layer* l : layers) layer_note(*l, 2, 3, "NR cannot run on this D3D11 device (see the log)");
+        P.served_ms = GetTickCount64();
+        return;
+    }
     // the back buffer's copy, a texture NR can write (an sRGB back buffer: its UNORM twin; CopyResource takes the pair)
     D3D11_TEXTURE2D_DESC have{};
     if (g_d11_target) g_d11_target->GetDesc(&have);
@@ -9127,8 +9220,9 @@ extern "C" __declspec(dllexport) void InitializeASI() {
         log("[nr] std::terminate: an exception left one of NR's threads; the process ends");
         std::abort();
     });
-    {   // and RenoDX's NR screenshots go to <game>\NR Screenshots, as on the OptiScaler route
-        nr::pe::screenshot::set_folder(nr::u8::wide(nr::pe::module_folder()) + L"\\NR Screenshots");
+    {   // and RenoDX's NR screenshots go to <game>\NR Screenshots (or %LOCALAPPDATA%\DLSSNR-AMD\apps\<tag>\NR Screenshots when read-only)
+        const std::string shot_base = nr::u8::writable_app_dir(nr::pe::module_folder());
+        nr::pe::screenshot::set_folder(nr::u8::wide(shot_base) + L"\\NR Screenshots");
     }
     log("[nr] dlssnr-amd.asi %s loaded by %s", NR_BUILD_STAMP, nr::u8::module_file(g_opti).c_str());
     nr::pe::restore_ini(nr::pe::module_folder());   // a deleted dlssnr-amd.ini: the installed one, before anything reads it
@@ -9239,7 +9333,8 @@ BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID reserved) {
         nr::asi::wilsjo2_vk_abandon_at_exit();
         nr::pe::menu::abandon_at_exit();
         nr::pe::bridge::Device::abandon_at_exit();
-        // the D3D12 passthrough's network and stages (amdxc64.dll is detached by now)
+        // the D3D11 <-> D3D12 bridge and the D3D12 passthrough's network and stages (amdxc64.dll is detached by now)
+        g_d11_d3d12.abandon_at_exit();
         nr::pe::d3d12_passthrough::abandon_at_exit();
     } else if (reason == DLL_PROCESS_DETACH) {
         nr::pe::remove_crash_watch();   // unloaded while the game runs: the handler must not outlive this module's code

@@ -1,5 +1,6 @@
 #include "nr_pe_optifix.hpp"
 
+#include "nr_path_win.hpp"
 #include "nr_pe_config.hpp"
 #include "nr_pe_log.hpp"
 #include "nr_screenshot.hpp"

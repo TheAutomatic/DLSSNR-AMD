@@ -290,6 +290,7 @@ struct OuterSlot {
     uint8_t* cpu = nullptr;
     uint64_t gpu_va = 0;
     uintptr_t srd_cpu = 0;
+    uintptr_t srd_data = 0;
     std::mutex* srd_mu = nullptr;
     mutable uint32_t rc[elf::kOuterRootConstants]{};
 
@@ -300,7 +301,7 @@ struct OuterSlot {
 
     void write_srv_tex(ID3D12Device* dev, const OuterBinding* b, ID3D12Resource* res, DXGI_FORMAT fmt,
                        uint32_t most_detailed_mip = 0, uint32_t mip_levels = 1) const {
-        if (!b || b->kind == kBuf || !srd_cpu || !srd_mu) return;
+        if (!b || b->kind == kBuf || !srd_cpu || !srd_data || !srd_mu) return;
         D3D12_SHADER_RESOURCE_VIEW_DESC d{};
         d.Format = fmt;
         d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -309,19 +310,19 @@ struct OuterSlot {
         d.Texture2D.MipLevels = mip_levels;
         std::lock_guard<std::mutex> lock(*srd_mu);
         dev->CreateShaderResourceView(res, &d, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(srd_cpu)});
-        std::memcpy(cpu + b->offset, reinterpret_cast<const void*>(srd_cpu), 32u);
+        std::memcpy(cpu + b->offset, reinterpret_cast<const void*>(srd_data), 32u);
     }
 
     void write_uav_tex(ID3D12Device* dev, const OuterBinding* b, ID3D12Resource* res, DXGI_FORMAT fmt,
                        uint32_t mip_slice = 0) const {
-        if (!b || b->kind == kBuf || !srd_cpu || !srd_mu) return;
+        if (!b || b->kind == kBuf || !srd_cpu || !srd_data || !srd_mu) return;
         D3D12_UNORDERED_ACCESS_VIEW_DESC d{};
         d.Format = fmt;
         d.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
         d.Texture2D.MipSlice = mip_slice;
         std::lock_guard<std::mutex> lock(*srd_mu);
         dev->CreateUnorderedAccessView(res, nullptr, &d, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(srd_cpu)});
-        std::memcpy(cpu + b->offset, reinterpret_cast<const void*>(srd_cpu), 32u);
+        std::memcpy(cpu + b->offset, reinterpret_cast<const void*>(srd_data), 32u);
     }
 
     void write_buf(const OuterBinding* b, ID3D12Resource* res, uint64_t bytes = 0) const {
@@ -397,23 +398,28 @@ public:
             srd_heap_->Release();
             srd_heap_ = nullptr;
             srd_cpu_ = 0;
+            srd_data_ = 0;
             if (why) *why = "CPU descriptor staging heap handle is opaque";
             return false;
         }
-        if (!verify_srd_layout(why)) {
+        if (!verify_srd_layout(&srd_data_, why)) {
             srd_heap_->Release();
             srd_heap_ = nullptr;
             srd_cpu_ = 0;
+            srd_data_ = 0;
             return false;
         }
         if (!add_block(why)) {
             srd_heap_->Release();
             srd_heap_ = nullptr;
             srd_cpu_ = 0;
+            srd_data_ = 0;
             return false;
         }
         return true;
     }
+
+    bool indirect_srd() const { return srd_data_ != 0 && srd_data_ != srd_cpu_; }
 
     void set_callbacks(CompletedFn completed, RetireFn retire) {
         completed_ = std::move(completed);
@@ -436,6 +442,7 @@ public:
             srd_heap_ = nullptr;
         }
         srd_cpu_ = 0;
+        srd_data_ = 0;
         device_ = nullptr;
         peak_blocks_ = 0;
     }
@@ -491,8 +498,19 @@ private:
         return uintptr_t(mbi.BaseAddress) + mbi.RegionSize >= ptr + bytes;
     }
 
-    // Confirm CPU-only SRDs match SHADER_VISIBLE SRDs bit-for-bit before trusting them for GPU execution.
-    bool verify_srd_layout(std::string* why) const {
+    static bool all_zero_32(uintptr_t p) {
+        uint32_t w[8]{};
+        std::memcpy(w, reinterpret_cast<const void*>(p), 32u);
+        for (uint32_t v : w) {
+            if (v != 0) return false;
+        }
+        return true;
+    }
+
+    // Confirm CPU staging SRDs match SHADER_VISIBLE hardware SRDs bit-for-bit (direct or 1-level indirect).
+    bool verify_srd_layout(uintptr_t* out_srd_data, std::string* why) const {
+        if (!out_srd_data) return false;
+        *out_srd_data = 0;
 #ifdef NR_TOOLS_BUILD
         if (const char* f = std::getenv("NR_TEST_FAIL_SRD_PROBE"); f && f[0] == '1') {
             if (why) *why = "forced SRD probe failure (NR_TEST_FAIL_SRD_PROBE=1)";
@@ -540,40 +558,79 @@ private:
             if (why) *why = "CreateCommittedResource(SRD probe) " + elf::hr_hex(FAILED(hr) ? hr : hr_d);
             return false;
         }
-        auto matches = [&]() -> bool {
-            return std::memcmp(reinterpret_cast<const void*>(srd_cpu_),
-                               reinterpret_cast<const void*>(vis_cpu), 32u) == 0;
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv16f{};
+        srv16f.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        srv16f.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv16f.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv16f.Texture2D.MipLevels = 1;
+
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uav16f{};
+        uav16f.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        uav16f.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv32d = srv16f;
+        srv32d.Format = DXGI_FORMAT_R32_FLOAT;
+
+        auto probe_pair = [&](uintptr_t cpu_data, uintptr_t vis_data, bool indirect) -> bool {
+            auto intact = [&]() -> bool {
+                if (!indirect) return true;
+                uintptr_t cur_cpu = 0, cur_vis = 0;
+                std::memcpy(&cur_cpu, reinterpret_cast<const void*>(srd_cpu_), sizeof(cur_cpu));
+                std::memcpy(&cur_vis, reinterpret_cast<const void*>(vis_cpu), sizeof(cur_vis));
+                return cur_cpu == cpu_data && cur_vis == vis_data;
+            };
+            auto eq_nonzero = [&]() -> bool {
+                return !all_zero_32(cpu_data) &&
+                       std::memcmp(reinterpret_cast<const void*>(cpu_data),
+                                   reinterpret_cast<const void*>(vis_data), 32u) == 0;
+            };
+
+            device_->CreateShaderResourceView(probe_tex, &srv16f, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(srd_cpu_)});
+            device_->CreateShaderResourceView(probe_tex, &srv16f, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(vis_cpu)});
+            MemoryBarrier();
+            if (!intact() || !eq_nonzero()) return false;
+            uint8_t srv16f_ref[32]{};
+            std::memcpy(srv16f_ref, reinterpret_cast<const void*>(cpu_data), 32u);
+
+            device_->CreateUnorderedAccessView(probe_tex, nullptr, &uav16f, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(srd_cpu_)});
+            device_->CreateUnorderedAccessView(probe_tex, nullptr, &uav16f, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(vis_cpu)});
+            MemoryBarrier();
+            if (!intact() || !eq_nonzero()) return false;
+
+            device_->CreateShaderResourceView(probe_depth, &srv32d, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(srd_cpu_)});
+            device_->CreateShaderResourceView(probe_depth, &srv32d, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(vis_cpu)});
+            MemoryBarrier();
+            if (!intact() || !eq_nonzero() ||
+                std::memcmp(reinterpret_cast<const void*>(cpu_data), srv16f_ref, 32u) == 0) {
+                return false;
+            }
+            return true;
         };
-        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-        srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        srv.Texture2D.MipLevels = 1;
-        device_->CreateShaderResourceView(probe_tex, &srv, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(srd_cpu_)});
-        device_->CreateShaderResourceView(probe_tex, &srv, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(vis_cpu)});
-        bool same = matches();
-        if (same) {
-            D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
-            uav.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-            uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-            device_->CreateUnorderedAccessView(probe_tex, nullptr, &uav, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(srd_cpu_)});
-            device_->CreateUnorderedAccessView(probe_tex, nullptr, &uav, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(vis_cpu)});
-            same = matches();
+
+        bool ok = false;
+        if (probe_pair(srd_cpu_, vis_cpu, false)) {
+            *out_srd_data = srd_cpu_;
+            ok = true;
+        } else {
+            uintptr_t ind_cpu = 0, ind_vis = 0;
+            std::memcpy(&ind_cpu, reinterpret_cast<const void*>(srd_cpu_), sizeof(ind_cpu));
+            std::memcpy(&ind_vis, reinterpret_cast<const void*>(vis_cpu), sizeof(ind_vis));
+            const bool ind_eligible =
+                ind_cpu != 0 && ind_vis != 0 && ind_cpu != ind_vis &&
+                ind_cpu != srd_cpu_ && ind_vis != vis_cpu &&
+                (ind_cpu % 4u) == 0 && (ind_vis % 4u) == 0 &&
+                readable_ptr(ind_cpu, 32u) && readable_ptr(ind_vis, 32u);
+            if (ind_eligible && probe_pair(ind_cpu, ind_vis, true)) {
+                *out_srd_data = ind_cpu;
+                ok = true;
+            }
         }
-        if (same) {
-            srv.Format = DXGI_FORMAT_R32_FLOAT;
-            device_->CreateShaderResourceView(probe_depth, &srv, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(srd_cpu_)});
-            device_->CreateShaderResourceView(probe_depth, &srv, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(vis_cpu)});
-            same = matches();
-        }
+        if (!ok && why) *why = "CPU and shader-visible hardware SRD encodings differ";
         probe_depth->Release();
         probe_tex->Release();
         vis->Release();
-        if (!same) {
-            if (why) *why = "CPU and shader-visible hardware SRD encodings differ";
-            return false;
-        }
-        return true;
+        return ok;
     }
 
     uint32_t count_free_slots() const {
@@ -650,6 +707,7 @@ private:
             out->cpu = reinterpret_cast<uint8_t*>(b.cpu_base + uintptr_t(idx) * kSlotBytes);
             out->gpu_va = va;
             out->srd_cpu = srd_cpu_;
+            out->srd_data = srd_data_;
             out->srd_mu = &srd_mutex_;
             out->zero(zero_bytes);
             return true;
@@ -660,6 +718,7 @@ private:
     ID3D12Device* device_ = nullptr;
     ID3D12DescriptorHeap* srd_heap_ = nullptr;
     uintptr_t srd_cpu_ = 0;
+    uintptr_t srd_data_ = 0;
     std::mutex srd_mutex_;
     uint32_t slots_per_block_ = 512;
     uint32_t max_blocks_ = 64;

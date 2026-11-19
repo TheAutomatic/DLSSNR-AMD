@@ -8,10 +8,12 @@
 //   Case C: Zero d3dcompiler_47.dll load + RDNA3 NRD12OUT archive verification and secondary RDNA3 GPU dispatch.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <d3d11_4.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
 
 #include "nr_asi_wilsjo2.hpp"
+#include "nr_d3d11_d3d12_bridge.hpp"
 #include "nr_d3d12_direct_state.hpp"
 #include "nr_d3d12_net_plan.hpp"
 #include "nr_d3d12_outer_elf.hpp"
@@ -21,6 +23,7 @@
 #include "nr_dlssnr_model.hpp"
 #include "nr_gpu_arch.hpp"
 #include "nr_hud_method_hook.hpp"
+#include "nr_path_win.hpp"
 #include "nr_pe_config.hpp"
 #include "nr_pe_crash.hpp"
 #include "nr_pe_d3d12split.hpp"
@@ -28,6 +31,7 @@
 #include "nr_pe_session.hpp"
 #include "nr_renodx.hpp"
 #include "nr_renodx_d3d12.hpp"
+#include "nr_swapchain_arbiter.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -2087,6 +2091,492 @@ int main(int argc, char** argv) {
             standalone_ok = 1;
         }
         std::printf("[PASS] Case H: Crash watch LastError & UEF preserved, dxgi-standalone=%d\n", standalone_ok);
+    }
+
+    // ---- Case I: Writable Directory Fallback (Read-Only App Dir -> LOCALAPPDATA) ----
+    {
+        wchar_t tmp_w[MAX_PATH * 4]{};
+        const DWORD tn = GetTempPathW(MAX_PATH * 4, tmp_w);
+        if (!tn || tn >= MAX_PATH * 4) {
+            std::fprintf(stderr, "FAIL: Case I GetTempPathW\n");
+            return 1;
+        }
+        std::string base = nr::u8::narrow(tmp_w);
+        while (!base.empty() && (base.back() == '\\' || base.back() == '/')) base.pop_back();
+        base += "\\nr_case_i_" + std::to_string(GetCurrentProcessId());
+        const std::string wdir = base + "\\writable";
+        if (!nr::u8::make_dirs(wdir.c_str()) || !nr::u8::dir_writable(wdir.c_str())) {
+            std::fprintf(stderr, "FAIL: Case I writable dir setup '%s'\n", wdir.c_str());
+            return 1;
+        }
+        bool fb_w = true;
+        const std::string wc = nr::u8::writable_cache_root(wdir, &fb_w);
+        if (fb_w || wc != wdir) {
+            std::fprintf(stderr, "FAIL: Case I writable_cache_root fell back on writable dir (%d, '%s')\n",
+                         fb_w ? 1 : 0, wc.c_str());
+            return 1;
+        }
+        const std::string wa = nr::u8::writable_app_dir(wdir, &fb_w);
+        if (fb_w || wa != wdir) {
+            std::fprintf(stderr, "FAIL: Case I writable_app_dir fell back on writable dir (%d, '%s')\n",
+                         fb_w ? 1 : 0, wa.c_str());
+            return 1;
+        }
+
+        // Create a regular file named `blocker` so `blocker\ro_child` is deterministically non-writable/non-creatable
+        // even under elevated tokens.
+        const std::string blocker = base + "\\blocker";
+        FILE* bf = nr::u8::fopen(blocker.c_str(), "wb");
+        if (!bf) {
+            std::fprintf(stderr, "FAIL: Case I blocker file create\n");
+            return 1;
+        }
+        std::fputs("ro", bf);
+        std::fclose(bf);
+        const std::string ro_dir = blocker + "\\ro_child";
+        if (nr::u8::dir_writable(ro_dir.c_str())) {
+            std::fprintf(stderr, "FAIL: Case I dir_writable returned true on blocker child '%s'\n", ro_dir.c_str());
+            return 1;
+        }
+        bool fb_ro_c = false;
+        const std::string rc = nr::u8::writable_cache_root(ro_dir, &fb_ro_c);
+        const std::string rc2 = nr::u8::writable_cache_root(ro_dir, &fb_ro_c);
+        if (!fb_ro_c || rc != rc2 || rc.find("\\cache") == std::string::npos || !nr::u8::dir_writable(rc.c_str())) {
+            std::fprintf(stderr, "FAIL: Case I writable_cache_root fallback failed (fb=%d rc='%s')\n",
+                         fb_ro_c ? 1 : 0, rc.c_str());
+            return 1;
+        }
+        bool fb_ro_a = false;
+        const std::string ra = nr::u8::writable_app_dir(ro_dir, &fb_ro_a);
+        const std::string ra2 = nr::u8::writable_app_dir(ro_dir, &fb_ro_a);
+        if (!fb_ro_a || ra != ra2 || ra.find("\\apps\\") == std::string::npos || !nr::u8::dir_writable(ra.c_str())) {
+            std::fprintf(stderr, "FAIL: Case I writable_app_dir fallback failed (fb=%d ra='%s')\n",
+                         fb_ro_a ? 1 : 0, ra.c_str());
+            return 1;
+        }
+
+        DeleteFileW(nr::u8::wide(blocker).c_str());
+        RemoveDirectoryW(nr::u8::wide(wdir).c_str());
+        RemoveDirectoryW(nr::u8::wide(base).c_str());
+        std::printf("[PASS] Case I: Writable directory fallback verified (cache='%s', app='%s')\n",
+                    rc.c_str(), ra.c_str());
+    }
+
+    // ---- Case J: D3D11 -> D3D12 Synchronous Bridge + RenoDX+NR Evaluation + LRU Slots + No-Deadlock Guard ----
+    {
+        ID3D11Device* d11_dev = nullptr;
+        ID3D11DeviceContext* d11_ctx = nullptr;
+        D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
+        const D3D_FEATURE_LEVEL fls[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+        if (FAILED(D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, fls, 2, D3D11_SDK_VERSION,
+                                     &d11_dev, &fl, &d11_ctx)) || !d11_dev || !d11_ctx) {
+            std::fprintf(stderr, "FAIL: Case J D3D11CreateDevice\n");
+            return 1;
+        }
+
+        constexpr uint32_t jw = 256, jh = 256;
+        std::vector<uint8_t> init_rgba(size_t(jw) * jh * 4);
+        for (uint32_t y = 0; y < jh; ++y) {
+            for (uint32_t x = 0; x < jw; ++x) {
+                const size_t idx = (size_t(y) * jw + x) * 4;
+                init_rgba[idx + 0] = static_cast<uint8_t>((x * 3 + y) & 0xFFu);
+                init_rgba[idx + 1] = static_cast<uint8_t>((x + y * 5) & 0xFFu);
+                init_rgba[idx + 2] = static_cast<uint8_t>(((x ^ y) * 7) & 0xFFu);
+                init_rgba[idx + 3] = 255;
+            }
+        }
+        auto make_d11_tex = [&](uint32_t w, uint32_t h, DXGI_FORMAT fmt, bool staging, const void* init, UINT pitch) {
+            D3D11_TEXTURE2D_DESC td{};
+            td.Width = w;
+            td.Height = h;
+            td.MipLevels = 1;
+            td.ArraySize = 1;
+            td.Format = fmt;
+            td.SampleDesc.Count = 1;
+            td.Usage = staging ? D3D11_USAGE_STAGING : D3D11_USAGE_DEFAULT;
+            td.BindFlags = staging ? 0 : (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE);
+            td.CPUAccessFlags = staging ? D3D11_CPU_ACCESS_READ : 0;
+            D3D11_SUBRESOURCE_DATA sd{init, pitch, 0};
+            ID3D11Texture2D* t = nullptr;
+            if (FAILED(d11_dev->CreateTexture2D(&td, init ? &sd : nullptr, &t))) return static_cast<ID3D11Texture2D*>(nullptr);
+            return t;
+        };
+
+        ID3D11Texture2D* tex11 = make_d11_tex(jw, jh, DXGI_FORMAT_R8G8B8A8_UNORM, false, init_rgba.data(), jw * 4);
+        ID3D11Texture2D* hud11 = make_d11_tex(jw, jh, DXGI_FORMAT_R8G8B8A8_UNORM, false, init_rgba.data(), jw * 4);
+        ID3D11Texture2D* rb11 = make_d11_tex(jw, jh, DXGI_FORMAT_R8G8B8A8_UNORM, true, nullptr, 0);
+        if (!tex11 || !hud11 || !rb11) {
+            std::fprintf(stderr, "FAIL: Case J D3D11 texture creation\n");
+            return 1;
+        }
+
+        nr::pe::d11_bridge::Bridge bridge;
+        ID3D12CommandAllocator* j_alloc = nullptr;
+        ID3D12GraphicsCommandList* j_cmd = nullptr;
+        ID3D12Resource* j_uav = nullptr;
+        ID3D12Resource* j_hud_copy = nullptr;
+        ID3D12Fence* j_wait_fence = nullptr;
+        ID3D12Device* j_d12_dev = nullptr;
+        ID3D12CommandQueue* j_d12_queue = nullptr;
+        HANDLE j_wait_ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        uint64_t j_wait_val = 0;
+
+        nr::renodx::Settings r_j{};
+        r_j.nr_enabled = true;
+        r_j.passes = 1;
+        r_j.codec_mode = 1;
+        r_j.transfer_strength = 0.8f;
+
+        bool produced_ok = false;
+        bool hud_copied = false;
+        for (int poll = 0; poll < 600; ++poll) {
+            int eval_waiting = 0;
+            bool eval_ran = false;
+            const auto st = bridge.execute(d11_dev, tex11, hud11, [&](nr::pe::d11_bridge::FrameContext& fc) {
+                if (!fc.device || !fc.queue || !fc.back || !fc.signal_out_fence) return;
+                if (!j_alloc) {
+                    j_d12_dev = fc.device;
+                    j_d12_queue = fc.queue;
+                    j_d12_dev->AddRef();
+                    j_d12_queue->AddRef();
+                    if (FAILED(fc.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&j_alloc))) ||
+                        FAILED(fc.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, j_alloc, nullptr, IID_PPV_ARGS(&j_cmd))) ||
+                        FAILED(fc.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&j_wait_fence)))) {
+                        return;
+                    }
+                    j_cmd->Close();
+                    j_uav = make_tex2d(fc.device, jw, jh, DXGI_FORMAT_R8G8B8A8_UNORM, true,
+                                       D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                    j_hud_copy = make_tex2d(fc.device, jw, jh, DXGI_FORMAT_R8G8B8A8_UNORM, false,
+                                            D3D12_RESOURCE_STATE_COPY_DEST);
+                    if (!j_uav || !j_hud_copy) return;
+                }
+                if (FAILED(j_alloc->Reset()) || FAILED(j_cmd->Reset(j_alloc, nullptr))) return;
+
+                auto b = [&](ID3D12Resource* r, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+                    if (before == after) return;
+                    D3D12_RESOURCE_BARRIER rb{};
+                    rb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                    rb.Transition.pResource = r;
+                    rb.Transition.StateBefore = before;
+                    rb.Transition.StateAfter = after;
+                    rb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                    j_cmd->ResourceBarrier(1, &rb);
+                };
+
+                b(fc.back, fc.back_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                b(j_uav, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+                j_cmd->CopyResource(j_uav, fc.back);
+                b(j_uav, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                if (fc.hudless) {
+                    b(fc.hudless, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    j_cmd->CopyResource(j_hud_copy, fc.hudless);
+                    b(fc.hudless, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+                    hud_copied = true;
+                }
+
+                nr::dlssnr::D3d12BackendFrame bf{};
+                bf.device = fc.device;
+                bf.cmd = j_cmd;
+                bf.color = j_uav;
+                bf.color_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                bf.output = j_uav;
+                bf.output_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                bf.width = jw;
+                bf.height = jh;
+                bf.intensity = 1.0f;
+                bf.local_tone = 1.0f;
+                bf.local_structure = 1.0f;
+                bf.skin_structure = -1.0f;
+                bf.history_f16 = 1;
+                bf.feature = 0x7711u;
+                bf.history_strength = -1.0f;
+                bf.renodx_route = 1;
+                bf.renodx_present = 1;
+                bf.renodx_white_nits = 203.0f;
+                bf.renodx_settings = &r_j;
+                bf.waiting = &eval_waiting;
+                eval_ran = nr::pe::d3d12_passthrough::evaluate_backend(bf);
+
+                b(j_uav, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                b(fc.back, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+                j_cmd->CopyResource(fc.back, j_uav);
+                b(fc.back, D3D12_RESOURCE_STATE_COPY_DEST, fc.back_state);
+                b(j_uav, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                if (FAILED(j_cmd->Close())) return;
+
+                ID3D12CommandList* lists[] = {j_cmd};
+                fc.queue->ExecuteCommandLists(1, lists);
+                fc.submitted = true;
+                if (*fc.signal_out_fence) {
+                    fc.signalled = SUCCEEDED(fc.queue->Signal(*fc.signal_out_fence, fc.signal_out_val));
+                }
+            });
+            if (j_d12_queue && j_wait_fence && j_wait_ev) {
+                if (SUCCEEDED(j_d12_queue->Signal(j_wait_fence, ++j_wait_val)) &&
+                    j_wait_fence->GetCompletedValue() < j_wait_val) {
+                    ResetEvent(j_wait_ev);
+                    if (SUCCEEDED(j_wait_fence->SetEventOnCompletion(j_wait_val, j_wait_ev))) {
+                        WaitForSingleObject(j_wait_ev, 5000);
+                    }
+                }
+            }
+            if (st == nr::pe::d11_bridge::Status::kFallback) {
+                std::fprintf(stderr, "FAIL: Case J bridge returned kFallback unexpectedly (%s)\n",
+                             bridge.last_error().c_str());
+                return 1;
+            }
+            if (st == nr::pe::d11_bridge::Status::kRan && eval_ran &&
+                nr::pe::d3d12_passthrough::backend_produced()) {
+                produced_ok = true;
+                break;
+            }
+            Sleep(20);
+        }
+        if (!produced_ok || !hud_copied) {
+            std::fprintf(stderr, "FAIL: Case J D3D11->D3D12 evaluate_backend failed (produced=%d hud=%d)\n",
+                         produced_ok ? 1 : 0, hud_copied ? 1 : 0);
+            return 1;
+        }
+
+        // Read back tex11 on D3D11 and confirm synchronous GPU copy modified pixels vs initial pattern.
+        d11_ctx->CopyResource(rb11, tex11);
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        if (FAILED(d11_ctx->Map(rb11, 0, D3D11_MAP_READ, 0, &mapped)) || !mapped.pData) {
+            std::fprintf(stderr, "FAIL: Case J D3D11 staging map failed\n");
+            return 1;
+        }
+        size_t diff_pixels = 0;
+        const auto* out_ptr = static_cast<const uint8_t*>(mapped.pData);
+        for (uint32_t y = 0; y < jh; ++y) {
+            const uint8_t* row = out_ptr + size_t(y) * mapped.RowPitch;
+            const uint8_t* ref = init_rgba.data() + size_t(y) * jw * 4;
+            for (uint32_t x = 0; x < jw; ++x) {
+                if (row[x * 4 + 0] != ref[x * 4 + 0] || row[x * 4 + 1] != ref[x * 4 + 1] ||
+                    row[x * 4 + 2] != ref[x * 4 + 2]) {
+                    ++diff_pixels;
+                }
+            }
+        }
+        d11_ctx->Unmap(rb11, 0);
+        if (diff_pixels == 0) {
+            std::fprintf(stderr, "FAIL: Case J D3D11 output matched input byte-for-byte after NR run\n");
+            return 1;
+        }
+
+        // Test early-return no-deadlock path (`submitted == false && signalled == false`) -> leaves tex11 untouched.
+        d11_ctx->UpdateSubresource(tex11, 0, nullptr, init_rgba.data(), jw * 4, 0);
+        const auto st_noop = bridge.execute(d11_dev, tex11, nullptr, [](nr::pe::d11_bridge::FrameContext&) {
+            // Deliberately return without executing or signalling.
+        });
+        if (st_noop != nr::pe::d11_bridge::Status::kRan) {
+            std::fprintf(stderr, "FAIL: Case J early-return no-op returned status %d\n", int(st_noop));
+            return 1;
+        }
+        d11_ctx->CopyResource(rb11, tex11);
+        if (FAILED(d11_ctx->Map(rb11, 0, D3D11_MAP_READ, 0, &mapped)) || !mapped.pData) {
+            std::fprintf(stderr, "FAIL: Case J no-op readback Map failed\n");
+            return 1;
+        }
+        bool noop_intact = true;
+        const auto* noop_ptr = static_cast<const uint8_t*>(mapped.pData);
+        for (uint32_t y = 0; y < jh && noop_intact; ++y) {
+            if (std::memcmp(noop_ptr + size_t(y) * mapped.RowPitch,
+                            init_rgba.data() + size_t(y) * jw * 4, jw * 4) != 0) {
+                noop_intact = false;
+            }
+        }
+        d11_ctx->Unmap(rb11, 0);
+        if (!noop_intact) {
+            std::fprintf(stderr, "FAIL: Case J early-return modified tex11 unexpectedly\n");
+            return 1;
+        }
+
+        // Test LRU eviction (kMaxSlots = 4) across 5 distinct (w, h, fmt) combinations.
+        const struct { uint32_t w, h; DXGI_FORMAT fmt; } combos[] = {
+            {128, 128, DXGI_FORMAT_R8G8B8A8_UNORM},
+            {96, 96, DXGI_FORMAT_B8G8R8A8_UNORM},
+            {64, 64, DXGI_FORMAT_R16G16B16A16_FLOAT},
+            {80, 80, DXGI_FORMAT_R8G8B8A8_UNORM},
+            {48, 48, DXGI_FORMAT_R8G8B8A8_UNORM},
+        };
+        for (const auto& c : combos) {
+            ID3D11Texture2D* ct = make_d11_tex(c.w, c.h, c.fmt, false, nullptr, 0);
+            if (!ct) {
+                std::fprintf(stderr, "FAIL: Case J resize tex (%ux%u fmt=%d)\n", c.w, c.h, int(c.fmt));
+                return 1;
+            }
+            const auto cs = bridge.execute(d11_dev, ct, nullptr, [](nr::pe::d11_bridge::FrameContext&) {});
+            ct->Release();
+            if (cs != nr::pe::d11_bridge::Status::kRan) {
+                std::fprintf(stderr, "FAIL: Case J resize bridge status=%d (%ux%u fmt=%d)\n", int(cs), c.w, c.h, int(c.fmt));
+                return 1;
+            }
+        }
+        if (bridge.cached_slot_count() != 4) {
+            std::fprintf(stderr, "FAIL: Case J LRU slot count=%u (expected 4)\n", bridge.cached_slot_count());
+            return 1;
+        }
+
+        // Test NR_D11_D3D12_BRIDGE=0 escape hatch.
+        SetEnvironmentVariableA("NR_D11_D3D12_BRIDGE", "0");
+        const auto st_off = bridge.execute(d11_dev, tex11, nullptr, [](nr::pe::d11_bridge::FrameContext&) {});
+        SetEnvironmentVariableA("NR_D11_D3D12_BRIDGE", nullptr);
+        if (st_off != nr::pe::d11_bridge::Status::kFallback) {
+            std::fprintf(stderr, "FAIL: Case J NR_D11_D3D12_BRIDGE=0 returned status %d (expected kFallback)\n", int(st_off));
+            return 1;
+        }
+
+        if (j_d12_queue && j_wait_fence && j_wait_ev) {
+            if (SUCCEEDED(j_d12_queue->Signal(j_wait_fence, ++j_wait_val))) {
+                ResetEvent(j_wait_ev);
+                if (j_wait_fence->GetCompletedValue() < j_wait_val &&
+                    SUCCEEDED(j_wait_fence->SetEventOnCompletion(j_wait_val, j_wait_ev))) {
+                    WaitForSingleObject(j_wait_ev, 5000);
+                }
+            }
+        }
+        bridge.reset();
+        if (j_wait_ev) CloseHandle(j_wait_ev);
+        if (j_wait_fence) j_wait_fence->Release();
+        if (j_hud_copy) j_hud_copy->Release();
+        if (j_uav) j_uav->Release();
+        if (j_cmd) j_cmd->Release();
+        if (j_alloc) j_alloc->Release();
+        if (j_d12_queue) j_d12_queue->Release();
+        if (j_d12_dev) j_d12_dev->Release();
+        rb11->Release();
+        hud11->Release();
+        tex11->Release();
+        d11_ctx->Release();
+        d11_dev->Release();
+        std::printf("[PASS] Case J: D3D11->D3D12 bridge NR inference (diff_px=%zu), hudless copy, LRU=4, no-deadlock & escape hatch\n",
+                    diff_pixels);
+    }
+
+    // ---- Case K: Multi-swapchain primary arbiter ----
+    {
+        nr::pe::SwapChainArbiter arb;
+        auto* sc1 = reinterpret_cast<IDXGISwapChain*>(uintptr_t(0x10001));
+        auto* sc2 = reinterpret_cast<IDXGISwapChain*>(uintptr_t(0x10002));
+        auto* sc3 = reinterpret_cast<IDXGISwapChain*>(uintptr_t(0x10003));
+        HWND hwnd1 = reinterpret_cast<HWND>(uintptr_t(0x1001));
+        HWND hwnd2 = reinterpret_cast<HWND>(uintptr_t(0x1002));
+        HWND hwnd3 = reinterpret_cast<HWND>(uintptr_t(0x1003));
+
+        bool alive1 = true, alive2 = true, alive3 = true;
+        bool vis1 = true, vis2 = true, vis3 = true;
+        HWND focused = hwnd1;
+        auto alive_fn = [&](HWND h) {
+            if (h == hwnd1) return alive1;
+            if (h == hwnd2) return alive2;
+            if (h == hwnd3) return alive3;
+            return true;
+        };
+        auto vis_fn = [&](HWND h) {
+            if (h == hwnd1) return vis1;
+            if (h == hwnd2) return vis2;
+            if (h == hwnd3) return vis3;
+            return true;
+        };
+        auto foc_fn = [&](HWND h) { return h && h == focused; };
+
+        uint64_t t = 1000;
+        // 1. Single swap chain always primary.
+        if (!arb.observe(sc1, hwnd1, 2412, 1128, t, alive_fn, vis_fn, foc_fn)) {
+            std::fprintf(stderr, "FAIL: Case K single swapchain not primary\n");
+            return 1;
+        }
+
+        // 2. OBS: 4K projector (unfocused) vs 2412x1128 preview (focused) -> 4K wins consistently.
+        t += 16;
+        if (!arb.observe(sc2, hwnd2, 3840, 2160, t, alive_fn, vis_fn, foc_fn)) {
+            std::fprintf(stderr, "FAIL: Case K 4K projector did not take primary\n");
+            return 1;
+        }
+        for (int i = 0; i < 4; ++i) {
+            t += 16;
+            if (arb.observe(sc1, hwnd1, 2412, 1128, t, alive_fn, vis_fn, foc_fn)) {
+                std::fprintf(stderr, "FAIL: Case K preview stole primary while 4K active\n");
+                return 1;
+            }
+            if (!arb.observe(sc2, hwnd2, 3840, 2160, t, alive_fn, vis_fn, foc_fn)) {
+                std::fprintf(stderr, "FAIL: Case K 4K lost primary during alternation\n");
+                return 1;
+            }
+        }
+
+        // 3. Closing projector (!alive) immediately returns primary to preview.
+        alive2 = false;
+        t += 16;
+        if (!arb.observe(sc1, hwnd1, 2412, 1128, t, alive_fn, vis_fn, foc_fn)) {
+            std::fprintf(stderr, "FAIL: Case K closed projector did not immediately restore preview\n");
+            return 1;
+        }
+
+        // 4. Stale projector (>600ms without Present) returns primary to preview.
+        alive2 = true;
+        t += 16;
+        if (!arb.observe(sc2, hwnd2, 3840, 2160, t, alive_fn, vis_fn, foc_fn)) {
+            std::fprintf(stderr, "FAIL: Case K re-activated projector did not win\n");
+            return 1;
+        }
+        t += 700;
+        if (!arb.observe(sc1, hwnd1, 2412, 1128, t, alive_fn, vis_fn, foc_fn)) {
+            std::fprintf(stderr, "FAIL: Case K stale projector (>600ms) did not hand back primary\n");
+            return 1;
+        }
+
+        // 5. Tiny <64x64 dummy (focused) must not steal primary from meaningful video window.
+        arb.reset();
+        focused = hwnd2;
+        if (!arb.observe(sc1, hwnd1, 1920, 1080, t, alive_fn, vis_fn, foc_fn) ||
+            arb.observe(sc2, hwnd2, 16, 16, t + 16, alive_fn, vis_fn, foc_fn) ||
+            !arb.observe(sc1, hwnd1, 1920, 1080, t + 32, alive_fn, vis_fn, foc_fn)) {
+            std::fprintf(stderr, "FAIL: Case K tiny dummy swapchain interfered with video window\n");
+            return 1;
+        }
+
+        // 6. Minimized/hidden 4K loses to visible 1080p.
+        arb.reset();
+        vis1 = true; vis2 = false; focused = hwnd2;
+        t += 100;
+        arb.observe(sc2, hwnd2, 3840, 2160, t, alive_fn, vis_fn, foc_fn);
+        if (!arb.observe(sc1, hwnd1, 1920, 1080, t + 16, alive_fn, vis_fn, foc_fn) ||
+            arb.observe(sc2, hwnd2, 3840, 2160, t + 32, alive_fn, vis_fn, foc_fn)) {
+            std::fprintf(stderr, "FAIL: Case K hidden 4K beat visible 1080p\n");
+            return 1;
+        }
+
+        // 7. Equal/near-equal area within 5%: focus breaks tie; unfocused stays sticky.
+        arb.reset();
+        vis1 = vis2 = vis3 = true;
+        focused = hwnd1;
+        t += 100;
+        arb.observe(sc1, hwnd1, 1920, 1080, t, alive_fn, vis_fn, foc_fn);
+        arb.observe(sc2, hwnd2, 1920, 1080, t + 16, alive_fn, vis_fn, foc_fn);
+        focused = hwnd2;
+        if (!arb.observe(sc2, hwnd2, 1920, 1080, t + 32, alive_fn, vis_fn, foc_fn)) {
+            std::fprintf(stderr, "FAIL: Case K focus tie-breaker did not select sc2\n");
+            return 1;
+        }
+        focused = hwnd3; // neither sc1 nor sc2 focused -> sc2 stays sticky
+        if (arb.observe(sc1, hwnd1, 1920, 1080, t + 48, alive_fn, vis_fn, foc_fn) ||
+            !arb.observe(sc2, hwnd2, 1920, 1080, t + 64, alive_fn, vis_fn, foc_fn)) {
+            std::fprintf(stderr, "FAIL: Case K unfocused equal-area did not stay sticky on sc2\n");
+            return 1;
+        }
+
+        // 8. Same-HWND replacement / proxy swap chain updates in place and remains primary.
+        arb.reset();
+        t += 100;
+        if (!arb.observe(sc1, hwnd1, 3840, 2160, t, alive_fn, vis_fn, foc_fn) ||
+            !arb.observe(sc3, hwnd1, 1920, 1080, t + 16, alive_fn, vis_fn, foc_fn)) {
+            std::fprintf(stderr, "FAIL: Case K same-HWND replacement lost primary\n");
+            return 1;
+        }
+
+        std::printf("[PASS] Case K: SwapChainArbiter (OBS 4K+preview, close/stale fallback, tiny dummy, hidden, focus tie-break, same-HWND)\n");
     }
 
     // Clean exit after GPU completion.

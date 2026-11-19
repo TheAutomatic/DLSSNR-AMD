@@ -73,6 +73,7 @@ glslang=${NR_GLSLANG:-toolchain/glslang/bin/glslang}
 "$cxx" "${common[@]}" -c windows/src/pe/nr_d3d12_passthrough.cpp -o "$out/d3d12_passthrough.o"
 "$cxx" "${common[@]}" -c windows/src/pe/nr_d3d12_passthrough_backend.cpp -o "$out/d3d12_passthrough_backend.o"
 "$cxx" "${common[@]}" -c windows/src/pe/nr_d3d12_passthrough_net.cpp -o "$out/d3d12_passthrough_net.o"
+"$cxx" "${common[@]}" -c windows/src/pe/nr_d3d11_d3d12_bridge.cpp -o "$out/d3d11_d3d12_bridge.o"
 "$cxx" "${common[@]}" -c windows/src/pe/nr_renodx_d3d12.cpp -o "$out/renodx_d3d12.o"
 "$cxx" "${common[@]}" -I"$imgui" -Iwindows/src/ui -c windows/src/pe/nr_d3d12_passthrough_panel.cpp \
     -o "$out/d3d12_passthrough_panel.o"
@@ -95,7 +96,7 @@ done
     -lkernel32 -static -static-libgcc -static-libstdc++
 
 objs=("$out/asi_main.o" "$out/d3d12_direct_state.o" "$out/d3d12_passthrough.o" "$out/d3d12_passthrough_backend.o"
-      "$out/d3d12_passthrough_net.o"
+      "$out/d3d12_passthrough_net.o" "$out/d3d11_d3d12_bridge.o"
       "$out/renodx_d3d12.o" "$out/d3d12_passthrough_panel.o" "$out/asi_wilsjo2.o" "$out/asi_wilsjo2_vk.o"
       "$out/nr_wilsjo2.o" "$out/asi_hudcap.o" "$out/menu.o"
       "$out"/im_*.o "$out/model.o" "$out/session.o" "$out/bridge.o" "$out/d3d12split.o" "$out/config.o" "$out/interop.o"

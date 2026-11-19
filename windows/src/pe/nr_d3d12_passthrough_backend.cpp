@@ -431,6 +431,9 @@ bool build(ID3D12Device* device, std::string* why) {
             [](IUnknown* p) { retire(p); }, why)) {
         return false;
     }
+    if (g.outer_pool->indirect_srd()) {
+        nr::pe::log("[d3d12] outer SRD staging: indirect descriptor handle mode (1-level deref verified)");
+    }
     // The ACO network, lowered by the planner the .asi sets (nr_asi_main.cpp).
     if (!net_planner()) { *why = "no network planner"; return false; }
     {

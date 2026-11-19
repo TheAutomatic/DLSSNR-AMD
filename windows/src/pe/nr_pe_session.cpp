@@ -1184,7 +1184,7 @@ struct Session::Impl {
     // The network this call wants: an NR-chain layer's own (set_call_network) when the run can serve it,
     // else [Network] Model (the switch, which also takes the hotkey: called on every call either way).
     int wanted_network() {
-        const int want = wanted_network_(net_switch.frame(root + "\\dlssnr-amd.ini"));
+        const int want = wanted_network_(net_switch.frame(nr::u8::writable_ini_path(root)));
         net_users[want][call_layer] = std::chrono::steady_clock::now();
         return want;
     }

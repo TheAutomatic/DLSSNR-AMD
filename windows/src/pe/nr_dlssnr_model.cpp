@@ -87,6 +87,8 @@ namespace {
 std::mutex g_lock;
 std::atomic<D3d12Backend> g_d3d12_backend{nullptr};   // set_d3d12_backend
 thread_local bool t_native_call = false;                 // set_d3d12_native_call
+thread_local bool t_no_vk_fallback = false;              // set_d3d12_no_vk_fallback
+thread_local bool t_backend_declined = false;            // take_d3d12_backend_declined
 std::atomic<int> g_d3d12_network{-1};
 // The D3D12 passthrough's frames, logged every 10 s as the bridge's session logs its own ("last 10 s: ... ran ...,
 // ... passed the frame through"): frames that carried NR, copy-through frames (recorded, no NR), frames passed through
@@ -205,7 +207,7 @@ nr::Preprocess preprocess_now() {
         epoch = nr::pe::config_epoch();
         next = now + 1000;
         const char* folder = nr::pe::module_folder();
-        if (*folder) file.poll(std::string(folder) + "\\dlssnr-amd.ini", config);
+        if (*folder) file.poll(nr::u8::writable_ini_path(folder), config);
     }
     return toggle.frame(config);
 }
@@ -216,7 +218,7 @@ nr::pe::RenoDXConfig renodx_now() {
     static nr::pe::RenoDXFile file;
     static nr::pe::RenoDXConfig config;
     const char* folder = nr::pe::module_folder();
-    if (*folder && file.poll(std::string(folder) + "\\dlssnr-amd.ini", config))
+    if (*folder && file.poll(nr::u8::writable_ini_path(folder), config))
         nr::pe::log("[nr] RenoDX-style option: dlssnr-amd.ini [RenoDX] read (intensity %.2f, %u pass%s, look %s, hook point %u, "
                     "colour %.2f, transfer %.2f, detail stability %u)",
                     config.values.intensity, config.values.passes, config.values.passes == 1 ? "" : "es",
@@ -1535,6 +1537,15 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
             device->Release();
             return static_cast<int>(NVSDK_NGX_Result_Success);
         }
+        if (t_no_vk_fallback) {
+            t_backend_declined = true;
+            device->Release();
+            return static_cast<int>(NVSDK_NGX_Result_Fail);
+        }
+    } else if (t_no_vk_fallback) {
+        t_backend_declined = true;
+        device->Release();
+        return static_cast<int>(NVSDK_NGX_Result_Fail);
     }
 
     // NR_DEBUG_READBACK=1: which evaluate this is, and the pair the previous one recorded.
@@ -2280,6 +2291,12 @@ void layer_changed(int layer) {
 
 void set_d3d12_backend(D3d12Backend backend) { g_d3d12_backend = backend; }
 void set_d3d12_native_call(bool on) { t_native_call = on; }
+void set_d3d12_no_vk_fallback(bool off) { t_no_vk_fallback = off; }
+bool take_d3d12_backend_declined() {
+    const bool declined = t_backend_declined;
+    t_backend_declined = false;
+    return declined;
+}
 int frame_network() {
     return g_d3d12_network.load();
 }

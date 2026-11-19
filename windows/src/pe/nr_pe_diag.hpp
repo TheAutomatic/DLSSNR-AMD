@@ -7,6 +7,7 @@
 // screenshot pair F5 takes of the current frame. Written on a thread of its own (the game keeps running); stored, not
 // compressed (no compression library in the program; a zip tool shrinks it further). Nothing is sent anywhere.
 #include "nr_path_u8.hpp"
+#include "nr_path_win.hpp"
 #include "nr_pe_log.hpp"
 
 #include <windows.h>

@@ -127,16 +127,33 @@ class Ini {
     // Written whole through a temporary and a replacing move: the DLL never reads half a file.
     void save() {
         if (!dirty_) return;
+        std::error_code ec;
+        if (const auto parent = path_.parent_path(); !parent.empty())
+            std::filesystem::create_directories(nr::u8::path(parent), ec);
         const auto tmp = path_.wstring() + L".nrcontrol";
+        bool wrote = false;
+        DWORD err = 0;
         {
             std::ofstream f(std::filesystem::path(tmp), std::ios::trunc | std::ios::binary);
-            for (const auto& l : lines_) f << l << "\r\n";
+            if (f.is_open()) {
+                for (const auto& l : lines_) f << l << "\r\n";
+                f.flush();
+                wrote = bool(f) && f.good();
+            }
+            if (!wrote) err = GetLastError();
         }
-        if (!MoveFileExW(tmp.c_str(), path_.wstring().c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
-            nr::pe::log("[nr] NR Control: could not save dlssnr-amd.ini (error %lu)", GetLastError());
+        if (!wrote) {
+            nr::pe::log("[nr] NR Control: could not write temporary dlssnr-amd.ini '%s' (error %lu)",
+                        nr::u8::narrow(tmp).c_str(), err);
+            DeleteFileW(tmp.c_str());
+        } else if (!MoveFileExW(tmp.c_str(), path_.wstring().c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            err = GetLastError();
+            nr::pe::log("[nr] NR Control: could not save dlssnr-amd.ini '%s' (error %lu)",
+                        nr::u8::narrow(path_.wstring()).c_str(), err);
+            DeleteFileW(tmp.c_str());
+        }
         dirty_ = false;
         nr::pe::touch_config();   // the DLL takes it at its next look, now
-        std::error_code ec;
         const auto t = std::filesystem::last_write_time(path_, ec);
         if (!ec) stamp_ = int64_t(t.time_since_epoch().count());
     }

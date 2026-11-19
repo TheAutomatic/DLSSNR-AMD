@@ -1817,7 +1817,7 @@ nr::arch::GpuArch gpu_manual(std::string* said) {
     static const std::pair<nr::arch::GpuArch, std::string> v = [] {
         char b[32] = {};
         nr::u8::profile("GPU", "Architecture", "auto", b, sizeof b,
-                        std::string(nr::pe::module_folder()) + "\\dlssnr-amd.ini");
+                        nr::u8::writable_ini_path(nr::pe::module_folder()));
         std::string t;
         for (const char* c = b; *c; ++c) if (!std::isspace(static_cast<unsigned char>(*c))) t += char(std::tolower(static_cast<unsigned char>(*c)));
         if (t == "rdna4") return std::make_pair(nr::arch::GpuArch::rdna4, t);
@@ -1860,10 +1860,22 @@ void write_log(FILE* f, bool enabled, bool clear) {
 
 bool restore_ini(const std::string& folder) {
     const std::string base = folder.empty() ? std::string(".") : folder;
-    const std::string ini = base + "\\dlssnr-amd.ini", copy = base + "\\dlssnr-amd\\dlssnr-amd.default.ini";
+    bool fb = false;
+    const std::string ini = nr::u8::writable_ini_path(folder, &fb);
     if (nr::u8::attributes(ini.c_str()) != INVALID_FILE_ATTRIBUTES) return false;
+    if (fb) {
+        const std::string installed = base + "\\dlssnr-amd.ini";
+        if (nr::u8::attributes(installed.c_str()) != INVALID_FILE_ATTRIBUTES &&
+            nr::u8::copy_file(installed.c_str(), ini.c_str(), TRUE)) {
+            nr::u8::clear_readonly(ini);
+            log("[nr] dlssnr-amd.ini was missing: put back from the install folder's dlssnr-amd.ini");
+            return true;
+        }
+    }
+    const std::string copy = base + "\\dlssnr-amd\\dlssnr-amd.default.ini";
     if (nr::u8::attributes(copy.c_str()) == INVALID_FILE_ATTRIBUTES || !nr::u8::copy_file(copy.c_str(), ini.c_str(), TRUE))
         return false;
+    nr::u8::clear_readonly(ini);
     log("[nr] dlssnr-amd.ini was missing: put back from dlssnr-amd\\dlssnr-amd.default.ini (the settings as installed)");
     return true;
 }
@@ -1871,7 +1883,7 @@ bool restore_ini(const std::string& folder) {
 void apply_debug_env(const std::string& folder) {
     static std::once_flag once;
     std::call_once(once, [&] {
-        const std::string ini = folder.empty() ? std::string("dlssnr-amd.ini") : folder + "\\dlssnr-amd.ini";
+        const std::string ini = nr::u8::writable_ini_path(folder);
         FILE* file = nr::u8::fopen(ini.c_str(), "r");
         if (!file) return;
         std::string section;
@@ -1915,8 +1927,13 @@ void configure_network(const std::string& folder) {
             std::fclose(file);
         }
         // The imported binaries are kept in aco-cache\ (made again when the driver or the files change).
-        const std::string cache = data + "\\aco-cache";
-        nr::u8::make_dir(cache.c_str(), nullptr);
+        bool cache_fb = false;
+        const std::string cache_root = nr::u8::writable_cache_root(data, &cache_fb);
+        const std::string cache = cache_root + "\\aco-cache";
+        nr::u8::make_dirs(cache.c_str());
+        if (cache_fb) {
+            log("[nr] cache folder '%s' is read-only; storing ACO binaries in '%s'", data.c_str(), cache.c_str());
+        }
         nr::binary::configure(bundle, {bundle + "\\shell", data + "\\shaders", data + "\\shaders\\temporal"}, cache,
                               std::move(aliases));
         log("[nr] ACO Mode: the network runs ACO's machine code from %s", bundle.c_str());
@@ -1927,7 +1944,12 @@ bool PreprocessFile::poll(const std::string& path, PreprocessConfig& out) {
     uint64_t stamp = stamp_of(path);
     if (!stamp && !tried_) {   // the installed copy first (restore_ini)
         const size_t cut = path.find_last_of("\\/");
-        if (restore_ini(cut == std::string::npos ? std::string() : path.substr(0, cut))) stamp = stamp_of(path);
+        if (restore_ini(cut == std::string::npos ? std::string() : path.substr(0, cut))) {
+            stamp = stamp_of(path);
+        } else {
+            const std::string mf = module_folder();
+            if (!mf.empty() && nr::u8::writable_ini_path(mf) == path && restore_ini(mf)) stamp = stamp_of(path);
+        }
     }
     if (!stamp) {
         if (tried_) return false;

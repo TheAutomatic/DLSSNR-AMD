@@ -3688,7 +3688,7 @@ void draw_page() {
         return;
     }
     if (!page_ini) {
-        page_ini = std::make_unique<nr::ini_edit::Ini>(config_path);
+        page_ini = std::make_unique<nr::ini_edit::Ini>(nr::u8::path(config_path));
         chain_editor = std::make_unique<nr::control_ui::ChainEditor>(*page_ini, kReShadeChain);
     }
     if (page_ini->refresh() || page_loaded < 0) { page_renodx.load(*page_ini); page_loaded = page_loaded < 0 ? 1 : page_loaded + 1; }

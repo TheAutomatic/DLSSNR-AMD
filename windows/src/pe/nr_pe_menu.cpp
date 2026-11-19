@@ -3,6 +3,7 @@
 #include "nr_vk_receipts.hpp"
 #include "nr_number.hpp"
 #include "nr_pe_menu.hpp"
+#include "nr_swapchain_arbiter.hpp"
 #include "mingw_d3d12_compat.h"
 #include "nr_control_shared.hpp"
 #include "nr_ini_network.hpp"
@@ -731,10 +732,12 @@ struct Menu {
     // (nr_control_pages.hpp) ----
     std::string report_said;
     void copy_report(const nr::control::Shared* s) {
+        const std::string mod_dir = nr::pe::module_folder();
         const std::string text = nr::control_ui::report_text(s, "dlssnr-amd.asi",
-                                                             std::string(nr::pe::module_folder()) + "\\dlssnr-amd.ini",
+                                                             mod_dir + "\\dlssnr-amd.ini",
                                                              nr::pe::log_path());
-        report_said = nr::control_ui::copy_report(text, std::string(nr::pe::module_folder()) + "\\dlssnr-amd\\nr-report.txt");
+        const std::string report_dir = nr::u8::writable_app_dir(mod_dir + "\\dlssnr-amd");
+        report_said = nr::control_ui::copy_report(text, report_dir + "\\nr-report.txt");
     }
     void draw_diagnostics(const nr::control::Shared* s) {
         static const bool diag_test = [] { const char* e = std::getenv("NR_CONTROL_DIAG_OPEN"); return e && e[0] == '1'; }();
@@ -1701,6 +1704,7 @@ std::map<void*, Kept<D3D11Overlay>> g_d3d11;
 std::map<void*, Kept<D3D12Overlay>> g_d3d12;
 constexpr std::chrono::seconds kIdle{3};
 IDXGISwapChain* g_failed_for = nullptr;   // the swap chain the menu could not be drawn on (said once)
+nr::pe::SwapChainArbiter g_sc_arbiter;
 thread_local bool t_inside = false;
 
 template <class T> void let_go_idle(std::map<void*, Kept<T>>& m, std::chrono::steady_clock::time_point now) {
@@ -1751,8 +1755,9 @@ std::atomic<ULONGLONG> g_system_drawn_ms{0};   // NR Control drawn at the system
 // null: the system's Present - the hooks run, and the menu is drawn.
 void draw_on(IDXGISwapChain* sc, UINT flags, IUnknown* known = nullptr) {
     if (g_dxgi_suppressed.load(std::memory_order_acquire)) return;
-    if (!known) ++g_presents;
     if (t_inside || (flags & DXGI_PRESENT_TEST)) return;
+    if (!known && !is_primary_swapchain(sc)) return;
+    if (!known) ++g_presents;
     t_inside = true;
     // The system's Present never waits for the menu's lock: under frame generation it is called on the generator's own
     // presenting thread, while the game's thread may hold g_mutex drawing the menu at the game's Present (draw_game, the
@@ -2241,6 +2246,16 @@ bool colour_space_of(IDXGISwapChain* swap_chain, int* space) {
 }
 
 void set_dxgi_suppressed(bool suppressed) { g_dxgi_suppressed.store(suppressed, std::memory_order_release); }
+
+bool is_primary_swapchain(IDXGISwapChain* swap_chain) {
+    nr::pe::SwapChainArbiter::ChangeInfo info{};
+    const bool ok = g_sc_arbiter.is_primary(swap_chain, &info);
+    if (info.changed && info.active_count >= 2) {
+        log("[nr] Present target: swap chain %p (%ux%u, hwnd %p) chosen among %zu active swap chains",
+            static_cast<void*>(info.sc), info.w, info.h, static_cast<void*>(info.hwnd), info.active_count);
+    }
+    return ok;
+}
 
 void install() {
     static std::once_flag once;
