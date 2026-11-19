@@ -105,7 +105,12 @@ repo artifacts/ref/reshade-shaders https://github.com/crosire/reshade-shaders.gi
 # vort_Shaders (MIT): the motion vectors of the ReShade route.
 repo artifacts/ref/vort_Shaders https://github.com/vortigern11/vort_Shaders.git \
      b410b9f0c0fbb83c8cb42164aaf1655fab386f4a
-# The Vulkan loader source is cloned by linux/build/build_vulkan_loader.sh itself.
+if [[ -d artifacts/ref/Vulkan-Loader ]]; then
+    echo "have artifacts/ref/Vulkan-Loader"
+else
+    echo "fetch artifacts/ref/Vulkan-Loader"
+    git clone -q --depth 1 --branch v1.4.357 https://github.com/KhronosGroup/Vulkan-Loader.git artifacts/ref/Vulkan-Loader
+fi
 
 # ---- binaries the packages carry unmodified ---------------------------------------------------
 # ReShade 6.8.0 with add-on support: the DLLs come out of the official installer, which is a zip.
@@ -200,15 +205,5 @@ EOF
     get artifacts/ref/dxvk/LICENSE \
         https://raw.githubusercontent.com/doitsujin/dxvk/601930949d111edbbcf9dd463948426d9f8f6ddd/LICENSE \
         a5cb1a6ded7d2d7e92d550ba28edd21be2d1d4044662b399887351023e30ce64
-    # SPIRV-Cross: the D3D12 route's own programs (NR's Preprocess, Passes (fast), debug views and the wilsjo2 style)
-    # are this package's SPIR-V turned into HLSL (windows/build/build_d3d12_hlsl.sh), which the plugin compiles in the
-    # game - one source for both routes.
-    repo toolchain/SPIRV-Cross https://github.com/KhronosGroup/SPIRV-Cross.git \
-         6c09849fe88c48eaed08413aa022aaa136a3a057                                  # vulkan-sdk-1.4.357.0
-    if [[ ! -x toolchain/SPIRV-Cross/build/spirv-cross ]]; then
-        cmake -S toolchain/SPIRV-Cross -B toolchain/SPIRV-Cross/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DSPIRV_CROSS_SHARED=OFF -DSPIRV_CROSS_STATIC=ON -DSPIRV_CROSS_CLI=ON -DSPIRV_CROSS_ENABLE_TESTS=OFF > /dev/null
-        cmake --build toolchain/SPIRV-Cross/build --target spirv-cross > /dev/null
-    fi
 fi
 echo "dependencies ready"
