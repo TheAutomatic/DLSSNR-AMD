@@ -91,6 +91,9 @@ def main():
             v = subprocess.run(['osslsigncode', 'verify', '-CAfile', cert, '-in', out], capture_output=True, text=True)
             if v.returncode != 0:
                 raise RuntimeError(f'{path}: the signature does not verify:\n{v.stdout}{v.stderr}')
+            mode = os.stat(path).st_mode
+            if not (mode & 0o200):
+                os.chmod(path, mode | 0o200)
             with open(path, 'wb') as f:   # in place (the file keeps its mode)
                 f.write(after)
             signed += 1
