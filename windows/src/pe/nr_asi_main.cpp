@@ -3360,6 +3360,7 @@ void fg_pacing_restart() {
 }
 
 void game_present_before(IDXGISwapChain* sc) {
+    if (g_vk_swap_active.load(std::memory_order_acquire)) return;
     nr::pe::watchdog::game_beat();
     nr::pe::stats::game_present();
     fg_pacing_restart();
@@ -4769,12 +4770,29 @@ struct SeenDevice {
     bool present_fences = false;
     bool translator = false;   // made by vkd3d-proton or DXVK (a D3D device's, e.g. OptiScaler's own D3D12 one)
 };
+// Module whose NVSDK_NGX_VULKAN_Init* call we saw directly (fallback for older RTX Remix without remixapi exports).
+std::atomic<HMODULE> g_ngx_vk_client{nullptr};
+// Fast export check so RTX Remix's Vulkan-backed d3d9.dll (which exposes remixapi_*) is recognized at device creation
+// and frame 0 without ever relaxing ordinary DXVK d3d9.dll / translator blocking.
+bool is_rtx_remix_module(HMODULE m) {
+    if (!m) return false;
+    return GetProcAddress(m, "remixapi_InitializeLibrary") != nullptr ||
+           GetProcAddress(m, "writeRemixCategoriesSchemaUsda") != nullptr ||
+           GetProcAddress(m, "remixinternal_GetNrcStatus") != nullptr ||
+           GetProcAddress(m, "RtxSentryShutdown") != nullptr;
+}
+bool is_vulkan_ngx_engine(HMODULE m) {
+    if (!m) return false;
+    const HMODULE client = g_ngx_vk_client.load(std::memory_order_acquire);
+    return (client && m == client) || is_rtx_remix_module(m);
+}
 // Whether `address` (a vkCreateDevice caller) is in vkd3d-proton's or DXVK's modules.
 bool in_translator(void* address) {
     HMODULE m = nullptr;
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                             reinterpret_cast<LPCWSTR>(address), &m) || !m)
         return false;
+    if (is_vulkan_ngx_engine(m)) return false;
     for (const wchar_t* name : {L"d3d12core.dll", L"d3d12.dll", L"d3d11.dll", L"dxgi.dll", L"d3d10core.dll", L"d3d9.dll"})
         if (HMODULE t = GetModuleHandleW(name); t && t == m) return true;
     return false;
@@ -4801,15 +4819,22 @@ using PFN_VkInitProject = NVSDK_NGX_Result(NR_NGX_MSABI*)(const char*, int, cons
 // the chaos / fallback gate NR_TEST_DEVICE_UNSEEN found NR not running.)
 PFN_VkInit real_vk_init[3] = {};
 PFN_VkInitProject real_vk_init_project[2] = {};
-void note_ngx_vk(VkInstance instance, VkPhysicalDevice physical, VkDevice device) {
+void note_ngx_vk(VkInstance instance, VkPhysicalDevice physical, VkDevice device, void* caller = nullptr) {
     if (!instance || !physical || !device) return;
+    if (caller) {
+        HMODULE cm = nullptr;
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCWSTR>(caller), &cm) &&
+            cm && cm != g_opti && cm != g_self)
+            g_ngx_vk_client.store(cm, std::memory_order_release);
+    }
     std::lock_guard<std::mutex> guard(g_devices_lock);
     g_ngx_vk.instance = instance; g_ngx_vk.physical = physical; g_ngx_vk.device = device;
 }
 template <int K>
 NVSDK_NGX_Result NR_NGX_MSABI hk_vk_init(unsigned long long app, const wchar_t* path, VkInstance instance, VkPhysicalDevice physical,
                                         VkDevice device, uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d) {
-    note_ngx_vk(instance, physical, device);
+    note_ngx_vk(instance, physical, device, __builtin_return_address(0));
     return real_vk_init[K](app, path, instance, physical, device, a, b, c, d);
 }
 template <int K>
@@ -4817,7 +4842,7 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_vk_init_project(const char* project, int engine
                                                 VkInstance instance, VkPhysicalDevice physical, VkDevice device, uintptr_t a,
                                                 uintptr_t b, uintptr_t c, uintptr_t d) {
     g_ngx_engine.store(engine);
-    note_ngx_vk(instance, physical, device);
+    note_ngx_vk(instance, physical, device, __builtin_return_address(0));
     return real_vk_init_project[K](project, engine, version, path, instance, physical, device, a, b, c, d);
 }
 
@@ -7052,24 +7077,38 @@ bool game_caller(void* address) {
         g_game_present_ms = now;
         return true;
     };
-    if (m == last) return served(last_game, last_wrapper);
-    bool game = m != g_opti && m != g_self && !in_translator(address), wrapper = false;
-    if (game) {
-        wchar_t path[MAX_PATH] = {};
-        GetModuleFileNameW(m, path, MAX_PATH);
-        std::wstring name = path;
-        const size_t slash = name.find_last_of(L"\\/");
-        if (slash != std::wstring::npos) name = name.substr(slash + 1);
-        for (wchar_t& c : name) c = wchar_t(std::towlower(c));
-        // by name too: DXVK's / vkd3d-proton's DLLs share their names with OptiScaler's proxy (in_translator finds the
-        // first module of a name only)
-        for (const wchar_t* not_game : {L"fidelityfx", L"ffx", L"sl.", L"nvngx", L"libxess", L"vulkan-1", L"dxgi", L"d3d9",
-                                        L"d3d10", L"d3d11", L"d3d12", L"dxvk", L"vkd3d"})
-            if (name.find(not_game) != std::wstring::npos) game = false;
-        if (!game) {   // a frame generator's or Streamline's only (not a translator's name): may be the game's path
-            wrapper = true;
-            for (const wchar_t* translator : {L"vulkan-1", L"dxgi", L"d3d9", L"d3d10", L"d3d11", L"d3d12", L"dxvk", L"vkd3d"})
-                if (name.find(translator) != std::wstring::npos) wrapper = false;
+    if (m == last && (last_game || m != g_ngx_vk_client.load(std::memory_order_relaxed)))
+        return served(last_game, last_wrapper);
+    const bool vk_ngx_engine = (m != g_opti && m != g_self) && is_vulkan_ngx_engine(m);
+    bool game = false, wrapper = false;
+    if (vk_ngx_engine) {
+        game = true;
+        static std::atomic<HMODULE> logged_ngx_engine{nullptr};
+        if (logged_ngx_engine.exchange(m, std::memory_order_relaxed) != m) {
+            wchar_t path[MAX_PATH] = {};
+            GetModuleFileNameW(m, path, MAX_PATH);
+            log("[nr] Vulkan presents: RTX Remix / Vulkan-NGX module %s accepted as the game's present path",
+                nr::u8::narrow(path).c_str());
+        }
+    } else {
+        game = m != g_opti && m != g_self && !in_translator(address);
+        if (game) {
+            wchar_t path[MAX_PATH] = {};
+            GetModuleFileNameW(m, path, MAX_PATH);
+            std::wstring name = path;
+            const size_t slash = name.find_last_of(L"\\/");
+            if (slash != std::wstring::npos) name = name.substr(slash + 1);
+            for (wchar_t& c : name) c = wchar_t(std::towlower(c));
+            // by name too: DXVK's / vkd3d-proton's DLLs share their names with OptiScaler's proxy (in_translator finds the
+            // first module of a name only)
+            for (const wchar_t* not_game : {L"fidelityfx", L"ffx", L"sl.", L"nvngx", L"libxess", L"vulkan-1", L"dxgi", L"d3d9",
+                                            L"d3d10", L"d3d11", L"d3d12", L"dxvk", L"vkd3d"})
+                if (name.find(not_game) != std::wstring::npos) game = false;
+            if (!game) {   // a frame generator's or Streamline's only (not a translator's name): may be the game's path
+                wrapper = true;
+                for (const wchar_t* translator : {L"vulkan-1", L"dxgi", L"d3d9", L"d3d10", L"d3d11", L"d3d12", L"dxvk", L"vkd3d"})
+                    if (name.find(translator) != std::wstring::npos) wrapper = false;
+            }
         }
     }
     last = m;
