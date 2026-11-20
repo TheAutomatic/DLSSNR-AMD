@@ -32,6 +32,7 @@
 #include "nr_renodx.hpp"
 #include "nr_renodx_d3d12.hpp"
 #include "nr_swapchain_arbiter.hpp"
+#include "ui/nr_ini_edit.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -2155,11 +2156,129 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+        bool fb_ini_w = true;
+        const std::string wi = nr::u8::writable_ini_path(wdir, &fb_ini_w);
+        if (fb_ini_w || wi != (wdir + "\\dlssnr-amd.ini")) {
+            std::fprintf(stderr, "FAIL: Case I writable_ini_path fell back on writable dir (%d, '%s')\n",
+                         fb_ini_w ? 1 : 0, wi.c_str());
+            return 1;
+        }
+        bool fb_ini_ro = false;
+        const std::string ri = nr::u8::writable_ini_path(ro_dir, &fb_ini_ro);
+        const std::string ri2 = nr::u8::writable_ini_path(ro_dir, &fb_ini_ro);
+        if (!fb_ini_ro || ri != ri2 || ri != (ra + "\\dlssnr-amd.ini")) {
+            std::fprintf(stderr, "FAIL: Case I writable_ini_path fallback failed (fb=%d ri='%s' exp='%s\\dlssnr-amd.ini')\n",
+                         fb_ini_ro ? 1 : 0, ri.c_str(), ra.c_str());
+            return 1;
+        }
+
+        // Verify seed_writable_ini seeds from read-only source, clears FILE_ATTRIBUTE_READONLY,
+        // works with nr::ini_edit::Ini::save(), and does not overwrite existing edited settings.
+        const std::string seed_src = base + "\\seed_src";
+        const std::string src_ini = seed_src + "\\dlssnr-amd.ini";
+        if (!nr::u8::make_dirs(seed_src.c_str())) {
+            std::fprintf(stderr, "FAIL: Case I seed_src dir setup\n");
+            return 1;
+        }
+        if (FILE* sf = nr::u8::fopen(src_ini.c_str(), "wb")) {
+            std::fputs("[Network]\r\nModel = CC_SMALL_FP8_EXPERIMENTAL\r\n", sf);
+            std::fclose(sf);
+        } else {
+            std::fprintf(stderr, "FAIL: Case I seed_src ini create\n");
+            return 1;
+        }
+        SetFileAttributesW(nr::u8::wide(src_ini).c_str(), FILE_ATTRIBUTE_READONLY);
+        DeleteFileW(nr::u8::wide(ri).c_str());
+        if (!nr::u8::seed_writable_ini(seed_src, ri)) {
+            std::fprintf(stderr, "FAIL: Case I seed_writable_ini failed for '%s' -> '%s'\n",
+                         src_ini.c_str(), ri.c_str());
+            return 1;
+        }
+        const DWORD dst_attr = nr::u8::attributes(ri);
+        if (dst_attr == INVALID_FILE_ATTRIBUTES || (dst_attr & FILE_ATTRIBUTE_READONLY) != 0) {
+            std::fprintf(stderr, "FAIL: Case I seeded ini invalid or still read-only (0x%lx)\n",
+                         static_cast<unsigned long>(dst_attr));
+            return 1;
+        }
+        char mod_buf[96]{};
+        nr::u8::profile("Network", "Model", "", mod_buf, sizeof(mod_buf), ri);
+        if (std::strcmp(mod_buf, "CC_SMALL_FP8_EXPERIMENTAL") != 0) {
+            std::fprintf(stderr, "FAIL: Case I seeded ini model='%s' expected CC_SMALL_FP8_EXPERIMENTAL\n", mod_buf);
+            return 1;
+        }
+        {
+            nr::ini_edit::Ini editor{nr::u8::path(ri)};
+            if (!editor.refresh()) {
+                std::fprintf(stderr, "FAIL: Case I Ini::refresh failed on '%s'\n", ri.c_str());
+                return 1;
+            }
+            editor.set("Network", "Model", "CC_SILVER_AARDWOLD_OPTIMIZED");
+            editor.save();
+        }
+        nr::u8::profile("Network", "Model", "", mod_buf, sizeof(mod_buf), ri);
+        if (std::strcmp(mod_buf, "CC_SILVER_AARDWOLD_OPTIMIZED") != 0) {
+            std::fprintf(stderr, "FAIL: Case I Ini::save did not persist Model='%s'\n", mod_buf);
+            return 1;
+        }
+        if (nr::u8::seed_writable_ini(seed_src, ri)) {
+            std::fprintf(stderr, "FAIL: Case I seed_writable_ini overwrote existing ini '%s'\n", ri.c_str());
+            return 1;
+        }
+        nr::u8::profile("Network", "Model", "", mod_buf, sizeof(mod_buf), ri);
+        if (std::strcmp(mod_buf, "CC_SILVER_AARDWOLD_OPTIMIZED") != 0) {
+            std::fprintf(stderr, "FAIL: Case I edited ini was clobbered after second seed ('%s')\n", mod_buf);
+            return 1;
+        }
+
+        // Verify fallback seeding from dlssnr-amd\dlssnr-amd.default.ini when dlssnr-amd.ini is absent.
+        const std::string seed_def_src = base + "\\seed_def_src";
+        const std::string seed_def_sub = seed_def_src + "\\dlssnr-amd";
+        const std::string seed_def_ini = seed_def_sub + "\\dlssnr-amd.default.ini";
+        const std::string ri_def = ra + "\\dlssnr-amd.default-test.ini";
+        if (!nr::u8::make_dirs(seed_def_sub.c_str())) {
+            std::fprintf(stderr, "FAIL: Case I seed_def_sub dir setup\n");
+            return 1;
+        }
+        if (FILE* df = nr::u8::fopen(seed_def_ini.c_str(), "wb")) {
+            std::fputs("[Network]\r\nModel = CC_SILVER_AARDWOLD\r\n", df);
+            std::fclose(df);
+        } else {
+            std::fprintf(stderr, "FAIL: Case I seed_def_ini create\n");
+            return 1;
+        }
+        SetFileAttributesW(nr::u8::wide(seed_def_ini).c_str(), FILE_ATTRIBUTE_READONLY);
+        DeleteFileW(nr::u8::wide(ri_def).c_str());
+        if (!nr::u8::seed_writable_ini(seed_def_src, ri_def)) {
+            std::fprintf(stderr, "FAIL: Case I default.ini fallback seed failed\n");
+            return 1;
+        }
+        const DWORD def_dst_attr = nr::u8::attributes(ri_def);
+        if (def_dst_attr == INVALID_FILE_ATTRIBUTES || (def_dst_attr & FILE_ATTRIBUTE_READONLY) != 0) {
+            std::fprintf(stderr, "FAIL: Case I seeded default ini invalid or still read-only (0x%lx)\n",
+                         static_cast<unsigned long>(def_dst_attr));
+            return 1;
+        }
+        nr::u8::profile("Network", "Model", "", mod_buf, sizeof(mod_buf), ri_def);
+        if (std::strcmp(mod_buf, "CC_SILVER_AARDWOLD") != 0) {
+            std::fprintf(stderr, "FAIL: Case I default.ini model='%s' expected CC_SILVER_AARDWOLD\n", mod_buf);
+            return 1;
+        }
+
+        DeleteFileW(nr::u8::wide(ri_def).c_str());
+        DeleteFileW(nr::u8::wide(ri).c_str());
+        RemoveDirectoryW(nr::u8::wide(ra).c_str());
+        nr::u8::clear_readonly(seed_def_ini);
+        DeleteFileW(nr::u8::wide(seed_def_ini).c_str());
+        RemoveDirectoryW(nr::u8::wide(seed_def_sub).c_str());
+        RemoveDirectoryW(nr::u8::wide(seed_def_src).c_str());
+        nr::u8::clear_readonly(src_ini);
+        DeleteFileW(nr::u8::wide(src_ini).c_str());
+        RemoveDirectoryW(nr::u8::wide(seed_src).c_str());
         DeleteFileW(nr::u8::wide(blocker).c_str());
         RemoveDirectoryW(nr::u8::wide(wdir).c_str());
         RemoveDirectoryW(nr::u8::wide(base).c_str());
-        std::printf("[PASS] Case I: Writable directory fallback verified (cache='%s', app='%s')\n",
-                    rc.c_str(), ra.c_str());
+        std::printf("[PASS] Case I: Writable directory & ini fallback verified (cache='%s', app='%s', ini='%s')\n",
+                    rc.c_str(), ra.c_str(), ri.c_str());
     }
 
     // ---- Case J: D3D11 -> D3D12 Synchronous Bridge + RenoDX+NR Evaluation + LRU Slots + No-Deadlock Guard ----

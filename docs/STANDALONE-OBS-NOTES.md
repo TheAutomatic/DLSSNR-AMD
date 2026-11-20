@@ -1,6 +1,6 @@
-# 独立模式 / OBS 调试与只读目录 `dlssnr-amd.ini` 故障排查说明（WIP）
+# 独立模式 / OBS 调试与只读目录 `dlssnr-amd.ini` 修复说明
 
-本文档记录在非管理员权限下于只读安装目录（`C:\Program Files\obs-studio\bin\64bit\obs64.exe`）运行 `dlssnr-amd.asi`（Standalone + `dxgi-standalone.dll`）时的已完成修复、当前新定位到的问题，以及尚未改完的 WIP 状态。
+本文档记录在非管理员权限下于只读安装目录（`C:\Program Files\obs-studio\bin\64bit\obs64.exe`）运行 `dlssnr-amd.asi`（Standalone + `dxgi-standalone.dll`）时的已完成修复、只读 `dlssnr-amd.ini` 问题定位与修复完成情况。
 
 ---
 
@@ -26,7 +26,7 @@
 
 ---
 
-## 二、已定位但尚未改完的问题：只读目录下在 NR Control 切模型不生效
+## 二、已定位并修复的问题：只读目录下在 NR Control 切模型不生效
 
 ### 1. 问题现象
 在 OBS 中打开 `NR Control` 切换模型（例如从 `CC_SMALL_FP8_EXPERIMENTAL` 切换为其它模型）时，界面下拉框看似已经改变，但实际推理仍然一直在跑之前的 `small` 模型。
@@ -48,31 +48,32 @@
 
 ---
 
-## 三、当前分支 WIP 改动进度（尚未改完，未重新编译与验证）
+## 三、修复实现与验证状态
 
-本次暂停时，只读 `dlssnr-amd.ini` 重定向方案**仅完成了前半部分修改**，因此当前提交为 **WIP（未完成、未重新编译、未跑验证）**：
+已将全链路 `dlssnr-amd.ini` 读写及辅助诊断输出统一路由至 `nr::u8::writable_ini_path()` / `nr::u8::writable_app_dir()`，确保在只读安装目录下首次从安装目录播种复制后保留用户编辑、不覆写既有设置，并在正常可写目录保持原有行为不变。
 
-### 已修改部分
-- `windows/src/core/nr_path_win.hpp`：新增 `clear_readonly()`、`seed_writable_ini()`、`writable_ini_path()`。
-- `windows/src/ui/nr_ini_edit.hpp`：加固 `Ini::save()`（确保父目录存在、检查流写入状态、区分写临时文件与 `MoveFileExW` 错误并清理残留 `.nrcontrol`）。
-- `windows/src/core/nr_runtime.cpp`：新增 `writable_ini_file()`，已替换全部 5 处 `dlssnr-amd.ini` 路径构造。
-- `windows/src/pe/nr_pe_log.cpp`：`read_settings()` 已改用 `nr::u8::writable_ini_path()`。
-- `windows/src/pe/nr_pe_config.cpp`：`gpu_manual()`、`restore_ini()`、`apply_debug_env()`、`PreprocessFile::poll()` 已改用 `nr::u8::writable_ini_path()` 并清除复制后的只读属性。
-- `windows/src/pe/nr_pe_control.cpp`：`read_pass_key()` 已改用 `nr::u8::writable_ini_path()`。
-- `windows/src/pe/nr_dlssnr_model.cpp`：`preprocess_now()` 与 `renodx_now()` 已改用 `nr::u8::writable_ini_path()`。
-- **仅局部修改的文件**：
-  - `windows/src/pe/nr_pe_session.cpp`：已改 `wanted_network()`；`carry()` 中的 `resize history` 尚未改。
-  - `windows/src/pe/nr_asi_main.cpp`：已改 `chain_now()`；`hud_capture_wanted_at_start()` 与 `InitializeASI()` 尚未改。
-  - `windows/src/pe/nr_reshade_addon.cpp`：已改 `draw_page()` 的 `Ini` 构造；`DllMain()` 与 `page_test_writes()` 尚未改。
-  - `windows/src/pe/nr_pe_diag.hpp`、`windows/src/pe/nr_d3d12_passthrough.cpp`、`windows/src/pe/nr_pe_optifix.cpp`：目前仅添加了 `#include "nr_path_win.hpp"`，调用点尚未替换。
+### 完整修改清单
+1. `windows/src/core/nr_path_win.hpp`：新增 `clear_readonly()`、`seed_writable_ini()`、`writable_ini_path()`（线程安全缓存、只读回退 `%LOCALAPPDATA%\DLSSNR-AMD\apps\<tag>\dlssnr-amd.ini`、首次按 `dlssnr-amd.ini` → `dlssnr-amd\dlssnr-amd.default.ini` 顺序播种并清除 `FILE_ATTRIBUTE_READONLY`）。
+2. `windows/src/ui/nr_ini_edit.hpp`：加固 `Ini::save()`（自动创建父目录、检查流写入状态并区分写 `.nrcontrol` 临时文件与 `MoveFileExW` 失败日志、失败时清理临时文件）。
+3. `windows/src/core/nr_runtime.cpp`：新增 `writable_ini_file()`，替换全部 5 处 `dlssnr-amd.ini` 路径读取。
+4. `windows/src/pe/nr_pe_log.cpp`：`read_settings()` 改用 `nr::u8::writable_ini_path()`。
+5. `windows/src/pe/nr_pe_config.cpp`：`gpu_manual()`、`restore_ini()`、`apply_debug_env()`、`PreprocessFile::poll()` 统一改用 `nr::u8::writable_ini_path()` 并清除复制后的只读属性。
+6. `windows/src/pe/nr_pe_control.cpp`：`read_pass_key()` 改用 `nr::u8::writable_ini_path()`。
+7. `windows/src/pe/nr_dlssnr_model.cpp`：`preprocess_now()` 与 `renodx_now()` 改用 `nr::u8::writable_ini_path()`。
+8. `windows/src/pe/nr_pe_session.cpp`：`wanted_network()` 与 `carry()`（`"resize history"`）改用 `nr::u8::writable_ini_path()`。
+9. `windows/src/pe/nr_asi_main.cpp`：`chain_now()`、`hud_capture_wanted_at_start()` 改用 `nr::u8::writable_ini_path()`，`InitializeASI()` 在回退时输出重定向日志。
+10. `windows/src/pe/nr_d3d12_passthrough.cpp`：`start()` 的 `g_ini` 改用 `nr::u8::writable_ini_path()`。
+11. `windows/src/pe/nr_pe_optifix.cpp`：`find_locks` 线程与 `fix_optiscaler()` 改用 `nr::u8::writable_ini_path()`。
+12. `windows/src/pe/nr_pe_menu.cpp`：`Menu::ini`、`marks_chain_file.poll`、`menu_key()`、`copy_report()`、`diag_request()`、`report_every`、`install_now()` 及 `nr-report-series.txt` 统一改用 `nr::u8::writable_ini_path()` / `nr::u8::writable_app_dir()`，移除未使用的 `game_dir()`。
+13. `windows/src/pe/nr_pe_diag.hpp`：诊断 zip 输出至 `writable_app_dir()`，优先打包活动的 `writable_ini_path()`（回退时跳过安装目录旧 `dlssnr-amd.ini`）、`nr-report.txt` 与可写目录下的截图。
+14. `windows/src/pe/nr_reshade_addon.cpp`：`DllMain()`、`draw_page()`、`page_test_writes()` 与 `Copy a report` 统一改用 `nr::u8::writable_ini_path()` / `nr::u8::writable_app_dir()`。
+15. `windows/tools/test_d3d12_direct_r33.cpp`：扩展 Case I，验证可写/只读目录 `writable_ini_path` 行为、只读源 `seed_writable_ini` 清除 `FILE_ATTRIBUTE_READONLY`、`Ini::save()` 持久化、不覆盖用户已编辑模型、以及 `dlssnr-amd.default.ini` 回退播种。
 
-### 待完成清单
-1. `windows/src/pe/nr_pe_menu.cpp`：将 `Menu::ini`、`marks_chain_file.poll`、`menu_key()`、`copy_report()`、`diag_request()`、`report_every`、`install_now()` 及 `nr-report-series.txt` 统一改用 `writable_ini_path()` / `writable_app_dir()`。
-2. `windows/src/pe/nr_pe_diag.hpp`：诊断包输出目录改用 `writable_app_dir()`，并优先打包活动的 `writable_ini_path()`（回退时跳过安装目录旧 `dlssnr-amd.ini`）、`nr-report.txt` 与可写目录下的截图。
-3. `windows/src/pe/nr_asi_main.cpp`：更新 `hud_capture_wanted_at_start()`，并在 `InitializeASI()` 打印 `dlssnr-amd.ini` 重定向提示日志。
-4. `windows/src/pe/nr_pe_session.cpp`：更新 `carry()` 中的 `"resize history"` 读取路径。
-5. `windows/src/pe/nr_d3d12_passthrough.cpp`：更新 `start()` 中的 `g_ini = nr::u8::writable_ini_path(...)`。
-6. `windows/src/pe/nr_pe_optifix.cpp`：更新 `find_locks` 线程与 `fix_optiscaler()` 中的 `dlssnr-amd.ini` 路径。
-7. `windows/src/pe/nr_reshade_addon.cpp`：更新 `DllMain()` 的 `config_path` 与 `page_test_writes()`。
-8. `windows/tools/test_d3d12_direct_r33.cpp`：在 Case I 增加 `writable_ini_path` / `seed_writable_ini` / `Ini::save()` 持久化与不覆盖用户编辑的回归测试。
-9. **完整编译与验证**：运行 `check_paths.sh`、`NR_TOOLS=1 bash windows/build/build_asi.sh artifacts/windows/asi`、OptiScaler/ReShade 相关编译检查、PE 导入表检查、`test_d3d12_direct_r33.exe`（Cases A–K），并在 OBS 只读目录下实测切换模型。
+### 已完成的本地验证
+- `bash windows/build/check_paths.sh` → `check_paths: OK`
+- `bash windows/build/check_imgui.sh` → `check_imgui: OK`
+- `NR_TOOLS=1 bash windows/build/build_asi.sh artifacts/windows/asi` → 退出码 0（`dlssnr-amd.asi` 12,674,874 bytes）
+- `x86_64-w64-mingw32-objdump -p artifacts/windows/asi/dlssnr-amd.asi` → PE 导入表严格保持为 `ADVAPI32.dll`、`KERNEL32.dll`、`msvcrt.dll`、`ole32.dll`、`SHELL32.dll`、`USER32.dll`、`VERSION.dll`（无静态 `vulkan-1.dll` / `d3dcompiler_47.dll`）
+- OptiScaler / ReShade 路由编译检查：`nr_pe_optifix.cpp`（`optifix-OK`）、`nr_pe_menu.cpp`（`opti-menu-OK`）、`nr_reshade_addon.cpp`（`reshade-addon-OK`）均通过
+- `artifacts/bench-pkg/test_d3d12_direct_r33.exe`（同步自 `artifacts/windows/asi/`）→ 退出码 0，Cases `A`、`B`、`B2`、`D01`（RDNA4 & RDNA3）、`C`、`D`、`E`、`F`、`F2`、`G`、`H`、`I`、`J`、`K` 全部 `[PASS]`
+- **待用户实机确认**：将新编译的 `artifacts/windows/asi/dlssnr-amd.asi` 覆盖到 `C:\Program Files\obs-studio\bin\64bit\` 后，在 OBS 中于 `NR Control` 切换模型，确认日志不再出现 `could not save dlssnr-amd.ini` 且后台触发目标模型构建并切换生效。

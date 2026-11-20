@@ -408,7 +408,7 @@ void set_gfx11_mach(uint32_t mach) { g_gfx11_mach = mach; }
 Canary canary() { return Canary(g_canary.load()); }
 
 void start() {
-    g_ini = std::string(nr::pe::module_folder()) + "\\dlssnr-amd.ini";
+    g_ini = nr::u8::writable_ini_path(nr::pe::module_folder());
     g_enabled = read_enabled(g_ini, kDefaultEnabled);
     log("[d3d12] D3D12 passthrough %s (dlssnr-amd.ini [%s] Enabled = %d)", g_enabled ? "on" : "off", kSection,
         g_enabled ? 1 : 0);

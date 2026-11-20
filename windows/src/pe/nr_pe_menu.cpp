@@ -103,7 +103,6 @@ template <class T> void release(T*& p) {
 
 nr::control::Shared* shared() { return nr::pe::control::page(); }
 
-std::filesystem::path game_dir() { return std::filesystem::path(nr::pe::module_folder()); }
 // The menus' language files (nr_lang.hpp)
 std::string lang_folder() { return std::string(nr::pe::module_folder()) + "\\dlssnr-amd\\lang"; }
 
@@ -294,7 +293,7 @@ std::atomic<bool> g_game_frame_new{false};
 struct Menu {
     ImGuiContext* context{};
     std::chrono::steady_clock::time_point previous = std::chrono::steady_clock::now();
-    Ini ini{game_dir() / "dlssnr-amd.ini"};
+    Ini ini{nr::u8::path(nr::u8::writable_ini_path(nr::pe::module_folder()))};
     KeyValues renodx;            // [RenoDX]: NR on / off and the screenshot keys (all layers)
     // the NR chain's list and the selected layer's page (nr_control_pages.hpp); the selected layer's number at start:
     // NR_CONTROL_LAYER=<n>, for tests
@@ -524,7 +523,7 @@ struct Menu {
         marks = nr::control_ui::inspect_marks(ini);
         const std::string v = ini.get("Inspect", "SpatialOutlines", "0");
         if (v != "1" && v != "true") return;
-        marks_chain_file.poll(std::string(nr::pe::module_folder()) + "\\dlssnr-amd.ini", marks_chain);
+        marks_chain_file.poll(nr::u8::writable_ini_path(nr::pe::module_folder()), marks_chain);
         const int chosen = std::max(1, marks_chain.inspect.layer);   // the final picture: the first layer's
         for (const nr::pe::LayerConfig& l : marks_chain.layers) {
             if (!l.enabled || std::max(l.number, 1) != chosen || l.processing != nr::pe::Processing::kWilsjo2) continue;
@@ -679,7 +678,7 @@ struct Menu {
             if (menu_key_read && now - menu_key_read < 1000) return;
             menu_key_read = now;
             char v[64] = {};
-            const std::string path = std::string(nr::pe::module_folder()) + "\\dlssnr-amd.ini";
+            const std::string path = nr::u8::writable_ini_path(nr::pe::module_folder());
             nr::u8::profile("NRControl", "MenuKey", "End", v, sizeof v, path.c_str());
             text = v;
         }
@@ -734,7 +733,7 @@ struct Menu {
     void copy_report(const nr::control::Shared* s) {
         const std::string mod_dir = nr::pe::module_folder();
         const std::string text = nr::control_ui::report_text(s, "dlssnr-amd.asi",
-                                                             mod_dir + "\\dlssnr-amd.ini",
+                                                             nr::u8::writable_ini_path(mod_dir),
                                                              nr::pe::log_path());
         const std::string report_dir = nr::u8::writable_app_dir(mod_dir + "\\dlssnr-amd");
         report_said = nr::control_ui::copy_report(text, report_dir + "\\nr-report.txt");
@@ -766,7 +765,7 @@ struct Menu {
         nr::pe::diag::Request r;
         r.game = nr::u8::path(nr::pe::module_folder());
         r.log = nr::u8::path(nr::pe::log_path());
-        r.report = nr::control_ui::report_text(s, "dlssnr-amd.asi", std::string(nr::pe::module_folder()) + "\\dlssnr-amd.ini",
+        r.report = nr::control_ui::report_text(s, "dlssnr-amd.asi", nr::u8::writable_ini_path(nr::pe::module_folder()),
                                                nr::pe::log_path());
         r.gpu = nr::pe::vkdevice::gpu_name();
         r.driver = nr::pe::vkdevice::driver_name();
@@ -1013,10 +1012,11 @@ struct Menu {
         static const int report_every = [] { const char* e = std::getenv("NR_CONTROL_REPORT_EVERY"); return e ? std::atoi(e) : 0; }();
         static int draws = 0;
         if (report_every > 0 && ++draws % report_every == 0) {
+            const std::string mod_dir = nr::pe::module_folder();
             const std::string text = nr::control_ui::report_text(s, "dlssnr-amd.asi",
-                                                                 std::string(nr::pe::module_folder()) + "\\dlssnr-amd.ini",
+                                                                 nr::u8::writable_ini_path(mod_dir),
                                                                  nr::pe::log_path());
-            if (FILE* f = nr::u8::fopen((std::string(nr::pe::module_folder()) + "\\nr-report-series.txt").c_str(), "ab")) {
+            if (FILE* f = nr::u8::fopen((nr::u8::writable_app_dir(mod_dir) + "\\nr-report-series.txt").c_str(), "ab")) {
                 std::fprintf(f, "--- draw %d\n%s\n", draws, text.c_str());
                 std::fclose(f);
             }
@@ -1972,7 +1972,7 @@ void install_now() {
     const std::string folder = nr::pe::module_folder();
     {
         char v[16] = {};
-        const std::string ini_path = folder + "\\dlssnr-amd.ini";
+        const std::string ini_path = nr::u8::writable_ini_path(folder);
         nr::u8::profile("NRControl", "SystemPresentHook", "1", v, sizeof v, ini_path.c_str());
         if (v[0] == '0' && v[1] == '\0') {
             say("[NRControl] SystemPresentHook = 0 in dlssnr-amd.ini; skipping System32\\dxgi.dll Present hooks");

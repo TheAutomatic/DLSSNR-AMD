@@ -2939,7 +2939,7 @@ bool Session::Impl::carry(VkCommandBuffer cmd, uint64_t feature) {
     const auto now = std::chrono::steady_clock::now();
     if (now - resize_history_read > std::chrono::seconds(1)) {
         resize_history_read = now;
-        std::string v = nr::ini_network_key(root + "\\dlssnr-amd.ini", "resize history");
+        std::string v = nr::ini_network_key(nr::u8::writable_ini_path(root), "resize history");
         for (auto& c : v) c = char(std::tolower(static_cast<unsigned char>(c)));
         const bool on = v == "1" || v == "true" || v == "on" || v == "yes";
         if (on != resize_history)

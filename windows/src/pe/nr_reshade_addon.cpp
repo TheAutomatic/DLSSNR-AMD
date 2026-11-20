@@ -3938,7 +3938,7 @@ void draw_page() {
                     const std::string folder = nr::pe::module_folder();
                     report_said = nr::control_ui::copy_report(
                         nr::control_ui::report_text(&view, "dlssnr_amd.addon", config_path, nr::pe::log_path()),
-                        folder + "\\dlssnr-amd\\nr-report.txt");
+                        nr::u8::writable_app_dir(folder + "\\dlssnr-amd") + "\\nr-report.txt");
                 }
                 nr::control_ui::help("For a bug report: the layers as they run, their engine data, the video memory and its "
                                      "residency, the events above, dlssnr-amd.ini and the last lines of dlssnr-amd.log, as text. "
@@ -4027,7 +4027,7 @@ void page_window() {
 }
 void page_test_writes() {
     if (!page_ini && !config_path.empty()) {
-        page_ini = std::make_unique<nr::ini_edit::Ini>(config_path);
+        page_ini = std::make_unique<nr::ini_edit::Ini>(nr::u8::path(config_path));
         chain_editor = std::make_unique<nr::control_ui::ChainEditor>(*page_ini, kReShadeChain);
     }
     if (page_ini) {
@@ -4282,7 +4282,9 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         nr::pe::watchdog::start();
         const std::string folder = nr::pe::module_folder();
         if (!folder.empty()) {
-            config_path = folder + "\\dlssnr-amd.ini";
+            bool ini_fb = false;
+            config_path = nr::u8::writable_ini_path(folder, &ini_fb);
+            if (ini_fb) log("[nr] settings folder '%s' is read-only; using '%s'", folder.c_str(), config_path.c_str());
             nr::pe::restore_ini(folder);   // a deleted dlssnr-amd.ini: the installed one, before it is read
             config.load(config_path);
             {   // HUD FIX at the start: its capture events only for Auto / Captured (registered below)
