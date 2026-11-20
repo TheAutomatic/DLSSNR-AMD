@@ -23,6 +23,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -257,6 +258,7 @@ void retire(IUnknown* p) {
     g.retired.push_back({int64_t(g.frames), g.uses_now(), p});
 }
 void release_generation(Backend& b);
+void release_renodx_feature_internal(uint64_t feature, bool clear_latch);
 
 // Has this backend frame's own recording finished? Frames without a Recording (the harness's early frames, a device
 // the split never hooked) fall back to the token watermark.
@@ -332,7 +334,7 @@ void sweep() {
     // accumulate one entry per frame for the life of the device.
     for (size_t i = 0; i < g.recordings.size();) {
         const bool dropped = g.recordings[i].rec && g.recordings[i].rec->never_submitted();
-        if (dropped) release_renodx_feature(g.recordings[i].feature);   // closed, never executed: history ends
+        if (dropped) release_renodx_feature_internal(g.recordings[i].feature, false);   // closed, never executed: history ends
         if (!g.recordings[i].rec || dropped || nr::pe::d3d12_direct::completed(g.recordings[i].rec))
             g.recordings.erase(g.recordings.begin() + long(i));
         else ++i;
@@ -486,6 +488,7 @@ bool build(ID3D12Device* device, std::string* why) {
 }
 
 void release_generation(Backend& b);
+void release_renodx_feature_internal(uint64_t feature, bool clear_latch);
 
 void drop_device() {
     std::lock_guard<std::recursive_mutex> owner(g_owner_lock);
@@ -579,6 +582,62 @@ bool fallback(const std::string& why) {
     return false;
 }
 
+constexpr uint64_t kFallbackWindowMs = 60000;
+constexpr uint32_t kFallbackLatchCount = 8;
+constexpr uint32_t kFallbackSwitchLatchCount = 3;
+
+struct FeatureFallback {
+    uint64_t window_start_ms = 0;
+    uint32_t fallbacks = 0;
+    uint32_t transitions = 0;
+    bool last_was_direct = false;
+    bool latched = false;
+    std::string latch_why;
+};
+
+// Kept outside Backend `g` so drop_device() on the same ID3D12Device* preserves per-feature bridge latches.
+ID3D12Device* g_fallback_device = nullptr;
+std::unordered_map<uint64_t, FeatureFallback> g_feature_fallback;
+uint64_t g_last_direct_ms = 0;
+uint64_t g_idle_evict_ms = 10000;
+
+void release_renodx_feature_internal(uint64_t feature, bool clear_latch);
+
+void maybe_evict_idle_backend() {
+    if (!g.device || !g.network || g_last_direct_ms == 0) return;
+    const uint64_t elapsed = GetTickCount64() - g_last_direct_ms;
+    if (elapsed < g_idle_evict_ms) return;
+    nr::pe::log("[d3d12] releasing idle D3D12 passthrough resources after %llu ms on the Vulkan bridge",
+                (unsigned long long)elapsed);
+    drop_device();
+    g_last_direct_ms = 0;
+}
+
+bool fallback_for(uint64_t feature, const std::string& why) {
+    const uint64_t now = GetTickCount64();
+    FeatureFallback& ff = g_feature_fallback[feature];
+    if (ff.window_start_ms == 0 || (now - ff.window_start_ms) > kFallbackWindowMs) {
+        ff.window_start_ms = now;
+        ff.fallbacks = 0;
+        ff.transitions = 0;
+    }
+    ++ff.fallbacks;
+    if (ff.last_was_direct) {
+        ++ff.transitions;
+        ff.last_was_direct = false;
+    }
+    if (!ff.latched && (ff.fallbacks >= kFallbackLatchCount || ff.transitions >= kFallbackSwitchLatchCount)) {
+        ff.latched = true;
+        ff.latch_why = why;
+        nr::pe::log("[d3d12] feature #%llu latched to the Vulkan bridge after %u fallback(s) / %u switch(es) (%s)",
+                    (unsigned long long)feature, ff.fallbacks, ff.transitions, why.c_str());
+        release_renodx_feature_internal(feature, false);
+    }
+    if (ff.latched) note_backend(("not run (the Vulkan bridge, latched): " + ff.latch_why).c_str(), false);
+    else fallback(why);
+    return false;
+}
+
 
 std::wstring widen(const char* u8) {
     std::wstring out;
@@ -596,24 +655,24 @@ constexpr uint64_t kUnnamedStack = 0xFFFFFFu;
 
 bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES color_state,
                   D3D12_RESOURCE_STATES output_state) {
-    if (!f.renodx_settings) return fallback("the RenoDX route without its frame (no settings)");
+    if (!f.renodx_settings) return fallback_for(f.feature, "the RenoDX route without its frame (no settings)");
     const nr::renodx::Settings& s = *f.renodx_settings;
     const D3D12_RESOURCE_DESC sd = f.color->GetDesc(), dd = f.output->GetDesc();
     if (sd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || dd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
         sd.DepthOrArraySize != 1 || dd.DepthOrArraySize != 1 || sd.SampleDesc.Count != 1 || dd.SampleDesc.Count != 1)
-        return fallback("the RenoDX route: colour or output is not a single-sampled 2D texture");
+        return fallback_for(f.feature, "the RenoDX route: colour or output is not a single-sampled 2D texture");
     const DXGI_FORMAT df = view_format(dd.Format);
     const DXGI_FORMAT srgb_unorm = sd.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ? DXGI_FORMAT_R8G8B8A8_UNORM
                                  : sd.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ? DXGI_FORMAT_B8G8R8A8_UNORM
                                  : DXGI_FORMAT_UNKNOWN;
     const DXGI_FORMAT sf = (f.color != f.output && srgb_unorm != DXGI_FORMAT_UNKNOWN && srgb_unorm == df)
                            ? srgb_unorm : view_format(sd.Format);
-    if (sf == DXGI_FORMAT_UNKNOWN || df == DXGI_FORMAT_UNKNOWN) return fallback("the RenoDX route: an sRGB format");
+    if (sf == DXGI_FORMAT_UNKNOWN || df == DXGI_FORMAT_UNKNOWN) return fallback_for(f.feature, "the RenoDX route: an sRGB format");
     if (!(dd.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) || !typed_uav(f.device, df))
-        return fallback("the RenoDX route: the output's format has no typed UAV store");
+        return fallback_for(f.feature, "the RenoDX route: the output's format has no typed UAV store");
     const uint32_t w = std::min<uint64_t>({f.width, sd.Width, dd.Width});
     const uint32_t h = std::min<uint64_t>({f.height, sd.Height, dd.Height});
-    if (!w || !h) return fallback("the RenoDX route: an empty extent");
+    if (!w || !h) return fallback_for(f.feature, "the RenoDX route: an empty extent");
 
     // The network's extent (nr_pe_session.cpp's renodx_extent: RenoDX's ComputeNrWorkingResolution, a size the
     // game's guides change to taken once it has held kContractDebounceFrames).
@@ -655,7 +714,7 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
             note_backend(("not run yet: the network: " + why + " (frames pass through with no NR; the bridge is not used)").c_str(), false, true);
             return false;
         }
-        return fallback("the RenoDX route: the network: " + why);
+        return fallback_for(f.feature, "the RenoDX route: the network: " + why);
     }
     note_network(g.network->name());
 
@@ -682,7 +741,7 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
         if (made) {
             made->set_completed([](uint64_t f) { return frame_done(int64_t(f)); });
         }
-        if (!made) return fallback("the RenoDX route: " + why);
+        if (!made) return fallback_for(f.feature, "the RenoDX route: " + why);
         e.stage = std::move(made);
         e.w = w; e.h = h; e.nw = nw; e.nh = nh; e.format = sf;
         e.hdr = f.renodx_hdr_flag; e.present = f.renodx_present;
@@ -705,7 +764,7 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
         e.stage = renodx12::Stage::make(c, &why);
         if (e.stage) e.stage->set_retire([](IUnknown* r) { retire(r); });
         if (e.stage) e.stage->set_completed([](uint64_t f) { return frame_done(int64_t(f)); });
-        if (!e.stage) return fallback("the RenoDX route: " + why);
+        if (!e.stage) return fallback_for(f.feature, "the RenoDX route: " + why);
     }
 
     renodx12::Frame rf;
@@ -868,13 +927,13 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
         // The frame is dropped after part of it was recorded: its history can no longer be trusted (the original
         // Runtime's rule for a dropped recording), so this feature's state goes rather than a stale latch surviving.
         const bool touched = e.stage->cmd_touched();
-        release_renodx_feature(f.feature);
+        release_renodx_feature_internal(f.feature, false);
         if (touched) {
             note_backend_produced(false);
             note_backend("dropped partial RenoDX D3D12 frame (bridge skipped)", true);
             return true;
         }
-        return fallback("the RenoDX stage could not make a surface this frame needs");
+        return fallback_for(f.feature, "the RenoDX stage could not make a surface this frame needs");
     }
     char line[200];
     const bool net_ok = e.stage->net_ran();
@@ -888,6 +947,22 @@ bool renodx_frame(const nr::dlssnr::D3d12BackendFrame& f, D3D12_RESOURCE_STATES 
     note_backend_produced(ran > 0);   // what Stage::record returns, the same ran the Vulkan path reports
     note_backend(line, true);
     return true;
+}
+
+void release_renodx_feature_internal(uint64_t feature, bool clear_latch) {
+    if (clear_latch) g_feature_fallback.erase(feature);
+    g.feature_extent.erase(feature);   // (Session::release_feature)
+    if (auto it = g.renodx.find(feature); it != g.renodx.end()) {
+        if (it->second.stage) g.renodx_retired.push_back({int64_t(g.frames), g.uses_now(), "feature", std::move(it->second.stage)});
+        g.renodx.erase(it);
+    }
+    if (g.network) {
+        const uint64_t named = feature ? feature : kUnnamedStack;
+        g.network->release_feature(feature);
+        if (!feature) g.network->release_feature(named);
+        for (uint32_t k = 1; k < renodx::kMaxUnlockedPasses; ++k)
+            g.network->release_feature(stack_feature(named, k));
+    }
 }
 }  // namespace
 
@@ -903,6 +978,8 @@ bool ensure_backend(ID3D12Device* device, std::string* why) {
         if (!build(device, &build_why)) {
             g.broken = true;
             g.broken_why = build_why;
+        } else {
+            g_last_direct_ms = GetTickCount64();
         }
     }
     if (g.broken) {
@@ -924,6 +1001,7 @@ bool wilsjo2_ready(ID3D12Device* device, ID3D12GraphicsCommandList* cmd, uint32_
     const Canary c = canary();
     if (c != Canary::kHit) {
         if (building && (c == Canary::kNotRun || c == Canary::kRunning)) *building = true;
+        else maybe_evict_idle_backend();
         y = std::string("canary ") + canary_name(c);
         return false;
     }
@@ -931,16 +1009,20 @@ bool wilsjo2_ready(ID3D12Device* device, ID3D12GraphicsCommandList* cmd, uint32_
     bool wait_reset = false;
     if (!nr::pe::d3d12_direct::ready(device, cmd, &y, &wait_reset)) {
         if (building && wait_reset) *building = true;
+        else maybe_evict_idle_backend();
         y = "the command list's state is not known (" + y + ")";
         return false;
     }
-    if (!ensure_backend(device, &y)) return false;
+    if (!ensure_backend(device, &y)) { maybe_evict_idle_backend(); return false; }
     if (!g.network->ready(device, w, h, &y)) {
-        if (building) *building = g.network->building();
+        const bool is_building = g.network->building();
+        if (building) *building = is_building;
+        if (!is_building) maybe_evict_idle_backend();
         y = "the network: " + y;
         return false;
     }
     note_network(g.network->name());
+    g_last_direct_ms = GetTickCount64();
     return true;
 }
 
@@ -1011,6 +1093,18 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
     const bool renodx = f.renodx_route != 0;
 
     sweep();
+    if (f.device != g_fallback_device) {
+        g_feature_fallback.clear();
+        g_fallback_device = f.device;
+    }
+    if (!g_feature_fallback.empty()) {
+        const auto it = g_feature_fallback.find(f.feature);
+        if (it != g_feature_fallback.end() && it->second.latched) {
+            note_backend(("not run (the Vulkan bridge, latched): " + it->second.latch_why).c_str(), false);
+            maybe_evict_idle_backend();
+            return false;
+        }
+    }
     std::string why;
     // As wilsjo2_ready: passing states wait (the frame as it came, no NR, no bridge); lasting ones take the bridge
     const auto wait = [&](const std::string& y) {
@@ -1018,18 +1112,24 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
         note_backend(("not run yet: " + y + " (frames pass through with no NR; the bridge is not used)").c_str(), false, true);
         return false;
     };
+    const auto fail_fallback = [&](const std::string& y) {
+        fallback_for(f.feature, y);
+        maybe_evict_idle_backend();
+        return false;
+    };
     on_device(f.device);   // the canary, once
     const Canary c = canary();
     if (c != Canary::kHit) {
         if (f.waiting && (c == Canary::kNotRun || c == Canary::kRunning)) return wait(std::string("canary ") + canary_name(c));
+        maybe_evict_idle_backend();
         return fallback(std::string("canary ") + canary_name(c));
     }
     bool wait_reset = false;
     if (!nr::pe::d3d12_direct::ready(f.device, f.cmd, &why, &wait_reset)) {
         if (f.waiting && wait_reset) return wait("the command list's state is not known (" + why + ")");
-        return fallback("the command list's state is not known (" + why + ")");
+        return fail_fallback("the command list's state is not known (" + why + ")");
     }
-    if (!ensure_backend(f.device, &why)) return fallback(why);
+    if (!ensure_backend(f.device, &why)) return fail_fallback(why);
     g.network->history_f16(f.history_f16 != 0);   // [Network] History Precision, live
     g.network->style_grade(f.style_grade != 0);   // [Network] Style Grade, live
 
@@ -1040,18 +1140,27 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
         // Marked even when the stage reports failure: a failed frame may have recorded some of its dispatches, and
         // those commands still hold internal resources that must not be released until the GPU ran past them.
         mark_frame(f.cmd);
+        if (ran) {
+            g_last_direct_ms = GetTickCount64();
+            if (!g_feature_fallback.empty()) {
+                const auto it = g_feature_fallback.find(f.feature);
+                if (it != g_feature_fallback.end()) it->second.last_was_direct = true;
+            }
+        } else if (!f.waiting || !*f.waiting) {
+            maybe_evict_idle_backend();
+        }
         return ran;
     }
 
     // The network call of the wilsjo2 flow on D3D12: Preprocess is the flow's own there (wilsjo2_prep, prep_outside);
     // one that asks the network's runtime for it is not this path's.
-    if (f.preprocess) return fallback("Preprocess in the network's runtime (the wilsjo2 flow runs its own)");
+    if (f.preprocess) return fail_fallback("Preprocess in the network's runtime (the wilsjo2 flow runs its own)");
     const D3D12_RESOURCE_DESC sd = f.color->GetDesc(), dd = f.output->GetDesc();
     if (sd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || dd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
         sd.DepthOrArraySize != 1 || dd.DepthOrArraySize != 1 || sd.SampleDesc.Count != 1 || dd.SampleDesc.Count != 1)
-        return fallback("colour or output is not a single-sampled 2D texture");
+        return fail_fallback("colour or output is not a single-sampled 2D texture");
     const DXGI_FORMAT sf = view_format(sd.Format), df = view_format(dd.Format);
-    if (sf == DXGI_FORMAT_UNKNOWN || df == DXGI_FORMAT_UNKNOWN) return fallback("an sRGB colour or output format");
+    if (sf == DXGI_FORMAT_UNKNOWN || df == DXGI_FORMAT_UNKNOWN) return fail_fallback("an sRGB colour or output format");
     const bool have_motion = f.motion != nullptr;
     ID3D12Resource* motion_res = f.motion;
     D3D12_RESOURCE_DESC md{};
@@ -1061,17 +1170,17 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
         mf = view_format(md.Format);
         if (md.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || md.SampleDesc.Count != 1 || mf == DXGI_FORMAT_UNKNOWN || !md.Width ||
             !md.Height)
-            return fallback("the motion guide is not a single-sampled 2D texture");
+            return fail_fallback("the motion guide is not a single-sampled 2D texture");
     } else {
-        if (!g.neutral_mv) return fallback("the neutral motion texture is missing");
+        if (!g.neutral_mv) return fail_fallback("the neutral motion texture is missing");
         motion_res = g.neutral_mv;
         md = g.neutral_mv->GetDesc();
         mf = DXGI_FORMAT_R16G16_FLOAT;
     }
     if (!(dd.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) || !typed_uav(f.device, df))
-        return fallback("the output's format has no typed UAV store");
+        return fail_fallback("the output's format has no typed UAV store");
     const uint32_t w = std::min<uint64_t>({f.width, sd.Width, dd.Width}), h = std::min<uint32_t>({f.height, sd.Height, dd.Height});
-    if (!w || !h) return fallback("an empty extent");
+    if (!w || !h) return fail_fallback("an empty extent");
     Backend::LinearSet* set = nullptr;
     for (auto& ls : g.linear_sets)
         if (ls.w == w && ls.h == h) { set = &ls; break; }
@@ -1092,7 +1201,7 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
         // 1 x 1 stand-in) - 4K RGBA32F is 127 MiB
         if (!ls.in || !ls.out || !ls.mv) {
             retire(ls.in); retire(ls.out); retire(ls.mv);
-            return fallback("the linear buffers could not be made");
+            return fail_fallback("the linear buffers could not be made");
         }
         g.linear_sets.push_back(ls);
         set = &g.linear_sets.back();
@@ -1144,7 +1253,7 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
                 note_backend(("not run yet: " + nwhy + " (frames pass through with no NR; the bridge is not used)").c_str(), false, true);
                 return false;
             }
-            return fallback("the network: " + nwhy);
+            return fail_fallback("the network: " + nwhy);
         }
         note_network(g.network->name());   // "(building)" until a network is active, then the model
         nr::D3d12NetControls nc;
@@ -1249,17 +1358,17 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
     const auto* b_hist_buf = hist_bytes ? k_hist.find_binding(3, d3d12_outer::kBuf) : nullptr;
     if (!g.outer_rs || !b_in_tex || !b_in_buf || !b_mv_tex || !b_mv_buf || !b_from_buf || !b_from_tex ||
         (have_depth && (!b_depth_tex || !b_depth_buf)) || (hist_bytes && (!b_hist_tex || !b_hist_buf))) {
-        return fallback("outer shader bindings incomplete");
+        return fail_fallback("outer shader bindings incomplete");
     }
 
     const nr::gpu::Ticket ticket = nr::pe::d3d12_direct::book(f.cmd);
-    if (!ticket) return fallback("the command list could not be booked");
+    if (!ticket) return fail_fallback("the command list could not be booked");
     // Acquire all outer descriptor slots before emitting the first barrier or dispatch so any failure leaves `cmd` clean.
-    if (!g.outer_pool) return fallback("outer descriptor pool is not built");
+    if (!g.outer_pool) return fail_fallback("outer descriptor pool is not built");
     const uint32_t need_slots = 3u + (have_depth ? 1u : 0u) + (hist_bytes ? 1u : 0u);
     std::string slot_why;
     if (!g.outer_pool->reserve(need_slots, &slot_why)) {
-        return fallback(slot_why.empty() ? "no outer descriptor slot available" : slot_why);
+        return fail_fallback(slot_why.empty() ? "no outer descriptor slot available" : slot_why);
     }
     const d3d12_outer::OuterSlot s_in = g.outer_pool->acquire(ticket, &slot_why, g.k_to_linear.desc_zero_bytes);
     const d3d12_outer::OuterSlot s_mv = g.outer_pool->acquire(ticket, &slot_why, g.k_to_motion.desc_zero_bytes);
@@ -1267,7 +1376,7 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
     const d3d12_outer::OuterSlot s_hist = hist_bytes ? g.outer_pool->acquire(ticket, &slot_why, k_hist.desc_zero_bytes) : d3d12_outer::OuterSlot{};
     const d3d12_outer::OuterSlot s_out = g.outer_pool->acquire(ticket, &slot_why, g.k_from_linear.desc_zero_bytes);
     if (!s_in.cpu || !s_mv.cpu || (have_depth && !s_depth.cpu) || (hist_bytes && !s_hist.cpu) || !s_out.cpu) {
-        return fallback(slot_why.empty() ? "no outer descriptor slot available" : slot_why);
+        return fail_fallback(slot_why.empty() ? "no outer descriptor slot available" : slot_why);
     }
 
     g.booking = ticket;
@@ -1369,21 +1478,15 @@ bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& f) {
                   net_ok ? g.network->name() : (std::string("the network recorded nothing (") + nwhy + "): input copied back").c_str());
     note_backend_produced(net_ok);
     note_backend(line, true);
+    g_last_direct_ms = GetTickCount64();
+    if (!g_feature_fallback.empty()) {
+        const auto it = g_feature_fallback.find(f.feature);
+        if (it != g_feature_fallback.end()) it->second.last_was_direct = true;
+    }
     return true;
 }
 void release_renodx_feature(uint64_t feature) {
-    g.feature_extent.erase(feature);   // (Session::release_feature)
-    if (auto it = g.renodx.find(feature); it != g.renodx.end()) {
-        if (it->second.stage) g.renodx_retired.push_back({int64_t(g.frames), g.uses_now(), "feature", std::move(it->second.stage)});
-        g.renodx.erase(it);
-    }
-    if (g.network) {
-        const uint64_t named = feature ? feature : kUnnamedStack;
-        g.network->release_feature(feature);
-        if (!feature) g.network->release_feature(named);
-        for (uint32_t k = 1; k < renodx::kMaxUnlockedPasses; ++k)
-            g.network->release_feature(stack_feature(named, k));
-    }
+    release_renodx_feature_internal(feature, true);
 }
 
 
@@ -1409,6 +1512,7 @@ void abandon_at_exit() {
     new decltype(g.retired)(std::move(g.retired));
     new decltype(g.recordings)(std::move(g.recordings));
     new decltype(g.booking)(std::move(g.booking));
+    new decltype(g_old_generations)(std::move(g_old_generations));
 }
 
 PassthroughNetStatus backend_net_status() {
@@ -1435,6 +1539,22 @@ PassthroughNetStatus backend_net_status() {
     }
     return s;
 }
+
+#ifdef NR_TOOLS_BUILD
+void set_test_idle_evict_ms(uint64_t ms) { g_idle_evict_ms = ms; }
+bool test_has_resident_network() {
+    std::lock_guard<std::recursive_mutex> l(g_owner_lock);
+    if (g.network != nullptr) return true;
+    for (const auto& old : g_old_generations) {
+        if (old && old->network != nullptr) return true;
+    }
+    return false;
+}
+void test_reset_fallback_state() {
+    g_feature_fallback.clear();
+    g_fallback_device = nullptr;
+}
+#endif
 
 
 }  // namespace nr::pe::d3d12_passthrough

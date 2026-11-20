@@ -1674,12 +1674,24 @@ bool disabled() {
     return g_disabled;
 }
 
+ListClass* find_class_for_vtable(void** vt) {
+    if (!vt) return nullptr;
+    if (ListClass* cls = class_by_vtable(vt)) return cls;
+    const int n = g_class_count.load(std::memory_order_acquire);
+    for (int i = 0; i < n; ++i) {
+        ListClass* c = g_classes[i];
+        if (c && c->slots > kReset && vt[kClose] == c->entry[kClose] && vt[kReset] == c->entry[kReset])
+            return c;
+    }
+    return nullptr;
+}
+
 bool is_split_list(ID3D12GraphicsCommandList* list, bool* active_cut) {
     if (active_cut) *active_cut = false;
     if (!list) return false;
     void** vt = *reinterpret_cast<void***>(list);
     if (!vt) return false;
-    ListClass* cls = class_by_vtable(vt);
+    ListClass* cls = find_class_for_vtable(vt);
     if (!cls || vt[kClose] != cls->entry[kClose] || vt[kReset] != cls->entry[kReset]) return false;
     if (active_cut) {
         bool cut_now = (target_of(list) != list);
@@ -1694,7 +1706,7 @@ bool is_split_list(ID3D12GraphicsCommandList* list, bool* active_cut) {
 
 void* orig_list_method(void** vt, unsigned slot) {
     if (!vt) return nullptr;
-    if (ListClass* cls = class_by_vtable(vt)) {
+    if (ListClass* cls = find_class_for_vtable(vt)) {
         return (slot < cls->slots) ? cls->orig[slot] : vt[slot];
     }
     return vt[slot];

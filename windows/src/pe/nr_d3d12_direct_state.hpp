@@ -11,6 +11,9 @@ namespace nr::pe::d3d12_direct {
 // Installs D3D12Core hooks on command list, command allocator, device, and command queue.
 bool install_hooks(ID3D12Device* dev, ID3D12GraphicsCommandList* cl = nullptr, std::string* why = nullptr);
 
+// Records an ID3D12CommandSignature's indirect argument layout (safe to call before install_hooks()).
+void note_command_signature(ID3D12CommandSignature* sig, const D3D12_COMMAND_SIGNATURE_DESC* desc);
+
 // Returns true once hooks are active and `cl` has observed a clean Reset/Create state in this process.
 // When false with `waiting_reset != nullptr`, sets *waiting_reset to true if waiting for first Reset.
 bool ready(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, std::string* why = nullptr, bool* waiting_reset = nullptr);

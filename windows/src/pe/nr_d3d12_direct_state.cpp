@@ -95,7 +95,7 @@ struct DirectCmdSigInfo {
 };
 
 void apply_cmd_sig_to_root(DirectRootArgs& r, const DirectCmdSigInfo* sig) {
-    if (!sig) return;
+    if (!sig || (!sig->view_clear_mask && !sig->const_clear_param_mask)) return;
     for (UINT i = 0; i < 64; ++i) {
         if (sig->view_clear_mask & (1ull << i)) {
             r.clear_root_view(i, sig->view_clear_kind[i]);
@@ -109,9 +109,12 @@ void apply_cmd_sig_to_root(DirectRootArgs& r, const DirectCmdSigInfo* sig) {
     }
 }
 
+constexpr uint8_t kUnknownIndirect = 1u;
+constexpr uint8_t kUnknownBundle = 2u;
+
 struct DirectListState {
     bool valid = false;
-    bool unknown = false;
+    uint8_t unknown_flags = 0;
     UINT heap_count = 0;
     ID3D12DescriptorHeap* heaps[2]{};
     DirectRootArgs compute_root{};
@@ -123,7 +126,7 @@ struct DirectListState {
 
     void reset(ID3D12PipelineState* initial) {
         valid = true;
-        unknown = false;
+        unknown_flags = 0;
         heap_count = 0;
         heaps[0] = heaps[1] = nullptr;
         compute_root.rs = nullptr;
@@ -138,10 +141,10 @@ struct DirectListState {
 
     void clear_state(ID3D12PipelineState* initial) {
         const bool v = valid;
-        const bool u = unknown;
+        const uint8_t u = unknown_flags;
         reset(initial);
         valid = v;
-        unknown = u;
+        unknown_flags = u;
     }
 };
 
@@ -173,6 +176,10 @@ thread_local void* t_direct_last_key = nullptr;
 thread_local DirectListState* t_direct_last_state = nullptr;
 thread_local uint64_t t_direct_last_epoch = 0;
 std::atomic<uint64_t> g_list_forget_epoch{1};
+std::atomic<uint64_t> g_cmd_sig_epoch{1};
+thread_local void* t_last_cmd_sig = nullptr;
+thread_local DirectCmdSigInfo t_last_cmd_sig_info{};
+thread_local uint64_t t_last_cmd_sig_epoch = 0;
 
 DirectListState* direct_state_of(void* list) {
     if (!list) return nullptr;
@@ -264,6 +271,7 @@ void register_direct_cmd_sig(void* sig, const D3D12_COMMAND_SIGNATURE_DESC* desc
     DirectGlobals& d = globals();
     std::lock_guard<std::mutex> lock(d.direct_cmd_sig_mutex);
     d.direct_cmd_sigs[sig] = info;
+    g_cmd_sig_epoch.fetch_add(1, std::memory_order_release);
 }
 
 void apply_direct_execute_indirect(DirectListState* s, void* sig) {
@@ -271,16 +279,25 @@ void apply_direct_execute_indirect(DirectListState* s, void* sig) {
     DirectCmdSigInfo info{};
     bool found = false;
     if (sig) {
-        DirectGlobals& d = globals();
-        std::lock_guard<std::mutex> lock(d.direct_cmd_sig_mutex);
-        const auto it = d.direct_cmd_sigs.find(sig);
-        if (it != d.direct_cmd_sigs.end()) {
-            info = it->second;
+        const uint64_t ep = g_cmd_sig_epoch.load(std::memory_order_acquire);
+        if (ep == t_last_cmd_sig_epoch && sig == t_last_cmd_sig) {
+            info = t_last_cmd_sig_info;
             found = true;
+        } else {
+            DirectGlobals& d = globals();
+            std::lock_guard<std::mutex> lock(d.direct_cmd_sig_mutex);
+            const auto it = d.direct_cmd_sigs.find(sig);
+            if (it != d.direct_cmd_sigs.end()) {
+                info = it->second;
+                found = true;
+                t_last_cmd_sig = sig;
+                t_last_cmd_sig_info = info;
+                t_last_cmd_sig_epoch = g_cmd_sig_epoch.load(std::memory_order_acquire);
+            }
         }
     }
     if (!found) {
-        s->unknown = true;
+        s->unknown_flags |= kUnknownIndirect;
         return;
     }
     if (info.pipeline_kind == 2) {
@@ -531,8 +548,8 @@ void STDMETHODCALLTYPE hk_cl_exec_bundle(ID3D12GraphicsCommandList* cl, ID3D12Gr
         const DirectListState* bs = (bundle && bundle != cl) ? direct_state_of(bundle) : nullptr;
         if (bundle && bundle != cl) direct_state_of(cl);
         if (bs && bs->valid) {
-            if (bs->unknown) {
-                s->unknown = true;
+            if (bs->unknown_flags) {
+                s->unknown_flags |= bs->unknown_flags;
             } else {
                 const DirectRootArgs& br = bs->compute_root;
                 if (br.rs_set) s->compute_root.set_rs(br.rs);
@@ -548,7 +565,7 @@ void STDMETHODCALLTYPE hk_cl_exec_bundle(ID3D12GraphicsCommandList* cl, ID3D12Gr
                 if (bs->so_set) { s->state_object = bs->state_object; s->so_set = true; s->so_last = bs->so_last; }
             }
         } else if (bundle && bundle != cl) {
-            s->unknown = true;
+            s->unknown_flags |= kUnknownBundle;
         }
     }
     real_cl_exec_bundle(cl, bundle);
@@ -697,7 +714,7 @@ void STDMETHODCALLTYPE hk_queue_execute(ID3D12CommandQueue* q, UINT n, ID3D12Com
 
 bool restore_direct_state(ID3D12GraphicsCommandList* cmd) {
     const DirectListState* s = direct_state_of(cmd);
-    if (!s || !s->valid || s->unknown) return false;
+    if (!s || !s->valid || s->unknown_flags != 0) return false;
 
     ++t_in_direct_record;
     t_in_direct_restore = true;
@@ -914,6 +931,10 @@ bool install_hooks(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, std::string
     return true;
 }
 
+void note_command_signature(ID3D12CommandSignature* sig, const D3D12_COMMAND_SIGNATURE_DESC* desc) {
+    register_direct_cmd_sig(sig, desc);
+}
+
 bool ready(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, std::string* why, bool* waiting_reset) {
     if (waiting_reset) *waiting_reset = false;
     if (!install_hooks(dev, cl, why)) return false;
@@ -940,8 +961,15 @@ bool ready(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, std::string* why, b
         if (why) *why = "the command list was made before the direct state hooks";
         return false;
     }
-    if (s->unknown) {
-        if (why) *why = "the command list recorded an unknown ExecuteIndirect signature or untracked bundle";
+    if (s->unknown_flags) {
+        if (why) {
+            if (s->unknown_flags == kUnknownIndirect)
+                *why = "the command list recorded an unknown ExecuteIndirect signature";
+            else if (s->unknown_flags == kUnknownBundle)
+                *why = "the command list executed an untracked bundle";
+            else
+                *why = "the command list recorded an unknown ExecuteIndirect signature and executed an untracked bundle";
+        }
         return false;
     }
     return true;

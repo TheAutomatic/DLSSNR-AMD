@@ -260,8 +260,9 @@ struct Built {
     std::map<std::string, Kern> kern;
     Kern t_pre, t_post, t_grade;                  // the temporal pre / post (t_grade.pso null: no Style grade)
     Kern t_post16, t_grade16;                     // the RGBA16F history's post (t_post16.pso null: none)
-    // stand: 256 bytes, the 1x1 surf1 and the missing depth (as the runtime's 1x1 images). noise: the seed-0 noise table,
-    // the stand-in until noise_real (made once frames keep seed 0, make_noise).
+    // stand: 512 bytes: [0..255] is the immutable zeroed 1x1 read stand-in (surf1, missing depth, empty HIST);
+    // [256..511] (+256, 256-byte aligned) is the write-only 1x1 discard sink for unused HIST_STORE writes. noise: the
+    // seed-0 noise table, the stand-in until noise_real (made once frames keep seed 0, make_noise).
     ID3D12Resource *act = nullptr, *wgt = nullptr, *wgt_upload = nullptr, *stand = nullptr, *noise = nullptr;
     // RDNA3 (the Vulkan runtime's fp16_twin): the arena's FP16 twin (twice its bytes, zero) and the weights' (each e4m3
     // byte as an f16), what its e4m3 views read
@@ -499,7 +500,7 @@ std::shared_ptr<Built> build(ID3D12Device* device, ID3D12RootSignature* rs, uint
         for (uint64_t i = 0; i < wbytes; ++i) o[i] = to_f16[b->plan.weights[size_t(i)]];
         b->wgt_e_upload->Unmap(0, nullptr);
     }
-    b->stand = buffer(device, D3D12_HEAP_TYPE_DEFAULT, 256, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
+    b->stand = buffer(device, D3D12_HEAP_TYPE_DEFAULT, 512, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
     b->noise = buffer(device, D3D12_HEAP_TYPE_DEFAULT, 256, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
     b->tables = uint32_t(b->plan.noise.size() + b->plan.disp.size());
     b->slot_bytes = uint64_t(b->tables) * kTableBytes + kParamsBytes;
@@ -891,13 +892,15 @@ public:
         const uint64_t act_e_va = b->act_e ? b->act_e->GetGPUVirtualAddress() : 0;
         const uint64_t wgt_e_va = b->wgt_e ? b->wgt_e->GetGPUVirtualAddress() : 0;
         const uint64_t stand_va = b->stand->GetGPUVirtualAddress();
+        const uint64_t stand_sink_va = stand_va + 256u;
         const uint64_t table_va = b->table->GetGPUVirtualAddress();
         const uint64_t params_va = table_va + uint64_t(b->tables) * kTableBytes;
         // (Passes (fast) Interleaved: the pass's history as it made it, read in place of the feature's; with external
-        // history, HIST_STORE binds the 1x1 stand-in so temporal_post discards out-of-bounds stores without touching VRAM)
+        // history, HIST_STORE binds the +256 write sink so temporal_post discards out-of-bounds stores without aliasing
+        // the immutable zero stand-in read by SURF1/DEPTH/empty HIST)
         const uint64_t hist_va = temporal_.history_va ? temporal_.history_va
                                : (ext_hist || !fs->hist[fs->hcur] ? stand_va : fs->hist[fs->hcur]->GetGPUVirtualAddress());
-        const uint64_t store_va = (ext_hist || !fs->hist[fs->hcur ^ 1u]) ? stand_va : fs->hist[fs->hcur ^ 1u]->GetGPUVirtualAddress();
+        const uint64_t store_va = (ext_hist || !fs->hist[fs->hcur ^ 1u]) ? stand_sink_va : fs->hist[fs->hcur ^ 1u]->GetGPUVirtualAddress();
         NetControlsPatch patch = g_patch.load();
         // [Network] Style Grade as the caller last said (style_grade), the plan's ini value before that (the Vulkan
         // runtime's style_grade && style_grade_on)
@@ -1063,7 +1066,7 @@ public:
                     else put_img(d, hist_va, b->w, b->h, hist_format);
                     break;
                 case HIST_STORE:
-                    if (ext_hist) put_img(d, stand_va, 1, 1, hist_format);
+                    if (ext_hist) put_img(d, stand_sink_va, 1, 1, hist_format);
                     else put_img(d, store_va, b->w, b->h, hist_format);
                     break;
                 case DEPTH:

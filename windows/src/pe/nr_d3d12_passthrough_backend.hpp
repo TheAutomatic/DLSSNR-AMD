@@ -129,5 +129,11 @@ void release_renodx_feature(uint64_t feature);
 // without an exception leaves behind, so a watchdog can poll it.
 HRESULT device_removed_reason();
 
+#ifdef NR_TOOLS_BUILD
+void set_test_idle_evict_ms(uint64_t ms);
+bool test_has_resident_network();
+void test_reset_fallback_state();
+#endif
+
 
 }  // namespace nr::pe::d3d12_passthrough

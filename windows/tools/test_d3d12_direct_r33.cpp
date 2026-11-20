@@ -626,6 +626,26 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // Create early CommandSignatures before d3d12_direct::install_hooks() for Case L1:
+    // one observed via note_command_signature() (simulating hudcap's early CreateCommandSignature hook),
+    // one kept untracked as a negative control.
+    ID3D12CommandSignature* early_tracked_sig = nullptr;
+    ID3D12CommandSignature* early_untracked_sig = nullptr;
+    {
+        D3D12_INDIRECT_ARGUMENT_DESC arg_desc{};
+        arg_desc.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+        D3D12_COMMAND_SIGNATURE_DESC cs_desc{};
+        cs_desc.ByteStride = sizeof(D3D12_DISPATCH_ARGUMENTS);
+        cs_desc.NumArgumentDescs = 1;
+        cs_desc.pArgumentDescs = &arg_desc;
+        if (FAILED(device->CreateCommandSignature(&cs_desc, nullptr, IID_PPV_ARGS(&early_tracked_sig))) ||
+            FAILED(device->CreateCommandSignature(&cs_desc, nullptr, IID_PPV_ARGS(&early_untracked_sig)))) {
+            std::fprintf(stderr, "FAIL: early CreateCommandSignature setup\n");
+            return 1;
+        }
+        nr::pe::d3d12_direct::note_command_signature(early_tracked_sig, &cs_desc);
+    }
+
     std::string why;
     if (!nr::pe::d3d12_direct::install_hooks(device, cmd, &why)) {
         std::fprintf(stderr, "FAIL: d3d12_direct::install_hooks: %s\n", why.c_str());
@@ -2696,6 +2716,168 @@ int main(int argc, char** argv) {
         }
 
         std::printf("[PASS] Case K: SwapChainArbiter (OBS 4K+preview, close/stale fallback, tiny dummy, hidden, focus tie-break, same-HWND)\n");
+    }
+
+    // ---- Case L: Early CommandSignature tracking, unregistered copied split vtable, and per-feature fallback latch ----
+    {
+        // L1: CommandSignature created before d3d12_direct::install_hooks() and observed via note_command_signature().
+        ID3D12Resource* arg_buf = make_buf(device, D3D12_HEAP_TYPE_DEFAULT, 64, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+        if (!arg_buf) {
+            std::fprintf(stderr, "FAIL: Case L1 arg_buf creation\n");
+            return 1;
+        }
+        alloc->Reset();
+        cmd->Reset(alloc, nullptr);
+        cmd->ExecuteIndirect(early_tracked_sig, 0, arg_buf, 0, nullptr, 0);
+        if (!nr::pe::d3d12_direct::ready(device, cmd, &why)) {
+            std::fprintf(stderr, "FAIL: Case L1 early note_command_signature was rejected (%s)\n", why.c_str());
+            return 1;
+        }
+        cmd->ExecuteIndirect(early_untracked_sig, 0, arg_buf, 0, nullptr, 0);
+        std::string indirect_why;
+        if (nr::pe::d3d12_direct::ready(device, cmd, &indirect_why) ||
+            indirect_why.find("ExecuteIndirect") == std::string::npos ||
+            indirect_why.find("bundle") != std::string::npos) {
+            std::fprintf(stderr, "FAIL: Case L1 untracked ExecuteIndirect mismatch (%s)\n", indirect_why.c_str());
+            return 1;
+        }
+        cmd->Close();
+        alloc->Reset();
+        cmd->Reset(alloc, nullptr);
+        if (!nr::pe::d3d12_direct::ready(device, cmd, &why)) {
+            std::fprintf(stderr, "FAIL: Case L1 ready did not recover after Reset (%s)\n", why.c_str());
+            return 1;
+        }
+        cmd->Close();
+        arg_buf->Release();
+        early_untracked_sig->Release();
+        early_tracked_sig->Release();
+
+        // L2: Unregistered private-memory vtable copy holding split stubs must be accepted by is_split_list & ready().
+        ID3D12CommandAllocator* ma2 = nullptr;
+        ID3D12GraphicsCommandList* mc2 = nullptr;
+        if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&ma2))) ||
+            FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, ma2, nullptr, IID_PPV_ARGS(&mc2)))) {
+            std::fprintf(stderr, "FAIL: Case L2 command list setup\n");
+            return 1;
+        }
+        if (!nr::pe::split::is_split_list(mc2)) {
+            if (!nr::pe::split::prepare(mc2, &why)) {
+                std::fprintf(stderr, "FAIL: Case L2 split::prepare (%s)\n", why.c_str());
+                return 1;
+            }
+            mc2->Close();
+            ma2->Reset();
+            mc2->Reset(ma2, nullptr);
+        }
+        void** orig_vt2 = *reinterpret_cast<void***>(mc2);
+        void* copied_split_vt[86]{};
+        std::memcpy(copied_split_vt, orig_vt2, sizeof copied_split_vt);
+        *reinterpret_cast<void***>(mc2) = copied_split_vt;
+        const bool l2_split = nr::pe::split::is_split_list(mc2);
+        const bool l2_ready = nr::pe::d3d12_direct::ready(device, mc2, &why);
+        *reinterpret_cast<void***>(mc2) = orig_vt2;
+        mc2->Close();
+        mc2->Release();
+        ma2->Release();
+        if (!l2_split || !l2_ready) {
+            std::fprintf(stderr, "FAIL: Case L2 unregistered copied split vtable split=%d ready=%d (%s)\n",
+                         l2_split, l2_ready, why.c_str());
+            return 1;
+        }
+
+        // L3: Per-feature fallback latch, sibling feature isolation, release-clears-latch, and idle VRAM eviction.
+        nr::pe::d3d12_passthrough::test_reset_fallback_state();
+        nr::pe::d3d12_passthrough::set_test_idle_evict_ms(10000);
+        ID3D12Resource* tex_srgb = make_tex2d(device, W, H, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, false,
+                                              D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        if (!tex_srgb) {
+            std::fprintf(stderr, "FAIL: Case L3 tex_srgb setup\n");
+            return 1;
+        }
+        nr::renodx::Settings r_l3{};
+        r_l3.nr_enabled = true;
+        r_l3.passes = 1;
+        r_l3.codec_mode = 1;
+        r_l3.transfer_strength = 1.0f;
+        int wait_l3 = 0;
+        auto run_l3 = [&](uint64_t feature, bool srgb_fail) -> bool {
+            alloc->Reset();
+            cmd->Reset(alloc, nullptr);
+            nr::dlssnr::D3d12BackendFrame bf = fill_plain_frame(&wait_l3);
+            bf.feature = feature;
+            bf.motion = nullptr; bf.motion_w = 0; bf.motion_h = 0;
+            bf.depth = nullptr; bf.depth_w = 0; bf.depth_h = 0;
+            bf.renodx_route = 1;
+            bf.renodx_present = 1;
+            bf.renodx_white_nits = 203.0f;
+            bf.renodx_settings = &r_l3;
+            if (srgb_fail) {
+                bf.color = tex_srgb;
+                bf.output = tex_srgb;
+                bf.output_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            }
+            const bool res = nr::pe::d3d12_passthrough::evaluate_backend(bf);
+            cmd->Close();
+            ID3D12CommandList* ls[] = {cmd};
+            queue->ExecuteCommandLists(1, ls);
+            wait_gpu();
+            return res;
+        };
+
+        if (!run_l3(0x7701u, false) || !run_l3(0x7702u, false) || !nr::pe::d3d12_passthrough::test_has_resident_network()) {
+            std::fprintf(stderr, "FAIL: Case L3 warmup on features A/B failed\n");
+            return 1;
+        }
+        for (int i = 0; i < 8; ++i) {
+            if (run_l3(0x7701u, true)) {
+                std::fprintf(stderr, "FAIL: Case L3 sRGB fallback unexpectedly succeeded\n");
+                return 1;
+            }
+        }
+        if (nr::pe::d3d12_passthrough::status().backend.find("latched") == std::string::npos) {
+            std::fprintf(stderr, "FAIL: Case L3 feature A did not latch (%s)\n",
+                         nr::pe::d3d12_passthrough::status().backend.c_str());
+            return 1;
+        }
+        if (run_l3(0x7701u, false)) {
+            std::fprintf(stderr, "FAIL: Case L3 latched feature A ping-ponged back to Direct\n");
+            return 1;
+        }
+        if (!run_l3(0x7702u, false)) {
+            std::fprintf(stderr, "FAIL: Case L3 sibling feature B was blocked by feature A latch\n");
+            return 1;
+        }
+        nr::pe::d3d12_passthrough::release_renodx_feature(0x7701u);
+        if (!run_l3(0x7701u, false)) {
+            std::fprintf(stderr, "FAIL: Case L3 release_renodx_feature did not clear feature A latch\n");
+            return 1;
+        }
+
+        // Idle VRAM release after feature C latches and idle threshold elapses with no Direct runs.
+        nr::pe::d3d12_passthrough::set_test_idle_evict_ms(30);
+        if (!run_l3(0x7703u, false)) {
+            std::fprintf(stderr, "FAIL: Case L3 warmup on feature C failed\n");
+            return 1;
+        }
+        for (int i = 0; i < 8; ++i) (void)run_l3(0x7703u, true);
+        Sleep(50);
+        if (run_l3(0x7703u, false)) {
+            std::fprintf(stderr, "FAIL: Case L3 latched feature C ran Direct during idle eviction check\n");
+            return 1;
+        }
+        // One follow-up pass after GPU idle completes any deferred generation sweep.
+        if (nr::pe::d3d12_passthrough::test_has_resident_network()) (void)run_l3(0x7703u, false);
+        if (nr::pe::d3d12_passthrough::test_has_resident_network()) {
+            std::fprintf(stderr, "FAIL: Case L3 idle D3D12 passthrough network remained resident after timeout\n");
+            return 1;
+        }
+        nr::pe::d3d12_passthrough::set_test_idle_evict_ms(10000);
+        nr::pe::d3d12_passthrough::test_reset_fallback_state();
+        tex_srgb->Release();
+
+        std::printf("[PASS] Case L: Early CommandSignature (%p), unregistered copied split vtable, & per-feature latch/idle evict\n",
+                    static_cast<void*>(orig_vt2));
     }
 
     // Clean exit after GPU completion.

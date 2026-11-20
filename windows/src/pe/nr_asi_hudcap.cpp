@@ -23,6 +23,7 @@
 // overlay place of the last frame (one copy a frame: the context runs in its own order). A deferred context's commands
 // are not seen.
 #include "nr_asi_hudcap.hpp"
+#include "nr_d3d12_direct_state.hpp"
 #include "nr_hud_capture.hpp"
 #include "nr_hud_trace.hpp"
 #include "nr_hud_root12.hpp"
@@ -656,6 +657,7 @@ HRESULT STDMETHODCALLTYPE hk_create_signature(PFN_CreateSignature real, ID3D12De
         ++signature_seen;
         ID3D12CommandSignature* sig=nullptr;
         if (SUCCEEDED(static_cast<IUnknown*>(*out)->QueryInterface(IID_PPV_ARGS(&sig))) && sig) {
+            nr::pe::d3d12_direct::note_command_signature(sig, desc);
             IndirectMetadata data; data.kind=nr::hudcap::indirect_kind(desc->NumArgumentDescs,desc->pArgumentDescs);
             // Object-owned bytes: no global pointer cache, no stale entry on address reuse.
             if (SUCCEEDED(sig->SetPrivateData(kIndirectMetadata,sizeof(data),&data))) ++signature_saved;

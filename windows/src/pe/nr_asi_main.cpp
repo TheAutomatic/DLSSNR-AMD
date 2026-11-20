@@ -726,22 +726,24 @@ DXGI_FORMAT writable(DXGI_FORMAT f) {
     }
 }
 
-// A texture of `source`'s own description - size, format and flags (with unordered access when `want_uav`, without
-// deny-shader-resource), one mip - in COPY_DEST: what the upscaler is handed before it, as the forked OptiScaler of
-// 0.0.7 hands it (DlssNr_Dx12::CreateBufferResource). A texture of another size and flags handed in the colour's place
-// (the region at base 0) ended a game with FSR 4 on Windows at the first frame. False when `source` is not a plain 2D
-// texture, `want_uav` is requested on an sRGB format, or it cannot be made.
+// A texture of `source`'s own description - size, format and flags (with unordered access on writable formats and
+// without it on _SRGB formats when `want_uav` is false, without deny-shader-resource), one mip - in COPY_DEST: what
+// the upscaler is handed before it, as the forked OptiScaler of 0.0.7 hands it (DlssNr_Dx12::CreateBufferResource). A
+// texture of another size and flags handed in the colour's place (the region at base 0) ended a game with FSR 4 on
+// Windows at the first frame. False when `source` is not a plain 2D texture, `want_uav` is requested on an sRGB format,
+// or it cannot be made.
 bool ensure_mirror(ID3D12Device* device, ID3D12Resource*& tex, D3D12_RESOURCE_STATES& state, ID3D12Resource* source,
                    bool want_uav = true) {
     D3D12_RESOURCE_DESC d = source->GetDesc();
     if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.SampleDesc.Count != 1 || d.DepthOrArraySize != 1)
         return false;
-    if (want_uav && d.Format != writable(d.Format)) return false;
+    const bool is_writable = d.Format == writable(d.Format);
+    if (want_uav && !is_writable) return false;
     d.MipLevels = 1;
     d.Alignment = 0;
     d.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    d.Flags = (want_uav ? (d.Flags | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
-                        : (d.Flags & ~D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) &
+    d.Flags = (is_writable ? (d.Flags | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
+                           : (d.Flags & ~D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) &
               ~D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
     if (tex) {
         const D3D12_RESOURCE_DESC h = tex->GetDesc();
