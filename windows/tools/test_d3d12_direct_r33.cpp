@@ -2827,7 +2827,42 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        bridge.reset();
+        // Each binding of the bridge to a device has its own number (what one device's frames leave on D3D12 -
+        // guides - is told from another's by it).
+        uint64_t bind2 = 0, bind1 = 0;
+        bridge.execute(dev2, back2, nullptr, [&](d11b::FrameContext& fc) { bind2 = fc.binding; });
+        handoff(items);
+        bridge.execute(dev, items, 5, false, [&](d11b::FrameContext& fc) { bind1 = fc.binding; });
+        if (!bind1 || !bind2 || bind1 == bind2) {
+            std::fprintf(stderr, "FAIL: Case J2 bindings: device 1's %llu, device 2's %llu (two different ones, neither 0)\n",
+                         static_cast<unsigned long long>(bind1), static_cast<unsigned long long>(bind2));
+            return 1;
+        }
+
+        // The route stays with the device itself: more devices than any table held keep theirs, and a new device is
+        // undecided whatever lived at its address before.
+        {
+            ID3D11Device* more[6] = {};
+            bool kept = true;
+            for (ID3D11Device*& d : more) {
+                if (FAILED(D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, fls, 2, D3D11_SDK_VERSION, &d, &fl,
+                                             nullptr)) || !d) {
+                    std::fprintf(stderr, "FAIL: Case J2 D3D11CreateDevice (more devices)\n");
+                    return 1;
+                }
+                kept = kept && bridge.route(d) == d11b::Route::kUndecided && bridge.decide(d, false) == d11b::Route::kBridge;
+            }
+            for (ID3D11Device* d : more) kept = kept && bridge.route(d) == d11b::Route::kBridge;
+            kept = kept && bridge.route(dev) == d11b::Route::kBridge && bridge.route(dev2) == d11b::Route::kBridge;
+            for (ID3D11Device* d : more) d->Release();
+            bridge.reset();
+            const bool forgotten = bridge.route(dev) == d11b::Route::kUndecided && bridge.route(dev2) == d11b::Route::kUndecided;
+            if (!kept || !forgotten) {
+                std::fprintf(stderr, "FAIL: Case J2 routes of 8 devices kept=%d, forgotten at reset=%d\n", int(kept), int(forgotten));
+                return 1;
+            }
+        }
+
         if (cmd) cmd->Release();
         if (alloc) alloc->Release();
         dsv->Release();
@@ -2836,7 +2871,7 @@ int main(int argc, char** argv) {
         ctx2->Release(); dev2->Release();
         ctx->Release(); dev->Release();
         std::printf("[PASS] Case J2: handoff by role (colour region, output in place, depth as R32_FLOAT), route latch, "
-                    "second device (statuses %d, %d)\n", int(st2), int(st1));
+                    "second device (statuses %d, %d), a number per binding, 8 devices' routes\n", int(st2), int(st1));
     }
 
     // ---- Case K: Multi-swapchain primary arbiter ----

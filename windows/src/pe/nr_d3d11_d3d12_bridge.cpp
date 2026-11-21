@@ -22,6 +22,17 @@ constexpr GUID kIID_IDXGIVkInteropDevice = {
 
 constexpr UINT kAmdVendorId = 0x1002u;
 
+// A device's route, kept with the device itself (its private data): it lasts exactly as long as the device does -
+// any number of devices, and none mistaken for one that lived at the same address before.
+const GUID kLatchData = {
+    0x6b0f6c6du, 0x3a52u, 0x4c1eu, {0x9d, 0x41, 0x2e, 0x7a, 0x55, 0xc3, 0x18, 0x0f}
+};
+struct Latch {
+    const void* owner;   // the Bridge that chose it
+    uint32_t epoch;      // that Bridge's reset count then
+    Route route;
+};
+
 bool env_flag_eq(const char* name, const char* expected) {
     char buf[16]{};
     const DWORD n = GetEnvironmentVariableA(name, buf, sizeof(buf));
@@ -134,7 +145,7 @@ void Bridge::reset() {
     if (abandoned_.load(std::memory_order_acquire)) return;
     std::lock_guard<std::mutex> lk(mu_);
     release_all_locked();
-    for (size_t i = 0; i < kLatches; ++i) latch_dev_[i].store(nullptr, std::memory_order_release);
+    epoch_.fetch_add(1, std::memory_order_acq_rel);   // every device's route is chosen again
     retry_ms_ = 0;
     waiting_said_ = false;
     last_logged_.clear();
@@ -165,22 +176,58 @@ void Bridge::release_entry(Entry& e) {
     safe_release(e.tex12);
 }
 
-void Bridge::drain_d12_queue_locked() {
-    if (!d12_queue_ || !shared_fence12_) return;
+// Asked once per format and device: the answer is a resource made and released, too much for every handoff.
+bool Bridge::uav_supported_locked(DXGI_FORMAT fmt) {
+    const auto it = uav_ok_.find(fmt);
+    if (it != uav_ok_.end()) return it->second;
+    const bool ok = d3d12_uav_supported(d12_dev_, fmt);
+    uav_ok_.emplace(fmt, ok);
+    return ok;
+}
+
+// Everything submitted to the bridge's queue so far is done (or its device is removed: nothing runs there any
+// more). False: not known to be - the wait ran out or could not be made - and nothing the queue may still use is
+// released then.
+bool Bridge::drain_d12_queue_locked() {
+    if (!d12_queue_ || !shared_fence12_) return true;
+    if (FAILED(d12_dev_->GetDeviceRemovedReason())) return true;
     if (!drain_event_) drain_event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (!drain_event_) return;
+    if (!drain_event_) return false;
     const uint64_t v = ++fence_val_;
-    if (SUCCEEDED(d12_queue_->Signal(shared_fence12_, v)) && shared_fence12_->GetCompletedValue() < v) {
-        ResetEvent(drain_event_);
-        if (SUCCEEDED(shared_fence12_->SetEventOnCompletion(v, drain_event_))) {
-            WaitForSingleObject(drain_event_, 5000);
+    bool done = false;
+    if (SUCCEEDED(d12_queue_->Signal(shared_fence12_, v))) {
+        done = shared_fence12_->GetCompletedValue() >= v;
+        if (!done) {
+            ResetEvent(drain_event_);
+            done = SUCCEEDED(shared_fence12_->SetEventOnCompletion(v, drain_event_)) &&
+                   WaitForSingleObject(drain_event_, 5000) == WAIT_OBJECT_0;
         }
     }
+    if (!done) done = FAILED(d12_dev_->GetDeviceRemovedReason());
+    if (done) {
+        for (Entry& e : late_) release_entry(e);
+        late_.clear();
+    }
+    return done;
+}
+
+// A shared pair leaves the pool: released once the queue is known to be done with it, kept until then (late_,
+// released by the next drain that succeeds).
+void Bridge::retire_locked(Entry& e, bool drained) {
+    if (drained) {
+        release_entry(e);
+    } else {
+        if (late_.empty())
+            nr::pe::log("[nr] d11->d3d12 bridge: the D3D12 queue did not finish in time; the shared textures it may "
+                        "still use are kept until it has");
+        late_.push_back(e);
+    }
+    e = {};
 }
 
 void Bridge::release_d11_side_locked() {
-    if (!pool_.empty()) drain_d12_queue_locked();
-    for (Entry& e : pool_) release_entry(e);
+    const bool drained = pool_.empty() || drain_d12_queue_locked();
+    for (Entry& e : pool_) retire_locked(e, drained);
     pool_.clear();
     depth_pass_.reset();
     safe_release(depth_stage11_);
@@ -192,6 +239,10 @@ void Bridge::release_d11_side_locked() {
 
 void Bridge::release_all_locked() {
     release_d11_side_locked();
+    // What the queue never finished in time (late_) is left to the process: releasing it under running GPU work is
+    // the worse end.
+    if (!late_.empty() && !drain_d12_queue_locked()) late_.clear();
+    uav_ok_.clear();
     pending_output_ = 0;
     pending_signal_queued_ = false;
     if (drain_event_) {
@@ -214,17 +265,18 @@ void Bridge::fail_locked(const std::string& what) {
 
 Route Bridge::route(ID3D11Device* d11_dev) const {
     if (!d11_dev) return Route::kUndecided;
-    for (size_t i = 0; i < kLatches; ++i)
-        if (latch_dev_[i].load(std::memory_order_acquire) == d11_dev)
-            return static_cast<Route>(latch_route_[i].load(std::memory_order_acquire));
-    return Route::kUndecided;
+    Latch latch{};
+    UINT size = sizeof(latch);
+    if (FAILED(d11_dev->GetPrivateData(kLatchData, &size, &latch)) || size != sizeof(latch)) return Route::kUndecided;
+    if (latch.owner != this || latch.epoch != epoch_.load(std::memory_order_acquire)) return Route::kUndecided;
+    return latch.route;
 }
 
 void Bridge::latch_locked(ID3D11Device* d11_dev, Route route, const char* why) {
-    const size_t slot = latch_next_++ % kLatches;
-    latch_dev_[slot].store(nullptr, std::memory_order_release);
-    latch_route_[slot].store(static_cast<int>(route), std::memory_order_release);
-    latch_dev_[slot].store(d11_dev, std::memory_order_release);
+    const Latch latch{this, epoch_.load(std::memory_order_acquire), route};
+    if (FAILED(d11_dev->SetPrivateData(kLatchData, sizeof(latch), &latch)))
+        nr::pe::log("[nr] D3D11 route: the route of D3D11 device %p could not be kept with it; it is chosen again at "
+                    "each use", static_cast<void*>(d11_dev));
     if (route == Route::kBridge) {
         nr::pe::log("[nr] D3D11 route: NR on D3D11 device %p runs on D3D12 (the D3D11 -> D3D12 bridge), chosen once "
                     "for this device", static_cast<void*>(d11_dev));
@@ -359,6 +411,7 @@ bool Bridge::bind_d11_locked(ID3D11Device* d11_dev, std::string* why) {
     CloseHandle(h_fence);
     if (FAILED(hr) || !shared_fence11_) return failed("OpenSharedFence failed", hr);
     bound_d11_ = d11_dev;
+    ++binding_;
     fence_val_ = std::max(fence_val_, shared_fence12_->GetCompletedValue());
     return true;
 }
@@ -465,8 +518,7 @@ bool Bridge::ensure_entry_locked(Role role, uint32_t set, uint32_t w, uint32_t h
     const size_t cap = role == Role::kBack || role == Role::kHudless ? kMaxSlots : 1;
     const Entry made{role, set, w, h, fmt, uav, tex12, tex11, ++use_seq_};
     if (same >= cap) {
-        drain_d12_queue_locked();   // (D3D12 does not keep a resource alive for its GPU work)
-        release_entry(pool_[oldest]);
+        retire_locked(pool_[oldest], drain_d12_queue_locked());   // (D3D12 does not keep a resource alive for its GPU work)
         pool_[oldest] = made;
         *index = oldest;
         return true;
@@ -496,18 +548,27 @@ bool Bridge::prepare_locked(Handoff& item, size_t* index, std::string* why) {
     // D3D12 can write (an sRGB format's UNORM twin: D3D11 copies between the two).
     const bool as_is = item.role == Role::kBack || item.role == Role::kHudless;
     const DXGI_FORMAT fmt = item.depth ? DXGI_FORMAT_R32_FLOAT : as_is ? d.Format : writable_format(d.Format);
-    if (item.role == Role::kBack && !d3d12_uav_supported(d12_dev_, writable_format(d.Format))) {
+    if (item.role == Role::kBack && !uav_supported_locked(writable_format(d.Format))) {
         *why = "back buffer format " + std::to_string(int(d.Format)) + " lacks D3D12 unordered access";
         return false;
     }
-    const bool uav = item.writable && d3d12_uav_supported(d12_dev_, fmt);
+    const bool uav = item.writable && uav_supported_locked(fmt);
     if (!ensure_entry_locked(item.role, item.set, item.w, item.h, fmt, uav, index)) { *why = last_error_; return false; }
     item.tex12 = pool_[*index].tex12;
     return true;
 }
 
 bool Bridge::copy_in_locked(const Handoff& item, const Entry& e, std::string* why) {
-    if (item.depth) {
+    D3D11_TEXTURE2D_DESC d{};
+    item.tex11->GetDesc(&d);
+    // A depth buffer that already is one 32-bit float per pixel is the shared texture's own format family: copied
+    // as it is. The depth pass is for the formats that are not (D24S8, D16, D32S8).
+    // (D3D11 copies a depth buffer only whole.)
+    const bool plain_depth = item.depth && d.MipLevels == 1 && d.SampleDesc.Count == 1 && item.w == d.Width &&
+                             item.h == d.Height &&
+                             (d.Format == DXGI_FORMAT_R32_TYPELESS || d.Format == DXGI_FORMAT_D32_FLOAT ||
+                              d.Format == DXGI_FORMAT_R32_FLOAT);
+    if (item.depth && !plain_depth) {
         // D3D11's depth pass writes a texture of ours (unordered access is not asked of the shared one)
         D3D11_TEXTURE2D_DESC have{};
         if (depth_stage11_) depth_stage11_->GetDesc(&have);
@@ -529,8 +590,6 @@ bool Bridge::copy_in_locked(const Handoff& item, const Entry& e, std::string* wh
         ctx4_->CopyResource(e.tex11, depth_stage11_);
         return true;
     }
-    D3D11_TEXTURE2D_DESC d{};
-    item.tex11->GetDesc(&d);
     if (d.MipLevels == 1 && item.w == d.Width && item.h == d.Height) {
         ctx4_->CopyResource(e.tex11, item.tex11);
     } else {
@@ -631,6 +690,7 @@ Status Bridge::execute(ID3D11Device* d11_dev, Handoff* items, size_t count, bool
     FrameContext fc{};
     fc.device = d12_dev_;
     fc.queue = d12_queue_;
+    fc.binding = binding_;
     fc.items = items;
     fc.count = count;
     fc.back = fc.find(Role::kBack);

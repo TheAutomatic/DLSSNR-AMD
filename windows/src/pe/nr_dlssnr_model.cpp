@@ -2292,6 +2292,7 @@ void layer_changed(int layer) {
 void set_d3d12_backend(D3d12Backend backend) { g_d3d12_backend = backend; }
 void set_d3d12_native_call(bool on) { t_native_call = on; }
 void set_d3d12_no_vk_fallback(bool off) { t_no_vk_fallback = off; }
+bool d3d12_no_vk_fallback() { return t_no_vk_fallback; }
 bool take_d3d12_backend_declined() {
     const bool declined = t_backend_declined;
     t_backend_declined = false;

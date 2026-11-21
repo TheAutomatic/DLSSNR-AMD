@@ -16,6 +16,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -69,6 +70,9 @@ struct Handoff {
 struct FrameContext {
     ID3D12Device* device = nullptr;
     ID3D12CommandQueue* queue = nullptr;
+    // Which binding of the bridge to a D3D11 device this frame is of (never 0): what one binding's frames left
+    // behind - guides - is not another's.
+    uint64_t binding = 0;
     // Every texture of the handoff, and the one of a role (null: not handed over).
     Handoff* items = nullptr;
     size_t count = 0;
@@ -150,23 +154,23 @@ private:
     bool copy_in_locked(const Handoff& item, const Entry& e, std::string* why);
     void release_entry(Entry& e);
     uint32_t cached_slot_count_locked() const;
-    void drain_d12_queue_locked();
+    bool drain_d12_queue_locked();
+    void retire_locked(Entry& e, bool drained);
+    bool uav_supported_locked(DXGI_FORMAT fmt);
     void release_d11_side_locked();
     void release_all_locked();
 
     mutable std::mutex mu_;
     std::atomic<bool> abandoned_{false};
-    // The devices' routes: written under mu_, read without it (route).
-    static constexpr size_t kLatches = 4;
-    std::atomic<ID3D11Device*> latch_dev_[kLatches]{};
-    std::atomic<int> latch_route_[kLatches]{};
-    size_t latch_next_ = 0;
+    // The devices' routes are kept with the devices (their private data); reset makes all of them stale.
+    std::atomic<uint32_t> epoch_{0};
     bool waiting_said_ = false;
     ULONGLONG retry_ms_ = 0;          // an error that stops the bridge for a while: no work before then
     ULONGLONG last_present_ms_ = 0;   // the bound device's last Present through the bridge
     std::string last_logged_;
 
     ID3D11Device* bound_d11_ = nullptr;
+    uint64_t binding_ = 0;            // counts the bindings to a D3D11 device (never 0 once bound)
     LUID d12_adapter_luid_{};
     bool has_d12_adapter_luid_ = false;
 
@@ -185,6 +189,8 @@ private:
     HANDLE drain_event_ = nullptr;
     std::string last_error_;
     std::vector<Entry> pool_;
+    std::vector<Entry> late_;                 // out of the pool, not yet known to be out of the queue's work
+    std::map<DXGI_FORMAT, bool> uav_ok_;      // the D3D12 device's unordered access, by format
     // The D3D11 depth pass and the R32_FLOAT texture it writes (copied into the shared one), on the bound device.
     std::unique_ptr<nr::pe::bridge::DepthCopyD3D11> depth_pass_;
     ID3D11Texture2D* depth_stage11_ = nullptr;

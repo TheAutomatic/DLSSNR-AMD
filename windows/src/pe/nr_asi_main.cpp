@@ -1093,7 +1093,8 @@ bool depth_read_only(D3D12_RESOURCE_STATES s) {
                         D3D12_RESOURCE_STATE_DEPTH_READ;
     return s != D3D12_RESOURCE_STATE_COMMON && (s & ~kReads) == 0;
 }
-// Our R32_FLOAT twin of the game's depth `source` (unordered access; it rests in NON_PIXEL_SHADER_RESOURCE).
+// Our R32_FLOAT twin of the game's depth `source` (unordered access; it rests in COPY_DEST, as every guide copy:
+// the Present that reads it takes it from there).
 bool depth_twin_of(ID3D12Device* device, ID3D12Resource*& twin, ID3D12Resource* source) {
     const D3D12_RESOURCE_DESC s = source->GetDesc();
     if (twin) {
@@ -1107,7 +1108,7 @@ bool depth_twin_of(ID3D12Device* device, ID3D12Resource*& twin, ID3D12Resource* 
     d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     d.Width = s.Width; d.Height = s.Height; d.DepthOrArraySize = 1; d.MipLevels = 1;
     d.Format = DXGI_FORMAT_R32_FLOAT; d.SampleDesc.Count = 1; d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+    if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COPY_DEST,
                                                nullptr, IID_PPV_ARGS(&twin)))) {
         twin = nullptr;
         return false;
@@ -1127,9 +1128,9 @@ bool depth_read_into(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, ID3D1
                               nr::pe::d3d12_direct::ready(device, cmd, &why);
     if (direct_depth) {
         transition(cmd, depth, from, read);
-        transition(cmd, twin, kRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        transition(cmd, twin, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         const bool ok = nr::pe::d3d12_passthrough::copy_depth_r32(device, cmd, depth, twin, &why);
-        transition(cmd, twin, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kRead);
+        transition(cmd, twin, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
         transition(cmd, depth, read, from);
         if (!ok && !g.said) { g.said = true; log("[nr] Present layers: the game's depth was not read (%s)", why.c_str()); }
         return ok;
@@ -1141,9 +1142,9 @@ bool depth_read_into(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, ID3D1
     }
     // a read state gains the compute-read bit; a write state (or none) becomes the compute read alone (as the bridge)
     transition(cmd, depth, from, read);
-    transition(cmd, twin, kRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    transition(cmd, twin, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     const bool ok = g.pass->record(device, cmd, depth, twin, &why);
-    transition(cmd, twin, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kRead);
+    transition(cmd, twin, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
     transition(cmd, depth, read, from);
     if (!ok && !g.said) { g.said = true; log("[nr] Present layers: the game's depth was not read (%s)", why.c_str()); }
     return ok;
@@ -1348,6 +1349,8 @@ struct GuideSet {
     Frame f;                                   // the evaluate's contract (its resources are not used at the Present)
     nr::asi::Wilsjo2Frame w2;                  // the same for the wilsjo2 processing (its own guide regions)
     uint64_t serial = 0;                       // 0: empty
+    uint64_t origin = 0;                       // whose frame: 0 a D3D12 game's, else the D3D11 -> D3D12 bridge's
+                                               // binding (FrameContext::binding) - read by that one's Presents only
     uint64_t captured_at = 0;                  // presents seen at the capture
     ULONGLONG captured_ms = 0;
     uint32_t out_w = 0, out_h = 0;             // the upscaler's output (the aspect a back buffer must have)
@@ -1541,7 +1544,9 @@ bool renodx_layer(const Layer& l) { return l.cfg.processing == nr::pe::Processin
 // At a game evaluate, while the chain has Present layers: its motion vectors and depth copied into the oldest set no
 // Present on the GPU still reads (none free: no copy this frame).
 void capture_guides(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, const Frame& f, const States& st,
-                    const nr::asi::Wilsjo2Frame& wf, uint32_t feature, bool depth_wanted) {
+                    const nr::asi::Wilsjo2Frame& wf, uint32_t feature, bool depth_wanted, uint64_t origin = 0) {
+    if (!f.motion) return;
+    if (!f.depth) depth_wanted = false;   // (the D3D11 -> D3D12 bridge hands none over where it cannot)
     GuideSet* target = nullptr;
     const uint64_t done = g_present.fence ? g_present.fence->GetCompletedValue() : ~0ull;
     // the set a Present read last is kept (present_path.hpp: a capture in flight must not leave every candidate
@@ -1584,6 +1589,7 @@ void capture_guides(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, const 
         return;
     }
     for (ID3D12Resource* r : {f.depth, f.motion}) {
+        if (!r) continue;
         const D3D12_RESOURCE_DESC d = r->GetDesc();
         if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.DepthOrArraySize != 1 || d.SampleDesc.Count != 1) return;
     }
@@ -1595,7 +1601,13 @@ void capture_guides(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, const 
     // copy of the resource as it is (said in the log once)
     std::string depth_why;
     bool depth_by_pass = false;
-    if (depth_wanted) {
+    // A depth that already is a plain R32_FLOAT texture (the D3D11 -> D3D12 bridge's, read on D3D11) is what the pass
+    // would write: copied as it is into the twin.
+    const bool depth_plain = depth_wanted && [&] {
+        const D3D12_RESOURCE_DESC d = f.depth->GetDesc();
+        return d.Format == DXGI_FORMAT_R32_FLOAT && d.MipLevels == 1 && !(d.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+    }();
+    if (depth_wanted && !depth_plain) {
         const bool direct_depth = nr::pe::d3d12_passthrough::enabled() &&
                                   nr::pe::d3d12_passthrough::canary() == nr::pe::d3d12_passthrough::Canary::kHit &&
                                   nr::pe::d3d12_direct::ready(device, cmd, &depth_why);
@@ -1613,7 +1625,7 @@ void capture_guides(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, const 
                 unsigned(f.depth->GetDesc().Format), depth_why.empty() ? "" : ": ", depth_why.c_str());
         }
     }
-    if ((depth_wanted && !(depth_by_pass ? depth_twin_of(device, target->depth, f.depth) : clone_of(device, target->depth, f.depth))) ||
+    if ((depth_wanted && !(depth_by_pass || depth_plain ? depth_twin_of(device, target->depth, f.depth) : clone_of(device, target->depth, f.depth))) ||
         !clone_of(device, target->motion, f.motion)) {
         target->serial = 0;
         return;
@@ -1643,6 +1655,7 @@ void capture_guides(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, const 
     if (!depth_copied) target->f.depth = nullptr;
     target->w2 = wf;
     target->serial = ++g_present.serial;
+    target->origin = origin;
     target->captured_at = g_present.presents;
     target->captured_ms = now_ms;
     target->out_w = f.out_w;
@@ -2186,7 +2199,7 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
         std::lock_guard<std::mutex> cg(g_capture_lock);
         for (uint32_t k = 0; k < kD12GuideSets; ++k) {
             const GuideSet& gs = g_present.sets[k];
-            ordered[k] = gs.serial && !gs.list && gs.queue &&
+            ordered[k] = gs.serial && !gs.list && gs.queue && gs.origin == (d11_at ? d11_at->binding : 0) &&
                          (gs.queue == queue || (gs.fence && gs.fence->GetCompletedValue() >= gs.value));
         }
     }
@@ -8884,6 +8897,9 @@ void d11_present_layers(IDXGISwapChain* sc, ID3D11Device* device) {
         // on D3D12 or this frame goes on as it is - the Vulkan route below is never started for it.
         namespace d11b = nr::pe::d11_bridge;
         const bool d12_game = d12_game_active();
+        // HUD FIX's image is the capture's own, replaced under this lock: held for as long as the handoff copies it
+        struct Held { ID3D11Texture2D* t; ~Held() { if (t) t->Release(); } } hud_held{hud_captured ? hud_cap.hudless : nullptr};
+        if (hud_held.t) hud_held.t->AddRef();
         guard.unlock();   // (the bridge's lock comes before g_lock)
         const d11b::Route route = g_d11_d3d12.decide(device, d12_game);
         if (route == d11b::Route::kUndecided) return;
@@ -8893,8 +8909,7 @@ void d11_present_layers(IDXGISwapChain* sc, ID3D11Device* device) {
                 if (!said) { said = true; log("[nr] Present layers (D3D11): a D3D12 game's NR runs in this process now; the D3D11 device's frames go on without NR's work"); }
                 return;
             }
-            ID3D11Texture2D* const hud11 = hud_captured ? hud_cap.hudless : nullptr;
-            g_d11_d3d12.execute(device, back, hud11, [&](d11b::FrameContext& fc) {
+            g_d11_d3d12.execute(device, back, hud_held.t, [&](d11b::FrameContext& fc) {
                 present_layers(sc, fc.queue, false, nullptr, &fc);
             });
             return;
@@ -9014,32 +9029,71 @@ thread_local int t_d11_inside = 0;
 // The evaluate's textures go to D3D12 by role in one round trip; there the D3D12 route's own code runs on them
 // (plan_layers, capture_guides, run_before, run_after) on a list of ours, submitted on the bridge's queue. The model's
 // Vulkan session is never started for this device.
-struct D11BridgeList {   // g_lock
+// D3D11's wait for the D3D12 work is queued, not slept on: the next handoff can record while the last one's list still
+// runs. So a few allocators, each taken again only once the queue has passed its recording (our fence, signalled after
+// each submission); none free - the queue that far behind - and that handoff's work is left out.
+struct D11BridgeList {   // g_lock; one recording at a time (the bridge's lock)
+    static constexpr size_t kAllocators = 8;
     ID3D12Device* device = nullptr;
-    ID3D12CommandAllocator* allocator = nullptr;
     ID3D12GraphicsCommandList* list = nullptr;
+    ID3D12Fence* fence = nullptr;
+    uint64_t value = 0;       // the last recording's (signalled at its submission)
+    struct Slot { ID3D12CommandAllocator* allocator = nullptr; uint64_t busy = 0; } slots[kAllocators];
+    bool behind_said = false;
+    void release() {
+        if (list) list->Release();
+        if (fence) fence->Release();
+        for (Slot& s : slots) if (s.allocator) s.allocator->Release();
+        if (device) device->Release();
+        *this = {};
+    }
 } g_d11_bridge_list;
 
-// The list, reset for a new recording: the bridge waits for each handoff's work before the next one starts, so one
-// allocator serves them all.
 ID3D12GraphicsCommandList* d11_bridge_list(ID3D12Device* device) {
     D11BridgeList& L = g_d11_bridge_list;
     if (L.device != device) {
-        if (L.list) L.list->Release();
-        if (L.allocator) L.allocator->Release();
-        if (L.device) L.device->Release();
-        L = {};
-        if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&L.allocator))) ||
-            FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, L.allocator, nullptr, IID_PPV_ARGS(&L.list)))) {
-            if (L.allocator) L.allocator->Release();
-            L = {};
-            return nullptr;
+        // The bridge's D3D12 device was made again (the old one removed: nothing of it still runs). What the old one
+        // left - the guide copies, every feature's layers - is not this device's.
+        L.release();
+        {
+            std::lock_guard<std::mutex> cg(g_capture_lock);
+            for (GuideSet& s : g_present.sets) if (s.origin) { s.serial = 0; s.list = nullptr; s.queue = nullptr; }
         }
-        L.list->Close();
+        for (GuideSet& s : g_present.sets) if (s.origin) {
+            release_resource(s.depth); release_resource(s.motion);
+            s.origin = 0;
+        }
+        for (auto& kv : g_d11_features) forget(kv.second.d12);
+        if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&L.fence)))) { L.fence = nullptr; return nullptr; }
         L.device = device;
         device->AddRef();
     }
-    if (FAILED(L.allocator->Reset()) || FAILED(L.list->Reset(L.allocator, nullptr))) return nullptr;
+    const uint64_t done = L.fence->GetCompletedValue();
+    D11BridgeList::Slot* slot = nullptr;
+    for (D11BridgeList::Slot& s : L.slots) if (s.busy <= done && (!slot || (s.allocator && !slot->allocator))) slot = &s;
+    if (!slot) {
+        if (!L.behind_said) {
+            L.behind_said = true;
+            log("[nr] D3D11 -> D3D12 bridge: the D3D12 queue is %u recordings behind; NR's work is left out of the frames "
+                "until it catches up", unsigned(D11BridgeList::kAllocators));
+        }
+        return nullptr;
+    }
+    if (!slot->allocator &&
+        FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&slot->allocator)))) {
+        slot->allocator = nullptr;
+        return nullptr;
+    }
+    if (FAILED(slot->allocator->Reset())) return nullptr;
+    if (!L.list) {
+        if (FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, slot->allocator, nullptr, IID_PPV_ARGS(&L.list)))) {
+            L.list = nullptr;
+            return nullptr;
+        }
+    } else if (FAILED(L.list->Reset(slot->allocator, nullptr))) {
+        return nullptr;
+    }
+    slot->busy = ++L.value;   // (d11_bridge_submit signals it, whatever becomes of the recording)
     nr::gpu::reset(L.list);
     return L.list;
 }
@@ -9057,12 +9111,16 @@ void d11_bridge_guides(ID3D12GraphicsCommandList* l, ID3D12CommandQueue* queue) 
 
 // Closes and submits the recording, and tells the bridge its work is on the queue. Without g_lock.
 bool d11_bridge_submit(nr::pe::d11_bridge::FrameContext& fc, ID3D12GraphicsCommandList* l) {
+    // (the list's fence and value: this recording's, no other is made meanwhile - the bridge's lock)
+    const auto passed = [&] { fc.queue->Signal(g_d11_bridge_list.fence, g_d11_bridge_list.value); };
     if (FAILED(l->Close())) {
         d11_bridge_guides(l, nullptr);
+        passed();
         return false;
     }
     ID3D12CommandList* lists[] = {l};
     fc.queue->ExecuteCommandLists(1, lists);
+    passed();
     d11_bridge_guides(l, fc.queue);
     fc.submitted = true;
     if (fc.signal_out_fence && *fc.signal_out_fence)
@@ -9186,18 +9244,29 @@ NVSDK_NGX_Result d11_bridge_evaluate(ID3D11DeviceContext* ctx, ID3D11Device* dev
         f12.depth = fc.find(d11b::Role::kDepth);
         f12.motion = fc.find(d11b::Role::kMotion);
         f12.exposure = fc.find(d11b::Role::kExposure);
-        return f12.output && f12.depth && f12.motion;
+        return f12.output && f12.motion;
     };
-    const auto guides_of = [&](std::vector<d11b::Handoff>& items) {
-        d11b::Handoff d;
-        d.role = d11b::Role::kDepth; d.tex11 = depth.tex; d.depth = true;
-        items.push_back(d);
+    // The guides go over once an evaluate, and the depth - a pass of its own on D3D11 for most formats - only for what
+    // reads it: a wilsjo2 layer, [Inspect]'s held frame, a Present that wants it. Where it cannot be handed over the
+    // rest still runs (what needs it says so itself).
+    const auto w2_in = [](const std::vector<const Layer*>& layers) {
+        return std::any_of(layers.begin(), layers.end(),
+                           [](const Layer* l) { return l->cfg.processing == nr::pe::Processing::kWilsjo2; });
+    };
+    bool depth_sent = false, guides_sent = false, exposure_sent = false;
+    uint64_t sent_binding = 0;   // the bridge's binding the guides went over in: its shared textures still hold them
+    const auto guides_of = [&](std::vector<d11b::Handoff>& items, bool depth_read) {
+        if (depth_read || depth_sent) {
+            d11b::Handoff d;
+            d.role = d11b::Role::kDepth; d.tex11 = depth.tex; d.depth = true; d.optional = true; d.in = !depth_sent;
+            items.push_back(d);
+        }
         d11b::Handoff m;
-        m.role = d11b::Role::kMotion; m.tex11 = motion.tex;
+        m.role = d11b::Role::kMotion; m.tex11 = motion.tex; m.in = !guides_sent;
         items.push_back(m);
         if (exposure.tex) {
             d11b::Handoff e;
-            e.role = d11b::Role::kExposure; e.tex11 = exposure.tex; e.optional = true;
+            e.role = d11b::Role::kExposure; e.tex11 = exposure.tex; e.optional = true; e.in = !exposure_sent;
             items.push_back(e);
         }
     };
@@ -9214,13 +9283,16 @@ NVSDK_NGX_Result d11_bridge_evaluate(ID3D11DeviceContext* ctx, ID3D11Device* dev
         d11b::Handoff o;   // (not copied: the layers ask for its format and size alone here)
         o.role = d11b::Role::kOutput; o.tex11 = output.tex; o.in = false; o.writable = true;
         items.push_back(o);
-        guides_of(items);
+        const bool depth_read = (plan.present_wanted && plan.depth_wanted) || chain->inspect.hold ||
+                                (before && w2_in(plan.before));
+        guides_of(items, depth_read);
         bool ran = false;
         const d11b::Status status = g_d11_d3d12.execute(device, items.data(), items.size(), false, [&](d11b::FrameContext& fc) {
             const nr::asi::hudcap::Own own;
             std::unique_lock<std::mutex> lk(g_lock);
             const auto it = g_d11_features.find(h->Id);
             Frame f12;
+            sent_binding = fc.binding;
             if (it == g_d11_features.end() || !frame12(fc, f12)) return;
             ID3D12GraphicsCommandList* const l = d11_bridge_list(fc.device);
             if (!l) return;
@@ -9228,7 +9300,7 @@ NVSDK_NGX_Result d11_bridge_evaluate(ID3D11DeviceContext* ctx, ID3D11Device* dev
                 nr::gpu::Scope recording(nr::asi::hudcap::d3d12_recording(l));
                 g_d12_uses.touch();
                 const nr::asi::Wilsjo2Frame wf = wilsjo2_frame(p, f12, st12);
-                if (plan.present_wanted) capture_guides(l, fc.device, f12, st12, wf, h->Id, plan.depth_wanted);
+                if (plan.present_wanted) capture_guides(l, fc.device, f12, st12, wf, h->Id, plan.depth_wanted, fc.binding);
                 if (before && f12.color) {
                     Frame fb = f12;   // the region alone, at the shared texture's origin
                     fb.color_x = fb.color_y = 0;
@@ -9248,6 +9320,13 @@ NVSDK_NGX_Result d11_bridge_evaluate(ID3D11DeviceContext* ctx, ID3D11Device* dev
             if (!d11_bridge_submit(fc, l)) ran = false;
         });
         handed = status == d11b::Status::kRan && ran;
+        // (what went over stays in the shared textures - one of a role - for the layers after the upscaler)
+        guides_sent = status == d11b::Status::kRan;
+        for (const d11b::Handoff& i : items) {
+            if (!guides_sent || !i.tex12) continue;
+            depth_sent |= i.role == d11b::Role::kDepth;
+            exposure_sent |= i.role == d11b::Role::kExposure;
+        }
     }
     NVSDK_NGX_Result r;
     if (handed) {
@@ -9268,12 +9347,14 @@ NVSDK_NGX_Result d11_bridge_evaluate(ID3D11DeviceContext* ctx, ID3D11Device* dev
     d11b::Handoff o;
     o.role = d11b::Role::kOutput; o.tex11 = output.tex; o.back = true; o.writable = true;
     items.push_back(o);
-    guides_of(items);
+    guides_of(items, chain->inspect.hold || w2_in(plan.after));
     g_d11_d3d12.execute(device, items.data(), items.size(), false, [&](d11b::FrameContext& fc) {
         const nr::asi::hudcap::Own own;
         std::unique_lock<std::mutex> lk(g_lock);
         const auto it = g_d11_features.find(h->Id);   // released meanwhile on another thread: nothing to run on
         Frame f12;
+        // (another device had the bridge in between: the guides in its shared textures are not this evaluate's)
+        if (guides_sent && fc.binding != sent_binding) return;
         if (it == g_d11_features.end() || !frame12(fc, f12)) return;
         if (!(f12.output->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
             static bool said = false;

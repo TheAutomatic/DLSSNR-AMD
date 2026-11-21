@@ -703,6 +703,11 @@ w2::Settings wilsjo2_settings(const nr::pe::LayerConfig& layer) {
     return s;
 }
 
+// A D3D11 game's D3D12 bridge is at work on this thread (nr_d3d11_d3d12_bridge.hpp): its device's route was chosen
+// once, so what the D3D12 programs cannot do is left undone there - never handed to the Vulkan bridge or to the
+// model's Vulkan session, which that device does not start.
+bool d3d12_only() { return nr::dlssnr::d3d12_no_vk_fallback(); }
+
 namespace {
 // ---- the native runtime: the whole flow in one recording of the bridge -----------------------------------------
 // On the bridge (nr_pe_bridge.hpp) a recording is a cut of the game's list with a copy of every image it names into
@@ -828,6 +833,11 @@ bool wilsjo2_run(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, Wilsjo2Ow
                 return false;
             }
             if (!why.empty()) {
+                if (d3d12_only()) {
+                    native::say_route("not run on this D3D12-only device (a D3D11 game's bridge; the Vulkan bridge is not "
+                                      "used there): " + why);
+                    return false;
+                }
                 if (nr::pe::d3d12_passthrough::enabled()) native::say_route("the Vulkan bridge for now: " + why);
                 return run_bridged(cmd, device, o, f, s, target, w, h, before_upscale);
             }
@@ -838,6 +848,7 @@ bool wilsjo2_run(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, Wilsjo2Ow
     }
     o.capture_layer = false;
     if (!target || !f.depth || !f.motion) return false;
+    if (!nstage && d3d12_only()) return false;   // (the model's Vulkan session is not this device's)
     D3d12Io io(cmd, device, o, &f, target, before_upscale, w, h);
     if (nstage) io.go_native(nstage, nimpl);
     w2::FlowFrame ff;
@@ -1029,6 +1040,7 @@ bool wilsjo2_convert(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, ID3D1
         }
     }
     if (g_stage_retry.blocked()) return false;
+    if (d3d12_only()) return false;
     bool recorded = false;
     nr::dlssnr::with_d3d12_session([&](nr::pe::Session& session) {
         recorded = session.record_raw(device, cmd, [&](VkCommandBuffer vk, const HostDevice& host,
@@ -1098,6 +1110,7 @@ bool hudfix_d3d12(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, const Hu
         }
     }
     if (g_stage_retry.blocked()) return false;
+    if (d3d12_only()) return false;
     bool recorded = false;
     nr::dlssnr::with_d3d12_session([&](nr::pe::Session& session) {
         recorded = session.record_raw(device, cmd, [&](VkCommandBuffer vk, const HostDevice& host,
@@ -1173,6 +1186,7 @@ bool hudfix_select_d3d12(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, I
         }
     }
     if (g_stage_retry.blocked()) return false;
+    if (d3d12_only()) return false;
     bool recorded = false;
     nr::dlssnr::with_d3d12_session([&](nr::pe::Session& session) {
         recorded = session.record_raw(device, cmd, [&](VkCommandBuffer vk, const HostDevice& host,
@@ -1240,6 +1254,7 @@ bool wilsjo2_fg_delta(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, ID3D
         }
     }
     if (g_stage_retry.blocked()) return false;
+    if (d3d12_only()) return false;
     bool recorded = false;
     nr::dlssnr::with_d3d12_session([&](nr::pe::Session& session) {
         recorded = session.record_raw(device, cmd, [&](VkCommandBuffer vk, const HostDevice& host,
@@ -1304,6 +1319,7 @@ bool wilsjo2_inspect(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, ID3D1
         }
     }
     if (g_stage_retry.blocked()) return false;
+    if (d3d12_only()) return false;
     bool recorded = false;
     nr::dlssnr::with_d3d12_session([&](nr::pe::Session& session) {
         recorded = session.record_raw(device, cmd, [&](VkCommandBuffer vk, const HostDevice& host,

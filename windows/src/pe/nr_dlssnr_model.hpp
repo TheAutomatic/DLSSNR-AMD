@@ -177,6 +177,7 @@ void set_d3d12_native_call(bool on);
 // declines (the D3D11 -> D3D12 bridge uses this so the caller can release the D3D12 bridge slot and try the D3D11
 // Vulkan bridge instead). take_d3d12_backend_declined() returns and clears whether the backend declined.
 void set_d3d12_no_vk_fallback(bool off);
+bool d3d12_no_vk_fallback();
 bool take_d3d12_backend_declined();
 
 // The frame's keys, once a frame: [RenoDX] NRToggleKey (NR on / off for this run) and the screenshot keys. True while NR
