@@ -557,7 +557,7 @@ void forget_list(void* self) {
     if (it != g_states.end()) it->second->valid = false;
 }
 
-bool patch_list_class(List* list, std::string* why, bool* wrapped_refusal = nullptr);
+bool patch_list_class(List* list, std::string* why);
 
 // ---- the hooks ---------------------------------------------------------------------------------------
 #define NR_TARGET(self) static_cast<List*>(tl_forward)
@@ -1265,30 +1265,7 @@ bool add_vtable(void** vt, ListClass* cls, bool hooked, std::string* why) {
     return true;
 }
 
-bool in_d3d12_module(const void* fn, std::string* out_mod = nullptr) {
-    if (!fn) return false;
-    HMODULE mod = nullptr;
-    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                            reinterpret_cast<LPCWSTR>(fn), &mod) || !mod) {
-        if (out_mod) *out_mod = "private memory";
-        return false;
-    }
-    wchar_t path[MAX_PATH]{};
-    if (!GetModuleFileNameW(mod, path, MAX_PATH)) return false;
-    const wchar_t* base = std::wcsrchr(path, L'\\');
-    base = base ? base + 1 : path;
-    if (out_mod) {
-        char buf[MAX_PATH]{};
-        const int n = WideCharToMultiByte(CP_UTF8, 0, base, -1, buf, int(sizeof buf), nullptr, nullptr);
-        *out_mod = n > 0 ? buf : "";
-    }
-    if (_wcsnicmp(base, L"d3d12", 5) == 0) return true;
-    for (const wchar_t* p = base; *p; ++p)
-        if (_wcsnicmp(p, L"vkd3d", 5) == 0) return true;
-    return false;
-}
-
-bool patch_list_class(List* list, std::string* why, bool* wrapped_refusal) {
+bool patch_list_class(List* list, std::string* why) {
     void** vt = *reinterpret_cast<void***>(list);
     if (ListClass* known = class_by_vtable(vt)) {
         // Hooked already - unless the vtable holds its class's originals again: a per-object copy that
@@ -1312,18 +1289,6 @@ bool patch_list_class(List* list, std::string* why, bool* wrapped_refusal) {
         bool same = c->slots == slots;
         for (unsigned k = 0; same && k < slots; ++k) same = vt[k] == c->orig[k];
         if (same) return add_vtable(vt, g_classes[i], false, why);
-    }
-    std::string mod;
-    if (!in_d3d12_module(vt[kReset], &mod) || !in_d3d12_module(vt[kClose], &mod)) {
-        *why = "the command list vtable is outside D3D12 module (" + mod + ")";
-        static bool logged = false;
-        if (!logged) {
-            logged = true;
-            log("[nr] bridge: refusing to patch wrapped command list vtable %p (%s)",
-                static_cast<void*>(vt), mod.c_str());
-        }
-        if (wrapped_refusal) *wrapped_refusal = true;
-        return false;
     }
     if (n >= 32) { *why = "too many command list classes"; return false; }
     auto* cls = new ListClass();
@@ -1445,16 +1410,10 @@ HRESULT STDMETHODCALLTYPE hk_CreateCommandList(ID3D12Device* d, UINT mask, D3D12
     return hr;
 }
 
-bool patch_device_class(ID3D12Device* device, std::string* why, bool* wrapped_refusal = nullptr) {
+bool patch_device_class(ID3D12Device* device, std::string* why) {
     void** vt = *reinterpret_cast<void***>(device);
     const int n = g_device_count.load();
     for (int i = 0; i < n; ++i) if (g_device_classes[i].vtable == vt) return true;
-    std::string mod;
-    if (!in_d3d12_module(vt[kDeviceCreateCommandList], &mod)) {
-        *why = "the device vtable is outside D3D12 module (" + mod + ")";
-        if (wrapped_refusal) *wrapped_refusal = true;
-        return false;
-    }
     if (n >= 8) { *why = "too many device classes"; return false; }
     g_device_classes[n] = {vt, vt[kDeviceCreateCommandList]};
     g_device_count.store(n + 1, std::memory_order_release);
@@ -1467,8 +1426,7 @@ bool patch_device_class(ID3D12Device* device, std::string* why, bool* wrapped_re
     return true;
 }
 
-bool patch_queue_classes(ID3D12Device* device, D3D12_COMMAND_LIST_TYPE type, std::string* why,
-                         bool* wrapped_refusal = nullptr) {
+bool patch_queue_classes(ID3D12Device* device, D3D12_COMMAND_LIST_TYPE type, std::string* why) {
     D3D12_COMMAND_QUEUE_DESC desc{};
     desc.Type = type;
     ID3D12CommandQueue* q = nullptr;
@@ -1481,12 +1439,7 @@ bool patch_queue_classes(ID3D12Device* device, D3D12_COMMAND_LIST_TYPE type, std
     const int n = g_queue_count.load();
     for (int i = 0; i < n; ++i) known = known || g_queue_classes[i].vtable == vt;
     bool ok = true;
-    std::string mod;
-    if (!known && !in_d3d12_module(vt[kQueueExecute], &mod)) {
-        ok = false;
-        *why = "the command queue vtable is outside D3D12 module (" + mod + ")";
-        if (wrapped_refusal) *wrapped_refusal = true;
-    } else if (!known && n >= 8) { ok = false; *why = "too many command queue classes"; }
+    if (!known && n >= 8) { ok = false; *why = "too many command queue classes"; }
     else if (!known) {
         g_queue_classes[n] = {vt, vt[kQueueExecute]};
         g_queue_count.store(n + 1, std::memory_order_release);
@@ -1507,9 +1460,8 @@ struct Snapshot {
 bool prepare(List* list, std::string* why) {
     std::lock_guard<std::recursive_mutex> guard(g_mutex);
     if (g_disabled) { *why = g_disabled_why; return false; }
-    bool wrapped_refusal = false;
-    if (!patch_list_class(list, why, &wrapped_refusal)) {
-        if (!wrapped_refusal) { g_disabled = true; g_disabled_why = *why; }
+    if (!patch_list_class(list, why)) {
+        g_disabled = true; g_disabled_why = *why;
         return false;
     }
     void** vt = *reinterpret_cast<void***>(list);
@@ -1522,13 +1474,12 @@ bool prepare(List* list, std::string* why) {
             *why = "the command list has no device";
             return false;
         }
-        bool q_wrapped = false;
-        const bool ok = patch_queue_classes(device, D3D12_COMMAND_LIST_TYPE_DIRECT, why, &q_wrapped) &&
-                        patch_queue_classes(device, D3D12_COMMAND_LIST_TYPE_COMPUTE, why, &q_wrapped) &&
-                        patch_device_class(device, why, &q_wrapped);
+        const bool ok = patch_queue_classes(device, D3D12_COMMAND_LIST_TYPE_DIRECT, why) &&
+                        patch_queue_classes(device, D3D12_COMMAND_LIST_TYPE_COMPUTE, why) &&
+                        patch_device_class(device, why);
         device->Release();
         if (!ok) {
-            if (!q_wrapped) { g_disabled = true; g_disabled_why = *why; }
+            g_disabled = true; g_disabled_why = *why;
             return false;
         }
         queues_done.push_back(vt);
