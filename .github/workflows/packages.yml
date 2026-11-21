@@ -1,11 +1,9 @@
-# Builds the packages on every push and pull request, and attaches them to a GitHub release when a v*
-# tag is pushed. The version in the package names comes from the tags (*/build/version.sh). No
+# Builds packages on v* tags or manual dispatch, and attaches them to a GitHub release for a v*
+# tag. The version in the package names comes from the tags (*/build/version.sh). No
 # package contains a model: the installers extract it from the user's own nvngx_dlssnr.dll.
 #
-# Windows switch: the Windows package is built unless the repository variable WINDOWS_PACKAGE is
-# "off" (for a Linux-only release):
-#   gh variable set WINDOWS_PACKAGE --body off     # Linux only
-#   gh variable set WINDOWS_PACKAGE --body on      # Linux and Windows
+# Linux packages require LINUX_PACKAGE=on. For Linux only, use a "-linux-" tag or set
+# WINDOWS_PACKAGE=off; otherwise the Windows package is built too.
 # A tag with "-win-" in it (v0.0.4-win-preview) is a Windows-only release: no Linux packages, and the
 # release is not marked latest, so the latest release keeps its Linux packages.
 name: Packages
@@ -119,7 +117,8 @@ jobs:
     if: >-
       always() && startsWith(github.ref, 'refs/tags/v') &&
       (needs.linux.result == 'success' || needs.linux.result == 'skipped') &&
-      needs.windows.result == 'success'
+      (needs.windows.result == 'success' || needs.windows.result == 'skipped') &&
+      (needs.linux.result == 'success' || needs.windows.result == 'success')
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
