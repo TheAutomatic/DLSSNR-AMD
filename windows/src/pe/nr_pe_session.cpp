@@ -89,11 +89,12 @@ template <class F> OnExit<F> on_exit(F f) { return OnExit<F>{std::move(f)}; }
 std::string address_space_report() {
     MEMORY_BASIC_INFORMATION region{};
     unsigned long long free_total = 0, largest = 0;
+    void* largest_base = nullptr;
     auto* address = static_cast<unsigned char*>(nullptr);
     while (VirtualQuery(address, &region, sizeof region) == sizeof region) {
         if (region.State == MEM_FREE) {
             free_total += region.RegionSize;
-            if (region.RegionSize > largest) largest = region.RegionSize;
+            if (region.RegionSize > largest) { largest = region.RegionSize; largest_base = region.BaseAddress; }
         }
         auto* next = static_cast<unsigned char*>(region.BaseAddress) + region.RegionSize;
         if (next <= address) break;   // no progress, or the pointer wrapped
@@ -102,12 +103,16 @@ std::string address_space_report() {
     MEMORYSTATUSEX memory{};
     memory.dwLength = sizeof memory;
     GlobalMemoryStatusEx(&memory);
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
     char text[256];
     std::snprintf(text, sizeof text,
-                  "address space: %.0f MB free in this process, largest contiguous block %.0f MB "
-                  "(of %.0f MB total); %.0f MB of RAM free",
-                  double(free_total) / (1 << 20), double(largest) / (1 << 20),
+                  "address space: %.0f MB free in this process, largest contiguous block %.0f MB at %p "
+                  "(of %.0f MB total, user VA to %p = LargeAddressAware %d); %.0f MB of RAM free",
+                  double(free_total) / (1 << 20), double(largest) / (1 << 20), largest_base,
                   double(memory.ullTotalVirtual) / (1 << 20),
+                  si.lpMaximumApplicationAddress,
+                  (int)(si.lpMaximumApplicationAddress > (void*)0x80000000),
                   double(memory.ullAvailPhys) / (1 << 20));
     return text;
 }
@@ -2653,8 +2658,17 @@ HostDevice Session::Impl::make_host() const {
     // and waits for it; the game is submitting to the same underlying VkQueue,
     // so each of those submits takes the queue lock (the build thread's).
     host.queue = access.queue; host.queue_family = access.family;
-    host.buffer_device_address = vkd3d_device || mode == Mode::Bridge ||
-                                 vkdevice::network_features_added(handles.device);
+    // The feature being asked for is not the same as the entry point being there: a device whose creator
+    // (DXVK, a layer) never enabled bufferDeviceAddress has a null slot for vkGetBufferDeviceAddress, and
+    // calling it is an execute-at-0. Ask the device itself, and keep NR_NO_BDA=1's override.
+    bool bda = vkd3d_device || mode == Mode::Bridge || vkdevice::network_features_added(handles.device);
+    if (bda && !vkGetDeviceProcAddr(handles.device, "vkGetBufferDeviceAddress")) {
+        bda = false;
+        log("[nr] bufferDeviceAddress: the device has no vkGetBufferDeviceAddress entry point; "
+            "the storage-buffer builds are used");
+    }
+    if (const char* no_bda = std::getenv("NR_NO_BDA"); no_bda && *no_bda == '1') bda = false;
+    host.buffer_device_address = bda;
     // the network of the GPU's architecture (nr_gpu_arch.hpp): the bridge's device's, else the game's physical device
     // asked directly - not inferred from whether the device watch added features to it
     host.arch = bdev ? bdev->arch() : handles.physical ? nr::arch::of(handles.physical) : nr::arch::GpuArch::unknown;
