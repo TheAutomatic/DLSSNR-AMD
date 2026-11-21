@@ -147,7 +147,12 @@ bool Bridge::active() const {
 
 uint32_t Bridge::cached_slot_count() const {
     std::lock_guard<std::mutex> lk(mu_);
-    return static_cast<uint32_t>(slots_.size());
+    return cached_slot_count_locked();
+}
+
+uint32_t Bridge::cached_slot_count_locked() const {
+    return static_cast<uint32_t>(std::count_if(pool_.begin(), pool_.end(),
+                                               [](const Entry& e) { return e.role == Role::kBack; }));
 }
 
 std::string Bridge::last_error() const {
@@ -155,11 +160,9 @@ std::string Bridge::last_error() const {
     return last_error_;
 }
 
-void Bridge::release_slot(Slot& s) {
-    safe_release(s.hud11);
-    safe_release(s.hud12);
-    safe_release(s.tex11);
-    safe_release(s.tex12);
+void Bridge::release_entry(Entry& e) {
+    safe_release(e.tex11);
+    safe_release(e.tex12);
 }
 
 void Bridge::drain_d12_queue_locked() {
@@ -176,9 +179,11 @@ void Bridge::drain_d12_queue_locked() {
 }
 
 void Bridge::release_d11_side_locked() {
-    if (!slots_.empty()) drain_d12_queue_locked();
-    for (Slot& s : slots_) release_slot(s);
-    slots_.clear();
+    if (!pool_.empty()) drain_d12_queue_locked();
+    for (Entry& e : pool_) release_entry(e);
+    pool_.clear();
+    depth_pass_.reset();
+    safe_release(depth_stage11_);
     safe_release(shared_fence11_);
     safe_release(ctx4_);
     safe_release(d11_dev5_);
@@ -401,18 +406,21 @@ bool Bridge::ready_locked(ID3D11Device* d11_dev, bool present) {
     return true;
 }
 
-Bridge::Slot* Bridge::ensure_slot(uint32_t w, uint32_t h, DXGI_FORMAT fmt) {
-    for (Slot& s : slots_) {
-        if (s.w == w && s.h == h && s.fmt == fmt) {
-            s.last_used = ++use_seq_;
-            return &s;
+// The shared pair of `role` (and guide set) at this size and format: found, or made (the least recently used of its
+// role going first when the role is full).
+bool Bridge::ensure_entry_locked(Role role, uint32_t set, uint32_t w, uint32_t h, DXGI_FORMAT fmt, bool uav,
+                                 size_t* index) {
+    size_t same = 0, oldest = pool_.size();
+    for (size_t i = 0; i < pool_.size(); ++i) {
+        Entry& e = pool_[i];
+        if (e.role != role || e.set != set) continue;
+        if (e.w == w && e.h == h && e.fmt == fmt && e.uav == uav) {
+            e.last_used = ++use_seq_;
+            *index = i;
+            return true;
         }
-    }
-
-    const DXGI_FORMAT wfmt = writable_format(fmt);
-    if (!d3d12_uav_supported(d12_dev_, wfmt)) {
-        fail_locked("back buffer format " + std::to_string(int(fmt)) + " lacks D3D12 UAV support");
-        return nullptr;
+        ++same;
+        if (oldest == pool_.size() || e.last_used < pool_[oldest].last_used) oldest = i;
     }
 
     D3D12_HEAP_PROPERTIES heap{};
@@ -426,120 +434,143 @@ Bridge::Slot* Bridge::ensure_slot(uint32_t w, uint32_t h, DXGI_FORMAT fmt) {
     rd.Format = fmt;
     rd.SampleDesc.Count = 1;
     rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+    if (uav) rd.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
 
+    const auto failed = [&](const char* what, HRESULT hr) {
+        char buf[160];
+        std::snprintf(buf, sizeof(buf), "%s (%ux%u fmt=%d) failed (0x%08lx)", what, w, h, int(fmt),
+                      static_cast<unsigned long>(hr));
+        fail_locked(buf);
+        return false;
+    };
     ID3D12Resource* tex12 = nullptr;
     HRESULT hr = d12_dev_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &rd,
                                                    D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                    IID_PPV_ARGS(&tex12));
-    if (FAILED(hr) || !tex12) {
-        char buf[160];
-        std::snprintf(buf, sizeof(buf), "CreateCommittedResource(%ux%u fmt=%d) failed (0x%08lx)",
-                      w, h, int(fmt), static_cast<unsigned long>(hr));
-        fail_locked(buf);
-        return nullptr;
-    }
-
+    if (FAILED(hr) || !tex12) return failed("CreateCommittedResource", hr);
     HANDLE h_tex = nullptr;
     hr = d12_dev_->CreateSharedHandle(tex12, nullptr, GENERIC_ALL, nullptr, &h_tex);
     if (FAILED(hr) || !h_tex) {
         tex12->Release();
-        char buf[128];
-        std::snprintf(buf, sizeof(buf), "CreateSharedHandle(tex) failed (0x%08lx)", static_cast<unsigned long>(hr));
-        fail_locked(buf);
-        return nullptr;
+        return failed("CreateSharedHandle(tex)", hr);
     }
-
     ID3D11Texture2D* tex11 = nullptr;
     hr = d11_dev5_->OpenSharedResource1(h_tex, IID_PPV_ARGS(&tex11));
     CloseHandle(h_tex);
     if (FAILED(hr) || !tex11) {
         tex12->Release();
-        char buf[128];
-        std::snprintf(buf, sizeof(buf), "OpenSharedResource1 failed (0x%08lx)", static_cast<unsigned long>(hr));
-        fail_locked(buf);
-        return nullptr;
+        return failed("OpenSharedResource1", hr);
     }
 
-    if (slots_.size() >= kMaxSlots) {
-        auto victim = std::min_element(slots_.begin(), slots_.end(),
-                                       [](const Slot& a, const Slot& b) { return a.last_used < b.last_used; });
-        if (victim != slots_.end()) {
-            drain_d12_queue_locked();
-            release_slot(*victim);
-            *victim = Slot{w, h, fmt, tex12, tex11, 0, 0, DXGI_FORMAT_UNKNOWN, nullptr, nullptr, ++use_seq_};
-            return &(*victim);
-        }
+    const size_t cap = role == Role::kBack || role == Role::kHudless ? kMaxSlots : 1;
+    const Entry made{role, set, w, h, fmt, uav, tex12, tex11, ++use_seq_};
+    if (same >= cap) {
+        drain_d12_queue_locked();   // (D3D12 does not keep a resource alive for its GPU work)
+        release_entry(pool_[oldest]);
+        pool_[oldest] = made;
+        *index = oldest;
+        return true;
     }
-
-    slots_.push_back(Slot{w, h, fmt, tex12, tex11, 0, 0, DXGI_FORMAT_UNKNOWN, nullptr, nullptr, ++use_seq_});
-    nr::pe::log("[nr] d11->d3d12 bridge active: %ux%u fmt=%d (slots=%zu)", w, h, int(fmt), slots_.size());
-    return &slots_.back();
+    pool_.push_back(made);
+    *index = pool_.size() - 1;
+    if (role == Role::kBack)
+        nr::pe::log("[nr] d11->d3d12 bridge active: %ux%u fmt=%d (slots=%u)", w, h, int(fmt), cached_slot_count_locked());
+    return true;
 }
 
-bool Bridge::ensure_hudless_in_slot(Slot& s, uint32_t w, uint32_t h, DXGI_FORMAT fmt) {
-    if (s.hud12 && s.hud11 && s.hud_w == w && s.hud_h == h && s.hud_fmt == fmt) return true;
-    if (s.hud12 || s.hud11) drain_d12_queue_locked();
-    safe_release(s.hud11);
-    safe_release(s.hud12);
-    s.hud_w = 0;
-    s.hud_h = 0;
-    s.hud_fmt = DXGI_FORMAT_UNKNOWN;
+// The shared pair for `item`, its region clipped to the texture.
+bool Bridge::prepare_locked(Handoff& item, size_t* index, std::string* why) {
+    item.tex12 = nullptr;
+    if (!item.tex11) { *why = "no texture"; return false; }
+    D3D11_TEXTURE2D_DESC d{};
+    item.tex11->GetDesc(&d);
+    if (!d.Width || !d.Height || d.ArraySize != 1 || d.SampleDesc.Count != 1) {
+        *why = "a multisampled, array or empty texture";
+        return false;
+    }
+    if (!item.w || !item.h || item.depth) { item.x = item.y = 0; item.w = d.Width; item.h = d.Height; }
+    if (item.x >= d.Width || item.y >= d.Height) { *why = "a region outside its texture"; return false; }
+    item.w = std::min(item.w, d.Width - item.x);
+    item.h = std::min(item.h, d.Height - item.y);
+    // The back buffer and its hudless frame in their own format (the Present layers map it); the rest in the format
+    // D3D12 can write (an sRGB format's UNORM twin: D3D11 copies between the two).
+    const bool as_is = item.role == Role::kBack || item.role == Role::kHudless;
+    const DXGI_FORMAT fmt = item.depth ? DXGI_FORMAT_R32_FLOAT : as_is ? d.Format : writable_format(d.Format);
+    if (item.role == Role::kBack && !d3d12_uav_supported(d12_dev_, writable_format(d.Format))) {
+        *why = "back buffer format " + std::to_string(int(d.Format)) + " lacks D3D12 unordered access";
+        return false;
+    }
+    const bool uav = item.writable && d3d12_uav_supported(d12_dev_, fmt);
+    if (!ensure_entry_locked(item.role, item.set, item.w, item.h, fmt, uav, index)) { *why = last_error_; return false; }
+    item.tex12 = pool_[*index].tex12;
+    return true;
+}
 
-    D3D12_HEAP_PROPERTIES heap{};
-    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-    D3D12_RESOURCE_DESC rd{};
-    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    rd.Width = w;
-    rd.Height = h;
-    rd.DepthOrArraySize = 1;
-    rd.MipLevels = 1;
-    rd.Format = fmt;
-    rd.SampleDesc.Count = 1;
-    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
-
-    ID3D12Resource* hud12 = nullptr;
-    if (FAILED(d12_dev_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &rd,
-                                                 D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                                 IID_PPV_ARGS(&hud12))) || !hud12) {
-        return false;
+bool Bridge::copy_in_locked(const Handoff& item, const Entry& e, std::string* why) {
+    if (item.depth) {
+        // D3D11's depth pass writes a texture of ours (unordered access is not asked of the shared one)
+        D3D11_TEXTURE2D_DESC have{};
+        if (depth_stage11_) depth_stage11_->GetDesc(&have);
+        if (!depth_stage11_ || have.Width != e.w || have.Height != e.h) {
+            safe_release(depth_stage11_);
+            depth_pass_.reset();   // (its views are of the old texture)
+            D3D11_TEXTURE2D_DESC d{};
+            d.Width = e.w; d.Height = e.h; d.MipLevels = 1; d.ArraySize = 1; d.Format = DXGI_FORMAT_R32_FLOAT;
+            d.SampleDesc.Count = 1; d.Usage = D3D11_USAGE_DEFAULT;
+            d.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+            if (FAILED(d11_dev5_->CreateTexture2D(&d, nullptr, &depth_stage11_)) || !depth_stage11_) {
+                depth_stage11_ = nullptr;
+                *why = "the depth pass's texture could not be made";
+                return false;
+            }
+        }
+        if (!depth_pass_) depth_pass_.reset(new nr::pe::bridge::DepthCopyD3D11());
+        if (!depth_pass_->run(d11_dev5_, ctx4_, item.tex11, depth_stage11_, why)) return false;
+        ctx4_->CopyResource(e.tex11, depth_stage11_);
+        return true;
     }
-    HANDLE h_hud = nullptr;
-    if (FAILED(d12_dev_->CreateSharedHandle(hud12, nullptr, GENERIC_ALL, nullptr, &h_hud)) || !h_hud) {
-        hud12->Release();
-        return false;
+    D3D11_TEXTURE2D_DESC d{};
+    item.tex11->GetDesc(&d);
+    if (d.MipLevels == 1 && item.w == d.Width && item.h == d.Height) {
+        ctx4_->CopyResource(e.tex11, item.tex11);
+    } else {
+        const D3D11_BOX box{item.x, item.y, 0, item.x + item.w, item.y + item.h, 1};
+        ctx4_->CopySubresourceRegion(e.tex11, 0, 0, 0, 0, item.tex11, 0, &box);
     }
-    ID3D11Texture2D* hud11 = nullptr;
-    const HRESULT open_hr = d11_dev5_->OpenSharedResource1(h_hud, IID_PPV_ARGS(&hud11));
-    CloseHandle(h_hud);
-    if (FAILED(open_hr) || !hud11) {
-        hud12->Release();
-        return false;
-    }
-    s.hud_w = w;
-    s.hud_h = h;
-    s.hud_fmt = fmt;
-    s.hud12 = hud12;
-    s.hud11 = hud11;
     return true;
 }
 
 Status Bridge::execute(ID3D11Device* d11_dev, ID3D11Texture2D* back11, ID3D11Texture2D* hudless11,
                        const PresentFn& fn) {
-    if (abandoned_.load(std::memory_order_acquire)) return Status::kPassthrough;
-    if (!d11_dev || !back11 || !fn) return Status::kPassthrough;
+    if (!back11) return Status::kPassthrough;
+    Handoff items[2];
+    size_t count = 1;
+    items[0].role = Role::kBack;
+    items[0].tex11 = back11;
+    items[0].back = true;
+    if (hudless11) {
+        D3D11_TEXTURE2D_DESC bd{}, hd{};
+        back11->GetDesc(&bd);
+        hudless11->GetDesc(&hd);
+        if (hd.Width == bd.Width && hd.Height == bd.Height) {
+            items[1].role = Role::kHudless;
+            items[1].tex11 = hudless11;
+            items[1].optional = true;
+            count = 2;
+        }
+    }
+    return execute(d11_dev, items, count, true, fn);
+}
 
-    D3D11_TEXTURE2D_DESC bd{};
-    back11->GetDesc(&bd);
+Status Bridge::execute(ID3D11Device* d11_dev, Handoff* items, size_t count, bool present, const PresentFn& fn) {
+    if (abandoned_.load(std::memory_order_acquire)) return Status::kPassthrough;
+    if (!d11_dev || !items || !count || !fn) return Status::kPassthrough;
 
     std::lock_guard<std::mutex> lk(mu_);
     const Route route = decide_locked(d11_dev, false);
     if (route == Route::kVulkan) return Status::kFallback;
     if (route == Route::kUndecided) return Status::kPassthrough;
     // From here the device is the bridge's: nothing below sends its frame to another route.
-    if (bd.Width == 0 || bd.Height == 0 || bd.SampleDesc.Count > 1) {
-        fail_locked("a multisampled or empty back buffer");
-        return Status::kPassthrough;
-    }
     // No new D3D11 writes, fence values or slot eviction until the previous D3D12 submission is done.
     if (pending_output_) {
         const uint64_t done = shared_fence12_->GetCompletedValue();
@@ -555,23 +586,28 @@ Status Bridge::execute(ID3D11Device* d11_dev, ID3D11Texture2D* back11, ID3D11Tex
             pending_output_ = 0;
         }
     }
-    if (!ready_locked(d11_dev, true)) return Status::kPassthrough;
+    if (!ready_locked(d11_dev, present)) return Status::kPassthrough;
 
-    Slot* slot = ensure_slot(bd.Width, bd.Height, bd.Format);
-    if (!slot) return Status::kPassthrough;
-
-    ID3D12Resource* hudless12 = nullptr;
-    if (hudless11) {
-        D3D11_TEXTURE2D_DESC hd{};
-        hudless11->GetDesc(&hd);
-        if (hd.Width == bd.Width && hd.Height == bd.Height && hd.SampleDesc.Count == 1 &&
-            ensure_hudless_in_slot(*slot, hd.Width, hd.Height, hd.Format)) {
-            hudless12 = slot->hud12;
-        }
+    // Every pair first (making one may wait for the D3D12 queue), then the copies.
+    std::vector<size_t> entry(count, SIZE_MAX);
+    std::string why;
+    for (size_t i = 0; i < count; ++i) {
+        if (prepare_locked(items[i], &entry[i], &why)) continue;
+        entry[i] = SIZE_MAX;
+        items[i].tex12 = nullptr;
+        if (items[i].optional) continue;
+        fail_locked(why);
+        return Status::kPassthrough;
     }
-
-    ctx4_->CopyResource(slot->tex11, back11);
-    if (hudless12 && slot->hud11) ctx4_->CopyResource(slot->hud11, hudless11);
+    for (size_t i = 0; i < count; ++i) {
+        if (entry[i] == SIZE_MAX || !items[i].in) continue;
+        if (copy_in_locked(items[i], pool_[entry[i]], &why)) continue;
+        entry[i] = SIZE_MAX;
+        items[i].tex12 = nullptr;
+        if (items[i].optional) continue;
+        fail_locked(why);
+        return Status::kPassthrough;
+    }
 
     const uint64_t in_val = ++fence_val_;
     const uint64_t out_val = ++fence_val_;
@@ -595,9 +631,11 @@ Status Bridge::execute(ID3D11Device* d11_dev, ID3D11Texture2D* back11, ID3D11Tex
     FrameContext fc{};
     fc.device = d12_dev_;
     fc.queue = d12_queue_;
-    fc.back = slot->tex12;
+    fc.items = items;
+    fc.count = count;
+    fc.back = fc.find(Role::kBack);
     fc.back_state = D3D12_RESOURCE_STATE_COMMON;
-    fc.hudless = hudless12;
+    fc.hudless = fc.find(Role::kHudless);
     fc.signal_out_fence = &shared_fence12_;
     fc.signal_out_val = out_val;
 
@@ -614,7 +652,7 @@ Status Bridge::execute(ID3D11Device* d11_dev, ID3D11Texture2D* back11, ID3D11Tex
         hr = signalled ? ctx4_->Wait(shared_fence11_, out_val) : fc.output_signal;
         if (FAILED(hr)) {
             pending_output_ = out_val;
-            // The failed frame stays dropped. Give the next Present a chance to reuse the slot.
+            // The failed frame stays dropped. Give the next handoff a chance to reuse the textures.
             pending_signal_queued_ = signalled || SUCCEEDED(d12_queue_->Signal(shared_fence12_, out_val));
             char buf[128];
             std::snprintf(buf, sizeof(buf), "%s failed (0x%08lx); skipping NR until the D3D12 queue completes",
@@ -623,7 +661,14 @@ Status Bridge::execute(ID3D11Device* d11_dev, ID3D11Texture2D* back11, ID3D11Tex
             return Status::kPassthrough;
         }
         if (!backend_declined) {
-            ctx4_->CopyResource(back11, slot->tex11);
+            for (size_t i = 0; i < count; ++i) {
+                if (entry[i] == SIZE_MAX || !items[i].back) continue;
+                const Entry& e = pool_[entry[i]];
+                D3D11_TEXTURE2D_DESC d{};
+                items[i].tex11->GetDesc(&d);
+                if (d.MipLevels == 1 && e.w == d.Width && e.h == d.Height) ctx4_->CopyResource(items[i].tex11, e.tex11);
+                else ctx4_->CopySubresourceRegion(items[i].tex11, 0, items[i].x, items[i].y, 0, e.tex11, 0, nullptr);
+            }
         }
     }
 

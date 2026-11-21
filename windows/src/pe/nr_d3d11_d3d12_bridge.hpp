@@ -6,6 +6,8 @@
 // bridge cannot serve the device at all (DXVK, non-AMD, canary fail, NR_BRIDGE=1, D3D11.4 unavailable,
 // a D3D12 game's NR in the same process). A device the bridge owns never changes route: an error
 // there is logged and that frame goes on without NR's work.
+#include "nr_pe_bridge.hpp"
+
 #include <windows.h>
 #include <d3d11_4.h>
 #include <d3d12.h>
@@ -14,6 +16,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -32,9 +35,49 @@ enum class Status {
     kFallback,     // The device's route is Vulkan (decide): the caller uses the D3D11 Vulkan route
 };
 
+// What a texture handed across is for. Each role has one shared pair (a D3D12 texture and the same texture opened on
+// the D3D11 device), made again when its size or format changes; the back buffer and its hudless frame keep up to four
+// (the least recently used goes first), and the guides one pair per guide set.
+enum class Role : uint8_t {
+    kBack,         // the swap chain's back buffer (Present layers)
+    kHudless,      // HUD FIX's frame before the HUD
+    kColour,       // the evaluate's colour region (layers before the upscaler)
+    kOutput,       // the evaluate's output (layers after the upscaler)
+    kDepth,        // the evaluate's depth, for its own layers
+    kMotion,       // the evaluate's motion vectors, for its own layers
+    kExposure,     // the evaluate's exposure texture
+    kGuideDepth,   // a guide set's depth (Present layers)
+    kGuideMotion,  // a guide set's motion vectors
+};
+constexpr uint32_t kGuideSets = 4;
+
+// One texture of a handoff: the game's D3D11 texture and what happens to it on the way to D3D12 and back.
+struct Handoff {
+    Role role = Role::kBack;
+    uint32_t set = 0;                      // the guide set (kGuideDepth / kGuideMotion), else 0
+    ID3D11Texture2D* tex11 = nullptr;      // the game's texture (mip 0 of a plain 2D, one-sample texture)
+    uint32_t x = 0, y = 0, w = 0, h = 0;   // its region handed over (w or h 0: all of it)
+    bool in = true;         // copied into the shared texture before the D3D12 work
+    bool back = false;      // copied back into the game's texture (the same region) after the D3D12 work ran
+    bool depth = false;     // a depth buffer: read into R32_FLOAT by a D3D11 compute pass first (depth and typeless
+                            // formats shared across the APIs are not relied on)
+    bool writable = false;  // D3D12 writes it in place: made with unordered access where its format allows
+    bool optional = false;  // a texture that cannot be handed over is left out (tex12 null) instead of stopping the frame
+    // Filled by the bridge: the shared texture on D3D12 (in COMMON, and left there), null when left out.
+    ID3D12Resource* tex12 = nullptr;
+};
+
 struct FrameContext {
     ID3D12Device* device = nullptr;
     ID3D12CommandQueue* queue = nullptr;
+    // Every texture of the handoff, and the one of a role (null: not handed over).
+    Handoff* items = nullptr;
+    size_t count = 0;
+    ID3D12Resource* find(Role role, uint32_t set = 0) const {
+        for (size_t i = 0; i < count; ++i)
+            if (items[i].role == role && items[i].set == set) return items[i].tex12;
+        return nullptr;
+    }
     ID3D12Resource* back = nullptr;
     D3D12_RESOURCE_STATES back_state = D3D12_RESOURCE_STATE_COMMON;
     // Optional HUD FIX captured hudless texture copied into D3D12 (shader-resource/copyable); null when absent.
@@ -62,6 +105,12 @@ public:
     // The route as chosen so far, without a lock.
     Route route(ID3D11Device* d11_dev) const;
 
+    // One synchronous round trip: every `in` texture copied into its shared twin by the device's immediate context,
+    // D3D11 signal -> D3D12 wait -> `fn` (records and submits on the bridge's queue) -> D3D12 signal -> D3D11 wait,
+    // then every `back` texture copied back. `present`: a Present of the device's swap chain (the presenting device
+    // has the bridge); else one of its evaluates.
+    Status execute(ID3D11Device* d11_dev, Handoff* items, size_t count, bool present, const PresentFn& fn);
+    // The Present layers' handoff: the back buffer there and back, HUD FIX's hudless frame there.
     Status execute(ID3D11Device* d11_dev, ID3D11Texture2D* back11, ID3D11Texture2D* hudless11,
                    const PresentFn& fn);
 
@@ -77,18 +126,15 @@ public:
     std::string last_error() const;
 
 private:
-    struct Slot {
+    struct Entry {
+        Role role = Role::kBack;
+        uint32_t set = 0;
         uint32_t w = 0;
         uint32_t h = 0;
-        DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
+        DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;   // the shared texture's
+        bool uav = false;
         ID3D12Resource* tex12 = nullptr;
         ID3D11Texture2D* tex11 = nullptr;
-        // Optional HUD FIX captured hudless pair (allocated lazily only when needed for this slot).
-        uint32_t hud_w = 0;
-        uint32_t hud_h = 0;
-        DXGI_FORMAT hud_fmt = DXGI_FORMAT_UNKNOWN;
-        ID3D12Resource* hud12 = nullptr;
-        ID3D11Texture2D* hud11 = nullptr;
         uint64_t last_used = 0;
     };
 
@@ -100,9 +146,11 @@ private:
     bool bind_d11_locked(ID3D11Device* d11_dev, std::string* why);
     bool ready_locked(ID3D11Device* d11_dev, bool present);
     void fail_locked(const std::string& what);
-    Slot* ensure_slot(uint32_t w, uint32_t h, DXGI_FORMAT fmt);
-    bool ensure_hudless_in_slot(Slot& slot, uint32_t w, uint32_t h, DXGI_FORMAT fmt);
-    void release_slot(Slot& slot);
+    bool ensure_entry_locked(Role role, uint32_t set, uint32_t w, uint32_t h, DXGI_FORMAT fmt, bool uav, size_t* index);
+    bool prepare_locked(Handoff& item, size_t* index, std::string* why);
+    bool copy_in_locked(const Handoff& item, const Entry& e, std::string* why);
+    void release_entry(Entry& e);
+    uint32_t cached_slot_count_locked() const;
     void drain_d12_queue_locked();
     void release_d11_side_locked();
     void release_all_locked();
@@ -137,7 +185,10 @@ private:
     uint64_t use_seq_ = 0;
     HANDLE drain_event_ = nullptr;
     std::string last_error_;
-    std::vector<Slot> slots_;
+    std::vector<Entry> pool_;
+    // The D3D11 depth pass and the R32_FLOAT texture it writes (copied into the shared one), on the bound device.
+    std::unique_ptr<nr::pe::bridge::DepthCopyD3D11> depth_pass_;
+    ID3D11Texture2D* depth_stage11_ = nullptr;
 };
 
 }  // namespace nr::pe::d11_bridge
