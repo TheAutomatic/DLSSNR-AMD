@@ -19,6 +19,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -1018,8 +1019,25 @@ struct Stage::Impl {
         const uint32_t NW = cfg.nr_width, NH = cfg.nr_height, nx = (NW + 15) / 16, ny = (NH + 15) / 16;
         const uint32_t n = il_slots, pi = il_preset - 1u;
         const bool stable = il_preset == 2u;
+        // NR_IL_DEPTH: 0 none, 1 dilation (256) + disocclusion (512), 2 disocclusion only, 3 dilation only.
+        // Default 3: under upscaling + RR/TAA sub-pixel jitter, step 5's nearest-upsampled render-res depth plus step 0's
+        // 2x2 max and reverse-Z ratio (np - nc)/max(nc, 1e-7) false-triggers in grid blocks, turned into light squares
+        // by mode 4's fill pyramid. Dilation (256), depth-aware fill (67108864/1073741824), and Preset 2 stable_reduce
+        // stay active; disocclusion relies on VTRUST (8) + BOX (128). Trade-off: slow, low-contrast foreground edges at
+        // native res may briefly keep 1..N frames of faint residual; set NR_IL_DEPTH=1 to restore DOCC.
+        static const uint32_t il_depth_mode = [] {
+            const char* e = std::getenv("NR_IL_DEPTH");
+            if (!e || !e[0]) return 3u;
+            if (e[0] >= '0' && e[0] <= '3' && e[1] == '\0') {
+                const uint32_t m = uint32_t(e[0] - '0');
+                if (m == 0u) nr::pe::log("[nr] RenoDX stage (D3D12): Interleaved depth disabled (NR_IL_DEPTH=0)");
+                return m;
+            }
+            nr::pe::log("[nr] RenoDX stage (D3D12): ignoring invalid NR_IL_DEPTH='%s' (expected 0..3), using default 3", e);
+            return 3u;
+        }();
         // the game's depth for the disocclusion test, the vector dilation and the depth-aware fill (as on Vulkan)
-        ID3D12Resource* depth = f.depth;
+        ID3D12Resource* depth = il_depth_mode ? f.depth : nullptr;
         DXGI_FORMAT dfmt = DXGI_FORMAT_UNKNOWN;
         uint32_t dw = 1, dh = 1;
         if (depth) {
@@ -1034,7 +1052,7 @@ struct Stage::Impl {
         if (s.depth_mode == 2u) inverted = true;
         if (depth && !il_depth_logged) {
             il_depth_logged = true;
-            nr::pe::log("[nr] RenoDX stage (D3D12): Interleaved reads the game's depth (DXGI format %d, %ux%u)", int(dfmt), dw, dh);
+            nr::pe::log("[nr] RenoDX stage (D3D12): Interleaved reads the game's depth (DXGI format %d, %ux%u), depth mode %u", int(dfmt), dw, dh, unsigned(il_depth_mode));
         }
         struct { uint32_t size[2], mbase[2], mgrid[2]; float mscale[2]; uint32_t mode, slot, n, flags; float k0, k1;
                  uint32_t dbase[2], dgrid[2]; uint32_t styles; float pad0; float inten[4]; } ip{
@@ -1062,11 +1080,15 @@ struct Stage::Impl {
             Tex& base_prev = il_bcur ? il_base : il_base2;
             const uint32_t d = il_cur, o = d ^ 1u;
             ip.mode = mode; ip.slot = slot;
-            // the product's flags (nr_renodx.cpp: fresh history, vector test with its gradient prediction, box test, depth
-            // disocclusion and dilation, edge, the fill and its depth-aware pyramid, the proxy kept, step 0's pyr1)
+            // the product's flags (nr_renodx.cpp: fresh history, vector test with its gradient prediction, box test,
+            // depth dilation/disocclusion via NR_IL_DEPTH (default dilation only; DOCC opt-in), edge, the fill and its
+            // depth-aware pyramid, the proxy kept, step 0's pyr1)
             ip.flags = (move ? 1u : 0u) | (mode == 0u && move ? 2u : 0u) | 268435456u | (move ? 8u : 0u) | (moved ? 64u : 0u) |
                        (mode == 0u && move ? 536870912u : 0u) | (mode == 0u && move && depth ? 1073741824u : 0u) |
-                       (move ? 128u : 0u) | (depth && move ? 768u : 0u) | (inverted ? 1024u : 0u) | (graded ? 2048u : 0u) |
+                       (move ? 128u : 0u) |
+                       (depth && move && (il_depth_mode == 1u || il_depth_mode == 3u) ? 256u : 0u) |
+                       (depth && move && (il_depth_mode == 1u || il_depth_mode == 2u) ? 512u : 0u) |
+                       (inverted ? 1024u : 0u) | (graded ? 2048u : 0u) |
                        (mode == 1u && moved ? 65536u : 0u) | (move ? 524288u | 1048576u : 0u) | (move ? 33554432u : 0u) |
                        (mode == 4u && depth ? 67108864u : 0u) |
                        (stable && depth ? 131072u : 0u) |

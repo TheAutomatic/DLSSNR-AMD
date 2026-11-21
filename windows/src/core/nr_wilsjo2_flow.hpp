@@ -331,7 +331,17 @@ inline void release_from(FlowIo& io, FlowState& o, size_t from) {
 inline bool il_run1(FlowIo& io, FlowState& o, const FlowFrame& f, const Settings& s, const NetCall& tmpl, uint32_t mw,
                    uint32_t mh, uint32_t n) {
     IlState1& L = o.il1;
-    const bool depth = bool(f.depth), stable = il_preset(s) == 2u;
+    // NR_IL_DEPTH: 0 none, 1 dilation (256) + disocclusion (512), 2 disocclusion only, 3 dilation only.
+    // Default 3: under upscaling + RR/TAA sub-pixel jitter, step 5's nearest-upsampled render-res depth plus step 0's
+    // 2x2 max and reverse-Z ratio (np - nc)/max(nc, 1e-7) false-triggers in grid blocks, turned into light squares by
+    // mode 4's fill pyramid. Dilation (256), depth-aware fill (67108864/1073741824), and Preset 2 stable_reduce stay
+    // active; disocclusion relies on VTRUST (8) + BOX (128). Trade-off: slow, low-contrast foreground edges at native
+    // res may briefly keep 1..N frames of faint residual; set NR_IL_DEPTH=1 to restore DOCC.
+    static const uint32_t il_depth_mode = [] {
+        const char* e = std::getenv("NR_IL_DEPTH");
+        return e && e[0] >= '0' && e[0] <= '3' && e[1] == '\0' ? uint32_t(e[0] - '0') : 3u;
+    }();
+    const bool depth = il_depth_mode != 0u && bool(f.depth), stable = il_preset(s) == 2u;
     IlPush ip{};
     ip.size[0] = mw; ip.size[1] = mh;
     ip.mbase[0] = f.motion_rect.x; ip.mbase[1] = f.motion_rect.y;
@@ -384,7 +394,10 @@ inline bool il_run1(FlowIo& io, FlowState& o, const FlowFrame& f, const Settings
         ip.mode = mode; ip.slot = slot;
         ip.flags = (stable && (mode == 6u || mode == 1u) && L.lf_valid ? 16u : 0u) | (stable && depth ? 131072u : 0u) | (move ? 1u : 0u) | (mode == 0u && move ? 2u : 0u) | 268435456u | (move ? 8u : 0u) | (moved ? 64u : 0u) |
                    (mode == 0u && move ? 536870912u : 0u) | (mode == 0u && move && depth ? 1073741824u : 0u) |
-                   (move ? 128u : 0u) | (depth && move ? 768u : 0u) | (tmpl.depth_inverted ? 1024u : 0u) |
+                   (move ? 128u : 0u) |
+                   (depth && move && (il_depth_mode == 1u || il_depth_mode == 3u) ? 256u : 0u) |
+                   (depth && move && (il_depth_mode == 1u || il_depth_mode == 2u) ? 512u : 0u) |
+                   (tmpl.depth_inverted ? 1024u : 0u) |
                    (graded ? 2048u : 0u) | (mode == 1u && moved ? 65536u : 0u) | (move ? 524288u | 1048576u : 0u) |
                    (move ? 33554432u : 0u) | (mode == 4u && depth ? 67108864u : 0u) |
                    (mode == 1u && moved && dbg ? 262144u : 0u) | (mode == 1u && moved && dbg == 3 ? 4194304u : 0u);

@@ -2060,8 +2060,25 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
                     return std::make_pair(false, std::make_pair(a, b));
                 }
                 std::sscanf(e, "%f,%f", &a, &b); return std::make_pair(true, std::make_pair(a, b)); }();
-            // NR_IL_DEPTH (research): the game's depth for a disocclusion test (1, 2) and vector dilation (1, 3)
-            static const uint32_t il_depth_mode = [] { const char* e = std::getenv("NR_IL_DEPTH"); return e && e[0] ? uint32_t(std::atoi(e)) : il_ag ? 1u : 0u; }();
+            // NR_IL_DEPTH (research): 0 none, 1 dilation (256) + disocclusion (512), 2 disocclusion only, 3 dilation only.
+            // Default 3: under upscaling + RR/TAA sub-pixel jitter, step 5's nearest-upsampled render-res depth plus
+            // step 0's 2x2 max and reverse-Z ratio (np - nc)/max(nc, 1e-7) false-triggers in grid blocks, turned into
+            // light squares by mode 4's fill pyramid. Dilation (256), depth-aware fill (67108864/1073741824), and
+            // Preset 2 stable_reduce stay active; disocclusion relies on VTRUST (8) + BOX (128). Trade-off: slow,
+            // low-contrast foreground edges at native res may briefly keep 1..N frames of faint residual; set NR_IL_DEPTH=1
+            // to restore DOCC.
+            static const uint32_t il_depth_mode = [] {
+                const uint32_t def = il_ag ? 3u : 0u;
+                const char* e = std::getenv("NR_IL_DEPTH");
+                if (!e || !e[0]) return def;
+                if (e[0] >= '0' && e[0] <= '3' && e[1] == '\0') {
+                    const uint32_t m = uint32_t(e[0] - '0');
+                    if (m == 0u) nr::logf("[nr] RenoDX stage: Interleaved depth disabled (NR_IL_DEPTH=0)");
+                    return m;
+                }
+                nr::logf("[nr] RenoDX stage: ignoring invalid NR_IL_DEPTH='%s' (expected 0..3), using default %u", e, unsigned(def));
+                return def;
+            }();
             VkImageView depth_view = VK_NULL_HANDLE;
             const VkImageAspectFlags depth_aspects =
                 fr.depth.format == VK_FORMAT_D32_SFLOAT || fr.depth.format == VK_FORMAT_D16_UNORM || fr.depth.format == VK_FORMAT_X8_D24_UNORM_PACK32
@@ -2075,7 +2092,7 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
                 if (vkCreateImageView(m.device, &vi, nullptr, &depth_view) == VK_SUCCESS) {
                     if (!borrow) borrow = &m.borrow_slot();
                     borrow->depth = depth_view;
-                    if (!m.il_depth_logged) { m.il_depth_logged = true; nr::logf("[nr] RenoDX stage: Interleaved reads the game's depth (VkFormat %u, %ux%u, layout %d -> %d)", unsigned(fr.depth.format), fr.depth.width, fr.depth.height, int(fr.depth.before), int(fr.depth.after)); }
+                    if (!m.il_depth_logged) { m.il_depth_logged = true; nr::logf("[nr] RenoDX stage: Interleaved reads the game's depth (VkFormat %u, %ux%u, layout %d -> %d), depth mode %u", unsigned(fr.depth.format), fr.depth.width, fr.depth.height, int(fr.depth.before), int(fr.depth.after), unsigned(il_depth_mode)); }
                 } else depth_view = VK_NULL_HANDLE;
             }
             const auto depth_layout = [&](bool to_general) {
