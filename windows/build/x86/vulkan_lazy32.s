@@ -3,673 +3,1060 @@
     .globl "_vkAllocateCommandBuffers@12"
 "_vkAllocateCommandBuffers@12":
     jmp *_nr_vk_p_vkAllocateCommandBuffers
+    .globl _nr_vk_unresolved_vkAllocateCommandBuffers
+_nr_vk_unresolved_vkAllocateCommandBuffers:
+    mov $-3, %eax
+    ret $12
     .globl "_vkAllocateDescriptorSets@12"
 "_vkAllocateDescriptorSets@12":
     jmp *_nr_vk_p_vkAllocateDescriptorSets
+    .globl _nr_vk_unresolved_vkAllocateDescriptorSets
+_nr_vk_unresolved_vkAllocateDescriptorSets:
+    mov $-3, %eax
+    ret $12
     .globl "_vkAllocateMemory@16"
 "_vkAllocateMemory@16":
     jmp *_nr_vk_p_vkAllocateMemory
+    .globl _nr_vk_unresolved_vkAllocateMemory
+_nr_vk_unresolved_vkAllocateMemory:
+    mov $-3, %eax
+    ret $16
     .globl "_vkBeginCommandBuffer@8"
 "_vkBeginCommandBuffer@8":
     jmp *_nr_vk_p_vkBeginCommandBuffer
+    .globl _nr_vk_unresolved_vkBeginCommandBuffer
+_nr_vk_unresolved_vkBeginCommandBuffer:
+    mov $-3, %eax
+    ret $8
     .globl "_vkBindBufferMemory@28"
 "_vkBindBufferMemory@28":
     jmp *_nr_vk_p_vkBindBufferMemory
+    .globl _nr_vk_unresolved_vkBindBufferMemory
+_nr_vk_unresolved_vkBindBufferMemory:
+    mov $-3, %eax
+    ret $28
     .globl "_vkBindImageMemory@28"
 "_vkBindImageMemory@28":
     jmp *_nr_vk_p_vkBindImageMemory
+    .globl _nr_vk_unresolved_vkBindImageMemory
+_nr_vk_unresolved_vkBindImageMemory:
+    mov $-3, %eax
+    ret $28
     .globl "_vkCmdBindDescriptorSets@36"
 "_vkCmdBindDescriptorSets@36":
     jmp *_nr_vk_p_vkCmdBindDescriptorSets
+    .globl _nr_vk_unresolved_vkCmdBindDescriptorSets
+_nr_vk_unresolved_vkCmdBindDescriptorSets:
+    mov $-3, %eax
+    ret $36
     .globl "_vkCmdBindPipeline@16"
 "_vkCmdBindPipeline@16":
     jmp *_nr_vk_p_vkCmdBindPipeline
+    .globl _nr_vk_unresolved_vkCmdBindPipeline
+_nr_vk_unresolved_vkCmdBindPipeline:
+    mov $-3, %eax
+    ret $16
     .globl "_vkCmdBlitImage@40"
 "_vkCmdBlitImage@40":
     jmp *_nr_vk_p_vkCmdBlitImage
+    .globl _nr_vk_unresolved_vkCmdBlitImage
+_nr_vk_unresolved_vkCmdBlitImage:
+    mov $-3, %eax
+    ret $40
     .globl "_vkCmdClearColorImage@28"
 "_vkCmdClearColorImage@28":
     jmp *_nr_vk_p_vkCmdClearColorImage
+    .globl _nr_vk_unresolved_vkCmdClearColorImage
+_nr_vk_unresolved_vkCmdClearColorImage:
+    mov $-3, %eax
+    ret $28
     .globl "_vkCmdCopyBuffer@28"
 "_vkCmdCopyBuffer@28":
     jmp *_nr_vk_p_vkCmdCopyBuffer
+    .globl _nr_vk_unresolved_vkCmdCopyBuffer
+_nr_vk_unresolved_vkCmdCopyBuffer:
+    mov $-3, %eax
+    ret $28
     .globl "_vkCmdCopyBufferToImage@32"
 "_vkCmdCopyBufferToImage@32":
     jmp *_nr_vk_p_vkCmdCopyBufferToImage
+    .globl _nr_vk_unresolved_vkCmdCopyBufferToImage
+_nr_vk_unresolved_vkCmdCopyBufferToImage:
+    mov $-3, %eax
+    ret $32
     .globl "_vkCmdCopyImage@36"
 "_vkCmdCopyImage@36":
     jmp *_nr_vk_p_vkCmdCopyImage
+    .globl _nr_vk_unresolved_vkCmdCopyImage
+_nr_vk_unresolved_vkCmdCopyImage:
+    mov $-3, %eax
+    ret $36
     .globl "_vkCmdCopyImageToBuffer@32"
 "_vkCmdCopyImageToBuffer@32":
     jmp *_nr_vk_p_vkCmdCopyImageToBuffer
+    .globl _nr_vk_unresolved_vkCmdCopyImageToBuffer
+_nr_vk_unresolved_vkCmdCopyImageToBuffer:
+    mov $-3, %eax
+    ret $32
     .globl "_vkCmdDispatch@16"
 "_vkCmdDispatch@16":
     jmp *_nr_vk_p_vkCmdDispatch
+    .globl _nr_vk_unresolved_vkCmdDispatch
+_nr_vk_unresolved_vkCmdDispatch:
+    mov $-3, %eax
+    ret $16
     .globl "_vkCmdFillBuffer@32"
 "_vkCmdFillBuffer@32":
     jmp *_nr_vk_p_vkCmdFillBuffer
+    .globl _nr_vk_unresolved_vkCmdFillBuffer
+_nr_vk_unresolved_vkCmdFillBuffer:
+    mov $-3, %eax
+    ret $32
     .globl "_vkCmdPipelineBarrier2@8"
 "_vkCmdPipelineBarrier2@8":
     jmp *_nr_vk_p_vkCmdPipelineBarrier2
+    .globl _nr_vk_unresolved_vkCmdPipelineBarrier2
+_nr_vk_unresolved_vkCmdPipelineBarrier2:
+    mov $-3, %eax
+    ret $8
     .globl "_vkCmdPipelineBarrier@40"
 "_vkCmdPipelineBarrier@40":
     jmp *_nr_vk_p_vkCmdPipelineBarrier
+    .globl _nr_vk_unresolved_vkCmdPipelineBarrier
+_nr_vk_unresolved_vkCmdPipelineBarrier:
+    mov $-3, %eax
+    ret $40
     .globl "_vkCmdPushConstants@28"
 "_vkCmdPushConstants@28":
     jmp *_nr_vk_p_vkCmdPushConstants
+    .globl _nr_vk_unresolved_vkCmdPushConstants
+_nr_vk_unresolved_vkCmdPushConstants:
+    mov $-3, %eax
+    ret $28
     .globl "_vkCmdResetQueryPool@20"
 "_vkCmdResetQueryPool@20":
     jmp *_nr_vk_p_vkCmdResetQueryPool
+    .globl _nr_vk_unresolved_vkCmdResetQueryPool
+_nr_vk_unresolved_vkCmdResetQueryPool:
+    mov $-3, %eax
+    ret $20
     .globl "_vkCmdSetEvent@16"
 "_vkCmdSetEvent@16":
     jmp *_nr_vk_p_vkCmdSetEvent
+    .globl _nr_vk_unresolved_vkCmdSetEvent
+_nr_vk_unresolved_vkCmdSetEvent:
+    mov $-3, %eax
+    ret $16
     .globl "_vkCmdUpdateBuffer@32"
 "_vkCmdUpdateBuffer@32":
     jmp *_nr_vk_p_vkCmdUpdateBuffer
+    .globl _nr_vk_unresolved_vkCmdUpdateBuffer
+_nr_vk_unresolved_vkCmdUpdateBuffer:
+    mov $-3, %eax
+    ret $32
     .globl "_vkCmdWriteTimestamp@20"
 "_vkCmdWriteTimestamp@20":
     jmp *_nr_vk_p_vkCmdWriteTimestamp
+    .globl _nr_vk_unresolved_vkCmdWriteTimestamp
+_nr_vk_unresolved_vkCmdWriteTimestamp:
+    mov $-3, %eax
+    ret $20
     .globl "_vkCreateBuffer@16"
 "_vkCreateBuffer@16":
     jmp *_nr_vk_p_vkCreateBuffer
+    .globl _nr_vk_unresolved_vkCreateBuffer
+_nr_vk_unresolved_vkCreateBuffer:
+    mov $-3, %eax
+    ret $16
     .globl "_vkCreateCommandPool@16"
 "_vkCreateCommandPool@16":
     jmp *_nr_vk_p_vkCreateCommandPool
+    .globl _nr_vk_unresolved_vkCreateCommandPool
+_nr_vk_unresolved_vkCreateCommandPool:
+    mov $-3, %eax
+    ret $16
     .globl "_vkCreateComputePipelines@28"
 "_vkCreateComputePipelines@28":
     jmp *_nr_vk_p_vkCreateComputePipelines
+    .globl _nr_vk_unresolved_vkCreateComputePipelines
+_nr_vk_unresolved_vkCreateComputePipelines:
+    mov $-3, %eax
+    ret $28
     .globl "_vkCreateDescriptorPool@16"
 "_vkCreateDescriptorPool@16":
     jmp *_nr_vk_p_vkCreateDescriptorPool
+    .globl _nr_vk_unresolved_vkCreateDescriptorPool
+_nr_vk_unresolved_vkCreateDescriptorPool:
+    mov $-3, %eax
+    ret $16
     .globl "_vkCreateDescriptorSetLayout@16"
 "_vkCreateDescriptorSetLayout@16":
     jmp *_nr_vk_p_vkCreateDescriptorSetLayout
+    .globl _nr_vk_unresolved_vkCreateDescriptorSetLayout
+_nr_vk_unresolved_vkCreateDescriptorSetLayout:
+    mov $-3, %eax
+    ret $16
     .globl "_vkCreateDevice@16"
 "_vkCreateDevice@16":
     jmp *_nr_vk_p_vkCreateDevice
+    .globl _nr_vk_unresolved_vkCreateDevice
+_nr_vk_unresolved_vkCreateDevice:
+    mov $-3, %eax
+    ret $16
     .globl "_vkCreateEvent@16"
 "_vkCreateEvent@16":
     jmp *_nr_vk_p_vkCreateEvent
+    .globl _nr_vk_unresolved_vkCreateEvent
+_nr_vk_unresolved_vkCreateEvent:
+    mov $-3, %eax
+    ret $16
     .globl "_vkCreateFence@16"
 "_vkCreateFence@16":
     jmp *_nr_vk_p_vkCreateFence
+    .globl _nr_vk_unresolved_vkCreateFence
+_nr_vk_unresolved_vkCreateFence:
+    mov $-3, %eax
+    ret $16
     .globl "_vkCreateImage@16"
 "_vkCreateImage@16":
     jmp *_nr_vk_p_vkCreateImage
+    .globl _nr_vk_unresolved_vkCreateImage
+_nr_vk_unresolved_vkCreateImage:
+    mov $-3, %eax
+    ret $16
     .globl "_vkCreateImageView@16"
 "_vkCreateImageView@16":
     jmp *_nr_vk_p_vkCreateImageView
+    .globl _nr_vk_unresolved_vkCreateImageView
+_nr_vk_unresolved_vkCreateImageView:
+    mov $-3, %eax
+    ret $16
     .globl "_vkCreateInstance@12"
 "_vkCreateInstance@12":
     jmp *_nr_vk_p_vkCreateInstance
+    .globl _nr_vk_unresolved_vkCreateInstance
+_nr_vk_unresolved_vkCreateInstance:
+    mov $-3, %eax
+    ret $12
     .globl "_vkCreatePipelineCache@16"
 "_vkCreatePipelineCache@16":
     jmp *_nr_vk_p_vkCreatePipelineCache
+    .globl _nr_vk_unresolved_vkCreatePipelineCache
+_nr_vk_unresolved_vkCreatePipelineCache:
+    mov $-3, %eax
+    ret $16
     .globl "_vkCreatePipelineLayout@16"
 "_vkCreatePipelineLayout@16":
     jmp *_nr_vk_p_vkCreatePipelineLayout
+    .globl _nr_vk_unresolved_vkCreatePipelineLayout
+_nr_vk_unresolved_vkCreatePipelineLayout:
+    mov $-3, %eax
+    ret $16
     .globl "_vkCreateQueryPool@16"
 "_vkCreateQueryPool@16":
     jmp *_nr_vk_p_vkCreateQueryPool
+    .globl _nr_vk_unresolved_vkCreateQueryPool
+_nr_vk_unresolved_vkCreateQueryPool:
+    mov $-3, %eax
+    ret $16
     .globl "_vkCreateSampler@16"
 "_vkCreateSampler@16":
     jmp *_nr_vk_p_vkCreateSampler
+    .globl _nr_vk_unresolved_vkCreateSampler
+_nr_vk_unresolved_vkCreateSampler:
+    mov $-3, %eax
+    ret $16
     .globl "_vkCreateSemaphore@16"
 "_vkCreateSemaphore@16":
     jmp *_nr_vk_p_vkCreateSemaphore
+    .globl _nr_vk_unresolved_vkCreateSemaphore
+_nr_vk_unresolved_vkCreateSemaphore:
+    mov $-3, %eax
+    ret $16
     .globl "_vkCreateShaderModule@16"
 "_vkCreateShaderModule@16":
     jmp *_nr_vk_p_vkCreateShaderModule
+    .globl _nr_vk_unresolved_vkCreateShaderModule
+_nr_vk_unresolved_vkCreateShaderModule:
+    mov $-3, %eax
+    ret $16
     .globl "_vkDestroyBuffer@16"
 "_vkDestroyBuffer@16":
     jmp *_nr_vk_p_vkDestroyBuffer
+    .globl _nr_vk_unresolved_vkDestroyBuffer
+_nr_vk_unresolved_vkDestroyBuffer:
+    mov $-3, %eax
+    ret $16
     .globl "_vkDestroyCommandPool@16"
 "_vkDestroyCommandPool@16":
     jmp *_nr_vk_p_vkDestroyCommandPool
+    .globl _nr_vk_unresolved_vkDestroyCommandPool
+_nr_vk_unresolved_vkDestroyCommandPool:
+    mov $-3, %eax
+    ret $16
     .globl "_vkDestroyDescriptorPool@16"
 "_vkDestroyDescriptorPool@16":
     jmp *_nr_vk_p_vkDestroyDescriptorPool
+    .globl _nr_vk_unresolved_vkDestroyDescriptorPool
+_nr_vk_unresolved_vkDestroyDescriptorPool:
+    mov $-3, %eax
+    ret $16
     .globl "_vkDestroyDescriptorSetLayout@16"
 "_vkDestroyDescriptorSetLayout@16":
     jmp *_nr_vk_p_vkDestroyDescriptorSetLayout
+    .globl _nr_vk_unresolved_vkDestroyDescriptorSetLayout
+_nr_vk_unresolved_vkDestroyDescriptorSetLayout:
+    mov $-3, %eax
+    ret $16
     .globl "_vkDestroyDevice@8"
 "_vkDestroyDevice@8":
     jmp *_nr_vk_p_vkDestroyDevice
+    .globl _nr_vk_unresolved_vkDestroyDevice
+_nr_vk_unresolved_vkDestroyDevice:
+    mov $-3, %eax
+    ret $8
     .globl "_vkDestroyEvent@16"
 "_vkDestroyEvent@16":
     jmp *_nr_vk_p_vkDestroyEvent
+    .globl _nr_vk_unresolved_vkDestroyEvent
+_nr_vk_unresolved_vkDestroyEvent:
+    mov $-3, %eax
+    ret $16
     .globl "_vkDestroyFence@16"
 "_vkDestroyFence@16":
     jmp *_nr_vk_p_vkDestroyFence
+    .globl _nr_vk_unresolved_vkDestroyFence
+_nr_vk_unresolved_vkDestroyFence:
+    mov $-3, %eax
+    ret $16
     .globl "_vkDestroyImage@16"
 "_vkDestroyImage@16":
     jmp *_nr_vk_p_vkDestroyImage
+    .globl _nr_vk_unresolved_vkDestroyImage
+_nr_vk_unresolved_vkDestroyImage:
+    mov $-3, %eax
+    ret $16
     .globl "_vkDestroyImageView@16"
 "_vkDestroyImageView@16":
     jmp *_nr_vk_p_vkDestroyImageView
+    .globl _nr_vk_unresolved_vkDestroyImageView
+_nr_vk_unresolved_vkDestroyImageView:
+    mov $-3, %eax
+    ret $16
     .globl "_vkDestroyInstance@8"
 "_vkDestroyInstance@8":
     jmp *_nr_vk_p_vkDestroyInstance
+    .globl _nr_vk_unresolved_vkDestroyInstance
+_nr_vk_unresolved_vkDestroyInstance:
+    mov $-3, %eax
+    ret $8
     .globl "_vkDestroyPipeline@16"
 "_vkDestroyPipeline@16":
     jmp *_nr_vk_p_vkDestroyPipeline
+    .globl _nr_vk_unresolved_vkDestroyPipeline
+_nr_vk_unresolved_vkDestroyPipeline:
+    mov $-3, %eax
+    ret $16
     .globl "_vkDestroyPipelineCache@16"
 "_vkDestroyPipelineCache@16":
     jmp *_nr_vk_p_vkDestroyPipelineCache
+    .globl _nr_vk_unresolved_vkDestroyPipelineCache
+_nr_vk_unresolved_vkDestroyPipelineCache:
+    mov $-3, %eax
+    ret $16
     .globl "_vkDestroyPipelineLayout@16"
 "_vkDestroyPipelineLayout@16":
     jmp *_nr_vk_p_vkDestroyPipelineLayout
+    .globl _nr_vk_unresolved_vkDestroyPipelineLayout
+_nr_vk_unresolved_vkDestroyPipelineLayout:
+    mov $-3, %eax
+    ret $16
     .globl "_vkDestroyQueryPool@16"
 "_vkDestroyQueryPool@16":
     jmp *_nr_vk_p_vkDestroyQueryPool
+    .globl _nr_vk_unresolved_vkDestroyQueryPool
+_nr_vk_unresolved_vkDestroyQueryPool:
+    mov $-3, %eax
+    ret $16
     .globl "_vkDestroySampler@16"
 "_vkDestroySampler@16":
     jmp *_nr_vk_p_vkDestroySampler
+    .globl _nr_vk_unresolved_vkDestroySampler
+_nr_vk_unresolved_vkDestroySampler:
+    mov $-3, %eax
+    ret $16
     .globl "_vkDestroySemaphore@16"
 "_vkDestroySemaphore@16":
     jmp *_nr_vk_p_vkDestroySemaphore
+    .globl _nr_vk_unresolved_vkDestroySemaphore
+_nr_vk_unresolved_vkDestroySemaphore:
+    mov $-3, %eax
+    ret $16
     .globl "_vkDestroyShaderModule@16"
 "_vkDestroyShaderModule@16":
     jmp *_nr_vk_p_vkDestroyShaderModule
+    .globl _nr_vk_unresolved_vkDestroyShaderModule
+_nr_vk_unresolved_vkDestroyShaderModule:
+    mov $-3, %eax
+    ret $16
     .globl "_vkDeviceWaitIdle@4"
 "_vkDeviceWaitIdle@4":
     jmp *_nr_vk_p_vkDeviceWaitIdle
+    .globl _nr_vk_unresolved_vkDeviceWaitIdle
+_nr_vk_unresolved_vkDeviceWaitIdle:
+    mov $-3, %eax
+    ret $4
     .globl "_vkEndCommandBuffer@4"
 "_vkEndCommandBuffer@4":
     jmp *_nr_vk_p_vkEndCommandBuffer
+    .globl _nr_vk_unresolved_vkEndCommandBuffer
+_nr_vk_unresolved_vkEndCommandBuffer:
+    mov $-3, %eax
+    ret $4
     .globl "_vkEnumerateDeviceExtensionProperties@16"
 "_vkEnumerateDeviceExtensionProperties@16":
     jmp *_nr_vk_p_vkEnumerateDeviceExtensionProperties
+    .globl _nr_vk_unresolved_vkEnumerateDeviceExtensionProperties
+_nr_vk_unresolved_vkEnumerateDeviceExtensionProperties:
+    mov $-3, %eax
+    ret $16
     .globl "_vkEnumerateInstanceVersion@4"
 "_vkEnumerateInstanceVersion@4":
     jmp *_nr_vk_p_vkEnumerateInstanceVersion
+    .globl _nr_vk_unresolved_vkEnumerateInstanceVersion
+_nr_vk_unresolved_vkEnumerateInstanceVersion:
+    mov $-3, %eax
+    ret $4
     .globl "_vkEnumeratePhysicalDevices@12"
 "_vkEnumeratePhysicalDevices@12":
     jmp *_nr_vk_p_vkEnumeratePhysicalDevices
+    .globl _nr_vk_unresolved_vkEnumeratePhysicalDevices
+_nr_vk_unresolved_vkEnumeratePhysicalDevices:
+    mov $-3, %eax
+    ret $12
     .globl "_vkFreeCommandBuffers@20"
 "_vkFreeCommandBuffers@20":
     jmp *_nr_vk_p_vkFreeCommandBuffers
+    .globl _nr_vk_unresolved_vkFreeCommandBuffers
+_nr_vk_unresolved_vkFreeCommandBuffers:
+    mov $-3, %eax
+    ret $20
     .globl "_vkFreeDescriptorSets@20"
 "_vkFreeDescriptorSets@20":
     jmp *_nr_vk_p_vkFreeDescriptorSets
+    .globl _nr_vk_unresolved_vkFreeDescriptorSets
+_nr_vk_unresolved_vkFreeDescriptorSets:
+    mov $-3, %eax
+    ret $20
     .globl "_vkFreeMemory@16"
 "_vkFreeMemory@16":
     jmp *_nr_vk_p_vkFreeMemory
+    .globl _nr_vk_unresolved_vkFreeMemory
+_nr_vk_unresolved_vkFreeMemory:
+    mov $-3, %eax
+    ret $16
     .globl "_vkGetBufferDeviceAddress@8"
 "_vkGetBufferDeviceAddress@8":
     jmp *_nr_vk_p_vkGetBufferDeviceAddress
+    .globl _nr_vk_unresolved_vkGetBufferDeviceAddress
+_nr_vk_unresolved_vkGetBufferDeviceAddress:
+    xor %eax, %eax
+    xor %edx, %edx
+    ret $8
     .globl "_vkGetBufferMemoryRequirements@16"
 "_vkGetBufferMemoryRequirements@16":
     jmp *_nr_vk_p_vkGetBufferMemoryRequirements
+    .globl _nr_vk_unresolved_vkGetBufferMemoryRequirements
+_nr_vk_unresolved_vkGetBufferMemoryRequirements:
+    mov $-3, %eax
+    ret $16
     .globl "_vkGetDeviceProcAddr@8"
 "_vkGetDeviceProcAddr@8":
     jmp *_nr_vk_p_vkGetDeviceProcAddr
+    .globl _nr_vk_unresolved_vkGetDeviceProcAddr
+_nr_vk_unresolved_vkGetDeviceProcAddr:
+    xor %eax, %eax
+    xor %edx, %edx
+    ret $8
     .globl "_vkGetDeviceQueue@16"
 "_vkGetDeviceQueue@16":
     jmp *_nr_vk_p_vkGetDeviceQueue
+    .globl _nr_vk_unresolved_vkGetDeviceQueue
+_nr_vk_unresolved_vkGetDeviceQueue:
+    mov $-3, %eax
+    ret $16
     .globl "_vkGetEventStatus@12"
 "_vkGetEventStatus@12":
     jmp *_nr_vk_p_vkGetEventStatus
+    .globl _nr_vk_unresolved_vkGetEventStatus
+_nr_vk_unresolved_vkGetEventStatus:
+    mov $-3, %eax
+    ret $12
     .globl "_vkGetFenceStatus@12"
 "_vkGetFenceStatus@12":
     jmp *_nr_vk_p_vkGetFenceStatus
+    .globl _nr_vk_unresolved_vkGetFenceStatus
+_nr_vk_unresolved_vkGetFenceStatus:
+    mov $-3, %eax
+    ret $12
     .globl "_vkGetImageMemoryRequirements@16"
 "_vkGetImageMemoryRequirements@16":
     jmp *_nr_vk_p_vkGetImageMemoryRequirements
+    .globl _nr_vk_unresolved_vkGetImageMemoryRequirements
+_nr_vk_unresolved_vkGetImageMemoryRequirements:
+    mov $-3, %eax
+    ret $16
     .globl "_vkGetInstanceProcAddr@8"
 "_vkGetInstanceProcAddr@8":
     jmp *_nr_vk_p_vkGetInstanceProcAddr
+    .globl _nr_vk_unresolved_vkGetInstanceProcAddr
+_nr_vk_unresolved_vkGetInstanceProcAddr:
+    xor %eax, %eax
+    xor %edx, %edx
+    ret $8
     .globl "_vkGetPhysicalDeviceExternalSemaphoreProperties@12"
 "_vkGetPhysicalDeviceExternalSemaphoreProperties@12":
     jmp *_nr_vk_p_vkGetPhysicalDeviceExternalSemaphoreProperties
+    .globl _nr_vk_unresolved_vkGetPhysicalDeviceExternalSemaphoreProperties
+_nr_vk_unresolved_vkGetPhysicalDeviceExternalSemaphoreProperties:
+    mov $-3, %eax
+    ret $12
     .globl "_vkGetPhysicalDeviceFeatures2@8"
 "_vkGetPhysicalDeviceFeatures2@8":
     jmp *_nr_vk_p_vkGetPhysicalDeviceFeatures2
-    .globl "_vkGetPhysicalDeviceFormatProperties@12"
-"_vkGetPhysicalDeviceFormatProperties@12":
-    jmp *_nr_vk_p_vkGetPhysicalDeviceFormatProperties
+    .globl _nr_vk_unresolved_vkGetPhysicalDeviceFeatures2
+_nr_vk_unresolved_vkGetPhysicalDeviceFeatures2:
+    mov $-3, %eax
+    ret $8
     .globl "_vkGetPhysicalDeviceFormatProperties2@12"
 "_vkGetPhysicalDeviceFormatProperties2@12":
     jmp *_nr_vk_p_vkGetPhysicalDeviceFormatProperties2
+    .globl _nr_vk_unresolved_vkGetPhysicalDeviceFormatProperties2
+_nr_vk_unresolved_vkGetPhysicalDeviceFormatProperties2:
+    mov $-3, %eax
+    ret $12
+    .globl "_vkGetPhysicalDeviceFormatProperties@12"
+"_vkGetPhysicalDeviceFormatProperties@12":
+    jmp *_nr_vk_p_vkGetPhysicalDeviceFormatProperties
+    .globl _nr_vk_unresolved_vkGetPhysicalDeviceFormatProperties
+_nr_vk_unresolved_vkGetPhysicalDeviceFormatProperties:
+    mov $-3, %eax
+    ret $12
     .globl "_vkGetPhysicalDeviceImageFormatProperties2@12"
 "_vkGetPhysicalDeviceImageFormatProperties2@12":
     jmp *_nr_vk_p_vkGetPhysicalDeviceImageFormatProperties2
+    .globl _nr_vk_unresolved_vkGetPhysicalDeviceImageFormatProperties2
+_nr_vk_unresolved_vkGetPhysicalDeviceImageFormatProperties2:
+    mov $-3, %eax
+    ret $12
     .globl "_vkGetPhysicalDeviceMemoryProperties2@8"
 "_vkGetPhysicalDeviceMemoryProperties2@8":
     jmp *_nr_vk_p_vkGetPhysicalDeviceMemoryProperties2
+    .globl _nr_vk_unresolved_vkGetPhysicalDeviceMemoryProperties2
+_nr_vk_unresolved_vkGetPhysicalDeviceMemoryProperties2:
+    mov $-3, %eax
+    ret $8
     .globl "_vkGetPhysicalDeviceMemoryProperties@8"
 "_vkGetPhysicalDeviceMemoryProperties@8":
     jmp *_nr_vk_p_vkGetPhysicalDeviceMemoryProperties
+    .globl _nr_vk_unresolved_vkGetPhysicalDeviceMemoryProperties
+_nr_vk_unresolved_vkGetPhysicalDeviceMemoryProperties:
+    mov $-3, %eax
+    ret $8
     .globl "_vkGetPhysicalDeviceProperties2@8"
 "_vkGetPhysicalDeviceProperties2@8":
     jmp *_nr_vk_p_vkGetPhysicalDeviceProperties2
+    .globl _nr_vk_unresolved_vkGetPhysicalDeviceProperties2
+_nr_vk_unresolved_vkGetPhysicalDeviceProperties2:
+    mov $-3, %eax
+    ret $8
     .globl "_vkGetPhysicalDeviceProperties@8"
 "_vkGetPhysicalDeviceProperties@8":
     jmp *_nr_vk_p_vkGetPhysicalDeviceProperties
+    .globl _nr_vk_unresolved_vkGetPhysicalDeviceProperties
+_nr_vk_unresolved_vkGetPhysicalDeviceProperties:
+    mov $-3, %eax
+    ret $8
     .globl "_vkGetPhysicalDeviceQueueFamilyProperties@12"
 "_vkGetPhysicalDeviceQueueFamilyProperties@12":
     jmp *_nr_vk_p_vkGetPhysicalDeviceQueueFamilyProperties
+    .globl _nr_vk_unresolved_vkGetPhysicalDeviceQueueFamilyProperties
+_nr_vk_unresolved_vkGetPhysicalDeviceQueueFamilyProperties:
+    mov $-3, %eax
+    ret $12
     .globl "_vkGetPipelineCacheData@20"
 "_vkGetPipelineCacheData@20":
     jmp *_nr_vk_p_vkGetPipelineCacheData
+    .globl _nr_vk_unresolved_vkGetPipelineCacheData
+_nr_vk_unresolved_vkGetPipelineCacheData:
+    mov $-3, %eax
+    ret $20
     .globl "_vkGetQueryPoolResults@40"
 "_vkGetQueryPoolResults@40":
     jmp *_nr_vk_p_vkGetQueryPoolResults
+    .globl _nr_vk_unresolved_vkGetQueryPoolResults
+_nr_vk_unresolved_vkGetQueryPoolResults:
+    mov $-3, %eax
+    ret $40
     .globl "_vkInvalidateMappedMemoryRanges@12"
 "_vkInvalidateMappedMemoryRanges@12":
     jmp *_nr_vk_p_vkInvalidateMappedMemoryRanges
+    .globl _nr_vk_unresolved_vkInvalidateMappedMemoryRanges
+_nr_vk_unresolved_vkInvalidateMappedMemoryRanges:
+    mov $-3, %eax
+    ret $12
     .globl "_vkMapMemory@36"
 "_vkMapMemory@36":
     jmp *_nr_vk_p_vkMapMemory
+    .globl _nr_vk_unresolved_vkMapMemory
+_nr_vk_unresolved_vkMapMemory:
+    mov $-3, %eax
+    ret $36
     .globl "_vkQueueSubmit@20"
 "_vkQueueSubmit@20":
     jmp *_nr_vk_p_vkQueueSubmit
+    .globl _nr_vk_unresolved_vkQueueSubmit
+_nr_vk_unresolved_vkQueueSubmit:
+    mov $-3, %eax
+    ret $20
     .globl "_vkQueueWaitIdle@4"
 "_vkQueueWaitIdle@4":
     jmp *_nr_vk_p_vkQueueWaitIdle
+    .globl _nr_vk_unresolved_vkQueueWaitIdle
+_nr_vk_unresolved_vkQueueWaitIdle:
+    mov $-3, %eax
+    ret $4
     .globl "_vkResetCommandBuffer@8"
 "_vkResetCommandBuffer@8":
     jmp *_nr_vk_p_vkResetCommandBuffer
+    .globl _nr_vk_unresolved_vkResetCommandBuffer
+_nr_vk_unresolved_vkResetCommandBuffer:
+    mov $-3, %eax
+    ret $8
     .globl "_vkResetDescriptorPool@16"
 "_vkResetDescriptorPool@16":
     jmp *_nr_vk_p_vkResetDescriptorPool
+    .globl _nr_vk_unresolved_vkResetDescriptorPool
+_nr_vk_unresolved_vkResetDescriptorPool:
+    mov $-3, %eax
+    ret $16
     .globl "_vkResetEvent@12"
 "_vkResetEvent@12":
     jmp *_nr_vk_p_vkResetEvent
+    .globl _nr_vk_unresolved_vkResetEvent
+_nr_vk_unresolved_vkResetEvent:
+    mov $-3, %eax
+    ret $12
     .globl "_vkResetFences@12"
 "_vkResetFences@12":
     jmp *_nr_vk_p_vkResetFences
+    .globl _nr_vk_unresolved_vkResetFences
+_nr_vk_unresolved_vkResetFences:
+    mov $-3, %eax
+    ret $12
     .globl "_vkUnmapMemory@12"
 "_vkUnmapMemory@12":
     jmp *_nr_vk_p_vkUnmapMemory
+    .globl _nr_vk_unresolved_vkUnmapMemory
+_nr_vk_unresolved_vkUnmapMemory:
+    mov $-3, %eax
+    ret $12
     .globl "_vkUpdateDescriptorSets@20"
 "_vkUpdateDescriptorSets@20":
     jmp *_nr_vk_p_vkUpdateDescriptorSets
+    .globl _nr_vk_unresolved_vkUpdateDescriptorSets
+_nr_vk_unresolved_vkUpdateDescriptorSets:
+    mov $-3, %eax
+    ret $20
     .globl "_vkWaitForFences@24"
 "_vkWaitForFences@24":
     jmp *_nr_vk_p_vkWaitForFences
+    .globl _nr_vk_unresolved_vkWaitForFences
+_nr_vk_unresolved_vkWaitForFences:
+    mov $-3, %eax
+    ret $24
     .data
     .globl _nr_vk_p_vkAllocateCommandBuffers
     .align 4
 _nr_vk_p_vkAllocateCommandBuffers:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkAllocateCommandBuffers
     .globl _nr_vk_p_vkAllocateDescriptorSets
     .align 4
 _nr_vk_p_vkAllocateDescriptorSets:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkAllocateDescriptorSets
     .globl _nr_vk_p_vkAllocateMemory
     .align 4
 _nr_vk_p_vkAllocateMemory:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkAllocateMemory
     .globl _nr_vk_p_vkBeginCommandBuffer
     .align 4
 _nr_vk_p_vkBeginCommandBuffer:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkBeginCommandBuffer
     .globl _nr_vk_p_vkBindBufferMemory
     .align 4
 _nr_vk_p_vkBindBufferMemory:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkBindBufferMemory
     .globl _nr_vk_p_vkBindImageMemory
     .align 4
 _nr_vk_p_vkBindImageMemory:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkBindImageMemory
     .globl _nr_vk_p_vkCmdBindDescriptorSets
     .align 4
 _nr_vk_p_vkCmdBindDescriptorSets:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkCmdBindDescriptorSets
     .globl _nr_vk_p_vkCmdBindPipeline
     .align 4
 _nr_vk_p_vkCmdBindPipeline:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkCmdBindPipeline
     .globl _nr_vk_p_vkCmdBlitImage
     .align 4
 _nr_vk_p_vkCmdBlitImage:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkCmdBlitImage
     .globl _nr_vk_p_vkCmdClearColorImage
     .align 4
 _nr_vk_p_vkCmdClearColorImage:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkCmdClearColorImage
     .globl _nr_vk_p_vkCmdCopyBuffer
     .align 4
 _nr_vk_p_vkCmdCopyBuffer:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkCmdCopyBuffer
     .globl _nr_vk_p_vkCmdCopyBufferToImage
     .align 4
 _nr_vk_p_vkCmdCopyBufferToImage:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkCmdCopyBufferToImage
     .globl _nr_vk_p_vkCmdCopyImage
     .align 4
 _nr_vk_p_vkCmdCopyImage:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkCmdCopyImage
     .globl _nr_vk_p_vkCmdCopyImageToBuffer
     .align 4
 _nr_vk_p_vkCmdCopyImageToBuffer:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkCmdCopyImageToBuffer
     .globl _nr_vk_p_vkCmdDispatch
     .align 4
 _nr_vk_p_vkCmdDispatch:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkCmdDispatch
     .globl _nr_vk_p_vkCmdFillBuffer
     .align 4
 _nr_vk_p_vkCmdFillBuffer:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkCmdFillBuffer
     .globl _nr_vk_p_vkCmdPipelineBarrier2
     .align 4
 _nr_vk_p_vkCmdPipelineBarrier2:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkCmdPipelineBarrier2
     .globl _nr_vk_p_vkCmdPipelineBarrier
     .align 4
 _nr_vk_p_vkCmdPipelineBarrier:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkCmdPipelineBarrier
     .globl _nr_vk_p_vkCmdPushConstants
     .align 4
 _nr_vk_p_vkCmdPushConstants:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkCmdPushConstants
     .globl _nr_vk_p_vkCmdResetQueryPool
     .align 4
 _nr_vk_p_vkCmdResetQueryPool:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkCmdResetQueryPool
     .globl _nr_vk_p_vkCmdSetEvent
     .align 4
 _nr_vk_p_vkCmdSetEvent:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkCmdSetEvent
     .globl _nr_vk_p_vkCmdUpdateBuffer
     .align 4
 _nr_vk_p_vkCmdUpdateBuffer:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkCmdUpdateBuffer
     .globl _nr_vk_p_vkCmdWriteTimestamp
     .align 4
 _nr_vk_p_vkCmdWriteTimestamp:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkCmdWriteTimestamp
     .globl _nr_vk_p_vkCreateBuffer
     .align 4
 _nr_vk_p_vkCreateBuffer:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkCreateBuffer
     .globl _nr_vk_p_vkCreateCommandPool
     .align 4
 _nr_vk_p_vkCreateCommandPool:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkCreateCommandPool
     .globl _nr_vk_p_vkCreateComputePipelines
     .align 4
 _nr_vk_p_vkCreateComputePipelines:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkCreateComputePipelines
     .globl _nr_vk_p_vkCreateDescriptorPool
     .align 4
 _nr_vk_p_vkCreateDescriptorPool:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkCreateDescriptorPool
     .globl _nr_vk_p_vkCreateDescriptorSetLayout
     .align 4
 _nr_vk_p_vkCreateDescriptorSetLayout:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkCreateDescriptorSetLayout
     .globl _nr_vk_p_vkCreateDevice
     .align 4
 _nr_vk_p_vkCreateDevice:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkCreateDevice
     .globl _nr_vk_p_vkCreateEvent
     .align 4
 _nr_vk_p_vkCreateEvent:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkCreateEvent
     .globl _nr_vk_p_vkCreateFence
     .align 4
 _nr_vk_p_vkCreateFence:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkCreateFence
     .globl _nr_vk_p_vkCreateImage
     .align 4
 _nr_vk_p_vkCreateImage:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkCreateImage
     .globl _nr_vk_p_vkCreateImageView
     .align 4
 _nr_vk_p_vkCreateImageView:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkCreateImageView
     .globl _nr_vk_p_vkCreateInstance
     .align 4
 _nr_vk_p_vkCreateInstance:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkCreateInstance
     .globl _nr_vk_p_vkCreatePipelineCache
     .align 4
 _nr_vk_p_vkCreatePipelineCache:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkCreatePipelineCache
     .globl _nr_vk_p_vkCreatePipelineLayout
     .align 4
 _nr_vk_p_vkCreatePipelineLayout:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkCreatePipelineLayout
     .globl _nr_vk_p_vkCreateQueryPool
     .align 4
 _nr_vk_p_vkCreateQueryPool:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkCreateQueryPool
     .globl _nr_vk_p_vkCreateSampler
     .align 4
 _nr_vk_p_vkCreateSampler:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkCreateSampler
     .globl _nr_vk_p_vkCreateSemaphore
     .align 4
 _nr_vk_p_vkCreateSemaphore:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkCreateSemaphore
     .globl _nr_vk_p_vkCreateShaderModule
     .align 4
 _nr_vk_p_vkCreateShaderModule:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkCreateShaderModule
     .globl _nr_vk_p_vkDestroyBuffer
     .align 4
 _nr_vk_p_vkDestroyBuffer:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkDestroyBuffer
     .globl _nr_vk_p_vkDestroyCommandPool
     .align 4
 _nr_vk_p_vkDestroyCommandPool:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkDestroyCommandPool
     .globl _nr_vk_p_vkDestroyDescriptorPool
     .align 4
 _nr_vk_p_vkDestroyDescriptorPool:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkDestroyDescriptorPool
     .globl _nr_vk_p_vkDestroyDescriptorSetLayout
     .align 4
 _nr_vk_p_vkDestroyDescriptorSetLayout:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkDestroyDescriptorSetLayout
     .globl _nr_vk_p_vkDestroyDevice
     .align 4
 _nr_vk_p_vkDestroyDevice:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkDestroyDevice
     .globl _nr_vk_p_vkDestroyEvent
     .align 4
 _nr_vk_p_vkDestroyEvent:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkDestroyEvent
     .globl _nr_vk_p_vkDestroyFence
     .align 4
 _nr_vk_p_vkDestroyFence:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkDestroyFence
     .globl _nr_vk_p_vkDestroyImage
     .align 4
 _nr_vk_p_vkDestroyImage:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkDestroyImage
     .globl _nr_vk_p_vkDestroyImageView
     .align 4
 _nr_vk_p_vkDestroyImageView:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkDestroyImageView
     .globl _nr_vk_p_vkDestroyInstance
     .align 4
 _nr_vk_p_vkDestroyInstance:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkDestroyInstance
     .globl _nr_vk_p_vkDestroyPipeline
     .align 4
 _nr_vk_p_vkDestroyPipeline:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkDestroyPipeline
     .globl _nr_vk_p_vkDestroyPipelineCache
     .align 4
 _nr_vk_p_vkDestroyPipelineCache:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkDestroyPipelineCache
     .globl _nr_vk_p_vkDestroyPipelineLayout
     .align 4
 _nr_vk_p_vkDestroyPipelineLayout:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkDestroyPipelineLayout
     .globl _nr_vk_p_vkDestroyQueryPool
     .align 4
 _nr_vk_p_vkDestroyQueryPool:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkDestroyQueryPool
     .globl _nr_vk_p_vkDestroySampler
     .align 4
 _nr_vk_p_vkDestroySampler:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkDestroySampler
     .globl _nr_vk_p_vkDestroySemaphore
     .align 4
 _nr_vk_p_vkDestroySemaphore:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkDestroySemaphore
     .globl _nr_vk_p_vkDestroyShaderModule
     .align 4
 _nr_vk_p_vkDestroyShaderModule:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkDestroyShaderModule
     .globl _nr_vk_p_vkDeviceWaitIdle
     .align 4
 _nr_vk_p_vkDeviceWaitIdle:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkDeviceWaitIdle
     .globl _nr_vk_p_vkEndCommandBuffer
     .align 4
 _nr_vk_p_vkEndCommandBuffer:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkEndCommandBuffer
     .globl _nr_vk_p_vkEnumerateDeviceExtensionProperties
     .align 4
 _nr_vk_p_vkEnumerateDeviceExtensionProperties:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkEnumerateDeviceExtensionProperties
     .globl _nr_vk_p_vkEnumerateInstanceVersion
     .align 4
 _nr_vk_p_vkEnumerateInstanceVersion:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkEnumerateInstanceVersion
     .globl _nr_vk_p_vkEnumeratePhysicalDevices
     .align 4
 _nr_vk_p_vkEnumeratePhysicalDevices:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkEnumeratePhysicalDevices
     .globl _nr_vk_p_vkFreeCommandBuffers
     .align 4
 _nr_vk_p_vkFreeCommandBuffers:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkFreeCommandBuffers
     .globl _nr_vk_p_vkFreeDescriptorSets
     .align 4
 _nr_vk_p_vkFreeDescriptorSets:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkFreeDescriptorSets
     .globl _nr_vk_p_vkFreeMemory
     .align 4
 _nr_vk_p_vkFreeMemory:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkFreeMemory
     .globl _nr_vk_p_vkGetBufferDeviceAddress
     .align 4
 _nr_vk_p_vkGetBufferDeviceAddress:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkGetBufferDeviceAddress
     .globl _nr_vk_p_vkGetBufferMemoryRequirements
     .align 4
 _nr_vk_p_vkGetBufferMemoryRequirements:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkGetBufferMemoryRequirements
     .globl _nr_vk_p_vkGetDeviceProcAddr
     .align 4
 _nr_vk_p_vkGetDeviceProcAddr:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkGetDeviceProcAddr
     .globl _nr_vk_p_vkGetDeviceQueue
     .align 4
 _nr_vk_p_vkGetDeviceQueue:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkGetDeviceQueue
     .globl _nr_vk_p_vkGetEventStatus
     .align 4
 _nr_vk_p_vkGetEventStatus:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkGetEventStatus
     .globl _nr_vk_p_vkGetFenceStatus
     .align 4
 _nr_vk_p_vkGetFenceStatus:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkGetFenceStatus
     .globl _nr_vk_p_vkGetImageMemoryRequirements
     .align 4
 _nr_vk_p_vkGetImageMemoryRequirements:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkGetImageMemoryRequirements
     .globl _nr_vk_p_vkGetInstanceProcAddr
     .align 4
 _nr_vk_p_vkGetInstanceProcAddr:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkGetInstanceProcAddr
     .globl _nr_vk_p_vkGetPhysicalDeviceExternalSemaphoreProperties
     .align 4
 _nr_vk_p_vkGetPhysicalDeviceExternalSemaphoreProperties:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkGetPhysicalDeviceExternalSemaphoreProperties
     .globl _nr_vk_p_vkGetPhysicalDeviceFeatures2
     .align 4
 _nr_vk_p_vkGetPhysicalDeviceFeatures2:
-    .long _nr_vk_unresolved
-    .globl _nr_vk_p_vkGetPhysicalDeviceFormatProperties
-    .align 4
-_nr_vk_p_vkGetPhysicalDeviceFormatProperties:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkGetPhysicalDeviceFeatures2
     .globl _nr_vk_p_vkGetPhysicalDeviceFormatProperties2
     .align 4
 _nr_vk_p_vkGetPhysicalDeviceFormatProperties2:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkGetPhysicalDeviceFormatProperties2
+    .globl _nr_vk_p_vkGetPhysicalDeviceFormatProperties
+    .align 4
+_nr_vk_p_vkGetPhysicalDeviceFormatProperties:
+    .long _nr_vk_unresolved_vkGetPhysicalDeviceFormatProperties
     .globl _nr_vk_p_vkGetPhysicalDeviceImageFormatProperties2
     .align 4
 _nr_vk_p_vkGetPhysicalDeviceImageFormatProperties2:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkGetPhysicalDeviceImageFormatProperties2
     .globl _nr_vk_p_vkGetPhysicalDeviceMemoryProperties2
     .align 4
 _nr_vk_p_vkGetPhysicalDeviceMemoryProperties2:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkGetPhysicalDeviceMemoryProperties2
     .globl _nr_vk_p_vkGetPhysicalDeviceMemoryProperties
     .align 4
 _nr_vk_p_vkGetPhysicalDeviceMemoryProperties:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkGetPhysicalDeviceMemoryProperties
     .globl _nr_vk_p_vkGetPhysicalDeviceProperties2
     .align 4
 _nr_vk_p_vkGetPhysicalDeviceProperties2:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkGetPhysicalDeviceProperties2
     .globl _nr_vk_p_vkGetPhysicalDeviceProperties
     .align 4
 _nr_vk_p_vkGetPhysicalDeviceProperties:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkGetPhysicalDeviceProperties
     .globl _nr_vk_p_vkGetPhysicalDeviceQueueFamilyProperties
     .align 4
 _nr_vk_p_vkGetPhysicalDeviceQueueFamilyProperties:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkGetPhysicalDeviceQueueFamilyProperties
     .globl _nr_vk_p_vkGetPipelineCacheData
     .align 4
 _nr_vk_p_vkGetPipelineCacheData:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkGetPipelineCacheData
     .globl _nr_vk_p_vkGetQueryPoolResults
     .align 4
 _nr_vk_p_vkGetQueryPoolResults:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkGetQueryPoolResults
     .globl _nr_vk_p_vkInvalidateMappedMemoryRanges
     .align 4
 _nr_vk_p_vkInvalidateMappedMemoryRanges:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkInvalidateMappedMemoryRanges
     .globl _nr_vk_p_vkMapMemory
     .align 4
 _nr_vk_p_vkMapMemory:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkMapMemory
     .globl _nr_vk_p_vkQueueSubmit
     .align 4
 _nr_vk_p_vkQueueSubmit:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkQueueSubmit
     .globl _nr_vk_p_vkQueueWaitIdle
     .align 4
 _nr_vk_p_vkQueueWaitIdle:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkQueueWaitIdle
     .globl _nr_vk_p_vkResetCommandBuffer
     .align 4
 _nr_vk_p_vkResetCommandBuffer:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkResetCommandBuffer
     .globl _nr_vk_p_vkResetDescriptorPool
     .align 4
 _nr_vk_p_vkResetDescriptorPool:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkResetDescriptorPool
     .globl _nr_vk_p_vkResetEvent
     .align 4
 _nr_vk_p_vkResetEvent:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkResetEvent
     .globl _nr_vk_p_vkResetFences
     .align 4
 _nr_vk_p_vkResetFences:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkResetFences
     .globl _nr_vk_p_vkUnmapMemory
     .align 4
 _nr_vk_p_vkUnmapMemory:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkUnmapMemory
     .globl _nr_vk_p_vkUpdateDescriptorSets
     .align 4
 _nr_vk_p_vkUpdateDescriptorSets:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkUpdateDescriptorSets
     .globl _nr_vk_p_vkWaitForFences
     .align 4
 _nr_vk_p_vkWaitForFences:
-    .long _nr_vk_unresolved
+    .long _nr_vk_unresolved_vkWaitForFences

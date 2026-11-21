@@ -207,14 +207,15 @@ constexpr int kMaxReports = 4;
 // the process still runs kClosingHoldMs later (a hang while closing is still reported); one line says so at once.
 std::atomic<ULONGLONG> g_quit_ms{0};
 constexpr ULONGLONG kClosingHoldMs = 30000;
+BOOL CALLBACK find_process_window(HWND h, LPARAM p) {
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    if (pid == GetCurrentProcessId() && IsWindowVisible(h)) { *reinterpret_cast<bool*>(p) = true; return FALSE; }
+    return TRUE;
+}
 bool any_window() {   // a visible top-level window of this process
     bool found = false;
-    EnumWindows([](HWND h, LPARAM p) -> BOOL {
-        DWORD pid = 0;
-        GetWindowThreadProcessId(h, &pid);
-        if (pid == GetCurrentProcessId() && IsWindowVisible(h)) { *reinterpret_cast<bool*>(p) = true; return FALSE; }
-        return TRUE;
-    }, reinterpret_cast<LPARAM>(&found));
+    EnumWindows(find_process_window, reinterpret_cast<LPARAM>(&found));
     return found;
 }
 std::mutex g_thread_lock;      // the watching thread's start and stop

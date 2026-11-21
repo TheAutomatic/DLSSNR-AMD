@@ -32,21 +32,22 @@ INC=(-I"$HERE" -I"$SRC/toolchain/Vulkan-Headers/include" -I"$SRC/windows/src" -I
 INC_ADDON=(-I"$SRC/artifacts/ref/DLSS5-Feeder/external/imgui" -I"$MINHOOK/include"
            -I"$SRC/artifacts/ref/DLSS5-Feeder/external/reshade/include")
 stamp=$(bash windows/build/version.sh)
-DEF=(-std=c++17 -O2 -DNDEBUG -DNR_BUILD_STAMP="\"$stamp\"" -DNR_RESHADE_ROUTE=1 -DNR_INT4=1 -fpermissive)
+DEF=(-std=c++17 -O2 -DNDEBUG -DNR_BUILD_STAMP="\"$stamp\"" -DNR_RESHADE_ROUTE=1 -DNR_INT4=1)
 
 mkdir -p "$OUT/shim"; printf '#include <windows.h>\n' > "$OUT/shim/Windows.h"   # reshade.hpp asks for Windows.h
 
 cd "$OUT"
-for f in nr_dlssnr_model nr_native_plan nr_pe_bridge nr_pe_config nr_pe_crash nr_pe_d3d12split \
+objs=()
+for f in nr_native_plan nr_pe_bridge nr_pe_config nr_pe_crash nr_pe_d3d12split \
          nr_pe_interop nr_pe_log nr_pe_session nr_pe_vkdevice nr_renodx nr_runtime nr_screenshot \
-         nr_vram_ledger nr_wilsjo2 nr_pe_renodx_route; do
+         nr_vram_ledger nr_wilsjo2; do
     p=$(find "$SRC/windows/src" -name "$f.cpp" | head -1)
     "$GXX" "${DEF[@]}" "${INC[@]}" "${NR_PRODUCT_DEFINES[@]}" -c "$p" -o "$f.o"
+    objs+=("$f.o")
 done
-# The add-on entry point has to be built by the same compiler, with the same stamp, as nr_dlssnr_model.cpp.
 "$GXX" "${DEF[@]}" -I. -I"$OUT/shim" "${INC[@]}" "${INC_ADDON[@]}" "${NR_PRODUCT_DEFINES[@]}" \
        -c "$SRC/windows/src/pe/nr_reshade_addon.cpp" -o reshade_addon.o
-"$GXX" "${DEF[@]}" "${INC[@]}" -c "$HERE/passthrough_stub32.cpp" -o passthrough_stub32.o
+objs+=(reshade_addon.o mh_hook.o mh_buffer.o mh_trampoline.o mh_hde32.o vulkan_lazy_c32.o vulkan_lazy_s32.o)
 
 # MinHook, 32-bit (hde32 only)
 "$GCC" -O2 -I"$MINHOOK/include" -I"$MINHOOK/src" -c "$MINHOOK/src/hook.c"       -o mh_hook.o
@@ -57,7 +58,7 @@ done
 "$GCC" -O2 -c "$HERE/vulkan_lazy32.c" -o vulkan_lazy_c32.o
 "$GCC" -O2 -c "$HERE/vulkan_lazy32.s" -o vulkan_lazy_s32.o
 
-"$GXX" -shared -static -static-libgcc -static-libstdc++ *.o -o "$OUT/dlssnr_amd.addon32" \
+"$GXX" -shared -static -static-libgcc -static-libstdc++ "${objs[@]}" -o "$OUT/dlssnr_amd.addon32" \
        -ld3d12 -ld3d11 -ldxgi -ldwmapi -lgdi32 -lole32      # no -lvulkan-1: the lazy stubs stand in
 
 ls -l "$OUT/dlssnr_amd.addon32"

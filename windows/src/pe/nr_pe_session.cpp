@@ -105,6 +105,9 @@ std::string address_space_report() {
     GlobalMemoryStatusEx(&memory);
     SYSTEM_INFO si{};
     GetSystemInfo(&si);
+    const auto* exe = reinterpret_cast<const unsigned char*>(GetModuleHandleW(nullptr));
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(exe);
+    const auto* pe = reinterpret_cast<const IMAGE_NT_HEADERS*>(exe + dos->e_lfanew);
     char text[256];
     std::snprintf(text, sizeof text,
                   "address space: %.0f MB free in this process, largest contiguous block %.0f MB at %p "
@@ -112,7 +115,7 @@ std::string address_space_report() {
                   double(free_total) / (1 << 20), double(largest) / (1 << 20), largest_base,
                   double(memory.ullTotalVirtual) / (1 << 20),
                   si.lpMaximumApplicationAddress,
-                  (int)(si.lpMaximumApplicationAddress > (void*)0x80000000),
+                  int((pe->FileHeader.Characteristics & IMAGE_FILE_LARGE_ADDRESS_AWARE) != 0),
                   double(memory.ullAvailPhys) / (1 << 20));
     return text;
 }
@@ -3261,7 +3264,16 @@ void apply_guide_subrect(ColourFrame* guide, const Session::Subrect& want, const
 bool Session::Impl::ensure_d3d12_device(ID3D12Device* device) {
     // The native runtime (or NR_BRIDGE=1): our own device on the game's adapter.
     if (mode == Mode::Unknown) decide_mode(device_handles(device).valid());
-    if (mode == Mode::Bridge) return ensure_bridge(device->GetAdapterLuid());
+    if (mode == Mode::Bridge) {
+#if defined(__i386__)
+        status = "Native D3D12 is not supported by the 32-bit add-on";
+        if (!failed) log("[nr] %s", status.c_str());
+        failed = true;
+        return false;
+#else
+        return ensure_bridge(device->GetAdapterLuid());
+#endif
+    }
     if (handles.valid() && access.valid()) return true;
     if (!handles.valid()) {
         handles = device_handles(device);
@@ -4405,7 +4417,7 @@ bool Session::run_d3d12_queue(const D3D12QueueFrame& f, const Controls& controls
     if (s.failed || !f.device || !f.queue || !f.target) return false;
     s.status.clear();
     if (!bridged(f.device)) { s.status = "the queue-level hand-over is for the native D3D12 runtime"; return false; }
-    if (!s.ensure_bridge(f.device->GetAdapterLuid())) return false;
+    if (!s.ensure_d3d12_device(f.device)) return false;
     // Our lists and their completion fence follow one queue's order: frames on any other queue pass through.
     if (!s.own_queue) { s.own_queue = f.queue; f.queue->AddRef(); }
     if (f.queue != s.own_queue) { s.status = "the frame is on another D3D12 queue than the network's"; return false; }

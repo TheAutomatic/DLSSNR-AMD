@@ -92,6 +92,9 @@ extern "C" __declspec(dllexport) const char* DESCRIPTION =
 // The generated thunks' loader (windows/build/build_package.sh): nothing pulls
 // Vulkan in until a game has its own graphics stack up.
 extern "C" void nr_vk_load(void);
+extern "C" const char* nr_vk_source;
+extern "C" int nr_vk_missing;
+extern "C" const char* nr_vk_first_missing;
 extern "C" void nr_vk_use_loader(int);
 extern "C" void* nr_vk_p_vkGetDeviceQueue;
 extern "C" void* nr_vk_p_vkGetPhysicalDeviceQueueFamilyProperties;
@@ -207,6 +210,7 @@ nr::pe::Config config{};
 std::string config_path;
 nr::pe::PreprocessSwitch prep_switch;   // [Preprocess] Enabled and its hotkey
 bool vk_loaded = false;
+std::string startup_why;
 
 // [RenoDX] Enabled as it was when the add-on loaded: the option is switched by restarting the game (its other
 // keys follow the file while the game runs).
@@ -2513,6 +2517,33 @@ void on_destroy_effect_runtime(effect_runtime* rt) {
     effects_seen = false;
 }
 
+bool load_vulkan(device_api api, ID3D12Device* d12 = nullptr) {
+    static bool attempted = false;
+    if (attempted) return vk_loaded;
+    attempted = true;
+#if defined(__i386__)
+    if (api == device_api::d3d12 && !nr::pe::device_handles(d12).valid()) {
+        startup_why = NR_N("Native D3D12 is not supported by the 32-bit add-on");
+        log("[nr] %s", startup_why.c_str());
+        return false;
+    }
+#endif
+    nr_vk_use_loader(api == device_api::vulkan);
+    nr_vk_load();
+    if (std::strcmp(nr_vk_source, "none") == 0)
+        startup_why = NR_N("The Vulkan loader is unavailable");
+    else if (nr_vk_missing)
+        startup_why = NR_N("The Vulkan loader is missing required entry points");
+    if (!startup_why.empty()) {
+        log("[nr] %s%s%s", startup_why.c_str(), nr_vk_missing ? ": " : "", nr_vk_missing ? nr_vk_first_missing : "");
+        return false;
+    }
+    nr::vram::install_vulkan();
+    vk_loaded = true;
+    log("[nr] feed: Vulkan entry points resolved");
+    return true;
+}
+
 // The Vulkan self-test: with no display to present on (a headless box), the
 // effect runtime never renders a technique, so NR_RESHADE_SELFTEST=1 runs the
 // whole Vulkan path once on a scratch image at device creation and logs the
@@ -2524,7 +2555,7 @@ void vulkan_selftest(VkDevice rs_device) {
     if (!GetEnvironmentVariableA("NR_RESHADE_SELFTEST", flag, sizeof flag) || flag[0] != '1') return;
     std::lock_guard<std::mutex> guard(lock);
     log("[nr] selftest: begin");
-    if (!vk_loaded) { nr_vk_use_loader(1); nr_vk_load(); nr::vram::install_vulkan(); vk_loaded = true; }
+    if (!vk_loaded && !load_vulkan(device_api::vulkan)) return;
     auto h = nr::pe::vkdevice::handles();
     h.device = rs_device;
     log("[nr] selftest: handles instance %p physical %p device %p", static_cast<void*>(h.instance),
@@ -2954,6 +2985,8 @@ bool run_layers(effect_runtime* rt, nr::pe::Session& s, const nr::pe::Session::R
 
 void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
     device* dev = rt->get_device();
+    if (!vk_loaded && !load_vulkan(dev->get_api(), dev->get_api() == device_api::d3d12
+                                 ? reinterpret_cast<ID3D12Device*>(dev->get_native()) : nullptr)) return;
     resource_view mv_srv{}, mv_srgb{}, d_srv{}, d_srgb{};
     if (mv_var.handle) rt->get_texture_binding(mv_var, &mv_srv, &mv_srgb);
     if (depth_var.handle) rt->get_texture_binding(depth_var, &d_srv, &d_srgb);
@@ -3006,9 +3039,6 @@ void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
         pf.preprocess_exposure = config.controls.preprocess.active() ? config.controls.preprocess.exposure : 0;
         pf.white_point = renodx_on ? 0.f : config.white_point;
     }
-    // the VRAM ledger wraps our allocation entry points (nr_vram_ledger.hpp) - after every load, or NR Control's VRAM
-    // breakdown shows none of the network's memory (the .asi does it in nr_pe_interop.cpp)
-    if (!vk_loaded) { nr_vk_use_loader(dev->get_api() == device_api::vulkan); nr_vk_load(); nr::vram::install_vulkan(); vk_loaded = true; log("[nr] feed: Vulkan entry points resolved"); }
     // An HDR10 back buffer is PQ (or HLG) over BT.2020, and nothing in this
     // pass decodes either. Running on it anyway would hand the model a picture
     // in a transfer function it has never seen and hand back a worse one, which
@@ -3781,6 +3811,7 @@ void draw_page() {
     static const int skip = [] { char v[8] = {}; return GetEnvironmentVariableA("NR_ADDON_PAGE_SKIP", v, 8) ? std::atoi(v) : 0; }();
     switch (addon_page) {
         case kPgStatus:   // what runs: the frame, the layers as they last ran and what they cost, a build, the video memory
+            if (!startup_why.empty()) nr::control_ui::text_dim_wrapped("%s", tr_text(startup_why.c_str()));
             if (view.width)
                 ImGui::Text(tr("Frame: %ux%u, %s, %s"), view.width, view.height, panel_facts.format.c_str(), space_name(back_buffer_space));
             if (!(skip & 1)) {
@@ -3792,7 +3823,7 @@ void draw_page() {
             if (session) {
                 const nr::pe::Session::State st = session->state();
                 if (st.bda_probe_failed)
-                    nr::control_ui::text_dim_wrapped("Storage-buffer shaders: the game's Vulkan device has no vkGetBufferDeviceAddress");
+                    nr::control_ui::text_dim_wrapped("Storage-buffer shaders: the Vulkan device NR is using has no vkGetBufferDeviceAddress");
                 if (st.building) {
                     char phase[128];
                     const float f = build_fraction(st, phase, sizeof phase);
