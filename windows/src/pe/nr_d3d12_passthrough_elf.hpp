@@ -961,7 +961,22 @@ inline bool create_carrier_root_signature(ID3D12Device* device, uint32_t constan
     HRESULT hr = D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1_0, &sig, &err);
     if (err) err->Release();
     if (FAILED(hr) || !sig) { *why = "D3D12SerializeRootSignature " + hr_hex(hr); return false; }
-    hr = device->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(out_rs));
+    // Add-ons like RenoDX rewrite root signatures made through ReShade's device; the ELF's user-data map must match exactly.
+    D3D12_HEAP_DESC heap_desc{};
+    heap_desc.SizeInBytes = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+    heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+    heap_desc.Properties.CreationNodeMask = 1;
+    heap_desc.Properties.VisibleNodeMask = 1;
+    heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+    ID3D12Heap* heap = nullptr;
+    hr = device->CreateHeap(&heap_desc, IID_PPV_ARGS(&heap));
+    if (FAILED(hr)) { sig->Release(); *why = "CreateHeap " + hr_hex(hr); return false; }
+    ID3D12Device* native = nullptr;
+    hr = heap->GetDevice(IID_PPV_ARGS(&native));
+    heap->Release();
+    if (FAILED(hr)) { sig->Release(); *why = "heap GetDevice " + hr_hex(hr); return false; }
+    hr = native->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(out_rs));
+    native->Release();
     sig->Release();
     if (FAILED(hr) || !*out_rs) { *why = "CreateRootSignature " + hr_hex(hr); return false; }
     return true;
