@@ -297,6 +297,7 @@ struct Session::Impl {
     }
     RuntimeConfig make_config(uint32_t w, uint32_t h, VkFormat f) const;
     HostDevice make_host() const;
+    mutable bool bda_probe_failed = false;
     TemporalConfig make_temporal() const {
         TemporalConfig temporal; temporal.enable = true;
         temporal.history_strength = history_strength;
@@ -2664,8 +2665,10 @@ HostDevice Session::Impl::make_host() const {
     bool bda = vkd3d_device || mode == Mode::Bridge || vkdevice::network_features_added(handles.device);
     if (bda && !vkGetDeviceProcAddr(handles.device, "vkGetBufferDeviceAddress")) {
         bda = false;
-        log("[nr] bufferDeviceAddress: the device has no vkGetBufferDeviceAddress entry point; "
-            "the storage-buffer builds are used");
+        if (!bda_probe_failed)
+            log("[nr] bufferDeviceAddress: the device has no vkGetBufferDeviceAddress entry point; "
+                "the storage-buffer builds are used");
+        bda_probe_failed = true;
     }
     if (const char* no_bda = std::getenv("NR_NO_BDA"); no_bda && *no_bda == '1') bda = false;
     host.buffer_device_address = bda;
@@ -3980,6 +3983,7 @@ void Session::network_size(uint32_t* width, uint32_t* height) const {
 Session::State Session::state() const {
     State s;
     const auto& m = *impl_;
+    s.bda_probe_failed = m.bda_probe_failed;
     s.running = m.runtime != nullptr;
     if (m.runtime) {
         s.model_w = m.runtime->model_width(); s.model_h = m.runtime->model_height();

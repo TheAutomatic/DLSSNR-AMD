@@ -491,6 +491,7 @@ class Session {
 
     // What a host's UI shows: the network running and the one being built.
     struct State {
+        bool bda_probe_failed = false;
         bool running = false;           // a network is serving frames
         int running_net = -1;           // the network serving (nr::NetworkChoice), -1 none
         uint32_t model_w = 0, model_h = 0;

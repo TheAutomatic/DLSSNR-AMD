@@ -3791,6 +3791,8 @@ void draw_page() {
             page_trace("layer status");
             if (session) {
                 const nr::pe::Session::State st = session->state();
+                if (st.bda_probe_failed)
+                    nr::control_ui::text_dim_wrapped("Storage-buffer shaders: the game's Vulkan device has no vkGetBufferDeviceAddress");
                 if (st.building) {
                     char phase[128];
                     const float f = build_fraction(st, phase, sizeof phase);
