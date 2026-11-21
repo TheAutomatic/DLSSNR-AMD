@@ -1732,6 +1732,17 @@ void* orig_queue_execute(void** qvt) {
 
 #endif
 
+// The public API below works on the 64-bit implementation's state; the 32-bit build (where the cut above is a stub) has
+// none, so it gets the same answers without one: no queue known, no recordings, nothing complete.
+#if !defined(_M_X64) && !defined(__x86_64__)
+ID3D12CommandQueue* last_direct_queue() { return nullptr; }
+std::shared_ptr<nr::gpu::Recording> book(ID3D12CommandList*) { return nullptr; }
+bool completed(const std::shared_ptr<nr::gpu::Recording>&) { return false; }
+void note_execution(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*) {}
+void seal(const std::shared_ptr<nr::gpu::Recording>&) {}
+void invalidate(const std::shared_ptr<nr::gpu::Recording>&) {}
+#else
+
 ID3D12CommandQueue* last_direct_queue() { return t_last_direct; }
 
 std::shared_ptr<nr::gpu::Recording> book(ID3D12CommandList* list) {
@@ -1772,6 +1783,7 @@ void seal(const std::shared_ptr<nr::gpu::Recording>& rec) { if (rec) rec->seal()
 void invalidate(const std::shared_ptr<nr::gpu::Recording>& rec) {
     if (rec) rec->seal();   // no further submissions; the waits it already has are still waited on
 }
+#endif
 
 void set_split_execution_hooks(SplitBeginFn begin_fn, SplitEndFn end_fn) {
     g_split_begin.store(begin_fn, std::memory_order_release);
