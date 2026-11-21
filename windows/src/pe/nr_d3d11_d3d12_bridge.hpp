@@ -37,7 +37,7 @@ enum class Status {
 
 // What a texture handed across is for. Each role has one shared pair (a D3D12 texture and the same texture opened on
 // the D3D11 device), made again when its size or format changes; the back buffer and its hudless frame keep up to four
-// (the least recently used goes first), and the guides one pair per guide set.
+// (the least recently used goes first).
 enum class Role : uint8_t {
     kBack,         // the swap chain's back buffer (Present layers)
     kHudless,      // HUD FIX's frame before the HUD
@@ -46,19 +46,18 @@ enum class Role : uint8_t {
     kDepth,        // the evaluate's depth, for its own layers
     kMotion,       // the evaluate's motion vectors, for its own layers
     kExposure,     // the evaluate's exposure texture
-    kGuideDepth,   // a guide set's depth (Present layers)
-    kGuideMotion,  // a guide set's motion vectors
 };
-constexpr uint32_t kGuideSets = 4;
 
 // One texture of a handoff: the game's D3D11 texture and what happens to it on the way to D3D12 and back.
 struct Handoff {
     Role role = Role::kBack;
-    uint32_t set = 0;                      // the guide set (kGuideDepth / kGuideMotion), else 0
+    uint32_t set = 0;                      // tells two textures of one role apart
     ID3D11Texture2D* tex11 = nullptr;      // the game's texture (mip 0 of a plain 2D, one-sample texture)
     uint32_t x = 0, y = 0, w = 0, h = 0;   // its region handed over (w or h 0: all of it)
     bool in = true;         // copied into the shared texture before the D3D12 work
     bool back = false;      // copied back into the game's texture (the same region) after the D3D12 work ran
+    ID3D11Texture2D* back_to = nullptr;   // with `back`: copied into this texture at its origin instead (the game's
+                                          // own is never written)
     bool depth = false;     // a depth buffer: read into R32_FLOAT by a D3D11 compute pass first (depth and typeless
                             // formats shared across the APIs are not relied on)
     bool writable = false;  // D3D12 writes it in place: made with unordered access where its format allows

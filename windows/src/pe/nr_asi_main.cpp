@@ -773,6 +773,8 @@ void copy_region(ID3D12GraphicsCommandList* cmd, ID3D12Resource* dst, uint32_t d
 }
 
 
+void read_frame_extents(const NVSDK_NGX_Parameter* p, const CreateSizes& create, uint32_t cw, uint32_t ch, uint32_t ow,
+                        uint32_t oh, uint32_t mw, uint32_t mh, Frame& f);
 bool read_frame(const NVSDK_NGX_Parameter* p, const Tracked& t, Frame& f) {
     // DLSS-D (Ray Reconstruction) blocks may name them DLSSD.*, as the forked OptiScaler reads them.
     f.color = get_resource(p, "Color", &f.color_as_resource);
@@ -794,23 +796,31 @@ bool read_frame(const NVSDK_NGX_Parameter* p, const Tracked& t, Frame& f) {
             f.flags_known = true;
         }
     }
-    const D3D12_RESOURCE_DESC cd = f.color->GetDesc(), od = f.output->GetDesc();
+    const D3D12_RESOURCE_DESC cd = f.color->GetDesc(), od = f.output->GetDesc(), md = f.motion->GetDesc();
+    read_frame_extents(p, t.create, uint32_t(cd.Width), cd.Height, uint32_t(od.Width), od.Height, uint32_t(md.Width),
+                       md.Height, f);
+    return true;
+}
+// The evaluate's extents, regions and scalars (f.flags set), from the block and its textures' sizes: the colour's
+// `cw` x `ch`, the output's `ow` x `oh`, the motion vectors' `mw` x `mh`.
+void read_frame_extents(const NVSDK_NGX_Parameter* p, const CreateSizes& create, uint32_t cw, uint32_t ch, uint32_t ow,
+                        uint32_t oh, uint32_t mw, uint32_t mh, Frame& f) {
     f.render_w = f.subrect_w = get_uint(p, "DLSS.Render.Subrect.Dimensions.Width");
     f.render_h = f.subrect_h = get_uint(p, "DLSS.Render.Subrect.Dimensions.Height");
     if (!f.render_w || !f.render_h) {   // the evaluate's Width / Height, else the create block's, else the colour's
-        f.render_w = get_uint(p, "Width", t.create.in_w ? t.create.in_w : uint32_t(cd.Width));
-        f.render_h = get_uint(p, "Height", t.create.in_h ? t.create.in_h : cd.Height);
+        f.render_w = get_uint(p, "Width", create.in_w ? create.in_w : cw);
+        f.render_h = get_uint(p, "Height", create.in_h ? create.in_h : ch);
     }
     f.color_x = get_uint(p, "DLSS.Input.Color.Subrect.Base.X");
     f.color_y = get_uint(p, "DLSS.Input.Color.Subrect.Base.Y");
     f.out_x = get_uint(p, "DLSS.Output.Subrect.Base.X");
     f.out_y = get_uint(p, "DLSS.Output.Subrect.Base.Y");
-    output_size(p, t.create, uint32_t(od.Width), od.Height, &f.out_w, &f.out_h);
-    if (!f.out_w || !f.out_h) { f.out_w = uint32_t(od.Width); f.out_h = od.Height; }
+    output_size(p, create, ow, oh, &f.out_w, &f.out_h);
+    if (!f.out_w || !f.out_h) { f.out_w = ow; f.out_h = oh; }
     // a region that does not fit the resource: clamped to it
-    if (f.out_x >= od.Width || f.out_y >= od.Height) { f.out_x = f.out_y = 0; }
-    f.out_w = std::min<uint32_t>(f.out_w, uint32_t(od.Width) - f.out_x);
-    f.out_h = std::min<uint32_t>(f.out_h, od.Height - f.out_y);
+    if (f.out_x >= ow || f.out_y >= oh) { f.out_x = f.out_y = 0; }
+    f.out_w = std::min<uint32_t>(f.out_w, ow - f.out_x);
+    f.out_h = std::min<uint32_t>(f.out_h, oh - f.out_y);
     // The guides as the forked OptiScaler gave them to NR: depth at the render extent from its own base, the motion
     // vectors from theirs at the render extent, or at the output's when the game says they are at display size.
     f.depth_rect = {get_uint(p, "DLSS.Input.Depth.Subrect.Base.X"), get_uint(p, "DLSS.Input.Depth.Subrect.Base.Y"),
@@ -818,17 +828,16 @@ bool read_frame(const NVSDK_NGX_Parameter* p, const Tracked& t, Frame& f) {
     const bool low_res_mv = !f.flags_known || (f.flags & kFlagMvLowRes) != 0;
     f.motion_rect = {get_uint(p, "DLSS.Input.MV.SubrectBase.X"), get_uint(p, "DLSS.Input.MV.SubrectBase.Y"),
                      low_res_mv ? f.render_w : f.out_w, low_res_mv ? f.render_h : f.out_h};
-    if (!low_res_mv && f.motion) {   // display-size vectors declared that the resource cannot hold: the part it holds (0.0.7's)
-        const D3D12_RESOURCE_DESC md = f.motion->GetDesc();
-        if (f.motion_rect.x + f.motion_rect.width > md.Width || f.motion_rect.y + f.motion_rect.height > md.Height) {
+    if (!low_res_mv) {   // display-size vectors declared that the resource cannot hold: the part it holds (0.0.7's)
+        if (f.motion_rect.x + f.motion_rect.width > mw || f.motion_rect.y + f.motion_rect.height > mh) {
             static int said = 0;
             if (said++ < 2)
                 log("[nr] the game says its motion vectors are at the output's size (%ux%u) but they are %llux%u: the part "
-                    "they cover is read", f.motion_rect.width, f.motion_rect.height, (unsigned long long)md.Width, md.Height);
-            f.motion_rect.x = std::min<uint32_t>(f.motion_rect.x, uint32_t(md.Width));
-            f.motion_rect.y = std::min<uint32_t>(f.motion_rect.y, md.Height);
-            f.motion_rect.width = std::min<uint32_t>(f.motion_rect.width, uint32_t(md.Width) - f.motion_rect.x);
-            f.motion_rect.height = std::min<uint32_t>(f.motion_rect.height, md.Height - f.motion_rect.y);
+                    "they cover is read", f.motion_rect.width, f.motion_rect.height, (unsigned long long)mw, mh);
+            f.motion_rect.x = std::min<uint32_t>(f.motion_rect.x, mw);
+            f.motion_rect.y = std::min<uint32_t>(f.motion_rect.y, mh);
+            f.motion_rect.width = std::min<uint32_t>(f.motion_rect.width, mw - f.motion_rect.x);
+            f.motion_rect.height = std::min<uint32_t>(f.motion_rect.height, mh - f.motion_rect.y);
         }
     }
     f.reset = get_uint(p, "Reset") != 0;
@@ -836,7 +845,6 @@ bool read_frame(const NVSDK_NGX_Parameter* p, const Tracked& t, Frame& f) {
     if (!get_float(p, "DLSS.Exposure.Scale", &f.exposure_scale) || !(f.exposure_scale > 0.0f) || !std::isfinite(f.exposure_scale)) f.exposure_scale = 1.0f;
     if (!get_float(p, "MV.Scale.X", &f.mv_x) || !std::isfinite(f.mv_x) || f.mv_x == 0.0f) f.mv_x = 1.0f;
     if (!get_float(p, "MV.Scale.Y", &f.mv_y) || !std::isfinite(f.mv_y) || f.mv_y == 0.0f) f.mv_y = 1.0f;
-    return true;
 }
 
 // A RenoDX layer on `target` (UNORDERED_ACCESS, in place), as the OptiScaler route's RenoDX-style option runs it, with
@@ -8382,11 +8390,13 @@ struct D11Tracked {
     VkTracked vk;                         // the layers' states (the Vulkan route's)
     ID3D11Texture2D* copy = nullptr;      // the colour's region, before the upscaler
     ID3D11Texture2D* mirror = nullptr;    // _SRGB twin back for the upscaler when colour is _SRGB
+    Tracked d12;                          // the layers' states on a device the D3D11 -> D3D12 bridge owns
 };
 std::unordered_map<uint32_t, D11Tracked> g_d11_features;   // g_lock
 
 void d11_forget(D11Tracked& t) {
     vk_forget(t.vk);
+    forget(t.d12);
     retire_texture(t.copy);
     retire_texture(t.mirror);
 }
@@ -9000,6 +9010,292 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_d11_release(NVSDK_NGX_Handle* h) {
 
 thread_local int t_d11_inside = 0;
 
+// ---- OptiScaler's D3D11 evaluate on a device the D3D11 -> D3D12 bridge owns (nr_d3d11_d3d12_bridge.hpp) ---------------
+// The evaluate's textures go to D3D12 by role in one round trip; there the D3D12 route's own code runs on them
+// (plan_layers, capture_guides, run_before, run_after) on a list of ours, submitted on the bridge's queue. The model's
+// Vulkan session is never started for this device.
+struct D11BridgeList {   // g_lock
+    ID3D12Device* device = nullptr;
+    ID3D12CommandAllocator* allocator = nullptr;
+    ID3D12GraphicsCommandList* list = nullptr;
+} g_d11_bridge_list;
+
+// The list, reset for a new recording: the bridge waits for each handoff's work before the next one starts, so one
+// allocator serves them all.
+ID3D12GraphicsCommandList* d11_bridge_list(ID3D12Device* device) {
+    D11BridgeList& L = g_d11_bridge_list;
+    if (L.device != device) {
+        if (L.list) L.list->Release();
+        if (L.allocator) L.allocator->Release();
+        if (L.device) L.device->Release();
+        L = {};
+        if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&L.allocator))) ||
+            FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, L.allocator, nullptr, IID_PPV_ARGS(&L.list)))) {
+            if (L.allocator) L.allocator->Release();
+            L = {};
+            return nullptr;
+        }
+        L.list->Close();
+        L.device = device;
+        device->AddRef();
+    }
+    if (FAILED(L.allocator->Reset()) || FAILED(L.list->Reset(L.allocator, nullptr))) return nullptr;
+    nr::gpu::reset(L.list);
+    return L.list;
+}
+
+// The guide sets recorded on `l`: submitted on `queue` (null: never - they are dropped).
+void d11_bridge_guides(ID3D12GraphicsCommandList* l, ID3D12CommandQueue* queue) {
+    std::lock_guard<std::mutex> guard(g_capture_lock);
+    for (GuideSet& s : g_present.sets) {
+        if (s.list != l) continue;   // (on_execute took it already where it sees the bridge's queue)
+        s.list = nullptr;
+        if (queue) { s.queue = queue; s.fence = nullptr; s.value = 0; }
+        else s.serial = 0;
+    }
+}
+
+// Closes and submits the recording, and tells the bridge its work is on the queue. Without g_lock.
+bool d11_bridge_submit(nr::pe::d11_bridge::FrameContext& fc, ID3D12GraphicsCommandList* l) {
+    if (FAILED(l->Close())) {
+        d11_bridge_guides(l, nullptr);
+        return false;
+    }
+    ID3D12CommandList* lists[] = {l};
+    fc.queue->ExecuteCommandLists(1, lists);
+    d11_bridge_guides(l, fc.queue);
+    fc.submitted = true;
+    if (fc.signal_out_fence && *fc.signal_out_fence)
+        fc.output_signal = fc.queue->Signal(*fc.signal_out_fence, fc.signal_out_val);
+    return true;
+}
+
+NVSDK_NGX_Result d11_bridge_evaluate(ID3D11DeviceContext* ctx, ID3D11Device* device, const NVSDK_NGX_Handle* h,
+                                     NVSDK_NGX_Parameter* p, void* callback) {
+    namespace d11b = nr::pe::d11_bridge;
+    struct Tex {
+        ID3D11Resource* res = nullptr;
+        ID3D11Texture2D* tex = nullptr;
+        D3D11_TEXTURE2D_DESC d{};
+        bool as_resource = true;
+        ~Tex() { if (tex) tex->Release(); }
+    };
+    const auto take = [p](Tex& t, const char* name, const char* dlssd) -> const char* {
+        const char* key = name;
+        t.res = d11_resource(p, name, &t.as_resource);
+        if (!t.res && dlssd && (t.res = d11_resource(p, dlssd, &t.as_resource))) key = dlssd;
+        if (t.res && SUCCEEDED(t.res->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&t.tex))) && t.tex)
+            t.tex->GetDesc(&t.d);
+        return key;
+    };
+    Tex colour, output, depth, motion, exposure;
+    const char* const color_key = take(colour, "Color", "DLSSD.Color");
+    take(output, "Output", "DLSSD.Output");
+    take(depth, "Depth", "DLSSD.Depth");
+    take(motion, "MotionVectors", "DLSSD.MotionVectors");
+    take(exposure, "ExposureTexture", nullptr);
+
+    std::unique_lock<std::mutex> guard(g_lock);
+    tick_retired();
+    tick_d11_retired();
+    D11Tracked& t = g_d11_features[h->Id];
+    if (!colour.tex || !output.tex || !depth.tex || !motion.tex) {
+        if (!t.d12.said) {
+            t.d12.said = true;
+            log("[nr] OptiScaler D3D11 feature %u: no colour, output, depth or motion vector texture in its evaluate; NR "
+                "does not run", h->Id);
+        }
+        guard.unlock();
+        return real_d11_evaluate(ctx, h, p, callback);
+    }
+    t.d12.feature = t.vk.feature;
+    t.d12.flags_known = t.vk.flags_known;
+    t.d12.flags = t.vk.flags;
+    t.d12.create = t.vk.create;
+    ++t.d12.evaluates;
+    // The evaluate's contract as the D3D12 route reads it, from the block and the D3D11 textures' sizes.
+    Frame f;
+    f.color_as_resource = colour.as_resource;
+    f.color_key = color_key;
+    f.flags_known = t.d12.flags_known;
+    f.flags = t.d12.flags;
+    if (!f.flags_known) {
+        int flags = 0;
+        if (p->Get("DLSS.Feature.Create.Flags", &flags) == NVSDK_NGX_Result_Success) { f.flags = uint32_t(flags); f.flags_known = true; }
+    }
+    read_frame_extents(p, t.d12.create, colour.d.Width, colour.d.Height, output.d.Width, output.d.Height, motion.d.Width,
+                       motion.d.Height, f);
+    const std::shared_ptr<const Chain> chain = chain_now();
+    match_layers(t.d12, *chain);
+    ++g_fg_frames;
+    g_present.evaluate_ms = GetTickCount64();
+    const bool nr_on = nr::dlssnr::frame_keys();
+    D3D12_RESOURCE_DESC cd{};   // the colour as plan_layers asks of it
+    cd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    cd.Width = colour.d.Width; cd.Height = colour.d.Height;
+    cd.DepthOrArraySize = UINT16(colour.d.ArraySize); cd.MipLevels = UINT16(colour.d.MipLevels);
+    cd.Format = colour.d.Format; cd.SampleDesc = colour.d.SampleDesc;
+    LayerPlan plan;
+    plan_layers(*chain, f, cd, nr_on, plan);
+    g_present.wanted = plan.present_wanted;
+    g_d11_present.wanted = plan.present_wanted;
+    if (plan.before.empty() && plan.after.empty() && !plan.present_wanted) {
+        guard.unlock();
+        return real_d11_evaluate(ctx, h, p, callback);
+    }
+    // Before the upscaler: the colour's region to D3D12, the layers on it there, their answer back into a texture of
+    // ours in the colour's own format, handed to the upscaler in the colour's place (base 0); the game's colour is
+    // never written.
+    const uint32_t rx = plan.before_renodx ? f.color_x : 0u, ry = plan.before_renodx ? f.color_y : 0u;
+    const uint32_t rw = plan.before_renodx ? f.render_w : plan.w2_aw, rh = plan.before_renodx ? f.render_h : plan.w2_ah;
+    bool before = !plan.before.empty();
+    if (before && (!rw || !rh || rx + rw > colour.d.Width || ry + rh > colour.d.Height)) before = false;
+    if (before) {
+        D3D11_TEXTURE2D_DESC have{};
+        if (t.copy) t.copy->GetDesc(&have);
+        if (!t.copy || have.Format != colour.d.Format || have.Width != rw || have.Height != rh) {
+            retire_texture(t.copy);
+            D3D11_TEXTURE2D_DESC d{};
+            d.Width = rw; d.Height = rh; d.MipLevels = 1; d.ArraySize = 1; d.Format = colour.d.Format;
+            d.SampleDesc.Count = 1; d.Usage = D3D11_USAGE_DEFAULT;
+            d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            if (FAILED(device->CreateTexture2D(&d, nullptr, &t.copy))) {
+                t.copy = nullptr;
+                before = false;
+                static bool said = false;
+                if (!said) { said = true; log("[nr] D3D11 -> D3D12 bridge: the colour's copy (DXGI format %d) could not be made; NR "
+                                              "before the upscaler does not run", int(colour.d.Format)); }
+            }
+        }
+    }
+    ID3D11Texture2D* const mine = before ? t.copy : nullptr;
+    if (mine) mine->AddRef();   // (the feature may be released on another thread meanwhile)
+    struct Mine { ID3D11Texture2D* t; ~Mine() { if (t) t->Release(); } } mine_hold{mine};
+    guard.unlock();
+
+    const States st12 = [] {   // the bridge's textures rest in COMMON
+        States s;
+        s.color = s.depth = s.motion = s.exposure = s.output = D3D12_RESOURCE_STATE_COMMON;
+        return s;
+    }();
+    // The frame on D3D12: the handoff's textures in the evaluate's places.
+    const auto frame12 = [&](const d11b::FrameContext& fc, Frame& f12) {
+        f12 = f;
+        f12.color = fc.find(d11b::Role::kColour);
+        f12.output = fc.find(d11b::Role::kOutput);
+        f12.depth = fc.find(d11b::Role::kDepth);
+        f12.motion = fc.find(d11b::Role::kMotion);
+        f12.exposure = fc.find(d11b::Role::kExposure);
+        return f12.output && f12.depth && f12.motion;
+    };
+    const auto guides_of = [&](std::vector<d11b::Handoff>& items) {
+        d11b::Handoff d;
+        d.role = d11b::Role::kDepth; d.tex11 = depth.tex; d.depth = true;
+        items.push_back(d);
+        d11b::Handoff m;
+        m.role = d11b::Role::kMotion; m.tex11 = motion.tex;
+        items.push_back(m);
+        if (exposure.tex) {
+            d11b::Handoff e;
+            e.role = d11b::Role::kExposure; e.tex11 = exposure.tex; e.optional = true;
+            items.push_back(e);
+        }
+    };
+
+    bool handed = false;   // the layers before the upscaler ran: `mine` holds their answer
+    if (before || plan.present_wanted) {
+        std::vector<d11b::Handoff> items;
+        if (before) {
+            d11b::Handoff c;
+            c.role = d11b::Role::kColour; c.tex11 = colour.tex; c.x = rx; c.y = ry; c.w = rw; c.h = rh;
+            c.back = true; c.back_to = mine; c.writable = true;
+            items.push_back(c);
+        }
+        d11b::Handoff o;   // (not copied: the layers ask for its format and size alone here)
+        o.role = d11b::Role::kOutput; o.tex11 = output.tex; o.in = false; o.writable = true;
+        items.push_back(o);
+        guides_of(items);
+        bool ran = false;
+        const d11b::Status status = g_d11_d3d12.execute(device, items.data(), items.size(), false, [&](d11b::FrameContext& fc) {
+            const nr::asi::hudcap::Own own;
+            std::unique_lock<std::mutex> lk(g_lock);
+            const auto it = g_d11_features.find(h->Id);
+            Frame f12;
+            if (it == g_d11_features.end() || !frame12(fc, f12)) return;
+            ID3D12GraphicsCommandList* const l = d11_bridge_list(fc.device);
+            if (!l) return;
+            {
+                nr::gpu::Scope recording(nr::asi::hudcap::d3d12_recording(l));
+                g_d12_uses.touch();
+                const nr::asi::Wilsjo2Frame wf = wilsjo2_frame(p, f12, st12);
+                if (plan.present_wanted) capture_guides(l, fc.device, f12, st12, wf, h->Id, plan.depth_wanted);
+                if (before && f12.color) {
+                    Frame fb = f12;   // the region alone, at the shared texture's origin
+                    fb.color_x = fb.color_y = 0;
+                    bool moved = false;
+                    ID3D12Resource* const out = run_before(l, fc.device, it->second.d12, *chain, plan, fb, st12, wf, nr_on, &moved);
+                    if (out != fb.color) {
+                        transition(l, out, st12.color, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                        transition(l, fb.color, st12.color, D3D12_RESOURCE_STATE_COPY_DEST);
+                        copy_region(l, fb.color, 0, 0, out, 0, 0, rw, rh);
+                        transition(l, fb.color, D3D12_RESOURCE_STATE_COPY_DEST, st12.color);
+                        transition(l, out, D3D12_RESOURCE_STATE_COPY_SOURCE, st12.color);
+                        ran = true;
+                    }
+                }
+            }
+            lk.unlock();   // (our ExecuteCommandLists comes through on_execute)
+            if (!d11_bridge_submit(fc, l)) ran = false;
+        });
+        handed = status == d11b::Status::kRan && ran;
+    }
+    NVSDK_NGX_Result r;
+    if (handed) {
+        if (colour.as_resource) p->Set(color_key, static_cast<ID3D11Resource*>(mine));
+        else p->Set(color_key, static_cast<void*>(mine));
+        const bool moved = f.color_x || f.color_y;
+        if (moved) { p->Set("DLSS.Input.Color.Subrect.Base.X", 0u); p->Set("DLSS.Input.Color.Subrect.Base.Y", 0u); }
+        r = real_d11_evaluate(ctx, h, p, callback);
+        if (colour.as_resource) p->Set(color_key, colour.res); else p->Set(color_key, static_cast<void*>(colour.res));
+        if (moved) { p->Set("DLSS.Input.Color.Subrect.Base.X", f.color_x); p->Set("DLSS.Input.Color.Subrect.Base.Y", f.color_y); }
+    } else {
+        r = real_d11_evaluate(ctx, h, p, callback);
+    }
+    if (r != NVSDK_NGX_Result_Success || plan.after.empty()) return r;
+
+    // After the upscaler: its output to D3D12, the layers on it in place, and back.
+    std::vector<d11b::Handoff> items;
+    d11b::Handoff o;
+    o.role = d11b::Role::kOutput; o.tex11 = output.tex; o.back = true; o.writable = true;
+    items.push_back(o);
+    guides_of(items);
+    g_d11_d3d12.execute(device, items.data(), items.size(), false, [&](d11b::FrameContext& fc) {
+        const nr::asi::hudcap::Own own;
+        std::unique_lock<std::mutex> lk(g_lock);
+        const auto it = g_d11_features.find(h->Id);   // released meanwhile on another thread: nothing to run on
+        Frame f12;
+        if (it == g_d11_features.end() || !frame12(fc, f12)) return;
+        if (!(f12.output->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
+            static bool said = false;
+            if (!said) { said = true; log("[nr] D3D11 -> D3D12 bridge: the upscaler's output (DXGI format %d) cannot be written on "
+                                          "D3D12; the layers after the upscaler do not run", int(output.d.Format)); }
+            return;
+        }
+        ID3D12GraphicsCommandList* const l = d11_bridge_list(fc.device);
+        if (!l) return;
+        {
+            nr::gpu::Scope recording(nr::asi::hudcap::d3d12_recording(l));
+            g_d12_uses.touch();
+            match_layers(it->second.d12, *chain);
+            const nr::asi::Wilsjo2Frame wf = wilsjo2_frame(p, f12, st12);
+            run_after(l, fc.device, it->second.d12, *chain, plan, f12, st12, wf, nr_on);
+        }
+        lk.unlock();
+        d11_bridge_submit(fc, l);
+    });
+    return r;
+}
+
 NVSDK_NGX_Result NR_NGX_MSABI hk_d11_evaluate(ID3D11DeviceContext* ctx, const NVSDK_NGX_Handle* h, NVSDK_NGX_Parameter* p,
                                              void* callback) {
     if (t_d11_inside || !ctx || !h || !p) return real_d11_evaluate(ctx, h, p, callback);
@@ -9046,6 +9342,11 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_d11_evaluate(ID3D11DeviceContext* ctx, const NV
         const bool d12_game = d12_game_active();
         guard.unlock();   // (the bridge's lock comes before g_lock)
         const d11b::Route route = g_d11_d3d12.decide(device, d12_game);
+        if (route == d11b::Route::kBridge) {
+            // a D3D12 game's NR in this process has the D3D12 Present path: this device's frames go on as they are
+            if (d12_game) return real_d11_evaluate(ctx, h, p, callback);
+            return d11_bridge_evaluate(ctx, device, h, p, callback);
+        }
         if (route != d11b::Route::kVulkan) return real_d11_evaluate(ctx, h, p, callback);
         guard.lock();
     }

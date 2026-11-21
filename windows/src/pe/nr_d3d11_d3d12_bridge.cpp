@@ -406,7 +406,7 @@ bool Bridge::ready_locked(ID3D11Device* d11_dev, bool present) {
     return true;
 }
 
-// The shared pair of `role` (and guide set) at this size and format: found, or made (the least recently used of its
+// The shared pair of `role` at this size and format: found, or made (the least recently used of its
 // role going first when the role is full).
 bool Bridge::ensure_entry_locked(Role role, uint32_t set, uint32_t w, uint32_t h, DXGI_FORMAT fmt, bool uav,
                                  size_t* index) {
@@ -664,6 +664,10 @@ Status Bridge::execute(ID3D11Device* d11_dev, Handoff* items, size_t count, bool
             for (size_t i = 0; i < count; ++i) {
                 if (entry[i] == SIZE_MAX || !items[i].back) continue;
                 const Entry& e = pool_[entry[i]];
+                if (items[i].back_to) {
+                    ctx4_->CopySubresourceRegion(items[i].back_to, 0, 0, 0, 0, e.tex11, 0, nullptr);
+                    continue;
+                }
                 D3D11_TEXTURE2D_DESC d{};
                 items[i].tex11->GetDesc(&d);
                 if (d.MipLevels == 1 && e.w == d.Width && e.h == d.Height) ctx4_->CopyResource(items[i].tex11, e.tex11);
