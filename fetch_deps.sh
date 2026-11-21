@@ -163,7 +163,7 @@ EOF
 # ---- Windows package only ---------------------------------------------------------------------
 if [[ $windows == 1 ]]; then
     # DXVK as GE-Proton 11-7 ships it (PE build, it runs on Windows): the DX9 route's d3d9.dll and dxgi.dll, with
-    # GE-Proton's dxvk version file, into artifacts/ref/dxvk-ge11-7 - only these three files: taken from an unpacked
+    # GE-Proton's dxvk version file, into artifacts/ref/dxvk-ge11-7: taken from an unpacked
     # toolchain/GE-Proton11-7-x86_64 when there is one, else out of GE-Proton's release tarball (deleted after,
     # unless it was there already).
     ge=GE-Proton11-7-x86_64
@@ -172,6 +172,8 @@ if [[ $windows == 1 ]]; then
         (cd "$dx" 2>/dev/null && sha256sum -c --quiet - 2>/dev/null) <<EOF
 2502fbd3ebec2fbaa8451251c62d1f47e18b03ad72e32d734f6d69ee7d22c3b7  x86_64-windows/d3d9.dll
 a32191d1292ee388d7e0c3b8e43716f944971c7b49ce77f213be2cf4f6432756  x86_64-windows/dxgi.dll
+b669a9f8ad11b4bbedb5182ffe2505832599db4a092cf4dd3b5cbbcb017c93b8  i386-windows/d3d9.dll
+ca929a4877dcf009b3d4bb148abf22a50ef7cc5f29aa10ab64d5d0eb2ad384ab  i386-windows/dxgi.dll
 c7df6b81518bf073cc5d558fb8670676d30a61492e882b7a2f3a088e7df28d62  version
 EOF
     }
@@ -179,12 +181,14 @@ EOF
         echo "have $dx"
     else
         echo "fetch $dx"
-        rm -rf -- "$dx"; mkdir -p -- "$dx/x86_64-windows"
+        rm -rf -- "$dx"; mkdir -p -- "$dx/x86_64-windows" "$dx/i386-windows"
         from=lib/wine/dxvk
         if [[ -d "toolchain/$ge/files/$from" ]]; then
             cp -- "toolchain/$ge/files/$from/x86_64-windows/d3d9.dll" "toolchain/$ge/files/$from/x86_64-windows/dxgi.dll" \
                 "$dx/x86_64-windows/"
             cp -- "toolchain/$ge/files/$from/version" "$dx/"
+            cp -- "toolchain/$ge/files/$from/i386-windows/d3d9.dll" "toolchain/$ge/files/$from/i386-windows/dxgi.dll" \
+                "$dx/i386-windows/"
         else
             tgz=artifacts/ref/downloads/$ge.tar.gz keep=1
             if [[ ! -f "$tgz" ]]; then
@@ -196,7 +200,8 @@ EOF
             echo "7db87e9787e20c35cbdac26018431d5794626b626e4067b050684e45a88cc2ca229d7d263519eafb2e168cde5bef57611065d159d3685aaec152ccb9abe3073f  $tgz" |
                 sha512sum -c --quiet - || { echo "checksum mismatch: $tgz" >&2; exit 1; }
             tar -C "$dx" --strip-components=5 -xzf "$tgz" "$ge/files/$from/x86_64-windows/d3d9.dll" \
-                "$ge/files/$from/x86_64-windows/dxgi.dll" "$ge/files/$from/version"
+                "$ge/files/$from/x86_64-windows/dxgi.dll" "$ge/files/$from/version" \
+                "$ge/files/$from/i386-windows/d3d9.dll" "$ge/files/$from/i386-windows/dxgi.dll"
             [[ $keep == 1 ]] || rm -f -- "$tgz"
         fi
         dxvk_ok || { echo "checksum mismatch: $dx" >&2; exit 1; }

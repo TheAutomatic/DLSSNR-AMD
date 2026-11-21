@@ -74,7 +74,7 @@ jobs:
           if [[ -f /etc/apt/apt-mirrors.txt ]] && grep -q 'ec2\.archive\.ubuntu\.com' /etc/apt/apt-mirrors.txt; then
             printf 'https://mirrors.edge.kernel.org/ubuntu/\nhttp://archive.ubuntu.com/ubuntu/\n' | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
           fi
-          pkgs=(g++-mingw-w64-x86-64-win32 osslsigncode)
+          pkgs=(g++-mingw-w64-x86-64-win32 g++-mingw-w64-i686-posix osslsigncode)
           for pair in cmake:cmake ninja:ninja-build g++:g++ python3:python3 7z:p7zip-full openssl:openssl curl:curl git:git; do
             command -v "${pair%%:*}" >/dev/null || pkgs+=("${pair#*:}")
           done
@@ -102,6 +102,10 @@ jobs:
           python3 - windows/package/*.zip <<'PY'
           import sys, zipfile
           for f in sys.argv[1:]:
+              names = zipfile.ZipFile(f).namelist()
+              for addon in ('reshade/dlssnr_amd.addon32', 'reshade/dlssnr_amd.addon64'):
+                  if addon not in names:
+                      sys.exit(f'{addon} missing from {f}')
               if any(n.endswith(('CC_SILVER_AARDWOLD.bin', 'CC_SMALL_FP8.bin', 'dlssnr.bin', 'dlssnr-small.bin')) for n in zipfile.ZipFile(f).namelist()):
                   sys.exit(f'model found in {f}')
           PY

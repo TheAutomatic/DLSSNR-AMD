@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The Vulkan loader both routes put in the game folder: the Khronos loader with
-# two patches, 64-bit.
+# two patches, x86-64 or i686 (NR_ARCH).
 #
 # Why a loader at all: in the game folder the game runs on DXVK / vkd3d-proton,
 # i.e. on Vulkan, and ReShade's Vulkan backend is a Vulkan layer. A layer is
@@ -18,13 +18,15 @@
 # Output: artifacts/windows/vulkan-loader/x86_64/{vulkan-1.dll, LICENSE.txt, PATCHES.diff}
 set -euo pipefail
 cd "$(dirname "$0")/../.."
-out=artifacts/windows/vulkan-loader/x86_64
+arch=${NR_ARCH:-x86_64}
+case "$arch" in x86_64|i686) ;; *) echo 'NR_ARCH must be x86_64 or i686' >&2; exit 2;; esac
+out=artifacts/windows/vulkan-loader/$arch
 if [[ "${NR_REBUILD_VK_LOADER:-0}" != 1 && -s "$out/vulkan-1.dll" && -s "$out/LICENSE.txt" && -s "$out/PATCHES.diff" ]]; then
     stale=0
     for dep in windows/build/build_vulkan_loader.sh \
                windows/vulkan-loader/patch-local-override.py \
                windows/vulkan-loader/patch-no-dxgi.py \
-               windows/vulkan-loader/toolchain-x86_64.cmake; do
+               "windows/vulkan-loader/toolchain-$arch.cmake"; do
         [[ "$dep" -nt "$out/vulkan-1.dll" ]] && { stale=1; break; }
     done
     if [[ $stale == 0 ]]; then
@@ -50,10 +52,10 @@ if [[ -d toolchain/Vulkan-Headers ]]; then
     fi
     deps_args=(-DUPDATE_DEPS=OFF -DVULKAN_HEADERS_INSTALL_DIR="$vh_install")
 fi
-build=$src/build-windows-x86_64
+build=$src/build-windows-$arch
 mkdir -p "$out"
 cmake -S "$src" -B "$build" -G Ninja \
-    -DCMAKE_TOOLCHAIN_FILE="$PWD/windows/vulkan-loader/toolchain-x86_64.cmake" \
+    -DCMAKE_TOOLCHAIN_FILE="$PWD/windows/vulkan-loader/toolchain-$arch.cmake" \
     -DCMAKE_BUILD_TYPE=Release "${deps_args[@]}" -DBUILD_TESTS=OFF -DUSE_GAS=ON > "$build.cmake.log" 2>&1
 ninja -C "$build" > "$build.ninja.log" 2>&1
 cp -- "$build/loader/vulkan-1.dll" "$out/vulkan-1.dll"

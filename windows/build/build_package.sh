@@ -107,6 +107,8 @@ bash windows/build/vulkan_lazy.sh "$out" "$cxx" -shared "${objs[@]}" "${ldflags[
 # ---- the other binaries -------------------------------------------------------------------------
 NR_INT4=${NR_INT4:-1} bash windows/build/build_asi.sh artifacts/windows/asi > /dev/null
 bash windows/build/build_vulkan_loader.sh > /dev/null
+bash windows/build/x86/build32.sh "$minhook" "$out/x86" > /dev/null
+NR_ARCH=i686 bash windows/build/build_vulkan_loader.sh > /dev/null
 
 # ---- package ------------------------------------------------------------------------------------
 pkg="$out/package"
@@ -228,6 +230,8 @@ cp -- "$out/extract/dlssnr_extract_model.exe" "$pkg/model-tools/"
 # dxvk/: D3D9 (and the DXGI it was installed with) for the DX9 route, as GE-Proton ships them.
 mkdir -p -- "$pkg/dxvk"
 for f in dxgi.dll d3d9.dll; do cp -- "$dxvk/x86_64-windows/$f" "$pkg/dxvk/"; done
+mkdir -p -- "$pkg/dxvk/x86"
+for f in dxgi.dll d3d9.dll; do cp -- "$dxvk/i386-windows/$f" "$pkg/dxvk/x86/"; done
 cat "$dxvk/version" > "$pkg/dxvk/version.txt"
 cp -- artifacts/ref/dxvk/LICENSE "$pkg/dxvk/LICENSE.txt"
 
@@ -237,12 +241,17 @@ mkdir -p -- "$pkg/vulkan"
 cp -- artifacts/windows/vulkan-loader/x86_64/vulkan-1.dll "$pkg/vulkan/"
 cp -- artifacts/windows/vulkan-loader/x86_64/LICENSE.txt "$pkg/vulkan/Vulkan-Loader-LICENSE.txt"
 cp -- artifacts/windows/vulkan-loader/x86_64/PATCHES.diff "$pkg/vulkan/Vulkan-Loader-PATCHES.diff"
+mkdir -p -- "$pkg/vulkan/x86"
+cp -- artifacts/windows/vulkan-loader/i686/vulkan-1.dll "$pkg/vulkan/x86/"
+cp -- artifacts/windows/vulkan-loader/i686/LICENSE.txt "$pkg/vulkan/x86/Vulkan-Loader-LICENSE.txt"
+cp -- artifacts/windows/vulkan-loader/i686/PATCHES.diff "$pkg/vulkan/x86/Vulkan-Loader-PATCHES.diff"
 
 # reshade/: ReShade 6.8 (add-on build): installed as dxgi.dll in DX10/11/12 games, and as a Vulkan layer
 # (vk-override/, found through that loader) for DX9 and Vulkan games.
 rs="$pkg/reshade"
 mkdir -p -- "$rs/reshade-shaders/Shaders" "$rs/reshade-shaders/Textures" "$rs/vk-override/implicit_layer"
 cp -- "$out/dlssnr_amd.addon64" artifacts/ref/reshade-6.8.0/ReShade64.dll "$rs/"
+cp -- "$out/x86/dlssnr_amd.addon32" artifacts/ref/reshade-6.8.0/ReShade32.dll "$rs/"
 cp -- artifacts/ref/reshade-6.8.0/ReShade-LICENSE.md "$rs/ReShade-LICENSE.md"
 cat > "$rs/vk-override/implicit_layer/ReShade64.json" <<'JSON'
 {
@@ -263,6 +272,7 @@ cat > "$rs/vk-override/implicit_layer/ReShade64.json" <<'JSON'
   }
 }
 JSON
+sed 's/ReShade64.dll/ReShade32.dll/' "$rs/vk-override/implicit_layer/ReShade64.json" > "$rs/vk-override/implicit_layer/ReShade32.json"
 cp -- artifacts/ref/DLSS5-Feeder/shaders/DLSS5_Feed.fx "$rs/reshade-shaders/Shaders/"
 cp -- artifacts/ref/DLSS5-Feeder/LICENSE "$rs/reshade-shaders/Shaders/DLSS5_Feed-LICENSE.txt"
 cp -- artifacts/ref/reshade-shaders/Shaders/ReShade.fxh artifacts/ref/reshade-shaders/Shaders/ReShadeUI.fxh \
