@@ -2532,12 +2532,13 @@ bool load_vulkan(device_api api, ID3D12Device* d12 = nullptr) {
     nr_vk_load();
     if (std::strcmp(nr_vk_source, "none") == 0)
         startup_why = NR_N("The Vulkan loader is unavailable");
-    else if (nr_vk_missing)
-        startup_why = NR_N("The Vulkan loader is missing required entry points");
     if (!startup_why.empty()) {
-        log("[nr] %s%s%s", startup_why.c_str(), nr_vk_missing ? ": " : "", nr_vk_missing ? nr_vk_first_missing : "");
+        log("[nr] %s", startup_why.c_str());
         return false;
     }
+    if (nr_vk_missing)
+        log("[nr] Vulkan entry points from %s: %d not exported (%s, ...)", nr_vk_source, nr_vk_missing,
+            nr_vk_first_missing);
     nr::vram::install_vulkan();
     vk_loaded = true;
     log("[nr] feed: Vulkan entry points resolved");

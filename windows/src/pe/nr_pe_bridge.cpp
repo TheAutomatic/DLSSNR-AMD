@@ -17,8 +17,6 @@
 
 extern "C" void nr_vk_load(void);
 extern "C" const char* nr_vk_source;
-extern "C" int nr_vk_missing;
-extern "C" const char* nr_vk_first_missing;
 
 namespace nr::pe::bridge {
 
@@ -189,9 +187,8 @@ Device* Device::get(const LUID& luid, std::string* why) {
 bool Device::create(const LUID& luid, std::string* why) {
     luid_ = luid;
     nr_vk_load();
-    if (std::strcmp(nr_vk_source, "none") == 0 || nr_vk_missing) {
-        *why = std::strcmp(nr_vk_source, "none") == 0 ? "the Vulkan loader is unavailable"
-               : std::string("the Vulkan loader does not export ") + nr_vk_first_missing;
+    if (std::strcmp(nr_vk_source, "none") == 0) {
+        *why = "the Vulkan loader is unavailable";
         return false;
     }
     nr::vram::install_vulkan();   // our allocations counted for NR Control's VRAM breakdown (as on the interop path)
