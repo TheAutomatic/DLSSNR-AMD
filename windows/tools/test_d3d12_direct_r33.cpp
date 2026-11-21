@@ -2620,6 +2620,225 @@ int main(int argc, char** argv) {
                     diff_pixels);
     }
 
+    // ---- Case J2: the bridge's handoff by role (an evaluate's textures), the route's latch, a second device ----
+    {
+        namespace d11b = nr::pe::d11_bridge;
+        ID3D11Device* dev = nullptr;
+        ID3D11DeviceContext* ctx = nullptr;
+        ID3D11Device* dev2 = nullptr;
+        ID3D11DeviceContext* ctx2 = nullptr;
+        D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
+        const D3D_FEATURE_LEVEL fls[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+        if (FAILED(D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, fls, 2, D3D11_SDK_VERSION, &dev, &fl, &ctx)) ||
+            FAILED(D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, fls, 2, D3D11_SDK_VERSION, &dev2, &fl, &ctx2)) ||
+            !dev || !ctx || !dev2 || !ctx2) {
+            std::fprintf(stderr, "FAIL: Case J2 D3D11CreateDevice\n");
+            return 1;
+        }
+        constexpr uint32_t cw = 128, ch = 96, rx = 16, ry = 8, rw = 64, rh = 32, ow = 160, oh = 120;
+        std::vector<uint8_t> colour_px(size_t(cw) * ch * 4), output_px(size_t(ow) * oh * 4);
+        for (uint32_t y = 0; y < ch; ++y)
+            for (uint32_t x = 0; x < cw; ++x) {
+                uint8_t* px = &colour_px[(size_t(y) * cw + x) * 4];
+                px[0] = uint8_t(x * 2 + 1); px[1] = uint8_t(y * 2 + 3); px[2] = uint8_t(x ^ y); px[3] = 255;
+            }
+        for (size_t i = 0; i < output_px.size(); ++i) output_px[i] = uint8_t(0x40 + (i & 0x3F));
+        const auto make = [](ID3D11Device* d, uint32_t w, uint32_t h, DXGI_FORMAT fmt, UINT bind, bool staging,
+                             const void* init, UINT pitch) {
+            D3D11_TEXTURE2D_DESC td{};
+            td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1; td.Format = fmt; td.SampleDesc.Count = 1;
+            td.Usage = staging ? D3D11_USAGE_STAGING : D3D11_USAGE_DEFAULT;
+            td.BindFlags = staging ? 0 : bind;
+            td.CPUAccessFlags = staging ? D3D11_CPU_ACCESS_READ : 0;
+            D3D11_SUBRESOURCE_DATA sd{init, pitch, 0};
+            ID3D11Texture2D* t = nullptr;
+            if (FAILED(d->CreateTexture2D(&td, init ? &sd : nullptr, &t))) t = nullptr;
+            return t;
+        };
+        const UINT colour_bind = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        ID3D11Texture2D* colour = make(dev, cw, ch, DXGI_FORMAT_R8G8B8A8_UNORM, colour_bind, false, colour_px.data(), cw * 4);
+        ID3D11Texture2D* mine = make(dev, rw, rh, DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_BIND_SHADER_RESOURCE, false, nullptr, 0);
+        ID3D11Texture2D* output = make(dev, ow, oh, DXGI_FORMAT_R8G8B8A8_UNORM, colour_bind, false, output_px.data(), ow * 4);
+        ID3D11Texture2D* depth = make(dev, cw, ch, DXGI_FORMAT_R32_TYPELESS, D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE,
+                                      false, nullptr, 0);
+        ID3D11Texture2D* motion = make(dev, cw, ch, DXGI_FORMAT_R16G16_FLOAT, colour_bind, false, nullptr, 0);
+        ID3D11Texture2D* depth_out = make(dev, cw, ch, DXGI_FORMAT_R32_FLOAT, colour_bind, false, nullptr, 0);
+        ID3D11Texture2D* rb_colour = make(dev, cw, ch, DXGI_FORMAT_R8G8B8A8_UNORM, 0, true, nullptr, 0);
+        ID3D11Texture2D* rb_mine = make(dev, rw, rh, DXGI_FORMAT_R8G8B8A8_UNORM, 0, true, nullptr, 0);
+        ID3D11Texture2D* rb_output = make(dev, ow, oh, DXGI_FORMAT_R8G8B8A8_UNORM, 0, true, nullptr, 0);
+        ID3D11Texture2D* rb_depth = make(dev, cw, ch, DXGI_FORMAT_R32_FLOAT, 0, true, nullptr, 0);
+        ID3D11Texture2D* back2 = make(dev2, 64, 64, DXGI_FORMAT_R8G8B8A8_UNORM, colour_bind, false, nullptr, 0);
+        ID3D11DepthStencilView* dsv = nullptr;
+        if (depth) {
+            D3D11_DEPTH_STENCIL_VIEW_DESC dd{};
+            dd.Format = DXGI_FORMAT_D32_FLOAT;
+            dd.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+            dev->CreateDepthStencilView(depth, &dd, &dsv);
+        }
+        if (!colour || !mine || !output || !depth || !motion || !depth_out || !rb_colour || !rb_mine || !rb_output ||
+            !rb_depth || !back2 || !dsv) {
+            std::fprintf(stderr, "FAIL: Case J2 D3D11 texture creation\n");
+            return 1;
+        }
+        constexpr float kDepth = 0.25f;
+        ctx->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH, kDepth, 0);
+
+        d11b::Bridge bridge;
+        ID3D12CommandAllocator* alloc = nullptr;
+        ID3D12GraphicsCommandList* cmd = nullptr;
+        // On D3D12: the colour's region into the output's corner, the depth (R32_FLOAT there) into `depth_out`.
+        DXGI_FORMAT depth_fmt12 = DXGI_FORMAT_UNKNOWN;
+        uint64_t colour_w12 = 0;
+        uint32_t colour_h12 = 0;
+        bool all_roles = false;
+        const auto work = [&](d11b::FrameContext& fc) {
+            ID3D12Resource* const c = fc.find(d11b::Role::kColour);
+            ID3D12Resource* const o = fc.find(d11b::Role::kOutput);
+            ID3D12Resource* const d = fc.find(d11b::Role::kDepth);
+            ID3D12Resource* const m = fc.find(d11b::Role::kMotion);
+            ID3D12Resource* const e = fc.find(d11b::Role::kExposure);
+            all_roles = c && o && d && m && e;
+            if (!all_roles) return;
+            depth_fmt12 = d->GetDesc().Format;
+            colour_w12 = c->GetDesc().Width;
+            colour_h12 = c->GetDesc().Height;
+            if (!cmd) {
+                if (FAILED(fc.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc))) ||
+                    FAILED(fc.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, nullptr, IID_PPV_ARGS(&cmd))))
+                    return;
+            } else if (FAILED(alloc->Reset()) || FAILED(cmd->Reset(alloc, nullptr))) {
+                return;   // (the bridge waited for the list's last run before it came back)
+            }
+            const D3D12_RESOURCE_STATES common = D3D12_RESOURCE_STATE_COMMON;
+            barrier_transition(cmd, c, common, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            barrier_transition(cmd, d, common, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            barrier_transition(cmd, o, common, D3D12_RESOURCE_STATE_COPY_DEST);
+            barrier_transition(cmd, e, common, D3D12_RESOURCE_STATE_COPY_DEST);
+            D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+            dst.pResource = o; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            src.pResource = c; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            cmd->CopyResource(e, d);
+            barrier_transition(cmd, e, D3D12_RESOURCE_STATE_COPY_DEST, common);
+            barrier_transition(cmd, o, D3D12_RESOURCE_STATE_COPY_DEST, common);
+            barrier_transition(cmd, d, D3D12_RESOURCE_STATE_COPY_SOURCE, common);
+            barrier_transition(cmd, c, D3D12_RESOURCE_STATE_COPY_SOURCE, common);
+            if (FAILED(cmd->Close())) return;
+            ID3D12CommandList* lists[] = {cmd};
+            fc.queue->ExecuteCommandLists(1, lists);
+            fc.submitted = true;
+            if (*fc.signal_out_fence) fc.output_signal = fc.queue->Signal(*fc.signal_out_fence, fc.signal_out_val);
+        };
+        const auto handoff = [&](d11b::Handoff* items) {
+            items[0] = {}; items[0].role = d11b::Role::kColour; items[0].tex11 = colour;
+            items[0].x = rx; items[0].y = ry; items[0].w = rw; items[0].h = rh;
+            items[0].back = true; items[0].back_to = mine; items[0].writable = true;
+            items[1] = {}; items[1].role = d11b::Role::kOutput; items[1].tex11 = output; items[1].back = true; items[1].writable = true;
+            items[2] = {}; items[2].role = d11b::Role::kDepth; items[2].tex11 = depth; items[2].depth = true;
+            items[3] = {}; items[3].role = d11b::Role::kMotion; items[3].tex11 = motion;
+            // (the depth as D3D12 saw it comes back in this one)
+            items[4] = {}; items[4].role = d11b::Role::kExposure; items[4].tex11 = depth_out; items[4].in = false; items[4].back = true;
+        };
+        d11b::Handoff items[5];
+        handoff(items);
+        d11b::Status st = d11b::Status::kPassthrough;
+        for (int attempt = 0; attempt < 240 && st != d11b::Status::kRan; ++attempt) {
+            st = bridge.execute(dev, items, 5, false, work);
+            if (st == d11b::Status::kFallback) break;
+            if (st != d11b::Status::kRan) Sleep(50);
+        }
+        if (st != d11b::Status::kRan || !all_roles) {
+            std::fprintf(stderr, "FAIL: Case J2 handoff by role status=%d all_roles=%d (%s)\n", int(st), int(all_roles),
+                         bridge.last_error().c_str());
+            return 1;
+        }
+        if (depth_fmt12 != DXGI_FORMAT_R32_FLOAT || colour_w12 != rw || colour_h12 != rh) {
+            std::fprintf(stderr, "FAIL: Case J2 shared textures: depth fmt=%d (R32_FLOAT expected), colour %llux%u (%ux%u expected)\n",
+                         int(depth_fmt12), static_cast<unsigned long long>(colour_w12), colour_h12, rw, rh);
+            return 1;
+        }
+        const auto read = [&](ID3D11Texture2D* rb, ID3D11Texture2D* tex, uint32_t w, uint32_t h, uint32_t bpp, std::vector<uint8_t>& out) {
+            ctx->CopyResource(rb, tex);
+            D3D11_MAPPED_SUBRESOURCE map{};
+            if (FAILED(ctx->Map(rb, 0, D3D11_MAP_READ, 0, &map)) || !map.pData) return false;
+            out.resize(size_t(w) * h * bpp);
+            for (uint32_t y = 0; y < h; ++y)
+                std::memcpy(&out[size_t(y) * w * bpp], static_cast<const uint8_t*>(map.pData) + size_t(y) * map.RowPitch, size_t(w) * bpp);
+            ctx->Unmap(rb, 0);
+            return true;
+        };
+        std::vector<uint8_t> got_colour, got_mine, got_output, got_depth;
+        if (!read(rb_colour, colour, cw, ch, 4, got_colour) || !read(rb_mine, mine, rw, rh, 4, got_mine) ||
+            !read(rb_output, output, ow, oh, 4, got_output) || !read(rb_depth, depth_out, cw, ch, 4, got_depth)) {
+            std::fprintf(stderr, "FAIL: Case J2 D3D11 readback\n");
+            return 1;
+        }
+        size_t bad_mine = 0, bad_out = 0, bad_depth = 0;
+        for (uint32_t y = 0; y < rh; ++y)
+            for (uint32_t x = 0; x < rw; ++x)
+                bad_mine += std::memcmp(&got_mine[(size_t(y) * rw + x) * 4], &colour_px[(size_t(y + ry) * cw + x + rx) * 4], 4) != 0;
+        for (uint32_t y = 0; y < oh; ++y)
+            for (uint32_t x = 0; x < ow; ++x) {
+                const uint8_t* want = x < rw && y < rh ? &colour_px[(size_t(y + ry) * cw + x + rx) * 4]
+                                                       : &output_px[(size_t(y) * ow + x) * 4];
+                bad_out += std::memcmp(&got_output[(size_t(y) * ow + x) * 4], want, 4) != 0;
+            }
+        for (size_t i = 0; i < size_t(cw) * ch; ++i) {
+            float v = 0.f;
+            std::memcpy(&v, &got_depth[i * 4], 4);
+            bad_depth += v != kDepth;
+        }
+        if (got_colour != colour_px || bad_mine || bad_out || bad_depth) {
+            std::fprintf(stderr, "FAIL: Case J2 round trip: game's colour %s, region copy bad=%zu, output bad=%zu, depth bad=%zu\n",
+                         got_colour == colour_px ? "untouched" : "WRITTEN", bad_mine, bad_out, bad_depth);
+            return 1;
+        }
+
+        // The latch: an error on the bridge's device is a frame passed through, never the Vulkan route - nor is the
+        // escape hatch read again for a device whose route is chosen.
+        d11b::Handoff broken[2];
+        handoff(items);
+        broken[0] = items[0];
+        broken[1] = {};
+        broken[1].role = d11b::Role::kMotion;   // (no texture)
+        int callbacks = 0;
+        const d11b::Status st_err = bridge.execute(dev, broken, 2, false, [&](d11b::FrameContext&) { ++callbacks; });
+        SetEnvironmentVariableA("NR_D11_D3D12_BRIDGE", "0");
+        handoff(items);
+        const d11b::Status st_latched = bridge.execute(dev, items, 5, false, work);
+        const d11b::Route r_latched = bridge.decide(dev, true);
+        SetEnvironmentVariableA("NR_D11_D3D12_BRIDGE", nullptr);
+        if (st_err != d11b::Status::kPassthrough || callbacks != 0 || st_latched != d11b::Status::kRan ||
+            r_latched != d11b::Route::kBridge) {
+            std::fprintf(stderr, "FAIL: Case J2 latch: error status=%d (callbacks=%d), with the hatch set status=%d route=%d\n",
+                         int(st_err), callbacks, int(st_latched), int(r_latched));
+            return 1;
+        }
+
+        // A second D3D11 device: its own route, chosen once; neither device is sent to Vulkan as the bridge moves.
+        const d11b::Route r2 = bridge.decide(dev2, false);
+        const d11b::Status st2 = bridge.execute(dev2, back2, nullptr, [](d11b::FrameContext&) {});
+        handoff(items);
+        const d11b::Status st1 = bridge.execute(dev, items, 5, false, work);
+        if (r2 != d11b::Route::kBridge || st2 == d11b::Status::kFallback || st1 == d11b::Status::kFallback ||
+            bridge.route(dev) != d11b::Route::kBridge || bridge.route(dev2) != d11b::Route::kBridge) {
+            std::fprintf(stderr, "FAIL: Case J2 second device: route=%d status=%d, first device status=%d route=%d\n", int(r2),
+                         int(st2), int(st1), int(bridge.route(dev)));
+            return 1;
+        }
+
+        bridge.reset();
+        if (cmd) cmd->Release();
+        if (alloc) alloc->Release();
+        dsv->Release();
+        for (ID3D11Texture2D* t : {colour, mine, output, depth, motion, depth_out, rb_colour, rb_mine, rb_output, rb_depth, back2})
+            t->Release();
+        ctx2->Release(); dev2->Release();
+        ctx->Release(); dev->Release();
+        std::printf("[PASS] Case J2: handoff by role (colour region, output in place, depth as R32_FLOAT), route latch, "
+                    "second device (statuses %d, %d)\n", int(st2), int(st1));
+    }
+
     // ---- Case K: Multi-swapchain primary arbiter ----
     {
         nr::pe::SwapChainArbiter arb;
