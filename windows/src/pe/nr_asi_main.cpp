@@ -4353,8 +4353,10 @@ nr::asi::Wilsjo2Frame wilsjo2_frame(const NVSDK_NGX_Parameter* p, const Frame& f
     // not seen, as OptiScaler's own FSR / FidelityFX inputs have them), else at the output's
     // (display-size vectors the resource cannot hold: the part it holds, guide_subrect - 0.0.7's GuideSubrect)
     const bool low_res_mv = !f.flags_known || (f.flags & kFlagMvLowRes) != 0;
-    w.depth_rect = guide_subrect(f.depth, f.subrect_w, f.subrect_h, get_uint(p, "DLSS.Input.Depth.Subrect.Base.X"),
-                                 get_uint(p, "DLSS.Input.Depth.Subrect.Base.Y"));
+    // (no depth: the D3D11 -> D3D12 bridge hands none over where nothing reads it)
+    if (f.depth)
+        w.depth_rect = guide_subrect(f.depth, f.subrect_w, f.subrect_h, get_uint(p, "DLSS.Input.Depth.Subrect.Base.X"),
+                                     get_uint(p, "DLSS.Input.Depth.Subrect.Base.Y"));
     w.motion_rect = guide_subrect(f.motion, low_res_mv ? f.subrect_w : f.out_w, low_res_mv ? f.subrect_h : f.out_h,
                                   get_uint(p, "DLSS.Input.MV.SubrectBase.X"), get_uint(p, "DLSS.Input.MV.SubrectBase.Y"));
     return w;
@@ -4403,6 +4405,18 @@ int trace_step() {
     if (left.load() <= 0) return 0;
     --left;
     return ++n;
+}
+
+// Do these layers read the game's depth this frame? Every network does unless Motion Without Depth is on; the wilsjo2
+// processing, [Inspect]'s held frame and Passes (fast) Interleaved - its anti-ghost's disocclusion test and vector
+// dilation, whatever the network does - always do.
+bool depth_read_by(const Chain& chain, const std::vector<const Layer*>& layers) {
+    if (layers.empty()) return false;
+    if (nr::pe::g_motion_without_depth_now.load() != 1 || chain.inspect.hold) return true;
+    return std::any_of(layers.begin(), layers.end(), [](const Layer* l) {
+        return l->cfg.processing == nr::pe::Processing::kWilsjo2 ||
+               (renodx_layer(*l) && l->cfg.renodx.values.passes_mode == 1u && l->cfg.renodx.values.fast_method == 0u);
+    });
 }
 
 // What an upscaling evaluate's layers do this frame: those before and after the upscaler in layer order, and whether
@@ -4458,13 +4472,9 @@ void plan_layers(const Chain& chain, const Frame& f, const D3D12_RESOURCE_DESC& 
     plan.before_renodx = before_renodx; plan.present_wanted = present_wanted; plan.present_takes = present_takes;
     plan.w2_aw = w2_aw; plan.w2_ah = w2_ah;
     if (!present_wanted) return;
-    plan.depth_wanted = nr::pe::g_motion_without_depth_now.load() != 1 || chain.inspect.hold;
-    for (const Layer& l : chain.layers)
-        // (Passes (fast) Interleaved reads the depth itself - its anti-ghost's disocclusion test and vector
-        // dilation - whatever the network does: without the copy those tests never ran at Present)
-        plan.depth_wanted |= present_layer(l) && (l.cfg.processing == nr::pe::Processing::kWilsjo2 ||
-                                             (renodx_layer(l) && l.cfg.renodx.values.passes_mode == 1u &&
-                                              l.cfg.renodx.values.fast_method == 0u));
+    std::vector<const Layer*> present_layers;
+    for (const Layer& l : chain.layers) if (present_layer(l)) present_layers.push_back(&l);
+    plan.depth_wanted = depth_read_by(chain, present_layers);
 }
 
 // The layers before the upscaler, recorded on `cmd`. Returns what the upscaler takes in the colour's place, in the
@@ -9157,10 +9167,11 @@ NVSDK_NGX_Result d11_bridge_evaluate(ID3D11DeviceContext* ctx, ID3D11Device* dev
     tick_retired();
     tick_d11_retired();
     D11Tracked& t = g_d11_features[h->Id];
-    if (!colour.tex || !output.tex || !depth.tex || !motion.tex) {
+    // (no depth: the layers that read it are left out below, the rest runs)
+    if (!colour.tex || !output.tex || !motion.tex) {
         if (!t.d12.said) {
             t.d12.said = true;
-            log("[nr] OptiScaler D3D11 feature %u: no colour, output, depth or motion vector texture in its evaluate; NR "
+            log("[nr] OptiScaler D3D11 feature %u: no colour, output or motion vector texture in its evaluate; NR "
                 "does not run", h->Id);
         }
         guard.unlock();
@@ -9247,16 +9258,23 @@ NVSDK_NGX_Result d11_bridge_evaluate(ID3D11DeviceContext* ctx, ID3D11Device* dev
         return f12.output && f12.motion;
     };
     // The guides go over once an evaluate, and the depth - a pass of its own on D3D11 for most formats - only for what
-    // reads it: a wilsjo2 layer, [Inspect]'s held frame, a Present that wants it. Where it cannot be handed over the
-    // rest still runs (what needs it says so itself).
-    const auto w2_in = [](const std::vector<const Layer*>& layers) {
-        return std::any_of(layers.begin(), layers.end(),
-                           [](const Layer* l) { return l->cfg.processing == nr::pe::Processing::kWilsjo2; });
+    // reads it (depth_read_by). Where there is none - the game gave none, or it could not be handed over - the layers
+    // that read it are left out and the rest still runs.
+    const bool depth_before = !plan.before.empty() && depth_read_by(*chain, plan.before);
+    const bool depth_after = depth_read_by(*chain, plan.after);
+    const auto depth_missing = [&](const Frame& f12, bool read) {
+        if (!read || f12.depth) return false;
+        static bool said = false;
+        if (!said) { said = true; log("[nr] D3D11 -> D3D12 bridge: the layers that read the depth do not run: %s",
+                                      depth.tex ? "it could not be handed to D3D12" : "the evaluate has none"); }
+        return true;
     };
     bool depth_sent = false, guides_sent = false, exposure_sent = false;
-    uint64_t sent_binding = 0;   // the bridge's binding the guides went over in: its shared textures still hold them
+    // the bridge's binding and handoff the guides went over in: its shared textures still hold them while the binding
+    // is that one and the next handoff is this evaluate's own
+    uint64_t sent_binding = 0, sent_handoff = 0;
     const auto guides_of = [&](std::vector<d11b::Handoff>& items, bool depth_read) {
-        if (depth_read || depth_sent) {
+        if (depth.tex && (depth_read || depth_sent)) {
             d11b::Handoff d;
             d.role = d11b::Role::kDepth; d.tex11 = depth.tex; d.depth = true; d.optional = true; d.in = !depth_sent;
             items.push_back(d);
@@ -9283,9 +9301,7 @@ NVSDK_NGX_Result d11_bridge_evaluate(ID3D11DeviceContext* ctx, ID3D11Device* dev
         d11b::Handoff o;   // (not copied: the layers ask for its format and size alone here)
         o.role = d11b::Role::kOutput; o.tex11 = output.tex; o.in = false; o.writable = true;
         items.push_back(o);
-        const bool depth_read = (plan.present_wanted && plan.depth_wanted) || chain->inspect.hold ||
-                                (before && w2_in(plan.before));
-        guides_of(items, depth_read);
+        guides_of(items, (plan.present_wanted && plan.depth_wanted) || (before && depth_before));
         bool ran = false;
         const d11b::Status status = g_d11_d3d12.execute(device, items.data(), items.size(), false, [&](d11b::FrameContext& fc) {
             const nr::asi::hudcap::Own own;
@@ -9293,6 +9309,7 @@ NVSDK_NGX_Result d11_bridge_evaluate(ID3D11DeviceContext* ctx, ID3D11Device* dev
             const auto it = g_d11_features.find(h->Id);
             Frame f12;
             sent_binding = fc.binding;
+            sent_handoff = fc.handoff;
             if (it == g_d11_features.end() || !frame12(fc, f12)) return;
             ID3D12GraphicsCommandList* const l = d11_bridge_list(fc.device);
             if (!l) return;
@@ -9301,7 +9318,7 @@ NVSDK_NGX_Result d11_bridge_evaluate(ID3D11DeviceContext* ctx, ID3D11Device* dev
                 g_d12_uses.touch();
                 const nr::asi::Wilsjo2Frame wf = wilsjo2_frame(p, f12, st12);
                 if (plan.present_wanted) capture_guides(l, fc.device, f12, st12, wf, h->Id, plan.depth_wanted, fc.binding);
-                if (before && f12.color) {
+                if (before && f12.color && !depth_missing(f12, depth_before)) {
                     Frame fb = f12;   // the region alone, at the shared texture's origin
                     fb.color_x = fb.color_y = 0;
                     bool moved = false;
@@ -9347,15 +9364,16 @@ NVSDK_NGX_Result d11_bridge_evaluate(ID3D11DeviceContext* ctx, ID3D11Device* dev
     d11b::Handoff o;
     o.role = d11b::Role::kOutput; o.tex11 = output.tex; o.back = true; o.writable = true;
     items.push_back(o);
-    guides_of(items, chain->inspect.hold || w2_in(plan.after));
+    guides_of(items, depth_after);
     g_d11_d3d12.execute(device, items.data(), items.size(), false, [&](d11b::FrameContext& fc) {
         const nr::asi::hudcap::Own own;
         std::unique_lock<std::mutex> lk(g_lock);
         const auto it = g_d11_features.find(h->Id);   // released meanwhile on another thread: nothing to run on
         Frame f12;
-        // (another device had the bridge in between: the guides in its shared textures are not this evaluate's)
-        if (guides_sent && fc.binding != sent_binding) return;
-        if (it == g_d11_features.end() || !frame12(fc, f12)) return;
+        // (another device had the bridge in between, or another evaluate of this device's: the guides in its shared
+        // textures are not this evaluate's)
+        if (guides_sent && (fc.binding != sent_binding || fc.handoff != sent_handoff + 1)) return;
+        if (it == g_d11_features.end() || !frame12(fc, f12) || depth_missing(f12, depth_after)) return;
         if (!(f12.output->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
             static bool said = false;
             if (!said) { said = true; log("[nr] D3D11 -> D3D12 bridge: the upscaler's output (DXGI format %d) cannot be written on "

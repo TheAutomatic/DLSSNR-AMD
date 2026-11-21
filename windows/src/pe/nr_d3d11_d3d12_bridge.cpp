@@ -187,20 +187,23 @@ bool Bridge::uav_supported_locked(DXGI_FORMAT fmt) {
 
 // Everything submitted to the bridge's queue so far is done (or its device is removed: nothing runs there any
 // more). False: not known to be - the wait ran out or could not be made - and nothing the queue may still use is
-// released then.
+// released then. On a fence of the queue's own: the shared one also moves with D3D11's signals, which say nothing
+// of the D3D12 queue.
 bool Bridge::drain_d12_queue_locked() {
-    if (!d12_queue_ || !shared_fence12_) return true;
+    if (!d12_queue_ || !d12_dev_) return true;
     if (FAILED(d12_dev_->GetDeviceRemovedReason())) return true;
     if (!drain_event_) drain_event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (!drain_event_) return false;
-    const uint64_t v = ++fence_val_;
+    if (!drain_fence_ && FAILED(d12_dev_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&drain_fence_))))
+        drain_fence_ = nullptr;
+    if (!drain_event_ || !drain_fence_) return false;
+    const uint64_t v = ++drain_val_;
     bool done = false;
-    if (SUCCEEDED(d12_queue_->Signal(shared_fence12_, v))) {
-        done = shared_fence12_->GetCompletedValue() >= v;
-        if (!done) {
-            ResetEvent(drain_event_);
-            done = SUCCEEDED(shared_fence12_->SetEventOnCompletion(v, drain_event_)) &&
-                   WaitForSingleObject(drain_event_, 5000) == WAIT_OBJECT_0;
+    if (SUCCEEDED(d12_queue_->Signal(drain_fence_, v)) && SUCCEEDED(drain_fence_->SetEventOnCompletion(v, drain_event_))) {
+        // (the event may still be set by an earlier value's wait that ran out: the fence's value decides, not the wake)
+        const uint64_t until = GetTickCount64() + 5000;
+        while (!(done = drain_fence_->GetCompletedValue() >= v)) {
+            const uint64_t now = GetTickCount64();
+            if (now >= until || WaitForSingleObject(drain_event_, DWORD(until - now)) != WAIT_OBJECT_0) break;
         }
     }
     if (!done) done = FAILED(d12_dev_->GetDeviceRemovedReason());
@@ -249,6 +252,7 @@ void Bridge::release_all_locked() {
         CloseHandle(drain_event_);
         drain_event_ = nullptr;
     }
+    safe_release(drain_fence_);
     safe_release(shared_fence12_);
     safe_release(d12_queue_);
     safe_release(d12_dev_);
@@ -475,6 +479,14 @@ bool Bridge::ensure_entry_locked(Role role, uint32_t set, uint32_t w, uint32_t h
         ++same;
         if (oldest == pool_.size() || e.last_used < pool_[oldest].last_used) oldest = i;
     }
+    // The role full: its oldest pair goes, once the queue is done with it (D3D12 does not keep a resource alive for
+    // its GPU work). Not known to be: the pair stays and this handoff is left out - nothing piles up behind a queue
+    // that does not move.
+    const size_t cap = role == Role::kBack || role == Role::kHudless ? kMaxSlots : 1;
+    if (same >= cap && !drain_d12_queue_locked()) {
+        fail_locked("the D3D12 queue did not finish in time; its shared textures stay as they are");
+        return false;
+    }
 
     D3D12_HEAP_PROPERTIES heap{};
     heap.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -515,10 +527,9 @@ bool Bridge::ensure_entry_locked(Role role, uint32_t set, uint32_t w, uint32_t h
         return failed("OpenSharedResource1", hr);
     }
 
-    const size_t cap = role == Role::kBack || role == Role::kHudless ? kMaxSlots : 1;
     const Entry made{role, set, w, h, fmt, uav, tex12, tex11, ++use_seq_};
     if (same >= cap) {
-        retire_locked(pool_[oldest], drain_d12_queue_locked());   // (D3D12 does not keep a resource alive for its GPU work)
+        release_entry(pool_[oldest]);
         pool_[oldest] = made;
         *index = oldest;
         return true;
@@ -691,6 +702,7 @@ Status Bridge::execute(ID3D11Device* d11_dev, Handoff* items, size_t count, bool
     fc.device = d12_dev_;
     fc.queue = d12_queue_;
     fc.binding = binding_;
+    fc.handoff = present ? handoffs_ : ++handoffs_;
     fc.items = items;
     fc.count = count;
     fc.back = fc.find(Role::kBack);

@@ -73,6 +73,9 @@ struct FrameContext {
     // Which binding of the bridge to a D3D11 device this frame is of (never 0): what one binding's frames left
     // behind - guides - is not another's.
     uint64_t binding = 0;
+    // The count of evaluate handoffs so far, this one included (a Present: the last evaluate's). The guides in the
+    // shared textures are a later handoff's own only if no other came in between.
+    uint64_t handoff = 0;
     // Every texture of the handoff, and the one of a role (null: not handed over).
     Handoff* items = nullptr;
     size_t count = 0;
@@ -187,6 +190,9 @@ private:
     bool pending_signal_queued_ = false;
     uint64_t use_seq_ = 0;
     HANDLE drain_event_ = nullptr;
+    ID3D12Fence* drain_fence_ = nullptr;   // the D3D12 queue's own progress (drain_d12_queue_locked)
+    uint64_t drain_val_ = 0;
+    uint64_t handoffs_ = 0;                // FrameContext::handoff
     std::string last_error_;
     std::vector<Entry> pool_;
     std::vector<Entry> late_;                 // out of the pool, not yet known to be out of the queue's work

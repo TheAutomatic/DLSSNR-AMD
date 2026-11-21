@@ -2816,23 +2816,28 @@ int main(int argc, char** argv) {
         }
 
         // A second D3D11 device: its own route, chosen once; neither device is sent to Vulkan as the bridge moves.
+        // The bridge follows the device that presents, and each binding has its own number (what one device's
+        // frames leave on D3D12 - guides - is told from another's by it).
+        uint64_t bind2 = 0, bind1 = 0;
         const d11b::Route r2 = bridge.decide(dev2, false);
-        const d11b::Status st2 = bridge.execute(dev2, back2, nullptr, [](d11b::FrameContext&) {});
+        const d11b::Status st2 = bridge.execute(dev2, back2, nullptr, [&](d11b::FrameContext& fc) { bind2 = fc.binding; });
+        // An evaluate of the other device right after that Present is left alone: the bridge stays with the presenter.
+        int other_calls = 0;
         handoff(items);
-        const d11b::Status st1 = bridge.execute(dev, items, 5, false, work);
+        const d11b::Status st_other = bridge.execute(dev, items, 5, false, [&](d11b::FrameContext&) { ++other_calls; });
+        handoff(items);
+        const d11b::Status st1 = bridge.execute(dev, items, 5, true, [&](d11b::FrameContext& fc) { bind1 = fc.binding; });
         if (r2 != d11b::Route::kBridge || st2 == d11b::Status::kFallback || st1 == d11b::Status::kFallback ||
             bridge.route(dev) != d11b::Route::kBridge || bridge.route(dev2) != d11b::Route::kBridge) {
             std::fprintf(stderr, "FAIL: Case J2 second device: route=%d status=%d, first device status=%d route=%d\n", int(r2),
                          int(st2), int(st1), int(bridge.route(dev)));
             return 1;
         }
-
-        // Each binding of the bridge to a device has its own number (what one device's frames leave on D3D12 -
-        // guides - is told from another's by it).
-        uint64_t bind2 = 0, bind1 = 0;
-        bridge.execute(dev2, back2, nullptr, [&](d11b::FrameContext& fc) { bind2 = fc.binding; });
-        handoff(items);
-        bridge.execute(dev, items, 5, false, [&](d11b::FrameContext& fc) { bind1 = fc.binding; });
+        if (st_other != d11b::Status::kPassthrough || other_calls) {
+            std::fprintf(stderr, "FAIL: Case J2 evaluate of the device that does not present: status=%d callbacks=%d "
+                                 "(passed through, none)\n", int(st_other), other_calls);
+            return 1;
+        }
         if (!bind1 || !bind2 || bind1 == bind2) {
             std::fprintf(stderr, "FAIL: Case J2 bindings: device 1's %llu, device 2's %llu (two different ones, neither 0)\n",
                          static_cast<unsigned long long>(bind1), static_cast<unsigned long long>(bind2));
