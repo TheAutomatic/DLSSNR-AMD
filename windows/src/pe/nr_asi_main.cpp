@@ -1443,8 +1443,14 @@ struct PresentPath {
     bool dlssg_menu_frame = false;             // the next taken present is the first of a game frame (for NR Control)
 };
 PresentPath g_present;                         // under g_lock, but the submission fields of `sets`
-nr::pe::d11_bridge::Bridge g_d11_d3d12;        // D3D11 Present -> D3D12 passthrough bridge (locks before g_lock)
+nr::pe::d11_bridge::Bridge g_d11_d3d12;        // D3D11 -> D3D12 passthrough bridge (locks before g_lock)
 std::atomic<bool> g_d12_present_seen{false};   // native D3D12 Present layers observed (exclude D3D11 sub-chains)
+std::atomic<bool> g_d12_evaluate_seen{false};  // a D3D12 game's upscaler evaluate observed
+// A D3D12 game's NR runs in this process: g_present is its own, so a D3D11 device met then takes the Vulkan route
+// (decided once, at that device's first use) and a device the bridge already owns skips its frames.
+bool d12_game_active() {
+    return g_d12_present_seen.load(std::memory_order_relaxed) || g_d12_evaluate_seen.load(std::memory_order_relaxed);
+}
 std::mutex g_capture_lock;                     // GuideSet's submission fields; never held across ExecuteCommandLists
 std::map<ID3D12CommandQueue*, std::pair<ID3D12Fence*, uint64_t>> g_trackers;   // our fence on each queue (g_capture_lock)
 
@@ -4455,6 +4461,7 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_evaluate(ID3D12GraphicsCommandList* cmd, const 
     menu_once(device);   // NR Control (above), if no swap chain of the game's was seen first
     ++g_fg_frames;   // a game frame (NR Control's frame-generation line)
     g_present.evaluate_ms = GetTickCount64();
+    g_d12_evaluate_seen.store(true, std::memory_order_relaxed);
     const bool renodx_only = std::all_of(chain->layers.begin(), chain->layers.end(), [](const Layer& l) {
         return l.cfg.processing == nr::pe::Processing::kRenoDX;
     });
@@ -8843,18 +8850,23 @@ void d11_present_layers(IDXGISwapChain* sc, ID3D11Device* device) {
     hud_report(!runs.empty(), true, hud_captured, hud_cap.why, false, false, std::string(), "", hud_cap.broken);
     if (runs.empty()) return;
 
-    bool has_guides = false;
-    for (uint32_t k = 0; k < kPresentGuideSets; ++k) {
-        if (P.sets[k].serial) { has_guides = true; break; }
-    }
-    const bool d12_game_active = g_d12_present_seen.load(std::memory_order_relaxed) || g_present.evaluate_ms.load() != 0;
-    if (!has_guides && !d12_game_active) {
-        ID3D11Texture2D* const hud11 = hud_captured ? hud_cap.hudless : nullptr;
-        guard.unlock();
-        const auto status = g_d11_d3d12.execute(device, back, hud11, [&](nr::pe::d11_bridge::FrameContext& fc) {
-            present_layers(sc, fc.queue, false, nullptr, &fc);
-        });
-        if (status == nr::pe::d11_bridge::Status::kRan || status == nr::pe::d11_bridge::Status::kPassthrough) {
+    {   // The device's route, chosen once (nr_d3d11_d3d12_bridge.hpp): on the bridge's device the Present layers run
+        // on D3D12 or this frame goes on as it is - the Vulkan route below is never started for it.
+        namespace d11b = nr::pe::d11_bridge;
+        const bool d12_game = d12_game_active();
+        guard.unlock();   // (the bridge's lock comes before g_lock)
+        const d11b::Route route = g_d11_d3d12.decide(device, d12_game);
+        if (route == d11b::Route::kUndecided) return;
+        if (route == d11b::Route::kBridge) {
+            if (d12_game) {
+                static bool said = false;
+                if (!said) { said = true; log("[nr] Present layers (D3D11): a D3D12 game's NR runs in this process now; the D3D11 device's frames go on without NR's work"); }
+                return;
+            }
+            ID3D11Texture2D* const hud11 = hud_captured ? hud_cap.hudless : nullptr;
+            g_d11_d3d12.execute(device, back, hud11, [&](d11b::FrameContext& fc) {
+                present_layers(sc, fc.queue, false, nullptr, &fc);
+            });
             return;
         }
         guard.lock();
@@ -8977,6 +8989,8 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_d11_evaluate(ID3D11DeviceContext* ctx, const NV
     tick_d11_retired();
     tick_vk_retired();
     nr::asi::wilsjo2_vk_tick();
+    int feature = -1;
+    {
     D11Tracked& t = g_d11_features[h->Id];
     if (t.vk.feature < 0) {
         HMODULE caller = nullptr;
@@ -8990,7 +9004,9 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_d11_evaluate(ID3D11DeviceContext* ctx, const NV
             caller == g_opti ? "OptiScaler's own input" : "the game (its create not seen; by what the call carries)",
             feature_name(t.vk.feature));
     }
-    if (t.vk.feature != kFeatureSuperSampling && t.vk.feature != kFeatureRayReconstruction) {
+    feature = t.vk.feature;
+    }
+    if (feature != kFeatureSuperSampling && feature != kFeatureRayReconstruction) {
         guard.unlock();
         return real_d11_evaluate(ctx, h, p, callback);
     }
@@ -8999,12 +9015,26 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_d11_evaluate(ID3D11DeviceContext* ctx, const NV
     // NR Control, drawn by this module over the game's D3D11 swap chain (nr_pe_menu.hpp's D3D11 overlay), from the
     // first frame NR sees, as on D3D12
     menu_once11();
-    const bool ready = device && d11_route_ready(device);
-    if (device) device->Release();
-    if (!ready) {
+    struct Dev { ID3D11Device* d; ~Dev() { if (d) d->Release(); } } dev_hold{device};
+    if (!device) {
         guard.unlock();
         return real_d11_evaluate(ctx, h, p, callback);
     }
+    {   // The device's route, chosen once at its first evaluate or Present (nr_d3d11_d3d12_bridge.hpp). A device the
+        // bridge owns never starts the model's Vulkan session.
+        namespace d11b = nr::pe::d11_bridge;
+        const bool d12_game = d12_game_active();
+        guard.unlock();   // (the bridge's lock comes before g_lock)
+        const d11b::Route route = g_d11_d3d12.decide(device, d12_game);
+        if (route != d11b::Route::kVulkan) return real_d11_evaluate(ctx, h, p, callback);
+        guard.lock();
+    }
+    if (!d11_route_ready(device)) {
+        guard.unlock();
+        return real_d11_evaluate(ctx, h, p, callback);
+    }
+    // (g_lock was let go for the route: the feature again, as another thread may have made it anew)
+    D11Tracked& t = g_d11_features[h->Id];
     // The call's resources (DLSS-D blocks may name them DLSSD.*), as DXVK has them.
     D11Image colour, output, depth, motion, exposure;
     VkFrame f;

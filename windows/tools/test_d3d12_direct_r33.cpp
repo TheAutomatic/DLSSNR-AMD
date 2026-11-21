@@ -2582,7 +2582,9 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        // Test NR_D11_D3D12_BRIDGE=0 escape hatch.
+        // Test NR_D11_D3D12_BRIDGE=0 escape hatch: read when a device's route is chosen, so on a bridge that has
+        // not met the device yet.
+        bridge.reset();
         SetEnvironmentVariableA("NR_D11_D3D12_BRIDGE", "0");
         const auto st_off = bridge.execute(d11_dev, tex11, nullptr, [](nr::pe::d11_bridge::FrameContext&) {});
         SetEnvironmentVariableA("NR_D11_D3D12_BRIDGE", nullptr);
