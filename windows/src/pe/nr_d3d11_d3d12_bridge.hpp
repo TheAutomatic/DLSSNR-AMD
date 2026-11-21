@@ -20,7 +20,7 @@ namespace nr::pe::d11_bridge {
 
 enum class Status {
     kRan,          // D3D12 Present layers ran and copied the result synchronously back to `back11`
-    kPassthrough,  // Transient startup warm-up (D3D12 canary running): frame left untouched without Vulkan
+    kPassthrough,  // Frame left untouched without Vulkan (warming up or recovering a handoff).
     kFallback,     // Unsupported / disabled / DXVK / D3D12 declined -> caller should use Vulkan Bridge
 };
 
@@ -35,7 +35,7 @@ struct FrameContext {
     ID3D12Fence** signal_out_fence = nullptr;
     uint64_t signal_out_val = 0;
     bool submitted = false;
-    bool signalled = false;
+    HRESULT output_signal = E_PENDING;
 };
 
 class Bridge {
@@ -106,6 +106,8 @@ private:
     ID3D11Fence* shared_fence11_ = nullptr;
 
     uint64_t fence_val_ = 0;
+    uint64_t pending_output_ = 0;
+    bool pending_signal_queued_ = false;
     uint64_t use_seq_ = 0;
     HANDLE drain_event_ = nullptr;
     std::string last_error_;

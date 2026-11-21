@@ -2448,7 +2448,7 @@ int main(int argc, char** argv) {
                 fc.queue->ExecuteCommandLists(1, lists);
                 fc.submitted = true;
                 if (*fc.signal_out_fence) {
-                    fc.signalled = SUCCEEDED(fc.queue->Signal(*fc.signal_out_fence, fc.signal_out_val));
+                    fc.output_signal = fc.queue->Signal(*fc.signal_out_fence, fc.signal_out_val);
                 }
             });
             if (j_d12_queue && j_wait_fence && j_wait_ev) {
@@ -2503,7 +2503,7 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        // Test early-return no-deadlock path (`submitted == false && signalled == false`) -> leaves tex11 untouched.
+        // A callback returning without submitting never waits on the output fence.
         d11_ctx->UpdateSubresource(tex11, 0, nullptr, init_rgba.data(), jw * 4, 0);
         const auto st_noop = bridge.execute(d11_dev, tex11, nullptr, [](nr::pe::d11_bridge::FrameContext&) {
             // Deliberately return without executing or signalling.
@@ -2528,6 +2528,31 @@ int main(int argc, char** argv) {
         d11_ctx->Unmap(rb11, 0);
         if (!noop_intact) {
             std::fprintf(stderr, "FAIL: Case J early-return modified tex11 unexpectedly\n");
+            return 1;
+        }
+
+        // Hold the D3D12 queue behind a CPU-controlled fence and omit the output Signal.
+        // No D3D11 slot access (including on the next Present) is safe until the queue catches up.
+        const uint64_t unblock = ++j_wait_val;
+        const auto missed = bridge.execute(d11_dev, tex11, hud11, [&](nr::pe::d11_bridge::FrameContext& fc) {
+            fc.submitted = SUCCEEDED(fc.queue->Wait(j_wait_fence, unblock));
+        });
+        bool reused = false;
+        const auto held = bridge.execute(d11_dev, tex11, hud11, [&](nr::pe::d11_bridge::FrameContext&) { reused = true; });
+        if (FAILED(j_wait_fence->Signal(unblock)) || reused ||
+            missed != nr::pe::d11_bridge::Status::kPassthrough || held != nr::pe::d11_bridge::Status::kPassthrough) {
+            std::fprintf(stderr, "FAIL: Case J unsignalled output did not hold the bridge (%d, %d, reused=%d)\n",
+                         int(missed), int(held), int(reused));
+            return 1;
+        }
+        bool recovered = false;
+        for (int i = 0; !recovered && i < 500; ++i) {
+            const auto st = bridge.execute(d11_dev, tex11, hud11, [&](nr::pe::d11_bridge::FrameContext&) { recovered = true; });
+            if (st == nr::pe::d11_bridge::Status::kFallback) break;
+            if (!recovered) Sleep(1);
+        }
+        if (!recovered) {
+            std::fprintf(stderr, "FAIL: Case J D3D12 bridge did not resume after the queue completed\n");
             return 1;
         }
 

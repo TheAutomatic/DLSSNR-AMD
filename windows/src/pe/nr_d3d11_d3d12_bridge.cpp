@@ -154,6 +154,7 @@ void Bridge::release_d11_side_locked() {
 
 void Bridge::release_all_locked() {
     release_d11_side_locked();
+    pending_output_ = 0;
     if (drain_event_) {
         CloseHandle(drain_event_);
         drain_event_ = nullptr;
@@ -456,6 +457,21 @@ Status Bridge::execute(ID3D11Device* d11_dev, ID3D11Texture2D* back11, ID3D11Tex
     if (bd.Width == 0 || bd.Height == 0 || bd.SampleDesc.Count > 1) return Status::kFallback;
 
     std::lock_guard<std::mutex> lk(mu_);
+    // No new D3D11 writes, fence values or slot eviction until the previous D3D12 submission is done.
+    if (pending_output_) {
+        const uint64_t done = shared_fence12_->GetCompletedValue();
+        if (done == UINT64_MAX) {
+            if (d11_dev == bound_d11_) return Status::kPassthrough;
+            release_all_locked();   // the removed device cannot still be using its slots
+        } else if (!pending_signal_queued_) {
+            pending_signal_queued_ = SUCCEEDED(d12_queue_->Signal(shared_fence12_, pending_output_));
+            return Status::kPassthrough;
+        } else if (done < pending_output_) {
+            return Status::kPassthrough;
+        } else {
+            pending_output_ = 0;
+        }
+    }
     bool passthrough_wait = false;
     if (!ensure_device(d11_dev, &passthrough_wait)) {
         return passthrough_wait ? Status::kPassthrough : Status::kFallback;
@@ -517,14 +533,19 @@ Status Bridge::execute(ID3D11Device* d11_dev, ID3D11Texture2D* back11, ID3D11Tex
 
     // Only wait on `shared_fence11_` when D3D12 actually submitted and signalled `out_val`;
     // waiting unconditionally on an early return would deadlock D3D11.
-    if (fc.submitted && fc.signalled) {
-        hr = ctx4_->Wait(shared_fence11_, out_val);
+    if (fc.submitted) {
+        const bool signalled = SUCCEEDED(fc.output_signal);
+        hr = signalled ? ctx4_->Wait(shared_fence11_, out_val) : fc.output_signal;
         if (FAILED(hr)) {
-            char buf[96];
-            std::snprintf(buf, sizeof(buf), "ctx4->Wait failed (0x%08lx)", static_cast<unsigned long>(hr));
+            pending_output_ = out_val;
+            // The failed frame stays dropped. Give the next Present a chance to reuse the slot.
+            pending_signal_queued_ = signalled || SUCCEEDED(d12_queue_->Signal(shared_fence12_, out_val));
+            char buf[128];
+            std::snprintf(buf, sizeof(buf), "%s failed (0x%08lx); skipping NR until the D3D12 queue completes",
+                          signalled ? "ctx4->Wait" : "d12_queue->Signal", static_cast<unsigned long>(hr));
             last_error_ = buf;
             nr::pe::log("[nr] d11->d3d12 bridge: %s", buf);
-            return Status::kFallback;
+            return Status::kPassthrough;
         }
         if (!backend_declined) {
             ctx4_->CopyResource(back11, slot->tex11);

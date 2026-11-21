@@ -2704,7 +2704,7 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
     if (d11_at) {
         d11_at->submitted = true;
         if (d11_at->signal_out_fence && *d11_at->signal_out_fence) {
-            d11_at->signalled = SUCCEEDED(queue->Signal(*d11_at->signal_out_fence, d11_at->signal_out_val));
+            d11_at->output_signal = queue->Signal(*d11_at->signal_out_fence, d11_at->signal_out_val);
         }
     }
     std::lock_guard<std::mutex> relock(g_lock);
