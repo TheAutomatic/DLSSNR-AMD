@@ -111,6 +111,7 @@ count=$(bash windows/build/vulkan_lazy.sh "$out" "$cxx" -shared "${objs[@]}" "${
 # NR_TOOLS=1: test_d3d12_offline.exe and test_d3d12_direct_r33.exe (not in the package): standalone Direct ELF
 # benchmarks and automated host-state preservation checks, linked against the plugin's objects without its entry point.
 if [[ ${NR_TOOLS:-0} == 1 ]]; then
+    bash windows/tools/test_d3d12_wrappers.sh --build-only "$out"
     "$cxx" "${common[@]}" -c windows/tools/test_d3d12_offline.cpp -o "$out/test_d3d12_offline.o"
     "$cxx" -o "$out/test_d3d12_offline.exe" "$out/test_d3d12_offline.o" "${objs[@]:1}" "$out/vulkan_lazy_s.o" \
         "$out/vulkan_lazy_c.o" "${ldflags[@]}" -lgdi32 -luuid -lpsapi -lshlwapi -ldwmapi
