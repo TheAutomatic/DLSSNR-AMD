@@ -6,14 +6,15 @@
 # <minhook> is a MinHook checkout with include/ and src/ (32-bit builds use hde32.c, not hde64.c).
 # The add-on is built from the tree this script lives in; nothing is copied over it.
 #
-# Toolchain: Debian/Ubuntu `apt install g++-mingw-w64-i686-posix`.
+# Toolchain: MinGW 13 in the dlssnr-amd-build Docker image.
 # The Vulkan entry points are not statically imported: vulkan_lazy32.c/.s stand in for vulkan-1.dll
 # (one tail jump per entry point, the same idea as windows/build/vulkan_lazy.sh does for x86-64).
 set -euo pipefail
 MINHOOK=${1:?path to minhook (with include/ and src/)}
 HERE=$(cd "$(dirname "$0")" && pwd)
-SRC=$(cd "$HERE/../.." && pwd)
-OUT=${2:-$PWD/out}
+SRC=$(cd "$HERE/../../.." && pwd)
+MINHOOK=$(realpath -- "$MINHOOK")
+OUT=$(realpath -m -- "${2:-$PWD/out}")
 
 command -v i686-w64-mingw32-g++-posix >/dev/null ||
     { echo 'missing i686-w64-mingw32-g++-posix (apt install g++-mingw-w64-i686-posix)'; exit 1; }
@@ -22,7 +23,7 @@ mkdir -p "$OUT"
 cd "$SRC"
 source windows/build/arch/rdna4.sh          # NR_PRODUCT_DEFINES (the network builds of this release)
 
-# tc/: i686 wrappers that add -D_WIN32_WINNT and the std::from_chars float shim (mingw 10 lacks them)
+# Windows 10 declarations are needed by the shared host code.
 GXX="$HERE/tc/gxx32"
 GCC="$HERE/tc/gcc32"
 
@@ -30,7 +31,8 @@ INC=(-I"$HERE" -I"$SRC/toolchain/Vulkan-Headers/include" -I"$SRC/windows/src" -I
      -I"$SRC/windows/src/pe" -I"$SRC/windows/src/ui" -I"$MINHOOK/include")
 INC_ADDON=(-I"$SRC/artifacts/ref/DLSS5-Feeder/external/imgui" -I"$MINHOOK/include"
            -I"$SRC/artifacts/ref/DLSS5-Feeder/external/reshade/include")
-DEF=(-std=c++17 -O2 -DNDEBUG -DNR_BUILD_STAMP="\"x86-0.0.9\"" -DNR_RESHADE_ROUTE=1 -DNR_INT4=1 -fpermissive)
+stamp=$(bash windows/build/version.sh)
+DEF=(-std=c++17 -O2 -DNDEBUG -DNR_BUILD_STAMP="\"$stamp\"" -DNR_RESHADE_ROUTE=1 -DNR_INT4=1 -fpermissive)
 
 mkdir -p "$OUT/shim"; printf '#include <windows.h>\n' > "$OUT/shim/Windows.h"   # reshade.hpp asks for Windows.h
 
@@ -52,7 +54,7 @@ done
 "$GCC" -O2 -I"$MINHOOK/include" -I"$MINHOOK/src" -c "$MINHOOK/src/trampoline.c" -o mh_trampoline.o
 "$GCC" -O2 -I"$MINHOOK/include" -I"$MINHOOK/src" -c "$MINHOOK/src/hde/hde32.c"  -o mh_hde32.o
 
-"$GXX" -O2 -c "$HERE/vulkan_lazy32.c" -o vulkan_lazy_c32.o
+"$GCC" -O2 -c "$HERE/vulkan_lazy32.c" -o vulkan_lazy_c32.o
 "$GCC" -O2 -c "$HERE/vulkan_lazy32.s" -o vulkan_lazy_s32.o
 
 "$GXX" -shared -static -static-libgcc -static-libstdc++ *.o -o "$OUT/dlssnr_amd.addon32" \
