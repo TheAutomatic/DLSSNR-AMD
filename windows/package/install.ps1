@@ -91,13 +91,17 @@ function Get-ExeBits([string]$path) {
 }
 
 # ---- choose the route ------------------------------------------------------------------------
+$bits = Get-ExeBits $exe
+if ($Route -notin @('remove', 'logs') -and $bits -eq 0) { Fail "Cannot determine the game's architecture: $exe" }
 if (-not $Route) {
     Say ''
     Say "Game folder: $game"
     Say 'Choose a route:'
-    Say '  1) optiscaler             the game has a DLSS, FSR or XeSS option (DX11 / DX12, OptiScaler)'
-    Say '  2) standalone             any DX11 / DX12 / Vulkan app, video player, Magpie or capture viewer (no upscaler or ReShade)'
-    Say '  3) reshade-feeder         other DX10/11/12 games (ReShade)'
+    if ($bits -eq 64) {
+        Say '  1) optiscaler             the game has a DLSS, FSR or XeSS option (DX11 / DX12, OptiScaler)'
+        Say '  2) standalone             any DX11 / DX12 / Vulkan app, video player, Magpie or capture viewer (no upscaler or ReShade)'
+    }
+    Say '  3) reshade-feeder         DX10/11 games (also native DX12 in 64-bit games; ReShade)'
     Say '  4) reshade-feeder-dx9     old DX9 games (ReShade)'
     Say '  5) reshade-feeder-vulkan  Vulkan games (ReShade)'
     Say '  6) Uninstall'
@@ -117,6 +121,10 @@ if ($Route -eq 'optiscaler-renodx') { $Route = 'optiscaler'; if (-not $RenoDX) {
 if ('optiscaler', 'standalone', 'reshade-feeder', 'reshade-feeder-dx9', 'reshade-feeder-vulkan', 'remove', 'logs' -notcontains $Route) {
     Fail "Unknown route: $Route"
 }
+if ($bits -eq 32 -and $Route -in @('optiscaler', 'standalone')) { Fail '32-bit games use the reshade-feeder, reshade-feeder-dx9 or reshade-feeder-vulkan routes.' }
+$reshadeDll = "ReShade$bits.dll"
+$addon = "dlssnr_amd.addon$bits"
+$binaryDir = if ($bits -eq 32) { 'x86\' } else { '' }
 
 # ---- the network a game starts with (asked after the model files are known) -----------------------------------
 $Networks = @('CC_SMALL_FP8', 'CC_SMALL_FP8_EXPERIMENTAL', 'CC_SILVER_AARDWOLD', 'CC_SILVER_AARDWOLD_OPTIMIZED')
@@ -400,8 +408,6 @@ function Install-Lumenite($lum, [string]$dest) {
 }
 
 # ---- install ---------------------------------------------------------------------------------
-$bits = Get-ExeBits $exe
-if ($bits -eq 32) { Fail "This is a 32-bit game ($exe); this package supports 64-bit games only." }
 # ---- model -----------------------------------------------------------------------------------
 # The package's models, or ones extracted now from the user's nvngx_dlssnr.dll; checked by SHA256.
 # CC_SILVER_AARDWOLD.bin = CC_SILVER_AARDWOLD (310.8.0, also preset 1 of 310.9.16), CC_SMALL_FP8.bin = CC_SMALL_FP8 (310.9.16's default).
@@ -673,7 +679,7 @@ if ($Lumenite -eq 'on') {
 if (Test-Path -LiteralPath $manifest) { Say 'Found a previous installation, removing it first.'; Remove-Installed }
 
 $otherProxies = @()
-foreach ($dllName in @('winmm.dll', 'version.dll', 'dwmapi.dll', 'dinput8.dll', 'dsound.dll', 'ReShade64.dll')) {
+foreach ($dllName in @('winmm.dll', 'version.dll', 'dwmapi.dll', 'dinput8.dll', 'dsound.dll', $reshadeDll)) {
     if (Test-Path -LiteralPath (Join-Path $game $dllName)) { $otherProxies += $dllName }
 }
 if ($Route -notin @('optiscaler', 'standalone', 'reshade-feeder') -and (Test-Path -LiteralPath (Join-Path $game 'dxgi.dll'))) {
@@ -704,8 +710,8 @@ Record-Logs @('dlssnr-amd.log', 'dlssnr-amd-crash.dmp')
 
 # Other ReShade add-ons in the game folder (installed earlier) would load too; move them to the backup folder.
 function Move-OtherAddons {
-    foreach ($item in Get-ChildItem -LiteralPath $game -File | Where-Object { $_.Extension -in '.addon', '.addon64' }) {
-        if ($item.Name -ne 'dlssnr_amd.addon64') { Save-Existing $item.Name; Say "Moved another ReShade add-on aside: $($item.Name)" }
+    foreach ($item in Get-ChildItem -LiteralPath $game -File | Where-Object { $_.Extension -in '.addon', ".addon$bits" }) {
+        if ($item.Name -ne $addon) { Save-Existing $item.Name; Say "Moved another ReShade add-on aside: $($item.Name)" }
     }
 }
 # ReShade's files. $asLayer: as a Vulkan layer (DX9 through DXVK, Vulkan games), found by the Vulkan loader in the
@@ -714,10 +720,17 @@ function Put-ReShade([bool]$asLayer) {
     Move-OtherAddons
     foreach ($item in Get-ChildItem -LiteralPath (Join-Path $here 'reshade')) {
         if ($item.Name -eq 'ReShadePreset-d3d9.ini') { continue }
-        if (-not $asLayer -and ($item.Name -eq 'vk-override' -or $item.Name -eq 'ReShade64.dll')) { continue }
+        if ($item.Name -eq 'vk-override') { continue }
+        if ($item.Extension -in '.addon32', '.addon64' -and $item.Name -ne $addon) { continue }
+        if ($item.Name -in 'ReShade32.dll', 'ReShade64.dll' -and (-not $asLayer -or $item.Name -ne $reshadeDll)) { continue }
         if ($item.PSIsContainer) { Put-Tree $item.FullName $item.Name } else { Put-File $item.FullName $item.Name }
     }
-    if (-not $asLayer) { Put-File (Join-Path $here 'reshade\ReShade64.dll') 'dxgi.dll' }
+    if ($asLayer) {
+        Save-Existing 'vk-override'
+        New-Item -ItemType Directory -Force -Path (Join-Path $game 'vk-override\implicit_layer') | Out-Null
+        Record 'D vk-override'
+        Put-File (Join-Path $here "reshade\vk-override\implicit_layer\ReShade$bits.json") "vk-override\implicit_layer\ReShade$bits.json"
+    } else { Put-File (Join-Path $here "reshade\$reshadeDll") 'dxgi.dll' }
     Record-Logs @('ReShade.log')
 }
 
@@ -770,7 +783,7 @@ if ($Route -eq 'optiscaler') {
     # Vulkan, NR runs guide-less RenoDX at Present, and NR Control's probe + licences go into dlssnr-amd\.
     Put-File (Join-Path $here 'standalone\dxgi.dll') 'dxgi.dll'
     Put-File (Join-Path $here 'standalone\dlssnr-amd.asi') 'dlssnr-amd.asi'
-    Put-File (Join-Path $here 'vulkan\vulkan-1.dll') 'vulkan-1.dll'
+    Put-File (Join-Path $here "vulkan\${binaryDir}vulkan-1.dll") 'vulkan-1.dll'
     Put-Tree (Join-Path $here 'standalone\vk-override') 'vk-override'
     Copy-Item -LiteralPath (Join-Path $here 'standalone\nr_present_probe.exe') -Destination (Join-Path $game 'dlssnr-amd') -Force
     Copy-Item -LiteralPath (Join-Path $here 'standalone\Inter-LICENSE.txt') -Destination (Join-Path $game 'dlssnr-amd') -Force
@@ -781,10 +794,10 @@ if ($Route -eq 'optiscaler') {
 } else {
     # DX9: DXVK moves the game to Vulkan, ReShade runs as a Vulkan layer. Vulkan games: only the ReShade layer.
     # The Vulkan loader in the game folder never calls DXGI and finds ReShade's layer beside it.
-    Put-File (Join-Path $here 'vulkan\vulkan-1.dll') 'vulkan-1.dll'
+    Put-File (Join-Path $here "vulkan\${binaryDir}vulkan-1.dll") 'vulkan-1.dll'
     if ($Route -eq 'reshade-feeder-dx9') {
-        Put-File (Join-Path $here 'dxvk\d3d9.dll') 'd3d9.dll'
-        Put-File (Join-Path $here 'dxvk\dxgi.dll') 'dxgi.dll'
+        Put-File (Join-Path $here "dxvk\${binaryDir}d3d9.dll") 'd3d9.dll'
+        Put-File (Join-Path $here "dxvk\${binaryDir}dxgi.dll") 'dxgi.dll'
         Record-Logs @("${exeName}_dxgi.log", "${exeName}_d3d9.log")
     }
     Put-ReShade $true

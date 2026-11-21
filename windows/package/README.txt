@@ -7,7 +7,7 @@ reimplemented in Vulkan; NVIDIA's runtime is neither needed nor called.
 It is slower than the Linux version and updated less often, and some releases may be Linux
 only. If something breaks, uninstall with option 6 of install.bat.
 
-DX10/11/12 games keep the system's own D3D; nothing is translated. NR runs on a Vulkan device
+Native DX10/11 games (and 64-bit DX12 games) keep the system's own D3D. NR runs on a Vulkan device
 of its own on the same graphics card, and the frame is handed between the two through shared
 textures and a shared fence, all on the GPU. Only DX9 games are moved to Vulkan with DXVK
 (D3D9 cannot share a frame with another API). Vulkan games: NR runs on the game's own device.
@@ -18,7 +18,9 @@ Requirements
 - RX 7000 series, Radeon 700M / 800M / 8000S graphics (RDNA3 / RDNA3.5): every network as well,
   experimental (see "ACO Mode")
 - AMD Software 26.9 or newer
-- 64-bit games
+- 64-bit games support all routes. 32-bit games use the ReShade routes: Vulkan, DX9 through
+  DXVK, and native DX10/11. D3D12 requires an existing vkd3d-proton setup; native 32-bit D3D12
+  is not supported.
 - Do not use it in online games with anti-cheat; start games with EasyAntiCheat with EAC off
 
 Install
@@ -26,12 +28,12 @@ Install
 Double-click install.bat, pick the game's exe (the one that actually runs - for Unreal Engine
 games it is under Binaries\Win64, not the launcher outside), then pick a route:
 
-  1) optiscaler             the game has a DLSS, FSR or XeSS option (DX11 / DX12 / Vulkan). OptiScaler
+  1) optiscaler             64-bit games with a DLSS, FSR or XeSS option (DX11 / DX12 / Vulkan). OptiScaler
                             does the upscaling and frame generation (the original OptiScaler, its files
                             unchanged); this project's NR runs as an OptiScaler plugin.
-  2) standalone             any DX11 / DX12 / Vulkan app, video player, Magpie or capture viewer without
+  2) standalone             any 64-bit DX11 / DX12 / Vulkan app, video player, Magpie or capture viewer without
                             an upscaler or ReShade (runs guide-less RenoDX NR at DXGI / Vulkan Present).
-  3) reshade-feeder         other DX10/11/12 games (ReShade + VORT, or the optional LumeniteFX, provide the
+  3) reshade-feeder         DX10/11 games, also native DX12 in 64-bit games (ReShade + VORT or LumeniteFX provide the
                             motion vectors; or DirectPresent without DLSS5_Feed.fx)
   4) reshade-feeder-dx9     old DX9 games (ReShade)
   5) reshade-feeder-vulkan  Vulkan games (ReShade)
