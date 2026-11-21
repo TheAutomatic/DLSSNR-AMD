@@ -4342,8 +4342,7 @@ nr::asi::Wilsjo2Frame wilsjo2_frame(const NVSDK_NGX_Parameter* p, const Frame& f
 // The wilsjo2 processing's own conditions for running before the upscaler: the colour at origin 0,
 // one mip, a valid active extent (a 2-D, one-sample, one-slice allocation of 1..16384 a side; the render subrect both
 // 0 = all of it, one 0 or larger = invalid). Else that layer runs after the upscaler. `aw` x `ah`: its active extent.
-bool wilsjo2_before_ok(const Frame& f, uint32_t* aw, uint32_t* ah) {
-    const D3D12_RESOURCE_DESC cd = f.color->GetDesc();
+bool wilsjo2_before_ok(const Frame& f, const D3D12_RESOURCE_DESC& cd, uint32_t* aw, uint32_t* ah) {
     const uint32_t cw = uint32_t(cd.Width), ch = cd.Height;
     *aw = f.subrect_w; *ah = f.subrect_h;
     if (!*aw && !*ah) { *aw = cw; *ah = ch; }
@@ -4383,6 +4382,278 @@ int trace_step() {
     if (left.load() <= 0) return 0;
     --left;
     return ++n;
+}
+
+// What an upscaling evaluate's layers do this frame: those before and after the upscaler in layer order, and whether
+// the Present layers want its guides.
+struct LayerPlan {
+    std::vector<const Layer*> before, after;
+    bool before_renodx = false;                           // a RenoDX layer runs before: the render region is its
+    bool present_wanted = false, present_takes = false;   // Present layers at all; some run at Present now
+    bool depth_wanted = false;                            // the Present layers read the depth
+    uint32_t w2_aw = 0, w2_ah = 0;                        // the wilsjo2 processing's active extent before the upscaler
+};
+// `colour`: the evaluate's colour as the game made it.
+void plan_layers(const Chain& chain, const Frame& f, const D3D12_RESOURCE_DESC& colour, bool nr_on, LayerPlan& plan) {
+    uint32_t w2_aw = 0, w2_ah = 0;
+    const bool w2_before_ok = wilsjo2_before_ok(f, colour, &w2_aw, &w2_ah);
+    std::vector<const Layer*> before, after;
+    bool before_renodx = false;
+    // Layers at Present run there (present_layers) and nowhere else (never before / after the upscaler in its
+    // place - the picture there differs too much). Here only their state when Present does not serve them: no Present
+    // of the game's has reached them for a second since they were wanted (its swap chain not found), or Present cannot
+    // serve this swap chain for their processing.
+    bool any_present = false;
+    for (const Layer& l : chain.layers) any_present |= present_layer(l);
+    const uint64_t now_ms = GetTickCount64();
+    if (!any_present) g_present.wanted_since_ms = 0;
+    else if (!g_present.wanted_since_ms) g_present.wanted_since_ms = now_ms;
+    const uint64_t served = g_present.served_ms.load();
+    const bool alive = !any_present || now_ms - g_present.wanted_since_ms < 1000 ||
+                       (served >= g_present.wanted_since_ms && now_ms - served < 1000);
+    const bool at_present = alive && !g_present.unusable.load(), at_present_w2 = alive && !g_present.unusable_w2.load();
+    bool present_wanted = false, present_takes = false;   // Present layers at all; some run at Present now
+    for (const Layer& l : chain.layers) {
+        const bool wilsjo2 = l.cfg.processing == nr::pe::Processing::kWilsjo2;
+        if (present_layer(l)) {
+            present_wanted = true;
+            if (wilsjo2 ? at_present_w2 : at_present) present_takes = true;
+            else if (!alive) layer_note(l, 2, 3, "waits for a Present of the game's (its swap chain was not found)");
+            else layer_note(l, 2, 3, "Present cannot serve this swap chain's colour format");
+            continue;
+        }
+        if (wilsjo2 && (f.out_x || f.out_y)) {
+            layer_note(l, 0, 3, "the output is a region away from the corner");
+            continue;
+        }
+        const bool want_before = l.cfg.placement == nr::pe::Placement::kBefore;
+        const bool b = want_before && (!wilsjo2 || w2_before_ok);
+        (b ? before : after).push_back(&l);
+        before_renodx |= b && !wilsjo2;
+        const char* note = want_before && !b ? "after the upscaler: this frame does not allow before" : "";
+        layer_note(l, b ? 1u : 0u, wilsjo2 && !nr_on ? 3u : 1u, wilsjo2 && !nr_on ? "NR is off (toggle key)" : note);
+    }
+    plan.before = std::move(before); plan.after = std::move(after);
+    plan.before_renodx = before_renodx; plan.present_wanted = present_wanted; plan.present_takes = present_takes;
+    plan.w2_aw = w2_aw; plan.w2_ah = w2_ah;
+    if (!present_wanted) return;
+    plan.depth_wanted = nr::pe::g_motion_without_depth_now.load() != 1 || chain.inspect.hold;
+    for (const Layer& l : chain.layers)
+        // (Passes (fast) Interleaved reads the depth itself - its anti-ghost's disocclusion test and vector
+        // dilation - whatever the network does: without the copy those tests never ran at Present)
+        plan.depth_wanted |= present_layer(l) && (l.cfg.processing == nr::pe::Processing::kWilsjo2 ||
+                                             (renodx_layer(l) && l.cfg.renodx.values.passes_mode == 1u &&
+                                              l.cfg.renodx.values.fast_method == 0u));
+}
+
+// The layers before the upscaler, recorded on `cmd`. Returns what the upscaler takes in the colour's place, in the
+// colour's state (`*moved_out`: the region alone, at base 0), or the colour itself when nothing could run on it.
+ID3D12Resource* run_before(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, Tracked& t, const Chain& chain,
+                           const LayerPlan& plan, const Frame& f, const States& st, const nr::asi::Wilsjo2Frame& wf,
+                           bool nr_on, bool* moved_out) {
+    const std::vector<const Layer*>& before = plan.before;
+    const std::vector<const Layer*>& after = plan.after;
+    *moved_out = false;
+    // The colour's region copied into a texture of our own, the layers on it in order, and that texture handed to
+    // the upscaler in the colour's place (at base 0, in the colour's state); the game's colour is never written.
+    // The region: the render region from the colour's base (RenoDX's), or for wilsjo2 layers alone their active
+    // extent at origin 0.
+    const uint32_t rx = plan.before_renodx ? f.color_x : 0u, ry = plan.before_renodx ? f.color_y : 0u;
+    const uint32_t rw = plan.before_renodx ? f.render_w : plan.w2_aw, rh = plan.before_renodx ? f.render_h : plan.w2_ah;
+    const DXGI_FORMAT format = f.color->GetDesc().Format;
+    // The first layer, a RenoDX one, reads the game's colour where it is and stores its answer into the mirror
+    // handed to the upscaler - no copy of the colour's region, no copy of the colour into the mirror, no copy of the
+    // region back (three render-size copies; t.copy not needed). Where the region is the whole colour and nothing
+    // reads the frame before that layer (no comparison, no held frame), on a device that takes it in place
+    // (d12_reads_in_place). NR_BEFORE_DIRECT=0: as before.
+    static const bool before_direct_off = [] { const char* e = std::getenv("NR_BEFORE_DIRECT"); return e && e[0] == '0'; }();
+    const D3D12_RESOURCE_DESC cdesc = f.color->GetDesc();
+    size_t ia0 = 0, ib0 = 0;
+    const bool before_direct = !before_direct_off && before.front()->cfg.processing == nr::pe::Processing::kRenoDX &&
+        d12_reads_in_place(device) &&
+        rx == 0 && ry == 0 && uint64_t(rw) == cdesc.Width && rh == cdesc.Height &&
+        !inspect_span(chain.inspect, before, after.empty() && !plan.present_takes, &ia0, &ib0) &&
+        chosen_index(chain.inspect, before) < 0 && ensure_mirror(device, t.mirror, t.mirror_state, f.color, true);
+    if (before_direct) {
+        if (t.copy) release_resource(t.copy);   // (made for frames that went the other way)
+        transition(cmd, f.color, st.color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        transition(cmd, t.mirror, t.mirror_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        bool filled = false;
+        const Frame live_frame = f; const States live_states = st; const auto live_wf = wf;
+        for (size_t k = 0; k < before.size(); ++k) {
+            Frame f = live_frame; States st = live_states; auto wf = live_wf;
+            const Layer* l = before[k];
+            if (k > 0 && !filled) {   // the first could not run: the colour copied in for the rest
+                transition(cmd, f.color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                transition(cmd, t.mirror, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+                cmd->CopyResource(t.mirror, f.color);
+                transition(cmd, t.mirror, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                transition(cmd, f.color, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                filled = true;
+            }
+            LayerState& ls = layer_state(t, *l);
+            if (l->cfg.processing == nr::pe::Processing::kRenoDX) {
+                const bool ran = run_renodx(cmd, ls, *l, 1, f, t.mirror, rw, rh, st, k == 0 ? f.color : nullptr);
+                if (k == 0) filled = ran;
+            } else if (nr_on) {
+                if (!ls.w2[1]) ls.w2[1] = nr::asi::wilsjo2_owner();
+                nr::pe::renodx_route::CallNetwork network(l->network);
+                nr::pe::renodx_route::CallLayer number(row_number(*l));
+                nr::asi::Wilsjo2Frame wr = wf;
+                wr.reset = wr.reset || hold_released(row_number(*l));
+                wr.out_w = f.out_w; wr.out_h = f.out_h;
+                nr::asi::wilsjo2_run(cmd, device, *ls.w2[1], wr, l->w2, t.mirror, rw, rh, true);
+            }
+        }
+        transition(cmd, f.color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, st.color);
+        ID3D12Resource* handed = filled ? t.mirror : f.color;   // nothing ran: the game's own colour
+        if (filled) {
+            transition(cmd, t.mirror, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, st.color);
+            t.mirror_state = st.color;
+        } else {
+            t.mirror_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        }
+        return handed;
+    }
+    const DXGI_FORMAT copy_fmt = writable(format);
+    if (!ensure_texture(device, t.copy, t.copy_state, copy_fmt, rw, rh)) {
+        // the layers before the upscaler cannot run this frame: the upscaler and the layers after it still do
+        // (0.0.7 ran its after-SR NR on its own)
+        static bool said = false;
+        if (!said) { said = true; log("[nr] the colour's copy could not be made; the layers before the upscaler skip such frames, the layers after it run"); }
+        return f.color;
+    }
+    transition(cmd, f.color, st.color, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    transition(cmd, t.copy, t.copy_state, D3D12_RESOURCE_STATE_COPY_DEST);
+    copy_region(cmd, t.copy, 0, 0, f.color, rx, ry, rw, rh);
+    transition(cmd, f.color, D3D12_RESOURCE_STATE_COPY_SOURCE, st.color);
+    transition(cmd, t.copy, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    // [Inspect]: the final picture's comparison is here when nothing runs after the upscaler or at Present (the
+    // comparison then goes through the upscaler); a chosen layer's wherever it runs
+    size_t ia = 0, ib = 0;
+    const bool inspect = inspect_span(chain.inspect, before, after.empty() && !plan.present_takes, &ia, &ib) &&
+                         inspect_format(copy_fmt);
+    const long held = chosen_index(chain.inspect, before);
+    const Frame live_frame = f; const States live_states = st; const auto live_wf = wf;
+    for (size_t k = 0; k < before.size(); ++k) {
+        Frame f = live_frame; States st = live_states; auto wf = live_wf;
+        const Layer* l = before[k];
+        if (long(k) == held) hold_frame(cmd, device, chain.inspect, t.hold, t.copy, row_number(*l));
+        if (long(k) == held && chain.inspect.hold) hold_inputs(cmd, device, t.hold, f, st, wf);
+        if (inspect && k == ia) inspect_copy(cmd, device, t.inspect_off, t.inspect_off_state, t.copy);
+        LayerState& ls = layer_state(t, *l);
+        if (l->cfg.processing == nr::pe::Processing::kRenoDX) {
+            run_renodx(cmd, ls, *l, 1, f, t.copy, rw, rh, st);
+        } else if (nr_on) {
+            if (!ls.w2[1]) ls.w2[1] = nr::asi::wilsjo2_owner();
+            nr::pe::renodx_route::CallNetwork network(l->network);
+            nr::pe::renodx_route::CallLayer number(row_number(*l));
+            nr::asi::Wilsjo2Frame wr = wf;
+            wr.reset = wr.reset || hold_released(row_number(*l));
+            wr.out_w = f.out_w; wr.out_h = f.out_h;
+            nr::asi::wilsjo2_run(cmd, device, *ls.w2[1], wr, l->w2, t.copy, rw, rh, true);
+        }
+        if (inspect && k == ib)
+            inspect_show(cmd, device, chain.inspect, t.inspect_off, t.inspect_off_state, t.inspect_on,
+                         t.inspect_on_state, t.copy);
+    }
+    // Handed to the upscaler: the colour's mirror (its own size, format and flags), NR's answer copied into the
+    // region at its own place, the subrect as the game gave it; without one, the region itself at base 0
+    ID3D12Resource* copy = t.copy;
+    bool moved = false;
+    if (ensure_mirror(device, t.mirror, t.mirror_state, f.color, false)) {
+        const D3D12_RESOURCE_DESC cd = f.color->GetDesc();
+        transition(cmd, f.color, st.color, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        transition(cmd, t.mirror, t.mirror_state, D3D12_RESOURCE_STATE_COPY_DEST);
+        copy_region(cmd, t.mirror, 0, 0, f.color, 0, 0, uint32_t(cd.Width), cd.Height);
+        transition(cmd, f.color, D3D12_RESOURCE_STATE_COPY_SOURCE, st.color);
+        transition(cmd, t.copy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        copy_region(cmd, t.mirror, rx, ry, t.copy, 0, 0, rw, rh);
+        transition(cmd, t.copy, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        t.copy_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        transition(cmd, t.mirror, D3D12_RESOURCE_STATE_COPY_DEST, st.color);
+        t.mirror_state = st.color;
+        copy = t.mirror;
+    } else {
+        transition(cmd, t.copy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, st.color);
+        t.copy_state = st.color;
+        moved = rx || ry;
+    }
+    *moved_out = moved;
+    return copy;
+}
+
+// The layers after the upscaler on its output, in place, recorded on `cmd`.
+void run_after(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, Tracked& t, const Chain& chain,
+               const LayerPlan& plan, const Frame& f, const States& st, const nr::asi::Wilsjo2Frame& wf, bool nr_on) {
+    const std::vector<const Layer*>& after = plan.after;
+    const D3D12_RESOURCE_DESC od = f.output->GetDesc();
+    const bool whole = !f.out_x && !f.out_y && od.Width == f.out_w && od.Height == f.out_h;
+    transition(cmd, f.output, st.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    // [Inspect]: the layers compared here, the output taken before the first of them and shown after the last
+    size_t ia = 0, ib = 0;
+    const bool inspect = inspect_span(chain.inspect, after, !plan.present_takes, &ia, &ib) &&
+                         inspect_format(od.Format);
+    const long held = chosen_index(chain.inspect, after);
+    const Frame live_frame = f; const States live_states = st; const auto live_wf = wf;
+    for (size_t k = 0; k < after.size(); ++k) {
+            Frame f = live_frame; States st = live_states; auto wf = live_wf;
+        const Layer* l = after[k];
+        if (long(k) == held) hold_frame(cmd, device, chain.inspect, t.hold, f.output, row_number(*l));
+            if (long(k) == held && chain.inspect.hold) hold_inputs(cmd, device, t.hold, f, st, wf);
+        if (inspect && k == ia) inspect_copy(cmd, device, t.inspect_off, t.inspect_off_state, f.output);
+        [&] {
+        LayerState& ls = layer_state(t, *l);
+        if (l->cfg.processing == nr::pe::Processing::kWilsjo2) {
+            // on the whole output resource (the native extent)
+            if (!nr_on) return;
+            if (!ls.w2[0]) ls.w2[0] = nr::asi::wilsjo2_owner();
+            nr::pe::renodx_route::CallNetwork network(l->network);
+            nr::pe::renodx_route::CallLayer number(row_number(*l));
+            nr::asi::Wilsjo2Frame wr = wf;
+            wr.reset = wr.reset || hold_released(row_number(*l));
+            // the processing reads and writes the output where it is; an output it cannot (no unordered access, or
+            // denied as a shader resource) goes through a copy of our own and back, as 0.0.7's fork did with its own
+            // intermediate
+            const bool in_place = (od.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
+                                  !(od.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE);
+            if (in_place) {
+                nr::asi::wilsjo2_run(cmd, device, *ls.w2[0], wr, l->w2, f.output, uint32_t(od.Width), od.Height, false);
+            } else if (ensure_texture(device, t.out_copy, t.out_copy_state, od.Format, uint32_t(od.Width), od.Height)) {
+                static bool said = false;
+                if (!said) { said = true; log("[nr] wilsjo2 after the upscaler: the output cannot be read and written in place (flags 0x%X); through a copy", unsigned(od.Flags)); }
+                transition(cmd, f.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                transition(cmd, t.out_copy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+                copy_region(cmd, t.out_copy, 0, 0, f.output, 0, 0, uint32_t(od.Width), od.Height);
+                transition(cmd, t.out_copy, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                nr::asi::wilsjo2_run(cmd, device, *ls.w2[0], wr, l->w2, t.out_copy, uint32_t(od.Width), od.Height, false);
+                transition(cmd, t.out_copy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                transition(cmd, f.output, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+                copy_region(cmd, f.output, 0, 0, t.out_copy, 0, 0, uint32_t(od.Width), od.Height);
+                transition(cmd, f.output, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                transition(cmd, t.out_copy, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            }
+        } else if (whole) {
+            run_renodx(cmd, ls, *l, 0, f, f.output, f.out_w, f.out_h, st);
+        } else if (ensure_texture(device, t.out_copy, t.out_copy_state, od.Format, f.out_w, f.out_h)) {
+            // An output subrect: its region out, NR, and back
+            transition(cmd, f.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            transition(cmd, t.out_copy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+            copy_region(cmd, t.out_copy, 0, 0, f.output, f.out_x, f.out_y, f.out_w, f.out_h);
+            transition(cmd, t.out_copy, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            run_renodx(cmd, ls, *l, 0, f, t.out_copy, f.out_w, f.out_h, st);
+            transition(cmd, t.out_copy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            transition(cmd, f.output, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+            copy_region(cmd, f.output, f.out_x, f.out_y, t.out_copy, 0, 0, f.out_w, f.out_h);
+            transition(cmd, f.output, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            transition(cmd, t.out_copy, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
+        }();
+        if (inspect && k == ib)
+            inspect_show(cmd, device, chain.inspect, t.inspect_off, t.inspect_off_state, t.inspect_on,
+                         t.inspect_on_state, f.output);
+    }
+    transition(cmd, f.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, st.output);
 }
 
 NVSDK_NGX_Result NR_NGX_MSABI hk_evaluate(ID3D12GraphicsCommandList* cmd, const NVSDK_NGX_Handle* h,
@@ -4477,215 +4748,30 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_evaluate(ID3D12GraphicsCommandList* cmd, const 
     // The layers by placement, in layer order. Before the upscaler with Ray Reconstruction too (RenoDX does not; players
     // found NR before it fine). A wilsjo2 layer: before only where its own conditions allow, and
     // with an output subrect away from the origin not at all.
-    uint32_t w2_aw = 0, w2_ah = 0;
-    const bool w2_before_ok = wilsjo2_before_ok(f, &w2_aw, &w2_ah);
-    std::vector<const Layer*> before, after;
-    bool before_renodx = false;
-    // Layers at Present run there (present_layers) and nowhere else (never before / after the upscaler in its
-    // place - the picture there differs too much). Here only their state when Present does not serve them: no Present
-    // of the game's has reached them for a second since they were wanted (its swap chain not found), or Present cannot
-    // serve this swap chain for their processing.
-    bool any_present = false;
-    for (const Layer& l : chain->layers) any_present |= present_layer(l);
-    const uint64_t now_ms = GetTickCount64();
-    if (!any_present) g_present.wanted_since_ms = 0;
-    else if (!g_present.wanted_since_ms) g_present.wanted_since_ms = now_ms;
-    const uint64_t served = g_present.served_ms.load();
-    const bool alive = !any_present || now_ms - g_present.wanted_since_ms < 1000 ||
-                       (served >= g_present.wanted_since_ms && now_ms - served < 1000);
-    const bool at_present = alive && !g_present.unusable.load(), at_present_w2 = alive && !g_present.unusable_w2.load();
-    bool present_wanted = false, present_takes = false;   // Present layers at all; some run at Present now
-    for (const Layer& l : chain->layers) {
-        const bool wilsjo2 = l.cfg.processing == nr::pe::Processing::kWilsjo2;
-        if (present_layer(l)) {
-            present_wanted = true;
-            if (wilsjo2 ? at_present_w2 : at_present) present_takes = true;
-            else if (!alive) layer_note(l, 2, 3, "waits for a Present of the game's (its swap chain was not found)");
-            else layer_note(l, 2, 3, "Present cannot serve this swap chain's colour format");
-            continue;
-        }
-        if (wilsjo2 && (f.out_x || f.out_y)) {
-            layer_note(l, 0, 3, "the output is a region away from the corner");
-            continue;
-        }
-        const bool want_before = l.cfg.placement == nr::pe::Placement::kBefore;
-        const bool b = want_before && (!wilsjo2 || w2_before_ok);
-        (b ? before : after).push_back(&l);
-        before_renodx |= b && !wilsjo2;
-        const char* note = want_before && !b ? "after the upscaler: this frame does not allow before" : "";
-        layer_note(l, b ? 1u : 0u, wilsjo2 && !nr_on ? 3u : 1u, wilsjo2 && !nr_on ? "NR is off (toggle key)" : note);
-    }
+    LayerPlan plan;
+    plan_layers(*chain, f, f.color->GetDesc(), nr_on, plan);
     const nr::asi::Wilsjo2Frame wf = wilsjo2_frame(p, f, st);
-    g_present.wanted = present_wanted;
-    if (present_wanted) {
-        bool depth_wanted = nr::pe::g_motion_without_depth_now.load() != 1 || chain->inspect.hold;
-        for (const Layer& l : chain->layers)
-            // (Passes (fast) Interleaved reads the depth itself - its anti-ghost's disocclusion test and vector
-            // dilation - whatever the network does: without the copy those tests never ran at Present)
-            depth_wanted |= present_layer(l) && (l.cfg.processing == nr::pe::Processing::kWilsjo2 ||
-                                                 (renodx_layer(l) && l.cfg.renodx.values.passes_mode == 1u &&
-                                                  l.cfg.renodx.values.fast_method == 0u));
-        capture_guides(cmd, device, f, st, wf, h->Id, depth_wanted);
-    }
+    g_present.wanted = plan.present_wanted;
+    if (plan.present_wanted) capture_guides(cmd, device, f, st, wf, h->Id, plan.depth_wanted);
 
-    NVSDK_NGX_Result r;
-    if (!before.empty()) {
-        // The colour's region copied into a texture of our own, the layers on it in order, and that texture handed to
-        // the upscaler in the colour's place (at base 0, in the colour's state); the game's colour is never written.
-        // The region: the render region from the colour's base (RenoDX's), or for wilsjo2 layers alone their active
-        // extent at origin 0.
-        const uint32_t rx = before_renodx ? f.color_x : 0u, ry = before_renodx ? f.color_y : 0u;
-        const uint32_t rw = before_renodx ? f.render_w : w2_aw, rh = before_renodx ? f.render_h : w2_ah;
-        const DXGI_FORMAT format = f.color->GetDesc().Format;
-        // The first layer, a RenoDX one, reads the game's colour where it is and stores its answer into the mirror
-        // handed to the upscaler - no copy of the colour's region, no copy of the colour into the mirror, no copy of the
-        // region back (three render-size copies; t.copy not needed). Where the region is the whole colour and nothing
-        // reads the frame before that layer (no comparison, no held frame), on a device that takes it in place
-        // (d12_reads_in_place). NR_BEFORE_DIRECT=0: as before.
-        static const bool before_direct_off = [] { const char* e = std::getenv("NR_BEFORE_DIRECT"); return e && e[0] == '0'; }();
-        const D3D12_RESOURCE_DESC cdesc = f.color->GetDesc();
-        size_t ia0 = 0, ib0 = 0;
-        const bool before_direct = !before_direct_off && before.front()->cfg.processing == nr::pe::Processing::kRenoDX &&
-            d12_reads_in_place(device) &&
-            rx == 0 && ry == 0 && uint64_t(rw) == cdesc.Width && rh == cdesc.Height &&
-            !inspect_span(chain->inspect, before, after.empty() && !present_takes, &ia0, &ib0) &&
-            chosen_index(chain->inspect, before) < 0 && ensure_mirror(device, t.mirror, t.mirror_state, f.color, true);
-        if (before_direct) {
-            if (t.copy) release_resource(t.copy);   // (made for frames that went the other way)
-            transition(cmd, f.color, st.color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-            transition(cmd, t.mirror, t.mirror_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            bool filled = false;
-            const Frame live_frame = f; const States live_states = st; const auto live_wf = wf;
-            for (size_t k = 0; k < before.size(); ++k) {
-                Frame f = live_frame; States st = live_states; auto wf = live_wf;
-                const Layer* l = before[k];
-                if (k > 0 && !filled) {   // the first could not run: the colour copied in for the rest
-                    transition(cmd, f.color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
-                    transition(cmd, t.mirror, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
-                    cmd->CopyResource(t.mirror, f.color);
-                    transition(cmd, t.mirror, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-                    transition(cmd, f.color, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                    filled = true;
-                }
-                LayerState& ls = layer_state(t, *l);
-                if (l->cfg.processing == nr::pe::Processing::kRenoDX) {
-                    const bool ran = run_renodx(cmd, ls, *l, 1, f, t.mirror, rw, rh, st, k == 0 ? f.color : nullptr);
-                    if (k == 0) filled = ran;
-                } else if (nr_on) {
-                    if (!ls.w2[1]) ls.w2[1] = nr::asi::wilsjo2_owner();
-                    nr::pe::renodx_route::CallNetwork network(l->network);
-                    nr::pe::renodx_route::CallLayer number(row_number(*l));
-                    nr::asi::Wilsjo2Frame wr = wf;
-                    wr.reset = wr.reset || hold_released(row_number(*l));
-                    wr.out_w = f.out_w; wr.out_h = f.out_h;
-                    nr::asi::wilsjo2_run(cmd, device, *ls.w2[1], wr, l->w2, t.mirror, rw, rh, true);
-                }
-            }
-            transition(cmd, f.color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, st.color);
-            ID3D12Resource* handed = filled ? t.mirror : f.color;   // nothing ran: the game's own colour
-            if (filled) {
-                transition(cmd, t.mirror, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, st.color);
-                t.mirror_state = st.color;
-            } else {
-                t.mirror_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-            }
-            guard.unlock();
-            if (handed != f.color) { if (f.color_as_resource) p->Set(f.color_key, handed); else p->Set(f.color_key, static_cast<void*>(handed)); }
-            if (tr) log("[nr] trace %d: the layers before the upscaler recorded; OptiScaler's evaluate next", tr);
-            r = real_evaluate(cmd, h, p, callback);
-            if (tr) log("[nr] trace %d: OptiScaler's evaluate returned %d", tr, int(r));
-            if (handed != f.color) { if (f.color_as_resource) p->Set(f.color_key, f.color); else p->Set(f.color_key, static_cast<void*>(f.color)); }
-            goto after_layers;
-        }
-        const DXGI_FORMAT copy_fmt = writable(format);
-        if (!ensure_texture(device, t.copy, t.copy_state, copy_fmt, rw, rh)) {
-            // the layers before the upscaler cannot run this frame: the upscaler and the layers after it still do
-            // (0.0.7 ran its after-SR NR on its own)
-            static bool said = false;
-            if (!said) { said = true; log("[nr] the colour's copy could not be made; the layers before the upscaler skip such frames, the layers after it run"); }
-            guard.unlock();
-            r = real_evaluate(cmd, h, p, callback);
-            goto after_layers;
-        }
-        transition(cmd, f.color, st.color, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        transition(cmd, t.copy, t.copy_state, D3D12_RESOURCE_STATE_COPY_DEST);
-        copy_region(cmd, t.copy, 0, 0, f.color, rx, ry, rw, rh);
-        transition(cmd, f.color, D3D12_RESOURCE_STATE_COPY_SOURCE, st.color);
-        transition(cmd, t.copy, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        // [Inspect]: the final picture's comparison is here when nothing runs after the upscaler or at Present (the
-        // comparison then goes through the upscaler); a chosen layer's wherever it runs
-        size_t ia = 0, ib = 0;
-        const bool inspect = inspect_span(chain->inspect, before, after.empty() && !present_takes, &ia, &ib) &&
-                             inspect_format(copy_fmt);
-        const long held = chosen_index(chain->inspect, before);
-        const Frame live_frame = f; const States live_states = st; const auto live_wf = wf;
-        for (size_t k = 0; k < before.size(); ++k) {
-            Frame f = live_frame; States st = live_states; auto wf = live_wf;
-            const Layer* l = before[k];
-            if (long(k) == held) hold_frame(cmd, device, chain->inspect, t.hold, t.copy, row_number(*l));
-            if (long(k) == held && chain->inspect.hold) hold_inputs(cmd, device, t.hold, f, st, wf);
-            if (inspect && k == ia) inspect_copy(cmd, device, t.inspect_off, t.inspect_off_state, t.copy);
-            LayerState& ls = layer_state(t, *l);
-            if (l->cfg.processing == nr::pe::Processing::kRenoDX) {
-                run_renodx(cmd, ls, *l, 1, f, t.copy, rw, rh, st);
-            } else if (nr_on) {
-                if (!ls.w2[1]) ls.w2[1] = nr::asi::wilsjo2_owner();
-                nr::pe::renodx_route::CallNetwork network(l->network);
-                nr::pe::renodx_route::CallLayer number(row_number(*l));
-                nr::asi::Wilsjo2Frame wr = wf;
-                wr.reset = wr.reset || hold_released(row_number(*l));
-                wr.out_w = f.out_w; wr.out_h = f.out_h;
-                nr::asi::wilsjo2_run(cmd, device, *ls.w2[1], wr, l->w2, t.copy, rw, rh, true);
-            }
-            if (inspect && k == ib)
-                inspect_show(cmd, device, chain->inspect, t.inspect_off, t.inspect_off_state, t.inspect_on,
-                             t.inspect_on_state, t.copy);
-        }
-        // Handed to the upscaler: the colour's mirror (its own size, format and flags), NR's answer copied into the
-        // region at its own place, the subrect as the game gave it; without one, the region itself at base 0
-        ID3D12Resource* copy = t.copy;
-        bool moved = false;
-        if (ensure_mirror(device, t.mirror, t.mirror_state, f.color, false)) {
-            const D3D12_RESOURCE_DESC cd = f.color->GetDesc();
-            transition(cmd, f.color, st.color, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            transition(cmd, t.mirror, t.mirror_state, D3D12_RESOURCE_STATE_COPY_DEST);
-            copy_region(cmd, t.mirror, 0, 0, f.color, 0, 0, uint32_t(cd.Width), cd.Height);
-            transition(cmd, f.color, D3D12_RESOURCE_STATE_COPY_SOURCE, st.color);
-            transition(cmd, t.copy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            copy_region(cmd, t.mirror, rx, ry, t.copy, 0, 0, rw, rh);
-            transition(cmd, t.copy, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            t.copy_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-            transition(cmd, t.mirror, D3D12_RESOURCE_STATE_COPY_DEST, st.color);
-            t.mirror_state = st.color;
-            copy = t.mirror;
-        } else {
-            transition(cmd, t.copy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, st.color);
-            t.copy_state = st.color;
-            moved = rx || ry;
-        }
-        guard.unlock();
-        if (f.color_as_resource) p->Set(f.color_key, copy); else p->Set(f.color_key, static_cast<void*>(copy));
-        if (moved) {
-            p->Set("DLSS.Input.Color.Subrect.Base.X", 0u);
-            p->Set("DLSS.Input.Color.Subrect.Base.Y", 0u);
-        }
-        if (tr) log("[nr] trace %d: the layers before the upscaler recorded; OptiScaler's evaluate next", tr);
-        r = real_evaluate(cmd, h, p, callback);
-        if (tr) log("[nr] trace %d: OptiScaler's evaluate returned %d", tr, int(r));
-        if (f.color_as_resource) p->Set(f.color_key, f.color); else p->Set(f.color_key, static_cast<void*>(f.color));
-        if (moved) {
-            p->Set("DLSS.Input.Color.Subrect.Base.X", f.color_x);
-            p->Set("DLSS.Input.Color.Subrect.Base.Y", f.color_y);
-        }
-    } else {
-        guard.unlock();
-        if (tr) log("[nr] trace %d: no layer before the upscaler; OptiScaler's evaluate next", tr);
-        r = real_evaluate(cmd, h, p, callback);
-        if (tr) log("[nr] trace %d: OptiScaler's evaluate returned %d", tr, int(r));
+    bool moved = false;
+    ID3D12Resource* const handed = plan.before.empty() ? f.color : run_before(cmd, device, t, *chain, plan, f, st, wf, nr_on, &moved);
+    guard.unlock();
+    if (handed != f.color) { if (f.color_as_resource) p->Set(f.color_key, handed); else p->Set(f.color_key, static_cast<void*>(handed)); }
+    if (moved) {
+        p->Set("DLSS.Input.Color.Subrect.Base.X", 0u);
+        p->Set("DLSS.Input.Color.Subrect.Base.Y", 0u);
     }
-after_layers:
+    if (tr) log("[nr] trace %d: %s; OptiScaler's evaluate next", tr, plan.before.empty() ? "no layer before the upscaler" : "the layers before the upscaler recorded");
+    const NVSDK_NGX_Result r = real_evaluate(cmd, h, p, callback);
+    if (tr) log("[nr] trace %d: OptiScaler's evaluate returned %d", tr, int(r));
+    if (handed != f.color) { if (f.color_as_resource) p->Set(f.color_key, f.color); else p->Set(f.color_key, static_cast<void*>(f.color)); }
+    if (moved) {
+        p->Set("DLSS.Input.Color.Subrect.Base.X", f.color_x);
+        p->Set("DLSS.Input.Color.Subrect.Base.Y", f.color_y);
+    }
     if (r != NVSDK_NGX_Result_Success) return r;
-    if (after.empty()) { if (tr) log("[nr] trace %d: back to the game", tr); return r; }
+    if (plan.after.empty()) { if (tr) log("[nr] trace %d: back to the game", tr); return r; }
 
     // After the upscaler: the layers on its output, in place, on the same command list.
     guard.lock();
@@ -4693,73 +4779,7 @@ after_layers:
     if (it == g_features.end()) return r;
     Tracked& t2 = it->second;
     match_layers(t2, *chain);
-    const D3D12_RESOURCE_DESC od = f.output->GetDesc();
-    const bool whole = !f.out_x && !f.out_y && od.Width == f.out_w && od.Height == f.out_h;
-    transition(cmd, f.output, st.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    // [Inspect]: the layers compared here, the output taken before the first of them and shown after the last
-    size_t ia = 0, ib = 0;
-    const bool inspect = inspect_span(chain->inspect, after, !present_takes, &ia, &ib) &&
-                         inspect_format(od.Format);
-    const long held = chosen_index(chain->inspect, after);
-    const Frame live_frame = f; const States live_states = st; const auto live_wf = wf;
-    for (size_t k = 0; k < after.size(); ++k) {
-            Frame f = live_frame; States st = live_states; auto wf = live_wf;
-        const Layer* l = after[k];
-        if (long(k) == held) hold_frame(cmd, device, chain->inspect, t2.hold, f.output, row_number(*l));
-            if (long(k) == held && chain->inspect.hold) hold_inputs(cmd, device, t2.hold, f, st, wf);
-        if (inspect && k == ia) inspect_copy(cmd, device, t2.inspect_off, t2.inspect_off_state, f.output);
-        [&] {
-        LayerState& ls = layer_state(t2, *l);
-        if (l->cfg.processing == nr::pe::Processing::kWilsjo2) {
-            // on the whole output resource (the native extent)
-            if (!nr_on) return;
-            if (!ls.w2[0]) ls.w2[0] = nr::asi::wilsjo2_owner();
-            nr::pe::renodx_route::CallNetwork network(l->network);
-            nr::pe::renodx_route::CallLayer number(row_number(*l));
-            nr::asi::Wilsjo2Frame wr = wf;
-            wr.reset = wr.reset || hold_released(row_number(*l));
-            // the processing reads and writes the output where it is; an output it cannot (no unordered access, or
-            // denied as a shader resource) goes through a copy of our own and back, as 0.0.7's fork did with its own
-            // intermediate
-            const bool in_place = (od.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
-                                  !(od.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE);
-            if (in_place) {
-                nr::asi::wilsjo2_run(cmd, device, *ls.w2[0], wr, l->w2, f.output, uint32_t(od.Width), od.Height, false);
-            } else if (ensure_texture(device, t2.out_copy, t2.out_copy_state, od.Format, uint32_t(od.Width), od.Height)) {
-                static bool said = false;
-                if (!said) { said = true; log("[nr] wilsjo2 after the upscaler: the output cannot be read and written in place (flags 0x%X); through a copy", unsigned(od.Flags)); }
-                transition(cmd, f.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-                transition(cmd, t2.out_copy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
-                copy_region(cmd, t2.out_copy, 0, 0, f.output, 0, 0, uint32_t(od.Width), od.Height);
-                transition(cmd, t2.out_copy, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-                nr::asi::wilsjo2_run(cmd, device, *ls.w2[0], wr, l->w2, t2.out_copy, uint32_t(od.Width), od.Height, false);
-                transition(cmd, t2.out_copy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-                transition(cmd, f.output, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-                copy_region(cmd, f.output, 0, 0, t2.out_copy, 0, 0, uint32_t(od.Width), od.Height);
-                transition(cmd, f.output, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-                transition(cmd, t2.out_copy, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            }
-        } else if (whole) {
-            run_renodx(cmd, ls, *l, 0, f, f.output, f.out_w, f.out_h, st);
-        } else if (ensure_texture(device, t2.out_copy, t2.out_copy_state, od.Format, f.out_w, f.out_h)) {
-            // An output subrect: its region out, NR, and back
-            transition(cmd, f.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            transition(cmd, t2.out_copy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
-            copy_region(cmd, t2.out_copy, 0, 0, f.output, f.out_x, f.out_y, f.out_w, f.out_h);
-            transition(cmd, t2.out_copy, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            run_renodx(cmd, ls, *l, 0, f, t2.out_copy, f.out_w, f.out_h, st);
-            transition(cmd, t2.out_copy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            transition(cmd, f.output, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-            copy_region(cmd, f.output, f.out_x, f.out_y, t2.out_copy, 0, 0, f.out_w, f.out_h);
-            transition(cmd, f.output, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            transition(cmd, t2.out_copy, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        }
-        }();
-        if (inspect && k == ib)
-            inspect_show(cmd, device, chain->inspect, t2.inspect_off, t2.inspect_off_state, t2.inspect_on,
-                         t2.inspect_on_state, f.output);
-    }
-    transition(cmd, f.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, st.output);
+    run_after(cmd, device, t2, *chain, plan, f, st, wf, nr_on);
     if (tr) log("[nr] trace %d: the layers after the upscaler recorded; back to the game", tr);
     return r;
 }
