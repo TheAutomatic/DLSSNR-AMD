@@ -591,6 +591,15 @@ bool Device::create_d3d12(ID3D12Device* device, uint32_t width, uint32_t height,
     return true;
 }
 
+bool Device::d3d11_keyed_handover() const {
+    // Make this opt-in: reacquiring the texture on the D3D11 side blocks the render thread.
+    static const bool enabled = [] {
+        char value[2]{};
+        return GetEnvironmentVariableA("NR_D11_VK_KEYED_MUTEX", value, sizeof value) == 1 && value[0] == '1';
+    }();
+    return enabled && keyed_mutex_;
+}
+
 bool Device::create_d3d11(ID3D11Device* device, uint32_t width, uint32_t height, DXGI_FORMAT format, Image* out,
                           std::string* why) {
     destroy(*out);
@@ -619,7 +628,8 @@ bool Device::create_d3d11(ID3D11Device* device, uint32_t width, uint32_t height,
     desc.Format = format; desc.SampleDesc.Count = 1;
     desc.Usage = D3D11_USAGE_DEFAULT;
     desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | (storage ? D3D11_BIND_UNORDERED_ACCESS : 0);
-    desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+    desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE |
+                     (d3d11_keyed_handover() ? D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX : D3D11_RESOURCE_MISC_SHARED);
     ID3D11Texture2D* texture = nullptr;
     HRESULT hr = device->CreateTexture2D(&desc, nullptr, &texture);
     if (FAILED(hr)) {
@@ -703,12 +713,14 @@ bool Device::create_d3d10(ID3D10Device* device, uint32_t width, uint32_t height,
 bool Device::submit_keyed(Job* job, uint64_t generation, const std::vector<const Image*>& images,
                           uint64_t acquire_key, uint64_t release_key) {
     std::vector<std::function<void()>> calls;
+    bool rejected = false;
     {
         std::lock_guard<std::mutex> guard(jobs_mutex_);
         if (job->gen != generation || job->state != Job::Ready) return false;
-        if (lost_) { drop_locked(job, calls); }
+        rejected = lost_;
+        if (rejected) drop_locked(job, calls);
     }
-    if (!calls.empty()) { for (auto& c : calls) c(); return false; }
+    if (rejected) { for (auto& c : calls) c(); return false; }
     std::vector<VkDeviceMemory> memories;
     for (const Image* i : images) if (i && i->memory) memories.push_back(i->memory);
     std::vector<uint64_t> acquire(memories.size(), acquire_key), release(memories.size(), release_key);

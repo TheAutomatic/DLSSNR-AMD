@@ -85,6 +85,7 @@ class Device {
                       std::string* why);
     bool create_d3d11(ID3D11Device* device, uint32_t width, uint32_t height, DXGI_FORMAT format, Image* out,
                       std::string* why);
+    bool d3d11_keyed_handover() const;
     // D3D10 has no fences: its shared textures carry a keyed mutex (legacy shared handle), and the
     // hand-over is the mutex - the D3D10 side releases key 1, our submit acquires 1 and releases 2,
     // the D3D10 side acquires 2. Needs VK_KHR_win32_keyed_mutex.
