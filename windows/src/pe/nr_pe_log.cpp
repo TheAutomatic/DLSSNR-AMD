@@ -9,6 +9,14 @@
 #include <string>
 
 namespace nr::pe {
+
+LocalTime::LocalTime() {
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    std::snprintf(text, sizeof text, "%02u:%02u:%02u.%03u", unsigned(now.wHour), unsigned(now.wMinute),
+                  unsigned(now.wSecond), unsigned(now.wMilliseconds));
+}
+
 namespace {
 
 std::mutex log_lock;

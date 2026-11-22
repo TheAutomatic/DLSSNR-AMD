@@ -63,17 +63,6 @@ namespace {
 
 using nr::pe::log;
 
-struct LocalTime {
-    char text[13]{};
-
-    LocalTime() {
-        SYSTEMTIME now{};
-        GetLocalTime(&now);
-        std::snprintf(text, sizeof text, "%02u:%02u:%02u.%03u", unsigned(now.wHour), unsigned(now.wMinute),
-                      unsigned(now.wSecond), unsigned(now.wMilliseconds));
-    }
-};
-
 bool diagnostic_log_due(std::chrono::steady_clock::time_point& last) {
     const auto now = std::chrono::steady_clock::now();
     if (last != std::chrono::steady_clock::time_point{} && now - last < std::chrono::seconds(1)) return false;
@@ -419,6 +408,7 @@ struct Session::Impl {
     // Evaluations that ran the network and that passed the frame through (building, freeing, failed): in the log
     // every kPassLog while NR is asked for, and for the whole session at its end.
     uint64_t ran{}, passed{}, ran_total{}, passed_total{};
+    void log_interval(double seconds, const char* present_stats = nullptr);
     uint64_t renodx_frame_index{}, no_history_evals{}, look_dt_spikes{};
     std::chrono::steady_clock::time_point no_history_logged{}, look_dt_logged{};
     bool totals_logged{};   // Session::log_totals
@@ -2253,40 +2243,42 @@ bool Session::Impl::ensure_runtime(const Controls& controls, uint32_t w, uint32_
     }
     heap_poll();
     if (!building && !plan_demanded() && drs_recent()) prefetch();
-    {
-        const auto now = std::chrono::steady_clock::now();
-        if (pass_logged == std::chrono::steady_clock::time_point{}) pass_logged = now;
-        if (now - pass_logged >= kPassLog) {
-            // every 10 s with NR asked for: a log that shows NR running as well as not (the OptiScaler route has no
-            // frame line of its own)
-            // on the bridge also the recordings handed to our device (each a cut of a command list and copies)
-            char handed[64] = "";
-            if (bdev) std::snprintf(handed, sizeof handed, "; %llu hand-overs to our device",
-                                    (unsigned long long)(bridge_runs - bridge_runs_logged));
-            bridge_runs_logged = bridge_runs;
-            if (passed || ran) {
-                // (ran = the network was ready for the evaluation; the passes by their reasons, most frequent first)
-                std::vector<std::pair<uint64_t, const std::string*>> why;
-                for (const auto& [text, n] : pass_why) why.push_back({n, &text});
-                std::sort(why.begin(), why.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
-                std::string reasons;
-                for (size_t i = 0; i < why.size() && i < 4; ++i)
-                    reasons += (i ? "; " : "; passed: ") + std::to_string(why[i].first) + " x " + *why[i].second;
-                log("[nr] %s last %.0f s: %llu evaluations ran the network, %llu passed the frame through (%s)%s%s; "
-                    "RenoDX: %llu evaluations without network history, %llu Look dt spikes (>25 ms); %s",
-                    LocalTime{}.text, std::chrono::duration<double>(now - pass_logged).count(), (unsigned long long)ran,
-                    (unsigned long long)passed, ok ? "running now" : status.c_str(), reasons.c_str(), handed,
-                    (unsigned long long)no_history_evals, (unsigned long long)look_dt_spikes,
-                    memory_report().c_str());
-            }
-            pass_why.clear();
-            ran_total += ran; passed_total += passed; ran = passed = 0;
-            no_history_evals = look_dt_spikes = 0;
-            if (nr::pe::stats::log_due()) nr::pe::stats::log_text(4);   // every 5 minutes: the whole session's, short
-            pass_logged = now;
-        }
+#ifndef NR_RESHADE_ROUTE
+    const auto now = std::chrono::steady_clock::now();
+    if (pass_logged == std::chrono::steady_clock::time_point{}) pass_logged = now;
+    if (now - pass_logged >= kPassLog) {
+        log_interval(std::chrono::duration<double>(now - pass_logged).count());
+        pass_logged = now;
     }
+#endif
     return ok;
+}
+
+void Session::Impl::log_interval(double seconds, const char* present_stats) {
+    // The bridge also counts recordings handed to our device (each a cut of a command list and copies).
+    char handed[64] = "";
+    if (bdev) std::snprintf(handed, sizeof handed, "; %llu hand-overs to our device",
+                            (unsigned long long)(bridge_runs - bridge_runs_logged));
+    bridge_runs_logged = bridge_runs;
+    if (passed || ran || present_stats) {
+        // ran = the network was ready for the evaluation; the passes by their reasons, most frequent first.
+        std::vector<std::pair<uint64_t, const std::string*>> why;
+        for (const auto& [text, n] : pass_why) why.push_back({n, &text});
+        std::sort(why.begin(), why.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+        std::string reasons;
+        for (size_t i = 0; i < why.size() && i < 4; ++i)
+            reasons += (i ? "; " : "; passed: ") + std::to_string(why[i].first) + " x " + *why[i].second;
+        const char* state = !ran && !passed ? "no evaluations" : last_ok ? "running now" : status.c_str();
+        log("[nr] %s last %.0f s: %llu evaluations ran the network, %llu passed the frame through (%s)%s%s; "
+            "RenoDX: %llu evaluations without network history, %llu Look dt spikes (>25 ms)%s%s; %s",
+            LocalTime{}.text, seconds, (unsigned long long)ran, (unsigned long long)passed, state, reasons.c_str(), handed,
+            (unsigned long long)no_history_evals, (unsigned long long)look_dt_spikes,
+            present_stats ? "; " : "", present_stats ? present_stats : "", memory_report().c_str());
+    }
+    pass_why.clear();
+    ran_total += ran; passed_total += passed; ran = passed = 0;
+    no_history_evals = look_dt_spikes = 0;
+    if (nr::pe::stats::log_due()) nr::pe::stats::log_text(4);   // every 5 minutes: the whole session's, short
 }
 
 bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32_t h, VkFormat format) {
@@ -3811,6 +3803,10 @@ void Session::log_totals() {
         log("[nr] session: %llu evaluations ran the network, %llu passed the frame through", (unsigned long long)r,
             (unsigned long long)p);
     if (r + p) nr::pe::stats::log_text(12);
+}
+
+void Session::log_reshade_interval(double seconds, const char* present_stats) {
+    impl_->log_interval(seconds, present_stats);
 }
 
 Session::~Session() {
