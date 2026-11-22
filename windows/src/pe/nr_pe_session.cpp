@@ -4743,9 +4743,14 @@ bool Session::Impl::finish11(Recording11& rec) {
         return false;
     }
     const uint64_t gen = bdev->generation(rec.job);
-    if (rec.d11) {
+    const auto copy_into_twins = [&] {
         // The twins' content, by the context: after everything it was given so far.
         for (const auto& u : rec.uses) {
+            if (rec.d10) {
+                rec.d10->CopyResource(static_cast<ID3D10Texture2D*>(u.twin->image.d3d),
+                                      static_cast<ID3D10Texture2D*>(u.d3d));
+                continue;
+            }
             auto* tw = static_cast<ID3D11Texture2D*>(u.twin->image.d3d);
             if (!u.twin->depth) {
                 rec.context->CopyResource(tw, static_cast<ID3D11Texture2D*>(u.d3d));
@@ -4754,15 +4759,27 @@ bool Session::Impl::finish11(Recording11& rec) {
                 log("[nr] bridge: running without depth: %s", why.c_str());
             }
         }
-        if (!bdev->run_between(rec.context, rec.job, gen)) return false;
-        for (const auto& u : rec.uses)
-            if (u.write)
+    };
+    const auto copy_from_twins = [&] {
+        for (const auto& u : rec.uses) {
+            if (!u.write) continue;
+            if (rec.d10) {
+                rec.d10->CopyResource(static_cast<ID3D10Texture2D*>(u.d3d),
+                                      static_cast<ID3D10Texture2D*>(u.twin->image.d3d));
+            } else {
                 rec.context->CopyResource(static_cast<ID3D11Texture2D*>(u.d3d), static_cast<ID3D11Texture2D*>(u.twin->image.d3d));
+            }
+        }
+    };
+    if (rec.d11 && !bdev->d3d11_keyed_handover()) {
+        copy_into_twins();
+        if (!bdev->run_between(rec.context, rec.job, gen)) return false;
+        copy_from_twins();
         static bool first = true;
         if (first) { first = false; log("[nr] bridge: first D3D11 frame handed over through the shared fence"); }
         return true;
     }
-    // D3D10: the twins taken at key 0 (ours on the D3D10 side) and copied into, then handed to our queue at key 1; a
+    // Keyed hand-over: take the twins at key 0 on the D3D side, copy into them and hand them to our queue at key 1. A
     // texture that refused stays ours at 0, the rest are taken back to 0. A key that was abandoned (a holder died) is
     // not used again.
     std::vector<const bridge::Image*> images;
@@ -4774,8 +4791,7 @@ bool Session::Impl::finish11(Recording11& rec) {
         if (took != Keyed::Timeout) { failed = true; log("[nr] bridge: %s", status.c_str()); }
         return false;
     }
-    for (const auto& u : rec.uses)
-        rec.d10->CopyResource(static_cast<ID3D10Texture2D*>(u.twin->image.d3d), static_cast<ID3D10Texture2D*>(u.d3d));
+    copy_into_twins();
     std::vector<bool> released;
     if (!release_all(images, 1, &released)) {
         bdev->discard(rec.job, gen);
@@ -4787,7 +4803,8 @@ bool Session::Impl::finish11(Recording11& rec) {
         log("[nr] bridge: %s%s", status.c_str(), recovered ? "" : "; the textures are lost to us");
         return false;
     }
-    rec.d10->Flush();
+    if (rec.context) rec.context->Flush();
+    else rec.d10->Flush();
     if (!bdev->submit_keyed(rec.job, gen, images, 1, 2)) {
         // Take the textures back at the key we left them at, so the next frame starts from 0.
         const bool recovered = acquire_all(images, 1, 1000) == Keyed::Ok && release_all(images, 0);
@@ -4795,7 +4812,7 @@ bool Session::Impl::finish11(Recording11& rec) {
         if (!recovered) { failed = true; log("[nr] bridge: %s; the shared textures are lost to us", status.c_str()); }
         return false;
     }
-    // Key 2: the network has finished. Waiting here is the only order D3D10 offers (it has no fences).
+    // Key 2: the network has finished and released the textures back to D3D.
     const Keyed back = acquire_all(images, 2, 1000);
     if (back != Keyed::Ok) {
         status = std::string("the network did not hand the frame back (") + keyed_text(back) + ")";
@@ -4803,13 +4820,14 @@ bool Session::Impl::finish11(Recording11& rec) {
         log("[nr] bridge: %s", status.c_str());
         return false;
     }
-    for (const auto& u : rec.uses)
-        if (u.write)
-            rec.d10->CopyResource(static_cast<ID3D10Texture2D*>(u.d3d), static_cast<ID3D10Texture2D*>(u.twin->image.d3d));
+    copy_from_twins();
     if (!release_all(images, 0)) {
         status = "a shared texture's keyed mutex was not handed back after the frame";
         failed = true;
         log("[nr] bridge: %s", status.c_str());
+    } else if (rec.d11) {
+        static std::once_flag first;
+        std::call_once(first, [] { log("[nr] bridge: first D3D11 frame handed over through shared texture keyed mutexes"); });
     }
     return true;
 }
