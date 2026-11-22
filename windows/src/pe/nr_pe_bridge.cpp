@@ -597,6 +597,12 @@ bool Device::d3d11_keyed_handover() const {
         char value[2]{};
         return GetEnvironmentVariableA("NR_D11_VK_KEYED_MUTEX", value, sizeof value) == 1 && value[0] == '1';
     }();
+    if (enabled && !keyed_mutex_) {
+        static std::once_flag warned;
+        std::call_once(warned, [] {
+            log("[nr] bridge: NR_D11_VK_KEYED_MUTEX=1 ignored (the driver has no VK_KHR_win32_keyed_mutex); using the shared fence");
+        });
+    }
     return enabled && keyed_mutex_;
 }
 
@@ -724,7 +730,7 @@ bool Device::submit_keyed(Job* job, uint64_t generation, const std::vector<const
     std::vector<VkDeviceMemory> memories;
     for (const Image* i : images) if (i && i->memory) memories.push_back(i->memory);
     std::vector<uint64_t> acquire(memories.size(), acquire_key), release(memories.size(), release_key);
-    std::vector<uint32_t> timeouts(memories.size(), 1000);
+    std::vector<uint32_t> timeouts(memories.size(), kKeyedTimeoutMs);
     VkWin32KeyedMutexAcquireReleaseInfoKHR km{VK_STRUCTURE_TYPE_WIN32_KEYED_MUTEX_ACQUIRE_RELEASE_INFO_KHR};
     km.acquireCount = uint32_t(memories.size());
     km.pAcquireSyncs = memories.data();
@@ -747,6 +753,7 @@ bool Device::submit_keyed(Job* job, uint64_t generation, const std::vector<const
             drop_locked(job, calls);
             static bool said = false;
             if (!said) { said = true; log("[nr] bridge: keyed-mutex vkQueueSubmit failed (%d)", int(r)); }
+            if (r == VK_ERROR_DEVICE_LOST && !lost_) { lost_ = true; log("[nr] bridge: our Vulkan device was lost"); }
         } else {
             job->state = Job::Submitted;
             job->submitted = ++g_submits;

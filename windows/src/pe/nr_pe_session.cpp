@@ -4784,7 +4784,7 @@ bool Session::Impl::finish11(Recording11& rec) {
     // not used again.
     std::vector<const bridge::Image*> images;
     for (const auto& u : rec.uses) images.push_back(&u.twin->image);
-    const Keyed took = acquire_all(images, 0, 1000);
+    const Keyed took = acquire_all(images, 0, bridge::kKeyedTimeoutMs);
     if (took != Keyed::Ok) {
         bdev->discard(rec.job, gen);
         status = std::string("the shared textures' keyed mutex ") + keyed_text(took);
@@ -4797,7 +4797,7 @@ bool Session::Impl::finish11(Recording11& rec) {
         bdev->discard(rec.job, gen);
         std::vector<const bridge::Image*> back;
         for (size_t n = 0; n < images.size(); ++n) if (released[n]) back.push_back(images[n]);
-        const bool recovered = acquire_all(back, 1, 1000) == Keyed::Ok && release_all(images, 0);
+        const bool recovered = acquire_all(back, 1, bridge::kKeyedTimeoutMs) == Keyed::Ok && release_all(images, 0);
         status = "a shared texture's keyed mutex could not be handed over";
         if (!recovered) failed = true;
         log("[nr] bridge: %s%s", status.c_str(), recovered ? "" : "; the textures are lost to us");
@@ -4807,13 +4807,13 @@ bool Session::Impl::finish11(Recording11& rec) {
     else rec.d10->Flush();
     if (!bdev->submit_keyed(rec.job, gen, images, 1, 2)) {
         // Take the textures back at the key we left them at, so the next frame starts from 0.
-        const bool recovered = acquire_all(images, 1, 1000) == Keyed::Ok && release_all(images, 0);
+        const bool recovered = acquire_all(images, 1, bridge::kKeyedTimeoutMs) == Keyed::Ok && release_all(images, 0);
         status = "the bridge submit failed";
         if (!recovered) { failed = true; log("[nr] bridge: %s; the shared textures are lost to us", status.c_str()); }
         return false;
     }
     // Key 2: the network has finished and released the textures back to D3D.
-    const Keyed back = acquire_all(images, 2, 1000);
+    const Keyed back = acquire_all(images, 2, bridge::kKeyedTimeoutMs);
     if (back != Keyed::Ok) {
         status = std::string("the network did not hand the frame back (") + keyed_text(back) + ")";
         failed = true;
