@@ -55,6 +55,9 @@ struct Image {
 // otherwise. DXGI_FORMAT_UNKNOWN for what the bridge does not carry.
 DXGI_FORMAT shared_format(DXGI_FORMAT format);
 
+// Wait budget for a keyed-mutex handover on either API (matches the 2 s D3D11 fence waits and Windows TDR).
+inline constexpr uint32_t kKeyedTimeoutMs = 2000;
+
 // A recording of the network for one frame. Made with Device::begin, finished with Device::end, then
 // either submitted (run_between / submit) or discarded.
 struct Job;
