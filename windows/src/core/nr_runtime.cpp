@@ -2685,7 +2685,8 @@ EngineResult Runtime::record_engine(VkCommandBuffer cmd, const EngineFrame& fram
     // both providers. It costs one blit and it means the consumer cannot drift
     // between the two paths - which was the point of splitting them.
     TemporalFrame temporal{frame.reset, frame.feature};
-    result.frame = record_all(cmd, frame.colour, c, nullptr, &temporal, &consumed, &frame).frame;
+    result.frame = record_all(cmd, frame.colour, c, nullptr, &temporal, &consumed, &frame,
+                              &result.history_skip_reason).frame;
     result.history_consumed = consumed;
     result.motion_provider = "engine";
     return result;
@@ -2693,7 +2694,7 @@ EngineResult Runtime::record_engine(VkCommandBuffer cmd, const EngineFrame& fram
 
 ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& frame, const Controls& c,
                              const ControlMaskFrame* mask, const TemporalFrame* temporal,
-                             bool* history_consumed, const EngineFrame* engine) {
+                             bool* history_consumed, const EngineFrame* engine, const char** history_skip_reason) {
     impl_->gpu_uses.touch();
     if (impl_->heap) impl_->heap->uses[impl_->heap_region].touch();
     if (stale()) throw std::logic_error("a runtime whose images another one has taken over (Runtime::stale)");
@@ -3007,7 +3008,8 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         // all.
         Impl::InputDomain& previous = fs ? fs->input : impl_->input_single;
         const bool domain_changed = !(input == previous);
-        gate = (fs ? fs->latch : t.latch) && !temporal->reset && !domain_changed;
+        const bool latched = fs ? fs->latch : t.latch;
+        gate = latched && !temporal->reset && !domain_changed;
         previous = input;
         // The pre block's noise seed, the DLL's rule: a counter in the pre node
         // (+0xc8) handed to the kernel and then incremented (0x180060f44), zeroed
@@ -3028,6 +3030,9 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         }();
         if (diag_seed0) pre_seed = 0;
         if (diag_tgate0) gate = false;
+        if (history_skip_reason && !gate)
+            *history_skip_reason = temporal->reset ? "reset requested" : !latched ? "fresh history latch"
+                                 : domain_changed ? "input domain changed" : "NR_DIAG_TGATE0";
         const uint32_t p = fs ? fs->parity : t.parity;
         if (engine) {
             // Engine motion: sampled in place (mv_direct, put back after the
