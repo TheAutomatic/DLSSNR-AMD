@@ -45,6 +45,7 @@ class Session {
     // The run's "session: N evaluations ran the network, M passed the frame through" line (once; the destructor
     // writes it otherwise). For a session left undestroyed at process exit.
     void log_totals();
+    void log_reshade_interval(double seconds, const char* present_stats);
 
     // The post block's history strength, 0..1; see Config::history. Applies to
     // the running network at once and to any network built later.

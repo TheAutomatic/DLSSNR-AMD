@@ -33,6 +33,11 @@ const char* module_folder();
 // loaded even if every later step fails.
 void log(const char* format, ...);
 
+struct LocalTime {
+    char text[13]{};
+    LocalTime();
+};
+
 // Where the log went, for anyone who needs to say it out loud.
 const char* log_path();
 
