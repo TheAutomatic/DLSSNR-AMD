@@ -174,11 +174,15 @@ using nr::lang::tr_text;
 unsigned diag_stage = 0;
 
 bool diagnostic_no_writeback(device* dev) {
-    return (diag_stage == 1 || diag_stage == 3) && dev->get_api() == device_api::vulkan;
+    return (diag_stage == 1 || diag_stage == 3 || diag_stage == 4) && dev->get_api() == device_api::vulkan;
 }
 
 bool diagnostic_build_only(device* dev) {
     return diag_stage == 2 && dev->get_api() == device_api::vulkan;
+}
+
+bool diagnostic_copy_only(device* dev) {
+    return diag_stage == 4 && dev->get_api() == device_api::vulkan;
 }
 
 // NR's own resources made through reshade::api (the frame copies: HUD FIX's, the PQ conversion's, the motion copies,
@@ -3198,12 +3202,12 @@ void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
     static const uint64_t run_from = env_number("NR_DEBUG_DUMP_RUN", 0),
                           run_count = env_number("NR_DEBUG_DUMP_COUNT", 32),
                           run_step = std::max<uint64_t>(1, env_number("NR_DEBUG_DUMP_STEP", 4));
-    const bool sample = debug_dump_on() &&
+    const bool sample = !diagnostic_copy_only(dev) && debug_dump_on() &&
                         (++dump_state.seen <= 3 || dump_state.seen % 300 == 0 ||
                          (run_from && dump_state.seen >= run_from && dump_state.seen < run_from + run_count &&
                           (dump_state.seen - run_from) % run_step == 0));
     bool sampling = false;
-    if (debug_dump_on()) {
+    if (!diagnostic_copy_only(dev) && debug_dump_on()) {
         // the last pair's copies done before it is read: D3D12 keeps more than one frame in flight (a dump every
         // frame read its staging pair before the copy into it had run)
         if (dump_state.pending) rt->get_command_queue()->wait_idle();
@@ -3415,6 +3419,7 @@ void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
             f.colour_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
             f.in_place = true;
             f.renodx = renodx;
+            f.diagnostic_copy_only = diag_stage == 4;
             f.wilsjo2 = w2run;
             f.feature = feature;
             const VkImage out = s.run_vulkan(h, cmd, f, controls);
@@ -3442,6 +3447,7 @@ void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
     };
     // A wilsjo2 layer on an HDR10 swap chain: run on pq.lin (decoded before, encoded back after). -2: cannot run here.
     const auto run_pq = [&](const nr::Controls& c, uint64_t feature, const nr::pe::Session::Wilsjo2Frame* w2f) -> int {
+        if (diagnostic_copy_only(dev)) return run_one(c, nullptr, feature, w2f);
         if (!pq_begin(dev, cl, colour, w, h_, cd.texture.format)) return -2;
         tgt = RunTarget{pq.lin, pq.lin_desc, true};
         const int one = run_one(c, nullptr, feature, w2f);
@@ -3479,7 +3485,7 @@ void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
         });
         cl->barrier(1, &colour, &ua, &rt_state);
     };
-    if (nr::pe::screenshot::wants_final()) shot_frame(false);
+    if (!diagnostic_copy_only(dev) && nr::pe::screenshot::wants_final()) shot_frame(false);
     struct ShotGuard { nr::pe::Session& s; bool& active; ~ShotGuard() { if (active) s.capture_abort(); } } shot_guard{s, shot_chain};
     // HUD FIX around every layer (composed before a final-picture comparison shows it)
     const HudPlan hud_plan = diagnostic_no_writeback(dev) ? HudPlan{} : hudfix_plan(dev, cl, colour.handle);
@@ -4359,7 +4365,7 @@ void on_render_technique(effect_runtime* rt, effect_technique t, command_list* c
         }
         return;
     }
-    if (!diagnostic_build_only(rt->get_device())) {
+    if (!diagnostic_build_only(rt->get_device()) && !diagnostic_copy_only(rt->get_device())) {
         nr::pe::watchdog::Phase probe("motion-vector data check");
         motion_probe(rt, cl, rtv);
     }
@@ -4391,6 +4397,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         log("[nr] NR_DIAG_STAGE=%u: %s", diag_stage, diag_stage == 1 ? "Vulkan, no back-buffer write-back"
             : diag_stage == 2 ? "Vulkan build only, no per-frame GPU recording"
             : diag_stage == 3 ? "Vulkan, copy-in and RenoDX; no network graph dispatches or back-buffer write-back"
+            : diag_stage == 4 ? "Vulkan, back-buffer copy-in only; no RenoDX, network dispatches or write-back"
             : "normal behaviour");
         nr::pe::vkdevice::diagnostic_queue_lock();
         nr::pe::watchdog::start();

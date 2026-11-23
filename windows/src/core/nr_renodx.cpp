@@ -1021,6 +1021,24 @@ struct Stage::Impl {
         b.image = im; b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         vkCmdPipelineBarrier(cmd, src, dst, 0, 0, nullptr, 0, nullptr, 1, &b);
     }
+    void copy_in(VkCommandBuffer cmd, const ColourFrame& colour, bool profile = true) {
+        image_barrier(cmd, colour.image, colour.before, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                      colour.before_stage, colour.before_access, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                      VK_ACCESS_TRANSFER_READ_BIT);
+        memory_barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
+                       VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        VkImageCopy region{};
+        region.srcSubresource = region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.extent = {colour.width, colour.height, 1};
+        vkCmdCopyImage(cmd, colour.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, original.handle,
+                       VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+        if (profile) mark(cmd, "copy-in");
+        image_barrier(cmd, colour.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, colour.before,
+                      VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                      VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        memory_barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    }
     // One of the stage's images onto another of the same extent (CopyMip0), both in GENERAL.
     static void copy_general(VkCommandBuffer cmd, const Image& from, const Image& to) {
         memory_barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
@@ -1448,6 +1466,22 @@ void working_resolution(const Settings& s, uint32_t rw, uint32_t rh, uint32_t gw
     }
 }
 
+void Stage::diagnostic_copy_in(VkCommandBuffer cmd, const ColourFrame& colour) {
+    Impl& m = *impl_;
+    m.gpu_uses.touch();
+    ++m.recordings;
+    m.collect();
+    if (!m.original.handle) {
+        m.original = m.make_image(colour.width, colour.height, m.frame_fmt, VK_IMAGE_USAGE_SAMPLED_BIT);
+        // Leave the other stage images uninitialised: this diagnostic never records their passes.
+        m.fresh.pop_back();
+        Impl::image_barrier(cmd, m.original.handle, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                            VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    }
+    m.copy_in(cmd, colour, false);
+}
+
 uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network& network) {
     Impl& m = *impl_;
     m.gpu_uses.touch();
@@ -1689,23 +1723,7 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
         Impl::image_barrier(cmd, fr.colour.image, fr.colour.before, VK_IMAGE_LAYOUT_GENERAL, fr.colour.before_stage,
                             fr.colour.before_access, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
     } else {
-    // 1. The frame into `original` (its own bits; an *_SRGB frame into the UNORM twin).
-    Impl::image_barrier(cmd, fr.colour.image, fr.colour.before, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                        fr.colour.before_stage, fr.colour.before_access, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                        VK_ACCESS_TRANSFER_READ_BIT);
-    Impl::memory_barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
-                         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
-    VkImageCopy region{};
-    region.srcSubresource = region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    region.extent = {W, H, 1};
-    vkCmdCopyImage(cmd, fr.colour.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, m.original.handle,
-                   VK_IMAGE_LAYOUT_GENERAL, 1, &region);
-    m.mark(cmd, "copy-in");
-    Impl::image_barrier(cmd, fr.colour.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, fr.colour.before,
-                        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                        VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
-    Impl::memory_barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    m.copy_in(cmd, fr.colour);
     }
     if (m.hdr) {
         // 2a. linearize: original (or the frame itself) -> work0, the linear source everything after reads.
