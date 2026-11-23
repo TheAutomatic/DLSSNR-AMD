@@ -43,6 +43,7 @@ std::vector<Queue> queues;
 std::vector<uint32_t> requested_families;
 // Devices created with the network's features added (network_features_added).
 std::vector<VkDevice> augmented_devices;
+std::map<VkDevice, bool> device_robustness;
 void (*device_callback)(VkDevice) = nullptr;
 
 using PFN_CreateInstance = VkResult(VKAPI_PTR*)(const VkInstanceCreateInfo*,
@@ -183,6 +184,21 @@ bool augment(VkPhysicalDevice physical, const VkDeviceCreateInfo* info, Augmente
         if (!listed(e, a->extensions.data(), a->extensions.size())) a->extensions.push_back(e);
     a->features = std::make_unique<nr::DeviceFeatures>(info->pNext);
     a->features->enable(a->arch, requirements.buffer_device_address);
+    bool robustness_ext = false;
+    for (const auto& h : have)
+        robustness_ext = robustness_ext || std::strcmp(h.extensionName, VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME) == 0;
+    VkPhysicalDevicePipelineRobustnessFeaturesEXT prf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT};
+    if (robustness_ext || api >= VK_API_VERSION_1_4) {
+        VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &prf};
+        vkGetPhysicalDeviceFeatures2(physical, &f2);
+    }
+    const nr::PipelineRobustnessRequirements robustness(api, robustness_ext, prf.pipelineRobustness != 0);
+    if (robustness.enabled) {
+        a->features->enable_pipeline_robustness();
+        if (robustness.extension && !listed(VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME,
+                                           a->extensions.data(), a->extensions.size()))
+            a->extensions.push_back(VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME);
+    }
     auto* w = a->features->get<VkPhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR>(
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_FEATURES_KHR);
     w->workgroupMemoryExplicitLayout = w->workgroupMemoryExplicitLayout8BitAccess =
@@ -233,6 +249,7 @@ VkResult VKAPI_PTR hooked_create_device(VkPhysicalDevice physical, const VkDevic
             seen.physical = physical;
             seen.device = *out;
             if (added) augmented_devices.push_back(*out);
+            device_robustness[*out] = nr::pipeline_robustness_enabled(added ? augmented.info.pNext : info ? info->pNext : nullptr);
         }
         log("[nr] Vulkan device created by the game");
         if (device_callback) device_callback(*out);
@@ -304,6 +321,10 @@ VkResult create_with_network(PFN_vkCreateDevice create, VkPhysicalDevice physica
         log("[nr] network features added to the game's device");
         std::lock_guard<std::mutex> guard(lock);
         augmented_devices.push_back(*out);
+    }
+    if (r == VK_SUCCESS && out && *out) {
+        std::lock_guard<std::mutex> guard(lock);
+        device_robustness[*out] = nr::pipeline_robustness_enabled(*added ? augmented.info.pNext : info ? info->pNext : nullptr);
     }
     return r;
 }
@@ -420,6 +441,7 @@ void forget_device(VkDevice device) {
                  queues.end());
     if (seen.device == device) { seen.device = VK_NULL_HANDLE; requested_families.clear(); }
     augmented_devices.erase(std::remove(augmented_devices.begin(), augmented_devices.end(), device), augmented_devices.end());
+    device_robustness.erase(device);
 }
 
 namespace {
@@ -458,6 +480,12 @@ bool network_features_added(VkDevice device) {
     for (VkDevice d : augmented_devices)
         if (d == device) return true;
     return false;
+}
+
+bool pipeline_robustness_enabled(VkDevice device) {
+    std::lock_guard<std::mutex> guard(lock);
+    const auto it = device_robustness.find(device);
+    return it != device_robustness.end() && it->second;
 }
 
 void set_device_callback(void (*callback)(VkDevice)) {

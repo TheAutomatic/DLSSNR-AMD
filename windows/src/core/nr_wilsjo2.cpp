@@ -742,12 +742,7 @@ Stage::Stage(const HostDevice& host, const std::string& shaders) : impl_(std::ma
         vkGetPhysicalDeviceProperties(host.physical, &props);
         m.prof.ns = props.limits.timestampPeriod;
     }
-    {
-        VkPhysicalDevicePipelineRobustnessFeaturesEXT prf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT};
-        VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &prf};
-        vkGetPhysicalDeviceFeatures2(host.physical, &f2);
-        m.pipeline_robustness = prf.pipelineRobustness != 0;
-    }
+    m.pipeline_robustness = host.pipeline_robustness;
     VkDescriptorSetLayoutBinding b[6]{};
     for (uint32_t i = 0; i < 6; ++i)
         b[i] = {i, i < 4 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1,

@@ -300,6 +300,10 @@ struct Session::Impl {
     }
     RuntimeConfig make_config(uint32_t w, uint32_t h, VkFormat f) const;
     HostDevice make_host() const;
+    bool pipeline_robustness() const {
+        return bdev && bdev->handles().device == handles.device ? bdev->pipeline_robustness_enabled()
+                                                              : vkdevice::pipeline_robustness_enabled(handles.device);
+    }
     mutable bool bda_probe_failed = false;
     TemporalConfig make_temporal() const {
         TemporalConfig temporal; temporal.enable = true;
@@ -2657,6 +2661,7 @@ RuntimeConfig Session::Impl::make_config(uint32_t w, uint32_t h, VkFormat f) con
 HostDevice Session::Impl::make_host() const {
     HostDevice host{};
     host.instance = handles.instance; host.physical = handles.physical; host.device = handles.device;
+    host.pipeline_robustness = pipeline_robustness();
     vkdevice::note_gpu(handles.physical);   // NR Control's header: the GPU the network is built on
     // A real queue and its real family. Construction submits the weight upload
     // and waits for it; the game is submitting to the same underlying VkQueue,
@@ -4805,6 +4810,7 @@ renodx::Stage* Session::Impl::renodx_stage(uint64_t feature, uint32_t w, uint32_
         sc.settings = rf.settings;   // the units it is made for
         HostDevice host{};
         host.instance = handles.instance; host.physical = handles.physical; host.device = handles.device;
+        host.pipeline_robustness = pipeline_robustness();
         host.queue = access.queue; host.queue_family = access.family;
         try {
             e.stage = std::make_unique<renodx::Stage>(host, sc);
@@ -5701,6 +5707,7 @@ bool Session::record_raw(ID3D12Device* device, ID3D12GraphicsCommandList* list, 
     if (!cmd) return false;
     HostDevice host{};
     host.instance = s.handles.instance; host.physical = s.handles.physical; host.device = s.handles.device;
+    host.pipeline_robustness = s.pipeline_robustness();
     host.queue = s.access.queue; host.queue_family = s.access.family;
     const RawLookup lookup = [&s, &rec](ID3D12Resource* r, D3D12_RESOURCE_STATES state, bool colour) {
         RawImage out{};
@@ -5742,6 +5749,7 @@ bool Session::record_raw_vk(VkCommandBuffer cmd, const RawRecorderVk& recorder) 
     if (!cmd || !recorder || !s.handles.valid() || !s.access.queue) return false;
     HostDevice host{};
     host.instance = s.handles.instance; host.physical = s.handles.physical; host.device = s.handles.device;
+    host.pipeline_robustness = s.pipeline_robustness();
     host.queue = s.access.queue; host.queue_family = s.access.family;
     const auto everything = [&] {
         VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -5865,6 +5873,7 @@ bool Session::record_raw_d3d11(IUnknown* device, const RawRecorder11& recorder) 
         if (!s.begin11(device, rec)) return false;
         HostDevice host{};
         host.instance = s.handles.instance; host.physical = s.handles.physical; host.device = s.handles.device;
+        host.pipeline_robustness = s.pipeline_robustness();
         host.queue = s.access.queue; host.queue_family = s.access.family;
         // What the recorder may write: a texture that can be a render target or an unordered-access view is copied
         // back after it (a copy of an unchanged twin gives the texture its own content).
@@ -5946,6 +5955,7 @@ bool Session::record_raw_d3d11(IUnknown* device, const RawRecorder11& recorder) 
     auto unsubmitted = on_exit([&s] { s.discard_timing(); });
     HostDevice host{};
     host.instance = s.handles.instance; host.physical = s.handles.physical; host.device = s.handles.device;
+    host.pipeline_robustness = s.pipeline_robustness();
     host.queue = s.access.queue; host.queue_family = s.access.family;
     const auto everything = [&] {
         VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};

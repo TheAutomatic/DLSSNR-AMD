@@ -80,6 +80,7 @@ class Device {
     DeviceHandles handles() const { return handles_; }
     VkQueue queue() const { return queue_; }
     uint32_t family() const { return family_; }
+    bool pipeline_robustness_enabled() const { return pipeline_robustness_; }
     // Taken around every submit on our queue (the network's weight upload included).
     void lock() { queue_mutex_.lock(); }
     void unlock() { queue_mutex_.unlock(); }
@@ -208,6 +209,7 @@ class Device {
     PFN_vkGetMemoryWin32HandlePropertiesKHR get_handle_properties_{};
     PFN_vkImportSemaphoreWin32HandleKHR import_semaphore_{};
     bool keyed_mutex_{};
+    bool pipeline_robustness_{};
 
     std::mutex jobs_mutex_;
     // The command pool is externally synchronised: held from begin() to end()/abort(), across the

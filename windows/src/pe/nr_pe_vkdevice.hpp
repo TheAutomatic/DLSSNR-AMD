@@ -65,6 +65,7 @@ void note_physical_devices(VkInstance instance, uint32_t count, const VkPhysical
 // The watch added the network's features (nr::DeviceFeatures::enable, bufferDeviceAddress among
 // them) to this device's vkCreateDevice and the device was created with them.
 bool network_features_added(VkDevice device);
+bool pipeline_robustness_enabled(VkDevice device);
 // A game's vkCreateDevice seen by someone other than the watcher (the .asi's wrap of the loader's vkCreateDevice): made
 // with the network's extensions and features, and ACO Mode's pipeline binaries, as the watcher makes it; made again as
 // the game asked when that fails. `added` says which it was.

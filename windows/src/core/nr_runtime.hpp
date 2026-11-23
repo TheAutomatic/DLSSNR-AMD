@@ -178,6 +178,7 @@ struct HostDevice {
     // then reads the activation arena through a buffer_reference where that is faster (Windows
     // network only).
     bool buffer_device_address = false;
+    bool pipeline_robustness = false;
     // The GPU's architecture (nr_gpu_arch.hpp identify of `physical`): the network built is that architecture's; one
     // without a network (unknown, RDNA2, ...) is refused, never built as another's.
     nr::arch::GpuArch arch = nr::arch::GpuArch::unknown;

@@ -541,7 +541,7 @@ struct Stage::Impl {
     VkDevice device{};
     VkPhysicalDevice physical{};
     VkPhysicalDeviceMemoryProperties mem{};
-    // The driver has VK_EXT_pipeline_robustness: the programs are compiled without robust buffer and image access,
+    // The device enabled pipelineRobustness: the programs are compiled without robust buffer and image access,
     // as the network's (nrvk::Kernel::create); DXVK and vkd3d-proton create the game's device robust.
     bool pipeline_robustness{};
     StageConfig cfg;
@@ -1261,12 +1261,7 @@ Stage::Stage(const HostDevice& host, const StageConfig& cfg) : impl_(std::make_u
     m.device = host.device; m.physical = host.physical; m.cfg = cfg;
     m.settings = cfg.settings;
     vkGetPhysicalDeviceMemoryProperties(host.physical, &m.mem);
-    {
-        VkPhysicalDevicePipelineRobustnessFeaturesEXT prf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT};
-        VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &prf};
-        vkGetPhysicalDeviceFeatures2(host.physical, &f2);
-        m.pipeline_robustness = prf.pipelineRobustness && !(std::getenv("NR_RENODX_ROBUST") && std::atoi(std::getenv("NR_RENODX_ROBUST")));
-    }
+    m.pipeline_robustness = host.pipeline_robustness && !(std::getenv("NR_RENODX_ROBUST") && std::atoi(std::getenv("NR_RENODX_ROBUST")));
     if (cfg.present) {
         // present_path.hpp: the colour space decides, units are absolute (PQ's 10000 nits, scRGB's 80).
         m.hdr = cfg.present == 2 ? 2 : cfg.present == 3 ? 1 : 0;

@@ -1601,7 +1601,7 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     if (transfer != Transfer::Identical && !(props[host.queue_family].queueFlags & VK_QUEUE_GRAPHICS_BIT))
         throw std::invalid_argument("NR colour format conversion requires a graphics-capable queue");
     std::string why;
-    if (!s.ctx.adopt(host.instance, host.physical, host.device, host.queue, host.queue_family, &why))
+    if (!s.ctx.adopt(host.instance, host.physical, host.device, host.queue, host.queue_family, host.pipeline_robustness, &why))
         throw std::runtime_error("NR device unsupported: " + why);
     s.ctx.queue_lock = host.queue_lock; s.ctx.queue_unlock = host.queue_unlock;
     s.ctx.buffer_device_address = host.buffer_device_address;
@@ -2323,7 +2323,7 @@ static bool adopt_for(nrvk::Context& ctx, const HostDevice& host) {
         nr::logf("[nr] the network's memory cannot be moved: %s", why.c_str());
         return false;
     }
-    if (!ctx.adopt(host.instance, host.physical, host.device, host.queue, host.queue_family, &why)) {
+    if (!ctx.adopt(host.instance, host.physical, host.device, host.queue, host.queue_family, host.pipeline_robustness, &why)) {
         nr::logf("[nr] the network's memory cannot be moved: %s", why.c_str());
         return false;
     }

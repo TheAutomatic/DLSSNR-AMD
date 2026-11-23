@@ -16,6 +16,25 @@ inline uint32_t effective_device_api(uint32_t requested, uint32_t supported) {
     return requested < supported ? requested : supported;
 }
 
+struct PipelineRobustnessRequirements {
+    bool enabled;
+    bool extension;
+    PipelineRobustnessRequirements(uint32_t api, bool offered, bool feature)
+        : enabled(feature && (api >= VK_API_VERSION_1_4 || offered)),
+          extension(enabled && api < VK_API_VERSION_1_4) {}
+};
+
+inline bool pipeline_robustness_enabled(const void* chain) {
+    size_t count = 0;
+    for (auto* p = static_cast<const VkBaseInStructure*>(chain); p && count++ < 512; p = p->pNext) {
+        if (p->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES)
+            return reinterpret_cast<const VkPhysicalDeviceVulkan14Features*>(p)->pipelineRobustness != 0;
+        if (p->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT)
+            return reinterpret_cast<const VkPhysicalDevicePipelineRobustnessFeaturesEXT*>(p)->pipelineRobustness != 0;
+    }
+    return false;
+}
+
 struct DeviceFeatureRequirements {
     bool buffer_device_address;
     std::vector<const char*> extensions;
@@ -71,6 +90,12 @@ public:
         p->sType = type; p->pNext = head;
         head = reinterpret_cast<VkBaseOutStructure*>(p);
         return p;
+    }
+    void enable_pipeline_robustness() {
+        if (auto* f = find<VkPhysicalDeviceVulkan14Features>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES))
+            f->pipelineRobustness = VK_TRUE;
+        else get<VkPhysicalDevicePipelineRobustnessFeaturesEXT>(
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT)->pipelineRobustness = VK_TRUE;
     }
     // The features the network of `arch` (nr_gpu_arch.hpp; one NR has a network for, checked by the caller) needs.
     void enable(nr::arch::GpuArch arch, bool buffer_device_address = true) {

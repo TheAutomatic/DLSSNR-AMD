@@ -59,5 +59,45 @@ int main() {
     nr::DeviceFeatures preserved(&game_bda);
     preserved.enable(nr::arch::GpuArch::rdna4, false);
     assert(preserved.find<VkPhysicalDeviceBufferDeviceAddressFeatures>(game_bda.sType)->bufferDeviceAddress == VK_TRUE);
+    for (uint32_t api : {VK_API_VERSION_1_0, VK_API_VERSION_1_1, VK_API_VERSION_1_2, VK_API_VERSION_1_3, VK_API_VERSION_1_4}) {
+        for (bool offered : {false, true}) for (bool feature : {false, true}) {
+            const nr::PipelineRobustnessRequirements required(api, offered, feature);
+            assert(required.enabled == (feature && (offered || api >= VK_API_VERSION_1_4)));
+            assert(required.extension == (required.enabled && api < VK_API_VERSION_1_4));
+            nr::DeviceFeatures chain(nullptr);
+            if (required.enabled) chain.enable_pipeline_robustness();
+            assert(nr::pipeline_robustness_enabled(chain.head) == required.enabled);
+        }
+    }
+    assert(!nr::pipeline_robustness_enabled(nullptr));
+    VkPhysicalDevicePipelineRobustnessFeaturesEXT app_robustness{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT};
+    nr::DeviceFeatures robustness(&app_robustness);
+    robustness.enable_pipeline_robustness();
+    robustness.enable_pipeline_robustness();
+    assert(nr::pipeline_robustness_enabled(robustness.head));
+    assert(robustness.head->pNext == nullptr);
+    assert(app_robustness.pipelineRobustness == VK_FALSE);
+    // A failed augmentation retries this original, unmodified chain.
+    assert(!nr::pipeline_robustness_enabled(&app_robustness));
+    app_robustness.pipelineRobustness = VK_TRUE;
+    nr::DeviceFeatures game_robustness(&app_robustness);
+    assert(nr::pipeline_robustness_enabled(game_robustness.head));
+    VkPhysicalDeviceVulkan14Features app14{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES};
+    app14.shaderSubgroupRotate = VK_TRUE;
+    nr::DeviceFeatures core_robustness(&app14);
+    core_robustness.enable_pipeline_robustness();
+    assert(nr::pipeline_robustness_enabled(core_robustness.head));
+    assert(core_robustness.head->pNext == nullptr);
+    assert(core_robustness.find<VkPhysicalDeviceVulkan14Features>(app14.sType)->shaderSubgroupRotate == VK_TRUE);
+    assert(app14.pipelineRobustness == VK_FALSE);
+    app14.pipelineRobustness = VK_TRUE;
+    assert(nr::pipeline_robustness_enabled(&app14));
+    VkPhysicalDeviceFeatures2 root{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &app14};
+    assert(nr::pipeline_robustness_enabled(&root));
+    VkBaseInStructure cycle{VK_STRUCTURE_TYPE_APPLICATION_INFO, nullptr};
+    cycle.pNext = &cycle;
+    assert(!nr::pipeline_robustness_enabled(&cycle));
     std::puts("PASS: API 1.0/1.1/1.2/1.3 exact extension sets; storage-class/device-group dependencies; x86/x64 BDA policy; unknown API uses physical version, explicit 1.0 preserved; clamped API; no added BDA struct below 1.2 on x86; aggregate and app-feature preservation");
+    std::puts("PASS: optional pipeline robustness API 1.0-1.4; supported/unsupported extension and feature; core promotion; empty/cyclic chain; app EXT/core preservation; no duplicate structs; retry chain retains original enablement");
 }

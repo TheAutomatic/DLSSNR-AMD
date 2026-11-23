@@ -381,6 +381,7 @@ bool Device::create(const LUID& luid, std::string* why) {
     handles_.instance = instance_;
     handles_.physical = physical_;
     handles_.device = device_;
+    pipeline_robustness_ = robustness;
     log("[nr] bridge: own Vulkan device on %s (queue family %u%s), the game's D3D runtime is native",
         chosen.deviceName, family_, keyed_mutex_ ? ", keyed mutexes" : "");
     return true;

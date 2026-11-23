@@ -374,7 +374,7 @@ struct Context {
     // instead of failing silently. A build that quietly does a lesser thing is
     // the failure mode this whole project is organised against.
     bool adopt(VkInstance inst, VkPhysicalDevice phys, VkDevice dev,
-               VkQueue q, uint32_t qfamily, std::string* why = nullptr) {
+               VkQueue q, uint32_t qfamily, bool robustness_enabled, std::string* why = nullptr) {
         instance = inst; physical = phys; device = dev; queue = q; family = qfamily;
         auto no = [&](const char* n) {
             if (why) *why = n;
@@ -395,13 +395,10 @@ struct Context {
         // memory blocks (NR_UPS_ALIAS), which needs this extension.
         VkPhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR wml{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_FEATURES_KHR};
-        VkPhysicalDevicePipelineRobustnessFeaturesEXT prf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT};
         VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-        f2.pNext = &c; c.pNext = &f8; f8.pNext = &v11; v11.pNext = &v12; v12.pNext = &v13; v13.pNext = &wml; wml.pNext = &prf;
+        f2.pNext = &c; c.pNext = &f8; f8.pNext = &v11; v11.pNext = &v12; v12.pNext = &v13; v13.pNext = &wml;
         vkGetPhysicalDeviceFeatures2(physical, &f2);
-        // DXVK and vkd3d-proton create their devices with robustBufferAccess2 and without this feature; RADV
-        // compiles a pipeline by its own VkPipelineRobustnessCreateInfo whether or not the device enabled it.
-        pipeline_robustness = prf.pipelineRobustness;
+        pipeline_robustness = robustness_enabled;
         if (!c.cooperativeMatrix)             return no("cooperativeMatrix");
         if (target_float8() && !f8.shaderFloat8)                 return no("shaderFloat8");
         if (target_float8() && !f8.shaderFloat8CooperativeMatrix) return no("shaderFloat8CooperativeMatrix");
@@ -435,7 +432,7 @@ struct Context {
     }
     // `destroy` must not tear down a device it did not create.
     bool adopted = false;
-    // The driver has VK_EXT_pipeline_robustness: Kernel::create compiles every pipeline without robust buffer and
+    // The device enabled pipelineRobustness: Kernel::create compiles every pipeline without robust buffer and
     // image access. Every access of ours is in bounds, so the output is the same; on a device with
     // robustBufferAccess2 (DXVK, vkd3d-proton) the robust pipelines are slower.
     bool pipeline_robustness = false;
