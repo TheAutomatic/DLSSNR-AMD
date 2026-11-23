@@ -2542,6 +2542,10 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
     std::fill(std::begin(build_bytes), std::end(build_bytes), 0);
     build_px = double((w + 63) / 64 * 64) * double((h + 63) / 64 * 64) * config.capacity;
     build_thread = std::thread([this, host, config, temporal, access_copy, tag = build_tag] {
+        struct DiagnosticThread {
+            DiagnosticThread() { vkdevice::diagnostic_queue_build_thread(true); }
+            ~DiagnosticThread() { vkdevice::diagnostic_queue_build_thread(false); }
+        } diagnostic_thread;
         nr::pe::watchdog::Phase phase("building the network (background)");
         nr::vram::BuildScope measured_as(tag);   // its allocations, for Memory Guard's estimate (measure_build; 0: none)
         const auto t0 = std::chrono::steady_clock::now();
@@ -3783,6 +3787,7 @@ void Session::log_totals() {
     static_assert(sizeof(impl_->ran_total) == 8, "counters");
     if (impl_->totals_logged) return;
     impl_->totals_logged = true;
+    vkdevice::diagnostic_queue_stats();
     const uint64_t r = impl_->ran_total + impl_->ran, p = impl_->passed_total + impl_->passed;
     if (r + p)
         log("[nr] session: %llu evaluations ran the network, %llu passed the frame through", (unsigned long long)r,

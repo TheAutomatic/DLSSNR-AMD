@@ -19,6 +19,8 @@
 #include <mutex>
 #include <vector>
 
+#include "nr_pe_diag_queue.hpp"
+
 namespace nr::pe::vkdevice {
 namespace {
 
@@ -209,6 +211,7 @@ VkResult VKAPI_PTR hooked_create_device(VkPhysicalDevice physical, const VkDevic
             if (added) augmented_devices.push_back(*out);
         }
         log("[nr] Vulkan device created by the game");
+        diag::install(*out, info);
         if (device_callback) device_callback(*out);
     }
     return r;
@@ -302,6 +305,11 @@ bool install() {
 }
 
 void uninstall() {
+    for (void* target : diag::targets) {
+        MH_DisableHook(target);
+        MH_RemoveHook(target);
+    }
+    diag::targets.clear();
     if (hooked_targets.empty()) return;
     for (void* target : hooked_targets) {
         MH_DisableHook(target);
@@ -397,6 +405,28 @@ std::recursive_mutex* queue_mutex(VkQueue queue) {
 
 void enable_queue_locks() { g_queue_locks = true; }
 bool queue_locks_enabled() { return g_queue_locks.load(); }
+void diagnostic_queue_lock() { diag::enabled = true; }
+void diagnostic_queue_build_thread(bool active) {
+    if (!diag::enabled) return;
+    if (!active) {
+        DWORD tid = GetCurrentThreadId();
+        diag::build_thread.compare_exchange_strong(tid, 0);
+        return;
+    }
+    diag::build_thread = GetCurrentThreadId();
+    log("[nr] diag queue lock: background build thread %lu", GetCurrentThreadId());
+}
+void diagnostic_queue_stats() {
+    if (!diag::enabled) return;
+    const uint64_t pair = diag::threads.load();
+    const uint64_t build = diag::build_threads.load();
+    log("[nr] diag queue lock: %llu contended calls (threads %lu vs %lu), %llu total; "
+        "%llu build-worker conflicts (threads %lu vs %lu); %llu unregistered queues",
+        (unsigned long long)diag::contended.load(), (unsigned long)(pair >> 32), (unsigned long)(pair & 0xffffffffu),
+        (unsigned long long)diag::total.load(), (unsigned long long)diag::build_contended.load(),
+        (unsigned long)(build >> 32), (unsigned long)(build & 0xffffffffu), (unsigned long long)diag::unknown.load());
+    if (diag::unknown.load()) log("[nr] diag queue lock: INCOMPLETE coverage: unregistered queues were called");
+}
 void lock_queue(VkQueue queue) { if (g_queue_locks.load() && queue) queue_mutex(queue)->lock(); }
 void unlock_queue(VkQueue queue) { if (g_queue_locks.load() && queue) queue_mutex(queue)->unlock(); }
 bool lock_queue_held(VkQueue queue) {

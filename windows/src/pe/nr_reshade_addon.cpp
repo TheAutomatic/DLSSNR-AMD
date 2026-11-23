@@ -3496,10 +3496,12 @@ void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
             (unsigned long long)(presents - presents_at_run - 1));
     if (ran) { have_run = true; presents_at_run = presents; need_reset = false; }
     if (ran) ++frames_run; else ++frames_declined;
-    if ((frames_run + frames_declined) % 240 == 0)
+    if ((frames_run + frames_declined) % 240 == 0) {
         log("[nr] frames: %u enhanced, %u declined; %.2f ms on the GPU (network %.2f, route %.2f); %s", frames_run,
             frames_declined, s.gpu_ms(), s.network_ms(), std::max(s.gpu_ms() - s.network_ms(), 0.0f),
             s.vram_line().c_str());
+        nr::pe::vkdevice::diagnostic_queue_stats();
+    }
 }
 
 // ---- the add-on's page, in ReShade's overlay (its Add-ons tab, under this add-on's name) ------------------------------
@@ -4313,6 +4315,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         nr::pe::install_crash_watch(reshade::internal::get_reshade_module_handle());
         log("[nr] ---------------------------------------------------------------");
         log("[nr] ReShade add-on loaded from %s (build %s)", nr::pe::module_folder(), NR_BUILD_STAMP);
+        log("[nr] DIAGNOSTIC BUILD: queue lock");
+        nr::pe::vkdevice::diagnostic_queue_lock();
         nr::pe::watchdog::start();
         const std::string folder = nr::pe::module_folder();
         if (!folder.empty()) {
