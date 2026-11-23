@@ -3,6 +3,7 @@
 #include "nr_pe_bridge.hpp"
 #include "nr_pe_d3d12split.hpp"
 #include "nr_pe_events.hpp"
+#include "nr_pe_roi.hpp"
 #include "nr_pe_stats.hpp"
 #include "nr_gpu_completion.hpp"
 #include "nrvk.hpp"   // nrvk::blit, compute_only_recording
@@ -847,10 +848,20 @@ struct Session::Impl {
     // frame after NR, copied into a host-visible slot in the frame's own command buffer, with DLSS.Pre.Exposure,
     // DLSS.Exposure.Scale and the style. Logged once its event is set: every 30th frame, and every frame for 240 frames
     // after the style or the intensity changed. A slot whose commands never ran stays allocated.
-    struct DiagSlot {
+    struct DiagReadback {
         VkBuffer buffer{};
         VkDeviceMemory memory{};
         void* mapped{};
+    };
+    struct RoiSlot : DiagReadback {
+        uint64_t present{}, generation{};
+        bridge::Job* job{};
+        struct Sample { VkFormat format{}; uint32_t width{}, height{}; };
+        Sample samples[roi::stages]{};
+    };
+    static constexpr VkDeviceSize kRoiStride = roi::side * roi::side * 16;
+    std::unique_ptr<RoiSlot[]> roi_ring;
+    struct DiagSlot : DiagReadback {
         VkEvent done{};
         bool pending{};
         uint64_t frame{};
@@ -929,9 +940,9 @@ struct Session::Impl {
             default: return false;
         }
     }
-    bool diag_make(DiagSlot& d) {
+    bool diag_allocate(DiagReadback& d, VkDeviceSize size, bool prefer_cached = false) {
         VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        bi.size = kDiagStride * (1 + 4 * kDiagPoints); bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        bi.size = size; bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         if (vkCreateBuffer(handles.device, &bi, nullptr, &d.buffer) != VK_SUCCESS) return false;
         VkMemoryRequirements req{};
         vkGetBufferMemoryRequirements(handles.device, d.buffer, &req);
@@ -939,23 +950,81 @@ struct Session::Impl {
         vkGetPhysicalDeviceMemoryProperties(handles.physical, &mem);
         const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
         uint32_t type = ~0u;
-        for (uint32_t i = 0; i < mem.memoryTypeCount && type == ~0u; ++i)
-            if ((req.memoryTypeBits & (1u << i)) && (mem.memoryTypes[i].propertyFlags & want) == want) type = i;
+        for (uint32_t i = 0; i < mem.memoryTypeCount; ++i) {
+            const auto flags = mem.memoryTypes[i].propertyFlags;
+            if (!(req.memoryTypeBits & (1u << i)) || (flags & want) != want) continue;
+            if (type == ~0u) type = i;
+            if (!prefer_cached || (flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) { type = i; break; }
+        }
         if (type == ~0u) return false;
         VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         ai.allocationSize = req.size; ai.memoryTypeIndex = type;
-        VkEventCreateInfo ei{VK_STRUCTURE_TYPE_EVENT_CREATE_INFO};
         return vkAllocateMemory(handles.device, &ai, nullptr, &d.memory) == VK_SUCCESS &&
                vkBindBufferMemory(handles.device, d.buffer, d.memory, 0) == VK_SUCCESS &&
-               vkMapMemory(handles.device, d.memory, 0, VK_WHOLE_SIZE, 0, &d.mapped) == VK_SUCCESS &&
+               vkMapMemory(handles.device, d.memory, 0, VK_WHOLE_SIZE, 0, &d.mapped) == VK_SUCCESS;
+    }
+    bool diag_make(DiagSlot& d) {
+        VkEventCreateInfo ei{VK_STRUCTURE_TYPE_EVENT_CREATE_INFO};
+        return diag_allocate(d, kDiagStride * (1 + 4 * kDiagPoints)) &&
                vkCreateEvent(handles.device, &ei, nullptr, &d.done) == VK_SUCCESS;
     }
-    void diag_free(DiagSlot& d) {
+    void diag_release(DiagReadback& d) {
         if (d.mapped) vkUnmapMemory(handles.device, d.memory);
         if (d.buffer) vkDestroyBuffer(handles.device, d.buffer, nullptr);
         if (d.memory) vkFreeMemory(handles.device, d.memory, nullptr);
+        d = {};
+    }
+    void diag_free(DiagSlot& d) {
+        diag_release(d);
         if (d.done) vkDestroyEvent(handles.device, d.done, nullptr);
         d = DiagSlot{};
+    }
+    RoiSlot* roi_prepare(uint64_t present) {
+        if (!roi_ring) roi_ring.reset(new (std::nothrow) RoiSlot[roi::slots]{});
+        if (!roi_ring) return nullptr;
+        RoiSlot& slot = roi_ring[present % roi::slots];
+        if (slot.present == present || (slot.job && bdev->busy(slot.job, slot.generation))) return nullptr;
+        if (!slot.mapped && !diag_allocate(slot, roi::stages * kRoiStride, true)) {
+            diag_release(slot);
+            return nullptr;
+        }
+        slot.present = 0;
+        slot.job = nullptr;
+        for (auto& sample : slot.samples) sample = {};
+        return &slot;
+    }
+    static void roi_copy(VkCommandBuffer cmd, RoiSlot* slot, unsigned stage, const ColourFrame& f, bool before = false) {
+        if (!slot || !f.image || !f.width || !f.height || !diag_bytes(f.format) ||
+            !(f.usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) return;
+        const auto patch = roi::region(f.width, f.height);
+        const auto pipeline = before ? f.before_stage : f.after_stage;
+        const auto layout = before ? f.before : f.after;
+        const auto access = before ? f.before_access : f.after_access;
+        VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.image = f.image;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.oldLayout = layout; b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | access; b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &b);
+        VkBufferImageCopy copy{};
+        copy.bufferOffset = stage * kRoiStride;
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.imageOffset = {int32_t(patch.x), int32_t(patch.y), 0};
+        copy.imageExtent = {patch.width, patch.height, 1};
+        vkCmdCopyImageToBuffer(cmd, f.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, slot->buffer, 1, &copy);
+        std::swap(b.oldLayout, b.newLayout);
+        b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT; b.dstAccessMask = access;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, pipeline, 0, 0, nullptr, 0, nullptr, 1, &b);
+        slot->samples[stage] = {f.format, patch.width, patch.height};
+    }
+    static void roi_host_barrier(VkCommandBuffer cmd, const RoiSlot& slot) {
+        VkBufferMemoryBarrier b{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.buffer = slot.buffer; b.size = VK_WHOLE_SIZE;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &b, 0, nullptr);
     }
     // The slots the GPU has filled into the log; then this frame's slot, when this frame is one to log.
     void diag_begin(const renodx::Settings& rs, const Session::RenoDXFrame& rf, bool reset) {
@@ -1064,7 +1133,7 @@ struct Session::Impl {
                                 const Session::RenoDXFrame& rf);
     bool record_renodx(VkCommandBuffer cmd, renodx::Stage& stage, const ColourFrame& colour, const ColourFrame& output,
                        EngineFrame engine, const Controls& c, const Session::RenoDXFrame& rf,
-                       const ColourFrame* exposure = nullptr);
+                       const ColourFrame* exposure = nullptr, RoiSlot* roi_slot = nullptr);
     void free_retired_stages() {
         const auto now = std::chrono::steady_clock::now();
         for (size_t i = renodx_retired.size(); i-- > 0;)
@@ -3834,6 +3903,12 @@ Session::~Session() {
     impl_->retired.clear();
     impl_->release_output();
     impl_->release_invalidator();
+    if (impl_->roi_ring) {
+        for (uint32_t i = 0; i < roi::slots; ++i) {
+            auto& slot = impl_->roi_ring[i];
+            if (!slot.job || !impl_->bdev->busy(slot.job, slot.generation)) impl_->diag_release(slot);
+        }
+    }
     impl_->release_bridge();
     impl_->release_vk_output();
     if (impl_->stage_timing) vkDestroyQueryPool(impl_->handles.device, impl_->stage_timing, nullptr);
@@ -4896,7 +4971,7 @@ bool Session::Impl::neutral_motion(VkCommandBuffer cmd, uint32_t w, uint32_t h, 
 // the motion and depth; its colour and target are the stage's.
 bool Session::Impl::record_renodx(VkCommandBuffer cmd, renodx::Stage& stage, const ColourFrame& colour,
                                   const ColourFrame& output, EngineFrame engine, const Controls& c,
-                                  const Session::RenoDXFrame& rf, const ColourFrame* exposure) {
+                                  const Session::RenoDXFrame& rf, const ColourFrame* exposure, RoiSlot* roi_slot) {
     // The Present path without the game's motion vectors (NRPresentGuides Optional), or set to Never: neutral guides
     // for the network - zero motion, no depth - and none for the look (its Detail stability is the game's vectors').
     const bool neutral = rf.present && (rf.settings.present_guides == 2u || !engine.motion.image);
@@ -4990,6 +5065,7 @@ bool Session::Impl::record_renodx(VkCommandBuffer cmd, renodx::Stage& stage, con
                   exposure->before, exposure->before_stage, exposure->before_access);
     diag_copy(cmd, 1, colour.image, colour.format, colour.width, colour.height, colour.usage, colour.before,
               colour.before_stage, colour.before_access);
+    roi_copy(cmd, roi_slot, 0, colour, true);
     // RenoDX's NR screenshot. The final picture before and after NR: the presented frame on the ReShade route,
     // OptiScaler's finished picture on its route (NR moved there for the capture, nr_pe_optifix.cpp; `clean`: no NR
     // ran on it inline). The model's input and output: the last pass's, after it ran.
@@ -5072,6 +5148,7 @@ bool Session::Impl::record_renodx(VkCommandBuffer cmd, renodx::Stage& stage, con
                     frame_index, k + 1u, result.history_skip_reason ? result.history_skip_reason : "no temporal history");
         }
         if (nm.raw) runtime->set_style_grade(net_switch.file().style_grade);
+        if (result.frame.network_dispatches) roi_copy(cmd, roi_slot, 1, neural);
         if (k == 0) {
             diag_copy(cmd, 2, proxy.image, proxy.format, proxy.width, proxy.height, proxy.usage, proxy.after,
                       proxy.after_stage, proxy.after_access);
@@ -5113,6 +5190,7 @@ bool Session::Impl::record_renodx(VkCommandBuffer cmd, renodx::Stage& stage, con
         diag_copy(cmd, 4, output.image, output.format, output.width, output.height, output.usage, output.after,
                   output.after_stage, output.after_access);
         diag_end(cmd);
+        roi_copy(cmd, roi_slot, 2, output);
         if (capture) {
             shot_copy(cmd, *capture, output.image, output.after, output.after_stage, output.after_access, capture->bytes);
             shot_recorded(cmd, std::move(capture));
@@ -6043,6 +6121,28 @@ bool Session::run_present(ID3D12Device* device, ID3D12GraphicsCommandList* list,
     return true;
 }
 
+roi::Luma Session::measure_roi(VkFormat format, const void* pixels, size_t pitch, uint32_t width, uint32_t height) {
+    const size_t stride = Impl::diag_bytes(format);
+    if (!stride) return {};
+    return roi::measure(static_cast<const uint8_t*>(pixels), pitch ? pitch : width * stride, stride, width, height,
+                        [format](const uint8_t* p, float rgb[3]) { return Impl::diag_texel(format, p, rgb); });
+}
+
+bool Session::read_present_roi(uint64_t present, roi::Luma* stages) {
+    auto& s = *impl_;
+    if (!s.roi_ring) return true;
+    auto& slot = s.roi_ring[present % roi::slots];
+    if (slot.present != present) return true;
+    if (s.bdev->busy(slot.job, slot.generation)) return false;
+    for (unsigned i = 0; i < roi::stages; ++i) {
+        const auto& sample = slot.samples[i];
+        if (sample.width)
+            stages[i] = measure_roi(sample.format, static_cast<const uint8_t*>(slot.mapped) + i * Impl::kRoiStride,
+                                    0, sample.width, sample.height);
+    }
+    return true;
+}
+
 bool Session::run_d3d11(const D3D11Frame& frame, const Controls& controls) {
     auto& s = *impl_;
     s.current_feature = frame.feature;   // which network memory a new frame size prefers (Impl::inframe)
@@ -6154,6 +6254,7 @@ bool Session::run_d3d11(const D3D11Frame& frame, const Controls& controls) {
 
     auto unsubmitted = on_exit([&s] { s.discard_timing(); });
     const VkCommandBuffer cmd = bridge ? s.bdev->command_buffer(rec.job) : s.own_cmd;
+    auto* roi_slot = frame.roi_present && bridge && rec.d11 && renodx_stage ? s.roi_prepare(frame.roi_present) : nullptr;
     try {
         if (!bridge) {
             VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -6168,10 +6269,11 @@ bool Session::run_d3d11(const D3D11Frame& frame, const Controls& controls) {
             w2_ran = s.record_wilsjo2(cmd, colour, engine, w2_controls, wf);
         } else if (renodx_stage) {
             if (!motion && Impl::renodx_needs_motion(*frame.renodx)) { if (!bridge) vkEndCommandBuffer(cmd); return false; }
-            if (!s.record_renodx(cmd, *renodx_stage, colour, colour, engine, renodx_controls, *frame.renodx)) {
+            if (!s.record_renodx(cmd, *renodx_stage, colour, colour, engine, renodx_controls, *frame.renodx, nullptr, roi_slot)) {
                 if (!bridge) vkEndCommandBuffer(cmd);
                 return false;
             }
+            if (roi_slot) s.roi_host_barrier(cmd, *roi_slot);
         } else {
             OwnOuterRun timing(*this, cmd, s.call_layer > 0 && !s.outer_open);
 
@@ -6191,7 +6293,13 @@ bool Session::run_d3d11(const D3D11Frame& frame, const Controls& controls) {
     }
 
     if (bridge) {
+        const auto generation = roi_slot ? s.bdev->generation(rec.job) : 0;
         if (!s.finish11(rec)) return false;
+        if (roi_slot) {
+            roi_slot->job = rec.job;
+            roi_slot->generation = generation;
+            roi_slot->present = frame.roi_present;
+        }
         unsubmitted.armed = false;
         return w2_ran;
     }
