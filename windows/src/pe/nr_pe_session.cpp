@@ -6,6 +6,7 @@
 #include "nr_pe_stats.hpp"
 #include "nr_gpu_completion.hpp"
 #include "nr_diag_fix.hpp"
+#include "nr_diag_build.hpp"
 #include "nrvk.hpp"   // nrvk::blit, compute_only_recording
 #include "nr_wilsjo2.hpp"
 #include "nr_wilsjo2_flow.hpp"
@@ -2544,6 +2545,8 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
     std::fill(std::begin(build_bytes), std::end(build_bytes), 0);
     build_px = double((w + 63) / 64 * 64) * double((h + 63) / 64 * 64) * config.capacity;
     build_thread = std::thread([this, host, config, temporal, access_copy, tag = build_tag] {
+        nr::diagbuild::Background diagnostic_build;
+        nr::diagbuild::wait(nr::diagbuild::Mode::late, "whole-build");
         struct DiagnosticThread {
             DiagnosticThread() { vkdevice::diagnostic_queue_build_thread(true); }
             ~DiagnosticThread() { vkdevice::diagnostic_queue_build_thread(false); }
@@ -2569,6 +2572,7 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
             locked.queue_unlock = access_copy.unlock_quiet;
             // a parked network whose weights went to RAM (Residency offload): back first
             if (config.share && network_offloaded(*config.share)) {
+                nr::diagbuild::wait(nr::diagbuild::Mode::late_gpu, "weights-reload");
                 const auto r0 = std::chrono::steady_clock::now();
                 nr::vram::Scope owner(nr::vram::kUnset, config_net(config));
                 if (!reload_network(locked, *config.share, config.act_arena, config.act_slack))

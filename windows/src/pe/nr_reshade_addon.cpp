@@ -45,6 +45,7 @@
 #include "nr_pe_vkdevice.hpp"
 #include "nr_pe_diag_stage.hpp"
 #include "nr_diag_fix.hpp"
+#include "nr_diag_build.hpp"
 #include "nr_vram_ledger.hpp"
 #include "nr_pe_events.hpp"
 
@@ -4390,6 +4391,7 @@ extern "C" __declspec(dllexport) void AddonUninit(HMODULE, HMODULE) { nr::pe::wa
 
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
     if (reason == DLL_PROCESS_ATTACH) {
+        (void)nr::diagbuild::origin();
         nr::pe::set_module(module);
         nr::pe::set_hudfix_default(0);   // HUD FIX off by default on the ReShade route
         chain.hud.mode = 0;
@@ -4402,6 +4404,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         const DWORD stage_length = GetEnvironmentVariableA("NR_DIAG_STAGE", stage, sizeof stage);
         diag_stage = stage_length < sizeof stage ? nr::pe::diagnostic_stage(stage) : 0u;
         log("[nr] DIAGNOSTIC BUILD: queue lock + stage switch");
+        log("[nr] NR_DIAG_BUILD=%s delay=%.3fs; t0=first DLL_PROCESS_ATTACH instruction (add-on load); waits on background build thread only",
+            nr::diagbuild::name(nr::diagbuild::active()), nr::diagbuild::delay(std::getenv("NR_DIAG_BUILD_DELAY")));
         log("[nr] NR_DIAG_FIX=%s (unset/invalid = baseline; normal processing unless NR_DIAG_STAGE overrides it)",
             nr::diagfix::name(nr::diagfix::active()));
         log("[nr] NR_DIAG_STAGE=%u: %s", diag_stage, diag_stage == 1 ? "Vulkan, no back-buffer write-back"

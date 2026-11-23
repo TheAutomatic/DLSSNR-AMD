@@ -1701,17 +1701,23 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     // Where the pass's own cost is measured. Two queries per ring slot. A queue
     // family is allowed to report no timestamp bits - then there is no pool, and
     // every accessor answers zero rather than a number made up from a clock.
-    if (props[host.queue_family].timestampValidBits && s.ctx.timestamp_period > 0.0f) {
-        VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
-        qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
-        impl_->split_timing = true;
-        impl_->timing_stride = 4;   // the whole recording's pair, the network's pair
-        qi.queryCount = Impl::kTimingSlots * impl_->timing_stride;
-        if (vkCreateQueryPool(s.ctx.device, &qi, nullptr, &impl_->timing) == VK_SUCCESS) {
-            impl_->timing_ok = true;
-            impl_->timestamp_ns = s.ctx.timestamp_period;
+    const auto create_timing = [&] {
+        if (props[host.queue_family].timestampValidBits && s.ctx.timestamp_period > 0.0f) {
+            VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            impl_->split_timing = true;
+            impl_->timing_stride = 4;   // the whole recording's pair, the network's pair
+            qi.queryCount = Impl::kTimingSlots * impl_->timing_stride;
+            if (vkCreateQueryPool(s.ctx.device, &qi, nullptr, &impl_->timing) == VK_SUCCESS) {
+                impl_->timing_ok = true;
+                impl_->timestamp_ns = s.ctx.timestamp_period;
+            }
         }
-    }
+    };
+    if (nr::diagbuild::selected(nr::diagbuild::Mode::late_gpu))
+        s.diagnostic_before_device = create_timing;
+    else
+        create_timing();
     // Values share arena memory by lifetime (nr_graph.cpp, `reuse`): same
     // arithmetic, same bytes out, a fraction of the memory. NR_ARENA_REUSE=0
     // gives every value its own bytes again, for an A/B.
