@@ -174,7 +174,7 @@ using nr::lang::tr_text;
 unsigned diag_stage = 0;
 
 bool diagnostic_no_writeback(device* dev) {
-    return (diag_stage == 1 || (diag_stage >= 3 && diag_stage <= 6)) && dev->get_api() == device_api::vulkan;
+    return (diag_stage == 1 || (diag_stage >= 3 && diag_stage <= 8)) && dev->get_api() == device_api::vulkan;
 }
 
 bool diagnostic_build_only(device* dev) {
@@ -182,7 +182,7 @@ bool diagnostic_build_only(device* dev) {
 }
 
 bool diagnostic_copy_only(device* dev) {
-    return diag_stage >= 4 && diag_stage <= 6 && dev->get_api() == device_api::vulkan;
+    return diag_stage >= 4 && diag_stage <= 8 && dev->get_api() == device_api::vulkan;
 }
 
 // NR's own resources made through reshade::api (the frame copies: HUD FIX's, the PQ conversion's, the motion copies,
@@ -2999,7 +2999,7 @@ bool run_layers(effect_runtime* rt, nr::pe::Session& s, const nr::pe::Session::R
     return ran;
 }
 
-void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
+void feed(effect_runtime* rt, command_list* cl, resource_view rtv, resource_usage colour_state = resource_usage::render_target) {
     device* dev = rt->get_device();
     if (!vk_loaded && !load_vulkan(dev->get_api(), dev->get_api() == device_api::d3d12
                                  ? reinterpret_cast<ID3D12Device*>(dev->get_native()) : nullptr)) return;
@@ -3415,8 +3415,11 @@ void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
             // and leaves the image as it found it (VulkanFrame::in_place).
             const resource_usage rt = resource_usage::render_target, src = resource_usage::copy_source,
                                  dst = resource_usage::copy_dest;
-            cl->barrier(1, &tgt.colour, &rt, &src);
-            f.colour_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            const bool raw_only = diag_stage == 8;
+            if (!raw_only) cl->barrier(1, &tgt.colour, &rt, &src);
+            f.colour_layout = raw_only
+                ? (colour_state == resource_usage::present ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+                : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
             f.in_place = true;
             f.renodx = renodx;
             f.diagnostic_copy_stage = diagnostic_copy_only(dev) ? diag_stage : 0;
@@ -3424,7 +3427,7 @@ void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
             f.feature = feature;
             const VkImage out = s.run_vulkan(h, cmd, f, controls);
             if (out == f.colour || (out && diagnostic_no_writeback(dev))) {
-                cl->barrier(1, &tgt.colour, &src, &rt);
+                if (!raw_only) cl->barrier(1, &tgt.colour, &src, &rt);
                 ran = true;
             } else if (out) {
                 cl->barrier(1, &tgt.colour, &src, &dst);
@@ -3435,7 +3438,7 @@ void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
                 cl->barrier(1, &tgt.colour, &dst, &rt);
                 ran = true;
             } else {
-                cl->barrier(1, &tgt.colour, &src, &rt);
+                if (!raw_only) cl->barrier(1, &tgt.colour, &src, &rt);
             }
             break;
         }
@@ -4187,7 +4190,8 @@ bool direct_wanted_now() {
     return config.direct_present == 2 || (config.direct_present == 1 && !technique.handle);
 }
 
-void feed_direct(effect_runtime* rt, command_list* cl, resource_view rtv) {
+void feed_direct(effect_runtime* rt, command_list* cl, resource_view rtv,
+                 resource_usage colour_state = resource_usage::render_target) {
     const nr::Controls& controls = settings();
     if (!controls.enabled && !renodx_on && !layered) {
         view.nr_on = 0;
@@ -4208,7 +4212,7 @@ void feed_direct(effect_runtime* rt, command_list* cl, resource_view rtv) {
     mv_var = {};
     depth_var = {};
     missing_reported = true;
-    feed(rt, cl, rtv);
+    feed(rt, cl, rtv, colour_state);
     frame_fed = true;
 }
 
@@ -4240,10 +4244,11 @@ void on_reshade_present(effect_runtime* rt) {
                     if (const resource_view rtv = direct_rtv_for(rt->get_device(), back); rtv.handle) {
                         const resource_usage pr = resource_usage::present, rtu = resource_usage::render_target;
                         const bool build_only = diagnostic_build_only(rt->get_device());
-                        if (!build_only) cl->barrier(1, &back, &pr, &rtu);
-                        feed_direct(rt, cl, rtv);
+                        const bool raw_only = diag_stage == 8 && rt->get_device()->get_api() == device_api::vulkan;
+                        if (!build_only && !raw_only) cl->barrier(1, &back, &pr, &rtu);
+                        feed_direct(rt, cl, rtv, raw_only ? pr : rtu);
                         if (!build_only) {
-                            cl->barrier(1, &back, &rtu, &pr);
+                            if (!raw_only) cl->barrier(1, &back, &rtu, &pr);
                             q->flush_immediate_command_list();
                         }
                         frame_fed = false;
@@ -4400,6 +4405,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
             : diag_stage == 4 ? "Vulkan, back-buffer copy-in only; no RenoDX, network dispatches or write-back"
             : diag_stage == 5 ? "Vulkan, back-buffer barriers only; no copy or destination init"
             : diag_stage == 6 ? "Vulkan, back-buffer copy-in only; explicitly dedicated destination memory"
+            : diag_stage == 7 ? "Vulkan, ReShade outer barriers only; no raw NR barriers, copy or destination init"
+            : diag_stage == 8 ? "Vulkan, raw NR barriers only; no ReShade outer barriers, copy or destination init"
             : "normal behaviour");
         nr::pe::vkdevice::diagnostic_queue_lock();
         nr::pe::watchdog::start();

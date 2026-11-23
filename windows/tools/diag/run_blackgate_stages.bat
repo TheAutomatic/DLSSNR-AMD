@@ -12,19 +12,15 @@ if not exist "Game.exe" (
 if not defined NR_LOG_PATH set "NR_LOG_PATH=%CD%\dlssnr-amd.log"
 if not exist "logs" mkdir "logs"
 if not exist "logs" exit /b 1
-echo Stages 4, 5 and 6: %runs% runs each. Exit the game after observing the 3D scene.
-echo Stage 7 is not implemented; it will be skipped, never launched as stage 0.
+echo Stages 2, 5, 7 and 8: %runs% runs each. Exit the game after observing the 3D scene.
+echo Stage 9 is not implemented: no incorrect layout established in upstream sources.
 echo Log source: "%NR_LOG_PATH%"
 echo Keep [Log] Enabled=1 and ClearOnStart=1 in dlssnr-amd.ini.
 >>"logs\results.txt" echo Session %DATE% %TIME%, runs=%runs%
-for %%S in (4 5 6 7) do (
-    if %%S==7 (
-        echo Stage 7 skipped: the network build itself creates frame-sized images.
-        >>"logs\results.txt" echo stage7 SKIPPED: requires a separate image-free network build path
-    ) else (
-        for /l %%R in (1,1,%runs%) do call :run %%S %%R
-    )
+for %%S in (2 5 7 8) do (
+    for /l %%R in (1,1,%runs%) do call :run %%S %%R
 )
+>>"logs\results.txt" echo stage9 SKIPPED: no incorrect layout established in upstream sources
 exit /b 0
 
 :run

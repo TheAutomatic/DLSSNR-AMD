@@ -1476,7 +1476,8 @@ void Stage::diagnostic_copy_in(VkCommandBuffer cmd, const ColourFrame& colour, u
     m.gpu_uses.touch();
     ++m.recordings;
     m.collect();
-    if (stage != 5 && !m.original.handle) {
+    const bool copy = stage == 4 || stage == 6;
+    if (copy && !m.original.handle) {
         m.original = m.make_image(colour.width, colour.height, m.frame_fmt, VK_IMAGE_USAGE_SAMPLED_BIT, stage == 6);
         // Leave the other stage images uninitialised: this diagnostic never records their passes.
         m.fresh.pop_back();
@@ -1484,7 +1485,7 @@ void Stage::diagnostic_copy_in(VkCommandBuffer cmd, const ColourFrame& colour, u
                             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                             VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
     }
-    m.copy_in(cmd, colour, false, stage != 5);
+    if (stage != 7) m.copy_in(cmd, colour, false, copy);
 }
 
 uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network& network) {

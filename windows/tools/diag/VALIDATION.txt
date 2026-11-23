@@ -3,13 +3,24 @@ BLACKGATE DIAGNOSTIC / 黑屏诊断
 Copy addon32 beside Game.exe, keeping your existing NR data and settings.
 From that folder run run_blackgate_stages.bat [N] (default: 3 runs per stage).
 Exit the game after observing the 3D scene; answer y only if the 3D scene is black.
-4 = copy-in only (the previous diagnostic).
-5 = the same barriers, no destination allocation/init or copy.
-6 = copy-in only with VkMemoryDedicatedAllocateInfo for the destination image.
-Stage 4 already allocates that image outside NR's image heap; stage 6 adds the
-explicit dedicated-allocation contract. Neither stage records network dispatches.
-7 is SKIPPED: building the network already creates/initializes frame-sized adapter
-images. An image-free build requires a wider change; stage 2 is not that test.
+This package runs stages 2, 5, 7 and 8 (3 runs each by default).
+2 = build/prepare only; no per-frame NR recording or EffectRecording flush/fence.
+5 = ReShade outer barriers plus NR raw image/global memory barriers; no copy/init.
+7 = only ReShade render_target <-> copy_source barriers; no raw NR barriers.
+8 = only raw NR image/global memory barriers; no ReShade outer barriers.
+Before effects are available, stages 5/7 also retain the startup Present
+fallback's PRESENT_SRC_KHR <-> COLOR_ATTACHMENT_OPTIMAL wrapper pair.
+Stage 8 starts/restores COLOR_ATTACHMENT_OPTIMAL in effect callbacks, or
+PRESENT_SRC_KHR in the startup Present fallback, without its wrapper barriers.
+Stages 5/7/8 retain normal CPU/runtime setup, other stage/network allocations,
+background upload submissions and EffectRecording flush/fence work. Thus stage 2
+versus 5 is not solely a barrier comparison. While the network builds, the outer
+pair can run before the raw diagnostic is ready. No stage here dispatches NR.
+Stages 0-6 remain available manually. Stage 9 is SKIPPED: stock ReShade 6.8.0
+already establishes COLOR_ATTACHMENT_OPTIMAL around effect callbacks; its
+render_target conversion agrees. No definite incorrect layout was established.
+The old "image-free network build" stage 7 was never implemented; 7 now means
+outer barriers only. These stages do not fix or establish a black-screen cause.
 Use fresh logs folders between sessions: stage<S>_run<R>.log files are overwritten;
 results.txt is appended. Keep [Log] Enabled=1 and ClearOnStart=1 (the defaults).
 NR logs beside the add-on module, not necessarily beside Game.exe. The supplied
@@ -20,10 +31,19 @@ If the game exits before NR starts, an old log may remain; check its stage banne
 
 把 addon32 放到 Game.exe 旁，保留现有 NR 数据和设置。在该目录运行
 run_blackgate_stages.bat [N]，默认每阶段 3 次。观察 3D 场景后退出游戏；
-仅在 3D 场景变黑时回答 y。阶段 4：只拷贝输入；5：仅屏障，不创建/初始化
-拷贝目标、不拷贝；6：显式独占分配拷贝目标显存。4 的目标原本也不在网络
-图像堆里。7 未实现，脚本会跳过，不会误运行阶段 0。网络构建本身会创建
-帧尺寸图像，不能把现有阶段 2 当作“完全不创建图像”的测试。
+仅在 3D 场景变黑时回答 y。本包运行 2、5、7、8，每阶段默认 3 次。
+2：仅构建/准备，不执行逐帧 NR 录制或 EffectRecording 提交/栅栏；
+5：ReShade 外层屏障和 NR 原始图像/全局内存屏障，不初始化拷贝目标、不拷贝；
+7：仅 ReShade 外层屏障；8：仅 NR 原始屏障，不执行 ReShade 外层屏障。
+效果尚未就绪时，5/7 的 Present 回退仍保留 PRESENT_SRC_KHR 与
+COLOR_ATTACHMENT_OPTIMAL 之间的包围屏障。
+8 在效果回调中从 COLOR_ATTACHMENT_OPTIMAL 开始并恢复；启动时 Present
+回退则从 PRESENT_SRC_KHR 开始并恢复，同时跳过该回退的包围屏障。
+5/7/8 保留其余构建/分配、后台上传和 EffectRecording 提交/栅栏；所以
+2 与 5 的差别不只是屏障。网络未就绪时外层屏障可能先于原始屏障执行。
+0-6 仍可手动选用；9 跳过：上游 ReShade 6.8.0 的布局与现有外层屏障一致，
+未发现确定的布局错误。之前未实现的“无图像构建”7 现在改为仅外层屏障。
+这些阶段都不执行网络推理，也不代表已修复或确定黑屏原因。
 日志在插件旁；目录不可写时转到上述 LOCALAPPDATA 路径。可用 NR_LOG_PATH
 指定日志完整路径。每轮结果在 logs\results.txt，日志在 logs\stage<S>_run<R>.log。
 换一批测试前备份 logs，避免覆盖。游戏若未启动到 NR，注意旧日志的阶段标识。
