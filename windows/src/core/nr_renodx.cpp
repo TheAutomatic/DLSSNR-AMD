@@ -1461,7 +1461,7 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
     // The colour into the output as it is: NR off (NeuralUplift), or every pass at zero strength (RenoDX's explicit
     // bypass).
     if (!s.nr_enabled || (m.hdr && !m.chain_active(0, passes))) {
-        if (fr.colour.image != fr.output.image) {
+        if (!fr.diagnostic_no_writeback && fr.colour.image != fr.output.image) {
             Impl::image_barrier(cmd, fr.colour.image, fr.colour.before, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                 fr.colour.before_stage, fr.colour.before_access, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                 VK_ACCESS_TRANSFER_READ_BIT);
@@ -1611,7 +1611,8 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
     // as before (copy in, decode, reduce, apply, copy out).
     static const bool sdr_inplace_off = [] { const char* e = std::getenv("NR_RDX_SDR_INPLACE"); return e && e[0] == '0'; }();
     const bool sdr_inplace = !m.hdr && passes == 1 && !sdr_inplace_off;
-    if (m.hdr || sdr_inplace) {
+    // A borrowed storage view could write the back buffer before the final copy-out.
+    if (!fr.diagnostic_no_writeback && (m.hdr || sdr_inplace)) {
         const bool out_ok = m.decoded_storage && (fr.output.usage & VK_IMAGE_USAGE_STORAGE_BIT) &&
                             fr.output.format == m.decoded_fmt && fr.output.width == W && fr.output.height == H;
         const bool in_ok = (!same || out_ok) && (fr.colour.usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
@@ -2543,7 +2544,7 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
         Impl::image_barrier(cmd, fr.output.image, VK_IMAGE_LAYOUT_GENERAL, fr.output.after,
                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, fr.output.after_stage,
                             fr.output.after_access);
-    } else {
+    } else if (!fr.diagnostic_no_writeback) {
     Impl::image_barrier(cmd, fr.output.image, fr.output.before, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                         fr.output.before_stage, fr.output.before_access, VK_PIPELINE_STAGE_TRANSFER_BIT,
                         VK_ACCESS_TRANSFER_WRITE_BIT);

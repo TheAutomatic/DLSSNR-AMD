@@ -43,6 +43,7 @@
 #include "nr_hud_capture.hpp"
 #include "nr_engine_panel.hpp"
 #include "nr_pe_vkdevice.hpp"
+#include "nr_pe_diag_stage.hpp"
 #include "nr_vram_ledger.hpp"
 #include "nr_pe_events.hpp"
 
@@ -169,6 +170,16 @@ namespace {
 using namespace reshade::api;
 using nr::lang::tr;
 using nr::lang::tr_text;
+
+unsigned diag_stage = 0;
+
+bool diagnostic_no_writeback(device* dev) {
+    return diag_stage == 1 && dev->get_api() == device_api::vulkan;
+}
+
+bool diagnostic_build_only(device* dev) {
+    return diag_stage == 2 && dev->get_api() == device_api::vulkan;
+}
 
 // NR's own resources made through reshade::api (the frame copies: HUD FIX's, the PQ conversion's, the motion copies,
 // Inspect's), in NR Control's video memory (nr_vram_ledger.hpp, "Frame copies"): D3D12 by its allocation size, D3D11 /
@@ -2995,7 +3006,8 @@ void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
     resource motion_image = mv_srv.handle ? rs::call(dev, &device::get_resource_from_view, mv_srv) : resource{};
     resource depth = d_srv.handle ? rs::call(dev, &device::get_resource_from_view, d_srv) : resource{};
     if (!colour.handle) return;
-    EffectRecording recording(rt, cl);
+    std::optional<EffectRecording> recording;
+    if (!diagnostic_build_only(dev)) recording.emplace(rt, cl);
     if (!motion_image.handle && !missing_reported) {
         missing_reported = true;
         report("DLSS5_Feed.fx rendered but its DLSS5_MV texture is not bound; the pass runs "
@@ -3078,6 +3090,7 @@ void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
     renodx_frame.fast_motion_available = motion_image.handle && (provider == 2 || provider == 3
         ? provider_technique.handle && rt->get_technique_state(provider_technique) : provider != 0);
     renodx_frame.after_upscale = true;
+    renodx_frame.diagnostic_no_writeback = diagnostic_no_writeback(dev);
     renodx_frame.settings = config.renodx.values;
     if (!layered && chain.inspect.layer == 1) renodx_frame.settings.debug_view = chain.inspect.debug_view;
     {   // NeuralUplift as NRToggleKey left it
@@ -3118,6 +3131,57 @@ void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
     view.nr_on = renodx_frame.settings.nr_enabled ? 1u : 0u;
     if (!layered && !renodx && !renodx_frame.settings.nr_enabled) {
         note_layer(1, true, 3, "NR is off (toggle key)", w, h_, 0, config.white_point);
+        return;
+    }
+
+    if (diagnostic_build_only(dev)) {
+        const VkDevice device = reinterpret_cast<VkDevice>(static_cast<uintptr_t>(dev->get_native()));
+        auto handles = nr::pe::vkdevice::handles();
+        handles.device = device;
+        VkQueue queue{};
+        uint32_t family{};
+        if (!handles.valid() || !nr::pe::vkdevice::queue_for(device, &queue, &family)) {
+            report("diagnostic stage 2: waiting for the game's Vulkan device and queue");
+            return;
+        }
+        s.set_vulkan_queue(queue, family);
+        const auto prepare = [&](const nr::Controls& c, const nr::pe::Session::RenoDXFrame* rf, uint64_t feature,
+                                 const nr::pe::Session::Wilsjo2Frame* wf = nullptr) -> int {
+            nr::pe::Session::VulkanFrame f{};
+            f.diagnostic_prepare_only = true;
+            f.colour = (VkImage)colour.handle;
+            f.colour_format = nr::pe::vulkan_colour_format_of(static_cast<DXGI_FORMAT>(cd.texture.format));
+            f.width = w; f.height = h_;
+            f.in_place = true;
+            f.linear_hdr = linear_hdr;
+            f.feature = feature;
+            f.renodx = rf;
+            f.wilsjo2 = wf;
+            if (motion_image.handle) {
+                const resource_desc md = rs::call(dev, &device::get_resource_desc, motion_image);
+                f.motion = (VkImage)motion_image.handle;
+                f.motion_width = md.texture.width; f.motion_height = md.texture.height;
+            }
+            const bool ready = s.run_vulkan(handles, VK_NULL_HANDLE, f, c) != VK_NULL_HANDLE;
+            report(ready ? "diagnostic stage 2: network resident; no per-frame GPU recording" : s.status());
+            return 0;
+        };
+        if (layered) {
+            run_layers(rt, s, renodx_frame, controls, motion_image.handle != 0,
+                       static_cast<DXGI_FORMAT>(cd.texture.format), w, h_, prepare, [](int, bool) {},
+                       [&](const nr::Controls& c, uint64_t feature, const nr::pe::Session::Wilsjo2Frame* wf) {
+                           return prepare(c, nullptr, feature, wf);
+                       });
+        } else if (renodx) {
+            prepare(controls, renodx, 3u);
+        } else {
+            const nr::wilsjo2::Settings ws = w2_settings(controls, config);
+            nr::pe::Session::Wilsjo2Frame wf;
+            wf.settings = &ws;
+            wf.preprocess = controls.preprocess;
+            prepare(controls, nullptr, 2u, &wf);
+        }
+        if (++frames_declined % 240 == 0) nr::pe::vkdevice::diagnostic_queue_stats();
         return;
     }
 
@@ -3181,6 +3245,7 @@ void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
         // a wilsjo2 layer: its flow, on linear light when the target is (scRGB, a decoded HDR10 frame)
         nr::pe::Session::Wilsjo2Frame w2frame;
         if (w2f) { w2frame = *w2f; w2frame.hdr = tgt.linear; w2frame.fast_motion = renodx_frame.fast_motion_available; }
+        w2frame.diagnostic_no_writeback = diagnostic_no_writeback(dev);
         const nr::pe::Session::Wilsjo2Frame* const w2run = w2f ? &w2frame : nullptr;
         bool ran = false;
         // DXVK builds D3D10 on its D3D11: an ID3D10Device or ID3D10Texture2D answers QueryInterface with the
@@ -3352,7 +3417,7 @@ void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
             f.wilsjo2 = w2run;
             f.feature = feature;
             const VkImage out = s.run_vulkan(h, cmd, f, controls);
-            if (out == f.colour) {
+            if (out == f.colour || (out && diagnostic_no_writeback(dev))) {
                 cl->barrier(1, &tgt.colour, &src, &rt);
                 ran = true;
             } else if (out) {
@@ -3380,12 +3445,12 @@ void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
         tgt = RunTarget{pq.lin, pq.lin_desc, true};
         const int one = run_one(c, nullptr, feature, w2f);
         tgt = RunTarget{colour, cd, linear_hdr};
-        if (one > 0 && !pq_end(dev, cl, colour)) return -2;
+        if (one > 0 && !diagnostic_no_writeback(dev) && !pq_end(dev, cl, colour)) return -2;
         return one;
     };
     // [Inspect]: Layer 0 (the final picture: every layer runs at Present here) around all of them, Layer N around its
     // own run (the layer page's number; the route without [LayerN] is layer 1)
-    const nr::pe::InspectConfig& ic = chain.inspect;
+    const nr::pe::InspectConfig ic = diagnostic_no_writeback(dev) ? nr::pe::InspectConfig{} : chain.inspect;
     const bool hold = ic.hold && ic.layer > 0;
     const bool ensured = (ic.compare || !ic.apply_model || hold) && inspect_ensure(dev, w, h_, cd.texture.format);
     // the fitted side by side's images go when it is not shown (its program stays)
@@ -3416,8 +3481,8 @@ void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
     if (nr::pe::screenshot::wants_final()) shot_frame(false);
     struct ShotGuard { nr::pe::Session& s; bool& active; ~ShotGuard() { if (active) s.capture_abort(); } } shot_guard{s, shot_chain};
     // HUD FIX around every layer (composed before a final-picture comparison shows it)
-    const HudPlan hud_plan = hudfix_plan(dev, cl, colour.handle);
-    const bool hud_on = hudfix_begin(dev, cl, colour, w, h_, cd.texture.format, hud_plan);
+    const HudPlan hud_plan = diagnostic_no_writeback(dev) ? HudPlan{} : hudfix_plan(dev, cl, colour.handle);
+    const bool hud_on = !diagnostic_no_writeback(dev) && hudfix_begin(dev, cl, colour, w, h_, cd.texture.format, hud_plan);
     // An early return after the captured image was installed must restore the game's frame, including its HUD.
     struct HudRestore {
         command_list* cl;
@@ -4167,10 +4232,13 @@ void on_reshade_present(effect_runtime* rt) {
                 if (back.handle) {
                     if (const resource_view rtv = direct_rtv_for(rt->get_device(), back); rtv.handle) {
                         const resource_usage pr = resource_usage::present, rtu = resource_usage::render_target;
-                        cl->barrier(1, &back, &pr, &rtu);
+                        const bool build_only = diagnostic_build_only(rt->get_device());
+                        if (!build_only) cl->barrier(1, &back, &pr, &rtu);
                         feed_direct(rt, cl, rtv);
-                        cl->barrier(1, &back, &rtu, &pr);
-                        q->flush_immediate_command_list();
+                        if (!build_only) {
+                            cl->barrier(1, &back, &rtu, &pr);
+                            q->flush_immediate_command_list();
+                        }
                         frame_fed = false;
                     }
                 }
@@ -4290,7 +4358,7 @@ void on_render_technique(effect_runtime* rt, effect_technique t, command_list* c
         }
         return;
     }
-    {
+    if (!diagnostic_build_only(rt->get_device())) {
         nr::pe::watchdog::Phase probe("motion-vector data check");
         motion_probe(rt, cl, rtv);
     }
@@ -4315,7 +4383,12 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         nr::pe::install_crash_watch(reshade::internal::get_reshade_module_handle());
         log("[nr] ---------------------------------------------------------------");
         log("[nr] ReShade add-on loaded from %s (build %s)", nr::pe::module_folder(), NR_BUILD_STAMP);
-        log("[nr] DIAGNOSTIC BUILD: queue lock");
+        char stage[16] = {};
+        const DWORD stage_length = GetEnvironmentVariableA("NR_DIAG_STAGE", stage, sizeof stage);
+        diag_stage = stage_length < sizeof stage ? nr::pe::diagnostic_stage(stage) : 0u;
+        log("[nr] DIAGNOSTIC BUILD: queue lock + stage switch");
+        log("[nr] NR_DIAG_STAGE=%u: %s", diag_stage, diag_stage == 1 ? "Vulkan, no back-buffer write-back"
+            : diag_stage == 2 ? "Vulkan build only, no per-frame GPU recording" : "normal behaviour");
         nr::pe::vkdevice::diagnostic_queue_lock();
         nr::pe::watchdog::start();
         const std::string folder = nr::pe::module_folder();
@@ -4330,7 +4403,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
                 nr::pe::ChainConfig start;
                 start.hud.mode = 0;
                 start_file.poll(config_path, start);
-                cap_registered = start.hud.mode == 1 || start.hud.mode == 3;
+                cap_registered = diag_stage == 0 && (start.hud.mode == 1 || start.hud.mode == 3);
             }
             nr::pe::apply_debug_env(folder);   // [Debug]: before anything reads the environment
             // ACO Mode: decided before any device of ours (or a game's we add features to) is made.

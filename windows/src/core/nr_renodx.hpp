@@ -168,6 +168,7 @@ struct StageConfig {
 };
 
 struct StageFrame {
+    bool diagnostic_no_writeback = false;
     bool fast_motion_available = true;   // A bound neutral texture is not a provider for temporal fast passes.
     ColourFrame colour;     // read
     ColourFrame output;     // written; may be the same image as `colour`

@@ -4914,6 +4914,7 @@ bool Session::Impl::record_renodx(VkCommandBuffer cmd, renodx::Stage& stage, con
         look_motion = ColourFrame{};
     }
     renodx::StageFrame sf;
+    sf.diagnostic_no_writeback = rf.diagnostic_no_writeback;
     sf.fast_motion_available = rf.fast_motion_available;
     sf.colour = colour;
     sf.output = output;
@@ -5520,7 +5521,7 @@ bool Session::Impl::record_wilsjo2(VkCommandBuffer cmd, const ColourFrame& colou
         status = "wilsjo2: the stage can neither store into the frame's format nor blit it into one it can";
         return false;
     }
-    const bool in_place = twin == colour.format && (colour.usage & rw) == rw;
+    const bool in_place = !wf.diagnostic_no_writeback && twin == colour.format && (colour.usage & rw) == rw;
     ColourFrame target = colour;
     const auto copy = [&](VkImage from, VkImageLayout from_layout, VkImage to, VkImageLayout to_layout) {
         if (blit) {
@@ -5588,7 +5589,7 @@ bool Session::Impl::record_wilsjo2(VkCommandBuffer cmd, const ColourFrame& colou
     ff.fast_motion = wf.fast_motion;
     const bool ran = nr::wilsjo2::flow_run(io, entry.flow, ff, *wf.settings, uint64_t(target.format));
     w2_everything(cmd);
-    if (!in_place) {   // the answer (or the frame as it came) back into the frame
+    if (!in_place && !wf.diagnostic_no_writeback) {   // the answer (or the frame as it came) back into the frame
         w2_layout(cmd, colour.image, colour.before, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         copy(entry.work->image, VK_IMAGE_LAYOUT_GENERAL, colour.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         w2_layout(cmd, colour.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, colour.after);
@@ -6350,7 +6351,7 @@ VkImage Session::run_vulkan(const DeviceHandles& handles, VkCommandBuffer cmd,
                             const VulkanFrame& frame, const Controls& controls) {
     auto& s = *impl_;
     s.current_feature = frame.feature;   // which network memory a new frame size prefers (Impl::inframe)
-    if (s.failed || !cmd || !frame.colour || !handles.valid()) return VK_NULL_HANDLE;
+    if (s.failed || (!cmd && !frame.diagnostic_prepare_only) || !frame.colour || !handles.valid()) return VK_NULL_HANDLE;
     s.status.clear();
     s.handles = handles;
 
@@ -6371,6 +6372,7 @@ VkImage Session::run_vulkan(const DeviceHandles& handles, VkCommandBuffer cmd,
                         frame.renodx->settings, &nw, &nh);
         if (frame.renodx->settings.nr_enabled && !s.renodx_runtime(controls, nw, nh, &renodx_controls))
             return VK_NULL_HANDLE;
+        if (frame.diagnostic_prepare_only) return frame.colour;
         if (!(renodx_stage = s.renodx_stage(frame.feature, frame.width, frame.height, nw, nh, frame.colour_format,
                                             *frame.renodx)))
             return VK_NULL_HANDLE;
@@ -6388,6 +6390,8 @@ VkImage Session::run_vulkan(const DeviceHandles& handles, VkCommandBuffer cmd,
     if (!s.ensure_runtime(controls, frame.width, frame.height, frame.colour_format))
         return VK_NULL_HANDLE;
     }
+
+    if (frame.diagnostic_prepare_only) return frame.colour;
 
     ColourFrame colour{};
     colour.image = frame.in_place ? frame.colour : s.vk_output;
