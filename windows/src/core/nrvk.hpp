@@ -1035,7 +1035,7 @@ struct Kernel {
     std::vector<VkDescriptorPoolSize> pool_sizes;
     std::vector<uint32_t> binding_ids;   // every binding of the set (the RDNA3 aliases' too)
     std::vector<VkBuffer> buffers;       // the buffer bindings' buffers as bound (twins in place), in binding order
-    uint32_t aco_push_gap{}; // ACO INT4 uses Linux's push layout, omitting Windows's arena address.
+    uint32_t aco_push_gap{}; // ACO uses Linux's push layout, omitting Windows's arena address.
     // RDNA3: which bindings read the FP16 twin of their arena and which are raw alias views, and the
     // context's twin map. A second descriptor set over this layout (nr_runtime.cpp kernel_set) has to
     // bind the same way `create` does, or the kernel reads and writes an arena in the wrong format.
@@ -1048,7 +1048,7 @@ struct Kernel {
             return;
         }
         if (bytes < aco_push_gap + 8 || bytes > 128)
-            throw std::runtime_error("invalid ACO INT4 push block");
+            throw std::runtime_error("invalid ACO push block");
         std::array<uint8_t,128> compact{};
         std::memcpy(compact.data(), data, aco_push_gap);
         std::memcpy(compact.data()+aco_push_gap, static_cast<const uint8_t*>(data)+aco_push_gap+8,
@@ -1072,13 +1072,11 @@ struct Kernel {
                 const std::vector<Context::Image*>& images = {}) {
         device = ctx.device;
         push_range = push_bytes;
-#if NR_INT4
-        if (!nr::binary::directory().empty() && nr::build_cfg("NR_I4_WEIGHTS")) {
+        if (!nr::binary::directory().empty()) {
             const auto name=spirv_path.substr(spirv_path.find_last_of("/\\")+1);
             if (!nr::binary::native_shell(name))
                 aco_push_gap=name.rfind("g_gemm",0)==0 && push_bytes>=88 ? 80u : name=="g_vitattn.spv" ? 20u : 0u;
         }
-#endif
         const std::vector<uint32_t> code = read_spirv(spirv_path);
         std::vector<VkBuffer> bound(bindings);
         std::set<uint32_t> declared;

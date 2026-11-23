@@ -3732,7 +3732,7 @@ bool plan_d3d12_network(const std::string& root_in, uint32_t mw, uint32_t mh, bo
             x.kern = d.kern; x.gx = d.gx; x.gy = d.gy; x.gz = d.gz; x.push = d.push;
             x.no_barrier_after = i + 1 < c.disp.size() && i < c.no_barrier_after.size() && c.no_barrier_after[i] != 0;
             // put_act_address: the arena's address at act_lo (PushVAttn for vitattn, PushGemm for the GEMMs)
-            const size_t gap = int4 ? (d.kern == "vitattn" ? offsetof(PushVAttn, act_lo) : gemm_push_kern(d.kern) ? offsetof(PushGemm, act_lo) : 0) : 0;
+            const size_t gap = d.kern == "vitattn" ? offsetof(PushVAttn, act_lo) : gemm_push_kern(d.kern) ? offsetof(PushGemm, act_lo) : 0;
             if (gap && x.push.size() >= gap + 8) { std::memmove(x.push.data() + gap, x.push.data() + gap + 8, x.push.size() - gap - 8); std::memset(x.push.data() + x.push.size() - 8, 0, 8); }
             else if (d.kern == "vitattn" && d.push.size() >= sizeof(PushVAttn)) x.act_at = int(offsetof(PushVAttn, act_lo));
             else if (gemm_push_kern(d.kern) && d.push.size() >= sizeof(PushGemm)) x.act_at = int(offsetof(PushGemm, act_lo));
