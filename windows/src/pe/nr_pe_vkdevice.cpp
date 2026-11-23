@@ -26,15 +26,11 @@ using nr::pe::log;
 
 std::mutex lock;
 DeviceHandles seen{};
-std::map<VkInstance, uint32_t> instance_versions;
-std::map<VkPhysicalDevice, VkInstance> physical_instances;
+nr::InstanceApiTracker instance_tracker;
 
-uint32_t requested_api(VkPhysicalDevice physical) {
+nr::InstanceApiInfo lookup_instance_api(VkPhysicalDevice physical) {
     std::lock_guard<std::mutex> guard(lock);
-    const auto p = physical_instances.find(physical);
-    if (p == physical_instances.end()) return 0;
-    const auto v = instance_versions.find(p->second);
-    return v == instance_versions.end() ? 0 : v->second;
+    return instance_tracker.lookup(physical);
 }
 
 struct Queue { VkDevice device; uint32_t family; VkQueue queue; };
@@ -48,6 +44,7 @@ void (*device_callback)(VkDevice) = nullptr;
 
 using PFN_CreateInstance = VkResult(VKAPI_PTR*)(const VkInstanceCreateInfo*,
                                                 const VkAllocationCallbacks*, VkInstance*);
+using PFN_DestroyInstance = void(VKAPI_PTR*)(VkInstance, const VkAllocationCallbacks*);
 using PFN_CreateDevice = VkResult(VKAPI_PTR*)(VkPhysicalDevice, const VkDeviceCreateInfo*,
                                               const VkAllocationCallbacks*, VkDevice*);
 using PFN_GetDeviceQueue = void(VKAPI_PTR*)(VkDevice, uint32_t, uint32_t, VkQueue*);
@@ -58,6 +55,7 @@ using PFN_GetDeviceQueue2 = void(VKAPI_PTR*)(VkDevice, const VkDeviceQueueInfo2*
 using PFN_EnumeratePhysicalDevices = VkResult(VKAPI_PTR*)(VkInstance, uint32_t*, VkPhysicalDevice*);
 
 PFN_CreateInstance real_create_instance = nullptr;
+PFN_DestroyInstance real_destroy_instance = nullptr;
 PFN_CreateDevice real_create_device = nullptr;
 PFN_GetDeviceQueue real_get_device_queue = nullptr;
 PFN_GetDeviceQueue2 real_get_device_queue2 = nullptr;
@@ -76,6 +74,11 @@ VkResult VKAPI_PTR hooked_create_instance(const VkInstanceCreateInfo* info,
         seen.instance = *out;
     }
     return r;
+}
+
+void VKAPI_PTR hooked_destroy_instance(VkInstance instance, const VkAllocationCallbacks* allocator) {
+    if (instance && !nr::pe::bridge::creating_device()) forget_instance(instance);
+    real_destroy_instance(instance, allocator);
 }
 
 // A hook that is installed while the game's vkCreateInstance is still on the
@@ -159,14 +162,22 @@ bool augment(VkPhysicalDevice physical, const VkDeviceCreateInfo* info, Augmente
     a->arch = id.arch;
     VkPhysicalDeviceProperties properties{};
     vkGetPhysicalDeviceProperties(physical, &properties);
-    const uint32_t requested = requested_api(physical);
-    if (!requested) {
-        static std::once_flag once;
-        std::call_once(once, [] {
-            log("[nr] instance API version unknown; using the physical device's API version for device features");
+    const nr::InstanceApiInfo inst_info = lookup_instance_api(physical);
+    const uint32_t api = nr::effective_device_api(inst_info.requested_api, properties.apiVersion, info);
+    if (!api) {
+        static std::once_flag once_unknown;
+        std::call_once(once_unknown, [] {
+            log("[nr] device features left as the game asked: instance API version is unknown and not inferable from device create info");
+        });
+        return false;
+    }
+    if (!inst_info.requested_api) {
+        static std::once_flag once_inferred;
+        std::call_once(once_inferred, [api] {
+            log("[nr] instance API version unknown; using inferred lower bound %u.%u from device create info",
+                VK_API_VERSION_MAJOR(api), VK_API_VERSION_MINOR(api));
         });
     }
-    const uint32_t api = nr::effective_device_api(requested, properties.apiVersion);
     // The tested 32-bit route uses storage buffers, not device addresses.
     const nr::DeviceFeatureRequirements requirements(api, sizeof(void*) == 4);
     network.insert(network.end(), requirements.extensions.begin(), requirements.extensions.end());
@@ -187,12 +198,21 @@ bool augment(VkPhysicalDevice physical, const VkDeviceCreateInfo* info, Augmente
     bool robustness_ext = false;
     for (const auto& h : have)
         robustness_ext = robustness_ext || std::strcmp(h.extensionName, VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME) == 0;
+    const bool can_query_features2 = nr::can_query_physical_device_features2(
+        api, inst_info.has_get_physical_device_properties2);
     VkPhysicalDevicePipelineRobustnessFeaturesEXT prf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT};
-    if (robustness_ext || api >= VK_API_VERSION_1_4) {
+    if (can_query_features2 && (robustness_ext || api >= VK_API_VERSION_1_4)) {
         VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &prf};
-        vkGetPhysicalDeviceFeatures2(physical, &f2);
+        if (api >= VK_API_VERSION_1_1) {
+            vkGetPhysicalDeviceFeatures2(physical, &f2);
+        } else if (inst_info.instance) {
+            const auto get_features2_khr = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2KHR>(
+                vkGetInstanceProcAddr(inst_info.instance, "vkGetPhysicalDeviceFeatures2KHR"));
+            if (get_features2_khr) get_features2_khr(physical, &f2);
+        }
     }
-    const nr::PipelineRobustnessRequirements robustness(api, robustness_ext, prf.pipelineRobustness != 0);
+    const nr::PipelineRobustnessRequirements robustness(
+        api, inst_info.has_get_physical_device_properties2, robustness_ext, prf.pipelineRobustness != 0);
     if (robustness.enabled) {
         a->features->enable_pipeline_robustness();
         if (robustness.extension && !listed(VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME,
@@ -284,14 +304,20 @@ void VKAPI_PTR hooked_get_device_queue2(VkDevice device, const VkDeviceQueueInfo
 void note_instance(VkInstance instance, const VkInstanceCreateInfo* info) {
     if (!instance) return;
     std::lock_guard<std::mutex> guard(lock);
-    instance_versions[instance] = info && info->pApplicationInfo && info->pApplicationInfo->apiVersion
-        ? info->pApplicationInfo->apiVersion : VK_API_VERSION_1_0;
+    instance_tracker.note_instance(instance, info);
 }
 
 void note_physical_devices(VkInstance instance, uint32_t count, const VkPhysicalDevice* physical) {
     if (!instance || !physical) return;
     std::lock_guard<std::mutex> guard(lock);
-    for (uint32_t i = 0; i < count; ++i) physical_instances[physical[i]] = instance;
+    instance_tracker.note_physical_devices(instance, count, physical);
+}
+
+void forget_instance(VkInstance instance) {
+    if (!instance) return;
+    std::lock_guard<std::mutex> guard(lock);
+    instance_tracker.forget_instance(instance);
+    if (seen.instance == instance) seen.instance = VK_NULL_HANDLE;
 }
 
 VkResult create_with_network(PFN_vkCreateDevice create, VkPhysicalDevice physical, const VkDeviceCreateInfo* info,
@@ -338,6 +364,8 @@ bool install() {
     struct { const char* name; void* detour; void** original; } entries[] = {
         {"vkCreateInstance", reinterpret_cast<void*>(&hooked_create_instance),
          reinterpret_cast<void**>(&real_create_instance)},
+        {"vkDestroyInstance", reinterpret_cast<void*>(&hooked_destroy_instance),
+         reinterpret_cast<void**>(&real_destroy_instance)},
         {"vkCreateDevice", reinterpret_cast<void*>(&hooked_create_device),
          reinterpret_cast<void**>(&real_create_device)},
         {"vkGetDeviceQueue", reinterpret_cast<void*>(&hooked_get_device_queue),

@@ -4936,15 +4936,44 @@ bool int4_wanted() {
 // A native Vulkan game calls winevulkan.dll's exported vkCreateDevice (through vulkan-1.dll) rather than asking
 // vkGetInstanceProcAddr: that export is detoured too, its instance found from the physical device
 // (vkEnumeratePhysicalDevices' export detoured, which instance listed it). A call that came through the wrapped
-// pointer and reaches the export goes straight on (t_in_create).
+// pointer and reaches the export goes straight on (t_in_create / t_in_create_instance / t_in_destroy_instance /
+// t_in_enum_phys).
+PFN_vkCreateInstance real_export_create_instance = nullptr;
+PFN_vkDestroyInstance real_export_destroy_instance = nullptr;
 PFN_vkCreateDevice real_export_create = nullptr;
 PFN_vkEnumeratePhysicalDevices real_enumerate_physical = nullptr;
+std::atomic<PFN_vkCreateInstance> g_next_create_instance{nullptr};
+std::atomic<PFN_vkDestroyInstance> g_next_destroy_instance{nullptr};
+std::atomic<PFN_vkEnumeratePhysicalDevices> g_next_enum_phys{nullptr};
 std::unordered_map<VkPhysicalDevice, VkInstance> g_physical_instance;   // g_devices_lock
+std::unordered_map<VkInstance, PFN_vkDestroyInstance> g_instance_destroy_procs;   // g_devices_lock
+std::unordered_map<VkInstance, PFN_vkEnumeratePhysicalDevices> g_instance_enum_phys_procs;   // g_devices_lock
 thread_local int t_in_create = 0;
+thread_local int t_in_create_instance = 0;
+thread_local int t_in_destroy_instance = 0;
+thread_local int t_in_enum_phys = 0;
 std::atomic<PFN_vkCreateDevice> g_layer_next_create_device{nullptr};
 std::atomic<VkInstance> g_layer_create_instance{VK_NULL_HANDLE};
+VKAPI_ATTR VkResult VKAPI_CALL nr_layer_create_instance(const VkInstanceCreateInfo* ci,
+                                                         const VkAllocationCallbacks* a, VkInstance* out);
+VKAPI_ATTR void VKAPI_CALL nr_layer_destroy_instance(VkInstance instance, const VkAllocationCallbacks* a);
 void hook_native_vk_device_procs(VkDevice device);
 void forget_vk_swapchains(VkDevice device);
+
+void forget_asi_instance(VkInstance instance) {
+    if (!instance) return;
+    nr::pe::vkdevice::forget_instance(instance);
+    VkInstance expected = instance;
+    g_create_instance.compare_exchange_strong(expected, VK_NULL_HANDLE, std::memory_order_acq_rel);
+    expected = instance;
+    g_layer_create_instance.compare_exchange_strong(expected, VK_NULL_HANDLE, std::memory_order_acq_rel);
+    std::lock_guard<std::mutex> guard(g_devices_lock);
+    g_instance_destroy_procs.erase(instance);
+    g_instance_enum_phys_procs.erase(instance);
+    for (auto it = g_physical_instance.begin(); it != g_physical_instance.end();)
+        if (it->second == instance) it = g_physical_instance.erase(it);
+        else ++it;
+}
 
 VkResult create_device(PFN_vkCreateDevice create, VkInstance instance, VkPhysicalDevice phys, const VkDeviceCreateInfo* ci,
                        const VkAllocationCallbacks* a, VkDevice* out, void* caller) {
@@ -4952,6 +4981,15 @@ VkResult create_device(PFN_vkCreateDevice create, VkInstance instance, VkPhysica
     struct Inside { Inside() { ++t_in_create; } ~Inside() { --t_in_create; } } inside;
     // The bridge's own device (nr_pe_bridge.hpp) is not the game's: passed straight through, unrecorded.
     if (nr::pe::bridge::creating_device()) return create(phys, ci, a, out);
+    if (instance && phys) {
+        bool known = false;
+        {
+            std::lock_guard<std::mutex> guard(g_devices_lock);
+            known = g_physical_instance.find(phys) != g_physical_instance.end();
+            if (!known) g_physical_instance[phys] = instance;
+        }
+        if (!known) nr::pe::vkdevice::note_physical_devices(instance, 1, &phys);
+    }
     // The network's extensions and features (cooperative matrices, FP8, the explicit workgroup memory layout) and ACO
     // Mode's pipeline binaries: the AMD Windows driver wants them enabled on the device the network runs on.
     bool added = false;
@@ -5037,19 +5075,126 @@ VKAPI_ATTR void VKAPI_CALL hk_destroy_device(VkDevice device, const VkAllocation
     real_destroy_device(device, a);
 }
 
-VKAPI_ATTR VkResult VKAPI_CALL hk_enumerate_physical(VkInstance instance, uint32_t* n, VkPhysicalDevice* list) {
-    const VkResult r = real_enumerate_physical(instance, n, list);
-    if ((r == VK_SUCCESS || r == VK_INCOMPLETE) && list && n) {
+VkResult create_instance_common(PFN_vkCreateInstance create, const VkInstanceCreateInfo* ci,
+                                const VkAllocationCallbacks* a, VkInstance* out) {
+    struct Inside { Inside() { ++t_in_create_instance; } ~Inside() { --t_in_create_instance; } } inside;
+    const VkResult r = create(ci, a, out);
+    if (r == VK_SUCCESS && out && *out && !nr::pe::bridge::creating_device())
+        nr::pe::vkdevice::note_instance(*out, ci);
+    return r;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL hk_export_create_instance(const VkInstanceCreateInfo* ci,
+                                                         const VkAllocationCallbacks* a, VkInstance* out) {
+    if (t_in_create_instance) return real_export_create_instance(ci, a, out);
+    return create_instance_common(real_export_create_instance, ci, a, out);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL hk_gipa_create_instance(const VkInstanceCreateInfo* ci,
+                                                       const VkAllocationCallbacks* a, VkInstance* out) {
+    PFN_vkCreateInstance next = g_next_create_instance.load(std::memory_order_acquire);
+    if (!next) next = real_export_create_instance;
+    if (!next) return VK_ERROR_INITIALIZATION_FAILED;
+    if (t_in_create_instance) return next(ci, a, out);
+    return create_instance_common(next, ci, a, out);
+}
+
+void destroy_instance_common(PFN_vkDestroyInstance destroy, VkInstance instance, const VkAllocationCallbacks* a) {
+    struct Inside { Inside() { ++t_in_destroy_instance; } ~Inside() { --t_in_destroy_instance; } } inside;
+    if (instance && !nr::pe::bridge::creating_device()) forget_asi_instance(instance);
+    destroy(instance, a);
+}
+
+VKAPI_ATTR void VKAPI_CALL hk_export_destroy_instance(VkInstance instance, const VkAllocationCallbacks* a) {
+    if (t_in_destroy_instance) {
+        real_export_destroy_instance(instance, a);
+        return;
+    }
+    destroy_instance_common(real_export_destroy_instance, instance, a);
+}
+
+VKAPI_ATTR void VKAPI_CALL hk_gipa_destroy_instance(VkInstance instance, const VkAllocationCallbacks* a) {
+    PFN_vkDestroyInstance next = nullptr;
+    if (instance) {
+        std::lock_guard<std::mutex> guard(g_devices_lock);
+        if (const auto it = g_instance_destroy_procs.find(instance); it != g_instance_destroy_procs.end()) {
+            next = it->second;
+            g_instance_destroy_procs.erase(it);
+        }
+    }
+    if (!next) next = g_next_destroy_instance.load(std::memory_order_acquire);
+    if (!next) next = real_export_destroy_instance;
+    if (!next) return;
+    if (t_in_destroy_instance) {
+        next(instance, a);
+        return;
+    }
+    destroy_instance_common(next, instance, a);
+}
+
+VkResult enumerate_physical_common(PFN_vkEnumeratePhysicalDevices enumerate, VkInstance instance, uint32_t* n,
+                                   VkPhysicalDevice* list) {
+    struct Inside { Inside() { ++t_in_enum_phys; } ~Inside() { --t_in_enum_phys; } } inside;
+    const VkResult r = enumerate(instance, n, list);
+    if ((r == VK_SUCCESS || r == VK_INCOMPLETE) && instance && list && n && !nr::pe::bridge::creating_device()) {
         nr::pe::vkdevice::note_physical_devices(instance, *n, list);
         std::lock_guard<std::mutex> guard(g_devices_lock);
-        for (uint32_t i = 0; i < *n; ++i) g_physical_instance[list[i]] = instance;
+        for (uint32_t i = 0; i < *n; ++i)
+            if (list[i] != VK_NULL_HANDLE) g_physical_instance[list[i]] = instance;
     }
     return r;
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL hk_enumerate_physical(VkInstance instance, uint32_t* n, VkPhysicalDevice* list) {
+    if (t_in_enum_phys) return real_enumerate_physical(instance, n, list);
+    return enumerate_physical_common(real_enumerate_physical, instance, n, list);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL hk_gipa_enumerate_physical(VkInstance instance, uint32_t* n, VkPhysicalDevice* list) {
+    PFN_vkEnumeratePhysicalDevices next = nullptr;
+    if (instance) {
+        std::lock_guard<std::mutex> guard(g_devices_lock);
+        if (const auto it = g_instance_enum_phys_procs.find(instance); it != g_instance_enum_phys_procs.end())
+            next = it->second;
+    }
+    if (!next) next = g_next_enum_phys.load(std::memory_order_acquire);
+    if (!next) next = real_enumerate_physical;
+    if (!next) return VK_ERROR_INITIALIZATION_FAILED;
+    if (t_in_enum_phys) return next(instance, n, list);
+    return enumerate_physical_common(next, instance, n, list);
+}
+
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL hk_gipa(VkInstance instance, const char* name) {
     const PFN_vkVoidFunction f = real_gipa(instance, name);
-    if (f && name && !std::strcmp(name, "vkCreateDevice")) {
+    if (!f || !name) return f;
+    if (!std::strcmp(name, "vkCreateInstance")) {
+        if (f == reinterpret_cast<PFN_vkVoidFunction>(&nr_layer_create_instance) ||
+            f == reinterpret_cast<PFN_vkVoidFunction>(&hk_gipa_create_instance))
+            return f;
+        g_next_create_instance.store(reinterpret_cast<PFN_vkCreateInstance>(f), std::memory_order_release);
+        return reinterpret_cast<PFN_vkVoidFunction>(&hk_gipa_create_instance);
+    }
+    if (!std::strcmp(name, "vkDestroyInstance")) {
+        if (f == reinterpret_cast<PFN_vkVoidFunction>(&nr_layer_destroy_instance) ||
+            f == reinterpret_cast<PFN_vkVoidFunction>(&hk_gipa_destroy_instance))
+            return f;
+        if (instance) {
+            std::lock_guard<std::mutex> guard(g_devices_lock);
+            g_instance_destroy_procs[instance] = reinterpret_cast<PFN_vkDestroyInstance>(f);
+        }
+        g_next_destroy_instance.store(reinterpret_cast<PFN_vkDestroyInstance>(f), std::memory_order_release);
+        return reinterpret_cast<PFN_vkVoidFunction>(&hk_gipa_destroy_instance);
+    }
+    if (!std::strcmp(name, "vkEnumeratePhysicalDevices")) {
+        if (f == reinterpret_cast<PFN_vkVoidFunction>(&hk_gipa_enumerate_physical)) return f;
+        if (instance) {
+            std::lock_guard<std::mutex> guard(g_devices_lock);
+            g_instance_enum_phys_procs[instance] = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(f);
+        }
+        g_next_enum_phys.store(reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(f), std::memory_order_release);
+        return reinterpret_cast<PFN_vkVoidFunction>(&hk_gipa_enumerate_physical);
+    }
+    if (!std::strcmp(name, "vkCreateDevice")) {
         if (f == reinterpret_cast<PFN_vkVoidFunction>(&hk_layer_create_device)) return f;
         g_next_create_device.store(reinterpret_cast<PFN_vkCreateDevice>(f));
         if (instance) g_create_instance.store(instance);
@@ -5113,6 +5258,19 @@ void hook_device_creation() {
             MH_EnableHook(gipa) != MH_OK)
             log("[nr] vulkan-1.dll's vkGetInstanceProcAddr could not be hooked: the network's device features are "
                 "not added");
+        void* create_inst = reinterpret_cast<void*>(GetProcAddress(m, "vkCreateInstance"));
+        void* destroy_inst = reinterpret_cast<void*>(GetProcAddress(m, "vkDestroyInstance"));
+        if (!create_inst ||
+            MH_CreateHook(create_inst, reinterpret_cast<void*>(&hk_export_create_instance),
+                          reinterpret_cast<void**>(&real_export_create_instance)) != MH_OK ||
+            MH_EnableHook(create_inst) != MH_OK)
+            log("[nr] vulkan-1.dll's vkCreateInstance could not be hooked: instance API version falls back to "
+                "physical device inference");
+        if (!destroy_inst ||
+            MH_CreateHook(destroy_inst, reinterpret_cast<void*>(&hk_export_destroy_instance),
+                          reinterpret_cast<void**>(&real_export_destroy_instance)) != MH_OK ||
+            MH_EnableHook(destroy_inst) != MH_OK)
+            log("[nr] vulkan-1.dll's vkDestroyInstance could not be hooked: destroyed instance records may linger");
         void* create = reinterpret_cast<void*>(GetProcAddress(m, "vkCreateDevice"));
         void* enumerate = reinterpret_cast<void*>(GetProcAddress(m, "vkEnumeratePhysicalDevices"));
         void* destroy = reinterpret_cast<void*>(GetProcAddress(m, "vkDestroyDevice"));
@@ -9904,12 +10062,7 @@ VKAPI_ATTR void VKAPI_CALL nr_layer_destroy_instance(VkInstance instance, const 
         if (g_layer_last_instance == instance)
             g_layer_last_instance = g_layer_instances.empty() ? VK_NULL_HANDLE : g_layer_instances.begin()->first;
     }
-    {
-        std::lock_guard<std::mutex> guard(g_devices_lock);
-        for (auto it = g_physical_instance.begin(); it != g_physical_instance.end();)
-            if (it->second == instance) it = g_physical_instance.erase(it);
-            else ++it;
-    }
+    forget_asi_instance(instance);
     if (next_gipa) {
         if (const auto next_di = reinterpret_cast<PFN_vkDestroyInstance>(next_gipa(instance, "vkDestroyInstance")))
             next_di(instance, a);

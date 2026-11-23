@@ -94,6 +94,9 @@ jobs:
       - name: Fetch dependencies
         run: bash fetch_deps.sh --windows
 
+      - name: Run device feature unit tests
+        run: bash windows/tools/test_device_features.sh
+
       - name: Build package   # builds the Vulkan loader and the OptiScaler DLLs too
         run: NR_SIGN=1 bash windows/build/build_package.sh
 

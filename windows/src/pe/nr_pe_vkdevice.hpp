@@ -61,6 +61,7 @@ void set_device_callback(void (*callback)(VkDevice));
 void note_handles(VkInstance instance, VkPhysicalDevice physical, VkDevice device);
 void note_instance(VkInstance instance, const VkInstanceCreateInfo* info);
 void note_physical_devices(VkInstance instance, uint32_t count, const VkPhysicalDevice* physical);
+void forget_instance(VkInstance instance);
 
 // The watch added the network's features (nr::DeviceFeatures::enable, bufferDeviceAddress among
 // them) to this device's vkCreateDevice and the device was created with them.
