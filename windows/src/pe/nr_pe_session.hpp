@@ -27,6 +27,7 @@
 #include <string>
 
 namespace nr::pe {
+namespace roi { struct Luma; }
 // The network's [Network] Motion Without Depth as the last RenoDX run's runtime has it (-1 none ran yet): the .asi's
 // Present guide sets copy the game's depth only when something reads it.
 extern std::atomic<int> g_motion_without_depth_now;
@@ -342,8 +343,11 @@ class Session {
         // The RenoDX-style option: RenoDX's processing around the network instead (needs `motion`).
         const RenoDXFrame* renodx{};
         const Wilsjo2Frame* wilsjo2{};   // a wilsjo2 layer: its flow around the network, on `target` in place
+        uint64_t roi_present{};   // opt-in ReShade diagnostic; zero leaves it off
     };
     bool run_d3d11(const D3D11Frame& frame, const Controls& controls);
+    bool read_present_roi(uint64_t present, roi::Luma* stages);
+    static roi::Luma measure_roi(VkFormat format, const void* pixels, size_t pitch, uint32_t width, uint32_t height);
     // The same for a D3D10 game on the native runtime (`device` an ID3D10Device), through the bridge
     // with keyed mutexes; D3D10 has neither fences nor compute shaders, so depth is not read.
     bool run_d3d10(const D3D11Frame& frame, const Controls& controls);
