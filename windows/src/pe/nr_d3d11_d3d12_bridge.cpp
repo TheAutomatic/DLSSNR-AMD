@@ -618,6 +618,7 @@ Status Bridge::execute(ID3D11Device* d11_dev, ID3D11Texture2D* back11, ID3D11Tex
     items[0].role = Role::kBack;
     items[0].tex11 = back11;
     items[0].back = true;
+    items[0].writable = true;
     if (hudless11) {
         D3D11_TEXTURE2D_DESC bd{}, hd{};
         back11->GetDesc(&bd);

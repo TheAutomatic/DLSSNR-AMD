@@ -2147,7 +2147,21 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
                 hud_fg && hud_cap.fg.copied ? " (copied on the game's list)" : "");
         }
     }
-    if (!ensure_ring(device) || !ensure_texture(device, g_present.target, g_present.target_state, format, w, h)) return;
+    std::vector<const Layer*> run_layers;
+    for (const Run& run : runs) run_layers.push_back(run.layer);
+    size_t ia = 0, ib = 0;
+    const bool inspect = inspect_span(chain->inspect, run_layers, true, &ia, &ib) && inspect_format(format);
+    const long held = chosen_index(chain->inspect, run_layers);
+    const bool want_shot = nr::pe::screenshot::wants_final();
+    // D3D11 -> D3D12 Present owns `back` (a shared UAV-capable texture): run layers directly on it when no
+    // copy-aside feature (HUD FIX, FG delta, F5 shot, Inspect, Hold) needs an untouched frame buffer.
+    const bool d11_in_place = d11_at && !at &&
+        (bd.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0 &&
+        bd.Format == format && !want_shot &&
+        !hud_captured && !d11_at->hudless && !inspect && held < 0 && !g_present.hold.held;
+    if (!ensure_ring(device) ||
+        (!d11_in_place && !ensure_texture(device, g_present.target, g_present.target_state, format, w, h)))
+        return;
     // The ring's next slot, waited for (bounded) while a Present of eight ago still runs
     const uint32_t slot = uint32_t((g_present.submitted + 1) % kPresentRing);
     uint64_t done = g_present.fence->GetCompletedValue();
@@ -2158,7 +2172,7 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
         ResetEvent(g_present.event);
         if (FAILED(g_present.fence->SetEventOnCompletion(g_present.slot_value[slot], g_present.event))) return;
         ID3D12Fence* const fence_was = g_present.fence;
-        ID3D12Resource* const target_was = g_present.target;
+        ID3D12Resource* const target_was = d11_in_place ? nullptr : g_present.target;
         const uint64_t waited_for = g_present.slot_value[slot], submitted_was = g_present.submitted;
         guard.unlock();
         const uint64_t wait_from = pacing_us();
@@ -2168,8 +2182,9 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
         guard.lock();
         // the lock was let go: the ring and the copy may have been made anew meanwhile (another device, a resize), or
         // another Present took the slot: this one leaves the frame alone
-        if (g_present.device != device || !g_present.list || !g_present.target || g_present.fence != fence_was ||
-            g_present.target != target_was || g_present.slot_value[slot] != waited_for || g_present.submitted != submitted_was)
+        if (g_present.device != device || !g_present.list || (!d11_in_place && !g_present.target) ||
+            g_present.fence != fence_was || (!d11_in_place && g_present.target != target_was) ||
+            g_present.slot_value[slot] != waited_for || g_present.submitted != submitted_was)
             return;
         done = g_present.fence->GetCompletedValue();
         if (!completed || done < waited_for) {
@@ -2240,9 +2255,13 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
         read_back = !hud_any && !fg_any && !inspect_span(chain->inspect, rl, true, &a0, &b0) &&
                     chosen_index(chain->inspect, rl) < 0 && !g_present.hold.held;
     }
+    ID3D12Resource* const target = d11_in_place ? back : g_present.target;
     D3D12_RESOURCE_STATES back_now = D3D12_RESOURCE_STATE_COPY_SOURCE;   // where the back buffer is until the end
-    bool filled = !read_back;
-    if (read_back) {
+    bool filled = d11_in_place || !read_back;
+    if (d11_in_place) {
+        back_now = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        transition(l, back, back_state, back_now);
+    } else if (read_back) {
         back_now = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         transition(l, back, back_state, back_now);
         transition(l, g_present.target, g_present.target_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -2278,7 +2297,7 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
         transition(l, back, D3D12_RESOURCE_STATE_COPY_SOURCE, back_now);
     };
     PresentShot shot;   // F5: the frame as the game presents it
-    if (nr::pe::screenshot::wants_final()) {
+    if (want_shot) {
         if (at)   // its pair needs our own submission's fence to read back
             nr::pe::screenshot::fail("unsupported_present", "the Present layers run at DLSS-G's evaluate (DLSS-G through "
                                      "NGX): the final picture's pair is not taken there");
@@ -2297,11 +2316,6 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
     namespace route = nr::pe::renodx_route;
     // [Inspect]: the Present layers compared (the final picture is theirs: Present is the last placement), the frame
     // taken before the first of them and shown after the last
-    std::vector<const Layer*> run_layers;
-    for (const Run& run : runs) run_layers.push_back(run.layer);
-    size_t ia = 0, ib = 0;
-    const bool inspect = inspect_span(chain->inspect, run_layers, true, &ia, &ib) && inspect_format(format);
-    const long held = chosen_index(chain->inspect, run_layers);
     if (held < 0 && g_present.hold.held) {   // the hold moved off these layers: the held one back to live
         g_hold_released.insert(g_present.hold.layer);
         g_present.hold.held = false;
@@ -2591,25 +2605,25 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
             if (run.encoding == 2) {   // PQ: through linear BT.709 scRGB and back
                 if (ensure_texture(device, g_present.linear, g_present.linear_state, DXGI_FORMAT_R16G16B16A16_FLOAT, w, h) &&
                     ensure_texture(device, g_present.encoded, g_present.encoded_state, format, w, h)) {
-                    transition(l, g_present.target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                    if (nr::asi::wilsjo2_convert(l, device, g_present.target, nullptr, g_present.linear, w, h, true)) {
+                    transition(l, target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                    if (nr::asi::wilsjo2_convert(l, device, target, nullptr, g_present.linear, w, h, true)) {
                         done_run = nr::asi::wilsjo2_run(l, device, *pl.w2, wf, ws, g_present.linear, w, h, false);
                         if (done_run) {
                             transition(l, g_present.linear, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                            if (nr::asi::wilsjo2_convert(l, device, g_present.linear, g_present.target, g_present.encoded, w, h, false)) {
+                            if (nr::asi::wilsjo2_convert(l, device, g_present.linear, target, g_present.encoded, w, h, false)) {
                                 transition(l, g_present.encoded, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-                                transition(l, g_present.target, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-                                l->CopyResource(g_present.target, g_present.encoded);
-                                transition(l, g_present.target, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                                transition(l, target, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+                                l->CopyResource(target, g_present.encoded);
+                                transition(l, target, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                                 transition(l, g_present.encoded, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                             }
                             transition(l, g_present.linear, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                         }
                     }
-                    transition(l, g_present.target, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                    transition(l, target, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 }
             } else {
-                done_run = nr::asi::wilsjo2_run(l, device, *pl.w2, wf, ws, g_present.target, w, h, false);
+                done_run = nr::asi::wilsjo2_run(l, device, *pl.w2, wf, ws, target, w, h, false);
             }
             pl.w2_reset = !done_run;
             if (!done_run) layer_note(layer, 2, 3, "its run could not be recorded (see the log)");
@@ -2655,7 +2669,7 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
         // the first layer reading the back buffer: colour = the back buffer (its state back_now), output = our
         // copy, written by the stage's store (or the seed copy when the network does not run)
         const bool from_back = !filled;
-        route::set_direct(from_back ? nullptr : g_present.target);
+        route::set_direct(from_back ? nullptr : target);
         filled = true;
         {
             route::CallStyle style(true);
@@ -2663,8 +2677,8 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
             route::CallNetwork network(layer.network);
             route::CallLayer number(row_number(layer));
             const Rect whole{0, 0, w, h};
-            nr::dlssnr::evaluate_d3d12(l, pl.nr, nullptr, from_back ? back : g_present.target, g ? g->depth : nullptr,
-                                       g ? g->motion : nullptr, g_present.target, w, h, g ? g->f.depth_rect : whole,
+            nr::dlssnr::evaluate_d3d12(l, pl.nr, nullptr, from_back ? back : target, g ? g->depth : nullptr,
+                                       g ? g->motion : nullptr, target, w, h, g ? g->f.depth_rect : whole,
                                        g ? g->f.motion_rect : whole, g ? ((g->f.flags & kFlagDepthInverted) ? 1 : 0) : 1,
                                        reset ? 1 : 0, nr::dlssnr::Controls6{}, g ? g->f.mv_x * share : 1.f,
                                        g ? g->f.mv_y * share : 1.f);
@@ -2706,16 +2720,20 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
         }
     }
     if (at) ++(hud_given == 1 ? g_pacing.dlssg_hud_own : hud_given == 2 ? g_pacing.dlssg_hud_other : g_pacing.dlssg_hud_none);
-    if (ran) fill_target();   // (every run fills it; for certainty)
-    shot.copy(l, g_present.target, 1);   // F5: the final picture
-    transition(l, g_present.target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    transition(l, back, back_now, ran ? D3D12_RESOURCE_STATE_COPY_DEST : back_state);
-    if (ran) {
-        l->CopyResource(back, g_present.target);
-        transition(l, back, D3D12_RESOURCE_STATE_COPY_DEST, back_state);
+    if (d11_in_place) {
+        transition(l, back, back_now, back_state);
+    } else {
+        if (ran) fill_target();   // (every run fills it; for certainty)
+        shot.copy(l, g_present.target, 1);   // F5: the final picture
+        transition(l, g_present.target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        transition(l, back, back_now, ran ? D3D12_RESOURCE_STATE_COPY_DEST : back_state);
+        if (ran) {
+            l->CopyResource(back, g_present.target);
+            transition(l, back, D3D12_RESOURCE_STATE_COPY_DEST, back_state);
+        }
+        transition(l, g_present.target, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        g_present.target_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     }
-    transition(l, g_present.target, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    g_present.target_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     if (at) {   // the evaluate's list: its owner closes and submits it; the guide sets wait for that recording
         for (GuideSet* gs : readable) { gs->read_order = ++g_present.reads; gs->read_ticket = nr::gpu::current(); }
         return;
