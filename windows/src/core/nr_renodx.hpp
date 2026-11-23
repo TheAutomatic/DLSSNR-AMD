@@ -224,7 +224,7 @@ public:
     // The frame through every pass of the stack (Settings::passes) into StageFrame::output. Returns how many passes
     // ran the network (0: NR off, or every pass at zero strength - the frame copied through as it is).
     uint32_t record(VkCommandBuffer, const StageFrame&, const Network&);
-    void diagnostic_copy_in(VkCommandBuffer, const ColourFrame&);
+    void diagnostic_copy_in(VkCommandBuffer, const ColourFrame&, unsigned stage);
     // Inside a Network call: the motion vectors that pass's history needs, when they are not the frame's own
     // (Interleaved: a slot's history is several frames old) - `use` false: the frame's own. Normalised backward
     // vectors at the network's size, scale 1, region at the origin.

@@ -363,7 +363,7 @@ class Session {
     // The device handles come from the upscaler's own context creation.
     struct VulkanFrame {
         bool diagnostic_prepare_only = false;
-        bool diagnostic_copy_only = false;
+        unsigned diagnostic_copy_stage = 0;
         uint64_t feature{};   // as EngineResources::feature
         VkImage colour{}; VkImageLayout colour_layout{VK_IMAGE_LAYOUT_UNDEFINED};
         VkFormat colour_format{VK_FORMAT_UNDEFINED};

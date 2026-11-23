@@ -174,7 +174,7 @@ using nr::lang::tr_text;
 unsigned diag_stage = 0;
 
 bool diagnostic_no_writeback(device* dev) {
-    return (diag_stage == 1 || diag_stage == 3 || diag_stage == 4) && dev->get_api() == device_api::vulkan;
+    return (diag_stage == 1 || (diag_stage >= 3 && diag_stage <= 6)) && dev->get_api() == device_api::vulkan;
 }
 
 bool diagnostic_build_only(device* dev) {
@@ -182,7 +182,7 @@ bool diagnostic_build_only(device* dev) {
 }
 
 bool diagnostic_copy_only(device* dev) {
-    return diag_stage == 4 && dev->get_api() == device_api::vulkan;
+    return diag_stage >= 4 && diag_stage <= 6 && dev->get_api() == device_api::vulkan;
 }
 
 // NR's own resources made through reshade::api (the frame copies: HUD FIX's, the PQ conversion's, the motion copies,
@@ -3419,7 +3419,7 @@ void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
             f.colour_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
             f.in_place = true;
             f.renodx = renodx;
-            f.diagnostic_copy_only = diag_stage == 4;
+            f.diagnostic_copy_stage = diagnostic_copy_only(dev) ? diag_stage : 0;
             f.wilsjo2 = w2run;
             f.feature = feature;
             const VkImage out = s.run_vulkan(h, cmd, f, controls);
@@ -4398,6 +4398,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
             : diag_stage == 2 ? "Vulkan build only, no per-frame GPU recording"
             : diag_stage == 3 ? "Vulkan, copy-in and RenoDX; no network graph dispatches or back-buffer write-back"
             : diag_stage == 4 ? "Vulkan, back-buffer copy-in only; no RenoDX, network dispatches or write-back"
+            : diag_stage == 5 ? "Vulkan, back-buffer barriers only; no copy or destination init"
+            : diag_stage == 6 ? "Vulkan, back-buffer copy-in only; explicitly dedicated destination memory"
             : "normal behaviour");
         nr::pe::vkdevice::diagnostic_queue_lock();
         nr::pe::watchdog::start();

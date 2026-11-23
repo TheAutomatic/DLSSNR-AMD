@@ -6393,16 +6393,16 @@ VkImage Session::run_vulkan(const DeviceHandles& handles, VkCommandBuffer cmd,
 
     if (frame.diagnostic_prepare_only) return frame.colour;
 
-    if (frame.diagnostic_copy_only) {
+    if (frame.diagnostic_copy_stage) {
         if (!renodx_stage) {
-            s.status = "diagnostic stage 4: copy-in requires a RenoDX layer; no recording";
+            s.status = "diagnostic copy-in requires a RenoDX layer; no recording";
             return VK_NULL_HANDLE;
         }
         ColourFrame in{};
         in.image = frame.colour; in.format = frame.colour_format; in.width = frame.width; in.height = frame.height;
         in.before = in.after = frame.colour_layout; in.usage = frame.colour_usage;
         try {
-            renodx_stage->diagnostic_copy_in(cmd, in);
+            renodx_stage->diagnostic_copy_in(cmd, in, frame.diagnostic_copy_stage);
         } catch (const std::exception& e) {
             s.status = std::string("diagnostic copy-in failed: ") + e.what();
             s.failed = true;

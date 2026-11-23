@@ -733,7 +733,7 @@ struct Stage::Impl {
     PrepPush prep_push{};          // this frame's Preprocess
     bool prep_on = false, ratio_resolve = false;
 
-    Image make_image(uint32_t w, uint32_t h, VkFormat f, VkImageUsageFlags usage) {
+    Image make_image(uint32_t w, uint32_t h, VkFormat f, VkImageUsageFlags usage, bool dedicated = false) {
         Image im; im.w = w; im.h = h; im.format = f;
         VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         ci.imageType = VK_IMAGE_TYPE_2D; ci.format = f; ci.extent = {w, h, 1};
@@ -742,7 +742,7 @@ struct Stage::Impl {
         ci.usage = usage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         check(vkCreateImage(device, &ci, nullptr, &im.handle), "image");
         VkMemoryRequirements req{}; vkGetImageMemoryRequirements(device, im.handle, &req);
-        im.memory = allocate(req, "an image");
+        im.memory = allocate(req, "an image", dedicated ? im.handle : VK_NULL_HANDLE);
         check(vkBindImageMemory(device, im.handle, im.memory, 0), "bind");
         VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         vi.image = im.handle; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = f;
@@ -751,7 +751,7 @@ struct Stage::Impl {
         fresh.push_back(im.handle);
         return im;
     }
-    VkDeviceMemory allocate(const VkMemoryRequirements& req, const char* what) {
+    VkDeviceMemory allocate(const VkMemoryRequirements& req, const char* what, VkImage image = VK_NULL_HANDLE) {
         uint32_t type = mem.memoryTypeCount;
         for (uint32_t i = 0; i < mem.memoryTypeCount; ++i)
             if ((req.memoryTypeBits & (1u << i)) && (mem.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
@@ -760,6 +760,9 @@ struct Stage::Impl {
         if (type == mem.memoryTypeCount) throw std::runtime_error(std::string("RenoDX stage: no device-local memory for ") + what);
         VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         ai.allocationSize = req.size; ai.memoryTypeIndex = type;
+        VkMemoryDedicatedAllocateInfo dedicated{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
+        dedicated.image = image;
+        ai.pNext = image ? &dedicated : nullptr;
         VkDeviceMemory m{};
         nr::vram::Scope kind(nr::vram::kRenoDX, -1);   // the RenoDX processing's, not a network's
         check(vkAllocateMemory(device, &ai, nullptr, &m), "memory");
@@ -1021,18 +1024,20 @@ struct Stage::Impl {
         b.image = im; b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         vkCmdPipelineBarrier(cmd, src, dst, 0, 0, nullptr, 0, nullptr, 1, &b);
     }
-    void copy_in(VkCommandBuffer cmd, const ColourFrame& colour, bool profile = true) {
+    void copy_in(VkCommandBuffer cmd, const ColourFrame& colour, bool profile = true, bool copy = true) {
         image_barrier(cmd, colour.image, colour.before, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                       colour.before_stage, colour.before_access, VK_PIPELINE_STAGE_TRANSFER_BIT,
                       VK_ACCESS_TRANSFER_READ_BIT);
         memory_barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
                        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
-        VkImageCopy region{};
-        region.srcSubresource = region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        region.extent = {colour.width, colour.height, 1};
-        vkCmdCopyImage(cmd, colour.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, original.handle,
-                       VK_IMAGE_LAYOUT_GENERAL, 1, &region);
-        if (profile) mark(cmd, "copy-in");
+        if (copy) {
+            VkImageCopy region{};
+            region.srcSubresource = region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            region.extent = {colour.width, colour.height, 1};
+            vkCmdCopyImage(cmd, colour.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, original.handle,
+                           VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+            if (profile) mark(cmd, "copy-in");
+        }
         image_barrier(cmd, colour.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, colour.before,
                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                       VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
@@ -1466,20 +1471,20 @@ void working_resolution(const Settings& s, uint32_t rw, uint32_t rh, uint32_t gw
     }
 }
 
-void Stage::diagnostic_copy_in(VkCommandBuffer cmd, const ColourFrame& colour) {
+void Stage::diagnostic_copy_in(VkCommandBuffer cmd, const ColourFrame& colour, unsigned stage) {
     Impl& m = *impl_;
     m.gpu_uses.touch();
     ++m.recordings;
     m.collect();
-    if (!m.original.handle) {
-        m.original = m.make_image(colour.width, colour.height, m.frame_fmt, VK_IMAGE_USAGE_SAMPLED_BIT);
+    if (stage != 5 && !m.original.handle) {
+        m.original = m.make_image(colour.width, colour.height, m.frame_fmt, VK_IMAGE_USAGE_SAMPLED_BIT, stage == 6);
         // Leave the other stage images uninitialised: this diagnostic never records their passes.
         m.fresh.pop_back();
         Impl::image_barrier(cmd, m.original.handle, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
                             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                             VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
     }
-    m.copy_in(cmd, colour, false);
+    m.copy_in(cmd, colour, false, stage != 5);
 }
 
 uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network& network) {

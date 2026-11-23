@@ -1,0 +1,73 @@
+BLACKGATE DIAGNOSTIC / 黑屏诊断
+
+Copy addon32 beside Game.exe, keeping your existing NR data and settings.
+From that folder run run_blackgate_stages.bat [N] (default: 3 runs per stage).
+Exit the game after observing the 3D scene; answer y only if the 3D scene is black.
+4 = copy-in only (the previous diagnostic).
+5 = the same barriers, no destination allocation/init or copy.
+6 = copy-in only with VkMemoryDedicatedAllocateInfo for the destination image.
+Stage 4 already allocates that image outside NR's image heap; stage 6 adds the
+explicit dedicated-allocation contract. Neither stage records network dispatches.
+7 is SKIPPED: building the network already creates/initializes frame-sized adapter
+images. An image-free build requires a wider change; stage 2 is not that test.
+Use fresh logs folders between sessions: stage<S>_run<R>.log files are overwritten;
+results.txt is appended. Keep [Log] Enabled=1 and ClearOnStart=1 (the defaults).
+NR logs beside the add-on module, not necessarily beside Game.exe. The supplied
+Blackgate logs show the add-on in the game's Bin folder. If different, set
+NR_LOG_PATH to the full path of dlssnr-amd.log before running the batch. Unwritable
+module folders fall back to %LOCALAPPDATA%\DLSSNR-AMD\apps\<tag>\dlssnr-amd.log.
+If the game exits before NR starts, an old log may remain; check its stage banner.
+
+把 addon32 放到 Game.exe 旁，保留现有 NR 数据和设置。在该目录运行
+run_blackgate_stages.bat [N]，默认每阶段 3 次。观察 3D 场景后退出游戏；
+仅在 3D 场景变黑时回答 y。阶段 4：只拷贝输入；5：仅屏障，不创建/初始化
+拷贝目标、不拷贝；6：显式独占分配拷贝目标显存。4 的目标原本也不在网络
+图像堆里。7 未实现，脚本会跳过，不会误运行阶段 0。网络构建本身会创建
+帧尺寸图像，不能把现有阶段 2 当作“完全不创建图像”的测试。
+日志在插件旁；目录不可写时转到上述 LOCALAPPDATA 路径。可用 NR_LOG_PATH
+指定日志完整路径。每轮结果在 logs\results.txt，日志在 logs\stage<S>_run<R>.log。
+换一批测试前备份 logs，避免覆盖。游戏若未启动到 NR，注意旧日志的阶段标识。
+
+VALIDATION (separate run, stage 0; do not use the stage-loop batch)
+
+Install a current Vulkan SDK with the 32-bit Khronos validation layer for this
+32-bit game. The SDK's vkconfig can select Game.exe, enable
+VK_LAYER_KHRONOS_validation, and enable Synchronization Validation. Keep core
+validation enabled too (allocation/binding/handle errors). Set Debug Action to
+Log Message and Log Filename to an absolute writable file, e.g.
+C:\NRLogs\blackgate-validation.txt. Disable the vkconfig override afterwards.
+
+Alternatively, with vkconfig overrides OFF, open cmd.exe in the game folder:
+  mkdir C:\NRLogs
+  set "NR_DIAG_STAGE=0"
+  set "VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation"
+  set "VK_LAYER_ENABLES=VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT"
+  set "VK_LAYER_VALIDATE_SYNC=true"
+  set "VK_LAYER_DEBUG_ACTION=VK_DBG_LAYER_ACTION_LOG_MSG"
+  set "VK_LAYER_LOG_FILENAME=C:\NRLogs\blackgate-validation.txt"
+  Game.exe
+
+VK_LAYER_ENABLES is a deprecated but retained compatibility setting in current
+layers; VK_LAYER_VALIDATE_SYNC is the current setting. No program rebuild is
+needed. The layer must be installed/registered for x86, not just x64. A failure
+such as VK_ERROR_LAYER_NOT_PRESENT is a setup failure, not a game result.
+Validation output goes to the configured file, separately from dlssnr-amd.log.
+If no validation output appears, verify the layer is loaded and its Log Message
+action is enabled in vkconfig; no output is not proof of a clean validation run.
+Capture dlssnr-amd.log too and report whether the 3D scene went black. Validation
+changes timing and cannot prove absence of driver bugs or imported shader OOB.
+Close this cmd window after testing to discard its environment overrides.
+
+验证需单独运行阶段 0，不要使用阶段循环脚本。安装包含 x86 验证层的当前
+Vulkan SDK，用 vkconfig 为 Game.exe 开启 Khronos 验证层、核心验证和同步
+验证，把 Debug Action 设为 Log Message，并指定可写的绝对日志路径。
+也可以关闭 vkconfig 覆盖后，在游戏目录的 cmd.exe 执行上面的环境变量命令。
+验证日志写入 C:\NRLogs\blackgate-validation.txt，与 dlssnr-amd.log 分开。
+仅装 x64 验证层不够；出现 LAYER_NOT_PRESENT 说明配置失败。没有输出也不等于
+没有错误，先确认验证层已加载、日志动作已开启。请同时提供 NR 日志和是否
+黑屏的结果。验证会改变时序，不能排除驱动或导入着色器的所有问题。测试后
+关闭 cmd 窗口或移除 vkconfig 覆盖。
+
+Layer settings reference (checked against current Khronos layer settings):
+https://github.com/KhronosGroup/Vulkan-ValidationLayers/blob/main/docs/khronos_validation_layer.md
+https://github.com/KhronosGroup/Vulkan-ValidationLayers/blob/main/layers/VkLayer_khronos_validation.json.in
