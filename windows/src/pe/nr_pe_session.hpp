@@ -89,6 +89,7 @@ class Session {
     // is the layer's WhitePointScale (this route has no game exposure). `estimate_motion`: without vectors, the
     // estimator's (the D3D11 Present fallback).
     struct Wilsjo2Frame {
+        bool diagnostic_no_writeback = false;
         const nr::wilsjo2::Settings* settings{};
         bool hdr{};
         Preprocess preprocess{};
@@ -166,6 +167,7 @@ class Session {
     // builds or when the frame cannot be taken (the caller then copies the input over, which OptiScaler
     // outputs as it is).
     struct RenoDXFrame {
+        bool diagnostic_no_writeback = false;
         bool fast_motion_available = true;
         bool hdr_flag = false;        // the game's colour is HDR (OptiScaler's own judgement)
         bool after_upscale = true;    // NR runs on the upscaler's output
@@ -360,6 +362,8 @@ class Session {
     // VkCommandBuffer and VkImages directly and there is no D3D12 in the way.
     // The device handles come from the upscaler's own context creation.
     struct VulkanFrame {
+        bool diagnostic_prepare_only = false;
+        unsigned diagnostic_copy_stage = 0;
         uint64_t feature{};   // as EngineResources::feature
         VkImage colour{}; VkImageLayout colour_layout{VK_IMAGE_LAYOUT_UNDEFINED};
         VkFormat colour_format{VK_FORMAT_UNDEFINED};

@@ -1701,17 +1701,23 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     // Where the pass's own cost is measured. Two queries per ring slot. A queue
     // family is allowed to report no timestamp bits - then there is no pool, and
     // every accessor answers zero rather than a number made up from a clock.
-    if (props[host.queue_family].timestampValidBits && s.ctx.timestamp_period > 0.0f) {
-        VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
-        qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
-        impl_->split_timing = true;
-        impl_->timing_stride = 4;   // the whole recording's pair, the network's pair
-        qi.queryCount = Impl::kTimingSlots * impl_->timing_stride;
-        if (vkCreateQueryPool(s.ctx.device, &qi, nullptr, &impl_->timing) == VK_SUCCESS) {
-            impl_->timing_ok = true;
-            impl_->timestamp_ns = s.ctx.timestamp_period;
+    const auto create_timing = [&] {
+        if (props[host.queue_family].timestampValidBits && s.ctx.timestamp_period > 0.0f) {
+            VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            impl_->split_timing = true;
+            impl_->timing_stride = 4;   // the whole recording's pair, the network's pair
+            qi.queryCount = Impl::kTimingSlots * impl_->timing_stride;
+            if (vkCreateQueryPool(s.ctx.device, &qi, nullptr, &impl_->timing) == VK_SUCCESS) {
+                impl_->timing_ok = true;
+                impl_->timestamp_ns = s.ctx.timestamp_period;
+            }
         }
-    }
+    };
+    if (nr::diagbuild::selected(nr::diagbuild::Mode::late_gpu))
+        s.diagnostic_before_device = create_timing;
+    else
+        create_timing();
     // Values share arena memory by lifetime (nr_graph.cpp, `reuse`): same
     // arithmetic, same bytes out, a fraction of the memory. NR_ARENA_REUSE=0
     // gives every value its own bytes again, for an A/B.
@@ -3311,7 +3317,7 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         const uint32_t net_query = timing_slot * impl_->timing_stride + 2 + 2 * pass;
         if (c.network_timestamp) c.network_timestamp(cmd, true);
         if (time_net) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, impl_->timing, net_query);
-        for (size_t i = 0; i < s.steps.size(); ++i) {
+        for (size_t i = 0; !c.diagnostic_skip_graph && i < s.steps.size(); ++i) {
             const auto& step = s.steps[i];
             const nrvk::Kernel* use = step.k;
             if (mask && step.k==impl_->original_pre) use = &impl_->mask_pre;
@@ -3396,7 +3402,7 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         s.ctx.destroy(impl_->retiring[i].first);
         impl_->retiring.erase(impl_->retiring.begin() + long(i));
     }
-    info.network_dispatches = uint32_t(s.steps.size()) * passes;
+    info.network_dispatches = c.diagnostic_skip_graph ? 0 : uint32_t(s.steps.size()) * passes;
     if (c.apply_model) {
         if (mask) {
             struct { uint32_t w,h;float intensity; } push{frame.width,frame.height,c.intensity};

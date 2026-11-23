@@ -4,6 +4,7 @@
 #include "nr_pe_interop.hpp"
 #include "nr_pe_log.hpp"
 #include "nr_device_features.hpp"
+#include "nr_diag_device.hpp"
 #include "nr_pipeline_binary.hpp"
 #include "nr_gpu_arch.hpp"
 
@@ -19,6 +20,8 @@
 #include <mutex>
 #include <vector>
 
+#include "nr_pe_diag_queue.hpp"
+
 namespace nr::pe::vkdevice {
 namespace {
 
@@ -26,6 +29,16 @@ using nr::pe::log;
 
 std::mutex lock;
 DeviceHandles seen{};
+std::map<VkInstance, uint32_t> instance_versions;
+std::map<VkPhysicalDevice, VkInstance> physical_instances;
+
+uint32_t requested_api(VkPhysicalDevice physical) {
+    std::lock_guard<std::mutex> guard(lock);
+    const auto p = physical_instances.find(physical);
+    const VkInstance instance = p == physical_instances.end() ? seen.instance : p->second;
+    const auto it = instance_versions.find(instance);
+    return it == instance_versions.end() ? 0 : it->second;
+}
 
 struct Queue { VkDevice device; uint32_t family; VkQueue queue; };
 std::vector<Queue> queues;
@@ -62,6 +75,8 @@ VkResult VKAPI_PTR hooked_create_instance(const VkInstanceCreateInfo* info,
     if (r == VK_SUCCESS && out && *out && !nr::pe::bridge::creating_device()) {
         std::lock_guard<std::mutex> guard(lock);
         seen.instance = *out;
+        instance_versions[*out] = info && info->pApplicationInfo && info->pApplicationInfo->apiVersion
+            ? info->pApplicationInfo->apiVersion : VK_API_VERSION_1_0;
     }
     return r;
 }
@@ -77,6 +92,8 @@ VkResult VKAPI_PTR hooked_enumerate_physical_devices(VkInstance instance, uint32
         std::lock_guard<std::mutex> guard(lock);
         if (!seen.instance) log("[nr] Vulkan instance learned from vkEnumeratePhysicalDevices");
         seen.instance = instance;
+        if ((r == VK_SUCCESS || r == VK_INCOMPLETE) && out && count)
+            for (uint32_t i = 0; i < *count; ++i) physical_instances[out[i]] = instance;
     }
     return r;
 }
@@ -98,6 +115,8 @@ struct Augmented {
     std::vector<const char*> extensions;
     VkDeviceCreateInfo info{};
     nr::binary::Features binary;
+    VkPhysicalDeviceFeatures core{};
+    uint32_t api = 0;
 };
 
 // Straight from vulkan-1.dll: the DLL's own vk* entry points are resolved later than this runs.
@@ -146,23 +165,49 @@ bool augment(VkPhysicalDevice physical, const VkDeviceCreateInfo* info, Augmente
     for (const char* e : network) {
         bool found = false;
         for (const auto& h : have) found = found || std::strcmp(h.extensionName, e) == 0;
-        if (!found) {
+        if (!found && !nr::diagfix::device()) {
             log("[nr] device features left as the game asked: the GPU has no %s", e);
             return false;
         }
     }
     a->extensions.assign(info->ppEnabledExtensionNames,
                          info->ppEnabledExtensionNames + info->enabledExtensionCount);
-    for (const char* e : network)
-        if (!listed(e, a->extensions.data(), a->extensions.size())) a->extensions.push_back(e);
     a->features = std::make_unique<nr::DeviceFeatures>(info->pNext);
-    a->features->enable(a->arch);
-    auto* w = a->features->get<VkPhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR>(
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_FEATURES_KHR);
-    w->workgroupMemoryExplicitLayout = w->workgroupMemoryExplicitLayout8BitAccess =
-        w->workgroupMemoryExplicitLayout16BitAccess = VK_TRUE;
+    a->api = requested_api(physical);
+    if (nr::diagfix::device()) {
+        VkPhysicalDeviceProperties properties{};
+        vkGetPhysicalDeviceProperties(physical, &properties);
+        if (a->api) a->api = std::min(a->api, properties.apiVersion);
+        log("[nr] NR_DIAG_FIX=%s: effective requested/device API %s%u.%u; unknown uses conservative extension requirements",
+            nr::diagfix::name(nr::diagfix::active()), a->api ? "" : "unknown, treating as ",
+            VK_VERSION_MAJOR(a->api ? a->api : VK_API_VERSION_1_0), VK_VERSION_MINOR(a->api ? a->api : VK_API_VERSION_1_0));
+        const uint32_t api = a->api ? a->api : VK_API_VERSION_1_0;
+        std::vector<const char*> available;
+        for (const auto& e : have) available.push_back(e.extensionName);
+        nr::DeviceFeatures support(nullptr);
+        for (const auto& r : nr::diagfix::rules())
+            if (nr::diagfix::available(r, api, available)) support.get_raw(r.type);
+        VkPhysicalDeviceFeatures2 supported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        supported.pNext = support.head;
+        vkGetPhysicalDeviceFeatures2(physical, &supported);
+        auto* f2 = a->features->find<VkPhysicalDeviceFeatures2>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2);
+        a->core = f2 ? f2->features : info->pEnabledFeatures ? *info->pEnabledFeatures : VkPhysicalDeviceFeatures{};
+        nr::diagfix::legalize(*a->features, support, a->core, supported.features, api, a->arch, available,
+            a->extensions, nr::diagfix::active(), [](const std::string& message) { log("[nr] NR_DIAG_FIX: %s", message.c_str()); });
+        if (f2) f2->features = a->core;
+    } else {
+        for (const char* e : network)
+            if (!listed(e, a->extensions.data(), a->extensions.size())) a->extensions.push_back(e);
+        a->features->enable(a->arch);
+        auto* w = a->features->get<VkPhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR>(
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_FEATURES_KHR);
+        w->workgroupMemoryExplicitLayout = w->workgroupMemoryExplicitLayout8BitAccess =
+            w->workgroupMemoryExplicitLayout16BitAccess = VK_TRUE;
+    }
     a->info = *info;
     a->info.pNext = a->features->head;
+    if (nr::diagfix::device() && !a->features->find<VkPhysicalDeviceFeatures2>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2))
+        a->info.pEnabledFeatures = &a->core;
     a->info.enabledExtensionCount = uint32_t(a->extensions.size());
     a->info.ppEnabledExtensionNames = a->extensions.data();
     a->binary.prepare(physical, a->info, a->extensions);
@@ -202,6 +247,13 @@ VkResult VKAPI_PTR hooked_create_device(VkPhysicalDevice physical, const VkDevic
     if (added && r == VK_SUCCESS && augmented.binary.active) nr::binary::mark(*out);
     if (added && r == VK_SUCCESS) log("[nr] network features added to the game's device");
     if (r == VK_SUCCESS && out && *out) {
+        if (nr::diagfix::active() != nr::diagfix::Fix::none) {
+            const auto caps = nr::diagfix::inspect(added ? augmented.info : *info,
+                augmented.api ? augmented.api : VK_API_VERSION_1_0, augmented.arch);
+            nr::diagfix::remember(*out, caps);
+            log("[nr] NR_DIAG_FIX: enabled device BDA=%s subgroup=%s robustness=%s required-network-features=%s",
+                caps.bda ? "yes" : "no", caps.subgroup ? "yes" : "no", caps.robustness ? "yes" : "no", caps.required ? "yes" : "no");
+        }
         {
             std::lock_guard<std::mutex> guard(lock);
             seen.physical = physical;
@@ -209,6 +261,7 @@ VkResult VKAPI_PTR hooked_create_device(VkPhysicalDevice physical, const VkDevic
             if (added) augmented_devices.push_back(*out);
         }
         log("[nr] Vulkan device created by the game");
+        diag::install(*out, info);
         if (device_callback) device_callback(*out);
     }
     return r;
@@ -261,6 +314,9 @@ VkResult create_with_network(PFN_vkCreateDevice create, VkPhysicalDevice physica
         r = create(physical, info, allocator, out);
     }
     if (*added && r == VK_SUCCESS && augmented.binary.active) nr::binary::mark(*out);
+    if (r == VK_SUCCESS && out && *out && nr::diagfix::active() != nr::diagfix::Fix::none)
+        nr::diagfix::remember(*out, nr::diagfix::inspect(*added ? augmented.info : *info,
+            augmented.api ? augmented.api : VK_API_VERSION_1_0, augmented.arch));
     if (*added && r == VK_SUCCESS) {
         log("[nr] network features added to the game's device");
         std::lock_guard<std::mutex> guard(lock);
@@ -302,6 +358,11 @@ bool install() {
 }
 
 void uninstall() {
+    for (void* target : diag::targets) {
+        MH_DisableHook(target);
+        MH_RemoveHook(target);
+    }
+    diag::targets.clear();
     if (hooked_targets.empty()) return;
     for (void* target : hooked_targets) {
         MH_DisableHook(target);
@@ -376,6 +437,7 @@ std::string gpu_name() {
 
 void forget_device(VkDevice device) {
     if (!device) return;
+    nr::diagfix::forget(device);
     std::lock_guard<std::mutex> guard(lock);
     queues.erase(std::remove_if(queues.begin(), queues.end(), [device](const Queue& q) { return q.device == device; }),
                  queues.end());
@@ -397,6 +459,28 @@ std::recursive_mutex* queue_mutex(VkQueue queue) {
 
 void enable_queue_locks() { g_queue_locks = true; }
 bool queue_locks_enabled() { return g_queue_locks.load(); }
+void diagnostic_queue_lock() { diag::enabled = true; }
+void diagnostic_queue_build_thread(bool active) {
+    if (!diag::enabled) return;
+    if (!active) {
+        DWORD tid = GetCurrentThreadId();
+        diag::build_thread.compare_exchange_strong(tid, 0);
+        return;
+    }
+    diag::build_thread = GetCurrentThreadId();
+    log("[nr] diag queue lock: background build thread %lu", GetCurrentThreadId());
+}
+void diagnostic_queue_stats() {
+    if (!diag::enabled) return;
+    const uint64_t pair = diag::threads.load();
+    const uint64_t build = diag::build_threads.load();
+    log("[nr] diag queue lock: %llu contended calls (threads %lu vs %lu), %llu total; "
+        "%llu build-worker conflicts (threads %lu vs %lu); %llu unregistered queues",
+        (unsigned long long)diag::contended.load(), (unsigned long)(pair >> 32), (unsigned long)(pair & 0xffffffffu),
+        (unsigned long long)diag::total.load(), (unsigned long long)diag::build_contended.load(),
+        (unsigned long)(build >> 32), (unsigned long)(build & 0xffffffffu), (unsigned long long)diag::unknown.load());
+    if (diag::unknown.load()) log("[nr] diag queue lock: INCOMPLETE coverage: unregistered queues were called");
+}
 void lock_queue(VkQueue queue) { if (g_queue_locks.load() && queue) queue_mutex(queue)->lock(); }
 void unlock_queue(VkQueue queue) { if (g_queue_locks.load() && queue) queue_mutex(queue)->unlock(); }
 bool lock_queue_held(VkQueue queue) {

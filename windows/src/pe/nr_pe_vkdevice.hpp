@@ -89,6 +89,9 @@ std::string driver_name();
 // queue's recursive lock; before that they do nothing (the ReShade routes: ReShade serialises its own queues).
 void enable_queue_locks();
 bool queue_locks_enabled();
+void diagnostic_queue_lock();
+void diagnostic_queue_build_thread(bool active);
+void diagnostic_queue_stats();
 void lock_queue(VkQueue queue);
 void unlock_queue(VkQueue queue);
 // The same for a call that may begin before enable_queue_locks and end after it (a hook installed earlier): the lock

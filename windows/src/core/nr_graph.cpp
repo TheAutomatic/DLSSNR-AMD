@@ -25,6 +25,7 @@
 #include "nr_shader_manifest.hpp"
 #include "nr_activation_lut.hpp"
 #include "nr_log.hpp"
+#include "nr_diag_build.hpp"
 #include "nr_vram_tag.hpp"
 #include "nrvk.hpp"
 #include "telemetry.hpp"
@@ -1387,6 +1388,7 @@ private:
 
 struct NrSession {
     nrvk::Context ctx;
+    std::function<void()> diagnostic_before_device;
     nrvk::Buffer act{}, wgt{};
     // RDNA3: the arenas' FP16 twins, which hold the e4m3 values as FP16 elements at the
     // same element index (nrvk::Context::fp16_twin; shaders reach them by block name).
@@ -5182,6 +5184,11 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     // A plan (GraphCore, the resize path) stops short of it: the lowering and the weight blob's extent tail are
     // all it keeps, for a network memory (GraphSlot) that already holds the weights.
     if (!plan_only) {
+        nr::diagbuild::wait(nr::diagbuild::Mode::late_gpu, "graph-device");
+        if (diagnostic_before_device) {
+            auto initialize = std::move(diagnostic_before_device);
+            initialize();
+        }
         if (!ctx.device) ctx.create();
         std::printf("GPU    %s\n", ctx.gpu_name.c_str());
         // Every pipeline this build creates, kept across runs. Empty path: no cache,
@@ -5649,6 +5656,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         return 4;
     }
     // ---- pipelines ---------------------------------------------------------
+    nr::diagbuild::wait(nr::diagbuild::Mode::late_pipelines, "network-pipelines");
     // Bindings differ per shader and the buffers do not: every kernel in this
     // project reaches both arenas through push-constant offsets, which is what
     // lets one descriptor set per *shader* serve all of that shader's layers.

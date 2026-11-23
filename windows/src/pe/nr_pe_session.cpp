@@ -5,6 +5,8 @@
 #include "nr_pe_events.hpp"
 #include "nr_pe_stats.hpp"
 #include "nr_gpu_completion.hpp"
+#include "nr_diag_fix.hpp"
+#include "nr_diag_build.hpp"
 #include "nrvk.hpp"   // nrvk::blit, compute_only_recording
 #include "nr_wilsjo2.hpp"
 #include "nr_wilsjo2_flow.hpp"
@@ -301,6 +303,7 @@ struct Session::Impl {
     RuntimeConfig make_config(uint32_t w, uint32_t h, VkFormat f) const;
     HostDevice make_host() const;
     mutable bool bda_probe_failed = false;
+    mutable bool diag_bda_logged = false;
     TemporalConfig make_temporal() const {
         TemporalConfig temporal; temporal.enable = true;
         temporal.history_strength = history_strength;
@@ -2542,6 +2545,12 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
     std::fill(std::begin(build_bytes), std::end(build_bytes), 0);
     build_px = double((w + 63) / 64 * 64) * double((h + 63) / 64 * 64) * config.capacity;
     build_thread = std::thread([this, host, config, temporal, access_copy, tag = build_tag] {
+        nr::diagbuild::Background diagnostic_build;
+        nr::diagbuild::wait(nr::diagbuild::Mode::late, "whole-build");
+        struct DiagnosticThread {
+            DiagnosticThread() { vkdevice::diagnostic_queue_build_thread(true); }
+            ~DiagnosticThread() { vkdevice::diagnostic_queue_build_thread(false); }
+        } diagnostic_thread;
         nr::pe::watchdog::Phase phase("building the network (background)");
         nr::vram::BuildScope measured_as(tag);   // its allocations, for Memory Guard's estimate (measure_build; 0: none)
         const auto t0 = std::chrono::steady_clock::now();
@@ -2563,6 +2572,7 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
             locked.queue_unlock = access_copy.unlock_quiet;
             // a parked network whose weights went to RAM (Residency offload): back first
             if (config.share && network_offloaded(*config.share)) {
+                nr::diagbuild::wait(nr::diagbuild::Mode::late_gpu, "weights-reload");
                 const auto r0 = std::chrono::steady_clock::now();
                 nr::vram::Scope owner(nr::vram::kUnset, config_net(config));
                 if (!reload_network(locked, *config.share, config.act_arena, config.act_slack))
@@ -2666,7 +2676,9 @@ HostDevice Session::Impl::make_host() const {
     // (DXVK, a layer) never enabled bufferDeviceAddress has a null slot for vkGetBufferDeviceAddress, and
     // calling it is an execute-at-0. Ask the device itself, and keep NR_NO_BDA=1's override.
     bool bda = vkd3d_device || mode == Mode::Bridge || vkdevice::network_features_added(handles.device);
-    if (bda && !vkGetDeviceProcAddr(handles.device, "vkGetBufferDeviceAddress")) {
+    if (nr::diagfix::device()) bda = nr::diagfix::capabilities(handles.device).bda;
+    if (bda && !(nr::diagfix::device() ? nr::diagfix::address_function(handles.device) :
+            reinterpret_cast<PFN_vkGetBufferDeviceAddress>(vkGetDeviceProcAddr(handles.device, "vkGetBufferDeviceAddress")))) {
         bda = false;
         if (!bda_probe_failed)
             log("[nr] bufferDeviceAddress: the device has no vkGetBufferDeviceAddress entry point; "
@@ -2675,6 +2687,11 @@ HostDevice Session::Impl::make_host() const {
     }
     if (const char* no_bda = std::getenv("NR_NO_BDA"); no_bda && *no_bda == '1') bda = false;
     host.buffer_device_address = bda;
+    if (nr::diagfix::device() && !diag_bda_logged) {
+        log("[nr] NR_DIAG_FIX=%s: selected %s shader path (logical-device enablement, core/KHR entry point, NR_NO_BDA)",
+            nr::diagfix::name(nr::diagfix::active()), bda ? "BDA" : "no-BDA storage-buffer");
+        diag_bda_logged = true;
+    }
     // the network of the GPU's architecture (nr_gpu_arch.hpp): the bridge's device's, else the game's physical device
     // asked directly - not inferred from whether the device watch added features to it
     host.arch = bdev ? bdev->arch() : handles.physical ? nr::arch::of(handles.physical) : nr::arch::GpuArch::unknown;
@@ -3783,6 +3800,7 @@ void Session::log_totals() {
     static_assert(sizeof(impl_->ran_total) == 8, "counters");
     if (impl_->totals_logged) return;
     impl_->totals_logged = true;
+    vkdevice::diagnostic_queue_stats();
     const uint64_t r = impl_->ran_total + impl_->ran, p = impl_->passed_total + impl_->passed;
     if (r + p)
         log("[nr] session: %llu evaluations ran the network, %llu passed the frame through", (unsigned long long)r,
@@ -4909,6 +4927,7 @@ bool Session::Impl::record_renodx(VkCommandBuffer cmd, renodx::Stage& stage, con
         look_motion = ColourFrame{};
     }
     renodx::StageFrame sf;
+    sf.diagnostic_no_writeback = rf.diagnostic_no_writeback;
     sf.fast_motion_available = rf.fast_motion_available;
     sf.colour = colour;
     sf.output = output;
@@ -5515,7 +5534,7 @@ bool Session::Impl::record_wilsjo2(VkCommandBuffer cmd, const ColourFrame& colou
         status = "wilsjo2: the stage can neither store into the frame's format nor blit it into one it can";
         return false;
     }
-    const bool in_place = twin == colour.format && (colour.usage & rw) == rw;
+    const bool in_place = !wf.diagnostic_no_writeback && twin == colour.format && (colour.usage & rw) == rw;
     ColourFrame target = colour;
     const auto copy = [&](VkImage from, VkImageLayout from_layout, VkImage to, VkImageLayout to_layout) {
         if (blit) {
@@ -5583,7 +5602,7 @@ bool Session::Impl::record_wilsjo2(VkCommandBuffer cmd, const ColourFrame& colou
     ff.fast_motion = wf.fast_motion;
     const bool ran = nr::wilsjo2::flow_run(io, entry.flow, ff, *wf.settings, uint64_t(target.format));
     w2_everything(cmd);
-    if (!in_place) {   // the answer (or the frame as it came) back into the frame
+    if (!in_place && !wf.diagnostic_no_writeback) {   // the answer (or the frame as it came) back into the frame
         w2_layout(cmd, colour.image, colour.before, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         copy(entry.work->image, VK_IMAGE_LAYOUT_GENERAL, colour.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         w2_layout(cmd, colour.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, colour.after);
@@ -6345,7 +6364,7 @@ VkImage Session::run_vulkan(const DeviceHandles& handles, VkCommandBuffer cmd,
                             const VulkanFrame& frame, const Controls& controls) {
     auto& s = *impl_;
     s.current_feature = frame.feature;   // which network memory a new frame size prefers (Impl::inframe)
-    if (s.failed || !cmd || !frame.colour || !handles.valid()) return VK_NULL_HANDLE;
+    if (s.failed || (!cmd && !frame.diagnostic_prepare_only) || !frame.colour || !handles.valid()) return VK_NULL_HANDLE;
     s.status.clear();
     s.handles = handles;
 
@@ -6366,6 +6385,7 @@ VkImage Session::run_vulkan(const DeviceHandles& handles, VkCommandBuffer cmd,
                         frame.renodx->settings, &nw, &nh);
         if (frame.renodx->settings.nr_enabled && !s.renodx_runtime(controls, nw, nh, &renodx_controls))
             return VK_NULL_HANDLE;
+        if (frame.diagnostic_prepare_only) return frame.colour;
         if (!(renodx_stage = s.renodx_stage(frame.feature, frame.width, frame.height, nw, nh, frame.colour_format,
                                             *frame.renodx)))
             return VK_NULL_HANDLE;
@@ -6382,6 +6402,27 @@ VkImage Session::run_vulkan(const DeviceHandles& handles, VkCommandBuffer cmd,
                               uint64_t(frame.depth ? frame.depth_width : 0) * (frame.depth ? frame.depth_height : 0));
     if (!s.ensure_runtime(controls, frame.width, frame.height, frame.colour_format))
         return VK_NULL_HANDLE;
+    }
+
+    if (frame.diagnostic_prepare_only) return frame.colour;
+
+    if (frame.diagnostic_copy_stage) {
+        if (!renodx_stage) {
+            s.status = "diagnostic copy-in requires a RenoDX layer; no recording";
+            return VK_NULL_HANDLE;
+        }
+        ColourFrame in{};
+        in.image = frame.colour; in.format = frame.colour_format; in.width = frame.width; in.height = frame.height;
+        in.before = in.after = frame.colour_layout; in.usage = frame.colour_usage;
+        try {
+            renodx_stage->diagnostic_copy_in(cmd, in, frame.diagnostic_copy_stage);
+        } catch (const std::exception& e) {
+            s.status = std::string("diagnostic copy-in failed: ") + e.what();
+            s.failed = true;
+            log("[nr] %s", s.status.c_str());
+            return VK_NULL_HANDLE;
+        }
+        return frame.colour;
     }
 
     ColourFrame colour{};

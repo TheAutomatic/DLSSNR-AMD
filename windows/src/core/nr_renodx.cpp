@@ -10,6 +10,7 @@
 // included as it is. The shaders are RenoDX's, compiled for Vulkan as RenoDX compiles them.
 #include "nr_path_u8.hpp"
 #include "nr_renodx.hpp"
+#include "nr_diag_fix.hpp"
 #include "nrvk.hpp"   // nrvk::blit
 #include "nr_gpu_completion.hpp"
 #include "nr_log.hpp"
@@ -733,7 +734,7 @@ struct Stage::Impl {
     PrepPush prep_push{};          // this frame's Preprocess
     bool prep_on = false, ratio_resolve = false;
 
-    Image make_image(uint32_t w, uint32_t h, VkFormat f, VkImageUsageFlags usage) {
+    Image make_image(uint32_t w, uint32_t h, VkFormat f, VkImageUsageFlags usage, bool dedicated = false) {
         Image im; im.w = w; im.h = h; im.format = f;
         VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         ci.imageType = VK_IMAGE_TYPE_2D; ci.format = f; ci.extent = {w, h, 1};
@@ -742,7 +743,7 @@ struct Stage::Impl {
         ci.usage = usage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         check(vkCreateImage(device, &ci, nullptr, &im.handle), "image");
         VkMemoryRequirements req{}; vkGetImageMemoryRequirements(device, im.handle, &req);
-        im.memory = allocate(req, "an image");
+        im.memory = allocate(req, "an image", dedicated ? im.handle : VK_NULL_HANDLE);
         check(vkBindImageMemory(device, im.handle, im.memory, 0), "bind");
         VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         vi.image = im.handle; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = f;
@@ -751,7 +752,7 @@ struct Stage::Impl {
         fresh.push_back(im.handle);
         return im;
     }
-    VkDeviceMemory allocate(const VkMemoryRequirements& req, const char* what) {
+    VkDeviceMemory allocate(const VkMemoryRequirements& req, const char* what, VkImage image = VK_NULL_HANDLE) {
         uint32_t type = mem.memoryTypeCount;
         for (uint32_t i = 0; i < mem.memoryTypeCount; ++i)
             if ((req.memoryTypeBits & (1u << i)) && (mem.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
@@ -760,6 +761,9 @@ struct Stage::Impl {
         if (type == mem.memoryTypeCount) throw std::runtime_error(std::string("RenoDX stage: no device-local memory for ") + what);
         VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         ai.allocationSize = req.size; ai.memoryTypeIndex = type;
+        VkMemoryDedicatedAllocateInfo dedicated{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
+        dedicated.image = image;
+        ai.pNext = image ? &dedicated : nullptr;
         VkDeviceMemory m{};
         nr::vram::Scope kind(nr::vram::kRenoDX, -1);   // the RenoDX processing's, not a network's
         check(vkAllocateMemory(device, &ai, nullptr, &m), "memory");
@@ -1021,6 +1025,26 @@ struct Stage::Impl {
         b.image = im; b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         vkCmdPipelineBarrier(cmd, src, dst, 0, 0, nullptr, 0, nullptr, 1, &b);
     }
+    void copy_in(VkCommandBuffer cmd, const ColourFrame& colour, bool profile = true, bool copy = true) {
+        image_barrier(cmd, colour.image, colour.before, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                      colour.before_stage, colour.before_access, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                      VK_ACCESS_TRANSFER_READ_BIT);
+        memory_barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
+                       VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        if (copy) {
+            VkImageCopy region{};
+            region.srcSubresource = region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            region.extent = {colour.width, colour.height, 1};
+            vkCmdCopyImage(cmd, colour.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, original.handle,
+                           VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+            if (profile) mark(cmd, "copy-in");
+        }
+        image_barrier(cmd, colour.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, colour.before,
+                      VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                      VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        memory_barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    }
     // One of the stage's images onto another of the same extent (CopyMip0), both in GENERAL.
     static void copy_general(VkCommandBuffer cmd, const Image& from, const Image& to) {
         memory_barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
@@ -1265,7 +1289,8 @@ Stage::Stage(const HostDevice& host, const StageConfig& cfg) : impl_(std::make_u
         VkPhysicalDevicePipelineRobustnessFeaturesEXT prf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT};
         VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &prf};
         vkGetPhysicalDeviceFeatures2(host.physical, &f2);
-        m.pipeline_robustness = prf.pipelineRobustness && !(std::getenv("NR_RENODX_ROBUST") && std::atoi(std::getenv("NR_RENODX_ROBUST")));
+        m.pipeline_robustness = nr::diagfix::pipeline_robustness(prf.pipelineRobustness, host.device) &&
+            !(std::getenv("NR_RENODX_ROBUST") && std::atoi(std::getenv("NR_RENODX_ROBUST")));
     }
     if (cfg.present) {
         // present_path.hpp: the colour space decides, units are absolute (PQ's 10000 nits, scRGB's 80).
@@ -1448,6 +1473,23 @@ void working_resolution(const Settings& s, uint32_t rw, uint32_t rh, uint32_t gw
     }
 }
 
+void Stage::diagnostic_copy_in(VkCommandBuffer cmd, const ColourFrame& colour, unsigned stage) {
+    Impl& m = *impl_;
+    m.gpu_uses.touch();
+    ++m.recordings;
+    m.collect();
+    const bool copy = stage == 4 || stage == 6;
+    if (copy && !m.original.handle) {
+        m.original = m.make_image(colour.width, colour.height, m.frame_fmt, VK_IMAGE_USAGE_SAMPLED_BIT, stage == 6);
+        // Leave the other stage images uninitialised: this diagnostic never records their passes.
+        m.fresh.pop_back();
+        Impl::image_barrier(cmd, m.original.handle, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                            VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    }
+    if (stage != 7) m.copy_in(cmd, colour, false, copy);
+}
+
 uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network& network) {
     Impl& m = *impl_;
     m.gpu_uses.touch();
@@ -1461,7 +1503,7 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
     // The colour into the output as it is: NR off (NeuralUplift), or every pass at zero strength (RenoDX's explicit
     // bypass).
     if (!s.nr_enabled || (m.hdr && !m.chain_active(0, passes))) {
-        if (fr.colour.image != fr.output.image) {
+        if (!fr.diagnostic_no_writeback && fr.colour.image != fr.output.image) {
             Impl::image_barrier(cmd, fr.colour.image, fr.colour.before, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                 fr.colour.before_stage, fr.colour.before_access, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                 VK_ACCESS_TRANSFER_READ_BIT);
@@ -1611,7 +1653,8 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
     // as before (copy in, decode, reduce, apply, copy out).
     static const bool sdr_inplace_off = [] { const char* e = std::getenv("NR_RDX_SDR_INPLACE"); return e && e[0] == '0'; }();
     const bool sdr_inplace = !m.hdr && passes == 1 && !sdr_inplace_off;
-    if (m.hdr || sdr_inplace) {
+    // A borrowed storage view could write the back buffer before the final copy-out.
+    if (!fr.diagnostic_no_writeback && (m.hdr || sdr_inplace)) {
         const bool out_ok = m.decoded_storage && (fr.output.usage & VK_IMAGE_USAGE_STORAGE_BIT) &&
                             fr.output.format == m.decoded_fmt && fr.output.width == W && fr.output.height == H;
         const bool in_ok = (!same || out_ok) && (fr.colour.usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
@@ -1688,23 +1731,7 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
         Impl::image_barrier(cmd, fr.colour.image, fr.colour.before, VK_IMAGE_LAYOUT_GENERAL, fr.colour.before_stage,
                             fr.colour.before_access, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
     } else {
-    // 1. The frame into `original` (its own bits; an *_SRGB frame into the UNORM twin).
-    Impl::image_barrier(cmd, fr.colour.image, fr.colour.before, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                        fr.colour.before_stage, fr.colour.before_access, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                        VK_ACCESS_TRANSFER_READ_BIT);
-    Impl::memory_barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
-                         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
-    VkImageCopy region{};
-    region.srcSubresource = region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    region.extent = {W, H, 1};
-    vkCmdCopyImage(cmd, fr.colour.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, m.original.handle,
-                   VK_IMAGE_LAYOUT_GENERAL, 1, &region);
-    m.mark(cmd, "copy-in");
-    Impl::image_barrier(cmd, fr.colour.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, fr.colour.before,
-                        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                        VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
-    Impl::memory_barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    m.copy_in(cmd, fr.colour);
     }
     if (m.hdr) {
         // 2a. linearize: original (or the frame itself) -> work0, the linear source everything after reads.
@@ -2543,7 +2570,7 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
         Impl::image_barrier(cmd, fr.output.image, VK_IMAGE_LAYOUT_GENERAL, fr.output.after,
                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, fr.output.after_stage,
                             fr.output.after_access);
-    } else {
+    } else if (!fr.diagnostic_no_writeback) {
     Impl::image_barrier(cmd, fr.output.image, fr.output.before, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                         fr.output.before_stage, fr.output.before_access, VK_PIPELINE_STAGE_TRANSFER_BIT,
                         VK_ACCESS_TRANSFER_WRITE_BIT);
