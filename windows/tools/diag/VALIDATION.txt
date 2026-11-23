@@ -1,5 +1,47 @@
 BLACKGATE DIAGNOSTIC / 黑屏诊断
 
+DIAG7 FIX COMPARISON / DIAG7 修复对照
+
+Use run_blackgate_fixes.bat [N] for this round (default 3 runs each).
+It clears NR_DIAG_STAGE: all five modes run normal processing, not stage 2.
+Order: baseline (NR_DIAG_FIX unset), device-nobda, device, robust, all.
+Unset, empty or invalid NR_DIAG_FIX preserves the previous behavior.
+device = legalize NR feature structs/extensions, enable supported shaderInt16,
+         and follow logical-device BDA/subgroup enables. BDA may turn ON on x86.
+device-nobda = device legalization with BDA structs/extensions removed.
+robust = only use pipeline robustness overrides if logically enabled.
+all = device-nobda + robust, deliberately retaining storage-buffer shaders.
+Check NR_DIAG_FIX, extension/struct decisions and selected BDA shader-path banners.
+If creation falls back to the original device or required features are missing,
+NR may not run: do not count that as a successful fixed NR result.
+ReShade can load the add-on during vkCreateInstance, too late to observe its
+requested API version. If unknown, the banner says so and conservatively adds
+supported parent extensions even for promoted features. It does not raise the
+application API version or change the shader SPIR-V target.
+Keep all other settings unchanged; remove NR_NO_BDA if testing device's BDA path.
+Logs: logs\fix_<mode>_run<R>.log; results append to logs\results.txt.
+Back up logs between rounds. Verify each copied log has the matching mode and
+NR_DIAG_STAGE=0 banner; a failed launch can leave a stale source log.
+Also report missing textures/models separately from a black 3D scene.
+
+本轮请运行 run_blackgate_fixes.bat [N]，默认每种模式 3 次。
+脚本清除 NR_DIAG_STAGE，按 baseline、device-nobda、device、robust、all
+顺序运行正常处理。baseline 不设置 NR_DIAG_FIX；空值或无效值保持原行为。
+device：修正功能结构与扩展启用，启用支持的 shaderInt16，并按逻辑设备
+实际启用状态选择 BDA/子组大小控制；x86 可能转为 BDA 着色器路径。
+device-nobda：同上但移除 BDA 结构和扩展；robust：仅在实际启用时使用
+流水线健壮性覆盖；all：device-nobda 加 robust，保持存储缓冲区路径。
+请检查模式、结构/扩展增删和 BDA 路径日志。若设备创建回退或缺少必要
+功能导致 NR 未运行，不要算作修复成功。插件可能加载太晚而无法观察
+请求的 API 版本；未知时会记录并保守添加支持的父扩展，不提高 API 版本，
+也不更改 SPIR-V 目标。保持其他设置一致，测试 device 的 BDA 时移除
+NR_NO_BDA。结果附加到 logs\results.txt，日志为 fix_<模式>_run<R>.log。
+每轮先备份 logs；检查日志模式及阶段 0 标识，避免误用启动失败留下的旧日志。
+请单独报告模型/材质缺失，不要只记录是否黑屏。
+
+The older stage runner described below is optional; do not use it for this round.
+以下旧阶段脚本仅供手动诊断，本轮不要使用。
+
 Copy addon32 beside Game.exe, keeping your existing NR data and settings.
 From that folder run run_blackgate_stages.bat [N] (default: 3 runs per stage).
 Exit the game after observing the 3D scene; answer y only if the 3D scene is black.
@@ -48,7 +90,7 @@ COLOR_ATTACHMENT_OPTIMAL 之间的包围屏障。
 指定日志完整路径。每轮结果在 logs\results.txt，日志在 logs\stage<S>_run<R>.log。
 换一批测试前备份 logs，避免覆盖。游戏若未启动到 NR，注意旧日志的阶段标识。
 
-VALIDATION (separate run, stage 0; do not use the stage-loop batch)
+VALIDATION (one separate run, NR_DIAG_FIX=all, stage 0; do not use either batch)
 
 Install a current Vulkan SDK with the 32-bit Khronos validation layer for this
 32-bit game. The SDK's vkconfig can select Game.exe, enable
@@ -60,12 +102,23 @@ C:\NRLogs\blackgate-validation.txt. Disable the vkconfig override afterwards.
 Alternatively, with vkconfig overrides OFF, open cmd.exe in the game folder:
   mkdir C:\NRLogs
   set "NR_DIAG_STAGE=0"
+  set "NR_DIAG_FIX=all"
   set "VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation"
   set "VK_LAYER_ENABLES=VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT"
   set "VK_LAYER_VALIDATE_SYNC=true"
   set "VK_LAYER_DEBUG_ACTION=VK_DBG_LAYER_ACTION_LOG_MSG"
   set "VK_LAYER_LOG_FILENAME=C:\NRLogs\blackgate-validation.txt"
   Game.exe
+
+For this all-mode run, confirm the missing-parent device feature VUIDs, BDA
+allocation-flag VUID and pipelineRobustness 06926-06929/pNext VUIDs are gone.
+Capture remaining errors too: ReShade descriptor indexing and SPIR-V-1.6 versus
+Vulkan-1.1 errors are not repaired by these candidate fixes. Use a current x86
+validation layer that understands VK_EXT_shader_float8, not SDK 1.3.296.
+这次验证请单独设置 NR_DIAG_FIX=all、阶段 0，确认设备功能父扩展、BDA
+分配标志及 pipelineRobustness 06926-06929/pNext 错误消失。其他错误也
+请保留；ReShade 描述符索引及 SPIR-V 1.6/Vulkan 1.1 不匹配不在本次修复内。
+请用支持 VK_EXT_shader_float8 的当前 x86 验证层，不要用旧 SDK 1.3.296。
 
 VK_LAYER_ENABLES is a deprecated but retained compatibility setting in current
 layers; VK_LAYER_VALIDATE_SYNC is the current setting. No program rebuild is

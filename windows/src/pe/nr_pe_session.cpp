@@ -5,6 +5,7 @@
 #include "nr_pe_events.hpp"
 #include "nr_pe_stats.hpp"
 #include "nr_gpu_completion.hpp"
+#include "nr_diag_fix.hpp"
 #include "nrvk.hpp"   // nrvk::blit, compute_only_recording
 #include "nr_wilsjo2.hpp"
 #include "nr_wilsjo2_flow.hpp"
@@ -301,6 +302,7 @@ struct Session::Impl {
     RuntimeConfig make_config(uint32_t w, uint32_t h, VkFormat f) const;
     HostDevice make_host() const;
     mutable bool bda_probe_failed = false;
+    mutable bool diag_bda_logged = false;
     TemporalConfig make_temporal() const {
         TemporalConfig temporal; temporal.enable = true;
         temporal.history_strength = history_strength;
@@ -2670,7 +2672,9 @@ HostDevice Session::Impl::make_host() const {
     // (DXVK, a layer) never enabled bufferDeviceAddress has a null slot for vkGetBufferDeviceAddress, and
     // calling it is an execute-at-0. Ask the device itself, and keep NR_NO_BDA=1's override.
     bool bda = vkd3d_device || mode == Mode::Bridge || vkdevice::network_features_added(handles.device);
-    if (bda && !vkGetDeviceProcAddr(handles.device, "vkGetBufferDeviceAddress")) {
+    if (nr::diagfix::device()) bda = nr::diagfix::capabilities(handles.device).bda;
+    if (bda && !(nr::diagfix::device() ? nr::diagfix::address_function(handles.device) :
+            reinterpret_cast<PFN_vkGetBufferDeviceAddress>(vkGetDeviceProcAddr(handles.device, "vkGetBufferDeviceAddress")))) {
         bda = false;
         if (!bda_probe_failed)
             log("[nr] bufferDeviceAddress: the device has no vkGetBufferDeviceAddress entry point; "
@@ -2679,6 +2683,11 @@ HostDevice Session::Impl::make_host() const {
     }
     if (const char* no_bda = std::getenv("NR_NO_BDA"); no_bda && *no_bda == '1') bda = false;
     host.buffer_device_address = bda;
+    if (nr::diagfix::device() && !diag_bda_logged) {
+        log("[nr] NR_DIAG_FIX=%s: selected %s shader path (logical-device enablement, core/KHR entry point, NR_NO_BDA)",
+            nr::diagfix::name(nr::diagfix::active()), bda ? "BDA" : "no-BDA storage-buffer");
+        diag_bda_logged = true;
+    }
     // the network of the GPU's architecture (nr_gpu_arch.hpp): the bridge's device's, else the game's physical device
     // asked directly - not inferred from whether the device watch added features to it
     host.arch = bdev ? bdev->arch() : handles.physical ? nr::arch::of(handles.physical) : nr::arch::GpuArch::unknown;

@@ -14,6 +14,7 @@
 #include "nr_path_u8.hpp"
 #include "nr_gpu_arch.hpp"
 #include "nr_gpu_completion.hpp"
+#include "nr_diag_fix.hpp"
 #include "nr_log.hpp"   // (nrvk::blit's lines; the int4 path's too)
 #if NR_INT4
 #include "nr_build_cfg.hpp"
@@ -401,7 +402,9 @@ struct Context {
         vkGetPhysicalDeviceFeatures2(physical, &f2);
         // DXVK and vkd3d-proton create their devices with robustBufferAccess2 and without this feature; RADV
         // compiles a pipeline by its own VkPipelineRobustnessCreateInfo whether or not the device enabled it.
-        pipeline_robustness = prf.pipelineRobustness;
+        pipeline_robustness = nr::diagfix::pipeline_robustness(prf.pipelineRobustness, device);
+        if (nr::diagfix::device() && !nr::diagfix::capabilities(device).required)
+            return no("NR_DIAG_FIX: required network features were not enabled on the logical device");
         if (!c.cooperativeMatrix)             return no("cooperativeMatrix");
         if (target_float8() && !f8.shaderFloat8)                 return no("shaderFloat8");
         if (target_float8() && !f8.shaderFloat8CooperativeMatrix) return no("shaderFloat8CooperativeMatrix");
@@ -604,7 +607,12 @@ struct Context {
         if (device_address) {
             VkBufferDeviceAddressInfo ai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
             ai.buffer = b.handle;
-            b.address = vkGetBufferDeviceAddress(device, &ai);
+            if (nr::diagfix::device()) {
+                const auto fn = nr::diagfix::address_function(device);
+                if (!nr::diagfix::capabilities(device).bda || !fn)
+                    throw std::runtime_error("NR_DIAG_FIX: device address not enabled or entry point missing");
+                b.address = fn(device, &ai);
+            } else b.address = vkGetBufferDeviceAddress(device, &ai);
         }
         if (host_visible) {
             NRVK_CHECK(vkMapMemory(device, b.memory, 0, bytes, 0, &b.mapped));
@@ -1201,6 +1209,7 @@ struct Kernel {
         VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         cpi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
         cpi.stage.pNext = &req;
+        if (nr::diagfix::device() && !nr::diagfix::capabilities(device).subgroup) cpi.stage.pNext = nullptr;
         cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         cpi.stage.module = out.module; cpi.stage.pName = "main";
         cpi.layout = out.layout;

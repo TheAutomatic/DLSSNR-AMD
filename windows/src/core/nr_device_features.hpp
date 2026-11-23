@@ -18,6 +18,20 @@ class DeviceFeatures {
     std::vector<Node> nodes;
 public:
     VkBaseOutStructure* head{};
+    void erase(VkStructureType type) {
+        for (auto** p = &head; *p; p = &(*p)->pNext)
+            if ((*p)->sType == type) { *p = (*p)->pNext; return; }
+    }
+    VkBaseOutStructure* get_raw(VkStructureType type) {
+        for (auto* p = head; p; p = p->pNext) if (p->sType == type) return p;
+        const size_t bytes = nr_device_chain_size(type);
+        if (!bytes) throw std::runtime_error("unknown diagnostic feature structure");
+        auto* p = static_cast<VkBaseOutStructure*>(std::calloc(1, bytes));
+        if (!p) throw std::bad_alloc();
+        nodes.emplace_back(p, std::free);
+        p->sType = type; p->pNext = head; head = p;
+        return p;
+    }
     explicit DeviceFeatures(const void* chain) {
         VkBaseOutStructure** tail = &head;
         for (auto p = static_cast<const VkBaseInStructure*>(chain); p; p = p->pNext) {

@@ -44,6 +44,7 @@
 #include "nr_engine_panel.hpp"
 #include "nr_pe_vkdevice.hpp"
 #include "nr_pe_diag_stage.hpp"
+#include "nr_diag_fix.hpp"
 #include "nr_vram_ledger.hpp"
 #include "nr_pe_events.hpp"
 
@@ -2674,6 +2675,8 @@ void on_vulkan_device_created(VkDevice device) {
 }
 
 void on_destroy_device(device* dev) {
+    if (dev->get_api() == device_api::vulkan)
+        nr::diagfix::forget(reinterpret_cast<VkDevice>(static_cast<uintptr_t>(dev->get_native())));
     if (own_device(dev)) return;
     nr::pe::watchdog::Phase phase("a device is destroyed");
     // Everything the session made lives on this device's VkDevice.
@@ -4399,6 +4402,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         const DWORD stage_length = GetEnvironmentVariableA("NR_DIAG_STAGE", stage, sizeof stage);
         diag_stage = stage_length < sizeof stage ? nr::pe::diagnostic_stage(stage) : 0u;
         log("[nr] DIAGNOSTIC BUILD: queue lock + stage switch");
+        log("[nr] NR_DIAG_FIX=%s (unset/invalid = baseline; normal processing unless NR_DIAG_STAGE overrides it)",
+            nr::diagfix::name(nr::diagfix::active()));
         log("[nr] NR_DIAG_STAGE=%u: %s", diag_stage, diag_stage == 1 ? "Vulkan, no back-buffer write-back"
             : diag_stage == 2 ? "Vulkan build only, no per-frame GPU recording"
             : diag_stage == 3 ? "Vulkan, copy-in and RenoDX; no network graph dispatches or back-buffer write-back"

@@ -10,6 +10,7 @@
 // included as it is. The shaders are RenoDX's, compiled for Vulkan as RenoDX compiles them.
 #include "nr_path_u8.hpp"
 #include "nr_renodx.hpp"
+#include "nr_diag_fix.hpp"
 #include "nrvk.hpp"   // nrvk::blit
 #include "nr_gpu_completion.hpp"
 #include "nr_log.hpp"
@@ -1288,7 +1289,8 @@ Stage::Stage(const HostDevice& host, const StageConfig& cfg) : impl_(std::make_u
         VkPhysicalDevicePipelineRobustnessFeaturesEXT prf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT};
         VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &prf};
         vkGetPhysicalDeviceFeatures2(host.physical, &f2);
-        m.pipeline_robustness = prf.pipelineRobustness && !(std::getenv("NR_RENODX_ROBUST") && std::atoi(std::getenv("NR_RENODX_ROBUST")));
+        m.pipeline_robustness = nr::diagfix::pipeline_robustness(prf.pipelineRobustness, host.device) &&
+            !(std::getenv("NR_RENODX_ROBUST") && std::atoi(std::getenv("NR_RENODX_ROBUST")));
     }
     if (cfg.present) {
         // present_path.hpp: the colour space decides, units are absolute (PQ's 10000 nits, scRGB's 80).
