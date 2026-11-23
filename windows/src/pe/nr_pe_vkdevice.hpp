@@ -59,6 +59,8 @@ void set_device_callback(void (*callback)(VkDevice));
 // Some upscalers hand us the device before we have seen it created - NGX's
 // Vulkan init does. Recording it here keeps one source of truth.
 void note_handles(VkInstance instance, VkPhysicalDevice physical, VkDevice device);
+void note_instance(VkInstance instance, const VkInstanceCreateInfo* info);
+void note_physical_devices(VkInstance instance, uint32_t count, const VkPhysicalDevice* physical);
 
 // The watch added the network's features (nr::DeviceFeatures::enable, bufferDeviceAddress among
 // them) to this device's vkCreateDevice and the device was created with them.

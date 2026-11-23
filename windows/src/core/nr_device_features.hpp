@@ -11,6 +11,33 @@
 #include "nr_gpu_arch_ids.hpp"
 
 namespace nr {
+inline uint32_t effective_device_api(uint32_t requested, uint32_t supported) {
+    if (!requested) return supported;
+    return requested < supported ? requested : supported;
+}
+
+struct DeviceFeatureRequirements {
+    bool buffer_device_address;
+    std::vector<const char*> extensions;
+
+    DeviceFeatureRequirements(uint32_t api, bool x86)
+        : buffer_device_address(!x86 || api >= VK_API_VERSION_1_2) {
+        if (api < VK_API_VERSION_1_1) {
+            extensions.push_back(VK_KHR_STORAGE_BUFFER_STORAGE_CLASS_EXTENSION_NAME);
+            extensions.push_back(VK_KHR_16BIT_STORAGE_EXTENSION_NAME);
+            if (buffer_device_address) extensions.push_back(VK_KHR_DEVICE_GROUP_EXTENSION_NAME);
+        }
+        if (api < VK_API_VERSION_1_2) {
+            extensions.push_back(VK_KHR_8BIT_STORAGE_EXTENSION_NAME);
+            extensions.push_back(VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME);
+            extensions.push_back(VK_KHR_VULKAN_MEMORY_MODEL_EXTENSION_NAME);
+            if (buffer_device_address) extensions.push_back(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
+        }
+        if (api < VK_API_VERSION_1_3)
+            extensions.push_back(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
+    }
+};
+
 // Preserve app feature fields and all known extension structures. Never write
 // through the application's const pNext pointers or prepend duplicate features.
 class DeviceFeatures {
@@ -46,13 +73,13 @@ public:
         return p;
     }
     // The features the network of `arch` (nr_gpu_arch.hpp; one NR has a network for, checked by the caller) needs.
-    void enable(nr::arch::GpuArch arch) {
+    void enable(nr::arch::GpuArch arch, bool buffer_device_address = true) {
         if (auto* f = find<VkPhysicalDeviceVulkan11Features>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES))
             f->storageBuffer16BitAccess = true;
         else get<VkPhysicalDevice16BitStorageFeatures>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES)->storageBuffer16BitAccess = true;
         if (auto* f = find<VkPhysicalDeviceVulkan12Features>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES)) {
             f->storageBuffer8BitAccess = f->shaderFloat16 = f->shaderInt8 = f->vulkanMemoryModel = true;
-            f->bufferDeviceAddress = true;
+            if (buffer_device_address) f->bufferDeviceAddress = true;
         } else {
             get<VkPhysicalDevice8BitStorageFeatures>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES)->storageBuffer8BitAccess = true;
             auto* half = get<VkPhysicalDeviceShaderFloat16Int8Features>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES);
@@ -60,7 +87,8 @@ public:
             get<VkPhysicalDeviceVulkanMemoryModelFeatures>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES)->vulkanMemoryModel = true;
             // The network reads the activation arena through a buffer_reference on Windows
             // (vit_attn.comp NR_VBDA). vkd3d-proton enables it anyway; DXVK does not.
-            get<VkPhysicalDeviceBufferDeviceAddressFeatures>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES)->bufferDeviceAddress = true;
+            if (buffer_device_address)
+                get<VkPhysicalDeviceBufferDeviceAddressFeatures>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES)->bufferDeviceAddress = true;
         }
         if (auto* f = find<VkPhysicalDeviceVulkan13Features>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES))
             f->subgroupSizeControl = true;

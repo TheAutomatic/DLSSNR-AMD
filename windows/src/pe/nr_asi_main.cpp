@@ -5040,6 +5040,7 @@ VKAPI_ATTR void VKAPI_CALL hk_destroy_device(VkDevice device, const VkAllocation
 VKAPI_ATTR VkResult VKAPI_CALL hk_enumerate_physical(VkInstance instance, uint32_t* n, VkPhysicalDevice* list) {
     const VkResult r = real_enumerate_physical(instance, n, list);
     if ((r == VK_SUCCESS || r == VK_INCOMPLETE) && list && n) {
+        nr::pe::vkdevice::note_physical_devices(instance, *n, list);
         std::lock_guard<std::mutex> guard(g_devices_lock);
         for (uint32_t i = 0; i < *n; ++i) g_physical_instance[list[i]] = instance;
     }
@@ -9884,6 +9885,7 @@ VKAPI_ATTR VkResult VKAPI_CALL nr_layer_create_instance(const VkInstanceCreateIn
 
     const VkResult r = next_ci(ci, a, out);
     if (r == VK_SUCCESS && out && *out) {
+        nr::pe::vkdevice::note_instance(*out, ci);
         std::lock_guard<std::mutex> guard(g_layer_instances_lock);
         g_layer_instances[*out] = next_gipa;
         g_layer_last_instance = *out;

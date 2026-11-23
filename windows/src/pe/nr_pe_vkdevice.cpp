@@ -26,6 +26,16 @@ using nr::pe::log;
 
 std::mutex lock;
 DeviceHandles seen{};
+std::map<VkInstance, uint32_t> instance_versions;
+std::map<VkPhysicalDevice, VkInstance> physical_instances;
+
+uint32_t requested_api(VkPhysicalDevice physical) {
+    std::lock_guard<std::mutex> guard(lock);
+    const auto p = physical_instances.find(physical);
+    if (p == physical_instances.end()) return 0;
+    const auto v = instance_versions.find(p->second);
+    return v == instance_versions.end() ? 0 : v->second;
+}
 
 struct Queue { VkDevice device; uint32_t family; VkQueue queue; };
 std::vector<Queue> queues;
@@ -60,6 +70,7 @@ VkResult VKAPI_PTR hooked_create_instance(const VkInstanceCreateInfo* info,
                                           VkInstance* out) {
     const VkResult r = real_create_instance(info, allocator, out);
     if (r == VK_SUCCESS && out && *out && !nr::pe::bridge::creating_device()) {
+        note_instance(*out, info);
         std::lock_guard<std::mutex> guard(lock);
         seen.instance = *out;
     }
@@ -74,6 +85,8 @@ VkResult VKAPI_PTR hooked_enumerate_physical_devices(VkInstance instance, uint32
                                                      VkPhysicalDevice* out) {
     const VkResult r = real_enumerate_physical_devices(instance, count, out);
     if (instance && !nr::pe::bridge::creating_device()) {
+        if ((r == VK_SUCCESS || r == VK_INCOMPLETE) && out && count)
+            note_physical_devices(instance, *count, out);
         std::lock_guard<std::mutex> guard(lock);
         if (!seen.instance) log("[nr] Vulkan instance learned from vkEnumeratePhysicalDevices");
         seen.instance = instance;
@@ -143,6 +156,19 @@ bool augment(VkPhysicalDevice physical, const VkDeviceCreateInfo* info, Augmente
         return false;
     }
     a->arch = id.arch;
+    VkPhysicalDeviceProperties properties{};
+    vkGetPhysicalDeviceProperties(physical, &properties);
+    const uint32_t requested = requested_api(physical);
+    if (!requested) {
+        static std::once_flag once;
+        std::call_once(once, [] {
+            log("[nr] instance API version unknown; using the physical device's API version for device features");
+        });
+    }
+    const uint32_t api = nr::effective_device_api(requested, properties.apiVersion);
+    // The tested 32-bit route uses storage buffers, not device addresses.
+    const nr::DeviceFeatureRequirements requirements(api, sizeof(void*) == 4);
+    network.insert(network.end(), requirements.extensions.begin(), requirements.extensions.end());
     for (const char* e : network) {
         bool found = false;
         for (const auto& h : have) found = found || std::strcmp(h.extensionName, e) == 0;
@@ -156,7 +182,7 @@ bool augment(VkPhysicalDevice physical, const VkDeviceCreateInfo* info, Augmente
     for (const char* e : network)
         if (!listed(e, a->extensions.data(), a->extensions.size())) a->extensions.push_back(e);
     a->features = std::make_unique<nr::DeviceFeatures>(info->pNext);
-    a->features->enable(a->arch);
+    a->features->enable(a->arch, requirements.buffer_device_address);
     auto* w = a->features->get<VkPhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR>(
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_FEATURES_KHR);
     w->workgroupMemoryExplicitLayout = w->workgroupMemoryExplicitLayout8BitAccess =
@@ -237,6 +263,19 @@ void VKAPI_PTR hooked_get_device_queue2(VkDevice device, const VkDeviceQueueInfo
 }
 
 }  // namespace
+
+void note_instance(VkInstance instance, const VkInstanceCreateInfo* info) {
+    if (!instance) return;
+    std::lock_guard<std::mutex> guard(lock);
+    instance_versions[instance] = info && info->pApplicationInfo && info->pApplicationInfo->apiVersion
+        ? info->pApplicationInfo->apiVersion : VK_API_VERSION_1_0;
+}
+
+void note_physical_devices(VkInstance instance, uint32_t count, const VkPhysicalDevice* physical) {
+    if (!instance || !physical) return;
+    std::lock_guard<std::mutex> guard(lock);
+    for (uint32_t i = 0; i < count; ++i) physical_instances[physical[i]] = instance;
+}
 
 VkResult create_with_network(PFN_vkCreateDevice create, VkPhysicalDevice physical, const VkDeviceCreateInfo* info,
                              const VkAllocationCallbacks* allocator, VkDevice* out, bool* added) {
