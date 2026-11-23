@@ -267,6 +267,7 @@ struct Built {
     // RDNA3 (the Vulkan runtime's fp16_twin): the arena's FP16 twin (twice its bytes, zero) and the weights' (each e4m3
     // byte as an f16), what its e4m3 views read
     bool rdna3 = false;
+    bool wgt_uploaded = false;
     ID3D12Resource *act_e = nullptr, *wgt_e = nullptr, *wgt_e_upload = nullptr;
     bool noise_real = false, want_noise = false;
     uint32_t seed0_run = 0;                       // consecutive recordings whose pre block ran seed 0
@@ -349,6 +350,91 @@ struct Shared {
     std::shared_ptr<Built> done;                  // built, not yet taken by ready()
     std::map<std::tuple<uint32_t, uint32_t, int>, std::string> failed;   // extents & models that cannot run (not built again)
 };
+
+// Upload weights via a temporary COPY (or DIRECT) queue using one reusable 16 MB staging buffer so neither
+// the game's first frame nor Process Committed sees a full-weights UPLOAD allocation spike.
+bool upload_weights_chunked(ID3D12Device* device, ID3D12Resource* wgt, ID3D12Resource* wgt_e,
+                            const std::vector<uint8_t>& weights, bool rdna3) {
+    if (weights.empty()) return true;
+    struct Hold {
+        ID3D12Resource* staging = nullptr;
+        void* mapped = nullptr;
+        HANDLE ev = nullptr;
+        ID3D12Fence* fence = nullptr;
+        ID3D12GraphicsCommandList* cmd = nullptr;
+        ID3D12CommandAllocator* alloc = nullptr;
+        ID3D12CommandQueue* queue = nullptr;
+        ~Hold() {
+            if (mapped && staging) staging->Unmap(0, nullptr);
+            release(staging);
+            if (ev) CloseHandle(ev);
+            release(fence);
+            release(cmd);
+            release(alloc);
+            release(queue);
+        }
+    } h;
+
+    D3D12_COMMAND_LIST_TYPE q_type = D3D12_COMMAND_LIST_TYPE_COPY;
+    D3D12_COMMAND_QUEUE_DESC qd{};
+    qd.Type = q_type;
+    if (FAILED(device->CreateCommandQueue(&qd, IID_PPV_ARGS(&h.queue))) || !h.queue) {
+        q_type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        qd.Type = q_type;
+        if (FAILED(device->CreateCommandQueue(&qd, IID_PPV_ARGS(&h.queue))) || !h.queue) return false;
+    }
+    if (FAILED(device->CreateCommandAllocator(q_type, IID_PPV_ARGS(&h.alloc))) || !h.alloc ||
+        FAILED(device->CreateCommandList(0, q_type, h.alloc, nullptr, IID_PPV_ARGS(&h.cmd))) || !h.cmd ||
+        FAILED(h.cmd->Close()) ||
+        FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&h.fence))) || !h.fence) {
+        return false;
+    }
+    h.ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!h.ev) return false;
+
+    const uint64_t wbytes = weights.size();
+    const uint64_t raw_chunk = std::min<uint64_t>(16ull << 20, rdna3 ? wbytes * 2 : wbytes);
+    const uint64_t chunk_bytes = std::max<uint64_t>(256ull, (raw_chunk + 255ull) & ~255ull);
+    h.staging = buffer(device, D3D12_HEAP_TYPE_UPLOAD, chunk_bytes, D3D12_RESOURCE_STATE_GENERIC_READ, false);
+    if (!h.staging || FAILED(h.staging->Map(0, nullptr, &h.mapped)) || !h.mapped) return false;
+
+    uint64_t fv = 0;
+    auto submit_chunk = [&](ID3D12Resource* dst, uint64_t dst_off, uint64_t len) -> bool {
+        if (FAILED(h.alloc->Reset()) || FAILED(h.cmd->Reset(h.alloc, nullptr))) return false;
+        h.cmd->CopyBufferRegion(dst, dst_off, h.staging, 0, len);
+        if (FAILED(h.cmd->Close())) return false;
+        ID3D12CommandList* lists[] = {h.cmd};
+        h.queue->ExecuteCommandLists(1, lists);
+        if (FAILED(h.queue->Signal(h.fence, ++fv))) return false;
+        if (h.fence->GetCompletedValue() < fv) {
+            ResetEvent(h.ev);
+            if (FAILED(h.fence->SetEventOnCompletion(fv, h.ev))) return false;
+            if (WaitForSingleObject(h.ev, 10000) != WAIT_OBJECT_0) return false;
+        }
+        return true;
+    };
+
+    for (uint64_t off = 0; off < wbytes;) {
+        const uint64_t len = std::min<uint64_t>(chunk_bytes, wbytes - off);
+        std::memcpy(h.mapped, weights.data() + off, size_t(len));
+        if (!submit_chunk(wgt, off, len)) return false;
+        off += len;
+    }
+    if (rdna3 && wgt_e) {
+        uint16_t to_f16[256];
+        for (int i = 0; i < 256; ++i) to_f16[i] = tin::f_to_f16(tin::e4m3_to_f(uint8_t(i)));
+        const uint64_t max_e = chunk_bytes / 2;
+        auto* out = static_cast<uint16_t*>(h.mapped);
+        for (uint64_t off = 0; off < wbytes;) {
+            const uint64_t len = std::min<uint64_t>(max_e, wbytes - off);
+            const uint8_t* src = weights.data() + off;
+            for (uint64_t i = 0; i < len; ++i) out[i] = to_f16[src[i]];
+            if (!submit_chunk(wgt_e, off * 2, len * 2)) return false;
+            off += len;
+        }
+    }
+    return true;
+}
 
 // build: the lowering and everything of the device's it needs. On the build thread.
 std::shared_ptr<Built> build(ID3D12Device* device, ID3D12RootSignature* rs, uint32_t w,
@@ -475,10 +561,9 @@ std::shared_ptr<Built> build(ID3D12Device* device, ID3D12RootSignature* rs, uint
     }
     {
         nr::vram::Scope s_wgt(nr::vram::kWeights, b->net);
-        b->wgt = buffer(device, D3D12_HEAP_TYPE_DEFAULT, wbytes, D3D12_RESOURCE_STATE_COPY_DEST, true);
+        b->wgt = buffer(device, D3D12_HEAP_TYPE_DEFAULT, wbytes, D3D12_RESOURCE_STATE_COMMON, true);
         nr::vram::track_d3d12(device, b->wgt, nr::vram::kWeights);
     }
-    b->wgt_upload = buffer(device, D3D12_HEAP_TYPE_UPLOAD, wbytes, D3D12_RESOURCE_STATE_GENERIC_READ, false);
     if (b->rdna3) {   // the FP16 twins (nr_graph.cpp / reload_network on RDNA3): the arena's zero, the weights' converted
         {
             nr::vram::Scope s_act(nr::vram::kActivations, b->net);
@@ -487,18 +572,10 @@ std::shared_ptr<Built> build(ID3D12Device* device, ID3D12RootSignature* rs, uint
         }
         {
             nr::vram::Scope s_wgt(nr::vram::kWeights, b->net);
-            b->wgt_e = buffer(device, D3D12_HEAP_TYPE_DEFAULT, wbytes * 2, D3D12_RESOURCE_STATE_COPY_DEST, true);
+            b->wgt_e = buffer(device, D3D12_HEAP_TYPE_DEFAULT, wbytes * 2, D3D12_RESOURCE_STATE_COMMON, true);
             nr::vram::track_d3d12(device, b->wgt_e, nr::vram::kWeights);
         }
-        b->wgt_e_upload = buffer(device, D3D12_HEAP_TYPE_UPLOAD, wbytes * 2, D3D12_RESOURCE_STATE_GENERIC_READ, false);
-        if (!b->act_e || !b->wgt_e || !b->wgt_e_upload) { *why = "the RDNA3 FP16 twins could not be made"; return nullptr; }
-        void* em = nullptr;
-        if (FAILED(b->wgt_e_upload->Map(0, nullptr, &em)) || !em) { *why = "the FP16 weights upload could not be mapped"; return nullptr; }
-        uint16_t to_f16[256];
-        for (int i = 0; i < 256; ++i) to_f16[i] = tin::f_to_f16(tin::e4m3_to_f(uint8_t(i)));
-        auto* o = static_cast<uint16_t*>(em);
-        for (uint64_t i = 0; i < wbytes; ++i) o[i] = to_f16[b->plan.weights[size_t(i)]];
-        b->wgt_e_upload->Unmap(0, nullptr);
+        if (!b->act_e || !b->wgt_e) { *why = "the RDNA3 FP16 twins could not be made"; return nullptr; }
     }
     b->stand = buffer(device, D3D12_HEAP_TYPE_DEFAULT, 512, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
     b->noise = buffer(device, D3D12_HEAP_TYPE_DEFAULT, 256, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
@@ -509,16 +586,33 @@ std::shared_ptr<Built> build(ID3D12Device* device, ID3D12RootSignature* rs, uint
         b->table = buffer(device, D3D12_HEAP_TYPE_DEFAULT, b->slot_bytes, D3D12_RESOURCE_STATE_COPY_DEST, true);
         nr::vram::track_d3d12(device, b->table, nr::vram::kUnset);
     }
-    if (!b->act || !b->wgt || !b->wgt_upload || !b->stand || !b->noise || !b->table) {
+    if (!b->act || !b->wgt || !b->stand || !b->noise || !b->table) {
         *why = "the network memory could not be made"; return nullptr;
     }
     for (ID3D12Resource* r : {b->act, b->wgt, b->stand, b->noise, b->table})
         if ((r->GetGPUVirtualAddress() >> 48) != 0) { *why = "a buffer address above 48 bits"; return nullptr; }
-    {
+    if (b->wgt_e && ((b->wgt_e->GetGPUVirtualAddress() >> 48) != 0 || (b->act_e->GetGPUVirtualAddress() >> 48) != 0)) {
+        *why = "a buffer address above 48 bits"; return nullptr;
+    }
+    b->wgt_uploaded = upload_weights_chunked(device, b->wgt, b->wgt_e, b->plan.weights, b->rdna3);
+    if (!b->wgt_uploaded) {
+        b->wgt_upload = buffer(device, D3D12_HEAP_TYPE_UPLOAD, wbytes, D3D12_RESOURCE_STATE_GENERIC_READ, false);
+        if (!b->wgt_upload) { *why = "the weights upload could not be made"; return nullptr; }
         void* wm = nullptr;
         if (FAILED(b->wgt_upload->Map(0, nullptr, &wm)) || !wm) { *why = "the weights upload could not be mapped"; return nullptr; }
         if (wbytes) std::memcpy(wm, b->plan.weights.data(), wbytes);
         b->wgt_upload->Unmap(0, nullptr);
+        if (b->rdna3) {
+            b->wgt_e_upload = buffer(device, D3D12_HEAP_TYPE_UPLOAD, wbytes * 2, D3D12_RESOURCE_STATE_GENERIC_READ, false);
+            if (!b->wgt_e_upload) { *why = "the RDNA3 FP16 twins could not be made"; return nullptr; }
+            void* em = nullptr;
+            if (FAILED(b->wgt_e_upload->Map(0, nullptr, &em)) || !em) { *why = "the FP16 weights upload could not be mapped"; return nullptr; }
+            uint16_t to_f16[256];
+            for (int i = 0; i < 256; ++i) to_f16[i] = tin::f_to_f16(tin::e4m3_to_f(uint8_t(i)));
+            auto* o = static_cast<uint16_t*>(em);
+            for (uint64_t i = 0; i < wbytes; ++i) o[i] = to_f16[b->plan.weights[size_t(i)]];
+            b->wgt_e_upload->Unmap(0, nullptr);
+        }
     }
     std::vector<uint8_t>().swap(b->plan.weights);
     {
@@ -1003,11 +1097,18 @@ public:
         }
         slot_buf->owner[slot_i] = frame;
         if (first) {
-            cmd->CopyBufferRegion(b->wgt, 0, b->wgt_upload, 0, b->wgt->GetDesc().Width);
-            transition(cmd, b->wgt, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            if (b->wgt_e) {
-                cmd->CopyBufferRegion(b->wgt_e, 0, b->wgt_e_upload, 0, b->wgt_e->GetDesc().Width);
-                transition(cmd, b->wgt_e, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            if (b->wgt_uploaded) {
+                transition(cmd, b->wgt, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                if (b->wgt_e) transition(cmd, b->wgt_e, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            } else {
+                transition(cmd, b->wgt, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+                cmd->CopyBufferRegion(b->wgt, 0, b->wgt_upload, 0, b->wgt->GetDesc().Width);
+                transition(cmd, b->wgt, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                if (b->wgt_e) {
+                    transition(cmd, b->wgt_e, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+                    cmd->CopyBufferRegion(b->wgt_e, 0, b->wgt_e_upload, 0, b->wgt_e->GetDesc().Width);
+                    transition(cmd, b->wgt_e, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                }
             }
         }
         if (noise_made) {   // the stand-in goes behind every recording that bound it (this one included)
@@ -1060,7 +1161,10 @@ public:
                 case TEX_IN: put_img(d, in.va, b->w, b->h, in_format); break;
                 case SURF0: put_img(d, out.va, b->w, b->h, out_format); break;
                 case SURF1: put_img(d, stand_va, 1, 1, kFormatRgba32f); break;
-                case FLOW: put_img(d, temporal_.motion_va, b->w, b->h, mv_format); break;
+                case FLOW:
+                    if (temporal_.motion_va) put_img(d, temporal_.motion_va, b->w, b->h, mv_format);
+                    else put_img(d, stand_va, 1, 1, mv_format);
+                    break;
                 case HIST:
                     if (ext_hist && !gate) put_img(d, stand_va, 1, 1, hist_format);
                     else put_img(d, hist_va, b->w, b->h, hist_format);
@@ -1187,13 +1291,15 @@ public:
         }
         if (first) {
             b->retargeted = true;
-            RetiredUse r;
-            r.net = current_shared_;
-            r.upload = b->wgt_upload;
-            r.uses = b->gpu;
-            r.frame = int64_t(frame);
-            retire_upload_.push_back(std::move(r));
-            b->wgt_upload = nullptr;
+            if (b->wgt_upload) {
+                RetiredUse r;
+                r.net = current_shared_;
+                r.upload = b->wgt_upload;
+                r.uses = b->gpu;
+                r.frame = int64_t(frame);
+                retire_upload_.push_back(std::move(r));
+                b->wgt_upload = nullptr;
+            }
             if (b->wgt_e_upload) {
                 RetiredUse e;
                 e.net = current_shared_;
