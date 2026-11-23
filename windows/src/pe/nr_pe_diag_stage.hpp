@@ -3,7 +3,7 @@
 namespace nr::pe {
 
 inline unsigned diagnostic_stage(const char* value) {
-    return value && value[0] >= '0' && value[0] <= '2' && value[1] == '\0'
+    return value && value[0] >= '0' && value[0] <= '3' && value[1] == '\0'
         ? unsigned(value[0] - '0') : 0u;
 }
 

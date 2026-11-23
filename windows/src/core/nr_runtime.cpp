@@ -3311,7 +3311,7 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         const uint32_t net_query = timing_slot * impl_->timing_stride + 2 + 2 * pass;
         if (c.network_timestamp) c.network_timestamp(cmd, true);
         if (time_net) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, impl_->timing, net_query);
-        for (size_t i = 0; i < s.steps.size(); ++i) {
+        for (size_t i = 0; !c.diagnostic_skip_graph && i < s.steps.size(); ++i) {
             const auto& step = s.steps[i];
             const nrvk::Kernel* use = step.k;
             if (mask && step.k==impl_->original_pre) use = &impl_->mask_pre;
@@ -3396,7 +3396,7 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         s.ctx.destroy(impl_->retiring[i].first);
         impl_->retiring.erase(impl_->retiring.begin() + long(i));
     }
-    info.network_dispatches = uint32_t(s.steps.size()) * passes;
+    info.network_dispatches = c.diagnostic_skip_graph ? 0 : uint32_t(s.steps.size()) * passes;
     if (c.apply_model) {
         if (mask) {
             struct { uint32_t w,h;float intensity; } push{frame.width,frame.height,c.intensity};

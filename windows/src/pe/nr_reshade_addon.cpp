@@ -174,7 +174,7 @@ using nr::lang::tr_text;
 unsigned diag_stage = 0;
 
 bool diagnostic_no_writeback(device* dev) {
-    return diag_stage == 1 && dev->get_api() == device_api::vulkan;
+    return (diag_stage == 1 || diag_stage == 3) && dev->get_api() == device_api::vulkan;
 }
 
 bool diagnostic_build_only(device* dev) {
@@ -3222,8 +3222,9 @@ void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
     struct RunTarget { resource colour; resource_desc cd; bool linear; };
     RunTarget tgt{colour, cd, linear_hdr};
     bool hold_running = false;
-    auto run_one = [&](const nr::Controls& controls, const nr::pe::Session::RenoDXFrame* renodx, uint64_t feature,
+    auto run_one = [&](nr::Controls controls, const nr::pe::Session::RenoDXFrame* renodx, uint64_t feature,
                        const nr::pe::Session::Wilsjo2Frame* w2f = nullptr) -> int {
+        controls.diagnostic_skip_graph = diag_stage == 3 && dev->get_api() == device_api::vulkan;
         auto& held_input = inspect_input;
         nr::pe::Session::RenoDXFrame held_frame;
         const bool use_hold = hold_running && held_input.held;
@@ -4388,7 +4389,9 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         diag_stage = stage_length < sizeof stage ? nr::pe::diagnostic_stage(stage) : 0u;
         log("[nr] DIAGNOSTIC BUILD: queue lock + stage switch");
         log("[nr] NR_DIAG_STAGE=%u: %s", diag_stage, diag_stage == 1 ? "Vulkan, no back-buffer write-back"
-            : diag_stage == 2 ? "Vulkan build only, no per-frame GPU recording" : "normal behaviour");
+            : diag_stage == 2 ? "Vulkan build only, no per-frame GPU recording"
+            : diag_stage == 3 ? "Vulkan, copy-in and RenoDX; no network graph dispatches or back-buffer write-back"
+            : "normal behaviour");
         nr::pe::vkdevice::diagnostic_queue_lock();
         nr::pe::watchdog::start();
         const std::string folder = nr::pe::module_folder();

@@ -97,6 +97,7 @@ struct ColourFrame;
 struct Controls {
     bool enabled = true;
     bool apply_model = true;
+    bool diagnostic_skip_graph = false;
     // NR Control's [Inspect] for this layer (wilsjo2_resolve.comp): DebugView 0 off, 1 the network's input, 2 its
     // answer, 3 its change x20 around grey; the skin weight.
     uint32_t debug_view = 0;
