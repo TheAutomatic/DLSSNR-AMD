@@ -27,7 +27,9 @@ pipeline of their own: "<suffix> <kernel>... : <block>...", from the overlay's "
 lists the differences (exit 1 if any).
 """
 import argparse
+import concurrent.futures
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -85,25 +87,40 @@ def main():
     consts = dict(r.split() for r in table['markers']['shader-constants.txt'][1:])
     if consts.get('post_no_out1') == '1' and 'NR_POST_NO_OUT1=1' not in pipelines['fswinimagepost32']['defines']:
         sys.exit('pipelines.json: post_no_out1 1, but fswinimagepost32 is built without NR_POST_NO_OUT1=1')
-    for name, e in pipelines.items():
-        glslang(a.arch, R / 'linux/shaders' / a.arch / e['source'], e['defines'], out / f'g_{name}.spv')
     for name, text in table['markers'].items():
         (out / name).write_text('\n'.join(text) + '\n' if isinstance(text, list) else text + '\n')
+    shutil.copy2(out / 'shader-constants.txt', out / 'temporal' / 'shader-constants.txt')
+
+    tasks = []
+    for name, e in pipelines.items():
+        tasks.append((R / 'linux/shaders' / a.arch / e['source'], e['defines'], out / f'g_{name}.spv'))
     for name, v in table['variants'].items():
         base = pipelines[v['base']]
-        glslang(a.arch, R / 'linux/shaders' / a.arch / base['source'], base['defines'] + v['add'],
-                out / 'temporal' / f'{name}.spv')
+        tasks.append((R / 'linux/shaders' / a.arch / base['source'], base['defines'] + v['add'],
+                      out / 'temporal' / f'{name}.spv'))
     grade = table['style_grade']
     for name in grade['pipelines']:
         e = pipelines[name]
-        glslang(a.arch, R / 'linux/shaders' / a.arch / e['source'], e['defines'] + grade['add'], out / f'g_{name}_grade.spv')
+        tasks.append((R / 'linux/shaders' / a.arch / e['source'], e['defines'] + grade['add'],
+                      out / f'g_{name}_grade.spv'))
     for name in grade['variants']:
         base = pipelines[table['variants'][name]['base']]
-        glslang(a.arch, R / 'linux/shaders' / a.arch / base['source'],
-                base['defines'] + table['variants'][name]['add'] + grade['add'], out / 'temporal' / f'{name}_grade.spv')
+        tasks.append((R / 'linux/shaders' / a.arch / base['source'],
+                      base['defines'] + table['variants'][name]['add'] + grade['add'],
+                      out / 'temporal' / f'{name}_grade.spv'))
     for k in MOTION:
-        glslang(a.arch, R / 'linux/shaders/passes' / f'{k}.comp', [], out / 'temporal' / f'{k}.spv')
-    shutil.copy2(out / 'shader-constants.txt', out / 'temporal' / 'shader-constants.txt')
+        tasks.append((R / 'linux/shaders/passes' / f'{k}.comp', [], out / 'temporal' / f'{k}.spv'))
+    if not overlay:
+        for k in RUNTIME:
+            tasks.append((R / 'linux/shaders/passes' / f'{k}.comp', [], out / 'runtime' / f'{k}.spv'))
+
+    env_jobs = os.environ.get('NR_JOBS', '').strip()
+    workers = int(env_jobs) if env_jobs.isdigit() and int(env_jobs) > 0 else (os.cpu_count() or 4)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = [pool.submit(glslang, a.arch, src, defs, dst) for src, defs, dst in tasks]
+        for fut in futs:
+            fut.result()
+
     if a.int4 or a.performance or a.ultra:
         for name in i4['iu4']:
             (out / f'g_{name}.spv.iu4').write_text('0\n')
@@ -126,9 +143,6 @@ def main():
                 lines.append(' '.join([r['suffix']] + r['kernels'] + [':'] + [str(b) for b in r['blocks']]))
             (out / 'block-routes.txt').write_text('\n'.join(lines) + '\n')
         (out / 'runtime').rmdir()
-    else:
-        for k in RUNTIME:
-            glslang(a.arch, R / 'linux/shaders/passes' / f'{k}.comp', [], out / 'runtime' / f'{k}.spv')
     print(f'{out}: {len(pipelines) + len(grade["pipelines"])} network pipelines, '
           f'{len(table["variants"]) + len(grade["variants"]) + len(MOTION)} temporal, '
           f'{0 if overlay else len(RUNTIME)} runtime')

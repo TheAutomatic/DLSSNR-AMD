@@ -65,6 +65,7 @@ for f in "$opti_7z" "$opti_license" artifacts/ref/reshade-6.8.0/ReShade64.dll; d
     [[ -f "$f" ]] || { echo "missing: $f" >&2; exit 1; }
 done
 source windows/build/arch/rdna4.sh
+source windows/build/parallel.sh
 
 # ---- the ReShade add-on -----------------------------------------------------------------------
 stamp=$(bash windows/build/version.sh)
@@ -74,27 +75,30 @@ common=(-std=c++17 -O2 -DNDEBUG -DNR_BUILD_STAMP="\"$stamp\"" -Itoolchain/Vulkan
 # (NR_RESHADE_ROUTE: these are the ReShade add-on's objects, all of them - the route's defaults, nr_fast_passes.hpp)
 common+=(-DNR_RESHADE_ROUTE=1)
 [[ "${NR_INT4:-1}" == 1 ]] && common+=(-DNR_INT4=1)
-"$cxx" "${common[@]}" "${NR_PRODUCT_DEFINES[@]}" -c windows/src/core/nr_runtime.cpp -o "$out/nr_runtime.o"
-"$cxx" "${common[@]}" -c windows/src/core/nr_native_plan.cpp -o "$out/nr_native_plan.o"
-"$cxx" "${common[@]}" -c windows/src/core/nr_renodx.cpp -o "$out/nr_renodx.o"
-"$cxx" "${common[@]}" -c windows/src/core/nr_wilsjo2.cpp -o "$out/nr_wilsjo2.o"   # its Stage: HUD FIX and the wilsjo2 layers
-"$cxx" "${common[@]}" -c windows/src/pe/nr_vram_ledger.cpp -o "$out/vram_ledger.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_pe_log.cpp -o "$out/log.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_pe_crash.cpp -o "$out/crash.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_pe_interop.cpp -o "$out/interop.o"
-"$cxx" "${common[@]}" -I"$minhook/include" -c windows/src/pe/nr_pe_vkdevice.cpp -o "$out/vkdevice.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_pe_session.cpp -o "$out/session.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_pe_bridge.cpp -o "$out/bridge.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_pe_d3d12split.cpp -o "$out/d3d12split.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_pe_config.cpp -o "$out/config.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_screenshot.cpp -o "$out/screenshot.o"
+nr_par_init
+# Largest units first so they never form a serial tail behind tiny files.
+nr_par_run "$cxx" "${common[@]}" "${NR_PRODUCT_DEFINES[@]}" -c windows/src/core/nr_runtime.cpp -o "$out/nr_runtime.o"
 # ReShade's headers include <Windows.h>; the case shim maps that onto mingw's.
-"$cxx" "${common[@]}" -idirafter windows/src/pe/reshade_compat -I"$reshade_inc" -I"$minhook/include" \
+nr_par_run "$cxx" "${common[@]}" -idirafter windows/src/pe/reshade_compat -I"$reshade_inc" -I"$minhook/include" \
     -Iartifacts/ref/DLSS5-Feeder/external/imgui -Iwindows/src/ui -c windows/src/pe/nr_reshade_addon.cpp -o "$out/reshade_addon.o"
+nr_par_run "$cxx" "${common[@]}" -c windows/src/core/nr_native_plan.cpp -o "$out/nr_native_plan.o"
+nr_par_run "$cxx" "${common[@]}" -c windows/src/core/nr_renodx.cpp -o "$out/nr_renodx.o"
+nr_par_run "$cxx" "${common[@]}" -c windows/src/core/nr_wilsjo2.cpp -o "$out/nr_wilsjo2.o"   # its Stage: HUD FIX and the wilsjo2 layers
+nr_par_run "$cxx" "${common[@]}" -c windows/src/pe/nr_vram_ledger.cpp -o "$out/vram_ledger.o"
+nr_par_run "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_log.cpp -o "$out/log.o"
+nr_par_run "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_crash.cpp -o "$out/crash.o"
+nr_par_run "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_interop.cpp -o "$out/interop.o"
+nr_par_run "$cxx" "${common[@]}" -I"$minhook/include" -c windows/src/pe/nr_pe_vkdevice.cpp -o "$out/vkdevice.o"
+nr_par_run "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_session.cpp -o "$out/session.o"
+nr_par_run "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_bridge.cpp -o "$out/bridge.o"
+nr_par_run "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_d3d12split.cpp -o "$out/d3d12split.o"
+nr_par_run "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_config.cpp -o "$out/config.o"
+nr_par_run "$cxx" "${common[@]}" -c windows/src/pe/nr_screenshot.cpp -o "$out/screenshot.o"
 for unit in hook buffer trampoline; do
-    "$cc" -O2 -I"$minhook/include" -I"$minhook/src" -c "$minhook/src/$unit.c" -o "$out/mh_$unit.o"
+    nr_par_run "$cc" -O2 -I"$minhook/include" -I"$minhook/src" -c "$minhook/src/$unit.c" -o "$out/mh_$unit.o"
 done
-"$cc" -O2 -I"$minhook/include" -I"$minhook/src" -c "$minhook/src/hde/hde64.c" -o "$out/mh_hde64.o"
+nr_par_run "$cc" -O2 -I"$minhook/include" -I"$minhook/src" -c "$minhook/src/hde/hde64.c" -o "$out/mh_hde64.o"
+nr_par_wait
 ldflags=(-ld3d12 -ld3d11 -ldxgi -ldwmapi -lgdi32 -lole32 -static -static-libgcc -static-libstdc++)
 
 # No static import of vulkan-1.dll (it would load before the game set up its graphics): windows/build/vulkan_lazy.sh.
@@ -389,15 +393,19 @@ sed -i 's/$/\r/' "$pkg/install.bat"
 preview=-preview; [[ "$stamp" == *preview* ]] && preview=
 name="DLSSNR-AMD-Vulkan-Windows-$stamp$preview-x86_64"
 rm -f -- "$out/$name.zip"
-python3 - "$pkg" "$out/$name.zip" <<'PY'
+if command -v 7z >/dev/null; then
+    ( cd "$pkg" && 7z a -tzip -mm=Deflate -mx=6 -mmt="$(nr_jobs_default)" -bd "$out/$name.zip" . > /dev/null )
+else
+    python3 - "$pkg" "$out/$name.zip" <<'PY'
 import os, sys, zipfile
 root, dst = sys.argv[1], sys.argv[2]
-with zipfile.ZipFile(dst, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+with zipfile.ZipFile(dst, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as z:
     for d, _, files in sorted(os.walk(root)):
         for f in sorted(files):
             full = os.path.join(d, f)
             z.write(full, os.path.relpath(full, root))
 PY
+fi
 mv -f -- "$out/$name.zip" "windows/package/$name.zip"
 du -sh -- "$pkg"
 sha256sum -- "windows/package/$name.zip"

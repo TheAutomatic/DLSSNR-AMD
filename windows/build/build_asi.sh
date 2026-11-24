@@ -33,30 +33,8 @@ common=(-std=c++17 -O2 -DNDEBUG -DNR_BUILD_STAMP="\"$stamp\"" -Itoolchain/Vulkan
 # The network the package ships (windows/build/arch/rdna4.sh): the host must be built with the same constants as the
 # shaders in dlssnr-amd/shaders.
 source windows/build/arch/rdna4.sh
-"$cxx" "${common[@]}" "${NR_PRODUCT_DEFINES[@]}" -c windows/src/core/nr_runtime.cpp -o "$out/nr_runtime.o"
-"$cxx" "${common[@]}" -c windows/src/core/nr_native_plan.cpp -o "$out/nr_native_plan.o"
-"$cxx" "${common[@]}" -c windows/src/core/nr_renodx.cpp -o "$out/nr_renodx.o"
-"$cxx" "${common[@]}" -c windows/src/core/nr_wilsjo2.cpp -o "$out/nr_wilsjo2.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_pe_log.cpp -o "$out/log.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_pe_crash.cpp -o "$out/crash.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_pe_interop.cpp -o "$out/interop.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_vram_ledger.cpp -o "$out/vram_ledger.o"
-"$cxx" "${common[@]}" -I"$minhook/include" -c windows/src/pe/nr_pe_vkdevice.cpp -o "$out/vkdevice.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_pe_session.cpp -o "$out/session.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_pe_bridge.cpp -o "$out/bridge.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_pe_d3d12split.cpp -o "$out/d3d12split.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_pe_config.cpp -o "$out/config.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_dlssnr_model.cpp -o "$out/model.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_pe_renodx_route.cpp -o "$out/renodx_route.o"
-"$cxx" "${common[@]}" -I"$minhook/include" -c windows/src/pe/nr_pe_control.cpp -o "$out/control.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_screenshot.cpp -o "$out/screenshot.o"
-"$cxx" "${common[@]}" -I"$minhook/include" -c windows/src/pe/nr_asi_main.cpp -o "$out/asi_main.o"
-# The wilsjo2 style (nr_asi_wilsjo2.hpp): its flow and its programs; the shaders go to dlssnr-amd\shaders\wilsjo2.
-"$cxx" "${common[@]}" -c windows/src/pe/nr_asi_wilsjo2.cpp -o "$out/asi_wilsjo2.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_asi_wilsjo2_vk.cpp -o "$out/asi_wilsjo2_vk.o"
-# HUD FIX's capture on D3D12 (nr_asi_hudcap.hpp): hooks of the game's command lists
-"$cxx" "${common[@]}" -I"$minhook/include" -c windows/src/pe/nr_asi_hudcap.cpp -o "$out/asi_hudcap.o"
-bash windows/build/build_wilsjo2.sh "$out/shaders/wilsjo2" > /dev/null
+source windows/build/parallel.sh
+
 # NR Control (End), drawn by the DLL over the game's swap chain: ImGui with its D3D11, D3D12 and Vulkan backends.
 imgui=${NR_IMGUI_ROOT:-toolchain/imgui-nr}
 [[ -f "$imgui/imgui_impl_dx12.cpp" ]] || { echo "missing $imgui (ImGui with its D3D backends)" >&2; exit 1; }
@@ -67,33 +45,61 @@ python3 windows/build/embed_font.py "$font" "$out/nr_menu_font.hpp" kMenuFont
 glslang=${NR_GLSLANG:-toolchain/glslang/bin/glslang}
 "$glslang" -V --target-env vulkan1.0 --vn kMenuComposeVert windows/shaders/control/menu_compose.vert -o "$out/menu_compose_vert.h" > /dev/null
 "$glslang" -V --target-env vulkan1.0 --vn kMenuComposeFrag windows/shaders/control/menu_compose.frag -o "$out/menu_compose_frag.h" > /dev/null
-"$cxx" "${common[@]}" -I"$minhook/include" -I"$imgui" -Iwindows/src/ui -c windows/src/pe/nr_pe_menu.cpp -o "$out/menu.o"
+
+nr_par_init
+# Launch heaviest units first so they overlap with smaller translation units.
+nr_par_run "$cxx" "${common[@]}" "${NR_PRODUCT_DEFINES[@]}" -c windows/src/core/nr_runtime.cpp -o "$out/nr_runtime.o"
+nr_par_run "$cxx" "${common[@]}" -I"$minhook/include" -I"$imgui" -Iwindows/src/ui -c windows/src/pe/nr_pe_menu.cpp -o "$out/menu.o"
+nr_par_run "$cxx" "${common[@]}" -c windows/src/pe/nr_d3d12_passthrough_net.cpp -o "$out/d3d12_passthrough_net.o"
+nr_par_run "$cxx" "${common[@]}" -I"$minhook/include" -c windows/src/pe/nr_asi_main.cpp -o "$out/asi_main.o"
+nr_par_run "$cxx" "${common[@]}" -c windows/src/pe/nr_d3d12_passthrough_backend.cpp -o "$out/d3d12_passthrough_backend.o"
+nr_par_run "$cxx" "${common[@]}" -c windows/src/core/nr_native_plan.cpp -o "$out/nr_native_plan.o"
+nr_par_run "$cxx" "${common[@]}" -c windows/src/core/nr_renodx.cpp -o "$out/nr_renodx.o"
+nr_par_run "$cxx" "${common[@]}" -c windows/src/core/nr_wilsjo2.cpp -o "$out/nr_wilsjo2.o"
+nr_par_run "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_log.cpp -o "$out/log.o"
+nr_par_run "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_crash.cpp -o "$out/crash.o"
+nr_par_run "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_interop.cpp -o "$out/interop.o"
+nr_par_run "$cxx" "${common[@]}" -c windows/src/pe/nr_vram_ledger.cpp -o "$out/vram_ledger.o"
+nr_par_run "$cxx" "${common[@]}" -I"$minhook/include" -c windows/src/pe/nr_pe_vkdevice.cpp -o "$out/vkdevice.o"
+nr_par_run "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_session.cpp -o "$out/session.o"
+nr_par_run "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_bridge.cpp -o "$out/bridge.o"
+nr_par_run "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_d3d12split.cpp -o "$out/d3d12split.o"
+nr_par_run "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_config.cpp -o "$out/config.o"
+nr_par_run "$cxx" "${common[@]}" -c windows/src/pe/nr_dlssnr_model.cpp -o "$out/model.o"
+nr_par_run "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_renodx_route.cpp -o "$out/renodx_route.o"
+nr_par_run "$cxx" "${common[@]}" -I"$minhook/include" -c windows/src/pe/nr_pe_control.cpp -o "$out/control.o"
+nr_par_run "$cxx" "${common[@]}" -c windows/src/pe/nr_screenshot.cpp -o "$out/screenshot.o"
+# The wilsjo2 style (nr_asi_wilsjo2.hpp): its flow and its programs; the shaders go to dlssnr-amd\shaders\wilsjo2.
+nr_par_run "$cxx" "${common[@]}" -c windows/src/pe/nr_asi_wilsjo2.cpp -o "$out/asi_wilsjo2.o"
+nr_par_run "$cxx" "${common[@]}" -c windows/src/pe/nr_asi_wilsjo2_vk.cpp -o "$out/asi_wilsjo2_vk.o"
+# HUD FIX's capture on D3D12 (nr_asi_hudcap.hpp): hooks of the game's command lists
+nr_par_run "$cxx" "${common[@]}" -I"$minhook/include" -c windows/src/pe/nr_asi_hudcap.cpp -o "$out/asi_hudcap.o"
 # the D3D12 passthrough (dlssnr-amd.ini [D3D12Passthrough] Enabled)
-"$cxx" "${common[@]}" -I"$minhook/include" -c windows/src/pe/nr_d3d12_direct_state.cpp -o "$out/d3d12_direct_state.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_d3d12_passthrough.cpp -o "$out/d3d12_passthrough.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_d3d12_passthrough_backend.cpp -o "$out/d3d12_passthrough_backend.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_d3d12_passthrough_net.cpp -o "$out/d3d12_passthrough_net.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_d3d11_d3d12_bridge.cpp -o "$out/d3d11_d3d12_bridge.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_renodx_d3d12.cpp -o "$out/renodx_d3d12.o"
-"$cxx" "${common[@]}" -I"$imgui" -Iwindows/src/ui -c windows/src/pe/nr_d3d12_passthrough_panel.cpp \
+nr_par_run "$cxx" "${common[@]}" -I"$minhook/include" -c windows/src/pe/nr_d3d12_direct_state.cpp -o "$out/d3d12_direct_state.o"
+nr_par_run "$cxx" "${common[@]}" -c windows/src/pe/nr_d3d12_passthrough.cpp -o "$out/d3d12_passthrough.o"
+nr_par_run "$cxx" "${common[@]}" -c windows/src/pe/nr_d3d11_d3d12_bridge.cpp -o "$out/d3d11_d3d12_bridge.o"
+nr_par_run "$cxx" "${common[@]}" -c windows/src/pe/nr_renodx_d3d12.cpp -o "$out/renodx_d3d12.o"
+nr_par_run "$cxx" "${common[@]}" -I"$imgui" -Iwindows/src/ui -c windows/src/pe/nr_d3d12_passthrough_panel.cpp \
     -o "$out/d3d12_passthrough_panel.o"
 for unit in imgui imgui_draw imgui_tables imgui_widgets imgui_impl_dx11 imgui_impl_vulkan; do
-    "$cxx" -std=c++17 -O2 -DNDEBUG -Itoolchain/Vulkan-Headers/include -I"$imgui" -c "$imgui/$unit.cpp" -o "$out/im_$unit.o"
+    nr_par_run "$cxx" -std=c++17 -O2 -DNDEBUG -Itoolchain/Vulkan-Headers/include -I"$imgui" -c "$imgui/$unit.cpp" -o "$out/im_$unit.o"
 done
-"$cxx" -std=c++17 -O2 -DNDEBUG -I"$imgui" -include windows/src/pe/mingw_d3d12_compat.h -c "$imgui/imgui_impl_dx12.cpp" \
+nr_par_run "$cxx" -std=c++17 -O2 -DNDEBUG -I"$imgui" -include windows/src/pe/mingw_d3d12_compat.h -c "$imgui/imgui_impl_dx12.cpp" \
     -o "$out/im_imgui_impl_dx12.o"
 for unit in hook buffer trampoline; do
-    "$cc" -O2 -I"$minhook/include" -I"$minhook/src" -c "$minhook/src/$unit.c" -o "$out/mh_$unit.o"
+    nr_par_run "$cc" -O2 -I"$minhook/include" -I"$minhook/src" -c "$minhook/src/$unit.c" -o "$out/mh_$unit.o"
 done
-"$cc" -O2 -I"$minhook/include" -I"$minhook/src" -c "$minhook/src/hde/hde64.c" -o "$out/mh_hde.o"
+nr_par_run "$cc" -O2 -I"$minhook/include" -I"$minhook/src" -c "$minhook/src/hde/hde64.c" -o "$out/mh_hde.o"
 # nr_present_probe.exe (dlssnr-amd\): finds DXGI's swap-chain methods for NR Control in a process of its own.
-"$cxx" -std=c++17 -O2 -DNDEBUG -municode windows/src/pe/nr_present_probe.cpp -o "$out/nr_present_probe.exe" \
+nr_par_run "$cxx" -std=c++17 -O2 -DNDEBUG -municode windows/src/pe/nr_present_probe.cpp -o "$out/nr_present_probe.exe" \
     -ldxgi -static -static-libgcc -static-libstdc++
-
 # dxgi-standalone.dll (standalone\dxgi.dll): loads System32\dxgi.dll + dlssnr-amd.asi for apps without OptiScaler.
-"$cxx" -std=c++20 -O2 -DNDEBUG -shared -o "$out/dxgi-standalone.dll" \
+nr_par_run "$cxx" -std=c++20 -O2 -DNDEBUG -shared -o "$out/dxgi-standalone.dll" \
     windows/src/pe/nr_dxgi_standalone.cpp windows/src/pe/nr_dxgi_standalone.def \
     -lkernel32 -static -static-libgcc -static-libstdc++
+nr_par_wait
+
+bash windows/build/build_wilsjo2.sh "$out/shaders/wilsjo2" > /dev/null
 
 objs=("$out/asi_main.o" "$out/d3d12_direct_state.o" "$out/d3d12_passthrough.o" "$out/d3d12_passthrough_backend.o"
       "$out/d3d12_passthrough_net.o" "$out/d3d11_d3d12_bridge.o"
