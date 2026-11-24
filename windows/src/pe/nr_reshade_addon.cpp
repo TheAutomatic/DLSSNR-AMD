@@ -242,6 +242,32 @@ unsigned frames_declined{};
 bool frame_fed{};
 bool effects_seen{};
 bool direct_logged{};
+enum class FeedSource { none, technique, direct_effects, direct_present };
+const char* feed_source_name(FeedSource source) {
+    switch (source) {
+    case FeedSource::technique: return "DLSS5_Feed";
+    case FeedSource::direct_effects: return "direct (finish effects)";
+    case FeedSource::direct_present: return "direct (Present)";
+    default: return "none";
+    }
+}
+struct WrittenTarget {
+    uint64_t handle{};
+    FeedSource source{};
+};
+struct PresentFeed {
+    uint64_t calls{};
+    FeedSource last_attempt{};
+    WrittenTarget first, other;
+
+    void wrote(resource target, FeedSource source) {
+        if (!first.handle) first = {target.handle, source};
+        else if (first.handle != target.handle) other = {target.handle, source};
+    }
+};
+PresentFeed present_feed{};
+uint64_t interval_presents{}, interval_feeds{}, interval_without_nr{}, interval_target_mismatches{};
+std::chrono::steady_clock::time_point present_interval{}, present_anomaly_logged{};
 struct DirectRtvEntry { device* dev; uint64_t res; resource_view rtv; };
 std::vector<DirectRtvEntry> direct_rtvs{};
 
@@ -2515,6 +2541,7 @@ void on_destroy_effect_runtime(effect_runtime* rt) {
     technique = {}; mv_var = {}; depth_var = {};
     frame_fed = false;
     effects_seen = false;
+    present_feed = {};
 }
 
 bool load_vulkan(device_api api, ID3D12Device* d12 = nullptr) {
@@ -2984,7 +3011,9 @@ bool run_layers(effect_runtime* rt, nr::pe::Session& s, const nr::pe::Session::R
     return ran;
 }
 
-void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
+void feed(effect_runtime* rt, command_list* cl, resource_view rtv, FeedSource source) {
+    ++present_feed.calls;
+    present_feed.last_attempt = source;
     device* dev = rt->get_device();
     if (!vk_loaded && !load_vulkan(dev->get_api(), dev->get_api() == device_api::d3d12
                                  ? reinterpret_cast<ID3D12Device*>(dev->get_native()) : nullptr)) return;
@@ -3494,7 +3523,10 @@ void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
     if (ran && gap)
         log("[nr] NR runs again after %llu frame(s) without it: history restarts",
             (unsigned long long)(presents - presents_at_run - 1));
-    if (ran) { have_run = true; presents_at_run = presents; need_reset = false; }
+    if (ran) {
+        have_run = true; presents_at_run = presents; need_reset = false;
+        present_feed.wrote(colour, source);
+    }
     if (ran) ++frames_run; else ++frames_declined;
     if ((frames_run + frames_declined) % 240 == 0)
         log("[nr] frames: %u enhanced, %u declined; %.2f ms on the GPU (network %.2f, route %.2f); %s", frames_run,
@@ -4113,7 +4145,7 @@ bool direct_wanted_now() {
     return config.direct_present == 2 || (config.direct_present == 1 && !technique.handle);
 }
 
-void feed_direct(effect_runtime* rt, command_list* cl, resource_view rtv) {
+void feed_direct(effect_runtime* rt, command_list* cl, resource_view rtv, FeedSource source) {
     const nr::Controls& controls = settings();
     if (!controls.enabled && !renodx_on && !layered) {
         view.nr_on = 0;
@@ -4134,7 +4166,7 @@ void feed_direct(effect_runtime* rt, command_list* cl, resource_view rtv) {
     mv_var = {};
     depth_var = {};
     missing_reported = true;
-    feed(rt, cl, rtv);
+    feed(rt, cl, rtv, source);
     frame_fed = true;
 }
 
@@ -4145,7 +4177,7 @@ void on_finish_effects(effect_runtime* rt, command_list* cl, resource_view rtv, 
     if (rt != bound) return;
     if (cl && rtv.handle) {
         effects_seen = true;
-        if (!frame_fed && direct_wanted_now()) feed_direct(rt, cl, rtv);
+        if (!frame_fed && direct_wanted_now()) feed_direct(rt, cl, rtv, FeedSource::direct_effects);
     }
 }
 
@@ -4158,15 +4190,25 @@ void on_reshade_present(effect_runtime* rt) {
     ++presents;
     const bool fed_already = std::exchange(frame_fed, false);
     const bool effects_ran = std::exchange(effects_seen, false);
+    resource back{};
+    bool back_queried = false;
+    uint32_t back_index{};
+    const auto presented_back = [&] {
+        if (!back_queried) {
+            back_index = rt->get_current_back_buffer_index();
+            back = rs::call(rt, &effect_runtime::get_back_buffer, back_index);
+            back_queried = true;
+        }
+        return back;
+    };
     if (!fed_already && !effects_ran && direct_wanted_now()) {
         if (command_queue* q = rt->get_command_queue()) {
             if (command_list* cl = q->get_immediate_command_list()) {
-                const resource back = rs::call(rt, &effect_runtime::get_back_buffer, rt->get_current_back_buffer_index());
-                if (back.handle) {
+                if (presented_back().handle) {
                     if (const resource_view rtv = direct_rtv_for(rt->get_device(), back); rtv.handle) {
                         const resource_usage pr = resource_usage::present, rtu = resource_usage::render_target;
                         cl->barrier(1, &back, &pr, &rtu);
-                        feed_direct(rt, cl, rtv);
+                        feed_direct(rt, cl, rtv, FeedSource::direct_present);
                         cl->barrier(1, &back, &rtu, &pr);
                         q->flush_immediate_command_list();
                         frame_fed = false;
@@ -4174,6 +4216,45 @@ void on_reshade_present(effect_runtime* rt) {
                 }
             }
         }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const PresentFeed fed = std::exchange(present_feed, {});
+    ++interval_presents;
+    interval_feeds += fed.calls;
+    const bool no_nr = !fed.first.handle;
+    const uint64_t back_handle = !no_nr ? presented_back().handle : 0;
+    const WrittenTarget mismatch = fed.first.handle == back_handle ? fed.other : fed.first;
+    const bool target_mismatch = back_handle && mismatch.handle;
+    const bool nr_expected = have_run && view.nr_on != 0 && rt->get_effects_state() &&
+                             (!session || (!session->building() && !session->failed()));
+    const bool unexpected_no_nr = no_nr && nr_expected;
+    interval_without_nr += no_nr;
+    interval_target_mismatches += target_mismatch;
+    if ((unexpected_no_nr || target_mismatch) &&
+        (present_anomaly_logged == std::chrono::steady_clock::time_point{} ||
+         now - present_anomaly_logged >= std::chrono::seconds(1))) {
+        present_anomaly_logged = now;
+        if (unexpected_no_nr) {
+            log("[nr] %s ReShade present %llu: NR did not run (feed calls %llu, last feed %s)",
+                nr::pe::LocalTime{}.text, (unsigned long long)presents, (unsigned long long)fed.calls,
+                feed_source_name(fed.last_attempt));
+        } else {
+            log("[nr] %s ReShade present %llu: NR target mismatch (%s wrote 0x%llx, back buffer %u is 0x%llx)",
+                nr::pe::LocalTime{}.text, (unsigned long long)presents, feed_source_name(mismatch.source),
+                (unsigned long long)mismatch.handle, back_index, (unsigned long long)back_handle);
+        }
+    }
+    if (present_interval == std::chrono::steady_clock::time_point{}) present_interval = now;
+    if (now - present_interval >= std::chrono::seconds(10)) {
+        char stats[160]{};
+        std::snprintf(stats, sizeof stats, "presents %llu, presents without NR %llu, target mismatches %llu, feed calls %llu",
+                      (unsigned long long)interval_presents, (unsigned long long)interval_without_nr,
+                      (unsigned long long)interval_target_mismatches, (unsigned long long)interval_feeds);
+        const double seconds = std::chrono::duration<double>(now - present_interval).count();
+        if (session) session->log_reshade_interval(seconds, stats);
+        else log("[nr] %s last %.0f s: %s", nr::pe::LocalTime{}.text, seconds, stats);
+        interval_presents = interval_feeds = interval_without_nr = interval_target_mismatches = 0;
+        present_interval = now;
     }
     page_test_present(rt);
     motion_sync(rt);
@@ -4292,7 +4373,7 @@ void on_render_technique(effect_runtime* rt, effect_technique t, command_list* c
         nr::pe::watchdog::Phase probe("motion-vector data check");
         motion_probe(rt, cl, rtv);
     }
-    feed(rt, cl, rtv);
+    feed(rt, cl, rtv, FeedSource::technique);
     frame_fed = true;
 }
 

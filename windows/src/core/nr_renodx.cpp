@@ -1150,9 +1150,12 @@ struct Stage::Impl {
         lf.reference_linear = hdr != 0;
         lf.transport = route.transport;
         const bool whole_edit = ls.stabilize_alpha > 0.f;
+        float gap = 0.f;
+        bool gap_restart = false;
         if (temporal) {
             // PlanLookHistory
-            const float gap = pl.hist.last_ns != 0 ? (now - pl.hist.last_ns) / 1e9f : 0.f;
+            gap = pl.hist.last_ns != 0 ? (now - pl.hist.last_ns) / 1e9f : 0.f;
+            gap_restart = pl.hist.valid && !reset && !whole_edit && gap > look::kHistoryMaxGapSeconds;
             const bool restart = !pl.hist.valid || reset || pl.hist.whole_edit != whole_edit ||
                                  (!whole_edit && gap > look::kHistoryMaxGapSeconds);
             lf.history_valid = !restart;
@@ -1174,6 +1177,8 @@ struct Stage::Impl {
         look::Settings shaping = ls;
         if (!temporal) shaping.stabilize = 0;
         look::Constants lc = look::make_constants(shaping, lf);
+        if (gap_restart && fr.look_timing_spike)
+            fr.look_timing_spike(pass, gap * 1000.f, lc.alpha, lf.history_valid);
         const VkImageView mv = motion.view ? motion.view : original.view ? original.view : ph16.view;
         const bool motion_borrowed = borrow && borrow->motion;
         const VkImageView hist_out = temporal ? pl.history[pl.hist.written ^ 1u].view : look_out.view;

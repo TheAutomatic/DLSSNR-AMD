@@ -411,6 +411,7 @@ struct EngineResult {
     RecordResult frame;
     bool history_consumed{};
     const char* motion_provider = "engine";
+    const char* history_skip_reason{};
 };
 
 // Diagnostics, off by default: every ~600 recordings of an engine frame, read back what the
@@ -582,6 +583,6 @@ private:
     // cannot drift apart in barriers or ordering.
     ControlMaskResult record_all(VkCommandBuffer, const ColourFrame&, const Controls&,
                                  const ControlMaskFrame*, const TemporalFrame*, bool*,
-                                 const EngineFrame*);
+                                 const EngineFrame*, const char** history_skip_reason = nullptr);
 };
 }  // namespace nr

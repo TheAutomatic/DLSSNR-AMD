@@ -63,6 +63,13 @@ namespace {
 
 using nr::pe::log;
 
+bool diagnostic_log_due(std::chrono::steady_clock::time_point& last) {
+    const auto now = std::chrono::steady_clock::now();
+    if (last != std::chrono::steady_clock::time_point{} && now - last < std::chrono::seconds(1)) return false;
+    last = now;
+    return true;
+}
+
 // `f` at the end of the scope unless disarmed: a command buffer of ours recorded and then not submitted (any early
 // return, or a failed submit) has its timing discarded (Session::Impl::discard_timing).
 template <class F> struct OnExit {
@@ -405,6 +412,9 @@ struct Session::Impl {
     // Evaluations that ran the network and that passed the frame through (building, freeing, failed): in the log
     // every kPassLog while NR is asked for, and for the whole session at its end.
     uint64_t ran{}, passed{}, ran_total{}, passed_total{};
+    void log_interval(double seconds, const char* present_stats = nullptr);
+    uint64_t renodx_frame_index{}, no_history_evals{}, look_dt_spikes{};
+    std::chrono::steady_clock::time_point no_history_logged{}, look_dt_logged{};
     bool totals_logged{};   // Session::log_totals
     std::chrono::steady_clock::time_point pass_logged{};
     static constexpr std::chrono::seconds kPassLog{10};
@@ -2237,37 +2247,45 @@ bool Session::Impl::ensure_runtime(const Controls& controls, uint32_t w, uint32_
     }
     heap_poll();
     if (!building && !plan_demanded() && drs_recent()) prefetch();
-    {
-        const auto now = std::chrono::steady_clock::now();
-        if (pass_logged == std::chrono::steady_clock::time_point{}) pass_logged = now;
-        if (now - pass_logged >= kPassLog) {
-            // every 10 s with NR asked for: a log that shows NR running as well as not (the OptiScaler route has no
-            // frame line of its own)
-            // on the bridge also the recordings handed to our device (each a cut of a command list and copies)
-            char handed[64] = "";
-            if (bdev) std::snprintf(handed, sizeof handed, "; %llu hand-overs to our device",
-                                    (unsigned long long)(bridge_runs - bridge_runs_logged));
-            bridge_runs_logged = bridge_runs;
-            if (passed || ran) {
-                // (ran = the network was ready for the evaluation; the passes by their reasons, most frequent first)
-                std::vector<std::pair<uint64_t, const std::string*>> why;
-                for (const auto& [text, n] : pass_why) why.push_back({n, &text});
-                std::sort(why.begin(), why.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
-                std::string reasons;
-                for (size_t i = 0; i < why.size() && i < 4; ++i)
-                    reasons += (i ? "; " : "; passed: ") + std::to_string(why[i].first) + " x " + *why[i].second;
-                log("[nr] last %.0f s: %llu evaluations ran the network, %llu passed the frame through (%s)%s%s; %s",
-                    std::chrono::duration<double>(now - pass_logged).count(), (unsigned long long)ran,
-                    (unsigned long long)passed, ok ? "running now" : status.c_str(), reasons.c_str(), handed,
-                    memory_report().c_str());
-            }
-            pass_why.clear();
-            ran_total += ran; passed_total += passed; ran = passed = 0;
-            if (nr::pe::stats::log_due()) nr::pe::stats::log_text(4);   // every 5 minutes: the whole session's, short
-            pass_logged = now;
-        }
+#ifndef NR_RESHADE_ROUTE
+    const auto now = std::chrono::steady_clock::now();
+    if (pass_logged == std::chrono::steady_clock::time_point{}) pass_logged = now;
+    if (now - pass_logged >= kPassLog) {
+        log_interval(std::chrono::duration<double>(now - pass_logged).count());
+        pass_logged = now;
     }
+#endif
     return ok;
+}
+
+void Session::Impl::log_interval(double seconds, const char* present_stats) {
+    // The bridge also counts recordings handed to our device (each a cut of a command list and copies).
+    char handed[64] = "";
+    if (bdev) std::snprintf(handed, sizeof handed, "; %llu hand-overs to our device",
+                            (unsigned long long)(bridge_runs - bridge_runs_logged));
+    bridge_runs_logged = bridge_runs;
+    if (passed || ran || present_stats) {
+        // ran = the network was ready for the evaluation; the passes by their reasons, most frequent first.
+        std::vector<std::pair<uint64_t, const std::string*>> why;
+        for (const auto& [text, n] : pass_why) why.push_back({n, &text});
+        std::sort(why.begin(), why.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+        std::string reasons;
+        for (size_t i = 0; i < why.size() && i < 4; ++i)
+            reasons += (i ? "; " : "; passed: ") + std::to_string(why[i].first) + " x " + *why[i].second;
+        char renodx_stats[160] = "";
+        if (renodx_frame_index > 0 || no_history_evals || look_dt_spikes)
+            std::snprintf(renodx_stats, sizeof renodx_stats,
+                          "; RenoDX: %llu evaluations without network history, %llu Look history restarts (>250 ms)",
+                          (unsigned long long)no_history_evals, (unsigned long long)look_dt_spikes);
+        const char* state = !ran && !passed ? "no evaluations" : last_ok ? "running now" : status.c_str();
+        log("[nr] %s last %.0f s: %llu evaluations ran the network, %llu passed the frame through (%s)%s%s%s%s%s; %s",
+            LocalTime{}.text, seconds, (unsigned long long)ran, (unsigned long long)passed, state, reasons.c_str(), handed,
+            renodx_stats, present_stats ? "; " : "", present_stats ? present_stats : "", memory_report().c_str());
+    }
+    pass_why.clear();
+    ran_total += ran; passed_total += passed; ran = passed = 0;
+    no_history_evals = look_dt_spikes = 0;
+    if (nr::pe::stats::log_due()) nr::pe::stats::log_text(4);   // every 5 minutes: the whole session's, short
 }
 
 bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32_t h, VkFormat format) {
@@ -3795,6 +3813,10 @@ void Session::log_totals() {
     if (r + p) nr::pe::stats::log_text(12);
 }
 
+void Session::log_reshade_interval(double seconds, const char* present_stats) {
+    impl_->log_interval(seconds, present_stats);
+}
+
 Session::~Session() {
     log_totals();
     // A build still running owns nothing the session is about to destroy, but
@@ -4931,6 +4953,13 @@ bool Session::Impl::record_renodx(VkCommandBuffer cmd, renodx::Stage& stage, con
     sf.create_flags_known = rf.create_flags_known;
     sf.preprocess = rf.preprocess;
     sf.present_white_nits = rf.present_white_nits;
+    const auto frame_index = static_cast<unsigned long long>(++renodx_frame_index);
+    sf.look_timing_spike = [this, frame_index](uint32_t pass, float gap_ms, float alpha, bool history_valid) {
+        ++look_dt_spikes;
+        if (diagnostic_log_due(look_dt_logged))
+            log("[nr] %s RenoDX frame %llu pass %u: Look history gap restart %.2f ms (>250 ms), alpha %.4f, Look history %s",
+                LocalTime{}.text, frame_index, pass + 1u, double(gap_ms), double(alpha), history_valid ? "valid" : "invalid");
+    };
     const renodx::Settings& rs = rf.settings;
     const uint32_t passes = renodx::stack_passes(rs);
     // A shorter stack than last frame: the passes it no longer runs give their histories back (a longer one starts
@@ -5062,7 +5091,13 @@ bool Session::Impl::record_renodx(VkCommandBuffer cmd, renodx::Stage& stage, con
                                 base + 2 + 2 * timed_passes + (begin ? 0u : 1u));
             if (!begin) ++timed_passes;
         };
-        runtime->record_engine(cmd, e, controls);
+        const auto result = runtime->record_engine(cmd, e, controls);
+        if (result.frame.network_dispatches && !result.history_consumed) {
+            ++no_history_evals;
+            if (diagnostic_log_due(no_history_logged))
+                log("[nr] %s RenoDX frame %llu pass %u: network history not consumed (%s)", LocalTime{}.text,
+                    frame_index, k + 1u, result.history_skip_reason ? result.history_skip_reason : "no temporal history");
+        }
         if (nm.raw) runtime->set_style_grade(net_switch.file().style_grade);
         if (k == 0) {
             diag_copy(cmd, 2, proxy.image, proxy.format, proxy.width, proxy.height, proxy.usage, proxy.after,

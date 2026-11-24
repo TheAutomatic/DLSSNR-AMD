@@ -202,6 +202,7 @@ struct StageFrame {
     // The Present hook point: the HDR diffuse white in nits (RenoDX's: NRPresentWhiteNits, a RenoDX mod's Game
     // Brightness, the Windows SDR content level, NRDiffuseWhiteNits).
     float present_white_nits = 203.0f;
+    std::function<void(uint32_t pass, float gap_ms, float alpha, bool history_valid)> look_timing_spike;
 };
 
 class Stage {
