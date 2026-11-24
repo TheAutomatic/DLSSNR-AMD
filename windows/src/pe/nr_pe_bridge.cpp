@@ -593,15 +593,24 @@ bool Device::create_d3d12(ID3D12Device* device, uint32_t width, uint32_t height,
 }
 
 bool Device::d3d11_keyed_handover() const {
-    // Make this opt-in: reacquiring the texture on the D3D11 side blocks the render thread.
+    // Default on when the driver exposes VK_KHR_win32_keyed_mutex: on AMD's Windows D3D11 driver a shared
+    // ID3D11Fence alone occasionally lets Vulkan read the shared twin before D3D11's CopyResource is visible,
+    // feeding the previous frame's NR output back in (periodic bright/dark flashes). NR_D11_VK_KEYED_MUTEX=0
+    // restores the shared-fence hand-over.
     static const bool enabled = [] {
         char value[2]{};
-        return GetEnvironmentVariableA("NR_D11_VK_KEYED_MUTEX", value, sizeof value) == 1 && value[0] == '1';
+        const DWORD n = GetEnvironmentVariableA("NR_D11_VK_KEYED_MUTEX", value, sizeof value);
+        return !(n == 1 && value[0] == '0');
     }();
-    if (enabled && !keyed_mutex_) {
+    if (!enabled) {
+        static std::once_flag noted;
+        std::call_once(noted, [] {
+            log("[nr] bridge: NR_D11_VK_KEYED_MUTEX=0: using the shared fence for D3D11 hand-overs");
+        });
+    } else if (!keyed_mutex_) {
         static std::once_flag warned;
         std::call_once(warned, [] {
-            log("[nr] bridge: NR_D11_VK_KEYED_MUTEX=1 ignored (the driver has no VK_KHR_win32_keyed_mutex); using the shared fence");
+            log("[nr] bridge: VK_KHR_win32_keyed_mutex unavailable; falling back to the shared fence for D3D11 hand-overs");
         });
     }
     return enabled && keyed_mutex_;
