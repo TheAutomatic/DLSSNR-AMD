@@ -19,6 +19,7 @@
 #include "nr_d3d12_passthrough_net.hpp"
 #include "nr_d3d12_passthrough.hpp"
 #include "nr_d3d12_passthrough_elf.hpp"
+#include "nr_aco_push.hpp"
 #include "tinlayout.hpp"
 #include "nr_ini_network.hpp"
 #include "nr_pe_log.hpp"
@@ -92,8 +93,8 @@ uint64_t fnv1a64(const uint8_t* p, size_t n) {
 
 // ---- a kernel's pipeline: its ACO record wrapped into a PAL ELF (nr_d3d12_passthrough_elf.hpp)
 // ------------------------
-struct KernElf { uint32_t dims[3]{}; std::string stem; std::vector<uint8_t> elf_bytes; std::set<uint32_t> e4m3;
-                 std::vector<uint32_t> aliases; };
+struct KernElf { uint32_t dims[3]{}; uint32_t push_bytes = 0; std::string stem; std::vector<uint8_t> elf_bytes;
+                 std::set<uint32_t> e4m3; std::vector<uint32_t> aliases; };
 // RDNA3's stand-ins: the storage-buffer bindings that hold e4m3 data (nrvk.hpp's e4m3_view_bindings, the same rule: the
 // block's name *E4M3*, *Pair4, Act, Act4 - bound to the FP16 twin) and the alias bindings (nrvk.hpp kAliasBase = 16 + k:
 // a raw-word view of the buffer at binding k, bound to that buffer itself), in binding order.
@@ -463,7 +464,7 @@ std::shared_ptr<Built> build(ID3D12Device* device, ID3D12RootSignature* rs, uint
         // RDNA3: the gfx11 machine the driver took (the first kernel tries them: gfx1100 first)
         const uint32_t mach = b->rdna3 ? (gfx11_mach() ? gfx11_mach() : uint32_t(elf::kGfx11Mach[0])) : 0u;
         if (b->rdna3) rdna3_bindings(spv, &k.e4m3, &k.aliases);
-        if (!elf::load_kernel_elf(b->plan.spv_dir, aco, spv, &k.elf_bytes, k.dims, &stem, &err, mach)) {
+        if (!elf::load_kernel_elf(b->plan.spv_dir, aco, spv, &k.elf_bytes, k.dims, &stem, &err, mach, &k.push_bytes)) {
             nr::pe::log("[d3d12] %s: %s", path.c_str(), err.c_str());
             return false;
         }
@@ -520,6 +521,15 @@ std::shared_ptr<Built> build(ID3D12Device* device, ID3D12RootSignature* rs, uint
     // The table in a buffer of its own (the network shaders' manifest says noise_buffer) is what this side binds
     if (!b->plan.noise.empty() && !b->plan.noise_in_buffer) {
         *why = "the shader folder keeps the noise table in the weights (not the shaders the ACO records were made from)"; return nullptr;
+    }
+    for (auto& d : b->plan.disp) {
+        if (d.act_at < 0) continue;
+        const auto it = found.find(d.kern);
+        if (it != found.end() &&
+            nr::aco_needs_compact_push(uint32_t(d.act_at), uint32_t(d.push.size()), it->second->push_bytes)) {
+            nr::aco_compact_push(d.push.data(), d.push.size(), uint32_t(d.act_at));
+            d.act_at = -1;
+        }
     }
     b->net = nr::network_choice(b->plan.model.substr(0, b->plan.model.find(' ')));
     if (b->net < 0) b->net = want_net >= 0 ? want_net : nr::kSmallFp8;

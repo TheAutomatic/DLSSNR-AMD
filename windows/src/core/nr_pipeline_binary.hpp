@@ -319,7 +319,9 @@ inline uint64_t record_reference(const uint32_t* code,size_t bytes) {
     return 0;
 }
 inline VkResult create_aco(VkDevice device,VkPipelineCache cache,const VkComputePipelineCreateInfo& ci,const std::string& dir,
-                           const std::string& path,const uint32_t* code,size_t bytes,VkPipeline* out,uint32_t push_bytes) {
+                           const std::string& path,const uint32_t* code,size_t bytes,VkPipeline* out,uint32_t push_bytes,
+                           uint32_t* out_record_push_bytes=nullptr) {
+    if(out_record_push_bytes) *out_record_push_bytes=0;
     pal::require(enabled(device),"binary mode was not enabled when this device was created");
     const uint64_t ref=record_reference(code,bytes);
     auto h=ref?ref:pal::hash(code,bytes);
@@ -392,20 +394,25 @@ inline VkResult create_aco(VkDevice device,VkPipelineCache cache,const VkCompute
                     cache_file=cache+"/"+b;
                 }
                 *out=create(device,shell_ci,record,push_bytes,workgroup,cache_file);
+                if(out_record_push_bytes) *out_record_push_bytes=record.push_bytes;
             }
         }catch(...){vkDestroyShaderModule(device,module,nullptr);throw;}
         vkDestroyShaderModule(device,module,nullptr);return VK_SUCCESS;
     }
     nr::logf("[nr] ACO network: no template for %s; the driver compiles its own SPIR-V for the container",
              path.substr(path.find_last_of("/\\")+1).c_str());
-    *out=create(device,ci,record,push_bytes,workgroup);return VK_SUCCESS;
+    *out=create(device,ci,record,push_bytes,workgroup);
+    if(out_record_push_bytes) *out_record_push_bytes=record.push_bytes;
+    return VK_SUCCESS;
 }
 inline VkResult create_or_default(VkDevice device,VkPipelineCache cache,const VkComputePipelineCreateInfo& ci,
-                                 const std::string& path,const uint32_t* code,size_t bytes,VkPipeline* out,uint32_t push_bytes) {
+                                 const std::string& path,const uint32_t* code,size_t bytes,VkPipeline* out,uint32_t push_bytes,
+                                 uint32_t* out_record_push_bytes=nullptr) {
+    if(out_record_push_bytes) *out_record_push_bytes=0;
     auto dir=directory();
     if(dir.empty() || !network_path(path))return vkCreateComputePipelines(device,cache,1,&ci,nullptr,out);
     try {
-        return create_aco(device,cache,ci,dir,path,code,bytes,out,push_bytes);
+        return create_aco(device,cache,ci,dir,path,code,bytes,out,push_bytes,out_record_push_bytes);
     } catch(const Error&) {
         throw;
     } catch(const std::bad_alloc&) {

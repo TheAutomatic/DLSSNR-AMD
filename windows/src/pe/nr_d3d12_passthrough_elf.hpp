@@ -898,7 +898,9 @@ inline constexpr uint8_t kCarrierTemplateElf[2332] = {
 inline bool build_model_elf_from_nrp(const uint8_t* nrp, size_t nrp_bytes, const uint32_t spv_dims[3],
                                      Bytes* out_elf, uint32_t out_dims[3], std::string* why, uint32_t gfx11_mach = 0,
                                      uint32_t push_off = kTablePushOff, uint32_t grid_off = kTableGridOff,
-                                     uint32_t inline_root_consts = 0, OuterElfLayout* out_layout = nullptr) {
+                                     uint32_t inline_root_consts = 0, OuterElfLayout* out_layout = nullptr,
+                                     uint32_t* out_push_bytes = nullptr) {
+    if (out_push_bytes) *out_push_bytes = 0;
     try {
         NrRecord rec = parse_nrpal001(nrp, nrp_bytes);
         if (spv_dims && spv_dims[0] && spv_dims[0] * spv_dims[1] * spv_dims[2] == rec.wg) {
@@ -930,6 +932,7 @@ inline bool build_model_elf_from_nrp(const uint8_t* nrp, size_t nrp_bytes, const
         out_dims[1] = rec.dims[1];
         out_dims[2] = rec.dims[2];
         if (out_layout) *out_layout = plan.outer;
+        if (out_push_bytes) *out_push_bytes = rec.push_bytes;
         return true;
     } catch (const std::exception& x) {
         *why = x.what();
@@ -1037,7 +1040,8 @@ inline uint64_t record_reference(const Bytes& spv) {
 // not 0): the records in <aco>\rdna3\records (int4: <aco>\rdna3\int4\records), named by the stand-in's reference.
 inline bool load_kernel_elf(const std::string& spv_dir, const std::wstring& aco_in, const Bytes& spv,
                             Bytes* out_elf, uint32_t out_dims[3], std::string* out_stem, std::string* why,
-                            uint32_t gfx11_mach = 0) {
+                            uint32_t gfx11_mach = 0, uint32_t* out_push_bytes = nullptr) {
+    if (out_push_bytes) *out_push_bytes = 0;
     const std::wstring aco = gfx11_mach ? aco_in + L"\\rdna3" : aco_in;
     const uint64_t ref = gfx11_mach ? record_reference(spv) : 0;
     char stem[32];
@@ -1068,7 +1072,8 @@ inline bool load_kernel_elf(const std::string& spv_dir, const std::wstring& aco_
     }
     uint32_t spv_dims[3] = {0, 0, 0};
     spv_local_size(spv.data(), spv.size(), spv_dims);
-    return build_model_elf_from_nrp(nrp.data(), nrp.size(), spv_dims, out_elf, out_dims, why, gfx11_mach);
+    return build_model_elf_from_nrp(nrp.data(), nrp.size(), spv_dims, out_elf, out_dims, why, gfx11_mach,
+                                    kTablePushOff, kTableGridOff, 0, nullptr, out_push_bytes);
 }
 
 } // namespace nr::pe::d3d12_passthrough::elf

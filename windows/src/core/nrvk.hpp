@@ -15,6 +15,7 @@
 #include "nr_gpu_arch.hpp"
 #include "nr_gpu_completion.hpp"
 #include "nr_log.hpp"   // (nrvk::blit's lines; the int4 path's too)
+#include "nr_aco_push.hpp"
 #if NR_INT4
 #include "nr_build_cfg.hpp"
 #endif
@@ -1000,6 +1001,7 @@ struct SharedPipeline {
     VkDescriptorSetLayout dsl{};
     VkPipelineLayout layout{};
     VkPipeline pipeline{};
+    uint32_t aco_record_push_bytes{};
     SharedPipeline() = default;
     SharedPipeline(const SharedPipeline&) = delete;
     SharedPipeline& operator=(const SharedPipeline&) = delete;
@@ -1032,7 +1034,7 @@ struct Kernel {
     std::vector<VkDescriptorPoolSize> pool_sizes;
     std::vector<uint32_t> binding_ids;   // every binding of the set (the RDNA3 aliases' too)
     std::vector<VkBuffer> buffers;       // the buffer bindings' buffers as bound (twins in place), in binding order
-    uint32_t aco_push_gap{}; // ACO uses Linux's push layout, omitting Windows's arena address.
+    uint32_t aco_push_gap{}; // Nonzero when the loaded ACO record uses Linux's compact push layout (no arena address).
     // RDNA3: which bindings read the FP16 twin of their arena and which are raw alias views, and the
     // context's twin map. A second descriptor set over this layout (nr_runtime.cpp kernel_set) has to
     // bind the same way `create` does, or the kernel reads and writes an arena in the wrong format.
@@ -1045,11 +1047,10 @@ struct Kernel {
             return;
         }
         if (bytes < aco_push_gap + 8 || bytes > 128)
-            throw std::runtime_error("invalid ACO push block");
+            throw std::runtime_error("invalid compact ACO push block");
         std::array<uint8_t,128> compact{};
-        std::memcpy(compact.data(), data, aco_push_gap);
-        std::memcpy(compact.data()+aco_push_gap, static_cast<const uint8_t*>(data)+aco_push_gap+8,
-                    bytes-aco_push_gap-8);
+        std::memcpy(compact.data(), data, bytes);
+        nr::aco_compact_push(compact.data(), bytes, aco_push_gap);
         // Keep the pipeline layout's declared range, including its zeroed tail.
         vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, bytes, compact.data());
     }
@@ -1069,11 +1070,6 @@ struct Kernel {
                 const std::vector<Context::Image*>& images = {}) {
         device = ctx.device;
         push_range = push_bytes;
-        if (!nr::binary::directory().empty()) {
-            const auto name=spirv_path.substr(spirv_path.find_last_of("/\\")+1);
-            if (!nr::binary::native_shell(name))
-                aco_push_gap=name.rfind("g_gemm",0)==0 && push_bytes>=88 ? 80u : name=="g_vitattn.spv" ? 20u : 0u;
-        }
         const std::vector<uint32_t> code = read_spirv(spirv_path);
         std::vector<VkBuffer> bound(bindings);
         std::set<uint32_t> declared;
@@ -1105,8 +1101,9 @@ struct Kernel {
                           1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
         for (uint32_t i = 0; i < na; ++i)
             lb[nb + ni + i] = {aliases[i].first, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-        // The shared part: found by device, file, binding types, push range and robustness, or made here.
+        // The shared part: found by device, file, ACO directory, binding types, push range and robustness, or made here.
         std::string key = std::to_string(reinterpret_cast<uintptr_t>(device)) + "|" + spirv_path + "|" +
+                          nr::binary::directory() + "|" +
                           std::to_string(push_bytes) + "|" + (ctx.pipeline_robustness ? "r" : "-") + "|";
         for (const auto& b : lb) key += char('0' + int(b.descriptorType));
         {
@@ -1125,6 +1122,10 @@ struct Kernel {
             if (!shared) { slot = made; shared = made; }
         }
         module = shared->module; dsl = shared->dsl; layout = shared->layout; pipeline = shared->pipeline;
+        const auto name = spirv_path.substr(spirv_path.find_last_of("/\\") + 1);
+        const uint32_t candidate_gap = name.rfind("g_gemm", 0) == 0 ? 80u : name == "g_vitattn.spv" ? 20u : 0u;
+        aco_push_gap = nr::aco_needs_compact_push(candidate_gap, push_bytes, shared->aco_record_push_bytes)
+                     ? candidate_gap : 0u;
         if (ctx.pin) {   // a memory's runtimes are built on two threads (inside frames, in the background)
             std::lock_guard<std::mutex> guard(shared_pipelines_lock());
             if (std::find(ctx.pin->begin(), ctx.pin->end(), shared) == ctx.pin->end()) ctx.pin->push_back(shared);
@@ -1208,7 +1209,8 @@ struct Kernel {
         if (ctx.pipeline_robustness) cpi.pNext = &robustness;
 #ifndef NR_PIPELINE_STATS
         NRVK_CHECK(nr::binary::create_or_default(device, ctx.pipeline_cache, cpi, spirv_path,
-                                                code.data(), code.size() * 4, &out.pipeline, push_bytes));
+                                                code.data(), code.size() * 4, &out.pipeline, push_bytes,
+                                                &out.aco_record_push_bytes));
 #else
         if (ctx.pipeline_stats) cpi.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
         // NR_DUMP_IR=<dir> (evaluation builds): also capture the driver's internal representations
@@ -1218,7 +1220,8 @@ struct Kernel {
             cpi.flags |= VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
         const auto t0 = std::chrono::steady_clock::now();
         const VkResult made = nr::binary::create_or_default(device, (dump_ir && *dump_ir) ? VK_NULL_HANDLE : ctx.pipeline_cache,
-                                                       cpi, spirv_path, code.data(), code.size() * 4, &out.pipeline, push_bytes);
+                                                       cpi, spirv_path, code.data(), code.size() * 4, &out.pipeline, push_bytes,
+                                                       &out.aco_record_push_bytes);
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         const std::string base = spirv_path.substr(spirv_path.find_last_of("/\\") + 1);
         std::printf("pipeline %s: %s in %.1f ms", base.c_str(), made == VK_SUCCESS ? "built" : "FAILED", ms);
