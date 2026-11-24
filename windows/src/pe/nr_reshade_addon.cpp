@@ -4225,7 +4225,8 @@ void on_reshade_present(effect_runtime* rt) {
     const uint64_t back_handle = !no_nr ? presented_back().handle : 0;
     const WrittenTarget mismatch = fed.first.handle == back_handle ? fed.other : fed.first;
     const bool target_mismatch = back_handle && mismatch.handle;
-    const bool nr_expected = have_run && view.nr_on != 0 && rt->get_effects_state() &&
+    const bool feed_active = direct_wanted_now() || (technique.handle && rt->get_technique_state(technique));
+    const bool nr_expected = have_run && view.nr_on != 0 && rt->get_effects_state() && feed_active &&
                              (!session || (!session->building() && !session->failed()));
     const bool unexpected_no_nr = no_nr && nr_expected;
     interval_without_nr += no_nr;
