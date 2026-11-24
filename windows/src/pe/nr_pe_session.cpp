@@ -1370,7 +1370,7 @@ struct Session::Impl {
         Impl* impl = nullptr;
         bridge::Job* job = nullptr;
         // `d3d`: the texture as ID3D11Texture2D / ID3D10Texture2D (not held: the caller's for the recording's length)
-        struct Use { IUnknown* texture; void* d3d; Twin* twin; bool write; ResourceHandle handle; };
+        struct Use { IUnknown* texture; void* d3d; Twin* twin; bool read; bool write; uint32_t tag; ResourceHandle handle; };
         std::vector<Use> uses;
         bool ended = false;
         bool bridge() const { return d11 || d10; }
@@ -1381,10 +1381,10 @@ struct Session::Impl {
     };
     // Starts a bridge recording on a native D3D11 / D3D10 device (false with `status`: the frame passes through).
     bool begin11(IUnknown* device, Recording11& rec);
-    ResourceHandle lookup11(Recording11& rec, IUnknown* texture, bool write);
+    ResourceHandle lookup11(Recording11& rec, IUnknown* texture, bool write, bool read = true, uint32_t tag = 0);
     // A D3D11 / D3D10 texture's twin (made if needed) and its Vulkan description; `d3d` the texture as
     // ID3D11Texture2D / ID3D10Texture2D. Null when the bridge does not carry it.
-    Twin* twin11(ID3D11Device* d11, ID3D10Device* d10, IUnknown* texture, ResourceHandle* h, void** d3d);
+    Twin* twin11(ID3D11Device* d11, ID3D10Device* d10, IUnknown* texture, ResourceHandle* h, void** d3d, uint32_t tag = 0);
     bool finish11(Recording11& rec);   // the job run between the context's work; false when it did not run
     void abandon11(Recording11& rec);
     void close11(Recording11& rec);    // the predicate put back, the devices released
@@ -1408,13 +1408,14 @@ struct Session::Impl {
         uint32_t width{}, height{};
         DXGI_FORMAT source_format{};
         bool depth{};             // a depth buffer, read through depth12 / depth11 as R32_FLOAT
+        uint32_t tag{};           // distinguishes ringed / split input-vs-output twins for one resource
         bridge::Image image;
         uint64_t used{};          // bridge_runs at its last use
     };
     // A list: a recording keeps pointers to the twins it looked up while it adds or replaces others.
     std::list<Twin> twins;
     Twin* twin_for(const void* resource, uint32_t w, uint32_t h, DXGI_FORMAT source_format, bool depth, DXGI_FORMAT format,
-                   ID3D12Device* d12, ID3D11Device* d11, ID3D10Device* d10, std::string* why);
+                   ID3D12Device* d12, ID3D11Device* d11, ID3D10Device* d10, std::string* why, uint32_t tag = 0);
     void sweep_twins();
     bridge::DepthCopyD3D12 depth12;
     bridge::DepthCopyD3D11 depth11;
@@ -3589,9 +3590,9 @@ bool read_only(D3D12_RESOURCE_STATES s) {
 
 Session::Impl::Twin* Session::Impl::twin_for(const void* resource, uint32_t w, uint32_t h, DXGI_FORMAT source_format,
                                              bool depth, DXGI_FORMAT format, ID3D12Device* d12, ID3D11Device* d11,
-                                             ID3D10Device* d10, std::string* why) {
+                                             ID3D10Device* d10, std::string* why, uint32_t tag) {
     for (auto it = twins.begin(); it != twins.end(); ++it)
-        if (it->resource == resource) {
+        if (it->resource == resource && it->tag == tag) {
             if (it->width == w && it->height == h && it->source_format == source_format && it->depth == depth &&
                 it->image.matches(w, h, format, d12 ? static_cast<const void*>(d12) : d11 ? static_cast<const void*>(d11) : d10)) {
                 it->used = bridge_runs;
@@ -3602,7 +3603,7 @@ Session::Impl::Twin* Session::Impl::twin_for(const void* resource, uint32_t w, u
             break;
         }
     Twin t;
-    t.resource = resource; t.width = w; t.height = h; t.source_format = source_format; t.depth = depth;
+    t.resource = resource; t.width = w; t.height = h; t.source_format = source_format; t.depth = depth; t.tag = tag;
     t.used = bridge_runs;
     const bool ok = d12 ? bdev->create_d3d12(d12, w, h, format, &t.image, why)
                   : d11 ? bdev->create_d3d11(d11, w, h, format, &t.image, why)
@@ -4659,7 +4660,7 @@ void Session::Impl::close11(Recording11& rec) {
 }
 
 Session::Impl::Twin* Session::Impl::twin11(ID3D11Device* d11, ID3D10Device* d10, IUnknown* texture, ResourceHandle* h,
-                                           void** d3d) {
+                                           void** d3d, uint32_t tag) {
     DXGI_FORMAT source = DXGI_FORMAT_UNKNOWN;
     uint32_t w = 0, hh = 0, samples = 0, mips = 0, layers = 0, bind = 0;
     ID3D11Texture2D* t11 = nullptr;
@@ -4694,7 +4695,7 @@ Session::Impl::Twin* Session::Impl::twin11(ID3D11Device* d11, ID3D10Device* d10,
         format = bridge::shared_format(source);
         if (format == DXGI_FORMAT_UNKNOWN) why = "DXGI format " + std::to_string(unsigned(source)) + " is not one the bridge carries";
     }
-    Twin* t = format == DXGI_FORMAT_UNKNOWN ? nullptr : twin_for(texture, w, hh, source, depth, format, nullptr, d11, d10, &why);
+    Twin* t = format == DXGI_FORMAT_UNKNOWN ? nullptr : twin_for(texture, w, hh, source, depth, format, nullptr, d11, d10, &why, tag);
     if (!t) {
         if (depth && !depth_warned) { depth_warned = true; log("[nr] bridge: running without depth: %s", why.c_str()); }
         else if (!depth) {
@@ -4710,22 +4711,23 @@ Session::Impl::Twin* Session::Impl::twin11(ID3D11Device* d11, ID3D10Device* d10,
     return t;
 }
 
-ResourceHandle Session::Impl::lookup11(Recording11& rec, IUnknown* texture, bool write) {
+ResourceHandle Session::Impl::lookup11(Recording11& rec, IUnknown* texture, bool write, bool read, uint32_t tag) {
     if (!rec.bridge()) return d3d11_image(texture, rec.device);
     ResourceHandle h{};
     if (!texture) return h;
     for (auto& u : rec.uses)
-        if (u.texture == texture) {
+        if (u.texture == texture && u.tag == tag) {
+            u.read = u.read || read;
             u.write = u.write || (write && !u.twin->depth);
             return u.handle;
         }
     void* d3d = nullptr;
-    Twin* t = twin11(rec.d11, rec.d10, texture, &h, &d3d);
+    Twin* t = twin11(rec.d11, rec.d10, texture, &h, &d3d, tag);
     if (!t) return h;
     // The D3D side's copy into the twin is made by finish11, right before the job runs: everything the context does
     // before then (the upscaler's work on its output, for one) is in it.
     bdev->acquire(rec.job, {&t->image});
-    rec.uses.push_back({texture, d3d, t, write && !t->depth, h});
+    rec.uses.push_back({texture, d3d, t, read, write && !t->depth, tag, h});
     return h;
 }
 
@@ -4746,6 +4748,7 @@ bool Session::Impl::finish11(Recording11& rec) {
     const auto copy_into_twins = [&] {
         // The twins' content, by the context: after everything it was given so far.
         for (const auto& u : rec.uses) {
+            if (!u.read) continue;
             if (rec.d10) {
                 rec.d10->CopyResource(static_cast<ID3D10Texture2D*>(u.twin->image.d3d),
                                       static_cast<ID3D10Texture2D*>(u.d3d));
@@ -4775,8 +4778,16 @@ bool Session::Impl::finish11(Recording11& rec) {
         copy_into_twins();
         if (!bdev->run_between(rec.context, rec.job, gen)) return false;
         copy_from_twins();
+        if (bdev->d3d11_split_twin() || bdev->d3d11_dual_fence() || bdev->d3d11_host_wait())
+            rec.context->Flush();
         static bool first = true;
-        if (first) { first = false; log("[nr] bridge: first D3D11 frame handed over through the shared fence"); }
+        if (first) {
+            first = false;
+            log("[nr] bridge: first D3D11 frame handed over through the shared fence%s%s%s",
+                bdev->d3d11_split_twin() ? " (split-twin ring)" : "",
+                bdev->d3d11_dual_fence() ? " (dual fences)" : "",
+                bdev->d3d11_host_wait() ? " (host wait)" : "");
+        }
         return true;
     }
     // Keyed hand-over: take the twins at key 0 on the D3D side, copy into them and hand them to our queue at key 1. A
@@ -6206,17 +6217,35 @@ bool Session::run_d3d11(const D3D11Frame& frame, const Controls& controls) {
     // Said once per target, not once per frame: this pair used to be two of the
     // fifteen flushed lines every frame wrote (see first_sight in
     // nr_pe_interop.cpp). What the target is only changes when it changes.
+    const bool split_twin = bridge && rec.d11 && frame.renodx && s.bdev->d3d11_split_twin();
+    const uint32_t in_tag = split_twin ? 1u + uint32_t(s.bridge_runs % 4u) * 2u : 0u;
+    const uint32_t out_tag = split_twin ? in_tag + 1u : 0u;
     static VkImage traced_target = VK_NULL_HANDLE;
-    const auto target = s.lookup11(rec, frame.target, true);
+    static const void* traced_d3d = nullptr;
+    static uint32_t traced_w = 0, traced_h = 0;
+    static VkFormat traced_fmt = VK_FORMAT_UNDEFINED;
+    const auto target = s.lookup11(rec, frame.target, !split_twin, true, in_tag);
     if (!target) {
         s.status = "the D3D11 texture exposes no Vulkan image";
         return false;
     }
-    if (target.image != traced_target) {
+    const auto target_out = split_twin ? s.lookup11(rec, frame.target, true, false, out_tag) : target;
+    if (!target_out) {
+        s.status = "the D3D11 output twin exposes no Vulkan image";
+        return false;
+    }
+    const bool target_changed = split_twin
+        ? (frame.target != traced_d3d || target.width != traced_w || target.height != traced_h || target.format != traced_fmt)
+        : (target.image != traced_target);
+    if (target_changed) {
         traced_target = target.image;
-        log("[nr] d3d11: queue family %u; target %ux%u format %u layout %u usage 0x%x",
+        traced_d3d = frame.target;
+        traced_w = target.width;
+        traced_h = target.height;
+        traced_fmt = target.format;
+        log("[nr] d3d11: queue family %u; target %ux%u format %u layout %u usage 0x%x%s",
             s.access.family, target.width, target.height, unsigned(target.format),
-            unsigned(target.layout), unsigned(target.usage));
+            unsigned(target.layout), unsigned(target.usage), split_twin ? " (split-twin ring)" : "");
     }
     // The pass transfers into and out of whatever image it is given. DXVK tells
     // us what the image may be used for, so this is a check rather than a hope -
@@ -6224,7 +6253,7 @@ bool Session::run_d3d11(const D3D11Frame& frame, const Controls& controls) {
     // producing validation errors inside somebody's game.
     constexpr VkImageUsageFlags required =
         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    if ((target.usage & required) != required) {
+    if ((target.usage & required) != required || (target_out.usage & required) != required) {
         s.status = "the game's texture cannot be copied to and from; nothing to run on";
         return false;
     }
@@ -6235,7 +6264,7 @@ bool Session::run_d3d11(const D3D11Frame& frame, const Controls& controls) {
             s.status = "the RenoDX-style option needs the motion vectors";
             return false;
         }
-        const auto mv = frame.motion ? s.lookup11(rec, frame.motion, false) : ResourceHandle{};
+        const auto mv = frame.motion ? s.lookup11(rec, frame.motion, false, true, in_tag) : ResourceHandle{};
         uint32_t nw = target.width, nh = target.height;
         s.renodx_extent(frame.feature, target.width, target.height, mv.width, mv.height, frame.renodx->settings, &nw, &nh);
         if (frame.renodx->settings.nr_enabled && !s.renodx_runtime(controls, nw, nh, &renodx_controls)) return false;
@@ -6259,6 +6288,16 @@ bool Session::run_d3d11(const D3D11Frame& frame, const Controls& controls) {
     // writes it in place at Model resolution below 100% instead of copying it out and back.
     colour.usage = target.usage;
 
+    ColourFrame output_cf = colour;
+    if (split_twin) {
+        output_cf.image = target_out.image;
+        output_cf.format = target_out.format;
+        output_cf.width = target_out.width;
+        output_cf.height = target_out.height;
+        output_cf.before = output_cf.after = target_out.layout;
+        output_cf.usage = target_out.usage;
+    }
+
     EngineFrame engine{};
     engine.feature = frame.feature;
     engine.colour = colour;
@@ -6267,8 +6306,8 @@ bool Session::run_d3d11(const D3D11Frame& frame, const Controls& controls) {
     engine.motion_scale_x = frame.motion_scale_x;
     engine.motion_scale_y = frame.motion_scale_y;
     engine.depth_inverted = frame.depth_inverted;
-    const bool motion = frame.motion && fill(&engine.motion, s.lookup11(rec, frame.motion, false));
-    if (frame.depth) fill(&engine.depth, s.lookup11(rec, frame.depth, false));
+    const bool motion = frame.motion && fill(&engine.motion, s.lookup11(rec, frame.motion, false, true, in_tag));
+    if (frame.depth) fill(&engine.depth, s.lookup11(rec, frame.depth, false, true, in_tag));
 
     auto unsubmitted = on_exit([&s] { s.discard_timing(); });
     const VkCommandBuffer cmd = bridge ? s.bdev->command_buffer(rec.job) : s.own_cmd;
@@ -6287,7 +6326,7 @@ bool Session::run_d3d11(const D3D11Frame& frame, const Controls& controls) {
             w2_ran = s.record_wilsjo2(cmd, colour, engine, w2_controls, wf);
         } else if (renodx_stage) {
             if (!motion && Impl::renodx_needs_motion(*frame.renodx)) { if (!bridge) vkEndCommandBuffer(cmd); return false; }
-            if (!s.record_renodx(cmd, *renodx_stage, colour, colour, engine, renodx_controls, *frame.renodx, nullptr, roi_slot)) {
+            if (!s.record_renodx(cmd, *renodx_stage, colour, output_cf, engine, renodx_controls, *frame.renodx, nullptr, roi_slot)) {
                 if (!bridge) vkEndCommandBuffer(cmd);
                 return false;
             }

@@ -395,7 +395,9 @@ Device::~Device() {
         if (layout_pool_) vkDestroyCommandPool(device_, layout_pool_, nullptr);
         for (auto& t : timelines_) {
             if (t.semaphore) vkDestroySemaphore(device_, t.semaphore, nullptr);
+            if (t.out_semaphore) vkDestroySemaphore(device_, t.out_semaphore, nullptr);
             if (t.fence) t.fence->Release();
+            if (t.out_fence) t.out_fence->Release();
             if (t.owner) t.owner->Release();
         }
         nr::binary::forget(device_);
@@ -606,6 +608,35 @@ bool Device::d3d11_keyed_handover() const {
     return enabled && keyed_mutex_;
 }
 
+bool Device::d3d11_split_twin() const {
+    static const bool enabled = [] {
+        char value[2]{};
+        return GetEnvironmentVariableA("NR_D11_SPLIT_TWIN", value, sizeof value) == 1 && value[0] == '1';
+    }();
+    return enabled && !d3d11_keyed_handover();
+}
+
+bool Device::d3d11_dual_fence() const {
+    static const int mode = [] {
+        char value[2]{};
+        if (GetEnvironmentVariableA("NR_D11_DUAL_FENCE", value, sizeof value) == 1) {
+            if (value[0] == '1') return 1;
+            if (value[0] == '0') return 0;
+        }
+        return -1;
+    }();
+    if (d3d11_keyed_handover()) return false;
+    return mode == 1 || (mode < 0 && d3d11_split_twin());
+}
+
+bool Device::d3d11_host_wait() const {
+    static const bool enabled = [] {
+        char value[2]{};
+        return GetEnvironmentVariableA("NR_D11_HOST_WAIT", value, sizeof value) == 1 && value[0] == '1';
+    }();
+    return enabled && !d3d11_keyed_handover();
+}
+
 bool Device::create_d3d11(ID3D11Device* device, uint32_t width, uint32_t height, DXGI_FORMAT format, Image* out,
                           std::string* why) {
     destroy(*out);
@@ -809,8 +840,9 @@ uint64_t Device::completed_locked(IUnknown* queue, bool* known) {
         uint64_t completed = 0;
         ID3D12Fence* f12 = nullptr;
         ID3D11Fence* f11 = nullptr;
-        if (SUCCEEDED(t.fence->QueryInterface(IID_PPV_ARGS(&f12))) && f12) { completed = f12->GetCompletedValue(); f12->Release(); }
-        else if (SUCCEEDED(t.fence->QueryInterface(IID_PPV_ARGS(&f11))) && f11) { completed = f11->GetCompletedValue(); f11->Release(); }
+        IUnknown* done_fence = t.out_fence ? t.out_fence : t.fence;
+        if (SUCCEEDED(done_fence->QueryInterface(IID_PPV_ARGS(&f12))) && f12) { completed = f12->GetCompletedValue(); f12->Release(); }
+        else if (SUCCEEDED(done_fence->QueryInterface(IID_PPV_ARGS(&f11))) && f11) { completed = f11->GetCompletedValue(); f11->Release(); }
         *known = true;
         return completed;
     }
@@ -1097,6 +1129,15 @@ bool Device::wait_idle() {
     return vkWaitForFences(device_, uint32_t(fences.size()), fences.data(), VK_TRUE, 1000000000ull) == VK_SUCCESS;
 }
 
+void Device::wait_job(Job* job, uint64_t generation) {
+    VkFence fence = VK_NULL_HANDLE;
+    {
+        std::lock_guard<std::mutex> guard(jobs_mutex_);
+        if (job && job->gen == generation && job->state == Job::Submitted) fence = job->fence;
+    }
+    if (fence) vkWaitForFences(device_, 1, &fence, VK_TRUE, uint64_t(kKeyedTimeoutMs) * 1000000ull);
+}
+
 // ---- fences ---------------------------------------------------------------------------------------
 
 VkSemaphore Device::import_fence(HANDLE handle, std::string* why) {
@@ -1176,10 +1217,30 @@ Device::Timeline* Device::timeline_d3d11(ID3D11DeviceContext* context) {
     else
         t.semaphore = import_fence(handle, &why);
     if (handle) CloseHandle(handle);
+    if (t.semaphore) {
+        t.fence = fence;
+        if (d3d11_dual_fence() && device5) {
+            ID3D11Fence* out_fence = nullptr;
+            HANDLE out_handle = nullptr;
+            std::string out_why;
+            if (SUCCEEDED(device5->CreateFence(0, D3D11_FENCE_FLAG_SHARED, IID_PPV_ARGS(&out_fence))) && out_fence &&
+                SUCCEEDED(out_fence->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &out_handle)) && out_handle) {
+                t.out_semaphore = import_fence(out_handle, &out_why);
+            } else {
+                out_why = "could not create or share the second D3D11 fence";
+            }
+            if (out_handle) CloseHandle(out_handle);
+            if (t.out_semaphore) t.out_fence = out_fence;
+            else {
+                if (out_fence) out_fence->Release();
+                log("[nr] bridge: dual D3D11 fences unavailable (%s); falling back to a single shared fence", out_why.c_str());
+            }
+        }
+    } else if (fence) {
+        fence->Release();
+    }
     if (device5) device5->Release();
     if (device) device->Release();
-    if (t.semaphore) t.fence = fence;
-    else if (fence) fence->Release();
     if (!t.semaphore) log("[nr] bridge: no GPU hand-over on the D3D11 context: %s", why.c_str());
     timelines_.push_back(t);
     return timelines_.back().semaphore ? &timelines_.back() : nullptr;
@@ -1283,9 +1344,12 @@ bool Device::run_between(ID3D11DeviceContext* context, Job* job, uint64_t genera
     }
     Timeline* t = timeline_d3d11(context);
     if (!t) { c4->Release(); discard(job, generation); return false; }
-    auto* fence = static_cast<ID3D11Fence*>(t->fence);
+    auto* in_fence = static_cast<ID3D11Fence*>(t->fence);
+    auto* out_fence = static_cast<ID3D11Fence*>(t->out_fence ? t->out_fence : t->fence);
+    const VkSemaphore wait_sem = t->semaphore;
+    const VkSemaphore sig_sem = t->out_semaphore ? t->out_semaphore : t->semaphore;
     const uint64_t ready = t->value + 1, done = t->value + 2;
-    HRESULT hr = c4->Signal(fence, ready);
+    HRESULT hr = c4->Signal(in_fence, ready);
     if (FAILED(hr)) {
         log("[nr] bridge: the D3D11 context refused a signal (0x%08lX)", (unsigned long)hr);
         c4->Release();
@@ -1296,13 +1360,14 @@ bool Device::run_between(ID3D11DeviceContext* context, Job* job, uint64_t genera
     // The signal has to reach the GPU queue before our queue can see it; D3D11 would otherwise hold it
     // in its batch until the next flush, with our queue waiting on it.
     c4->Flush();
-    const bool ok = submit(job, generation, t->semaphore, ready, t->semaphore, done);
-    if (!ok && FAILED(hr = c4->Signal(fence, done))) {
+    const bool ok = submit(job, generation, wait_sem, ready, sig_sem, done);
+    if (!ok && FAILED(hr = c4->Signal(out_fence, done))) {
         log("[nr] bridge: the D3D11 context refused a signal (0x%08lX)", (unsigned long)hr);
         c4->Release();
         return false;
     }
-    hr = c4->Wait(fence, done);
+    if (ok && d3d11_host_wait()) wait_job(job, generation);
+    hr = c4->Wait(out_fence, done);
     if (FAILED(hr)) {
         log("[nr] bridge: the D3D11 context refused to wait for the network (0x%08lX)", (unsigned long)hr);
         lost("the D3D11 context does not wait on the shared fence");

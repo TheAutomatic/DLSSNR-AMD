@@ -89,6 +89,9 @@ class Device {
     bool create_d3d11(ID3D11Device* device, uint32_t width, uint32_t height, DXGI_FORMAT format, Image* out,
                       std::string* why);
     bool d3d11_keyed_handover() const;
+    bool d3d11_split_twin() const;
+    bool d3d11_dual_fence() const;
+    bool d3d11_host_wait() const;
     // D3D10 has no fences: its shared textures carry a keyed mutex (legacy shared handle), and the
     // hand-over is the mutex - the D3D10 side releases key 1, our submit acquires 1 and releases 2,
     // the D3D10 side acquires 2. Needs VK_KHR_win32_keyed_mutex.
@@ -194,6 +197,7 @@ class Device {
                      bool* dedicated);
     bool submit(Job* job, uint64_t generation, VkSemaphore wait, uint64_t wait_value, VkSemaphore signal,
                 uint64_t signal_value);
+    void wait_job(Job* job, uint64_t generation);
     VkSemaphore import_fence(HANDLE handle, std::string* why);
     bool initial_layout(VkImage image, std::string* why);
 
@@ -225,6 +229,8 @@ class Device {
         IUnknown* owner{};   // the ID3D12CommandQueue or ID3D11DeviceContext, held
         IUnknown* fence{};   // ID3D12Fence or ID3D11Fence
         VkSemaphore semaphore{};
+        IUnknown* out_fence{};   // optional second ID3D11Fence for Vulkan -> D3D11 hand-back
+        VkSemaphore out_semaphore{};
         uint64_t value{};
     };
     std::mutex sync_mutex_;
