@@ -5175,7 +5175,7 @@ bool Session::Impl::record_renodx(VkCommandBuffer cmd, renodx::Stage& stage, con
                     frame_index, k + 1u, result.history_skip_reason ? result.history_skip_reason : "no temporal history");
         }
         if (nm.raw) runtime->set_style_grade(net_switch.file().style_grade);
-        if (result.frame.network_dispatches) roi_copy(cmd, roi_slot, 1, neural);
+        if (result.frame.network_dispatches && k + 1 == passes) roi_copy(cmd, roi_slot, 1, neural);
         if (k == 0) {
             diag_copy(cmd, 2, proxy.image, proxy.format, proxy.width, proxy.height, proxy.usage, proxy.after,
                       proxy.after_stage, proxy.after_access);

@@ -2742,6 +2742,12 @@ void on_destroy_device(device* dev) {
         cap.immediate.store(nullptr);
         cap.api.store(0);
     }
+    if (roi_ring && (sessions_device ||
+                     (dev->get_api() == device_api::d3d11 &&
+                      roi_ring->uses_device(reinterpret_cast<IUnknown*>(static_cast<uintptr_t>(dev->get_native())))))) {
+        roi_ring->drain(sessions_device ? session.get() : nullptr, true);
+        roi_ring.reset();
+    }
     if (session && session_device && dev != session_device) {
         log("[nr] device %p (api 0x%x) is being destroyed; NR's session is on device %p and goes on",
             static_cast<void*>(dev), unsigned(dev->get_api()), static_cast<void*>(session_device));
@@ -4242,7 +4248,7 @@ void on_reshade_present(effect_runtime* rt) {
     interval_feeds += fed.calls;
     const bool no_nr = !fed.first.handle;
     const uint64_t back_handle = !no_nr ? presented_back().handle : 0;
-    if (roi) roi->capture(presents, reinterpret_cast<IUnknown*>(presented_back().handle), session.get());
+    if (roi) roi->capture(presents, reinterpret_cast<IUnknown*>(static_cast<uintptr_t>(presented_back().handle)), session.get());
     const WrittenTarget mismatch = fed.first.handle == back_handle ? fed.other : fed.first;
     const bool target_mismatch = back_handle && mismatch.handle;
     const bool nr_expected = have_run && view.nr_on != 0 && rt->get_effects_state() &&

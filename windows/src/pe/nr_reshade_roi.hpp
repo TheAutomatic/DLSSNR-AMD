@@ -41,7 +41,9 @@ class Csv {
         if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, reinterpret_cast<LPCWSTR>(&write_loop), &module)) {
             if (HANDLE thread = CreateThread(nullptr, 0, write_loop, csv.get(), 0, nullptr)) {
                 CloseHandle(thread);
-                log("[nr] NR_DIAG_ROI=1 active (native D3D11 RenoDX): writing '%s'", path.c_str());
+                const auto pos = configured_percent();
+                log("[nr] NR_DIAG_ROI=1 active (native D3D11 RenoDX, ROI %ux%u at %u%%,%u%%): writing '%s'",
+                    side, side, pos.x, pos.y, path.c_str());
                 return csv.release();
             }
             FreeLibrary(module);
@@ -107,6 +109,30 @@ class PresentRing {
     explicit PresentRing(Csv& csv) : csv_(csv) {}
     ~PresentRing() { for (auto& slot : slots_) slot.release(); }
 
+    bool uses_device(IUnknown* dev) const {
+        if (!dev) return false;
+        ID3D11Device* d11{};
+        if (FAILED(dev->QueryInterface(IID_PPV_ARGS(&d11)))) return false;
+        IUnknown* target_id{};
+        const bool have_id = SUCCEEDED(d11->QueryInterface(IID_PPV_ARGS(&target_id)));
+        bool match = false;
+        for (const auto& slot : slots_) {
+            if (!slot.device) continue;
+            if (slot.device == d11) { match = true; break; }
+            if (have_id) {
+                IUnknown* slot_id{};
+                if (SUCCEEDED(slot.device->QueryInterface(IID_PPV_ARGS(&slot_id)))) {
+                    match = slot_id == target_id;
+                    slot_id->Release();
+                    if (match) break;
+                }
+            }
+        }
+        if (target_id) target_id->Release();
+        d11->Release();
+        return match;
+    }
+
     void drain(Session* session, bool closing = false) {
         while (count_ && pop(session, closing)) {}
     }
@@ -136,6 +162,7 @@ class PresentRing {
 
     struct Slot {
         PresentRow row{};
+        ID3D11Device* device{};
         ID3D11Texture2D* staging{};
         ID3D11Query* query{};
         ID3D11DeviceContext* context{};
@@ -146,7 +173,10 @@ class PresentRing {
             if (staging) staging->Release();
             if (query) query->Release();
             if (context) context->Release();
-            staging = nullptr; query = nullptr; context = nullptr;
+            if (device) device->Release();
+            staging = nullptr; query = nullptr; context = nullptr; device = nullptr;
+            desc = {};
+            pending = false; issued = false;
         }
 
         HRESULT poll() {
@@ -157,18 +187,29 @@ class PresentRing {
         }
 
         bool enqueue(IUnknown* back_buffer) {
-            if (!back_buffer || poll() != S_OK) return false;
+            if (!back_buffer) return false;
             ID3D11Texture2D* back{};
             if (FAILED(back_buffer->QueryInterface(IID_PPV_ARGS(&back)))) return false;
+            ID3D11Device* src_device{};
+            back->GetDevice(&src_device);
+            if (!src_device) {
+                back->Release();
+                return false;
+            }
+            if (device && device != src_device) release();
+            if (poll() != S_OK) {
+                src_device->Release();
+                back->Release();
+                return false;
+            }
             D3D11_TEXTURE2D_DESC src{};
             back->GetDesc(&src);
             const auto patch = region(src.Width, src.Height);
             bool ok = src.SampleDesc.Count == 1 && patch.width && patch.height && vk_format(src.Format);
-            if (ok && (!staging || desc.Format != src.Format || desc.Width != patch.width || desc.Height != patch.height)) {
+            if (ok && (!staging || device != src_device || desc.Format != src.Format ||
+                       desc.Width != patch.width || desc.Height != patch.height)) {
                 release();
-                ID3D11Device* device{};
-                back->GetDevice(&device);
-                device->GetImmediateContext(&context);
+                src_device->GetImmediateContext(&context);
                 desc = {};
                 desc.Width = patch.width; desc.Height = patch.height;
                 desc.MipLevels = desc.ArraySize = desc.SampleDesc.Count = 1;
@@ -176,10 +217,14 @@ class PresentRing {
                 desc.Usage = D3D11_USAGE_STAGING;
                 desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
                 const D3D11_QUERY_DESC event{D3D11_QUERY_EVENT, 0};
-                ok = context && SUCCEEDED(device->CreateTexture2D(&desc, nullptr, &staging)) &&
-                     SUCCEEDED(device->CreateQuery(&event, &query));
-                device->Release();
-                if (!ok) release();
+                ok = context && SUCCEEDED(src_device->CreateTexture2D(&desc, nullptr, &staging)) &&
+                     SUCCEEDED(src_device->CreateQuery(&event, &query));
+                if (ok) {
+                    device = src_device;
+                    src_device = nullptr;
+                } else {
+                    release();
+                }
             }
             if (ok) {
                 const D3D11_BOX box{patch.x, patch.y, 0, patch.x + patch.width, patch.y + patch.height, 1};
@@ -187,6 +232,7 @@ class PresentRing {
                 context->End(query);
                 pending = true;
             }
+            if (src_device) src_device->Release();
             back->Release();
             return ok;
         }
