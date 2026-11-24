@@ -2272,12 +2272,15 @@ void Session::Impl::log_interval(double seconds, const char* present_stats) {
         std::string reasons;
         for (size_t i = 0; i < why.size() && i < 4; ++i)
             reasons += (i ? "; " : "; passed: ") + std::to_string(why[i].first) + " x " + *why[i].second;
+        char renodx_stats[160] = "";
+        if (renodx_frame_index > 0 || no_history_evals || look_dt_spikes)
+            std::snprintf(renodx_stats, sizeof renodx_stats,
+                          "; RenoDX: %llu evaluations without network history, %llu Look history restarts (>250 ms)",
+                          (unsigned long long)no_history_evals, (unsigned long long)look_dt_spikes);
         const char* state = !ran && !passed ? "no evaluations" : last_ok ? "running now" : status.c_str();
-        log("[nr] %s last %.0f s: %llu evaluations ran the network, %llu passed the frame through (%s)%s%s; "
-            "RenoDX: %llu evaluations without network history, %llu Look dt spikes (>25 ms)%s%s; %s",
+        log("[nr] %s last %.0f s: %llu evaluations ran the network, %llu passed the frame through (%s)%s%s%s%s%s; %s",
             LocalTime{}.text, seconds, (unsigned long long)ran, (unsigned long long)passed, state, reasons.c_str(), handed,
-            (unsigned long long)no_history_evals, (unsigned long long)look_dt_spikes,
-            present_stats ? "; " : "", present_stats ? present_stats : "", memory_report().c_str());
+            renodx_stats, present_stats ? "; " : "", present_stats ? present_stats : "", memory_report().c_str());
     }
     pass_why.clear();
     ran_total += ran; passed_total += passed; ran = passed = 0;
@@ -4954,7 +4957,7 @@ bool Session::Impl::record_renodx(VkCommandBuffer cmd, renodx::Stage& stage, con
     sf.look_timing_spike = [this, frame_index](uint32_t pass, float gap_ms, float alpha, bool history_valid) {
         ++look_dt_spikes;
         if (diagnostic_log_due(look_dt_logged))
-            log("[nr] %s RenoDX frame %llu pass %u: Look dt spike %.2f ms, alpha %.4f, Look history %s",
+            log("[nr] %s RenoDX frame %llu pass %u: Look history gap restart %.2f ms (>250 ms), alpha %.4f, Look history %s",
                 LocalTime{}.text, frame_index, pass + 1u, double(gap_ms), double(alpha), history_valid ? "valid" : "invalid");
     };
     const renodx::Settings& rs = rf.settings;

@@ -4225,13 +4225,16 @@ void on_reshade_present(effect_runtime* rt) {
     const uint64_t back_handle = !no_nr ? presented_back().handle : 0;
     const WrittenTarget mismatch = fed.first.handle == back_handle ? fed.other : fed.first;
     const bool target_mismatch = back_handle && mismatch.handle;
+    const bool nr_expected = have_run && view.nr_on != 0 && rt->get_effects_state() &&
+                             (!session || (!session->building() && !session->failed()));
+    const bool unexpected_no_nr = no_nr && nr_expected;
     interval_without_nr += no_nr;
     interval_target_mismatches += target_mismatch;
-    if ((no_nr || target_mismatch) &&
+    if ((unexpected_no_nr || target_mismatch) &&
         (present_anomaly_logged == std::chrono::steady_clock::time_point{} ||
          now - present_anomaly_logged >= std::chrono::seconds(1))) {
         present_anomaly_logged = now;
-        if (no_nr) {
+        if (unexpected_no_nr) {
             log("[nr] %s ReShade present %llu: NR did not run (feed calls %llu, last feed %s)",
                 nr::pe::LocalTime{}.text, (unsigned long long)presents, (unsigned long long)fed.calls,
                 feed_source_name(fed.last_attempt));
