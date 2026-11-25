@@ -373,7 +373,7 @@ cp -- linux/data/optimized/dlssnr-optimized.sha256 "$pkg/optimized/CC_SILVER_AAR
 python3 windows/package/make_ini.py windows/src/pe/nr_pe_config.cpp "$pkg/ini" > /dev/null
 sed -i 's/$/\r/' "$pkg/ini/"*.ini
 
-cp -- windows/package/install.bat windows/package/README.txt "$pkg/"
+cp -- windows/package/install.bat windows/package/README.txt LICENSE NOTICE "$pkg/"
 # Windows PowerShell 5.1 reads a script without a byte-order mark in the ANSI code page: one UTF-8 BOM each (a
 # second one would be text, and the script's first line a command), any BOM of the source dropped first.
 printf '\xef\xbb\xbf' > "$pkg/install.ps1"; sed '1s/^\xEF\xBB\xBF//' windows/package/install.ps1 >> "$pkg/install.ps1"
