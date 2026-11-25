@@ -2,7 +2,7 @@
 #
 #   install.bat                      a window asks for the game's exe, then for the route
 #   install.bat <game exe or its folder> [optiscaler|standalone|reshade-feeder|reshade-feeder-dx9|reshade-feeder-vulkan|remove|logs]
-#               [-Dll <nvngx_dlssnr.dll or its zip>] [-Model <network>] [-RenoDX on|off] [-Lumenite on|off]
+#               [-Dll <nvngx_dlssnr.dll or its zip>] [-Model <network>] [-RenoDX on|off] [-Rdna2Preset on|off] [-Lumenite on|off]
 #
 # Unreal Engine games: the folder is <project>\Binaries\Win64 (the *-Shipping.exe), not the top folder with the launcher.
 #
@@ -47,7 +47,7 @@
 # Every file put into the game folder is listed in dlssnr-amd-install.txt; existing files it would
 # overwrite are first moved to dlssnr-amd-backup\, and uninstall deletes ours and puts them back.
 param([string]$Target = '', [string]$Route = '', [string]$Dll = '', [string]$Model = '', [string]$Network = '',
-      [string]$AcoMode = '', [string]$RenoDX = '', [string]$Lumenite = '', [string]$LumeniteZip = '', [switch]$Pause)
+      [string]$AcoMode = '', [string]$RenoDX = '', [string]$Rdna2Preset = '', [string]$Lumenite = '', [string]$LumeniteZip = '', [switch]$Pause)
 
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
@@ -88,6 +88,77 @@ function Get-ExeBits([string]$path) {
         switch ([BitConverter]::ToUInt16($b, $pe + 4)) { 0x8664 { return 64 } 0x14C { return 32 } }
     } catch { }
     return 0
+}
+
+# Exact AMD PCI Device IDs from windows/src/core/nr_gpu_arch_ids.hpp; discrete GPUs win over integrated GPUs so e.g.
+# 780M + RX 6900 XT detects RDNA2 and RX 9070 XT + RDNA2 iGPU keeps the RDNA4 default flow.
+function Select-Rdna2Gpu($controllers) {
+    if (-not $controllers) { return $null }
+    $rdna4Dgpu = @(0x7550, 0x7551, 0x7590)
+    $rdna3Dgpu = @(0x7448, 0x7449, 0x744a, 0x744b, 0x744c, 0x745e, 0x7460, 0x7461, 0x7470, 0x747e,
+                   0x73f0, 0x7480, 0x7481, 0x7483, 0x7487, 0x7489, 0x748b, 0x7499, 0x749f)
+    $rdna3Igpu = @(0x15bf, 0x15c8, 0x1900, 0x1901, 0x1902, 0x150e, 0x1586, 0x1114)
+    $rdna2Dgpu = @(0x73a1, 0x73a2, 0x73a3, 0x73a5, 0x73ab, 0x73ae, 0x73af, 0x73bf, 0x73c3, 0x73ce,
+                   0x73df, 0x73e0, 0x73e1, 0x73e3, 0x73ef, 0x73ff, 0x7421, 0x7422, 0x7423, 0x7424, 0x743f)
+    $rdna2Igpu = @(0x163f, 0x1435, 0x1681, 0x164e, 0x13c0, 0x1506)
+
+    $parsed = @()
+    foreach ($c in @($controllers)) {
+        if ($c.PNPDeviceID -and $c.PNPDeviceID -match 'VEN_1002&DEV_([0-9A-Fa-f]{4})') {
+            $parsed += [pscustomobject]@{
+                Name = [string]$c.Name
+                Id   = [Convert]::ToInt32($Matches[1], 16)
+            }
+        }
+    }
+    foreach ($g in $parsed) {
+        if ($rdna4Dgpu -contains $g.Id -or $rdna3Dgpu -contains $g.Id) { return $null }
+    }
+    foreach ($g in $parsed) {
+        if ($rdna2Dgpu -contains $g.Id) { return $g.Name }
+    }
+    foreach ($g in $parsed) {
+        if ($rdna3Igpu -contains $g.Id) { return $null }
+    }
+    foreach ($g in $parsed) {
+        if ($rdna2Igpu -contains $g.Id) { return $g.Name }
+    }
+    return $null
+}
+
+function Get-DetectedRdna2Gpu {
+    try {
+        $controllers = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue
+        return Select-Rdna2Gpu $controllers
+    } catch {
+        return $null
+    }
+}
+
+function Update-InstallIniLines([string[]]$lines, [string]$Route, [string]$Model, [string]$RenoDX, [string]$Rdna2Preset, [bool]$HasLumenite) {
+    $out = [string[]]$lines.Clone()
+    $section = ''; $done = @{}
+    for ($i = 0; $i -lt $out.Count; $i++) {
+        if ($out[$i] -match '^\[([^\]]+)\]') { $section = $Matches[1]; continue }
+        if ($section -eq 'RenoDX' -and ($Route -notin @('optiscaler', 'standalone')) -and $RenoDX -eq 'on' -and $out[$i] -eq 'Enabled = 0') {
+            $out[$i] = 'Enabled = 1'; $done['renodx'] = 1
+        } elseif ($section -eq 'RenoDX' -and $Rdna2Preset -eq 'on' -and $Route -eq 'optiscaler' -and $RenoDX -eq 'on' -and $out[$i] -match '^NRHookPoint = ') {
+            $out[$i] = 'NRHookPoint = 1'; $done['rdna2_hook'] = 1
+        } elseif ($section -eq 'Network' -and $out[$i] -match '^Model = ') {
+            $out[$i] = "Model = $Model"; $done['model'] = 1
+        } elseif ($section -eq 'Network' -and $Rdna2Preset -eq 'on' -and $out[$i] -match '^Rdna2Int8 = ') {
+            $out[$i] = 'Rdna2Int8 = 1'; $done['rdna2_int8'] = 1
+        } elseif ($HasLumenite -and $out[$i] -ceq 'MotionVectors=vort') {
+            $out[$i] = 'MotionVectors=lumenite'; $done['lumenite'] = 1
+        }
+    }
+    if ($HasLumenite -and -not $done['lumenite']) { Fail 'dlssnr-amd.ini: could not set MotionVectors=lumenite.' }
+    if (-not $done['model'] -or (($Route -notin @('optiscaler', 'standalone')) -and $RenoDX -eq 'on' -and -not $done['renodx']) -or
+        ($Rdna2Preset -eq 'on' -and -not $done['rdna2_int8']) -or
+        ($Rdna2Preset -eq 'on' -and $Route -eq 'optiscaler' -and $RenoDX -eq 'on' -and -not $done['rdna2_hook'])) {
+        Fail 'The package''s dlssnr-amd.ini is not as expected; unpack the package again.'
+    }
+    return $out
 }
 
 # ---- choose the route ------------------------------------------------------------------------
@@ -142,6 +213,31 @@ $haveInt4 = Test-Path -LiteralPath (Join-Path $here 'dlssnr-amd\int4') -PathType
 $haveExperimental = Test-Path -LiteralPath (Join-Path $here 'experimental\dlssnr-small-experimental.delta') -PathType Leaf
 $haveOptimized = Test-Path -LiteralPath (Join-Path $here 'optimized\dlssnr-optimized.delta') -PathType Leaf
 
+# ---- RDNA2 recommended preset (detected or -Rdna2Preset on|off) ------------------------------
+if ($Rdna2Preset -and 'on', 'off' -notcontains $Rdna2Preset) {
+    Fail "Unknown Rdna2Preset choice: $Rdna2Preset (on or off)"
+}
+if ($Route -notin @('remove', 'logs') -and -not $Rdna2Preset -and -not ($Model -and $RenoDX)) {
+    $rdna2Gpu = Get-DetectedRdna2Gpu
+    if ($rdna2Gpu) {
+        Say ''
+        Say "Detected RDNA2 GPU: $rdna2Gpu"
+        Say 'Recommended RDNA2 settings:'
+        Say '  [Network] Model = CC_SMALL_FP8'
+        Say '  [Network] Rdna2Int8 = 1          (INT8 dot4 kernels)'
+        if ($Route -eq 'optiscaler' -and $RenoDX -ne 'off') {
+            Say '  [RenoDX]  Enabled = 1            (RenoDX style)'
+            Say '  [RenoDX]  NRHookPoint = 1        (before the upscaler - faster on RDNA2)'
+        }
+        $pick = Read-Host 'Apply recommended RDNA2 settings? [Y/n, Enter = Y]'
+        $Rdna2Preset = if ($pick -eq '' -or $pick -eq 'y' -or $pick -eq 'Y') { 'on' } else { 'off' }
+    }
+}
+if (-not $Rdna2Preset) { $Rdna2Preset = 'off' }
+if ($Rdna2Preset -eq 'on' -and -not $RenoDX -and $Route -in @('optiscaler', 'standalone')) {
+    $RenoDX = 'on'
+}
+
 # ---- the processing before and after NR --------------------------------------------------------
 if ($Route -eq 'standalone') {
     if ($RenoDX -eq 'off') {
@@ -192,7 +288,7 @@ if ($Route -ne 'logs') {
         Say 'This folder needs administrator rights, asking for them...'
         # the chosen exe, not its folder: from a folder the first exe would be taken again (another bitness)
         $again = if ($exe) { $exe } else { $game }
-        $elevated = "-NoProfile -ExecutionPolicy Bypass -STA -File `"$PSCommandPath`" -Target `"$again`" -Route $Route -RenoDX $RenoDX -Pause"
+        $elevated = "-NoProfile -ExecutionPolicy Bypass -STA -File `"$PSCommandPath`" -Target `"$again`" -Route $Route -RenoDX $RenoDX -Rdna2Preset $Rdna2Preset -Pause"
         if ($Model) { $elevated += " -Model $Model" }
         $elevated += " -Lumenite $Lumenite"
         if ($LumeniteZip) { $elevated += " -LumeniteZip `"$LumeniteZip`"" }
@@ -486,6 +582,9 @@ if (-not $haveSmall) {
     Say 'To add it, install again with -Dll pointing at the 310.9.16 nvngx_dlssnr.dll or its zip.'
 }
 # The network a game starts with: all four are installed, this only sets [Network] Model in dlssnr-amd.ini.
+if ($Rdna2Preset -eq 'on' -and -not $Model) {
+    $Model = if ($haveSmall) { 'CC_SMALL_FP8' } else { 'CC_SILVER_AARDWOLD' }
+}
 if (-not $Model) {
     $default = if ($haveSmall) { 1 } else { 3 }
     Say ''
@@ -832,20 +931,9 @@ elseif ($Route -eq 'standalone') { $iniSrc = 'ini\dlssnr-amd-standalone.ini' }
 else { $iniSrc = 'ini\dlssnr-amd-addon.ini' }
 $iniDst = Join-Path $game 'dlssnr-amd.ini'
 # The RenoDX style ([RenoDX] Enabled = 1 on the ReShade routes; the OptiScaler and standalone routes have files of their own), the
-# network a game starts with ([Network] Model).
+# network a game starts with ([Network] Model), and optional RDNA2 defaults ([Network] Rdna2Int8, [RenoDX] NRHookPoint).
 $lines = [System.IO.File]::ReadAllLines((Join-Path $here $iniSrc), [System.Text.Encoding]::UTF8)
-$section = ''; $done = @{}
-for ($i = 0; $i -lt $lines.Count; $i++) {
-    if ($lines[$i] -match '^\[([^\]]+)\]') { $section = $Matches[1]; continue }
-    if ($section -eq 'RenoDX' -and ($Route -notin @('optiscaler', 'standalone')) -and $RenoDX -eq 'on' -and $lines[$i] -eq 'Enabled = 0') {
-        $lines[$i] = 'Enabled = 1'; $done['renodx'] = 1
-    } elseif ($section -eq 'Network' -and $lines[$i] -match '^Model = ') { $lines[$i] = "Model = $Model"; $done['model'] = 1 }
-    elseif ($lumeniteFx -and $lines[$i] -ceq 'MotionVectors=vort') { $lines[$i] = 'MotionVectors=lumenite'; $done['lumenite'] = 1 }
-}
-if ($lumeniteFx -and -not $done['lumenite']) { Fail 'dlssnr-amd.ini: could not set MotionVectors=lumenite.' }
-if (-not $done['model'] -or (($Route -notin @('optiscaler', 'standalone')) -and $RenoDX -eq 'on' -and -not $done['renodx'])) {
-    Fail 'The package''s dlssnr-amd.ini is not as expected; unpack the package again.'
-}
+$lines = Update-InstallIniLines $lines $Route $Model $RenoDX $Rdna2Preset ([bool]$lumeniteFx)
 [System.IO.File]::WriteAllText($iniDst, (($lines -join "`r`n") + "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
 # The same file kept in dlssnr-amd\: a dlssnr-amd.ini that is deleted comes back from it at the next start, with the
 # choices made here (NR writes its built-in defaults only when this copy is missing too).
@@ -857,9 +945,13 @@ Say ''
 $style = if ($RenoDX -eq 'on') { 'RenoDX style' } else { 'wilsjo2 style' }
 Say "Installed the $Route route into: $game ($style)"
 Say "Networks installed: $(if ($haveSmall) { 'CC_SMALL_FP8, ' })$(if ($expModelFrom) { 'CC_SMALL_FP8_EXPERIMENTAL, ' })CC_SILVER_AARDWOLD$(if ($optModelFrom) { ', CC_SILVER_AARDWOLD_OPTIMIZED' + $(if (-not $int4ModelFrom) { ' (without its int4 layers)' }) }); games start with $Model."
+if ($Rdna2Preset -eq 'on') {
+    $rdna2Hook = if ($Route -eq 'optiscaler' -and $RenoDX -eq 'on') { ', NRHookPoint = 1 (before the upscaler)' } else { '' }
+    Say "RDNA2 recommended settings applied: Rdna2Int8 = 1$rdna2Hook."
+}
 Say "Switch the network in game at any time: the drop-down in $(if ($Route -in @('optiscaler', 'standalone')) { 'NR Control (End)' } else { 'ReShade''s Add-ons page' }), or Ctrl+F11 to cycle; settings: [Network] in dlssnr-amd.ini."
 Say 'The network runs as machine code made in advance by the ACO compiler (ACO Mode). When your driver cannot take it,'
-Say "$(if ($Route -in @('optiscaler', 'standalone')) { 'NR Control' } else { 'ReShade''s Add-ons page' }) and dlssnr-amd.log say why; an RX 9000 then runs the network compiled by the AMD driver"
+Say "$(if ($Route -in @('optiscaler', 'standalone')) { 'NR Control' } else { 'ReShade''s Add-ons page' }) and dlssnr-amd.log say why; an RX 9000 or RX 6000 then runs the network compiled by the AMD driver"
 Say '(without CC_SMALL_FP8_EXPERIMENTAL and CC_SILVER_AARDWOLD_OPTIMIZED); RX 7000 and Radeon 700M / 800M / 8000S graphics have no NR then.'
 if ($Route -eq 'optiscaler') {
     Say 'In game, turn on DLSS, FSR or XeSS in the game''s settings. End opens NR Control (DirectX 11 / 12 and Vulkan games: every'
