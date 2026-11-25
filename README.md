@@ -499,14 +499,14 @@ for your own use. Do not share packages that contain the model.
 
 ## Licence
 
-Original works and modifications by TheAutomatic in this repository (and combined release packages) are
-licensed for noncommercial use under the PolyForm Noncommercial License 1.0.0; see [LICENSE](LICENSE)
-and [NOTICE](NOTICE). Upstream code from [mochizuki0323/DLSSNR-AMD](https://gitlab.com/mochizuki0323/DLSSNR-AMD)
-retains its original MIT licence (preserved in [NOTICE](NOTICE)). Pull requests submitted by
-TheAutomatic to upstream projects (including
-[mochizuki0323/DLSSNR-AMD](https://gitlab.com/mochizuki0323/DLSSNR-AMD) and
+Original works and modifications by TheAutomatic in this repository are licensed for noncommercial use
+under the PolyForm Noncommercial License 1.0.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE). Upstream
+code from [mochizuki0323/DLSSNR-AMD](https://gitlab.com/mochizuki0323/DLSSNR-AMD) retains its original
+MIT licence (preserved in [NOTICE](NOTICE)). Pull requests submitted by TheAutomatic to upstream
+projects (including [mochizuki0323/DLSSNR-AMD](https://gitlab.com/mochizuki0323/DLSSNR-AMD) and
 [OpenNeuralRendering/OpenRR](https://github.com/OpenNeuralRendering/OpenRR)), or upstream integrations
 expressly authorized in writing by TheAutomatic, may be incorporated under upstream's original MIT
-licence; no MIT or commercial licence is granted to third parties. The packages also carry third-party
-components under their own licences, listed in [THIRD_PARTY.md](THIRD_PARTY.md). NVIDIA's model
-weights are NVIDIA's property and are neither included nor distributed.
+licence; no MIT or commercial licence is granted to third parties. Bundled third-party components
+(including unmodified OptiScaler under GPL-3.0) are distributed as an aggregate strictly under their own
+licences with no additional restrictions; see [NOTICE](NOTICE) and [THIRD_PARTY.md](THIRD_PARTY.md).
+NVIDIA's model weights are NVIDIA's property and are neither included nor distributed.
