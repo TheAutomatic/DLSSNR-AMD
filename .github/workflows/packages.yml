@@ -100,6 +100,12 @@ jobs:
       - name: Run ACO push layout unit tests
         run: python3 windows/tools/test_aco_push_layout.py
 
+      - name: Run ReShade ROI unit tests
+        run: |
+          g++ -std=c++17 -O2 -Wall -Wextra -Werror -Iwindows/src/pe \
+            windows/tools/test_reshade_roi.cpp -o "${RUNNER_TEMP:-/tmp}/test_reshade_roi"
+          "${RUNNER_TEMP:-/tmp}/test_reshade_roi"
+
       - name: Build package   # builds the Vulkan loader and the OptiScaler DLLs too
         run: NR_SIGN=1 bash windows/build/build_package.sh
 

@@ -45,6 +45,7 @@
 #include "nr_pe_vkdevice.hpp"
 #include "nr_vram_ledger.hpp"
 #include "nr_pe_events.hpp"
+#include "nr_reshade_roi.hpp"
 
 #include <MinHook.h>
 #include <d3dcommon.h>
@@ -266,6 +267,16 @@ struct PresentFeed {
     }
 };
 PresentFeed present_feed{};
+std::unique_ptr<nr::pe::roi::PresentRing> roi_ring;
+bool present_roi_enabled() {
+    static const bool on = [] { const char* e = std::getenv("NR_DIAG_ROI"); return e && e[0] == '1'; }();
+    return on;
+}
+nr::pe::roi::PresentRing* present_roi() {
+    static auto* const csv = nr::pe::roi::Csv::open();
+    if (csv && !roi_ring) roi_ring.reset(new (std::nothrow) nr::pe::roi::PresentRing(*csv));
+    return roi_ring.get();
+}
 uint64_t interval_presents{}, interval_feeds{}, interval_without_nr{}, interval_target_mismatches{};
 std::chrono::steady_clock::time_point present_interval{}, present_anomaly_logged{};
 struct DirectRtvEntry { device* dev; uint64_t res; resource_view rtv; };
@@ -2537,6 +2548,10 @@ void on_reloaded_effects(effect_runtime* rt) {
 void on_destroy_effect_runtime(effect_runtime* rt) {
     std::lock_guard<std::mutex> guard(lock);
     if (rt != bound) return;
+    if (roi_ring) {
+        roi_ring->drain(session.get(), true);
+        roi_ring.reset();
+    }
     bound = nullptr;
     technique = {}; mv_var = {}; depth_var = {};
     frame_fed = false;
@@ -2726,6 +2741,12 @@ void on_destroy_device(device* dev) {
         cap.dev.store(nullptr);
         cap.immediate.store(nullptr);
         cap.api.store(0);
+    }
+    if (roi_ring && (sessions_device ||
+                     (dev->get_api() == device_api::d3d11 &&
+                      roi_ring->uses_device(reinterpret_cast<IUnknown*>(static_cast<uintptr_t>(dev->get_native())))))) {
+        roi_ring->drain(sessions_device ? session.get() : nullptr, true);
+        roi_ring.reset();
     }
     if (session && session_device && dev != session_device) {
         log("[nr] device %p (api 0x%x) is being destroyed; NR's session is on device %p and goes on",
@@ -3241,6 +3262,8 @@ void feed(effect_runtime* rt, command_list* cl, resource_view rtv, FeedSource so
             f.renodx = renodx;
             f.wilsjo2 = w2run;
             f.feature = feature;
+            if (present_roi_enabled() && api == device_api::d3d11 && renodx && present_roi())
+                f.roi_present = presents + (source != FeedSource::direct_present);
             // The native D3D10 runtime (ReShade as dxgi.dll): the bridge with keyed mutexes.
             ran = api == device_api::d3d10 ? s.run_d3d10(f, controls) : s.run_d3d11(f, controls);
             break;
@@ -4188,6 +4211,8 @@ void on_reshade_present(effect_runtime* rt) {
     if (!bound) { bound = rt; resolve(rt); }
     if (rt != bound) return;
     ++presents;
+    auto* roi = present_roi_enabled() && rt->get_device()->get_api() == device_api::d3d11 ? present_roi() : nullptr;
+    if (roi) roi->drain(session.get());
     const bool fed_already = std::exchange(frame_fed, false);
     const bool effects_ran = std::exchange(effects_seen, false);
     resource back{};
@@ -4223,6 +4248,7 @@ void on_reshade_present(effect_runtime* rt) {
     interval_feeds += fed.calls;
     const bool no_nr = !fed.first.handle;
     const uint64_t back_handle = !no_nr ? presented_back().handle : 0;
+    if (roi) roi->capture(presents, reinterpret_cast<IUnknown*>(static_cast<uintptr_t>(presented_back().handle)), session.get());
     const WrittenTarget mismatch = fed.first.handle == back_handle ? fed.other : fed.first;
     const bool target_mismatch = back_handle && mismatch.handle;
     const bool nr_expected = have_run && view.nr_on != 0 && rt->get_effects_state() &&
@@ -4487,6 +4513,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         // are gone, possibly inside vkd3d-proton's / DXVK's locks, and its destructor's GPU waits and queue locks
         // could wait for ever (the game would never end). The process's end frees it.
         if (reserved) {
+            (void)roi_ring.release();
             if (session) {
                 session->log_totals();
                 (void)session.release();
