@@ -43,6 +43,12 @@ License Scope & Upstream / Third-Party Attributions
    supply separately required files from their own legitimate copies under their
    applicable licenses.
 
+5. RDNA2 Port Attribution (RDNA2 Branch Only)
+   The RDNA2 (gfx10.3) wave32 shader/ACO implementation on this branch is
+   based on foundational work by Matheus Ferreira de Souza
+   (https://github.com/MatheusFerreiraS), ported and adapted to this project
+   by Haoz.
+
 ================================================================================
 Upstream MIT License Notice (mochizuki0323/DLSSNR-AMD)
 ================================================================================

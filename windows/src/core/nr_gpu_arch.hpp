@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -35,6 +36,10 @@ namespace nr::arch {
 using ManualReader = GpuArch (*)(std::string* said);
 inline ManualReader& manual_reader() { static ManualReader r = nullptr; return r; }
 inline GpuArch manual(std::string* said = nullptr) {
+    if (const char* e = std::getenv("NR_FORCE_RDNA2"); e && *e && std::atoi(e) != 0) {
+        if (said) *said = "rdna2 (NR_FORCE_RDNA2)";
+        return GpuArch::rdna2;
+    }
     if (const ManualReader r = manual_reader()) return r(said);
     if (said) *said = "auto";
     return GpuArch::unknown;
@@ -48,14 +53,19 @@ inline Identity with_manual(Identity r) {
     const GpuArch m = manual(&said);
     if (m == GpuArch::unknown) {
         if (!has_network(r.arch))
-            r.how += "; dlssnr-amd.ini [GPU] Architecture (NR Control > Network) can set it by hand: rdna4 or rdna3";
+            r.how += "; dlssnr-amd.ini [GPU] Architecture (NR Control > Network) can set it by hand: rdna4, rdna3 or rdna2";
         return r;
     }
     const std::string found = r.how;
     const bool other = r.mach && r.arch != m;
-    r.how = std::string("set by hand: dlssnr-amd.ini [GPU] Architecture = ") + said +
-            (other ? std::string(" - WARNING: AMD's driver names ") + name(r.arch) + "; machine code for " + name(m) +
-                     " runs on it as set" : "") + " (auto: " + name(r.arch) + ", " + found + ")";
+    const std::string source = said.find("NR_FORCE_RDNA2") != std::string::npos
+        ? std::string("NR_FORCE_RDNA2=1")
+        : std::string("dlssnr-amd.ini [GPU] Architecture = ") + said;
+    r.how = std::string("set by hand: ") + source +
+            (other ? std::string(" - WARNING: AMD's driver names ") + name(r.arch) + "; " +
+                     (m == GpuArch::rdna2 ? std::string("running the portable wave32 SPIR-V network")
+                                          : std::string("machine code for ") + name(m) + " runs on it as set")
+                   : "") + " (auto: " + name(r.arch) + ", " + found + ")";
     r.arch = m;
     return r;
 }

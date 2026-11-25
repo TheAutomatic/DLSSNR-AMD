@@ -48,6 +48,7 @@ struct NetworkConfig {
     bool style_grade = true;   // Style Grade: Natural / Cinematic graded as NVIDIA's DLL (false: the older picture)
     bool memory_guard = false;  // Memory Guard (off by default since 0.0.8.3): a network only with video memory left for the game (false: no such check)
     bool history_f16 = true;   // History Precision: 16 the history images RGBA16F (default), 32 RGBA32F
+    bool rdna2_int8 = false;   // Rdna2Int8: RDNA2 only - 1 INT8 dot4 kernels where supported, 0 FP16 (default)
     // OptimizedLayers: CC_SILVER_AARDWOLD_OPTIMIZED's level (nr::kLayersQuality / Balanced / Performance / Ultra (default));
     // `model` is already the one it picks (nr::network_with_layers)
     int optimized_layers = 3;   // nr::kLayersDefault (Ultra Performance); a number: make_ini.py reads these defaults

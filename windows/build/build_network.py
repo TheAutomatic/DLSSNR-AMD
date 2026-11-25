@@ -43,11 +43,13 @@ QUAD = True   # --no-quad: the pair loops as written (A/B)
 UNROLLED = {'fswin_t.comp', 'ffwd3_t.comp', 'attn.comp', 'vit_attn.comp'}
 
 
-def glslang(arch, src, defines, out, unroll=False, network=False):
+def glslang(arch, src, defines, out, unroll=False, network=False, tree='windows'):
+    inc_arch = str(R / tree / 'shaders' / arch / 'include')
+    inc_passes = str(R / 'windows/shaders/passes/include')
     if unroll or (network and QUAD):
         pre = out.with_suffix('.pre.comp')
-        r = subprocess.run([str(R / 'toolchain/glslang/bin/glslang'), '-E', '-I' + str(R / 'windows/shaders' / arch / 'include'),
-                            '-I' + str(R / 'windows/shaders/passes/include')] + ['-D' + d for d in defines] + [str(src)],
+        r = subprocess.run([str(R / 'toolchain/glslang/bin/glslang'), '-E', '-I' + inc_arch,
+                            '-I' + inc_passes] + ['-D' + d for d in defines] + [str(src)],
                            capture_output=True, text=True)
         if r.returncode:
             sys.exit(f'glslang -E failed on {src}:\n{r.stdout}{r.stderr}')
@@ -60,7 +62,7 @@ def glslang(arch, src, defines, out, unroll=False, network=False):
                            check=True, stdout=subprocess.DEVNULL)
         src, defines = pre, []
     cmd = [str(R / 'toolchain/glslang/bin/glslang'), '-V', '--target-env', 'vulkan1.3',
-           '-I' + str(R / 'windows/shaders' / arch / 'include'), '-I' + str(R / 'windows/shaders/passes/include')]
+           '-I' + inc_arch, '-I' + inc_passes]
     cmd += ['-D' + d for d in defines] + [str(src), '-o', str(out)]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode:
@@ -72,6 +74,10 @@ def glslang(arch, src, defines, out, unroll=False, network=False):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('arch')
+    ap.add_argument('--tree', choices=['windows', 'linux'], default='windows',
+                    help='shader tree to read from (default: windows)')
+    ap.add_argument('--int8', action='store_true',
+                    help='build the INT8 variant defined by pipelines.json["int8"] (e.g. rdna2)')
     ap.add_argument('--out', type=Path)
     ap.add_argument('--define', action='append', default=[],
                     help='extra define for every network pipeline (diagnostics, e.g. NR_PROF_OFF=...)')
@@ -81,13 +87,23 @@ def main():
     a = ap.parse_args()
     global QUAD
     QUAD = not a.no_quad
-    table = json.loads((R / 'windows/shaders' / a.arch / 'pipelines.json').read_text())
-    out = a.out or R / 'build/windows' / a.arch / 'network'
+    shaders_root = R / a.tree / 'shaders'
+    table = json.loads((shaders_root / a.arch / 'pipelines.json').read_text())
+    out = a.out or R / 'build/windows' / a.arch / ('network-int8' if a.int8 else 'network')
     if out.exists():
         shutil.rmtree(out)
     out.mkdir(parents=True)
 
     pipelines = table['pipelines']
+    if a.int8:
+        int8 = table.get('int8')
+        if not int8:
+            sys.exit(f'{shaders_root / a.arch / "pipelines.json"} has no "int8" section')
+        for name, add_defs in int8['add'].items():
+            if name not in pipelines:
+                sys.exit(f'pipelines.json["int8"]["add"] references unknown pipeline {name}')
+            pipelines[name]['defines'] = pipelines[name]['defines'] + add_defs
+        table['markers']['shader-constants.txt'].append(f'int8 {int8["marker"]}')
     # post_no_out1 in the manifest tells the host that the post kernels never write their second output (it makes
     # that image 1x1): it has to say what they are built with.
     consts = dict(r.split() for r in table['markers']['shader-constants.txt'][1:])
@@ -101,21 +117,21 @@ def main():
 
     tasks = []
     for name, e in pipelines.items():
-        tasks.append((R / 'windows/shaders' / a.arch / e['source'], e['defines'] + a.define,
+        tasks.append((shaders_root / a.arch / e['source'], e['defines'] + a.define,
                       out / f'g_{name}.spv', e['source'] in UNROLLED, True))
     for name, v in table['variants'].items():
         base = pipelines[v['base']]
-        tasks.append((R / 'windows/shaders' / a.arch / base['source'], base['defines'] + v['add'],
+        tasks.append((shaders_root / a.arch / base['source'], base['defines'] + v['add'] + a.define,
                       out / 'temporal' / f'{name}.spv', base['source'] in UNROLLED, True))
     grade = table['style_grade']
     for name in grade['pipelines']:
         e = pipelines[name]
-        tasks.append((R / 'windows/shaders' / a.arch / e['source'], e['defines'] + a.define + grade['add'],
+        tasks.append((shaders_root / a.arch / e['source'], e['defines'] + a.define + grade['add'],
                       out / f'g_{name}_grade.spv', e['source'] in UNROLLED, True))
     for name in grade['variants']:
         base = pipelines[table['variants'][name]['base']]
-        tasks.append((R / 'windows/shaders' / a.arch / base['source'],
-                      base['defines'] + table['variants'][name]['add'] + grade['add'],
+        tasks.append((shaders_root / a.arch / base['source'],
+                      base['defines'] + table['variants'][name]['add'] + a.define + grade['add'],
                       out / 'temporal' / f'{name}_grade.spv', base['source'] in UNROLLED, True))
     for k in MOTION:
         tasks.append((R / 'windows/shaders/passes' / f'{k}.comp', [], out / 'temporal' / f'{k}.spv', False, False))
@@ -125,7 +141,8 @@ def main():
     env_jobs = os.environ.get('NR_JOBS', '').strip()
     workers = int(env_jobs) if env_jobs.isdigit() and int(env_jobs) > 0 else (os.cpu_count() or 4)
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        futs = [pool.submit(glslang, a.arch, src, defs, dst, unroll, net) for src, defs, dst, unroll, net in tasks]
+        futs = [pool.submit(glslang, a.arch, src, defs, dst, unroll, net, a.tree)
+                for src, defs, dst, unroll, net in tasks]
         for fut in futs:
             fut.result()
     print(f'{out}: {len(pipelines) + len(grade["pipelines"])} network pipelines, '

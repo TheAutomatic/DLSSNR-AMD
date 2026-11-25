@@ -154,7 +154,27 @@ bool augment(VkPhysicalDevice physical, const VkDeviceCreateInfo* info, Augmente
         }
         break;
     }
-    case nr::arch::GpuArch::unknown: case nr::arch::GpuArch::rdna1: case nr::arch::GpuArch::rdna2:
+    case nr::arch::GpuArch::rdna2: {
+        network.erase(std::remove_if(network.begin(), network.end(), [](const char* e) {
+            return std::strcmp(e, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME) == 0;
+        }), network.end());
+        if (!nr::binary::directory().empty()) {
+            const nr::arch::Identity phys = nr::arch::identify(physical, false);
+            if (phys.arch == nr::arch::GpuArch::rdna2) {
+                std::string why;
+                if (!nr::binary::use_rdna2(&why)) {
+                    log("[nr] device features: ACO off on RDNA2 (%s): driver compiles SPIR-V", why.c_str());
+                    nr::binary::disable(why);
+                }
+            } else {
+                log("[nr] device features: cross-GPU RDNA2 test on %s: disabling ACO for driver SPIR-V compile",
+                    nr::arch::name(phys.arch));
+                nr::binary::disable("cross-GPU RDNA2 test uses driver SPIR-V compilation");
+            }
+        }
+        break;
+    }
+    case nr::arch::GpuArch::unknown: case nr::arch::GpuArch::rdna1:
         log("[nr] device features left as the game asked: NR has no network for this GPU (%s)",
             nr::arch::name(id.arch));
         return false;
@@ -179,12 +199,14 @@ bool augment(VkPhysicalDevice physical, const VkDeviceCreateInfo* info, Augmente
         });
     }
     // The tested 32-bit route uses storage buffers, not device addresses.
-    const nr::DeviceFeatureRequirements requirements(api, sizeof(void*) == 4);
+    const nr::DeviceFeatureRequirements requirements(api, sizeof(void*) == 4, a->arch);
     network.insert(network.end(), requirements.extensions.begin(), requirements.extensions.end());
+    auto have_ext = [&](const char* e) {
+        for (const auto& h : have) if (std::strcmp(h.extensionName, e) == 0) return true;
+        return false;
+    };
     for (const char* e : network) {
-        bool found = false;
-        for (const auto& h : have) found = found || std::strcmp(h.extensionName, e) == 0;
-        if (!found) {
+        if (!have_ext(e)) {
             log("[nr] device features left as the game asked: the GPU has no %s", e);
             return false;
         }
@@ -195,22 +217,38 @@ bool augment(VkPhysicalDevice physical, const VkDeviceCreateInfo* info, Augmente
         if (!listed(e, a->extensions.data(), a->extensions.size())) a->extensions.push_back(e);
     a->features = std::make_unique<nr::DeviceFeatures>(info->pNext);
     a->features->enable(a->arch, requirements.buffer_device_address);
-    bool robustness_ext = false;
-    for (const auto& h : have)
-        robustness_ext = robustness_ext || std::strcmp(h.extensionName, VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME) == 0;
+    bool robustness_ext = have_ext(VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME);
     const bool can_query_features2 = nr::can_query_physical_device_features2(
         api, inst_info.has_get_physical_device_properties2);
-    VkPhysicalDevicePipelineRobustnessFeaturesEXT prf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT};
-    if (can_query_features2 && (robustness_ext || api >= VK_API_VERSION_1_4)) {
-        VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &prf};
+    auto query_features2 = [&](void* feat_struct) {
+        VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, feat_struct};
         if (api >= VK_API_VERSION_1_1) {
             vkGetPhysicalDeviceFeatures2(physical, &f2);
-        } else if (inst_info.instance) {
+            return true;
+        }
+        if (inst_info.instance) {
             const auto get_features2_khr = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2KHR>(
                 vkGetInstanceProcAddr(inst_info.instance, "vkGetPhysicalDeviceFeatures2KHR"));
-            if (get_features2_khr) get_features2_khr(physical, &f2);
+            if (get_features2_khr) { get_features2_khr(physical, &f2); return true; }
+        }
+        return false;
+    };
+    if (a->arch == nr::arch::GpuArch::rdna2 && can_query_features2) {
+        const bool ext_idp = have_ext(VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME);
+        if (api >= VK_API_VERSION_1_3 || ext_idp) {
+            VkPhysicalDeviceShaderIntegerDotProductFeatures idp{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES};
+            if (query_features2(&idp) && idp.shaderIntegerDotProduct) {
+                a->features->enable_integer_dot_product();
+                if (api < VK_API_VERSION_1_3 && ext_idp &&
+                    !listed(VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME,
+                            a->extensions.data(), a->extensions.size()))
+                    a->extensions.push_back(VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME);
+            }
         }
     }
+    VkPhysicalDevicePipelineRobustnessFeaturesEXT prf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT};
+    if (can_query_features2 && (robustness_ext || api >= VK_API_VERSION_1_4)) query_features2(&prf);
     const nr::PipelineRobustnessRequirements robustness(
         api, inst_info.has_get_physical_device_properties2, robustness_ext, prf.pipelineRobustness != 0);
     if (robustness.enabled) {

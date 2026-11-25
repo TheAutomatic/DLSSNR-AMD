@@ -167,6 +167,10 @@ cp -- windows/data/aco/rdna3/records/*.nrp "$aco/rdna3/records/"
 cp -- windows/data/aco/rdna3/d3d12_outer.nra "$aco/rdna3/"
 cp -r -- windows/data/aco/rdna3/shells "$aco/rdna3/shells"
 cp -- windows/data/aco/rdna3/shell-aliases.txt "$aco/rdna3/"
+# RDNA2 (RX 6000): precompiled gfx10.3 ACO records for pure-SSBO FP16/INT8 kernels (synthesized via VK_KHR_pipeline_binary);
+# image/sampler kernels fall back per-kernel to the driver compiler using dlssnr-amd/shaders-rdna2[-int8].
+mkdir -p -- "$aco/rdna2/records"
+cp -- windows/data/aco/rdna2/records/*.nrp "$aco/rdna2/records/"
 if [[ "${NR_INT4:-1}" == 1 ]]; then
     # CC_SILVER_AARDWOLD_OPTIMIZED with its int4 layers as ACO's machine code (windows/data/aco/int4/records: the records
     # of its three int4 levels, Balanced, Performance and Ultra Performance - one folder, the records are named by their

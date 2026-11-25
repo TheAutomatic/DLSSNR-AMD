@@ -618,7 +618,7 @@ struct FootRow { const char* label; std::string value; bool lit = false; };
 // ACO Mode in this run (the Network page says why when off): "On (RDNA4)" lit, "Off", "-" until NR first runs
 inline FootRow aco_row(const nr::control::Shared* s) {
     const uint32_t a = s ? s->aco_state : 0;
-    if (a == 1) return {NR_N("ACO"), std::string(tr("On")) + (s->aco_rdna3 ? " (RDNA3)" : " (RDNA4)"), true};
+    if (a == 1) return {NR_N("ACO"), std::string(tr("On")) + (s->aco_rdna3 == 1 ? " (RDNA3)" : s->aco_rdna3 == 2 ? " (RDNA2)" : " (RDNA4)"), true};
     return {NR_N("ACO"), a >= 2 && a <= 4 ? tr("Off") : tr("-"), false};
 }
 // The device the network runs on (Shared::device_path): "Bridge" (a Vulkan device of NR's own beside the game's D3D),
@@ -816,7 +816,7 @@ inline std::string report_text(const nr::control::Shared* s, const char* module,
             add("Render %ux%u, output %ux%u", s->render_width, s->render_height, s->output_width, s->output_height);
         else if (s->render_width)   // (the D3D12 passthrough's Present layers: the upscaler's output is not reported there)
             add("Render %ux%u, output not reported on this path", s->render_width, s->render_height);
-        add("ACO Mode: %s%s%s", s->aco_state == 1 ? (s->aco_rdna3 ? "on (RDNA3)" : "on (RDNA4)")
+        add("ACO Mode: %s%s%s", s->aco_state == 1 ? (s->aco_rdna3 == 1 ? "on (RDNA3)" : s->aco_rdna3 == 2 ? "on (RDNA2)" : "on (RDNA4)")
                                 : s->aco_state >= 2 && s->aco_state <= 4 ? "off" : "not known yet",
             s->aco_why[0] ? " - " : "", s->aco_why);
         add("%s", path_text(s->device_path));
@@ -1300,10 +1300,12 @@ inline void draw_network_options(nr::ini_edit::Ini& ini, const nr::control::Shar
         switch (s->aco_state) {
             case 1:
                 ImGui::TextWrapped(tr("ACO Mode: on in this run (machine code for %s)"),
-                                   s->aco_rdna3 ? tr("RDNA3: RX 7000, Radeon 700M / 800M / 8000S") : tr("RDNA4: RX 9000"));
+                                   s->aco_rdna3 == 1 ? tr("RDNA3: RX 7000, Radeon 700M / 800M / 8000S")
+                                 : s->aco_rdna3 == 2 ? tr("RDNA2: RX 6000")
+                                                     : tr("RDNA4: RX 9000"));
                 break;
             case 2: case 3: case 4:
-                ImGui::TextWrapped(tr("ACO Mode: off in this run%s%s - an RX 9000 runs the network compiled by the AMD driver; "
+                ImGui::TextWrapped(tr("ACO Mode: off in this run%s%s - RX 9000 and RX 6000 run the network compiled by the AMD driver; "
                                       "RX 7000 and Radeon 700M / 800M / 8000S graphics have no NR"),
                                    s->aco_why[0] ? ": " : "", tr_text(s->aco_why));
                 break;
@@ -1321,15 +1323,15 @@ inline void draw_network_options(nr::ini_edit::Ini& ini, const nr::control::Shar
         }
     }
     {   // [GPU] Architecture: auto, or set by hand where NR cannot tell the GPU (nr_gpu_arch.hpp with_manual)
-        static const char* const keys[] = {"auto", "rdna4", "rdna3"};
+        static const char* const keys[] = {"auto", "rdna4", "rdna3", "rdna2"};
         static const char* const names[] = {NR_N("Auto (AMD's driver tells)"), NR_N("RDNA4: RX 9000"),
-                                            NR_N("RDNA3: RX 7000, Radeon 700M / 800M / 8000S")};
+                                            NR_N("RDNA3: RX 7000, Radeon 700M / 800M / 8000S"), NR_N("RDNA2: RX 6000")};
         std::string v = ini.get("GPU", "Architecture", "auto");
         for (char& c : v) c = char(std::tolower(static_cast<unsigned char>(c)));
         int cur = 0;
-        for (int i = 0; i < 3; ++i) if (v == keys[i]) cur = i;
+        for (int i = 0; i < 4; ++i) if (v == keys[i]) cur = i;
         if (ImGui::BeginCombo(tr("GPU architecture (restart the game)##gpu"), tr(names[cur]))) {
-            for (int i = 0; i < 3; ++i)
+            for (int i = 0; i < 4; ++i)
                 if (ImGui::Selectable(tr(names[i]), i == cur)) ini.set("GPU", "Architecture", keys[i]);
             ImGui::EndCombo();
         }
@@ -1339,6 +1341,9 @@ inline void draw_network_options(nr::ini_edit::Ini& ini, const nr::control::Shar
              "code and the game may stop - set it back to Auto). "
              "Takes effect when the game restarts.");
     }
+    ini_flag(ini, "RDNA2 INT8 kernels (restart the game)##net", "Network", "Rdna2Int8", "0",
+             "[Network] Rdna2Int8. RX 6000 (RDNA2) only: 1 = use INT8 dot4 kernels where the device supports "
+             "shaderIntegerDotProduct; 0 = use FP16 kernels (default). Takes effect when the game restarts.");
     {
         const std::string k = ini.get("Network", "Hotkey", "Ctrl+F11");
         ImGui::TextDisabled(tr("Next network: %s (see Hotkeys)"), k.empty() ? tr("no key") : k.c_str());

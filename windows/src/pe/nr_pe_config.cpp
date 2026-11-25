@@ -388,6 +388,7 @@ bool parse(const std::string& path, Config& c, bool& legacy) {
             else if (key == "resize history") { if (auto b = parse_bool(value)) n.resize_history = *b; }
             else if (key == "style grade") { if (auto b = parse_bool(value)) n.style_grade = *b; }
             else if (key == "memory guard") { if (auto b = parse_bool(value)) n.memory_guard = *b; }
+            else if (key == "rdna2int8") { if (auto b = parse_bool(value)) n.rdna2_int8 = *b; }
             else if (key == "optimizedlayers") { if (const int v = nr::optimized_layers_value(value); v >= 0) n.optimized_layers = v; }
             else if (key == "history precision") {
                 const std::string v = lower(value);
@@ -1645,13 +1646,18 @@ void write_network(FILE* f, const NetworkConfig& n) {
         "; 32 = 32-bit, as up to 0.0.8.1 (4K: 133 MB more a network, 66 MB more each further pass)\n"
         "; With several passes the two can differ in fine detail. Applied at once (the previous result starts afresh)\n"
         "\n"
+        "Rdna2Int8 = %d\n"
+        "; RDNA2 (RX 6000) only: 1 = use INT8 dot4 kernels where the device supports shaderIntegerDotProduct;\n"
+        "; 0 = use FP16 kernels (default). Takes effect when the game restarts\n"
+        "\n"
         "; ACO Mode is not a setting: the network always runs as machine code made in advance by the ACO compiler (the\n"
         "; one the Linux version uses), loaded by the AMD driver. When that cannot be used, NR Control and dlssnr-amd.log\n"
-        "; say why, and an RX 9000 runs the network compiled by the AMD driver instead (without CC_SMALL_FP8_EXPERIMENTAL\n"
-        "; and CC_SILVER_AARDWOLD_OPTIMIZED); RX 7000 and the Radeon 700M / 800M / 8000S graphics have no NR then.\n"
+        "; say why, and an RX 9000 or RX 6000 runs the network compiled by the AMD driver instead (without\n"
+        "; CC_SMALL_FP8_EXPERIMENTAL and CC_SILVER_AARDWOLD_OPTIMIZED); RX 7000 and the Radeon 700M / 800M / 8000S\n"
+        "; graphics have no NR then.\n"
         "\n", nr::network_codename(n.model), n.optimized_layers, n.hotkey.c_str(), n.sound ? 1 : 0, residency_name(n.residency),
         n.motion_without_depth ? 1 : 0, n.resize_history ? 1 : 0, n.style_grade ? 1 : 0, osd_name(n.osd),
-        n.memory_guard ? 1 : 0, n.history_f16 ? 16 : 32);
+        n.memory_guard ? 1 : 0, n.history_f16 ? 16 : 32, n.rdna2_int8 ? 1 : 0);
 }
 
 void write_preprocess(FILE* f, const PreprocessConfig& p) {
@@ -1808,7 +1814,8 @@ void write_gpu(FILE* f) {
         "Architecture = auto\n"
         "; auto (default) = AMD's driver tells it (its compiler names the GPU the code is for; a renamed or spoofed GPU -\n"
         ";                  OptiScaler's GPU spoofing - does not change that)\n"
-        "; rdna4 = an RX 9000 (RDNA4). rdna3 = an RX 7000 or Radeon 700M / 800M / 8000S graphics (RDNA3 / RDNA3.5)\n"
+        "; rdna4 = an RX 9000 (RDNA4). rdna3 = an RX 7000 or Radeon 700M / 800M / 8000S graphics (RDNA3 / RDNA3.5).\n"
+        "; rdna2 = an RX 6000 (RDNA2, or wave32 cross-GPU testing via Vulkan)\n"
         "; Set it by hand where NR says it cannot tell the GPU: it is then used as set, whatever the driver or the GPU's\n"
         "; IDs say (a wrong one runs another GPU's machine code: the game may stop - set it back to auto)\n");
 }
@@ -1822,8 +1829,9 @@ nr::arch::GpuArch gpu_manual(std::string* said) {
         for (const char* c = b; *c; ++c) if (!std::isspace(static_cast<unsigned char>(*c))) t += char(std::tolower(static_cast<unsigned char>(*c)));
         if (t == "rdna4") return std::make_pair(nr::arch::GpuArch::rdna4, t);
         if (t == "rdna3") return std::make_pair(nr::arch::GpuArch::rdna3, t);
+        if (t == "rdna2") return std::make_pair(nr::arch::GpuArch::rdna2, t);
         if (!t.empty() && t != "auto")
-            log("[nr] dlssnr-amd.ini [GPU] Architecture = %s not understood (auto, rdna4 or rdna3): auto", t.c_str());
+            log("[nr] dlssnr-amd.ini [GPU] Architecture = %s not understood (auto, rdna4, rdna3 or rdna2): auto", t.c_str());
         return std::make_pair(nr::arch::GpuArch::unknown, std::string("auto"));
     }();
     if (said) *said = v.second;

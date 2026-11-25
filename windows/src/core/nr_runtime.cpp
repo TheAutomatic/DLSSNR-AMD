@@ -1424,8 +1424,25 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     // was not (a game's device made before we could add them) builds with the driver's compiler.
     if (!nr::binary::directory().empty() && !nr::binary::enabled(host.device))
         nr::binary::disable("the device was created without pipeline binaries");
-    // The ACO folder is the architecture's own: RDNA3's records are gfx11 code, the bundle's own (RDNA4's) gfx12.
+    // The ACO folder is the architecture's own: RDNA3's records are gfx11 code, RDNA2's gfx10.3,
+    // the bundle's own (RDNA4's) gfx12.
     switch (host.arch) {
+    case nr::arch::GpuArch::rdna2:
+        if (!nr::binary::directory().empty()) {
+            const nr::arch::Identity physical = nr::arch::identify(host.physical, false);
+            if (physical.arch == nr::arch::GpuArch::rdna2) {
+                std::string why;
+                if (!nr::binary::use_rdna2(&why)) {
+                    nr::logf("[nr] ACO off on RDNA2 (%s): driver compiles SPIR-V", why.c_str());
+                    nr::binary::disable(why);
+                }
+            } else {
+                nr::logf("[nr] cross-GPU RDNA2 test on %s: disabling ACO for driver SPIR-V compile",
+                         nr::arch::name(physical.arch));
+                nr::binary::disable("cross-GPU RDNA2 test uses driver SPIR-V compilation");
+            }
+        }
+        break;
     case nr::arch::GpuArch::rdna3:
         if (!nr::binary::directory().empty()) {
             std::string why;
@@ -1438,17 +1455,18 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         break;
     case nr::arch::GpuArch::rdna4: {
         const std::string d = nr::binary::directory();
-        if (d.size() > 6 && d.compare(d.size() - 6, 6, "/rdna3") == 0)
-            throw std::runtime_error("this GPU (RDNA4) needs the bundle's own ACO network, and the process's ACO folder is "
-                                     "RDNA3's (" + d + ")");
+        if (nr::binary::is_rdna2_dir(d) || (d.size() > 6 && d.compare(d.size() - 6, 6, "/rdna3") == 0))
+            throw std::runtime_error("this GPU (RDNA4) needs the bundle's own ACO network, and the process's ACO folder is " +
+                                     d);
         break;
     }
-    case nr::arch::GpuArch::unknown: case nr::arch::GpuArch::rdna1: case nr::arch::GpuArch::rdna2:
+    case nr::arch::GpuArch::unknown: case nr::arch::GpuArch::rdna1:
         break;   // refused above
     }
     const std::string aco = nr::binary::directory();
     const auto native_shaders = installed ? data / "shaders" : root / "build";
-    const auto network_shaders = !aco.empty() ? std::filesystem::path(aco) / "shaders" : native_shaders;
+    std::filesystem::path network_shaders = !aco.empty() ? std::filesystem::path(aco) / "shaders" : native_shaders;
+    bool rdna2_int8 = false;
     // Shaders are read from inside the NR root, or from the ACO bundle when one is in use.
     const auto inside = [&](const std::filesystem::path& p) {
         for (const auto& base : {root, aco.empty() ? root : std::filesystem::canonical(aco)}) {
@@ -1493,7 +1511,8 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         // machine code - ACO Mode only, as int4 mixed; RDNA3: the bundle's own aco/rdna3/experimental/shaders);
         // anything missing: the small model.
         if (v == 2) {
-            const char* missing = !installed ? "not an installed tree"
+            const char* missing = host.arch == nr::arch::GpuArch::rdna2 ? "RDNA2 uses CC_SMALL_FP8 / CC_SILVER_AARDWOLD only"
+                : !installed ? "not an installed tree"
                 : aco.empty() ? "it needs ACO Mode (a driver with pipeline binaries)"
                 : !std::filesystem::is_regular_file(xroot / "shaders" / "fixed-attention.txt", ec) ||
                           !std::filesystem::is_directory(xroot / "shaders" / "temporal", ec) ? x_incomplete.c_str()
@@ -1513,7 +1532,8 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         // anything missing: the 310.8 model as it is.
         if (v == 3) {
             network = NetworkModel::Original;
-            const char* missing = !installed ? "not an installed tree"
+            const char* missing = host.arch == nr::arch::GpuArch::rdna2 ? "RDNA2 uses CC_SMALL_FP8 / CC_SILVER_AARDWOLD only"
+                : !installed ? "not an installed tree"
                 : aco.empty() ? "it needs ACO Mode (a driver with pipeline binaries)"
                 : !std::filesystem::is_regular_file(oroot / "shaders" / "fixed-attention.txt", ec) ||
                           !std::filesystem::is_directory(oroot / "shaders" / "temporal", ec) ? o_incomplete.c_str()
@@ -1629,6 +1649,37 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         }
     }
     s.ctx.require_matrix_config();
+    if (host.arch == nr::arch::GpuArch::rdna2) {
+        std::string i8_env;
+#ifdef _WIN32
+        { char b[16] = {}; const unsigned long n = GetEnvironmentVariableA("NR_RDNA2_INT8", b, sizeof b); if (n && n < sizeof b) i8_env = b; }
+#endif
+        if (i8_env.empty()) if (const char* e = std::getenv("NR_RDNA2_INT8")) i8_env = e;
+        bool want_int8 = false;
+        const char* int8_from = "default";
+        if (!i8_env.empty()) {
+            want_int8 = std::atoi(i8_env.c_str()) != 0;
+            int8_from = "NR_RDNA2_INT8";
+        } else {
+            const int iv = nr::ini_rdna2_int8(writable_ini_file(data.parent_path()));
+            if (iv == 1) { want_int8 = true; int8_from = "dlssnr-amd.ini"; }
+        }
+        const std::filesystem::path fp16_shaders = installed ? (data / "shaders-rdna2") : (root / "build/windows/rdna2/network");
+        const std::filesystem::path int8_shaders = installed ? (data / "shaders-rdna2-int8") : (root / "build/windows/rdna2/network-int8");
+        std::error_code ec;
+        if (want_int8) {
+            if (!s.ctx.int8_dot) {
+                nr::logf("[nr] RDNA2 INT8 requested (%s) but device lacks shaderIntegerDotProduct: using FP16", int8_from);
+            } else if (!std::filesystem::is_regular_file(int8_shaders / "shader-constants.txt", ec)) {
+                nr::logf("[nr] RDNA2 INT8 requested (%s) but %s is missing: using FP16", int8_from, int8_shaders.string().c_str());
+            } else {
+                rdna2_int8 = true;
+                nr::logf("[nr] RDNA2 INT8 kernels enabled (%s)%s", int8_from,
+                         s.ctx.int8_dot_accel ? "" : " (software/unaccelerated dot4 reported)");
+            }
+        }
+        network_shaders = rdna2_int8 ? int8_shaders : fp16_shaders;
+    }
 #if NR_INT4
     // CC_SILVER_AARDWOLD_OPTIMIZED's level of optimized layers (the caller's choice - the in-game switch - over
     // DLSSNR_INT4 over dlssnr-amd.ini [Network] OptimizedLayers; none of them: Ultra Performance). Balanced, Performance and Ultra
@@ -1667,7 +1718,8 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         std::error_code ec;
         const std::string incomplete = "dlssnr-amd/" + i4root.filename().string() + "/ is incomplete";
         const std::string no_weights = "dlssnr-amd/" + i4weights.filename().string() + " is missing (run install.ps1 again)";
-        const char* missing = network == NetworkModel::Small ? "the small model has no int4 layers"
+        const char* missing = host.arch == nr::arch::GpuArch::rdna2 ? "RDNA2 does not support INT4 layers"
+            : network == NetworkModel::Small ? "the small model has no int4 layers"
             : !installed ? "not an installed tree"
             : !std::filesystem::is_directory(i4spv / "temporal", ec) || !std::filesystem::is_directory(i4root / "vit", ec) ||
                       !std::filesystem::is_regular_file(i4root / "settings.txt", ec) ? incomplete.c_str()
@@ -1720,9 +1772,11 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         return e && *e ? std::atoi(e) != 0 : kArenaReuseDefault;
     };
     const std::filesystem::path cache_data = installed ? writable_cache_base(data) : data;
+    const char* rdna2_inst_cache = rdna2_int8 ? "pipeline-rdna2-int8.cache" : "pipeline-rdna2.cache";
+    const char* rdna2_dev_cache = rdna2_int8 ? "dlssnr-amd-rdna2-int8.pipelinecache" : "dlssnr-amd-rdna2.pipelinecache";
     const std::filesystem::path cache_file = installed
-        ? (cache_data / "pipeline.cache")
-        : (writable_cache_base(root) / "dlssnr-amd.pipelinecache");
+        ? (cache_data / (host.arch == nr::arch::GpuArch::rdna2 ? rdna2_inst_cache : "pipeline.cache"))
+        : (writable_cache_base(root) / (host.arch == nr::arch::GpuArch::rdna2 ? rdna2_dev_cache : "dlssnr-amd.pipelinecache"));
     {
         std::error_code cec;
         std::filesystem::create_directories(cache_file.parent_path(), cec);
@@ -1734,6 +1788,7 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         "--source-height", std::to_string(mh), "--accumulation", config.accumulation,
         "--pipeline-cache", cache_file.string(),
         "--lazy-images"};
+    if (host.arch == nr::arch::GpuArch::rdna2) arguments.push_back("--spv-dir-aco");
     if (experimental || optimized) {   // CC_SMALL_FP8_EXPERIMENTAL, CC_SILVER_AARDWOLD_OPTIMIZED: their own shaders (ACO SPIR-V: kept with ACO Mode on) and pipeline caches
         const std::filesystem::path& var_root = experimental ? xroot : oroot;
         const std::filesystem::path var_cache = ((cache_data == data) ? var_root : (cache_data / var_root.filename())) / "pipeline.cache";
@@ -1871,8 +1926,12 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     }
     impl_->width = config.width; impl_->height = config.height;
     // The runtime passes are the driver's compile in either case (the ACO bundle's are the same SPIR-V).
+    const std::filesystem::path default_adapters =
+        (host.arch == nr::arch::GpuArch::rdna2 && !std::filesystem::exists(native_shaders / "runtime" / "runtime_alpha.spv"))
+            ? (network_shaders / "runtime")
+            : (native_shaders / "runtime");
     const auto adapters = std::filesystem::canonical(config.adapter_shaders.empty()
-        ? native_shaders / "runtime" : std::filesystem::path(config.adapter_shaders));
+        ? default_adapters : std::filesystem::path(config.adapter_shaders));
     nrvk::set_compute_blit_spirv((adapters / "runtime_blit.spv").string());   // (nrvk::blit on compute-only lists)
     if (!inside(adapters))
         throw std::invalid_argument("adapter shaders must be inside NR root");
@@ -1936,7 +1995,8 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         auto& t = impl_->temporal;
         // The temporal pre/post blocks are network kernels: the ACO bundle's own SPIR-V when it is in use.
         auto shaders = std::filesystem::canonical(temporal_config.shaders.empty()
-            ? (!aco.empty() ? std::filesystem::path(aco) / "shaders/temporal"
+            ? (host.arch == nr::arch::GpuArch::rdna2 ? network_shaders / "temporal"
+               : !aco.empty() ? std::filesystem::path(aco) / "shaders/temporal"
                : installed ? data / "shaders/temporal" : root / "build/windows/rdna4/network/temporal")
             : std::filesystem::path(temporal_config.shaders));
         if (experimental) shaders = std::filesystem::canonical(xroot / "shaders" / "temporal");
@@ -2336,7 +2396,7 @@ static bool adopt_for(nrvk::Context& ctx, const HostDevice& host) {
 // that records (the render thread reads these arenas while it picks an activation arena for a build).
 bool download_network_weights(const HostDevice& host, const RuntimeCore& core, std::vector<uint8_t>& out) {
     const GraphArenas* a = core.slot ? core.slot.get() : core.graph ? core.graph->arenas.get() : nullptr;
-    if (!a || !a->wgt.handle || !a->weights_end) return false;
+    if (!a || !a->wgt.handle || !a->weights_end || a->rdna2_int8) return false;
     nrvk::Context ctx;
     if (!adopt_for(ctx, host)) return false;
     try {
@@ -2370,6 +2430,8 @@ void release_network(const RuntimeCore& core, std::vector<uint8_t>&& weights) {
 }
 
 bool offload_network(const HostDevice& host, const RuntimeCore& core) {
+    const GraphArenas* a = core.slot ? core.slot.get() : core.graph ? core.graph->arenas.get() : nullptr;
+    if (a && a->rdna2_int8) return false;
     std::vector<uint8_t> w;
     if (!download_network_weights(host, core, w)) return false;
     release_network(core, std::move(w));
@@ -2386,7 +2448,7 @@ bool reload_network(const HostDevice& host, const RuntimeCore& core, const std::
     if (!arena) {
         if (act && act->act && act->act->device == a->device && act->act->cap >= a->act_want) {
             arena = act->act;
-            if (ctx.rdna3 && arena && !arena->twin.handle && arena->cap) {
+            if (ctx.fp16() && arena && !arena->twin.handle && arena->cap) {
                 arena->twin = ctx.buffer(VkDeviceSize(arena->cap) * 2);
             }
         } else {
@@ -2394,23 +2456,23 @@ bool reload_network(const HostDevice& host, const RuntimeCore& core, const std::
             g->device = a->device; g->cap = size_t(double(a->act_want) * std::max(1.0, slack) + 255) / 256 * 256;
             nr::vram::Scope kind(nr::vram::kActivations);
             g->buf = ctx.buffer(g->cap, false, /*device_address=*/true);   // freed by ~GraphAct if what follows throws
-            if (ctx.rdna3) {
+            if (ctx.fp16()) {
                 g->twin = ctx.buffer(VkDeviceSize(g->cap) * 2);
             }
             arena = std::move(g);
         }
-    } else if (ctx.rdna3 && !arena->twin.handle && arena->cap) {
+    } else if (ctx.fp16() && !arena->twin.handle && arena->cap) {
         arena->twin = ctx.buffer(VkDeviceSize(arena->cap) * 2);
     }
     nrvk::Buffer w{}, w_e{};
     nr::vram::Scope kind(nr::vram::kWeights);
     try {
         w = ctx.buffer(a->wgt_cap);
-        if (ctx.rdna3) {
+        if (ctx.fp16()) {
             w_e = ctx.buffer(VkDeviceSize(a->wgt_cap) * 2);
         }
         ctx.upload(w, 0, a->host_weights.data(), a->host_weights.size());
-        if (ctx.rdna3) {
+        if (ctx.fp16()) {
             std::array<uint16_t, 256> to_f16{};
             for (int i = 0; i < 256; ++i) to_f16[size_t(i)] = tin::f_to_f16(tin::e4m3_to_f(uint8_t(i)));
             std::vector<uint8_t> f16_buf(a->host_weights.size() * 2);
@@ -2424,7 +2486,7 @@ bool reload_network(const HostDevice& host, const RuntimeCore& core, const std::
         throw;
     }
     a->wgt = w;
-    if (ctx.rdna3) a->wgt_e = w_e;
+    if (ctx.fp16()) a->wgt_e = w_e;
     a->act = std::move(arena);
     a->loaded = 0;   // the tail and the noise fields: the first recording (retarget)
     std::vector<uint8_t>().swap(a->host_weights);
@@ -3545,7 +3607,10 @@ bool plan_d3d12_network(const std::string& root_in, uint32_t mw, uint32_t mh, bo
         case nr::arch::GpuArch::rdna4:
             if (aco.size() > 6 && aco.compare(aco.size() - 6, 6, "/rdna3") == 0) aco.resize(aco.size() - 6);
             break;
-        case nr::arch::GpuArch::unknown: case nr::arch::GpuArch::rdna1: case nr::arch::GpuArch::rdna2:
+        case nr::arch::GpuArch::rdna2:
+            *why = "RDNA2 uses the Vulkan bridge / SPIR-V path";
+            return false;
+        case nr::arch::GpuArch::unknown: case nr::arch::GpuArch::rdna1:
             *why = std::string("NR has no network for this GPU's architecture (") + nr::arch::name(arch) + ")";
             return false;
         }

@@ -464,7 +464,10 @@ void on_device(ID3D12Device* device) {
         if (elf::is_gfx11_mach(id.mach)) set_gfx11_mach(id.mach);
         break;
     }
-    case nr::arch::GpuArch::unknown: case nr::arch::GpuArch::rdna1: case nr::arch::GpuArch::rdna2:
+    case nr::arch::GpuArch::rdna2:
+        finish_canary(Canary::kFail, "RDNA2 uses the Vulkan bridge / SPIR-V path");
+        return;
+    case nr::arch::GpuArch::unknown: case nr::arch::GpuArch::rdna1:
         finish_canary(Canary::kFail, name + ": NR has no network for this GPU (" + nr::arch::describe(id) + ")");
         return;
     }

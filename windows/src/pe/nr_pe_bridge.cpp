@@ -245,19 +245,41 @@ bool Device::create(const LUID& luid, std::string* why) {
         }
         break;
     }
-    case nr::arch::GpuArch::unknown: case nr::arch::GpuArch::rdna1: case nr::arch::GpuArch::rdna2:
+    case nr::arch::GpuArch::rdna2: {
+        if (!nr::binary::directory().empty()) {
+            const nr::arch::Identity physical = nr::arch::identify(physical_, false);
+            if (physical.arch == nr::arch::GpuArch::rdna2) {
+                std::string aco;
+                if (!nr::binary::use_rdna2(&aco)) {
+                    log("[nr] bridge: ACO off on RDNA2 (%s): driver compiles SPIR-V", aco.c_str());
+                    nr::binary::disable(aco);
+                }
+            } else {
+                log("[nr] bridge: cross-GPU RDNA2 test on %s: disabling ACO for driver SPIR-V compile",
+                    nr::arch::name(physical.arch));
+                nr::binary::disable("cross-GPU RDNA2 test uses driver SPIR-V compilation");
+            }
+        }
+        break;
+    }
+    case nr::arch::GpuArch::unknown: case nr::arch::GpuArch::rdna1:
         *why = std::string(chosen.deviceName) + ": NR has no network for this GPU (" + nr::arch::describe(id) + ")";
         unidentified_ = id.arch == nr::arch::GpuArch::unknown && !id.mach && nr::arch::manual() == nr::arch::GpuArch::unknown;
         return false;
     }
     arch_ = id.arch;
-    const bool fp8_network = arch_ == nr::arch::GpuArch::rdna4;   // RDNA3's network has no FP8 (nr_gpu_arch.hpp)
+    const bool fp8_network = arch_ == nr::arch::GpuArch::rdna4;   // RDNA3/RDNA2 networks have no FP8 (nr_gpu_arch.hpp)
+    const bool rdna2 = arch_ == nr::arch::GpuArch::rdna2;
 
     uint32_t n = 0;
     vkEnumerateDeviceExtensionProperties(physical_, nullptr, &n, nullptr);
     std::vector<VkExtensionProperties> have(n);
     vkEnumerateDeviceExtensionProperties(physical_, nullptr, &n, have.data());
-    std::vector<const char*> extensions(std::begin(kRequiredExtensions), std::end(kRequiredExtensions));
+    std::vector<const char*> extensions;
+    for (const char* e : kRequiredExtensions) {
+        if (rdna2 && std::strcmp(e, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME) == 0) continue;
+        extensions.push_back(e);
+    }
     if (fp8_network) extensions.push_back(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
     for (const char* e : extensions) {
         bool found = false;
@@ -291,10 +313,19 @@ bool Device::create(const LUID& luid, std::string* why) {
     q.pNext = &coop; coop.pNext = &fp8; fp8.pNext = &f11; f11.pNext = &f12; f12.pNext = &f13; f13.pNext = &wml;
     wml.pNext = &prf;
     vkGetPhysicalDeviceFeatures2(physical_, &q);
+    VkPhysicalDeviceFloatControlsProperties fc{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
+    VkPhysicalDeviceSubgroupProperties sub{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+    if (rdna2) {
+        VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &fc};
+        fc.pNext = &sub;
+        vkGetPhysicalDeviceProperties2(physical_, &p2);
+    }
     struct { bool have; const char* name; } required[] = {
-        {bool(coop.cooperativeMatrix), "cooperativeMatrix"},
+        {rdna2 || bool(coop.cooperativeMatrix), "cooperativeMatrix"},
         {!fp8_network || bool(fp8.shaderFloat8), "shaderFloat8"},
         {!fp8_network || bool(fp8.shaderFloat8CooperativeMatrix), "shaderFloat8CooperativeMatrix"},
+        {!rdna2 || bool(fc.shaderRoundingModeRTEFloat16), "shaderRoundingModeRTEFloat16"},
+        {!rdna2 || bool(sub.supportedOperations & VK_SUBGROUP_FEATURE_SHUFFLE_BIT), "subgroupShuffle"},
         {bool(f11.storageBuffer16BitAccess), "storageBuffer16BitAccess"},
         {bool(f12.storageBuffer8BitAccess), "storageBuffer8BitAccess"},
         {bool(f12.shaderFloat16), "shaderFloat16"},
@@ -309,6 +340,7 @@ bool Device::create(const LUID& luid, std::string* why) {
     for (const auto& r : required)
         if (!r.have) { *why = std::string(chosen.deviceName) + " lacks " + r.name; return false; }
     const bool sync2 = f13.synchronization2;
+    const bool int8_dot = f13.shaderIntegerDotProduct != 0;
 
     coop = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
     coop.cooperativeMatrix = VK_TRUE;
@@ -322,6 +354,7 @@ bool Device::create(const LUID& luid, std::string* why) {
     f13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     f13.subgroupSizeControl = VK_TRUE;
     f13.synchronization2 = sync2 ? VK_TRUE : VK_FALSE;
+    f13.shaderIntegerDotProduct = (rdna2 && int8_dot) ? VK_TRUE : VK_FALSE;
     wml = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_FEATURES_KHR};
     wml.workgroupMemoryExplicitLayout = wml.workgroupMemoryExplicitLayout8BitAccess =
         wml.workgroupMemoryExplicitLayout16BitAccess = VK_TRUE;
@@ -348,7 +381,7 @@ bool Device::create(const LUID& luid, std::string* why) {
     VkDeviceQueueCreateInfo qi{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qi.queueFamilyIndex = family_; qi.queueCount = 1; qi.pQueuePriorities = &priority;
     VkDeviceCreateInfo di{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
-    di.pNext = &coop;
+    di.pNext = rdna2 ? static_cast<void*>(&f11) : static_cast<void*>(&coop);
     di.queueCreateInfoCount = 1; di.pQueueCreateInfos = &qi;
     di.enabledExtensionCount = uint32_t(extensions.size());
     di.ppEnabledExtensionNames = extensions.data();

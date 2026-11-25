@@ -22,8 +22,8 @@ inline const char* name(GpuArch a) {
 // NR has a network for it (and its data in the package).
 inline bool has_network(GpuArch a) {
     switch (a) {
-    case GpuArch::rdna3: case GpuArch::rdna4: return true;
-    case GpuArch::unknown: case GpuArch::rdna1: case GpuArch::rdna2: break;
+    case GpuArch::rdna2: case GpuArch::rdna3: case GpuArch::rdna4: return true;
+    case GpuArch::unknown: case GpuArch::rdna1: break;
     }
     return false;
 }
@@ -32,7 +32,8 @@ inline const char* aco_folder(GpuArch a) {
     switch (a) {
     case GpuArch::rdna4: return "";
     case GpuArch::rdna3: return "rdna3";
-    case GpuArch::unknown: case GpuArch::rdna1: case GpuArch::rdna2: break;
+    case GpuArch::rdna2: return "rdna2";
+    case GpuArch::unknown: case GpuArch::rdna1: break;
     }
     return nullptr;
 }

@@ -252,4 +252,46 @@ int main() {
 
     std::puts("PASS: unknown API safety & pNext lower-bound inference; explicit 1.0/1.1/1.2/1.3/1.4 extension/BDA/features2 policy");
     std::puts("PASS: ASI/ReShade instance tracking, vkDestroyInstance cleanup, and handle-reuse safety; pipeline robustness chain preservation");
+
+    // 5. RDNA2 extension & feature requirements (no cooperativeMatrix, extra float_controls/subgroup_extended_types < 1.2, integerDotProduct).
+    auto extensions_for = [](uint32_t api, bool x86, nr::arch::GpuArch arch) {
+        const nr::DeviceFeatureRequirements req(api, x86, arch);
+        return std::set<std::string>(req.extensions.begin(), req.extensions.end());
+    };
+    for (bool x86 : {false, true}) {
+        for (uint32_t api : {VK_API_VERSION_1_0, VK_API_VERSION_1_1}) {
+            const auto exts = extensions_for(api, x86, nr::arch::GpuArch::rdna2);
+            assert(exts.count(VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME) == 1);
+            assert(exts.count(VK_KHR_SHADER_SUBGROUP_EXTENDED_TYPES_EXTENSION_NAME) == 1);
+        }
+        for (uint32_t api : {VK_API_VERSION_1_2, VK_API_VERSION_1_3}) {
+            const auto exts = extensions_for(api, x86, nr::arch::GpuArch::rdna2);
+            assert(exts.count(VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME) == 0);
+            assert(exts.count(VK_KHR_SHADER_SUBGROUP_EXTENDED_TYPES_EXTENSION_NAME) == 0);
+        }
+    }
+    {
+        nr::DeviceFeatures rdna2_feat(nullptr);
+        rdna2_feat.enable(nr::arch::GpuArch::rdna2, true);
+        assert(!rdna2_feat.find<VkPhysicalDeviceCooperativeMatrixFeaturesKHR>(
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR));
+        assert(!rdna2_feat.find<VkPhysicalDeviceShaderFloat8FeaturesEXT>(
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT));
+        rdna2_feat.enable_integer_dot_product();
+        auto* idp = rdna2_feat.find<VkPhysicalDeviceShaderIntegerDotProductFeatures>(
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES);
+        assert(idp && idp->shaderIntegerDotProduct == VK_TRUE);
+    }
+    {
+        VkPhysicalDeviceVulkan13Features app13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+        nr::DeviceFeatures v13_idp(&app13);
+        v13_idp.enable(nr::arch::GpuArch::rdna2, true);
+        v13_idp.enable_integer_dot_product();
+        auto* f13 = v13_idp.find<VkPhysicalDeviceVulkan13Features>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES);
+        assert(f13 && f13->shaderIntegerDotProduct == VK_TRUE);
+        assert(!v13_idp.find<VkPhysicalDeviceShaderIntegerDotProductFeatures>(
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES));
+        assert(app13.shaderIntegerDotProduct == VK_FALSE);
+    }
+    std::puts("PASS: RDNA2 extensions, no cooperativeMatrix/float8, and integerDotProduct chaining");
 }

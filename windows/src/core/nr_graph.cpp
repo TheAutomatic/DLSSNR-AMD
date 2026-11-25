@@ -169,8 +169,8 @@ static std::vector<uint8_t> g_tc_nobar;
 static std::vector<uint32_t> g_tc_words;
 static std::vector<size_t> g_tc_err;   // error words, as indices into g_tc_words
 static size_t g_tc_base = 0;
-static bool tchain_active(bool rdna3 = false) {
-    if (!NR_TCHAIN_TILES || g_chain_epoch_word == 0xFFFFFFFFu) return false;
+static bool tchain_active(bool rdna3 = false, bool rdna2 = false) {
+    if (!NR_TCHAIN_TILES || g_chain_epoch_word == 0xFFFFFFFFu || rdna2) return false;
     const char* e = std::getenv("NR_TCHAIN");
     if (rdna3) {
         // RDNA3 initial default: explicit barriers. Chaining is opt-in via NR_TCHAIN=1.
@@ -184,7 +184,7 @@ static bool tchain_active(bool rdna3 = false) {
 // attention -> projection -> the next expand (QKV -> attention needs every
 // token and keeps its barrier). The arena layout probe asks before any offset
 // exists, so this looks only at the kernels; the build checks the data offsets.
-static bool tchain_kern(const std::string& k);
+static bool tchain_kern(const std::string& k, bool linux_net = false);
 #if NR_INT4
 // int4 mixed: per Swin block whether its MLP weights took the hard-swish fold, and the e_off values that are int4
 // records (never packed as matrices).
@@ -207,17 +207,17 @@ static std::string i4base(const std::string& k) {
 #else
 #define NR_KBASE(k) (k)
 #endif
-static bool tchain_pair(const std::string& p, const std::string& q) {
+static bool tchain_pair(const std::string& p, const std::string& q, bool linux_net = false) {
 #if NR_INT4
-    if (i4base(p) != p || i4base(q) != q) return tchain_pair(i4base(p), i4base(q));
+    if (i4base(p) != p || i4base(q) != q) return tchain_pair(i4base(p), i4base(q), linux_net);
 #endif
-    if (!tchain_kern(p) || !tchain_kern(q)) return false;   // both ends built with NR_TCHAIN
+    if (!tchain_kern(p, linux_net) || !tchain_kern(q, linux_net)) return false;   // both ends built with NR_TCHAIN
     auto g = [](const std::string& k) { return k == "gemmprojc" || k == "gemmproj5"; };
     auto f = [](const std::string& k) { return k == "ffwd3" || k == "ffwd3w"; };
     auto vp = [](const std::string& k) { return k == "gemmproj" || k == "gemmprojw" || k == "gemmprojt"; };
     auto up = [](const std::string& k) { return k == "fswinpup256" || k == "fswinpup128" || k == "fswinpup64"; };
     const uint32_t kinds = std::getenv("NR_TCHAIN_KINDS")   // diagnostic: bit per group below
-        ? uint32_t(std::strtoul(std::getenv("NR_TCHAIN_KINDS"), nullptr, 0)) : (nr::binary::directory().empty() ? 0x1u : 0x1ffu);
+        ? uint32_t(std::strtoul(std::getenv("NR_TCHAIN_KINDS"), nullptr, 0)) : (linux_net ? 0x1ffu : 0x1u);
     // diagnostic NR_TCHAIN_C512=<bits>: 1 attn -> projection, 2 projection -> FFN, 4 FFN -> projection, 8 projection -> attn
     static const uint32_t c512 = std::getenv("NR_TCHAIN_C512") ? uint32_t(std::strtoul(std::getenv("NR_TCHAIN_C512"), nullptr, 0)) : 0xFu;
     return ((kinds & 1) && (((c512 & 1) && p == "attn" && g(q)) || ((c512 & 2) && g(p) && f(q)) ||
@@ -237,23 +237,23 @@ static bool tchain_pair(const std::string& p, const std::string& q) {
 // The kernels built with NR_TCHAIN=1, which carry the five push words right
 // after their push block as this file declares it (gemm1x1 pipelines therefore
 // all build NR_GEMM_REMAP_PC=1, so their block ends with `remap` like PushGemm).
-static bool tchain_kern(const std::string& k00) {
+static bool tchain_kern(const std::string& k00, bool linux_net) {
     // the decoder's copies (block-routes.txt, CC_SMALL_FP8_EXPERIMENTAL's fswin32nhd) chain like their base kernels
-    if (k00 == "fswin32d" || k00 == "fswin32v") return tchain_kern("fswin32");
-    if (k00 == "fswin32nhd" || k00 == "fswin32nhv") return tchain_kern("fswin32nh");
+    if (k00 == "fswin32d" || k00 == "fswin32v") return tchain_kern("fswin32", linux_net);
+    if (k00 == "fswin32nhd" || k00 == "fswin32nhv") return tchain_kern("fswin32nh", linux_net);
     // Optimized layers Performance: encoder block 2 keeps its real attention on these copies (route "e")
-    if (k00 == "fswin32e") return tchain_kern("fswin32");
-    if (k00 == "fswin32nhe") return tchain_kern("fswin32nh");
+    if (k00 == "fswin32e") return tchain_kern("fswin32", linux_net);
+    if (k00 == "fswin32nhe") return tchain_kern("fswin32nh", linux_net);
 #if NR_INT4
     {   // the int4 pipelines and the hard-swish route's "<kern>p" (NR_HS_ROUTE) chain like their base kernels
         std::string k = i4base(k00);
         if (k.size() > 3 && k.back() == 'p' && (k.compare(k.size() - 3, 3, "nhp") == 0 || k.compare(k.size() - 3, 3, "32p") == 0))
             k.pop_back();
-        if (k != k00) return tchain_kern(k);
+        if (k != k00) return tchain_kern(k, linux_net);
     }
 #endif
     const std::string& k = k00;
-    if (!nr::binary::directory().empty()) {
+    if (linux_net) {
         std::string base = k;
         if (base.size() > 2 && base.compare(base.size()-2, 2, "nh") == 0) base.resize(base.size()-2);
         return base == "attn" || base == "gemmprojc" || base == "ffwd3" || base == "ffwd3w" ||
@@ -1577,6 +1577,7 @@ struct GraphArenas {
     // room to get back (reload_network).
     std::vector<uint8_t> host_weights;
     size_t act_want{};
+    bool rdna2_int8 = false;
     ~GraphArenas() {
         if (noise.device) noise.destroy();
         if (wgt.mapped) vkUnmapMemory(device, wgt.memory);
@@ -1695,6 +1696,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     if (accumulation!="fp32" && accumulation!="round-fp16") {
         std::fprintf(stderr,"--accumulation must be fp32 or round-fp16\n");return 1;
     }
+    const bool linux_net = !nr::binary::directory().empty() || ctx.is_rdna2();
     std::string spv_dir = network_spv_dir(argc, argv);
     if(accumulation=="round-fp16") spv_dir += "/round-fp16";
     std::ifstream policy_file(nr::u8::path(spv_dir+"/accumulation.txt"));
@@ -2103,10 +2105,18 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         probe.arena_probe = true;
         const nr::LogSink sink = nr::g_log_sink;
         const uint32_t epoch_word = g_chain_epoch_word;
-        nr::set_log_sink([](const char*) {});
+        std::vector<std::string> probe_logs;
+        static thread_local std::vector<std::string>* tls_probe_logs = nullptr;
+        tls_probe_logs = &probe_logs;
+        nr::set_log_sink([](const char* s) { if (tls_probe_logs && s) tls_probe_logs->emplace_back(s); });
         int rc = -1;
-        try { rc = probe.build(argc, argv, &plan); } catch (...) { nr::set_log_sink(sink); throw; }
-        nr::set_log_sink(sink);
+        auto replay_and_restore = [&](bool failed) {
+            nr::set_log_sink(sink);
+            tls_probe_logs = nullptr;
+            if (failed) for (const auto& line : probe_logs) nr::logf("[arena-probe] %s", line.c_str());
+        };
+        try { rc = probe.build(argc, argv, &plan); } catch (...) { replay_and_restore(true); throw; }
+        replay_and_restore(rc != 3);
         g_chain_epoch_word = epoch_word;
         if (rc != 3) throw std::runtime_error("arena reuse: the layout probe did not finish");
         voff.m = probe.arena_layout;
@@ -2197,6 +2207,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     uint32_t qkv_fused_norm = 0, ups_fused_mode = 0, wide_ups_fused_mode = 0;
     uint32_t weight_layout = 0, kswap = 0;
     math_profile = 0;
+    uint32_t i8_roles = 0;
     {
         const std::string path = spv_dir + "/shader-constants.txt";
         std::ifstream f(nr::u8::path(path));
@@ -2288,10 +2299,16 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         // accumulators with every k pair swapped in the upper lane half, and the weight tiles they
         // multiply those operands by have to be stored the same way; see the repack below.
         if (!built.count("kswap")) built["kswap"] = 0;
-        if (built.at("kswap") && !ctx.rdna3) {
-            std::fprintf(stderr, "kswap shaders need the RDNA3 host\n"); return 1;
+        if (built.at("kswap") && !ctx.fp16()) {
+            std::fprintf(stderr, "kswap shaders need an FP16-emulated host\n"); return 1;
         }
         kswap = built.at("kswap");
+        if (built.count("int8")) {
+            i8_roles = built.at("int8");
+            if (i8_roles && !ctx.is_rdna2()) {
+                std::fprintf(stderr, "int8 shaders need an RDNA2 host\n"); return 1;
+            }
+        }
         if (!built.count("ffwd_gmajor")) built["ffwd_gmajor"] = 0;
         if (!built.count("gemm_remap")) built["gemm_remap"] = 0;
         for (const auto& [name, mine] : want) {
@@ -3402,6 +3419,8 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                     dead[pool_key(s.block)] = voff.step;   // the pooled tile stays in the body
                     continue;
                 }
+                if (ctx.is_rdna2() && disp[ds_body].kern == "fswinds" + std::to_string(C))
+                    throw std::runtime_error("RDNA2 shaders require fused fswindsp* downsampling (remove --legacy-ds-quant)");
                 disp.push_back(std::move(dg));
                 continue;
             }
@@ -3959,13 +3978,13 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             // 1080p -8 us, 1440p -24, 4K -35 over the 31 dispatches.
             // Windows: off. Under LLPC gemmprojc takes 169 VGPRs (gemmproj 70) and the 31
             // dispatches cost 0.58 ms at 1080p instead of 0.32 (measured); NR_PROJC=1 for A/B.
-            const bool projc = !nr::binary::directory().empty() ||
+            const bool projc = linux_net ||
                 (std::getenv("NR_PROJC") && *std::getenv("NR_PROJC") == '1');
             if (projc && d.kern == "gemmproj" && s.type.rfind("CCSplitSwin16H", 0) == 0) d.kern = "gemmprojc";
             // The C=512 projections on their own name, gemmproj5 (gemmproj's code built with the tile
             // counters and the M-major order), so the C=512 chain can take them; the ViT keeps gemmproj.
             // NR_PROJ5=0 keeps gemmproj.
-            const bool proj5 = nr::binary::directory().empty() &&
+            const bool proj5 = !linux_net &&
                 !(std::getenv("NR_PROJ5") && *std::getenv("NR_PROJ5") == '0');
             if (proj5 && d.kern == "gemmproj" && s.type.rfind("CCSplitSwin16H", 0) == 0 &&
                 std::filesystem::exists(spv_dir + "/g_gemmproj5.spv")) d.kern = "gemmproj5";
@@ -4190,6 +4209,95 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     if (!arena_probe)
         nr::logf("weight arena %.1f MB over %zu dispatches", double(wblob.size()) / 1e6, disp.size());
 
+    // RDNA2 INT8 (pipelines.json `int8.marker`): read plain tile-blocked e4m3 matrices before `weight_layout`
+    // reorders or k-swaps `wblob`, quantize per-row to int8 + trailing fp32 row scale, and keep the twin byte
+    // ranges to overlay during `wgt_e` upload.
+    std::vector<std::pair<size_t, std::vector<uint8_t>>> i8_twin;
+    if (i8_roles) {
+        enum : uint32_t {
+            kI8SwinE = 1u << 0, kI8SwinCt = 1u << 1, kI8SwinQkv = 1u << 2, kI8SwinWo = 1u << 3,
+            kI8WideE = 1u << 4, kI8WideMid = 1u << 5, kI8WideCt = 1u << 6, kI8WideQkv = 1u << 7, kI8WideWo = 1u << 8,
+            kI8Gemm = 1u << 9, kI8PreE = 1u << 10, kI8PostE = 1u << 11, kI8UpsE = 1u << 12,
+            kI8Attn = 1u << 13, kI8Ffwd1 = 1u << 14, kI8Ffwd2 = 1u << 15, kI8Ffwd3 = 1u << 16, kI8GemmVact = 1u << 17,
+        };
+        const char* wsc = std::getenv("MZ_I8_WSCALE");
+        const bool pow2 = wsc && std::atoi(wsc) == 1;
+        std::set<uint32_t> seen;
+        auto quantise = [&](uint32_t role, uint32_t off, size_t rows, size_t K) {
+            if (!(i8_roles & role) || !seen.insert(off).second) return;
+            const size_t bytes = rows * K;
+            if (rows % 16 || K % 16 || size_t(off) + bytes > wblob.size() || off % 128)
+                throw std::runtime_error("int8: weight matrix bounds");
+            std::vector<uint8_t> e(bytes);
+            wblob.read(off, e.data(), bytes);
+            const size_t KF = K / 16;
+            auto at = [&](size_t r, size_t k) { return ((r / 16) * KF + k / 16) * 256 + (r % 16) * 16 + k % 16; };
+            std::vector<float> scale(rows, 1.0f);
+            for (size_t r = 0; r < rows; ++r) {
+                float amax = 0.0f;
+                for (size_t k = 0; k < K; ++k) amax = std::max(amax, std::fabs(tin::e4m3_to_f(e[at(r, k)])));
+                if (amax > 0.0f) scale[r] = pow2 ? std::ldexp(1.0f, std::ilogb(amax) - 6) : amax / 127.0f;
+            }
+            std::vector<uint8_t> t(bytes + rows * 4);
+            for (size_t r = 0; r < rows; ++r)
+                for (size_t k = 0; k < K; ++k) {
+                    const long q = long(std::nearbyint(tin::e4m3_to_f(e[at(r, k)]) / scale[r]));
+                    t[at(r, k)] = uint8_t(int8_t(std::clamp(q, -127L, 127L)));
+                }
+            std::memcpy(t.data() + bytes, scale.data(), rows * 4);
+            i8_twin.emplace_back(size_t(off) * 2, std::move(t));
+        };
+        for (const auto& pd : disp) {
+            const std::string& k = pd.kern;
+            if (k.rfind("fswin", 0) == 0) {
+                PushFSwin p{};
+                if (pd.push.size() < sizeof p) throw std::runtime_error("int8: Swin push mismatch");
+                std::memcpy(&p, pd.push.data(), sizeof p);
+                if (k.size() >= 2 && k.compare(k.size() - 2, 2, "32") == 0) {
+                    quantise(k == "fswinimagepreds32" ? kI8PreE : k == "fswinimagepost32" ? kI8PostE
+                             : k == "fswinfusedup32" ? kI8UpsE : kI8SwinE, p.e_off, 128, 32);
+                    quantise(kI8SwinCt, p.ct_off, 32, 128);
+                    quantise(kI8SwinQkv, p.qkv_off, 96, 32);
+                    quantise(kI8SwinWo, p.op_off, 32, 32);
+                } else {
+                    size_t C = 0;
+                    for (size_t c : {64u, 128u, 256u}) {
+                        const std::string suf = std::to_string(c);
+                        if (k.size() >= suf.size() && k.compare(k.size() - suf.size(), suf.size(), suf) == 0) C = c;
+                    }
+                    if (!C) throw std::runtime_error("int8: unknown Swin kernel " + k);
+                    quantise(kI8WideE, p.e_off, 4 * C, C);
+                    quantise(kI8WideMid, p.mid_off, C, 128);
+                    quantise(kI8WideCt, p.ct_off, C, C);
+                    quantise(kI8WideQkv, p.qkv_off, 3 * C, C);
+                    quantise(kI8WideWo, p.op_off, C, C);
+                }
+            } else if (k == "attn") {
+                PushAttn p{};
+                if (pd.push.size() < sizeof p) throw std::runtime_error("int8: attention push mismatch");
+                std::memcpy(&p, pd.push.data(), sizeof p);
+                quantise(kI8Attn, p.w_off, 1536, p.C);
+            } else if (k == "ffwd3" || k == "ffwd3w") {
+                PushFfwd3 p{};
+                if (pd.push.size() < sizeof p) throw std::runtime_error("int8: FFWD push mismatch");
+                std::memcpy(&p, pd.push.data(), sizeof p);
+                quantise(kI8Ffwd1, p.a_off, FF_GROUPS * FF_R, FF_K);
+                quantise(kI8Ffwd2, p.q0_off, FF_GROUPS * FF_J, FF_R);
+                quantise(kI8Ffwd3, p.q2_off, FF_GROUPS * FF_OUT, FF_J);
+            } else if (k.rfind("gemm", 0) == 0) {
+                PushGemm p{};
+                if (pd.push.size() < sizeof p) throw std::runtime_error("int8: GEMM push mismatch");
+                std::memcpy(&p, pd.push.data(), sizeof p);
+                if (k == "gemmproj" || k == "gemmprojc") quantise(kI8Gemm, p.w_off, p.N, p.K);
+                else if (k == "gemmvact") quantise(kI8GemmVact, p.w_off, p.N, p.K);
+            }
+        }
+        size_t n8 = 0;
+        for (const auto& t : i8_twin) n8 += t.second.size();
+        nr::logf("[nr] int8 weights: %zu matrices (%.1f MB)%s", i8_twin.size(), double(n8) / 1e6,
+                 pow2 ? ", power-of-two row scales" : "");
+    }
+
     // ---- one dispatch for a run of consecutive blocks ----------------------
     // Manifest v2 layouts 1/2 pair adjacent output-channel fragments so a lane
     // fetches 16 FP8 weights at once. Original files and K order stay intact.
@@ -4219,7 +4327,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             // The default Linux ACO attention reads N-pair QKV weights. Native
             // Windows attention retains the original layout, including when
             // selected as a diagnostic shell in an otherwise ACO graph.
-            if (!nr::binary::directory().empty() && pd.kern=="attn" &&
+            if (linux_net && pd.kern=="attn" &&
                 !nr::binary::native_shell("g_attn.spv")) {
                 PushAttn p{};
                 if(pd.push.size()<sizeof p)throw std::runtime_error("binary attention push mismatch");
@@ -4231,9 +4339,9 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                 PushFfwd3 p{};
                 if(pd.push.size()!=sizeof p) throw std::runtime_error("packed FFWD push mismatch");
                 std::memcpy(&p,pd.push.data(),sizeof p);
-                pack_matrix(p.a_off,FF_GROUPS*FF_R,FF_K,ctx.rdna3);
-                pack_matrix(p.q0_off,FF_GROUPS*FF_J,FF_R,ctx.rdna3);
-                pack_matrix(p.q2_off,FF_GROUPS*FF_OUT,FF_J,ctx.rdna3);
+                pack_matrix(p.a_off,FF_GROUPS*FF_R,FF_K,ctx.fp16());
+                pack_matrix(p.q0_off,FF_GROUPS*FF_J,FF_R,ctx.fp16());
+                pack_matrix(p.q2_off,FF_GROUPS*FF_OUT,FF_J,ctx.fp16());
                 continue;
             }
 #if NR_INT4
@@ -4261,7 +4369,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             // operand are stored with their k pairs swapped too. Which tiles those are is a property
             // of each kernel: a tile against an operand loaded from LDS or the arena stays plain.
             // The swap is a permutation of the tile's bytes; the products are the same products.
-            if(ctx.rdna3 && pd.kern.rfind("fswin",0)==0) {
+            if(ctx.fp16() && pd.kern.rfind("fswin",0)==0) {
                 if(!kswap) continue;
                 PushFSwin p{};
                 if(pd.push.size()<sizeof p) throw std::runtime_error("kswap: Swin push mismatch");
@@ -4346,10 +4454,12 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     // individual layers and a merged run has no individual layers left.
     {
         // Persistent Swin workgroup loops on RDNA3 have spin/barrier deadlock issues at resolutions >= 1080p
-        // causing GPU TDR (display resets). On RDNA3 default to off (opt-in with NR_PERSIST=1); on RDNA4 default to on.
-        const bool asked_off = ctx.rdna3
-            ? (!(std::getenv("NR_PERSIST") && *std::getenv("NR_PERSIST") == '1') || flag(argc, argv, "--no-persist"))
-            : (flag(argc, argv, "--no-persist") || (std::getenv("NR_NO_PERSIST") && *std::getenv("NR_NO_PERSIST")));
+        // causing GPU TDR (display resets). On RDNA3 default to off (opt-in with NR_PERSIST=1); on RDNA2 leave off
+        // (pipelines.json builds per-layer fswin*); on RDNA4 default to on.
+        const bool asked_off = ctx.is_rdna2() ? true
+            : ctx.rdna3
+                ? (!(std::getenv("NR_PERSIST") && *std::getenv("NR_PERSIST") == '1') || flag(argc, argv, "--no-persist"))
+                : (flag(argc, argv, "--no-persist") || (std::getenv("NR_NO_PERSIST") && *std::getenv("NR_NO_PERSIST")));
         const char* per_step_flags[] = {"--only", "--seed-dir", "--no-barrier-after",
                                         "--barrier-stride"};
         bool per_step = flag(argc, argv, "--oracle") || flag(argc, argv, "--no-barrier") ||
@@ -4764,7 +4874,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         // (arena_joined). On a big frame every run boundary keeps its barrier here, and
         // holding values across them to the next one only cost memory.
         arena_joined.assign(size_t(nd), 0);
-        if (tchain_active(ctx.rdna3)) {
+        if (tchain_active(ctx.rdna3, ctx.is_rdna2())) {
             size_t tick = size_t(nd);
             // (the links' tick: the first fswin32 / fswin32nh when its ticking pipeline exists - not asked here:
             // an earlier tick only joins more pairs, and the build checks it joined no other)
@@ -4772,7 +4882,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                 if (disp[i].kern == "fswin32" || disp[i].kern == "fswin32nh") tick = i;
             const bool big_frame = tc_big_frame(disp);
             for (int f = 0; f + 1 < nd; ++f)
-                arena_joined[size_t(f)] = tchain_pair(disp[size_t(f)].kern, disp[size_t(f) + 1].kern) &&
+                arena_joined[size_t(f)] = tchain_pair(disp[size_t(f)].kern, disp[size_t(f) + 1].kern, linux_net) &&
                     size_t(f) >= tick && !tc_big_barrier(disp[size_t(f)].kern, disp[size_t(f) + 1].kern, big_frame);
             std::vector<int> stretch_end(size_t(nd) + 1);
             for (int f = nd; f >= 0; --f)
@@ -4961,7 +5071,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     g_tc_err.clear();
     tc_expect.clear(); tc_pair.clear(); tc_err.clear(); tc_base = 0; tc_words = 0;
     if (NR_TCHAIN_TILES) {
-        const bool on = tchain_active(ctx.rdna3);
+        const bool on = tchain_active(ctx.rdna3, ctx.is_rdna2());
         act_total = align(act_total, 256);
         g_tc_base = act_total / 4;
         // The frame counter: ticked by the frame's first fswin32 (a real barrier
@@ -4972,7 +5082,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         size_t tick = disp.size();
         for (size_t i = 0; i < disp.size() && tick == disp.size(); ++i)
             if (disp[i].kern == "fswin32" || disp[i].kern == "fswin32nh") {
-                if (!nr::binary::directory().empty()) tick = i;
+                if (linux_net) tick = i;
                 else if (std::filesystem::exists(spv_dir + "/g_" + disp[i].kern + "t.spv")) {
                     disp[i].kern += "t"; tick = i;
                 }
@@ -5036,7 +5146,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         // ViT one; the decoder's upsample levels take their own raster (4K C=64: 32640).
         for (size_t i = 0; on && i + 1 < disp.size(); ++i) {
             const Disp& P = disp[i]; Disp& Q = disp[i + 1];
-            if (!tchain_pair(P.kern, Q.kern)) continue;
+            if (!tchain_pair(P.kern, Q.kern, linux_net)) continue;
             if (tick > i) continue;   // no frame tick before this pair
             // (the layout probe keeps the same barriers: tc_big_barrier)
             if (tc_big_barrier(P.kern, Q.kern, big_frame)) continue;
@@ -5147,7 +5257,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             g_tc_nobar[i] = 1; ++nch;
         }
         for (size_t i = 0; i < disp.size(); ++i) {
-            if (!tchain_kern(disp[i].kern)) continue;
+            if (!tchain_kern(disp[i].kern, linux_net)) continue;
             const uint32_t r = (rec[i][1] == 0u && rec[i][2] == 0xFFFFFFFFu && rec[i][3] == 0xFFFFFFFFu)
                 ? 0xFFFFFFFFu : putw(rec[i].data(), sizeof rec[i]);
             const size_t o = disp[i].push.size();
@@ -5216,7 +5326,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         act_shared = given_act && given_act->device == ctx.device && given_act->cap >= act_bytes;
         if (act_shared) {
             arenas->act = given_act;
-            if (ctx.rdna3 && !given_act->twin.handle) {
+            if (ctx.fp16() && !given_act->twin.handle) {
                 given_act->twin = ctx.buffer(VkDeviceSize(given_act->cap) * 2);
             }
             nr::logf("activation arena: taken over from another network (%.1f MB, this one needs %.1f MB)",
@@ -5227,7 +5337,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             {
                 nr::vram::Scope kind(nr::vram::kActivations);
                 a->device = ctx.device; a->buf = ctx.buffer(room, false, /*device_address=*/true); a->cap = room;
-                if (ctx.rdna3) a->twin = ctx.buffer(VkDeviceSize(room) * 2);
+                if (ctx.fp16()) a->twin = ctx.buffer(VkDeviceSize(room) * 2);
             }
             arenas->act = std::move(a);
         }
@@ -5235,7 +5345,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         {
             nr::vram::Scope kind(nr::vram::kWeights);
             act = arenas->act->buf; wgt = ctx.buffer(std::max(wgt_bytes, wblob.size()));
-            if (ctx.rdna3) {
+            if (ctx.fp16()) {
                 act_e = arenas->act->twin;
                 arenas->wgt_e = ctx.buffer(VkDeviceSize(std::max(wgt_bytes, wblob.size())) * 2);
                 wgt_e = arenas->wgt_e;
@@ -5312,9 +5422,10 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         ctx.upload_with(wgt, 0, wblob.size(), [&](VkDeviceSize off, VkDeviceSize n, uint8_t* dst) {
             wblob.read(size_t(off), dst, size_t(n));
         });
-        if (ctx.rdna3) {
+        if (ctx.fp16()) {
             // Every byte read as an e4m3 code. Regions that hold f16/f32/u32 data decode to
-            // garbage here, and nothing reads them through an e4m3 view.
+            // garbage here, and nothing reads them through an e4m3 view; INT8 matrices then overwrite
+            // their own FP16 ranges inside `wgt_e`.
             std::array<uint16_t, 256> to_f16{};
             for (int i = 0; i < 256; ++i) to_f16[size_t(i)] = tin::f_to_f16(tin::e4m3_to_f(uint8_t(i)));
             std::vector<uint8_t> codes(size_t(nrvk::Context::kStageBytes / 2));
@@ -5323,7 +5434,13 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                 wblob.read(size_t(off / 2), codes.data(), count);
                 uint16_t* out = reinterpret_cast<uint16_t*>(dst);
                 for (size_t i = 0; i < count; ++i) out[i] = to_f16[codes[i]];
+                for (const auto& [at, t] : i8_twin) {
+                    const size_t lo = std::max<size_t>(size_t(off), at);
+                    const size_t hi = std::min<size_t>(size_t(off + n), at + t.size());
+                    if (lo < hi) std::memcpy(dst + (lo - size_t(off)), t.data() + (lo - at), hi - lo);
+                }
             });
+            i8_twin.clear();
         }
         // The extent tail is kept for the resize path (GraphCore::tail); the rest of the host copy is not needed
         // again: free it before the runtime allocates.
@@ -5424,11 +5541,11 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         int n = 0;
         for (Disp& d : disp)
             if ((d.kern == "fswin32" || d.kern == "fswinimagepreds32" || d.kern == "fswin32t" ||
-                 (!nr::binary::directory().empty() && (d.kern == "fswindsp32" || d.kern == "fswinfusedup32"))) && d.s &&
+                 (linux_net && (d.kern == "fswindsp32" || d.kern == "fswinfusedup32"))) && d.s &&
                 g_nohi.count({d.s->block, d.s->layer})) {
                 // The ACO upsample variant needs a complete, unshifted grid,
                 // matching the Linux source's qualification for this binary.
-                if (!nr::binary::directory().empty() && d.kern == "fswinfusedup32") {
+                if (linux_net && d.kern == "fswinfusedup32") {
                     PushFSwin p{}; std::memcpy(&p, d.push.data(), sizeof p);
                     if (p.shift || p.shift_y || p.tiles_x != 2u*d.gx || p.tiles_y != 2u*d.gy) continue;
                 }
@@ -5693,7 +5810,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     // is exactly zero". Fill now, disarm, and every later submit keeps what the
     // seeder put there.
     runner.zero_buffer = act.handle;
-    if (ctx.rdna3) {
+    if (ctx.fp16()) {
         runner.zero_twin = act_e.handle; runner.zero_twin_bytes = VkDeviceSize(act_total) * 2;
     }
     runner.zero_bytes = VkDeviceSize(act_total);
@@ -5777,6 +5894,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         auto c = std::const_pointer_cast<GraphCore>(make_core(argc, argv, spv_dir));
         c->arenas = arenas;
         arenas->weights_hash = c->weights_hash;
+        arenas->rdna2_int8 = (i8_roles != 0);
         arenas->loaded = c->id;   // uploaded and noise-filled above
         // zeroed above; a taken arena is left alone (another network's frames may use it): this new plan's id was never
         // loaded there, so the first recording zeroes it
@@ -5862,7 +5980,7 @@ void NrSession::retarget(VkCommandBuffer cmd) {
     // The arena as a build leaves it (zero), the tail as it uploads it, the noise fields as it fills them.
     if (zero) {
         vkCmdFillBuffer(cmd, act.handle, 0, (VkDeviceSize(c.act_total) + 3) / 4 * 4, 0);
-        if (ctx.rdna3 && act_e.handle)
+        if (ctx.fp16() && act_e.handle)
             vkCmdFillBuffer(cmd, act_e.handle, 0, ((VkDeviceSize(c.act_total) * 2) + 3) / 4 * 4, 0);
     }
     if (tail && c.staging && c.staging->buf.handle) {
@@ -5948,6 +6066,7 @@ bool NrSession::make_images(int argc, char** argv) {
 }
 
 void NrSession::create_kernels(const std::string& spv_dir, const std::set<std::string>& chain) {
+    const bool linux_net = !nr::binary::directory().empty() || ctx.is_rdna2();
     for (const Disp& d : disp) {
         if (kern.count(d.kern)) continue;
         struct Tick { ~Tick() { ++nr::g_build_pipes_done; } } tick;
@@ -5961,7 +6080,7 @@ void NrSession::create_kernels(const std::string& spv_dir, const std::set<std::s
         }
         if (d.kern.rfind("fswindsp",0)==0)
             kern[d.kern].create(ctx,p,{act.handle,act.handle,wgt.handle,wgt.handle,wgt.handle,act.handle},
-                                sizeof(PushFSwin)+sizeof(PushDsProj) + (NR_TCHAIN_TILES && tchain_kern(d.kern) ? 4 : 0));
+                                sizeof(PushFSwin)+sizeof(PushDsProj) + (NR_TCHAIN_TILES && tchain_kern(d.kern, linux_net) ? 4 : 0));
         else if (d.kern.rfind("fswinimagepreds32",0)==0)   // binding 5: the noise table (image_input.glsl; unread without noise_buffer)
             kern[d.kern].create(ctx,p,{act.handle,act.handle,wgt.handle,wgt.handle,wgt.handle,noise_buf.handle},
                                 sizeof(PushFSwin)+sizeof(PushPreImage),{&tex_in});
@@ -5978,11 +6097,11 @@ void NrSession::create_kernels(const std::string& spv_dir, const std::set<std::s
         else if (is_persist_kern(d.kern))
             kern[d.kern].create(ctx, p, {act.handle, act.handle, wgt.handle,
                                          wgt.handle, wgt.handle, act.handle},
-                                sizeof(PushPersist) + (NR_TCHAIN_TILES && tchain_kern(d.kern) ? 4 : 0));
+                                sizeof(PushPersist) + (NR_TCHAIN_TILES && tchain_kern(d.kern, linux_net) ? 4 : 0));
         else if (d.kern.rfind("fswin", 0) == 0)
             kern[d.kern].create(ctx, p, {act.handle, act.handle, wgt.handle,
                                          wgt.handle, wgt.handle, act.handle},
-                                sizeof(PushFSwin) + (NR_TCHAIN_TILES && tchain_kern(d.kern) ? 4 : 0));
+                                sizeof(PushFSwin) + (NR_TCHAIN_TILES && tchain_kern(d.kern, linux_net) ? 4 : 0));
         else if (d.kern.rfind("pool", 0) == 0)
             kern[d.kern].create(ctx, p, {act.handle}, sizeof(PushPool));
         else if (d.kern == "decups")
@@ -6015,7 +6134,7 @@ void NrSession::create_kernels(const std::string& spv_dir, const std::set<std::s
             kern[d.kern].create(ctx, p, {act.handle, act.handle, act.handle, wgt.handle,
                                          wgt.handle, act.handle, wgt.handle, act.handle},
                                 sizeof(PushGemm) + (chain.count(d.kern) ? 16 : 0) +
-                                (NR_TCHAIN_TILES && tchain_kern(d.kern) ? 4 : 0));
+                                (NR_TCHAIN_TILES && tchain_kern(d.kern, linux_net) ? 4 : 0));
     }
     for (const Disp& d : disp)   // a push longer than its pipeline's range reads garbage past the end
         if (kern.count(d.kern) && d.push.size() > kern.at(d.kern).push_range)
@@ -6049,7 +6168,7 @@ int NrSession::build_shared(int argc, char** argv) {
     persist_err = c.persist_err;
     tc_base = c.tc_base; tc_words = c.tc_words; tc_err = c.tc_err; tc_expect = c.tc_expect; tc_pair = c.tc_pair;
     arenas = slot; act = arenas->act->buf; wgt = arenas->wgt;
-    if (ctx.rdna3) {
+    if (ctx.fp16()) {
         act_e = arenas->act->twin; wgt_e = arenas->wgt_e;
         ctx.fp16_twin[act.handle] = act_e.handle; ctx.fp16_twin[wgt.handle] = wgt_e.handle;
     }

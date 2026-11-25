@@ -103,11 +103,16 @@ struct Context {
     // set_arch.
     nr::arch::GpuArch arch = nr::arch::GpuArch::unknown;
     bool rdna3 = false;
+    bool int8_dot = false;
+    bool int8_dot_accel = false;
+    bool is_rdna2() const { return arch == nr::arch::GpuArch::rdna2; }
+    bool fp16() const { return arch == nr::arch::GpuArch::rdna3 || arch == nr::arch::GpuArch::rdna2; }
     bool set_arch(nr::arch::GpuArch a, std::string* why = nullptr) {
         switch (a) {
         case nr::arch::GpuArch::rdna4: arch = a; rdna3 = false; return true;
         case nr::arch::GpuArch::rdna3: arch = a; rdna3 = true; return true;
-        case nr::arch::GpuArch::unknown: case nr::arch::GpuArch::rdna1: case nr::arch::GpuArch::rdna2: break;
+        case nr::arch::GpuArch::rdna2: arch = a; rdna3 = false; return true;
+        case nr::arch::GpuArch::unknown: case nr::arch::GpuArch::rdna1: break;
         }
         arch = nr::arch::GpuArch::unknown; rdna3 = false;
         if (why) *why = std::string("NR has no network for this GPU's architecture (") + nr::arch::name(a) + ")";
@@ -117,13 +122,14 @@ struct Context {
         switch (arch) {
         case nr::arch::GpuArch::rdna4: return "RDNA4 (FP8 matrices)";
         case nr::arch::GpuArch::rdna3: return "RDNA3 (FP16 matrices)";
-        case nr::arch::GpuArch::unknown: case nr::arch::GpuArch::rdna1: case nr::arch::GpuArch::rdna2: break;
+        case nr::arch::GpuArch::rdna2: return "RDNA2 (no matrices)";
+        case nr::arch::GpuArch::unknown: case nr::arch::GpuArch::rdna1: break;
         }
         return "no architecture set";
     }
     bool target_float8() const { return arch == nr::arch::GpuArch::rdna4; }
     VkComponentTypeKHR target_matrix_ab() const {
-        return rdna3 ? VK_COMPONENT_TYPE_FLOAT16_KHR : VK_COMPONENT_TYPE_FLOAT8_E4M3_EXT;
+        return fp16() ? VK_COMPONENT_TYPE_FLOAT16_KHR : VK_COMPONENT_TYPE_FLOAT8_E4M3_EXT;
     }
 
     // RDNA3: an arena's FP16 twin, which holds its e4m3 values as FP16 elements at the same
@@ -175,11 +181,15 @@ struct Context {
         std::vector<VkPhysicalDevice> devices(count);
         NRVK_CHECK(vkEnumeratePhysicalDevices(instance, &count, devices.data()));
         const char* forced = getenv("NR_GPU");
+        const bool force_rdna2 = nr::arch::manual() == nr::arch::GpuArch::rdna2;
         std::string seen;
         for (uint32_t i = 0; i < count; ++i) {
             VkPhysicalDeviceProperties p{};
             vkGetPhysicalDeviceProperties(devices[i], &p);
-            const nr::arch::GpuArch a = forced || p.vendorID != 0x1002 ? nr::arch::GpuArch::unknown : nr::arch::of(devices[i], nullptr, false);   // (looking among GPUs: not the hand setting)
+            const nr::arch::GpuArch a = forced ? nr::arch::GpuArch::unknown
+                                      : force_rdna2 ? nr::arch::GpuArch::rdna2
+                                      : p.vendorID != 0x1002 ? nr::arch::GpuArch::unknown
+                                      : nr::arch::of(devices[i], nullptr, false);   // (looking among GPUs: not the hand setting)
             const bool want = forced ? i == uint32_t(atoi(forced)) : nr::arch::has_network(a);
             if (!want) continue;
             if (physical)
@@ -189,7 +199,7 @@ struct Context {
             gpu_vendor_id = p.vendorID; gpu_device_id = p.deviceID;
             seen = p.deviceName;
         }
-        if (!physical) throw std::runtime_error("no RDNA4 or RDNA3 GPU found; set NR_GPU");
+        if (!physical) throw std::runtime_error("no RDNA4, RDNA3 or RDNA2 GPU found; set NR_GPU");
         {
             std::string how, why;
             if (!set_arch(nr::arch::of(physical, &how), &why)) throw std::runtime_error(why + ": " + how);
@@ -207,9 +217,23 @@ struct Context {
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
         features.pNext = &coop; coop.pNext = &fp8; fp8.pNext = &f11; f11.pNext = &f12; f12.pNext = &f13;
         vkGetPhysicalDeviceFeatures2(physical, &features);
+
+        VkPhysicalDeviceSubgroupProperties sub{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+        VkPhysicalDeviceFloatControlsProperties fc{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
+        VkPhysicalDeviceShaderIntegerDotProductProperties idp_p{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES};
+        {
+            VkPhysicalDeviceProperties2 qp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &sub};
+            sub.pNext = &fc; fc.pNext = &idp_p;
+            vkGetPhysicalDeviceProperties2(physical, &qp);
+        }
+        int8_dot = bool(f13.shaderIntegerDotProduct);
+        int8_dot_accel = bool(idp_p.integerDotProductAccumulatingSaturating4x8BitPackedSignedAccelerated);
+
         const bool no_fp8 = !target_float8();
+        const bool no_coop = is_rdna2();
         struct { bool have; const char* name; } required[] = {
-            {bool(coop.cooperativeMatrix),            "cooperativeMatrix"},
+            {no_coop || bool(coop.cooperativeMatrix),            "cooperativeMatrix"},
             {no_fp8 || bool(fp8.shaderFloat8),                  "shaderFloat8"},
             {no_fp8 || bool(fp8.shaderFloat8CooperativeMatrix), "shaderFloat8CooperativeMatrix"},
             {bool(f12.storageBuffer8BitAccess),       "storageBuffer8BitAccess"},
@@ -218,6 +242,8 @@ struct Context {
             {bool(f12.vulkanMemoryModel),             "vulkanMemoryModel"},
             {bool(f13.subgroupSizeControl),           "subgroupSizeControl"},
             {bool(f11.storageBuffer16BitAccess),      "storageBuffer16BitAccess"},
+            {!no_coop || bool(fc.shaderRoundingModeRTEFloat16), "shaderRoundingModeRTEFloat16"},
+            {!no_coop || bool(sub.supportedOperations & VK_SUBGROUP_FEATURE_SHUFFLE_BIT), "subgroupShuffle"},
         };
         for (const auto& r : required)
             if (!r.have) throw std::runtime_error(std::string("device feature missing: ") + r.name);
@@ -252,6 +278,7 @@ struct Context {
         // the first one. It is here for `--storage-barrier`, which says
         // "storage buffer" where the legacy mask can only say "shader read".
         f13.synchronization2 = VK_TRUE;
+        if (is_rdna2() && int8_dot) f13.shaderIntegerDotProduct = VK_TRUE;
         coop.pNext = &fp8; fp8.pNext = &f11; f11.pNext = &f12; f12.pNext = &f13;
 
         VkPhysicalDeviceSubgroupSizeControlProperties sg{
@@ -297,11 +324,13 @@ struct Context {
         wml.pNext = nullptr;
         wml.workgroupMemoryExplicitLayoutScalarBlockLayout = VK_FALSE;
         if (have_wml) f13.pNext = &wml;
-        std::vector<const char*> ext_list{VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME};
+        std::vector<const char*> ext_list;
+        if (!is_rdna2()) ext_list.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
         if (target_float8()) ext_list.push_back(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
         if (have_wml) ext_list.push_back(VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME);
         VkDeviceCreateInfo di{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
-        di.pNext = &coop; di.queueCreateInfoCount = 1; di.pQueueCreateInfos = &qi;
+        di.pNext = is_rdna2() ? static_cast<const void*>(&f11) : static_cast<const void*>(&coop);
+        di.queueCreateInfoCount = 1; di.pQueueCreateInfos = &qi;
         // Our pipelines ask for no robust buffer / image access (Kernel::create); the feature that allows it.
         VkPhysicalDevicePipelineRobustnessFeaturesEXT prf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT};
         {
@@ -317,7 +346,7 @@ struct Context {
             if (prf.pipelineRobustness && listed) {
                 prf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT};
                 prf.pipelineRobustness = VK_TRUE;
-                VkBaseOutStructure* tail = reinterpret_cast<VkBaseOutStructure*>(&coop);
+                VkBaseOutStructure* tail = reinterpret_cast<VkBaseOutStructure*>(const_cast<void*>(di.pNext));
                 while (tail->pNext) tail = tail->pNext;
                 tail->pNext = reinterpret_cast<VkBaseOutStructure*>(&prf);
                 ext_list.push_back(VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME);
@@ -399,8 +428,14 @@ struct Context {
         VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
         f2.pNext = &c; c.pNext = &f8; f8.pNext = &v11; v11.pNext = &v12; v12.pNext = &v13; v13.pNext = &wml;
         vkGetPhysicalDeviceFeatures2(physical, &f2);
+        VkPhysicalDeviceShaderIntegerDotProductFeatures idp_f{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES};
+        if (!v13.shaderIntegerDotProduct) {
+            VkPhysicalDeviceFeatures2 f2_idp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &idp_f};
+            vkGetPhysicalDeviceFeatures2(physical, &f2_idp);
+        }
         pipeline_robustness = robustness_enabled;
-        if (!c.cooperativeMatrix)             return no("cooperativeMatrix");
+        if (!is_rdna2() && !c.cooperativeMatrix) return no("cooperativeMatrix");
         if (target_float8() && !f8.shaderFloat8)                 return no("shaderFloat8");
         if (target_float8() && !f8.shaderFloat8CooperativeMatrix) return no("shaderFloat8CooperativeMatrix");
         if (!v11.storageBuffer16BitAccess)    return no("storageBuffer16BitAccess");
@@ -415,12 +450,24 @@ struct Context {
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
         VkPhysicalDeviceDriverProperties drv{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceSubgroupProperties sub{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+        VkPhysicalDeviceFloatControlsProperties fc{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
+        VkPhysicalDeviceShaderIntegerDotProductProperties idp_p{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES};
         VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
-        props.pNext = &drv; drv.pNext = &sg;
+        props.pNext = &drv; drv.pNext = &sg; sg.pNext = &sub; sub.pNext = &fc; fc.pNext = &idp_p;
         vkGetPhysicalDeviceProperties2(physical, &props);
         driver_name = std::string(drv.driverName) + " / " + drv.driverInfo;
         timestamp_period = props.properties.limits.timestampPeriod;
         gpu_vendor_id = props.properties.vendorID; gpu_device_id = props.properties.deviceID;
+        if (is_rdna2()) {
+            if (!fc.shaderRoundingModeRTEFloat16) return no("shaderRoundingModeRTEFloat16");
+            if (!(sub.supportedOperations & VK_SUBGROUP_FEATURE_SHUFFLE_BIT)) return no("subgroupShuffle");
+        }
+        int8_dot = bool(v13.shaderIntegerDotProduct) || bool(idp_f.shaderIntegerDotProduct);
+        int8_dot_accel = bool(idp_p.integerDotProductAccumulatingSaturating4x8BitPackedSignedAccelerated);
         // The same requirement `create` makes, and for the same reason: the
         // coopmat properties are reported per subgroup size and every fragment
         // size in this port is a wave32 one.
@@ -512,6 +559,7 @@ struct Context {
         static const char* const with_fp8[] = {VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME,
                                                VK_EXT_SHADER_FLOAT8_EXTENSION_NAME};
         static const char* const without_fp8[] = {VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME};
+        if (is_rdna2()) { n = 0; return nullptr; }
         if (target_float8()) { n = 2; return with_fp8; }
         n = 1;
         return without_fp8;
@@ -541,6 +589,7 @@ struct Context {
     // The configuration the whole port rests on. Asserting it here means a driver that quietly
     // stops reporting it fails at startup with a name, rather than in a kernel with wrong numbers.
     void require_matrix_config() const {
+        if (is_rdna2()) return;
         if (has_matrix_config(instance, physical, target_matrix_ab())) return;
         if (!vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR"))
             throw std::runtime_error("vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR absent");
@@ -1124,7 +1173,8 @@ struct Kernel {
         module = shared->module; dsl = shared->dsl; layout = shared->layout; pipeline = shared->pipeline;
         const auto name = spirv_path.substr(spirv_path.find_last_of("/\\") + 1);
         const uint32_t candidate_gap = name.rfind("g_gemm", 0) == 0 ? 80u : name == "g_vitattn.spv" ? 20u : 0u;
-        aco_push_gap = nr::aco_needs_compact_push(candidate_gap, push_bytes, shared->aco_record_push_bytes)
+        const bool rdna2_compact = ctx.is_rdna2() && candidate_gap != 0u && push_bytes >= candidate_gap + 8u;
+        aco_push_gap = (rdna2_compact || nr::aco_needs_compact_push(candidate_gap, push_bytes, shared->aco_record_push_bytes))
                      ? candidate_gap : 0u;
         if (ctx.pin) {   // a memory's runtimes are built on two threads (inside frames, in the background)
             std::lock_guard<std::mutex> guard(shared_pipelines_lock());

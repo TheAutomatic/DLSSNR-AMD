@@ -27,6 +27,20 @@ for f in accumulation.txt swin-bias-storage.txt coherent-act.txt shader-constant
 done
 cp -- "$NR_PRODUCT_SPV"/runtime/* "$dst/shaders/runtime/"
 cp -- "$NR_PRODUCT_SPV"/temporal/* "$dst/shaders/temporal/"
+
+copy_rdna2_shaders() {
+    local spv_out=$1 pkg_dir=$2 extra=${3:-}
+    python3 windows/build/build_network.py rdna2 --tree linux --no-quad ${extra:+"$extra"} --out "$spv_out" > /dev/null
+    mkdir -p -- "$pkg_dir/runtime" "$pkg_dir/temporal"
+    cp -- "$spv_out"/g_*.spv "$pkg_dir/"
+    for f in accumulation.txt swin-bias-storage.txt coherent-act.txt shader-constants.txt; do
+        cp -- "$spv_out/$f" "$pkg_dir/"
+    done
+    cp -- "$spv_out"/runtime/* "$pkg_dir/runtime/"
+    cp -- "$spv_out"/temporal/* "$pkg_dir/temporal/"
+}
+copy_rdna2_shaders build/windows/rdna2/network "$dst/shaders-rdna2"
+copy_rdna2_shaders build/windows/rdna2/network-int8 "$dst/shaders-rdna2-int8" --int8
 bash windows/build/build_renodx.sh "$dst/shaders/renodx" > /dev/null   # the RenoDX style
 cp -- windows/shaders/renodx/LICENSE "$dst/shaders/renodx/RenoDX-LICENSE.txt"
 bash windows/build/build_wilsjo2.sh "$dst/shaders/wilsjo2" > /dev/null   # the wilsjo2 style, HUD FIX on every route

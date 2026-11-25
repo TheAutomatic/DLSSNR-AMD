@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include "nr_path_u8.hpp"   // UTF-8 paths (a game folder with any letters)
 #include <map>
@@ -42,6 +43,22 @@ inline bool use_rdna3(std::string* why) {
     std::map<std::string,std::string> aliases;
     for(std::string a,b;probe>>a>>b;)aliases[a]=b;
     s.dir=dir;s.shells={dir+"/shells"};s.aliases=std::move(aliases);
+    return true;
+}
+inline bool is_rdna2_dir(const std::string& dir) {
+    return dir.size() >= 6 && dir.compare(dir.size() - 6, 6, "/rdna2") == 0;
+}
+inline bool use_rdna2(std::string* why) {
+    auto& s = mode(); std::lock_guard<std::mutex> l(s.m);
+    if (s.disabled || !s.configured) { if (why) *why = "ACO Mode is off"; return false; }
+    if (is_rdna2_dir(s.dir)) return true;
+    const std::string dir = s.dir + "/rdna2";
+    std::error_code ec;
+    if (!std::filesystem::is_directory(nr::u8::path(dir + "/records"), ec)) {
+        if (why) *why = "the ACO network has no RDNA2 records (" + dir + "/records)";
+        return false;
+    }
+    s.dir = dir; s.shells.clear(); s.aliases.clear();
     return true;
 }
 inline void configure(const std::string& dir, std::vector<std::string> shells, const std::string& cache,
@@ -83,8 +100,10 @@ inline std::vector<std::string> shell_dirs() {
 }
 inline std::mutex devices_mutex;
 inline std::set<VkDevice> enabled_devices;
+struct DeviceCode { uint32_t mach = 0, key_size = 0, push_base = 1; };
+inline std::map<VkDevice, DeviceCode> device_codes;
 inline void mark(VkDevice d) {std::lock_guard<std::mutex> l(devices_mutex);enabled_devices.insert(d);}
-inline void forget(VkDevice d) {std::lock_guard<std::mutex> l(devices_mutex);enabled_devices.erase(d);}
+inline void forget(VkDevice d) {std::lock_guard<std::mutex> l(devices_mutex);enabled_devices.erase(d);device_codes.erase(d);}
 inline bool enabled(VkDevice d) {std::lock_guard<std::mutex> l(devices_mutex);return enabled_devices.count(d)!=0;}
 // A failure of ACO's machine code itself (no record for the SPIR-V, its template, the driver refusing the import):
 // the build that met it turns ACO Mode off for the process and builds again with the driver's compiler. What is not
@@ -241,6 +260,108 @@ inline VkPipeline import_pipeline(Functions& f,VkDevice device,const VkComputePi
     if(result!=VK_SUCCESS){if(pipeline)vkDestroyPipeline(device,pipeline,nullptr);check(result,"create imported pipeline");}
     return pipeline;
 }
+inline pal::Bytes capture_binary(Functions& f,VkDevice device,const VkComputePipelineCreateInfo& ci,VkPipelineBinaryKeyKHR& key) {
+    Captured captured(f);
+    VkPipelineCreateFlags2CreateInfoKHR flags{VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR};
+    flags.flags=VkPipelineCreateFlags2KHR(ci.flags)|VK_PIPELINE_CREATE_2_CAPTURE_DATA_BIT_KHR;flags.pNext=ci.pNext;
+    auto capture_ci=ci;capture_ci.pNext=&flags;
+    check(vkCreateComputePipelines(device,VK_NULL_HANDLE,1,&capture_ci,nullptr,&captured.pipeline),"capture pipeline");
+    Binaries original(f);VkPipelineBinaryCreateInfoKHR bi{VK_STRUCTURE_TYPE_PIPELINE_BINARY_CREATE_INFO_KHR};bi.pipeline=captured.pipeline;
+    VkPipelineBinaryHandlesInfoKHR hi{VK_STRUCTURE_TYPE_PIPELINE_BINARY_HANDLES_INFO_KHR};
+    check(f.create(device,&bi,nullptr,&hi),"count captured binaries");
+    pal::require(hi.pipelineBinaryCount==1,"expected one PAL compute binary");original.handles.resize(1);
+    hi.pPipelineBinaries=original.handles.data();check(f.create(device,&bi,nullptr,&hi),"capture binaries");
+    VkPipelineBinaryDataInfoKHR di{VK_STRUCTURE_TYPE_PIPELINE_BINARY_DATA_INFO_KHR};di.pipelineBinary=original.handles[0];
+    key=VkPipelineBinaryKeyKHR{VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR};size_t bytes=0;
+    check(f.data(device,&di,&key,&bytes,nullptr),"size captured binary");
+    pal::require(bytes && bytes<=64*1024*1024,"captured binary size limit");pal::Bytes blob(bytes);
+    check(f.data(device,&di,&key,&bytes,blob.data()),"read captured binary");pal::require(bytes<=blob.size(),"captured binary grew");blob.resize(bytes);
+    return blob;
+}
+// The GPU's machine as its driver writes it in e_flags, from the driver's compile of an empty kernel with the
+// pipeline's layout (gfx10.3 containers are built by synthesize, not captured, and need it once per VkDevice).
+inline DeviceCode device_code(Functions& f,VkDevice device,const VkComputePipelineCreateInfo& ci,uint32_t) {
+    {std::lock_guard<std::mutex> l(devices_mutex);auto it=device_codes.find(device);if(it!=device_codes.end())return it->second;}
+    // layout(local_size_x = 32) in; void main() {} (glslang 16.5.0, --target-env vulkan1.3)
+    static const uint32_t empty_kernel[]={
+        0x07230203,0x00010600,0x0008000b,0x0000000b,0x00000000,0x00020011,0x00000001,0x0006000b,
+        0x00000001,0x4c534c47,0x6474732e,0x3035342e,0x00000000,0x0003000e,0x00000000,0x00000001,
+        0x0005000f,0x00000005,0x00000004,0x6e69616d,0x00000000,0x00060010,0x00000004,0x00000011,
+        0x00000020,0x00000001,0x00000001,0x00030003,0x00000002,0x000001c2,0x00040005,0x00000004,
+        0x6e69616d,0x00000000,0x00020013,0x00000002,0x00030021,0x00000003,0x00000002,0x00040015,
+        0x00000006,0x00000020,0x00000000,0x00040017,0x00000007,0x00000006,0x00000003,0x0004002b,
+        0x00000006,0x00000008,0x00000020,0x0004002b,0x00000006,0x00000009,0x00000001,0x0006002c,
+        0x00000007,0x0000000a,0x00000008,0x00000009,0x00000009,0x00050036,0x00000002,0x00000004,
+        0x00000000,0x00000003,0x000200f8,0x00000005,0x000100fd,0x00010038};
+    VkShaderModuleCreateInfo sm{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};sm.codeSize=sizeof empty_kernel;sm.pCode=empty_kernel;
+    VkShaderModule module{};check(vkCreateShaderModule(device,&sm,nullptr,&module),"create empty kernel module");
+    auto empty_ci=ci;empty_ci.stage.module=module;empty_ci.stage.pSpecializationInfo=nullptr;empty_ci.stage.pName="main";
+    VkPipelineBinaryKeyKHR key{};pal::Bytes blob;
+    try{blob=capture_binary(f,device,empty_ci,key);}catch(...){vkDestroyShaderModule(device,module,nullptr);throw;}
+    vkDestroyShaderModule(device,module,nullptr);
+    pal::require(blob.size()>=64,"captured binary size limit");
+    const uint32_t flags=pal::read<uint32_t>(blob,48);
+    const pal::Elf elf(blob);
+    DeviceCode dc{elf.mach,key.keySize};
+    pal::require(dc.key_size && dc.key_size<=VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR,"driver binary key size");
+    // #version 450 / layout(local_size_x = 32) in; / layout(set = 0, binding = 0) buffer B { uint v[]; };
+    // layout(push_constant) uniform P { uint x; }; / void main() { v[gl_GlobalInvocationID.x] = x; } (glslang 16.5.0)
+    static const uint32_t layout_kernel[]={
+        0x07230203,0x00010600,0x0008000b,0x0000001f,0x00000000,0x00020011,0x00000001,0x0006000b,0x00000001,0x4c534c47,
+        0x6474732e,0x3035342e,0x00000000,0x0003000e,0x00000000,0x00000001,0x0008000f,0x00000005,0x00000004,0x6e69616d,
+        0x00000000,0x0000000a,0x0000000f,0x00000016,0x00060010,0x00000004,0x00000011,0x00000020,0x00000001,0x00000001,
+        0x00030003,0x00000002,0x000001c2,0x00040005,0x00000004,0x6e69616d,0x00000000,0x00030005,0x00000008,0x00000042,
+        0x00040006,0x00000008,0x00000000,0x00000076,0x00030005,0x0000000a,0x00000000,0x00080005,0x0000000f,0x475f6c67,
+        0x61626f6c,0x766e496c,0x7461636f,0x496e6f69,0x00000044,0x00030005,0x00000014,0x00000050,0x00040006,0x00000014,
+        0x00000000,0x00000078,0x00030005,0x00000016,0x00000000,0x00040047,0x00000007,0x00000006,0x00000004,0x00030047,
+        0x00000008,0x00000002,0x00050048,0x00000008,0x00000000,0x00000023,0x00000000,0x00040047,0x0000000a,0x00000021,
+        0x00000000,0x00040047,0x0000000a,0x00000022,0x00000000,0x00040047,0x0000000f,0x0000000b,0x0000001c,0x00030047,
+        0x00000014,0x00000002,0x00050048,0x00000014,0x00000000,0x00000023,0x00000000,0x00020013,0x00000002,0x00030021,
+        0x00000003,0x00000002,0x00040015,0x00000006,0x00000020,0x00000000,0x0003001d,0x00000007,0x00000006,0x0003001e,
+        0x00000008,0x00000007,0x00040020,0x00000009,0x0000000c,0x00000008,0x0004003b,0x00000009,0x0000000a,0x0000000c,
+        0x00040015,0x0000000b,0x00000020,0x00000001,0x0004002b,0x0000000b,0x0000000c,0x00000000,0x00040017,0x0000000d,
+        0x00000006,0x00000003,0x00040020,0x0000000e,0x00000001,0x0000000d,0x0004003b,0x0000000e,0x0000000f,0x00000001,
+        0x0004002b,0x00000006,0x00000010,0x00000000,0x00040020,0x00000011,0x00000001,0x00000006,0x0003001e,0x00000014,
+        0x00000006,0x00040020,0x00000015,0x00000009,0x00000014,0x0004003b,0x00000015,0x00000016,0x00000009,0x00040020,
+        0x00000017,0x00000009,0x00000006,0x00040020,0x0000001a,0x0000000c,0x00000006,0x0004002b,0x00000006,0x0000001c,
+        0x00000020,0x0004002b,0x00000006,0x0000001d,0x00000001,0x0006002c,0x0000000d,0x0000001e,0x0000001c,0x0000001d,
+        0x0000001d,0x00050036,0x00000002,0x00000004,0x00000000,0x00000003,0x000200f8,0x00000005,0x00050041,0x00000011,
+        0x00000012,0x0000000f,0x00000010,0x0004003d,0x00000006,0x00000013,0x00000012,0x00050041,0x00000017,0x00000018,
+        0x00000016,0x0000000c,0x0004003d,0x00000006,0x00000019,0x00000018,0x00060041,0x0000001a,0x0000001b,0x0000000a,
+        0x0000000c,0x00000013,0x0003003e,0x0000001b,0x00000019,0x000100fd,0x00010038};
+    uint64_t limit=0;
+    VkDescriptorSetLayout set_layout{};VkPipelineLayout layout{};VkShaderModule probe{};
+    try{
+        VkDescriptorSetLayoutBinding binding{0,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr};
+        VkDescriptorSetLayoutCreateInfo sl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};sl.bindingCount=1;sl.pBindings=&binding;
+        check(vkCreateDescriptorSetLayout(device,&sl,nullptr,&set_layout),"create layout probe set");
+        VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT,0,4};
+        VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        pl.setLayoutCount=1;pl.pSetLayouts=&set_layout;pl.pushConstantRangeCount=1;pl.pPushConstantRanges=&range;
+        check(vkCreatePipelineLayout(device,&pl,nullptr,&layout),"create layout probe layout");
+        VkShaderModuleCreateInfo pm{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};pm.codeSize=sizeof layout_kernel;pm.pCode=layout_kernel;
+        check(vkCreateShaderModule(device,&pm,nullptr,&probe),"create layout probe module");
+        VkComputePipelineCreateInfo pci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pci.stage={VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};pci.stage.stage=VK_SHADER_STAGE_COMPUTE_BIT;
+        pci.stage.module=probe;pci.stage.pName="main";pci.layout=layout;
+        VkPipelineBinaryKeyKHR pkey{};
+        const pal::Bytes pb=capture_binary(f,device,pci,pkey);
+        const pal::Elf pe(pb);
+        limit=pal::pal_metadata(pe.data[pe.find(".note")]).at("amdpal.pipelines").items.at(0).at(".user_data_limit").number();
+    }catch(const std::exception& e){
+        nr::logf("[nr] ACO: the user-data layout probe failed (%s); push constants taken at entry 1",e.what());
+    }
+    if(probe)vkDestroyShaderModule(device,probe,nullptr);
+    if(layout)vkDestroyPipelineLayout(device,layout,nullptr);
+    if(set_layout)vkDestroyDescriptorSetLayout(device,set_layout,nullptr);
+    if(limit) {
+        try{dc.push_base=pal::xgl_layout_of_limit(limit,4).push_base;}
+        catch(const std::exception&){nr::logf("[nr] ACO: the layout probe's user-data limit %llu is not understood",(unsigned long long)limit);limit=0;}
+    }
+    nr::logf("[nr] ACO: the driver's code objects are for machine 0x%02x (e_flags 0x%x), push constants at user data %u%s",
+             dc.mach,flags,dc.push_base,limit?"":" (assumed)");
+    std::lock_guard<std::mutex> l(devices_mutex);return device_codes.emplace(device,dc).first->second;
+}
 inline VkPipeline create(VkDevice device,const VkComputePipelineCreateInfo& ci,const pal::Record& record,uint32_t push_bytes,
                          std::array<uint32_t,3> workgroup,const std::string& cache_file={}) {
     Functions f(device);
@@ -250,7 +371,6 @@ inline VkPipeline create(VkDevice device,const VkComputePipelineCreateInfo& ci,c
             try{return import_pipeline(f,device,ci,key,blob);}catch(const std::exception&){}   // made again below
         }
     }
-    Captured captured(f);
     const bool trace=std::getenv("NR_ACO_DUMP")!=nullptr;
     auto step=[&](const char* s){if(trace){std::fprintf(stderr,"ACO %s: %s\n",keyname(record.spv_hash).c_str(),s);std::fflush(stderr);}};
     // The caller's pNext chain is retained. Flags2 and binary input are owned here.
@@ -259,28 +379,21 @@ inline VkPipeline create(VkDevice device,const VkComputePipelineCreateInfo& ci,c
                      p->sType!=VK_STRUCTURE_TYPE_PIPELINE_BINARY_INFO_KHR,"unsupported pipeline input chain");
     pal::require(!ci.stage.pSpecializationInfo && std::strcmp(ci.stage.pName,"main")==0 &&
                  !(ci.flags & VK_PIPELINE_CREATE_DERIVATIVE_BIT),"unsupported pipeline specialization/entry");
-    VkPipelineCreateFlags2CreateInfoKHR flags{VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR};
-    flags.flags=VkPipelineCreateFlags2KHR(ci.flags)|VK_PIPELINE_CREATE_2_CAPTURE_DATA_BIT_KHR;flags.pNext=ci.pNext;
-    auto capture_ci=ci;capture_ci.pNext=&flags;
-    step("capture pipeline");
-    check(vkCreateComputePipelines(device,VK_NULL_HANDLE,1,&capture_ci,nullptr,&captured.pipeline),"capture pipeline");
-    Binaries original(f);VkPipelineBinaryCreateInfoKHR bi{VK_STRUCTURE_TYPE_PIPELINE_BINARY_CREATE_INFO_KHR};bi.pipeline=captured.pipeline;
-    VkPipelineBinaryHandlesInfoKHR hi{VK_STRUCTURE_TYPE_PIPELINE_BINARY_HANDLES_INFO_KHR};
-    check(f.create(device,&bi,nullptr,&hi),"count captured binaries");
-    pal::require(hi.pipelineBinaryCount==1,"expected one PAL compute binary");original.handles.resize(1);
-    hi.pPipelineBinaries=original.handles.data();check(f.create(device,&bi,nullptr,&hi),"capture binaries");
-    VkPipelineBinaryDataInfoKHR di{VK_STRUCTURE_TYPE_PIPELINE_BINARY_DATA_INFO_KHR};di.pipelineBinary=original.handles[0];
-    VkPipelineBinaryKeyKHR key{VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR};size_t bytes=0;
-    check(f.data(device,&di,&key,&bytes,nullptr),"size captured binary");
-    pal::require(bytes && bytes<=64*1024*1024,"captured binary size limit");pal::Bytes blob(bytes);
-    check(f.data(device,&di,&key,&bytes,blob.data()),"read captured binary");pal::require(bytes<=blob.size(),"captured binary grew");blob.resize(bytes);
-    if(const char* dump=std::getenv("NR_ACO_DUMP")) if(*dump) {
-        std::ofstream out(nr::u8::path(std::string(dump)+"/"+keyname(record.spv_hash)+".captured.elf"),std::ios::binary);
-        pal::require(bool(out),"cannot open captured binary dump");
-        out.write(reinterpret_cast<const char*>(blob.data()),std::streamsize(blob.size()));
-        pal::require(bool(out),"cannot write captured binary dump");
+    VkPipelineBinaryKeyKHR key{VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR};pal::Bytes blob;
+    if(pal::is_gfx103(record.mach)) {
+        const DeviceCode dc=device_code(f,device,ci,push_bytes);
+        step("synthesize");blob=pal::synthesize(record,dc.mach,push_bytes,workgroup,dc.push_base);key.keySize=dc.key_size;step("synthesized");
+    } else {
+        step("capture pipeline");
+        blob=capture_binary(f,device,ci,key);
+        if(const char* dump=std::getenv("NR_ACO_DUMP")) if(*dump) {
+            std::ofstream out(nr::u8::path(std::string(dump)+"/"+keyname(record.spv_hash)+".captured.elf"),std::ios::binary);
+            pal::require(bool(out),"cannot open captured binary dump");
+            out.write(reinterpret_cast<const char*>(blob.data()),std::streamsize(blob.size()));
+            pal::require(bool(out),"cannot write captured binary dump");
+        }
+        step("captured");blob=pal::splice(blob,record,push_bytes,workgroup);step("spliced");
     }
-    step("captured");blob=pal::splice(blob,record,push_bytes,workgroup);step("spliced");
     // Domain-separate the imported key and include the complete transformed data.
     pal::require(key.keySize && key.keySize<=VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR,"driver binary key size");
     uint64_t h=pal::hash(blob.data(),blob.size())^record.spv_hash^0x4e5250414c303031ull;
@@ -339,6 +452,25 @@ inline VkResult create_aco(VkDevice device,VkPipelineCache cache,const VkCompute
         p+=n;
     }
     pal::require(workgroup[0]!=0,"literal SPIR-V local size required");
+    if(pal::is_gfx103(record.mach)) {
+        std::string cache_file;
+        const std::string cache=cache_dir();
+        if(!cache.empty()) {
+#ifdef NR_BUILD_STAMP
+            static const char build[]=NR_BUILD_STAMP;
+#else
+            static const char build[]="unstamped";
+#endif
+            uint64_t k[7]={pal::hash(record_bytes.data(),record_bytes.size()),pal::hash(code,bytes),
+                           identity(),push_bytes,(uint64_t(workgroup[0])<<32)|workgroup[1],workgroup[2],
+                           pal::hash(build,sizeof build-1)};
+            char b[40];std::snprintf(b,sizeof b,"%016llx.nrb",static_cast<unsigned long long>(pal::hash(k,sizeof k)));
+            cache_file=cache+"/"+b;
+        }
+        *out=create(device,ci,record,push_bytes,workgroup,cache_file);
+        if(out_record_push_bytes) *out_record_push_bytes=record.push_bytes;
+        return VK_SUCCESS;
+    }
     // The PAL container comes from the driver's own compile of a template SPIR-V with the same interface:
     // the first shell directory holding the name (NR_ACO_SHELL_DIR, or the product's aco/shell then the
     // native network shaders), else the Linux SPIR-V itself.
@@ -411,6 +543,36 @@ inline VkResult create_or_default(VkDevice device,VkPipelineCache cache,const Vk
     if(out_record_push_bytes) *out_record_push_bytes=0;
     auto dir=directory();
     if(dir.empty() || !network_path(path))return vkCreateComputePipelines(device,cache,1,&ci,nullptr,out);
+    if(is_rdna2_dir(dir)) {
+        const auto name=path.substr(path.find_last_of("/\\")+1);
+        if(native_shell(name)) {
+            nr::logf("[nr] ACO rdna2 %s: driver (NR_ACO_NATIVE_KERNELS)",name.c_str());
+            return vkCreateComputePipelines(device,cache,1,&ci,nullptr,out);
+        }
+        const uint64_t ref=record_reference(code,bytes);
+        const auto h=ref?ref:pal::hash(code,bytes);
+        std::error_code ec;
+        if(!std::filesystem::is_regular_file(nr::u8::path(dir+"/records/"+keyname(h)),ec)) {
+            nr::logf("[nr] ACO rdna2 %s: no record; the driver compiles it",name.c_str());
+            return vkCreateComputePipelines(device,cache,1,&ci,nullptr,out);
+        }
+        try {
+            const VkResult r=create_aco(device,cache,ci,dir,path,code,bytes,out,push_bytes,out_record_push_bytes);
+            nr::logf("[nr] ACO rdna2 %s: imported",name.c_str());
+            return r;
+        } catch(const std::bad_alloc&) {
+            throw;
+        } catch(const VkFailure& e) {
+            if(e.result==VK_ERROR_OUT_OF_HOST_MEMORY || e.result==VK_ERROR_OUT_OF_DEVICE_MEMORY || e.result==VK_ERROR_DEVICE_LOST)throw;
+            if(out_record_push_bytes) *out_record_push_bytes=0;
+            nr::logf("[nr] ACO rdna2 %s: not imported (%s); the driver compiles it",name.c_str(),e.what());
+            return vkCreateComputePipelines(device,cache,1,&ci,nullptr,out);
+        } catch(const std::exception& e) {
+            if(out_record_push_bytes) *out_record_push_bytes=0;
+            nr::logf("[nr] ACO rdna2 %s: not imported (%s); the driver compiles it",name.c_str(),e.what());
+            return vkCreateComputePipelines(device,cache,1,&ci,nullptr,out);
+        }
+    }
     try {
         return create_aco(device,cache,ci,dir,path,code,bytes,out,push_bytes,out_record_push_bytes);
     } catch(const Error&) {

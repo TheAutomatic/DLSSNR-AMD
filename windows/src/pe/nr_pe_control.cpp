@@ -592,7 +592,7 @@ void report(const Status& st) {
     s->net_want = st.net_want < 0 ? nr::control::kNoNet : uint32_t(st.net_want);
     for (int n = 0; n < nr::kNetworkChoices; ++n)
         std::snprintf(s->net_why[n], sizeof s->net_why[n], "%s", st.net_why[n].c_str());
-    s->aco_state = uint32_t(st.aco); s->aco_rdna3 = st.aco_rdna3 ? 1u : 0u;
+    s->aco_state = uint32_t(st.aco); s->aco_rdna3 = st.aco_rdna3;
     std::snprintf(s->aco_why, sizeof s->aco_why, "%s", st.aco_why.c_str());
     s->device_path = uint32_t(st.device_path);
     s->net_known = st.net_want >= 0;

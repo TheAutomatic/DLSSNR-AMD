@@ -3665,7 +3665,7 @@ void fill_view() {
         view.net_known = 1;
         for (int n = 0; n < nr::kNetworkChoices; ++n)
             std::snprintf(view.net_why[n], sizeof view.net_why[n], "%s", st.unavailable[n].c_str());
-        view.aco_state = uint32_t(st.aco); view.aco_rdna3 = st.aco_rdna3 ? 1u : 0u;
+        view.aco_state = uint32_t(st.aco); view.aco_rdna3 = st.aco_rdna3;
         std::snprintf(view.aco_why, sizeof view.aco_why, "%s", st.aco_why.c_str());
         view.device_path = uint32_t(st.device_path);
         view.building = st.building ? 1u : 0u;

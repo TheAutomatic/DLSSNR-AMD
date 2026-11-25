@@ -520,11 +520,11 @@ class Session {
         bool passed = false;
         std::string status;
         // ACO Mode in this run (nr_pipeline_binary.hpp): 0 not known yet (no device), 1 on, 2 off (no reason given),
-        // 3 off: it cannot be used (`aco_why`), 4 off for this device (`aco_why`). `aco_rdna3`: the machine code is
-        // RDNA3's.
+        // 3 off: it cannot be used (`aco_why`), 4 off for this device (`aco_why`). `aco_rdna3`: 0 RDNA4, 1 RDNA3,
+        // 2 RDNA2.
         int aco = 0;
         std::string aco_why;
-        bool aco_rdna3 = false;
+        uint32_t aco_rdna3 = 0;
         // The device the network runs on: 0 not known yet, 1 the bridge (a Vulkan device of NR's own beside the game's
         // D3D10/11/12, the frame through shared textures and fences), 2 the game's own Vulkan device (a Vulkan game, D3D9
         // through DXVK, D3D through vkd3d-proton / DXVK under Wine), 3 the game's D3D12 device itself (not made yet: kept

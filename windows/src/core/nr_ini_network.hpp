@@ -141,4 +141,14 @@ inline std::string ini_network_key(const std::string& path, const std::string& k
     std::fclose(f);
     return r;
 }
+// [Network] Rdna2Int8: 1 on, 0 off, -1 unset.
+inline int ini_rdna2_int8(const std::string& path) {
+    std::string v = ini_network_key(path, "rdna2int8");
+    if (v.empty()) return -1;
+    std::string t;
+    for (char c : v) if (!std::isspace(static_cast<unsigned char>(c))) t += char(std::tolower(static_cast<unsigned char>(c)));
+    if (t == "1" || t == "true" || t == "on" || t == "yes") return 1;
+    if (t == "0" || t == "false" || t == "off" || t == "no") return 0;
+    return -1;
+}
 }  // namespace nr

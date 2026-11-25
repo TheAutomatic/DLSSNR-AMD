@@ -132,7 +132,7 @@ struct DeviceFeatureRequirements {
     bool buffer_device_address;
     std::vector<const char*> extensions;
 
-    DeviceFeatureRequirements(uint32_t api, bool x86)
+    DeviceFeatureRequirements(uint32_t api, bool x86, nr::arch::GpuArch arch = nr::arch::GpuArch::rdna4)
         : known_api(api >= VK_API_VERSION_1_0),
           buffer_device_address(known_api && (!x86 || api >= VK_API_VERSION_1_2)) {
         if (!known_api) return;
@@ -146,6 +146,10 @@ struct DeviceFeatureRequirements {
             extensions.push_back(VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME);
             extensions.push_back(VK_KHR_VULKAN_MEMORY_MODEL_EXTENSION_NAME);
             if (buffer_device_address) extensions.push_back(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
+            if (arch == nr::arch::GpuArch::rdna2) {
+                extensions.push_back(VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME);
+                extensions.push_back(VK_KHR_SHADER_SUBGROUP_EXTENDED_TYPES_EXTENSION_NAME);
+            }
         }
         if (api < VK_API_VERSION_1_3)
             extensions.push_back(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
@@ -192,6 +196,12 @@ public:
         else get<VkPhysicalDevicePipelineRobustnessFeaturesEXT>(
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT)->pipelineRobustness = VK_TRUE;
     }
+    void enable_integer_dot_product() {
+        if (auto* f = find<VkPhysicalDeviceVulkan13Features>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES))
+            f->shaderIntegerDotProduct = VK_TRUE;
+        else get<VkPhysicalDeviceShaderIntegerDotProductFeatures>(
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES)->shaderIntegerDotProduct = VK_TRUE;
+    }
     // The features the network of `arch` (nr_gpu_arch.hpp; one NR has a network for, checked by the caller) needs.
     void enable(nr::arch::GpuArch arch, bool buffer_device_address = true) {
         if (auto* f = find<VkPhysicalDeviceVulkan11Features>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES))
@@ -213,8 +223,9 @@ public:
         if (auto* f = find<VkPhysicalDeviceVulkan13Features>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES))
             f->subgroupSizeControl = true;
         else get<VkPhysicalDeviceSubgroupSizeControlFeatures>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES)->subgroupSizeControl = true;
-        get<VkPhysicalDeviceCooperativeMatrixFeaturesKHR>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR)->cooperativeMatrix = true;
-        // The FP8 features are RDNA4's network's; RDNA3's multiplies FP16 operands and enables nothing here.
+        if (arch != nr::arch::GpuArch::rdna2)
+            get<VkPhysicalDeviceCooperativeMatrixFeaturesKHR>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR)->cooperativeMatrix = true;
+        // The FP8 features are RDNA4's network's; RDNA3 and RDNA2 multiply FP16/INT8 operands and enable nothing here.
         switch (arch) {
         case nr::arch::GpuArch::rdna4: {
             auto* f = get<VkPhysicalDeviceShaderFloat8FeaturesEXT>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT);
@@ -222,7 +233,8 @@ public:
             break;
         }
         case nr::arch::GpuArch::rdna3:
-        case nr::arch::GpuArch::unknown: case nr::arch::GpuArch::rdna1: case nr::arch::GpuArch::rdna2:
+        case nr::arch::GpuArch::rdna2:
+        case nr::arch::GpuArch::unknown: case nr::arch::GpuArch::rdna1:
             break;
         }
     }

@@ -39,9 +39,9 @@ struct Status {
     bool waiting = false;                  // the run passed its frame through, not building (`waiting_why`)
     bool ran = false;                      // this run's network ran (a switch builds behind the network before)
     std::string waiting_why;
-    int aco = 0;                           // ACO Mode in this run (Session::State::aco), its reason, RDNA3's code
+    int aco = 0;                           // ACO Mode in this run (Session::State::aco), its reason, arch (0/1/2)
     std::string aco_why;
-    bool aco_rdna3 = false;
+    uint32_t aco_rdna3 = 0;
     int device_path = 0;                   // the device the network runs on (Session::State::device_path)
     bool vram_known = false;               // the process's device-local heap: use, budget, size (Session::video_memory)
     uint64_t vram_usage = 0, vram_budget = 0, vram_heap = 0;

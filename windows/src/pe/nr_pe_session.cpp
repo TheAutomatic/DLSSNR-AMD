@@ -3037,17 +3037,28 @@ void Session::Impl::check_availability() {
         x_attention = "dlssnr-amd\\aco\\rdna3\\experimental\\shaders\\fixed-attention.txt";
         o_attention = "dlssnr-amd\\aco\\rdna3\\optimized\\shaders\\fixed-attention.txt";
         break;
-    case nr::arch::GpuArch::unknown: case nr::arch::GpuArch::rdna1: case nr::arch::GpuArch::rdna2: {
+    case nr::arch::GpuArch::rdna2:
+        break;
+    case nr::arch::GpuArch::unknown: case nr::arch::GpuArch::rdna1: {
         const std::string why = std::string("NR has no network for this GPU (") + nr::arch::name(arch) + ")";
         for (int i = 0; i < nr::kNetworkChoices; ++i) net_switch.unavailable(i, why);
         return;
     }
     }
     const bool rdna3 = arch == nr::arch::GpuArch::rdna3;
+    const bool rdna2 = arch == nr::arch::GpuArch::rdna2;
     if (!exists("dlssnr-amd\\CC_SMALL_FP8.bin"))
         net_switch.unavailable(nr::kSmallFp8, "needs the model of the 310.9.16 nvngx_dlssnr.dll (install.ps1 -Dll)");
     if (!exists("dlssnr-amd\\CC_SILVER_AARDWOLD.bin"))
         net_switch.unavailable(nr::kSilverAardwold, "the model file is missing (run install.bat again)");
+    if (rdna2) {
+        net_switch.unavailable(nr::kSmallFp8Experimental, "RDNA2 uses CC_SMALL_FP8 / CC_SILVER_AARDWOLD only");
+        net_switch.unavailable(nr::kSilverAardwoldOptimizedFp8, "RDNA2 uses CC_SMALL_FP8 / CC_SILVER_AARDWOLD only");
+        net_switch.unavailable(nr::kSilverAardwoldOptimized, "RDNA2 does not support INT4 layers");
+        net_switch.unavailable(nr::kSilverAardwoldOptimizedPerformance, "RDNA2 does not support INT4 layers");
+        net_switch.unavailable(nr::kSilverAardwoldOptimizedUltra, "RDNA2 does not support INT4 layers");
+        return;
+    }
     if (!exists(x_attention))
         net_switch.unavailable(nr::kSmallFp8Experimental, "not installed (run install.bat again)");
     else if (!exists("dlssnr-amd\\CC_SMALL_FP8_EXPERIMENTAL.bin"))
@@ -4049,7 +4060,8 @@ Session::State Session::state() const {
             s.aco_why = "the device NR runs on was made without pipeline binaries";
         } else {
             s.aco = 1;
-            s.aco_rdna3 = dir.size() > 6 && dir.compare(dir.size() - 6, 6, "/rdna3") == 0;
+            s.aco_rdna3 = (dir.size() > 6 && dir.compare(dir.size() - 6, 6, "/rdna3") == 0) ? 1u
+                        : nr::binary::is_rdna2_dir(dir) ? 2u : 0u;
         }
     }
     s.passed = !m.last_ok;

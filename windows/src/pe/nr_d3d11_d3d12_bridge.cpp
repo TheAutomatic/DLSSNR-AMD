@@ -4,6 +4,7 @@
 
 #include "nr_d3d12_passthrough.hpp"
 #include "nr_dlssnr_model.hpp"
+#include "nr_gpu_arch.hpp"
 #include "nr_pe_log.hpp"
 
 #include <algorithm>
@@ -115,7 +116,8 @@ IDXGIAdapter* amd_adapter_of(ID3D11Device* d11_dev, LUID* luid, std::string* why
     bool ok = false;
     if (SUCCEEDED(adapter->QueryInterface(IID_PPV_ARGS(&adapter1))) && adapter1) {
         if (SUCCEEDED(adapter1->GetDesc1(&desc1)))
-            ok = desc1.VendorId == kAmdVendorId && (desc1.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0;
+            ok = (desc1.VendorId == kAmdVendorId || nr::arch::manual() == nr::arch::GpuArch::rdna2) &&
+                 (desc1.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0;
         adapter1->Release();
     }
     if (!ok) {
