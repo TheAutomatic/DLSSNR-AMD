@@ -99,6 +99,9 @@ bool parse_key(const std::string& text, int* vk, int* mods);
 // While NR Control takes a key for a hotkey (its Hotkeys section): no hotkey of NR's acts for `ms` (each frame of the
 // capture renews it).
 void pause_hotkeys(uint32_t ms = 300);
+// Cross-process target window (e.g. Electron/Chromium BrowserWindow when NR runs in the GPU child process):
+// hotkeys treat the process as focused when the foreground window is this window or its root/owner ancestor.
+void set_focus_window(void* window);
 // NRScreenshotKey: true on the frame the key goes down (the game's window in front).
 class KeyPress {
   public:

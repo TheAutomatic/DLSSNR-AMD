@@ -143,20 +143,25 @@ class Ini {
             if (!wrote) err = GetLastError();
         }
         if (!wrote) {
+            save_error_ = err ? uint32_t(err) : 1u;
             nr::pe::log("[nr] NR Control: could not write temporary dlssnr-amd.ini '%s' (error %lu)",
                         nr::u8::narrow(tmp).c_str(), err);
             DeleteFileW(tmp.c_str());
         } else if (!MoveFileExW(tmp.c_str(), path_.wstring().c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
             err = GetLastError();
+            save_error_ = err ? uint32_t(err) : 1u;
             nr::pe::log("[nr] NR Control: could not save dlssnr-amd.ini '%s' (error %lu)",
                         nr::u8::narrow(path_.wstring()).c_str(), err);
             DeleteFileW(tmp.c_str());
+        } else {
+            save_error_ = 0;
         }
         dirty_ = false;
         nr::pe::touch_config();   // the DLL takes it at its next look, now
         const auto t = std::filesystem::last_write_time(path_, ec);
         if (!ec) stamp_ = int64_t(t.time_since_epoch().count());
     }
+    uint32_t save_error() const { return save_error_; }
 
   private:
     static std::string trim(std::string s) {
@@ -207,6 +212,7 @@ class Ini {
     std::filesystem::path path_;
     std::vector<std::string> lines_;
     int64_t stamp_ = -1;
+    uint32_t save_error_ = 0;
     bool dirty_ = false;
     mutable bool indexed_ = false;
     mutable std::unordered_map<std::string, int> headers_;   // lower-cased trimmed header line -> its first line
