@@ -3658,6 +3658,24 @@ void* detour_of(DetourKind kind, int k) {
 }
 static_assert(kDetoursPerKind == 8, "detour_of lists eight instances");
 
+// A wrapper's Present1 that only tail-calls this->Present (e.g. AMD FSR 3's
+// FrameInterpolationSwapChainDX12::Present1) compiles to `mov rax, [rcx]; jmp qword ptr [rax+0x40]`.
+// Under MSVC /OPT:ICF, that 6-byte thunk is folded with unrelated vtable[8] forwarders in the game
+// (e.g. Wwise I/O hooks in Black Myth: Wukong); MinHooking it with present1()'s 32-bit UINT
+// parameters truncates 64-bit pointers passed to those unrelated methods. Slot 8 is already hooked,
+// so skipping slot 22 keeps Present1 intercepted through slot 8 without patching the shared thunk.
+bool present1_forwards_to_present(const void* fn) {
+    if (!fn) return false;
+    const auto* b = static_cast<const uint8_t*>(fn);
+    if (b[0] != 0x48 || b[1] != 0x8b || b[2] != 0x01) return false;   // mov rax, [rcx]
+    const uint8_t* j = b + 3;
+    if (*j == 0x48) ++j;                                               // optional REX.W
+    if (j[0] != 0xff) return false;
+    if (j[1] == 0x60 && j[2] == 0x40) return true;                     // jmp qword ptr [rax+0x40]
+    if (j[1] == 0xa0 && j[2] == 0x40 && j[3] == 0x00 && j[4] == 0x00 && j[5] == 0x00) return true;
+    return false;
+}
+
 // The function in `object`'s vtable `slot`, hooked with the next free detour of `kind` (once per function). False when
 // it runs unhooked.
 bool hook_slot(void* object, int slot, DetourKind kind) {
@@ -3685,6 +3703,12 @@ bool hook_slot(void* object, int slot, DetourKind kind) {
                                 name == L"d3d10.dll" || name.rfind(L"dxvk", 0) == 0 || name.rfind(L"vkd3d", 0) == 0;
             if (system) {
                 g_hooked_functions[fn] = -2;
+                return true;
+            }
+            if (kind == kDetourPresent1 && present1_forwards_to_present(fn)) {
+                g_hooked_functions[fn] = -2;
+                log("[nr] Present layers: %s's Present1 (slot %d) forwards to Present (slot 8); left unhooked",
+                    nr::u8::narrow(name).c_str(), slot);
                 return true;
             }
             log("[nr] Present layers: the game's swap chain is %s's (frame generation's, or another wrapper's): its "
