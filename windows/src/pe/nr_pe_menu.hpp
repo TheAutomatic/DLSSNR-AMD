@@ -78,6 +78,8 @@ bool colour_space_of(IDXGISwapChain* swap_chain, int* space);
 void abandon_at_exit();
 // Arbitrates primary swap-chain ownership when standalone hosts present multiple windows.
 bool is_primary_swapchain(IDXGISwapChain* swap_chain);
+// Suppresses DXGI Present hooks / menu drawing (used when Vulkan standalone owns presentation).
+void set_dxgi_suppressed(bool suppressed);
 // Native Vulkan Present: same Menu and input watcher as DXGI, its own Vulkan draw/compose passes.
 const VkPresentInfoKHR* vulkan_present(VkInstance instance, VkPhysicalDevice physical, VkDevice device,
         VkQueue queue, uint32_t family, VkSwapchainKHR sc, VkFormat format, VkColorSpaceKHR space,

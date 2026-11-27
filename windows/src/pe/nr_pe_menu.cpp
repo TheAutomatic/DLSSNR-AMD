@@ -1755,11 +1755,13 @@ ID3D12CommandQueue* created_queue(IDXGISwapChain* sc) {   // AddRef'd; null: not
 // frames only where the generator made them from the back buffer at that Present; a generator that takes the game's
 // frame earlier (a game dispatching FSR frame generation itself, DLSS-G through NGX) showed it on every other frame.
 std::atomic<ULONGLONG> g_system_drawn_ms{0};   // NR Control drawn at the system's Present then
+std::atomic<bool> g_dxgi_suppressed{false};
 // `known`: the game's own swap chain's queue (D3D12) or device (D3D11), given by draw_game while the system's Present
 // has not drawn the menu for a second (it is not hooked, or sees no presents) - the menu drawn there, no hooks run;
 // null: the system's Present - the hooks run, and the menu is drawn.
 void draw_on(IDXGISwapChain* sc, UINT flags, IUnknown* known = nullptr) {
     if (t_inside || (flags & DXGI_PRESENT_TEST)) return;
+    if (!known && g_dxgi_suppressed.load(std::memory_order_acquire)) return;
     if (!known && !is_primary_swapchain(sc)) return;
     if (!known) ++g_presents;
     t_inside = true;
@@ -2218,6 +2220,7 @@ void note_swapchain_queue(IDXGISwapChain* swap_chain, ID3D12CommandQueue* queue)
 }
 void draw_game(IDXGISwapChain* swap_chain, IUnknown* device, bool new_frame) {
     if (!swap_chain || !device) return;
+    if (g_dxgi_suppressed.load(std::memory_order_acquire)) return;
     const ULONGLONG now = GetTickCount64();
     g_game_present_ms = now;
     if (now - g_system_drawn_ms.load() < 1000) {   // drawn at the system's Present, on every frame shown
@@ -2256,6 +2259,9 @@ bool is_primary_swapchain(IDXGISwapChain* swap_chain) {
             static_cast<void*>(info.sc), info.w, info.h, static_cast<void*>(info.hwnd), info.active_count);
     }
     return ok;
+}
+void set_dxgi_suppressed(bool suppressed) {
+    g_dxgi_suppressed.store(suppressed, std::memory_order_release);
 }
 
 void install() {

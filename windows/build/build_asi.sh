@@ -91,6 +91,9 @@ par "$cc" -O2 -I"$minhook/include" -I"$minhook/src" -c "$minhook/src/hde/hde64.c
 # nr_present_probe.exe (dlssnr-amd\): finds DXGI's swap-chain methods for NR Control in a process of its own.
 par "$cxx" -std=c++17 -O2 -DNDEBUG -municode windows/src/pe/nr_present_probe.cpp -o "$out/nr_present_probe.exe" \
     -ldxgi -static -static-libgcc -static-libstdc++
+# dxgi-standalone.dll: drop-in DXGI proxy that forwards DXGI calls to system dxgi.dll and boots dlssnr-amd.asi directly.
+par "$cxx" -std=c++17 -O2 -DNDEBUG -shared windows/src/pe/nr_dxgi_standalone.cpp windows/src/pe/nr_dxgi_standalone.def \
+    -o "$out/dxgi-standalone.dll" -static -static-libgcc -static-libstdc++
 
 par_wait
 objs=("$out/asi_main.o" "$out/d3d12_direct_state.o" "$out/d3d12_passthrough.o" "$out/d3d12_passthrough_backend.o"
@@ -106,5 +109,5 @@ ldflags=(-ld3d12 -ld3d11 -ldxgi -lole32 -lversion -static -static-libgcc -static
 count=$(bash windows/build/vulkan_lazy.sh "$out" "$cxx" -shared "${objs[@]}" "${ldflags[@]}" | grep -o '[0-9]*$')
 "$cxx" -shared -o "$out/dlssnr-amd.asi" "${objs[@]}" "$out/vulkan_lazy_s.o" "$out/vulkan_lazy_c.o" "${ldflags[@]}"
 
-echo "built $out/dlssnr-amd.asi ($(stat -c %s "$out/dlssnr-amd.asi") bytes, $count Vulkan entry points at run time), $out/nr_present_probe.exe and $out/shaders/wilsjo2"
+echo "built $out/dlssnr-amd.asi ($(stat -c %s "$out/dlssnr-amd.asi") bytes, $count Vulkan entry points at run time), $out/dxgi-standalone.dll, $out/nr_present_probe.exe and $out/shaders/wilsjo2"
 echo "exports: $("$objdump" -p "$out/dlssnr-amd.asi" | grep -c 'InitializeASI')  imports: $("$objdump" -p "$out/dlssnr-amd.asi" | grep 'DLL Name' | awk '{print $3}' | tr '\n' ' ')"

@@ -68,6 +68,7 @@
 #include "nr_vram_ledger.hpp"
 #include "nr_vk_receipts.hpp"
 
+#include <vulkan/vk_layer.h>
 #include <windows.h>
 #include <vulkan/vulkan_win32.h>
 #include <d3d12.h>
@@ -110,7 +111,13 @@ using nr::dlssnr::Feature;
 using nr::dlssnr::Rect;
 
 HMODULE g_self = nullptr;
-HMODULE g_opti = nullptr;   // OptiScaler: the module that called InitializeASI
+HMODULE g_opti = nullptr;   // OptiScaler: the module that called InitializeASI (or standalone dxgi.dll)
+bool g_standalone = false;  // true when loaded by our standalone dxgi.dll (NR_Standalone_DXGI) or Vulkan layer, no OptiScaler/upscaler host
+bool g_vk_standalone = false;
+std::atomic<bool> g_vk_swap_active{false};
+std::mutex g_layer_instances_lock;
+std::unordered_map<VkInstance, PFN_vkGetInstanceProcAddr> g_layer_instances;
+VkInstance g_layer_last_instance = VK_NULL_HANDLE;
 
 // The DLSS flags (NVSDK_NGX_DLSS_Feature_Flags) this module reads.
 constexpr uint32_t kFlagIsHdr = 1u << 0, kFlagMvLowRes = 1u << 1, kFlagDepthInverted = 1u << 3,
@@ -571,6 +578,15 @@ std::shared_ptr<const Chain> chain_now() {
     }();
     static std::shared_ptr<const Chain> current;
     if (!file.poll(nr::u8::writable_ini_path(nr::pe::module_folder()), config) && current) return current;
+    if (g_standalone) {
+        for (nr::pe::LayerConfig& lc : config.layers) {
+            lc.placement = nr::pe::Placement::kPresent;
+            if (lc.processing == nr::pe::Processing::kRenoDX) {
+                lc.renodx.values.present_guides = 2u;
+                lc.renodx.values.frame_reuse = false;
+            }
+        }
+    }
     auto next = std::make_shared<Chain>();
     Chain& chain = *next;
     chain.version = current ? current->version : 0;
@@ -580,6 +596,7 @@ std::shared_ptr<const Chain> chain_now() {
         Layer x{l, {}, -1};
         if (l.processing == nr::pe::Processing::kWilsjo2) {
             x.w2 = nr::asi::wilsjo2_settings(l);
+            if (g_standalone) x.w2.frame_reuse = false;
             if (config.inspect.layer == std::max(l.number, 1)) {   // [Inspect]'s debug views, of the layer it chose
                 x.w2.debug_view = config.inspect.debug_view;
                 x.w2.show_skin_mask = config.inspect.skin_mask;
@@ -3507,6 +3524,7 @@ void note_frame_generation() {
     nr::asi::hudcap::fg_delay(capture ? nr::pe::Session::frames_delay() : 0,capture);
 }
 void on_present(IDXGISwapChain* sc, ID3D12CommandQueue* queue, int encoding) {
+    if (g_vk_swap_active.load(std::memory_order_acquire)) return;
     nr::pe::watchdog::beat();
     nr::pe::stats::shown_present();
     nr::pe::watchdog::Phase phase("the system's Present (NR Control's hook)");
@@ -3605,6 +3623,7 @@ void fg_pacing_restart() {
 }
 
 void game_present_before(IDXGISwapChain* sc) {
+    if (g_vk_swap_active.load(std::memory_order_acquire)) return;
     nr::pe::watchdog::game_beat();
     nr::pe::stats::game_present();
     fg_pacing_restart();
@@ -3998,6 +4017,7 @@ void menu_once11() {
     });
 }
 void on_present11(IDXGISwapChain* sc, ID3D11Device* device) {
+    if (g_vk_swap_active.load(std::memory_order_acquire)) return;
     nr::pe::watchdog::beat();
     nr::pe::stats::shown_present();
     frame_generation_line();
@@ -4014,6 +4034,7 @@ void on_present11(IDXGISwapChain* sc, ID3D11Device* device) {
 void adopt_swapchain(IUnknown* device, IDXGISwapChain* sc) {
     ID3D12CommandQueue* queue = nullptr;
     if (!device || !sc) return;
+    if (g_vk_standalone && g_vk_swap_active.load(std::memory_order_acquire)) return;
     if (FAILED(device->QueryInterface(IID_PPV_ARGS(&queue))) || !queue) {   // a D3D11 (D3D10) game's: its menu now
         ID3D11Device* d11 = nullptr;
         if (FAILED(device->QueryInterface(IID_PPV_ARGS(&d11))) || !d11) { nr::pe::menu::install(); return; }
@@ -4024,14 +4045,19 @@ void adopt_swapchain(IUnknown* device, IDXGISwapChain* sc) {
             if (slot) slot->Release();
             slot = d11;
         }
-        bool hooked = hook_slot(sc, 8, kDetourPresent);
-        IDXGISwapChain1* sc1 = nullptr;
-        if (SUCCEEDED(sc->QueryInterface(IID_PPV_ARGS(&sc1))) && sc1) {
-            hooked = hook_slot(sc1, 22, kDetourPresent1) && hooked;
-            sc1->Release();
+        bool hooked = false;
+        if (!g_standalone) {
+            hooked = hook_slot(sc, 8, kDetourPresent);
+            IDXGISwapChain1* sc1 = nullptr;
+            if (SUCCEEDED(sc->QueryInterface(IID_PPV_ARGS(&sc1))) && sc1) {
+                hooked = hook_slot(sc1, 22, kDetourPresent1) && hooked;
+                sc1->Release();
+            }
         }
         log("[nr] Present layers: the game's D3D11 swap chain %p found%s", static_cast<void*>(sc),
-            hooked ? "; they run at its Present, before OptiScaler's" : ", but its Present is not hooked (above)");
+            g_standalone ? "; they run at DXGI Present"
+            : hooked     ? "; they run at its Present, before OptiScaler's"
+                         : ", but its Present is not hooked (above)");
         return;
     }
     {
@@ -4066,13 +4092,19 @@ void adopt_swapchain(IUnknown* device, IDXGISwapChain* sc) {
                      "under it"
                    : "is not frame generation's: the layers may also run at the system's Present again");
     }
-    bool hooked = hook_slot(sc, 8, kDetourPresent);
-    IDXGISwapChain1* sc1 = nullptr;
-    if (SUCCEEDED(sc->QueryInterface(IID_PPV_ARGS(&sc1))) && sc1) {
-        hooked = hook_slot(sc1, 22, kDetourPresent1) && hooked;
-        sc1->Release();
+    bool hooked = false;
+    if (!g_standalone) {
+        hooked = hook_slot(sc, 8, kDetourPresent);
+        IDXGISwapChain1* sc1 = nullptr;
+        if (SUCCEEDED(sc->QueryInterface(IID_PPV_ARGS(&sc1))) && sc1) {
+            hooked = hook_slot(sc1, 22, kDetourPresent1) && hooked;
+            sc1->Release();
+        }
     }
-    if (hooked)
+    if (g_standalone)
+        log("[nr] Present layers: the game's swap chain %p (presenting on queue %p) found via standalone DXGI; they run at "
+            "DXGI Present", static_cast<void*>(sc), static_cast<void*>(queue));
+    else if (hooked)
         log("[nr] Present layers: the game's swap chain %p (presenting on queue %p) found; they run at its Present, "
             "before OptiScaler's", static_cast<void*>(sc), static_cast<void*>(queue));
     else
@@ -4118,6 +4150,7 @@ HRESULT WINAPI hk_create_factory2(UINT flags, REFIID riid, void** out) {
 // From InitializeASI: the factory creation of the dxgi.dll the game loads (OptiScaler itself when it is dxgi.dll).
 void hook_game_dxgi() {
     HMODULE dxgi = GetModuleHandleW(L"dxgi.dll");
+    if (!dxgi && g_standalone && !g_vk_standalone) dxgi = g_opti;
     if (!dxgi) {
         log("[nr] Present layers: no dxgi.dll loaded with OptiScaler; they run under OptiScaler's Present (after its "
             "frame generation)");
@@ -5569,18 +5602,30 @@ std::mutex g_surfaces_lock;
 std::unordered_map<VkSurfaceKHR, SurfaceRec> g_surface_windows;   // g_surfaces_lock
 std::unordered_map<VkInstance, PFN_vkCreateWin32SurfaceKHR> g_instance_create_win32_surface_procs;   // g_surfaces_lock
 std::unordered_map<VkInstance, PFN_vkDestroySurfaceKHR> g_instance_destroy_surface_procs;   // g_surfaces_lock
+std::unordered_map<VkInstance, PFN_vkCreateWin32SurfaceKHR> g_layer_create_win32_surface_procs;   // g_surfaces_lock
+std::unordered_map<VkInstance, PFN_vkDestroySurfaceKHR> g_layer_destroy_surface_procs;   // g_surfaces_lock
 thread_local int t_in_create = 0;
 thread_local int t_in_create_instance = 0;
 thread_local int t_in_destroy_instance = 0;
 thread_local int t_in_enum_phys = 0;
 thread_local int t_in_create_win32_surface = 0;
 thread_local int t_in_destroy_surface = 0;
+std::atomic<PFN_vkCreateDevice> g_layer_next_create_device{nullptr};
+std::atomic<VkInstance> g_layer_create_instance{VK_NULL_HANDLE};
+
+void forget_vk_swapchains(VkDevice device);
+void hook_native_vk_device_procs(VkDevice device);
+VKAPI_ATTR VkResult VKAPI_CALL nr_layer_create_instance(const VkInstanceCreateInfo* ci,
+                                                         const VkAllocationCallbacks* a, VkInstance* out);
+VKAPI_ATTR void VKAPI_CALL nr_layer_destroy_instance(VkInstance instance, const VkAllocationCallbacks* a);
 
 void forget_asi_instance(VkInstance instance) {
     if (!instance) return;
     nr::pe::vkdevice::forget_instance(instance);
     VkInstance expected = instance;
     g_create_instance.compare_exchange_strong(expected, VK_NULL_HANDLE, std::memory_order_acq_rel);
+    VkInstance layer_expected = instance;
+    g_layer_create_instance.compare_exchange_strong(layer_expected, VK_NULL_HANDLE, std::memory_order_acq_rel);
     {
         std::lock_guard<std::mutex> guard(g_devices_lock);
         g_instance_destroy_procs.erase(instance);
@@ -5593,6 +5638,8 @@ void forget_asi_instance(VkInstance instance) {
         std::lock_guard<std::mutex> guard(g_surfaces_lock);
         g_instance_create_win32_surface_procs.erase(instance);
         g_instance_destroy_surface_procs.erase(instance);
+        g_layer_create_win32_surface_procs.erase(instance);
+        g_layer_destroy_surface_procs.erase(instance);
         for (auto it = g_surface_windows.begin(); it != g_surface_windows.end();)
             if (it->second.instance == instance) it = g_surface_windows.erase(it);
             else ++it;
@@ -5638,12 +5685,25 @@ VkResult create_device(PFN_vkCreateDevice create, VkInstance instance, VkPhysica
             d.counts.push_back(ci->pQueueCreateInfos[i].queueCount);
         }
         nr::asi::hudcap::vk_device(*out, d.translator);   // HUD FIX's capture: its creations followed (not a translator's)
-        std::lock_guard<std::mutex> guard(g_devices_lock);
-        // the instance that listed this physical device (vkEnumeratePhysicalDevices), else the one the wrapped
-        // vkGetInstanceProcAddr was last asked of
-        const auto it = g_physical_instance.find(phys);
-        d.instance = it != g_physical_instance.end() ? it->second : instance;
-        g_devices.push_back(std::move(d));
+        const bool native = !d.translator;
+        VkInstance layer_inst = VK_NULL_HANDLE;
+        {
+            std::lock_guard<std::mutex> lg(g_layer_instances_lock);
+            layer_inst = g_layer_last_instance;
+        }
+        {
+            std::lock_guard<std::mutex> guard(g_devices_lock);
+            // the instance that listed this physical device (vkEnumeratePhysicalDevices), else the one the wrapped
+            // vkGetInstanceProcAddr was last asked of, else our layer's instance
+            const auto it = g_physical_instance.find(phys);
+            VkInstance resolved = it != g_physical_instance.end() ? it->second : instance;
+            if (!resolved) resolved = g_create_instance.load(std::memory_order_relaxed);
+            if (!resolved) resolved = g_layer_create_instance.load(std::memory_order_relaxed);
+            if (!resolved) resolved = layer_inst;
+            d.instance = resolved;
+            g_devices.push_back(std::move(d));
+        }
+        if (native) hook_native_vk_device_procs(*out);
     }
     return r;
 }
@@ -5651,6 +5711,13 @@ VkResult create_device(PFN_vkCreateDevice create, VkInstance instance, VkPhysica
 VKAPI_ATTR VkResult VKAPI_CALL hk_create_device(VkPhysicalDevice phys, const VkDeviceCreateInfo* ci,
                                                 const VkAllocationCallbacks* a, VkDevice* out) {
     return create_device(g_next_create_device.load(), g_create_instance.load(), phys, ci, a, out, __builtin_return_address(0));
+}
+VKAPI_ATTR VkResult VKAPI_CALL hk_layer_create_device(VkPhysicalDevice phys, const VkDeviceCreateInfo* ci,
+                                                      const VkAllocationCallbacks* a, VkDevice* out) {
+    PFN_vkCreateDevice next = g_layer_next_create_device.load(std::memory_order_acquire);
+    if (t_in_create) return next(phys, ci, a, out);
+    return create_device(next, g_layer_create_instance.load(std::memory_order_relaxed), phys, ci, a, out,
+                         __builtin_return_address(0));
 }
 VKAPI_ATTR VkResult VKAPI_CALL hk_export_create_device(VkPhysicalDevice phys, const VkDeviceCreateInfo* ci,
                                                        const VkAllocationCallbacks* a, VkDevice* out) {
@@ -5668,6 +5735,7 @@ VKAPI_ATTR void VKAPI_CALL hk_destroy_device(VkDevice device, const VkAllocation
     if (device) {
         nr::pe::menu::vulkan_forget(device);
         vk_route_teardown(device);
+        forget_vk_swapchains(device);
         forget_queues(device);
         nr::pe::vkdevice::forget_device(device);
         std::lock_guard<std::mutex> guard(g_devices_lock);
@@ -5841,16 +5909,68 @@ VKAPI_ATTR void VKAPI_CALL hk_gipa_destroy_surface(VkInstance instance, VkSurfac
     destroy_surface_common(next, instance, surface, a);
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL hk_layer_create_win32_surface(VkInstance instance,
+                                                             const VkWin32SurfaceCreateInfoKHR* ci,
+                                                             const VkAllocationCallbacks* a, VkSurfaceKHR* out) {
+    PFN_vkCreateWin32SurfaceKHR next = nullptr;
+    if (instance) {
+        std::lock_guard<std::mutex> guard(g_surfaces_lock);
+        if (const auto it = g_layer_create_win32_surface_procs.find(instance);
+            it != g_layer_create_win32_surface_procs.end())
+            next = it->second;
+    }
+    if (!next && instance) {
+        PFN_vkGetInstanceProcAddr next_gipa = nullptr;
+        {
+            std::lock_guard<std::mutex> guard(g_layer_instances_lock);
+            if (const auto it = g_layer_instances.find(instance); it != g_layer_instances.end()) next_gipa = it->second;
+        }
+        if (next_gipa) next = reinterpret_cast<PFN_vkCreateWin32SurfaceKHR>(next_gipa(instance, "vkCreateWin32SurfaceKHR"));
+    }
+    if (!next) return VK_ERROR_EXTENSION_NOT_PRESENT;
+    if (t_in_create_win32_surface) return next(instance, ci, a, out);
+    return create_win32_surface_common(next, instance, ci, a, out);
+}
+
+VKAPI_ATTR void VKAPI_CALL hk_layer_destroy_surface(VkInstance instance, VkSurfaceKHR surface,
+                                                    const VkAllocationCallbacks* a) {
+    PFN_vkDestroySurfaceKHR next = nullptr;
+    if (instance) {
+        std::lock_guard<std::mutex> guard(g_surfaces_lock);
+        if (const auto it = g_layer_destroy_surface_procs.find(instance);
+            it != g_layer_destroy_surface_procs.end())
+            next = it->second;
+    }
+    if (!next && instance) {
+        PFN_vkGetInstanceProcAddr next_gipa = nullptr;
+        {
+            std::lock_guard<std::mutex> guard(g_layer_instances_lock);
+            if (const auto it = g_layer_instances.find(instance); it != g_layer_instances.end()) next_gipa = it->second;
+        }
+        if (next_gipa) next = reinterpret_cast<PFN_vkDestroySurfaceKHR>(next_gipa(instance, "vkDestroySurfaceKHR"));
+    }
+    if (!next) return;
+    if (t_in_destroy_surface) {
+        next(instance, surface, a);
+        return;
+    }
+    destroy_surface_common(next, instance, surface, a);
+}
+
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL hk_gipa(VkInstance instance, const char* name) {
     const PFN_vkVoidFunction f = real_gipa(instance, name);
     if (!f || !name) return f;
     if (!std::strcmp(name, "vkCreateInstance")) {
-        if (f == reinterpret_cast<PFN_vkVoidFunction>(&hk_gipa_create_instance)) return f;
+        if (f == reinterpret_cast<PFN_vkVoidFunction>(&nr_layer_create_instance) ||
+            f == reinterpret_cast<PFN_vkVoidFunction>(&hk_gipa_create_instance))
+            return f;
         g_next_create_instance.store(reinterpret_cast<PFN_vkCreateInstance>(f), std::memory_order_release);
         return reinterpret_cast<PFN_vkVoidFunction>(&hk_gipa_create_instance);
     }
     if (!std::strcmp(name, "vkDestroyInstance")) {
-        if (f == reinterpret_cast<PFN_vkVoidFunction>(&hk_gipa_destroy_instance)) return f;
+        if (f == reinterpret_cast<PFN_vkVoidFunction>(&nr_layer_destroy_instance) ||
+            f == reinterpret_cast<PFN_vkVoidFunction>(&hk_gipa_destroy_instance))
+            return f;
         if (instance) {
             std::lock_guard<std::mutex> guard(g_devices_lock);
             g_instance_destroy_procs[instance] = reinterpret_cast<PFN_vkDestroyInstance>(f);
@@ -5868,12 +5988,15 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL hk_gipa(VkInstance instance, const char
         return reinterpret_cast<PFN_vkVoidFunction>(&hk_gipa_enumerate_physical);
     }
     if (!std::strcmp(name, "vkCreateDevice")) {
+        if (f == reinterpret_cast<PFN_vkVoidFunction>(&hk_layer_create_device)) return f;
         g_next_create_device.store(reinterpret_cast<PFN_vkCreateDevice>(f));
         if (instance) g_create_instance.store(instance);
         return reinterpret_cast<PFN_vkVoidFunction>(&hk_create_device);
     }
     if (!std::strcmp(name, "vkCreateWin32SurfaceKHR")) {
-        if (f == reinterpret_cast<PFN_vkVoidFunction>(&hk_gipa_create_win32_surface)) return f;
+        if (f == reinterpret_cast<PFN_vkVoidFunction>(&hk_gipa_create_win32_surface) ||
+            f == reinterpret_cast<PFN_vkVoidFunction>(&hk_layer_create_win32_surface))
+            return f;
         if (instance) {
             std::lock_guard<std::mutex> guard(g_surfaces_lock);
             g_instance_create_win32_surface_procs[instance] = reinterpret_cast<PFN_vkCreateWin32SurfaceKHR>(f);
@@ -5882,7 +6005,9 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL hk_gipa(VkInstance instance, const char
         return reinterpret_cast<PFN_vkVoidFunction>(&hk_gipa_create_win32_surface);
     }
     if (!std::strcmp(name, "vkDestroySurfaceKHR")) {
-        if (f == reinterpret_cast<PFN_vkVoidFunction>(&hk_gipa_destroy_surface)) return f;
+        if (f == reinterpret_cast<PFN_vkVoidFunction>(&hk_gipa_destroy_surface) ||
+            f == reinterpret_cast<PFN_vkVoidFunction>(&hk_layer_destroy_surface))
+            return f;
         if (instance) {
             std::lock_guard<std::mutex> guard(g_surfaces_lock);
             g_instance_destroy_surface_procs[instance] = reinterpret_cast<PFN_vkDestroySurfaceKHR>(f);
@@ -7961,12 +8086,22 @@ struct SwapRec {
     std::vector<uint32_t> families;
     std::vector<VkImage> images;   // as the game sees them (asked through the present path's own entry), at first use
     HWND hwnd = nullptr;
+    bool translator = false;
 };
 std::mutex g_swap_lock;
 std::unordered_map<VkSwapchainKHR, SwapRec> g_swaps;
 VkSwapchainKHR g_swap_latest = VK_NULL_HANDLE;
-PFN_vkCreateSwapchainKHR real_create_swapchain = nullptr;
-PFN_vkDestroySwapchainKHR real_destroy_swapchain = nullptr;
+PFN_vkCreateSwapchainKHR real_create_swapchain[2] = {};
+PFN_vkDestroySwapchainKHR real_destroy_swapchain[2] = {};
+thread_local int t_swap_inside = 0;
+
+void refresh_vk_swap_active_locked() {
+    bool active = false;
+    for (const auto& [sc, rec] : g_swaps)
+        if (!rec.translator) { active = true; break; }
+    g_vk_swap_active.store(active, std::memory_order_release);
+    nr::pe::menu::set_dxgi_suppressed(active);
+}
 
 VkResult present_receipt(PFN_vkQueuePresentKHR present, VkQueue q, const VkPresentInfoKHR* p) {
     static thread_local bool inside = false;
@@ -8005,13 +8140,18 @@ VkResult present_receipt(PFN_vkQueuePresentKHR present, VkQueue q, const VkPrese
     return result;
 }
 
+template <int I>
 VKAPI_ATTR VkResult VKAPI_CALL hk_create_swapchain(VkDevice device, const VkSwapchainCreateInfoKHR* ci,
                                                    const VkAllocationCallbacks* a, VkSwapchainKHR* out) {
+    if (t_swap_inside) return real_create_swapchain[I](device, ci, a, out);
+    struct Inside { Inside() { ++t_swap_inside; } ~Inside() { --t_swap_inside; } } inside;
     VkSwapchainCreateInfoKHR c = *ci;
     VkPhysicalDevice physical = VK_NULL_HANDLE;
+    bool translator = false;
     {
         std::lock_guard<std::mutex> guard(g_devices_lock);
-        for (const SeenDevice& d : g_devices) if (d.device == device) physical = d.physical;
+        for (const SeenDevice& d : g_devices)
+            if (d.device == device) { physical = d.physical; translator = d.translator; }
     }
     VkSurfaceCapabilitiesKHR caps{};
     static const auto surface_caps = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>(reinterpret_cast<void*>(
@@ -8019,10 +8159,14 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_create_swapchain(VkDevice device, const VkSwap
     if (physical && surface_caps && surface_caps(physical, ci->surface, &caps) == VK_SUCCESS)
         c.imageUsage |= caps.supportedUsageFlags & (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                                                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
-    VkResult r = real_create_swapchain(device, &c, a, out);
+    if (!translator) {
+        g_vk_swap_active.store(true, std::memory_order_release);
+        nr::pe::menu::set_dxgi_suppressed(true);
+    }
+    VkResult r = real_create_swapchain[I](device, &c, a, out);
     if (r != VK_SUCCESS && c.imageUsage != ci->imageUsage) {   // as the game asked, rather than none
         c = *ci;
-        r = real_create_swapchain(device, &c, a, out);
+        r = real_create_swapchain[I](device, &c, a, out);
     }
     if (r == VK_SUCCESS && out && *out) {
         HWND surface_hwnd = nullptr;
@@ -8035,16 +8179,23 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_create_swapchain(VkDevice device, const VkSwap
         SwapRec& rec = g_swaps[*out];
         rec = SwapRec{};
         rec.device = device; rec.format = c.imageFormat; rec.space = c.imageColorSpace; rec.extent = c.imageExtent;
-        rec.usage = c.imageUsage; rec.sharing = c.imageSharingMode; rec.hwnd = surface_hwnd;
+        rec.usage = c.imageUsage; rec.sharing = c.imageSharingMode; rec.hwnd = surface_hwnd; rec.translator = translator;
         if (c.queueFamilyIndexCount) rec.families.assign(c.pQueueFamilyIndices, c.pQueueFamilyIndices + c.queueFamilyIndexCount);
         rec.path = std::make_shared<VkPresentPath>("Vulkan games");
         rec.signals = std::make_shared<PresentSignals>(); rec.signals->device = device;
         g_swap_latest = *out;
+        refresh_vk_swap_active_locked();
+    } else {
+        std::lock_guard<std::mutex> guard(g_swap_lock);
+        refresh_vk_swap_active_locked();
     }
     return r;
 }
 void retire_present_path(VkPresentPath& P);
+template <int I>
 VKAPI_ATTR void VKAPI_CALL hk_destroy_swapchain(VkDevice device, VkSwapchainKHR sc, const VkAllocationCallbacks* a) {
+    if (t_swap_inside) { real_destroy_swapchain[I](device, sc, a); return; }
+    struct Inside { Inside() { ++t_swap_inside; } ~Inside() { --t_swap_inside; } } inside;
     {
         std::lock_guard<std::mutex> route_guard(g_lock);
         std::lock_guard<std::mutex> guard(g_swap_lock);
@@ -8055,20 +8206,57 @@ VKAPI_ATTR void VKAPI_CALL hk_destroy_swapchain(VkDevice device, VkSwapchainKHR 
         }
         g_swaps.erase(sc);
         if (g_swap_latest == sc) g_swap_latest = VK_NULL_HANDLE;
+        refresh_vk_swap_active_locked();
     }
     nr::pe::menu::vulkan_forget(device, sc);
-    real_destroy_swapchain(device, sc, a);
+    real_destroy_swapchain[I](device, sc, a);
+}
+void forget_vk_swapchains(VkDevice device) {
+    if (!device) return;
+    std::lock_guard<std::mutex> route_guard(g_lock);
+    std::lock_guard<std::mutex> guard(g_swap_lock);
+    for (auto it = g_swaps.begin(); it != g_swaps.end();) {
+        if (it->second.device != device) { ++it; continue; }
+        if (it->second.path) retire_present_path(*it->second.path);
+        if (it->second.signals) for (VkSemaphore sem : it->second.signals->images) receipts::retire(device, sem);
+        if (g_swap_latest == it->first) g_swap_latest = VK_NULL_HANDLE;
+        it = g_swaps.erase(it);
+    }
+    refresh_vk_swap_active_locked();
 }
 void hook_swapchains(HMODULE m) {
     void* create = reinterpret_cast<void*>(GetProcAddress(m, "vkCreateSwapchainKHR"));
     void* destroy = reinterpret_cast<void*>(GetProcAddress(m, "vkDestroySwapchainKHR"));
     const bool ok = create && destroy &&
-                    MH_CreateHook(create, reinterpret_cast<void*>(&hk_create_swapchain),
-                                  reinterpret_cast<void**>(&real_create_swapchain)) == MH_OK &&
-                    MH_CreateHook(destroy, reinterpret_cast<void*>(&hk_destroy_swapchain),
-                                  reinterpret_cast<void**>(&real_destroy_swapchain)) == MH_OK &&
+                    MH_CreateHook(create, reinterpret_cast<void*>(&hk_create_swapchain<0>),
+                                  reinterpret_cast<void**>(&real_create_swapchain[0])) == MH_OK &&
+                    MH_CreateHook(destroy, reinterpret_cast<void*>(&hk_destroy_swapchain<0>),
+                                  reinterpret_cast<void**>(&real_destroy_swapchain[0])) == MH_OK &&
                     MH_EnableHook(create) == MH_OK && MH_EnableHook(destroy) == MH_OK;
     if (!ok) log("[nr] vulkan-1.dll's swap-chain calls could not be hooked: no Present layers on Vulkan games");
+}
+void hook_native_vk_device_procs(VkDevice device) {
+    HMODULE m = GetModuleHandleW(L"vulkan-1.dll");
+    if (!m || !device) return;
+    const auto gdpa = reinterpret_cast<PFN_vkGetDeviceProcAddr>(reinterpret_cast<void*>(GetProcAddress(m, "vkGetDeviceProcAddr")));
+    if (!gdpa) return;
+    struct Entry { const char* name; void* detour; void** real; };
+    const Entry entries[] = {
+        {"vkCreateSwapchainKHR", reinterpret_cast<void*>(&hk_create_swapchain<1>), reinterpret_cast<void**>(&real_create_swapchain[1])},
+        {"vkDestroySwapchainKHR", reinterpret_cast<void*>(&hk_destroy_swapchain<1>), reinterpret_cast<void**>(&real_destroy_swapchain[1])},
+        {"vkQueuePresentKHR", reinterpret_cast<void*>(&hk_queue_present<1>), reinterpret_cast<void**>(&real_queue_present[1])},
+    };
+    for (const Entry& e : entries) {
+        void* exported = reinterpret_cast<void*>(GetProcAddress(m, e.name));
+        void* asked = reinterpret_cast<void*>(gdpa(device, e.name));
+        if (!asked || asked == exported) continue;
+        if (*e.real) {
+            MH_EnableHook(asked);
+            continue;
+        }
+        const MH_STATUS c = MH_CreateHook(asked, e.detour, e.real);
+        if (c == MH_OK || c == MH_ERROR_ALREADY_CREATED) MH_EnableHook(asked);
+    }
 }
 
 // Whether a present call comes from the game (not from DXVK / vkd3d-proton, OptiScaler, this module, a frame
@@ -10242,6 +10430,7 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_d11_evaluate(ID3D11DeviceContext* ctx, const NV
 }
 
 bool hook(const char* name, void* detour, void** real, bool required) {
+    if (g_standalone) return false;
     void* fn = reinterpret_cast<void*>(GetProcAddress(g_opti, name));
     if (!fn) {
         if (required) log("[nr] OptiScaler exports no %s", name);
@@ -10312,6 +10501,7 @@ extern "C" __declspec(dllexport) void InitializeASI() {
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                        reinterpret_cast<LPCWSTR>(__builtin_return_address(0)), &g_opti);
     if (!g_opti) g_opti = GetModuleHandleW(nullptr);
+    g_standalone = g_vk_standalone || GetProcAddress(g_opti, "NR_Standalone_DXGI") != nullptr;
     g_opti_range = range_of(g_opti);
     g_self_range = range_of(g_self);
     // frame generation's HUD-less hand-overs: the game's own only (not OptiScaler's own frame generation's calls)
@@ -10404,13 +10594,23 @@ extern "C" __declspec(dllexport) void InitializeASI() {
          reinterpret_cast<void**>(&real_init_project_id), false);
     hook("NVSDK_NGX_D3D12_Init_with_ProjectID", reinterpret_cast<void*>(&hk_init_with_project_id),
          reinterpret_cast<void**>(&real_init_with_project_id), false);
+    if (g_standalone) {
+        nr::pe::menu::on_d3d11_present(&on_present11);
+        nr::pe::menu::on_d3d12_present(&on_present);
+        nr::pe::menu::on_d3d12_shown(&on_shown);
+        nr::pe::menu::on_execute(&on_execute);
+        if (!g_vk_standalone) nr::pe::menu::install();
+    }
     hook_device_creation();
     hook_present_beat();
     hook_game_dxgi();
     hook_fg_libraries();
     nr::asi::hudcap::d3d12_module(GetModuleHandleW(L"d3d12.dll"));
-    log("[nr] %s (Unreal Engine by the executable: %s)", ok ? "NR runs in OptiScaler's D3D12 evaluate"
-                                                             : "OptiScaler's D3D12 evaluate could not be hooked: NR does not run",
+    log("[nr] %s (Unreal Engine by the executable: %s)",
+        g_standalone ? (g_vk_standalone ? "NR runs standalone on Vulkan / DXGI Present (no OptiScaler/upscaler host)"
+                                        : "NR runs standalone on DXGI Present (no OptiScaler/upscaler host)")
+        : ok         ? "NR runs in OptiScaler's D3D12 evaluate"
+                     : "OptiScaler's D3D12 evaluate could not be hooked: NR does not run",
         g_unreal_by_exe ? "yes" : "no");
 }
 
@@ -10441,4 +10641,117 @@ BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID reserved) {
         nr::pe::remove_crash_watch();   // unloaded while the game runs: the handler must not outlive this module's code
     }
     return TRUE;
+}
+
+namespace {
+VkLayerInstanceCreateInfo* layer_chain_info(const VkInstanceCreateInfo* ci, VkLayerFunction func) {
+    for (const auto* p = static_cast<const VkBaseInStructure*>(ci ? ci->pNext : nullptr); p; p = p->pNext) {
+        if (p->sType == VK_STRUCTURE_TYPE_LOADER_INSTANCE_CREATE_INFO) {
+            auto* info = const_cast<VkLayerInstanceCreateInfo*>(reinterpret_cast<const VkLayerInstanceCreateInfo*>(p));
+            if (info->function == func) return info;
+        }
+    }
+    return nullptr;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL nr_layer_create_instance(const VkInstanceCreateInfo* ci,
+                                                         const VkAllocationCallbacks* a, VkInstance* out) {
+    VkLayerInstanceCreateInfo* chain_info = layer_chain_info(ci, VK_LAYER_LINK_INFO);
+    if (!chain_info || !chain_info->u.pLayerInfo) return VK_ERROR_INITIALIZATION_FAILED;
+    const PFN_vkGetInstanceProcAddr next_gipa = chain_info->u.pLayerInfo->pfnNextGetInstanceProcAddr;
+    if (!next_gipa) return VK_ERROR_INITIALIZATION_FAILED;
+    chain_info->u.pLayerInfo = chain_info->u.pLayerInfo->pNext;
+    const auto next_ci = reinterpret_cast<PFN_vkCreateInstance>(next_gipa(VK_NULL_HANDLE, "vkCreateInstance"));
+    if (!next_ci) return VK_ERROR_INITIALIZATION_FAILED;
+
+    g_vk_standalone = true;
+    InitializeASI();
+    hook_device_creation();
+    hook_present_beat();
+
+    const VkResult r = next_ci(ci, a, out);
+    if (r == VK_SUCCESS && out && *out) {
+        nr::pe::vkdevice::note_instance(*out, ci);
+        std::lock_guard<std::mutex> guard(g_layer_instances_lock);
+        g_layer_instances[*out] = next_gipa;
+        g_layer_last_instance = *out;
+    }
+    return r;
+}
+
+VKAPI_ATTR void VKAPI_CALL nr_layer_destroy_instance(VkInstance instance, const VkAllocationCallbacks* a) {
+    PFN_vkGetInstanceProcAddr next_gipa = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(g_layer_instances_lock);
+        if (const auto it = g_layer_instances.find(instance); it != g_layer_instances.end()) {
+            next_gipa = it->second;
+            g_layer_instances.erase(it);
+        }
+        if (g_layer_last_instance == instance)
+            g_layer_last_instance = g_layer_instances.empty() ? VK_NULL_HANDLE : g_layer_instances.begin()->first;
+    }
+    forget_asi_instance(instance);
+    if (next_gipa) {
+        if (const auto next_di = reinterpret_cast<PFN_vkDestroyInstance>(next_gipa(instance, "vkDestroyInstance")))
+            next_di(instance, a);
+    }
+}
+}  // namespace
+
+extern "C" __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL
+vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface* v);
+
+extern "C" __declspec(dllexport) VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+NR_Layer_GetInstanceProcAddr(VkInstance instance, const char* name) {
+    if (name) {
+        if (!std::strcmp(name, "vkGetInstanceProcAddr"))
+            return reinterpret_cast<PFN_vkVoidFunction>(&NR_Layer_GetInstanceProcAddr);
+        if (!std::strcmp(name, "vkCreateInstance"))
+            return reinterpret_cast<PFN_vkVoidFunction>(&nr_layer_create_instance);
+        if (!std::strcmp(name, "vkDestroyInstance"))
+            return reinterpret_cast<PFN_vkVoidFunction>(&nr_layer_destroy_instance);
+        if (!std::strcmp(name, "vkNegotiateLoaderLayerInterfaceVersion"))
+            return reinterpret_cast<PFN_vkVoidFunction>(&vkNegotiateLoaderLayerInterfaceVersion);
+    }
+    if (!instance) return nullptr;
+    PFN_vkGetInstanceProcAddr next_gipa = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(g_layer_instances_lock);
+        if (const auto it = g_layer_instances.find(instance); it != g_layer_instances.end()) next_gipa = it->second;
+    }
+    if (!next_gipa) return nullptr;
+    const PFN_vkVoidFunction f = next_gipa(instance, name);
+    if (f && name && !std::strcmp(name, "vkCreateDevice")) {
+        g_layer_next_create_device.store(reinterpret_cast<PFN_vkCreateDevice>(f), std::memory_order_release);
+        g_layer_create_instance.store(instance, std::memory_order_relaxed);
+        return reinterpret_cast<PFN_vkVoidFunction>(&hk_layer_create_device);
+    }
+    if (f && name && !std::strcmp(name, "vkCreateWin32SurfaceKHR")) {
+        if (f == reinterpret_cast<PFN_vkVoidFunction>(&hk_layer_create_win32_surface)) return f;
+        {
+            std::lock_guard<std::mutex> guard(g_surfaces_lock);
+            g_layer_create_win32_surface_procs[instance] = reinterpret_cast<PFN_vkCreateWin32SurfaceKHR>(f);
+        }
+        return reinterpret_cast<PFN_vkVoidFunction>(&hk_layer_create_win32_surface);
+    }
+    if (f && name && !std::strcmp(name, "vkDestroySurfaceKHR")) {
+        if (f == reinterpret_cast<PFN_vkVoidFunction>(&hk_layer_destroy_surface)) return f;
+        {
+            std::lock_guard<std::mutex> guard(g_surfaces_lock);
+            g_layer_destroy_surface_procs[instance] = reinterpret_cast<PFN_vkDestroySurfaceKHR>(f);
+        }
+        return reinterpret_cast<PFN_vkVoidFunction>(&hk_layer_destroy_surface);
+    }
+    return f;
+}
+
+extern "C" __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL
+vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface* v) {
+    if (!v || v->sType != LAYER_NEGOTIATE_INTERFACE_STRUCT) return VK_ERROR_INITIALIZATION_FAILED;
+    if (v->loaderLayerInterfaceVersion > CURRENT_LOADER_LAYER_INTERFACE_VERSION)
+        v->loaderLayerInterfaceVersion = CURRENT_LOADER_LAYER_INTERFACE_VERSION;
+    v->pfnGetInstanceProcAddr = &NR_Layer_GetInstanceProcAddr;
+    v->pfnGetDeviceProcAddr = nullptr;
+    v->pfnGetPhysicalDeviceProcAddr = nullptr;
+    return VK_SUCCESS;
 }
