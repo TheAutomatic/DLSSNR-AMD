@@ -32,6 +32,10 @@ jobs:
   linux:
     if: ${{ !contains(github.ref_name, '-win-') && (vars.LINUX_PACKAGE == 'on' || inputs.build_linux == true || contains(github.ref_name, '-linux-')) }}
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, i686]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -56,10 +60,8 @@ jobs:
       - name: Build the Vulkan loader
         run: bash linux/build/build_vulkan_loader.sh
 
-      - name: Build packages
-        run: |
-          NR_ARCH=x86_64 bash linux/build/build_package.sh
-          NR_ARCH=i686 bash linux/build/build_package.sh
+      - name: Build package
+        run: NR_JOBS=$(nproc) NR_ARCH=${{ matrix.arch }} bash linux/build/build_package.sh
 
       - name: Check that no model was packaged
         run: |
@@ -69,7 +71,7 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
-          name: linux-packages
+          name: linux-package-${{ matrix.arch }}
           path: linux/package/*.tar.gz
           if-no-files-found: error
 
