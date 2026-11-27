@@ -389,7 +389,7 @@ mkdir -p -- "$pkg/CC_SILVER_AARDWOLD_OPTIMIZED"
 cp -- linux/data/CC_SILVER_AARDWOLD_OPTIMIZED/CC_SILVER_AARDWOLD_OPTIMIZED.delta \
     linux/data/CC_SILVER_AARDWOLD_OPTIMIZED/CC_SILVER_AARDWOLD_OPTIMIZED.bin.sha256 linux/build/delta_weights.py \
     "$pkg/CC_SILVER_AARDWOLD_OPTIMIZED/"
-cp -- linux/package/install.sh linux/package/README.txt linux/package/lumenite.py "$pkg/"
+cp -- linux/package/install.sh linux/package/README.txt linux/package/lumenite.py LICENSE NOTICE "$pkg/"
 chmod +x "$pkg/install.sh" "$mt/extract_model.sh"
 
 # NR_SIGN=1: every Windows binary without a signature of its own signed with a self-signed certificate made for this
