@@ -9,7 +9,7 @@
 #   - Windows: built unless repository variable WINDOWS_PACKAGE is "off" (or tag contains "-linux-")
 #   - Linux: skipped by default unless repository variable LINUX_PACKAGE is "on", workflow_dispatch
 #     input build_linux is true, or tag contains "-linux-"
-#   - Tag builds upload assets to a Draft Release (`gh release create --draft`)
+#   - Tag builds upload assets to a Pre-release (`gh release create --prerelease`)
 name: Packages
 
 on:
@@ -154,5 +154,5 @@ jobs:
             gh release upload "$GITHUB_REF_NAME" dist/* --clobber --repo "$GITHUB_REPOSITORY"
           else
             gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" \
-              --draft ${notes:+--notes "$notes"} --generate-notes
+              --prerelease ${notes:+--notes "$notes"} --generate-notes
           fi
