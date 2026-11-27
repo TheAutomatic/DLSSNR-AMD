@@ -50,7 +50,7 @@ for f in nr_native_plan nr_pe_bridge nr_pe_config nr_pe_crash nr_pe_d3d12split \
     par "$GXX" "${DEF[@]}" "${INC[@]}" "${NR_PRODUCT_DEFINES[@]}" -c "$p" -o "$f.o"
     objs+=("$f.o")
 done
-par "$GXX" "${DEF[@]}" -I. -I"$OUT/shim" "${INC[@]}" "${INC_ADDON[@]}" "${NR_PRODUCT_DEFINES[@]}" \
+par "$GXX" "${DEF[@]}" -I. "${INC[@]}" "${INC_ADDON[@]}" -idirafter "$OUT/shim" "${NR_PRODUCT_DEFINES[@]}" \
        -c "$SRC/windows/src/pe/nr_reshade_addon.cpp" -o reshade_addon.o
 objs+=(reshade_addon.o mh_hook.o mh_buffer.o mh_trampoline.o mh_hde32.o)
 
