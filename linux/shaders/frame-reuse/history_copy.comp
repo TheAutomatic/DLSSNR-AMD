@@ -1,0 +1,6 @@
+#version 460
+// Frame reuse: a network history carried into the slot the skipped network would have written (RGBA16F)
+layout(local_size_x=16,local_size_y=16) in;
+layout(binding=0) uniform sampler2D Src;
+layout(binding=1,rgba16f) uniform writeonly image2D Dst;
+void main(){ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(p,imageSize(Dst))))return;imageStore(Dst,p,texelFetch(Src,p,0));}

@@ -58,7 +58,11 @@ struct Frame {
     // layout Passes (fast) Interleaved hands each pass's history in (NetTemporal::history_va)
     uint32_t net_history_bytes = 0;
     bool style_grade = true;   // [Network] Style Grade as the network applies it (Interleaved grades its passes itself)
+    bool style_grade_accel = false;   // ... in closed form ([Network] Style Grade Acceleration): Interleaved's il_ga programs
     float present_white_nits = 203.0f;
+    // Frame reuse's even frames: after each network call, the list the network went on in (a second list of the
+    // caller's once the network was split there) - the stage goes on in it. Unset: one list.
+    std::function<ID3D12GraphicsCommandList*()> cmd_now;
     // The network's motion/depth guides resampled by the stage (to_motion / to_depth at the network's extent);
     // `net` runs one pass: the controls the D3D12 network takes, its temporal inputs, and the pass's linear buffers
     // (both UNORDERED_ACCESS, `out` to hold the answer). Returns false when it recorded nothing.
@@ -91,6 +95,8 @@ public:
     uint32_t record(ID3D12GraphicsCommandList* cmd, const Frame& f, const Frame::Net& net);
     // False when the last record() could not make a surface it needed: 0 passes then is not a copy-through.
     bool record_ok() const;
+    // True when the last record() wrote barriers, copies, or dispatches into `cmd`.
+    bool cmd_touched() const;
     // True when this frame's network call actually ran (the stage copied through otherwise).
     bool net_ran() const;
     // Answers whether the frame with this number has finished on the GPU; a descriptor slot is rewritten only then.

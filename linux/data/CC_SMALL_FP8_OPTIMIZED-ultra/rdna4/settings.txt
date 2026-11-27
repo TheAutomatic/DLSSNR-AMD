@@ -1,0 +1,4 @@
+# CC_SMALL_FP8_OPTIMIZED's int4 layers (Optimized layers: Ultra Performance): the ViT's FFN and QKV on int4 on every
+# frame with the tables of vit/; where the ViT raster's padding is all the image's edge (1440p class) only blocks 14-18,
+# with the tables of vit-sink/ (blocks 14-18 of the same tables). Every setting is in the network (pipelines-small-ultra.json)
+# and the tables beside this file.

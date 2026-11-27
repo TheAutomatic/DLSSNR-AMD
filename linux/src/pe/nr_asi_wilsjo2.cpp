@@ -4,6 +4,7 @@
 // specification by one of our OptiScaler fixes (nr_pe_optifix.cpp), the fix is what is followed, and said so below.
 #include "nr_asi_wilsjo2.hpp"
 
+#include "nr_frame_pair.hpp"
 #include "nr_pe_config.hpp"
 #include "nr_pe_log.hpp"
 #include "nr_pe_renodx_route.hpp"
@@ -16,7 +17,9 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -155,6 +158,11 @@ void wilsjo2_abandon_at_exit() { (void)g_stage.release(); }
 struct Wilsjo2Owner {
     bool capture_layer = false;
     bool at_present = false;   // wilsjo2_owner_at_present
+    // FrameReuse on an SDR frame: the flow inside the model's session through this feature (run_in_session); else the
+    // flow here (own_flow: its state is there to let go of when the other runs)
+    nr::dlssnr::Feature* session = nullptr;
+    uint32_t session_w = 0, session_h = 0;
+    bool own_flow = false, reuse_hdr_said = false;
     w2::FlowState flow;
     std::vector<nr::dlssnr::Feature*> models;      // pass k's at [k]
     std::map<ID3D12Resource*, bool> colour;        // our surfaces: colour-family (else read as a single-channel image)
@@ -277,6 +285,11 @@ public:
         nr::dlssnr::with_d3d12_session([&](nr::pe::Session& s) { on = s.style_grade_active(); });
         return on;
     }
+    bool style_grade_accelerated() const override {
+        bool on = false;
+        nr::dlssnr::with_d3d12_session([&](nr::pe::Session& s) { on = s.style_grade_accelerated(); });
+        return on;
+    }
     bool stage_failed() const override { return g_stage_retry.blocked(); }
     w2::PassReady pass(uint32_t k, const w2::PassControls& pc, uint32_t mw, uint32_t mh) override {
         if (k < o_.models.size() && o_.models[k]) return w2::PassReady::kReady;
@@ -317,6 +330,7 @@ public:
         style_.emplace(false);
         facts_.hdr = x.hdr; facts_.exposure = int(x.exposure); facts_.asked = x.asked; facts_.white = x.white;
         facts_.history = x.history; facts_.mode = x.mode; facts_.passes = x.passes;
+        facts_.pre_history = x.pre_history; facts_.noise_every_frame = x.noise_every_frame;
         facts_.prep_outside = x.prep_outside; facts_.prep_missing = x.prep_missing;
         facts_.fast_passes = x.fast_passes; facts_.fast_fallback = x.fast_fallback; facts_.fast_fallback_spatial = x.fast_fallback_spatial; facts_.il_missing = x.il_missing;
         told_.emplace(&facts_);
@@ -334,6 +348,8 @@ public:
         session_->set_call_layer(nr::pe::renodx_route::call_layer());   // the run's whole time, for NR Control
         session_->outer_begin(vk);
         // F5 (nr_screenshot.hpp): the frame before this layer's NR, while a capture is armed
+        // (a Present whose screenshot pairs the frame that frame reuse shows with its input takes the pair itself)
+        if (!nr::frame_pair::Observation::current)
         o_.capture_layer = session_->capture_begin(vk, frame.image, frame.format, w_, h_, frame.layout, hdr ? 1 : 0,
                                o_.at_present ? "present" : before_ ? "nr-before-upscaler" : "nr-after-upscaler");
     }
@@ -377,13 +393,86 @@ private:
     nr::pe::renodx_route::Wilsjo2Facts facts_;
     std::optional<nr::pe::renodx_route::CallWilsjo2> told_;
     nr::pe::renodx_route::Frame rf_;
+public:
 };
+
+// FrameReuse on an SDR frame: the layer's flow inside the model's session, frame reuse around it (nr_pe_session.cpp
+// record_wilsjo2; the route marker renodx_route::CallW2Present), through the owner's own NR feature at the frame's extent.
+// The owner's flow here (its surfaces, its passes' features) goes first: one of the two runs the layer at a time.
+bool run_in_session(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, Wilsjo2Owner& o, const Wilsjo2Frame& f,
+                    const w2::Settings& s, ID3D12Resource* target, uint32_t w, uint32_t h, bool before_upscale) {
+    namespace route = nr::pe::renodx_route;
+    if (!target || !f.motion || !device) return false;   // (as the flow here: both guides, or no run)
+    if (o.own_flow) {   // (its sizes too: a later run of the flow here allocates afresh)
+        D3d12Io io(nullptr, nullptr, o, nullptr, nullptr, false, 0, 0);
+        w2::flow_release(io, o.flow);
+        o.flow = w2::FlowState{};
+        o.own_flow = false;
+    }
+    if (o.session && (o.session_w != w || o.session_h != h)) { nr::dlssnr::release_d3d12(o.session); o.session = nullptr; }
+    if (!o.session) {
+        int rc = 0;
+        o.session = nr::dlssnr::create_d3d12(device, cmd, nullptr, w, h, 0, 1, nr::dlssnr::Controls6{}, &rc);
+        if (!o.session) {
+            log("[nr] wilsjo2 style: the frame reuse's NR feature could not be made (0x%08X): %s", unsigned(rc),
+                nr::dlssnr::last_error());
+            return false;
+        }
+        o.session_w = w; o.session_h = h;
+    }
+    route::W2Present wp;
+    wp.settings = &s; wp.hdr = f.hdr;
+    wp.at_present = o.at_present; wp.before_upscale = before_upscale; wp.pre_exposure = f.pre_exposure;
+    route::CallW2Present present(&wp);
+    route::CallStyle style(false);
+    // what the flow here tells the route of its frame (D3d12Io::passes_begin / network)
+    route::note_pass(f.flags, 1.0f, f.depth_rect.width, f.depth_rect.height, f.out_w ? f.out_w : w, f.out_h ? f.out_h : h);
+    route::Frame rf;
+    rf.before_upscale = before_upscale;
+    rf.pre_exposure = f.pre_exposure;
+    route::begin_run(rf);
+    // the guides in the state the model reads them in (as the .asi's RenoDX layers hand them)
+    transition(cmd, f.depth, f.depth_state, kSrv);
+    if (f.motion != f.depth) transition(cmd, f.motion, f.motion_state, kSrv);
+    const auto sane = [](float v) { return std::isfinite(v) && v != 0.0f ? v : 1.0f; };   // (as the flow reads it)
+    nr::dlssnr::evaluate_d3d12(cmd, o.session, nullptr, target, f.depth, f.motion, target, w, h, f.depth_rect, f.motion_rect,
+                               (f.flags & (1u << 3)) ? 1 : 0, f.reset ? 1 : 0, nr::dlssnr::Controls6{}, sane(f.mv_x),
+                               sane(f.mv_y));
+    if (f.motion != f.depth) transition(cmd, f.motion, kSrv, f.motion_state);
+    transition(cmd, f.depth, kSrv, f.depth_state);
+    route::end_run();
+    if (wp.ran)   // peripheral compression's outlines in NR Control, as the flow here notes them (spatial_ran)
+        nr::dlssnr::with_d3d12_session([&](nr::pe::Session& session) {
+            if (session.spatial_active()) wilsjo2_note_spatial(route::call_layer(), session.spatial_layout());
+        });
+    return wp.ran;
+}
+// A frame of display codes (frame reuse's rules are in them): the Present's resolved SDR (the caller's `hdr` false), else
+// an 8 / 10-bit UNORM frame - a float frame at the upscaler is scene light (as a RenoDX layer's frame_units: mode 1)
+bool float_frame(DXGI_FORMAT f) {
+    switch (f) {
+        case DXGI_FORMAT_R16G16B16A16_FLOAT: case DXGI_FORMAT_R16G16B16A16_TYPELESS: case DXGI_FORMAT_R32G32B32A32_FLOAT:
+        case DXGI_FORMAT_R32G32B32A32_TYPELESS: case DXGI_FORMAT_R32G32B32_FLOAT: case DXGI_FORMAT_R32G32B32_TYPELESS:
+        case DXGI_FORMAT_R11G11B10_FLOAT:
+        case DXGI_FORMAT_R9G9B9E5_SHAREDEXP:
+            return true;
+        default:
+            return false;
+    }
+}
+// Tests (gates only): NR_TEST_W2_SESSION=1 runs every SDR frame's flow inside the session, frame reuse on or off - the
+// session's flow byte-compared with the flow here
+bool test_session() {
+    static const bool on = [] { const char* e = std::getenv("NR_TEST_W2_SESSION"); return e && e[0] == '1'; }();
+    return on;
+}
 }  // namespace
 
 void wilsjo2_release(Wilsjo2Owner* o) {
     if (!o) return;
     D3d12Io io(nullptr, nullptr, *o, nullptr, nullptr, false, 0, 0);
     w2::flow_release(io, o->flow);
+    if (o->session) nr::dlssnr::release_d3d12(o->session);
     delete o;
 }
 
@@ -408,8 +497,15 @@ bool wilsjo2_run(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, Wilsjo2Ow
                  const w2::Settings& s, ID3D12Resource* target, uint32_t w, uint32_t h, bool before_upscale) {
     gpu_uses.touch();
     o.capture_layer = false;
+    // (IsHDR on a non-float frame is not HDR: the project's rule, wilsjo2_frame / RenoDX's encode)
+    const bool sdr = !f.hdr && target && (o.at_present || !float_frame(target->GetDesc().Format));
+    if ((s.frame_reuse || (nr::frame_pair::PresentAge::active && nr::frame_pair::PresentAge::active->gathering()) || (test_session() && sdr))) return run_in_session(cmd, device, o, f, s, target, w, h, before_upscale);
+    if (o.session) { nr::dlssnr::release_d3d12(o.session); o.session = nullptr; }
+    // this Present's frames on time (a frame reuse of this layer's that delayed them is not running now)
+    if (o.at_present) nr::pe::Session::note_frames_delayed(0);
     if (!target || !f.depth || !f.motion) return false;
     D3d12Io io(cmd, device, o, &f, target, before_upscale, w, h);
+    o.own_flow = true;
     w2::FlowFrame ff;
     ff.target = {target};
     ff.width = w; ff.height = h;

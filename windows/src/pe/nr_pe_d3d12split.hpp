@@ -63,6 +63,9 @@ void invalidate(const std::shared_ptr<nr::gpu::Recording>& rec);
 // succeeded - public so a test can drive the same path without the hooks.
 void note_execution(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists);
 void seal(const std::shared_ptr<nr::gpu::Recording>& rec);
+using SplitBeginFn = void (*)();
+using SplitEndFn = void (*)(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists);
+void set_split_execution_hooks(SplitBeginFn begin_fn, SplitEndFn end_fn);
 
 // Hooks the list's class (once per class) and its queues'. False when lists of this class cannot be
 // cut, or when this list's state since its last Reset is not known yet - the hooks were installed
@@ -96,5 +99,11 @@ bool cut(ID3D12GraphicsCommandList* list, Job job, const std::shared_ptr<Snapsho
 // NR Control (nr_pe_menu.cpp): a D3D12 swap chain does not say which queue presents it, and a game presents on the
 // thread that has just executed its frame on that queue.
 ID3D12CommandQueue* last_direct_queue();
+
+// Read-only introspection for Direct passthrough coexistence (both orders).
+bool is_split_list(ID3D12GraphicsCommandList* list, bool* active_cut = nullptr);
+void* orig_list_method(void** vt, unsigned slot);
+void* orig_device_create_cl(void** dvt);
+void* orig_queue_execute(void** qvt);
 
 }  // namespace nr::pe::split

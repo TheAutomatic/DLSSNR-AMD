@@ -1,7 +1,7 @@
 #pragma once
 // A wilsjo2 layer's keys on the ReShade route ([LayerN] Processing = wilsjo2, read by nr_pe_config.cpp layer_config): the
 // original's [DlssNr] names as the .asi's layers have them (nr_wilsjo2_keys.hpp), only those this route runs, Transfer
-// with our two enlargements as 5 and 6, and the route's own ClassicScaler, History and NoiseEveryFrame. The table shape of
+// with our two enlargements as 5 and 6, and the route's own ClassicScaler, NoiseEveryFrame, PreHistory and PostHistory. The table shape of
 // nr_renodx_keys.hpp; Passes and Pass<N> are drawn apart (nr_reshade_addon.cpp).
 #include "nr_renodx_keys.hpp"
 #include "nr_wilsjo2_shared_keys.hpp"
@@ -13,7 +13,6 @@ using renodx_keys::kFloat;
 using renodx_keys::kText;
 using renodx_keys::kUint;
 inline constexpr Key kKeys[] = {
-    wilsjo2_keys::kHistory,
     {"Style", kUint, 0, 0.0f, 2.0f, 0.0f, "Network", "Style", "Style.", "Standard\0Natural\0Cinematic\0"},
     {"Intensity", kFloat, 2, 0.0f, 2.0f, 1.0f, "Network", "Intensity", "Intensity. Enhancement strength.", nullptr},
     {"LocalStructure", kFloat, 2, 0.0f, 2.0f, 1.0f, "Network", "Local structure", "LocalStructure. Fine detail and local contrast.", nullptr},
@@ -45,7 +44,9 @@ inline constexpr Key kKeys[] = {
     {"SkinColour", kFloat, 2, 0.0f, 1.0f, 1.0f, "Skin and environment", "Skin colour", "SkinColour.", nullptr},
     {"EnvironmentDetail", kFloat, 2, 0.0f, 1.0f, 1.0f, "Skin and environment", "Environment detail", "EnvironmentDetail.", nullptr},
     {"EnvironmentColour", kFloat, 2, 0.0f, 1.0f, 1.0f, "Skin and environment", "Environment colour", "EnvironmentColour.", nullptr},
-    {"NoiseEveryFrame", kBool, 0, 0.0f, 0.0f, 0.0f, "This route's own", "New noise without motion vectors", "NoiseEveryFrame. Frames without motion vectors: a new noise seed every frame, as NVIDIA's DLL does.", nullptr},
+    {"NoiseEveryFrame", kBool, 0, 0.0f, 0.0f, 1.0f, "This route's own", "New noise every frame", "NoiseEveryFrame. A new noise seed for the network every frame, as NVIDIA's DLL does (default). Off: the same seed every frame.", nullptr},
+    {"PreHistory", kBool, 0, 0.0f, 0.0f, 1.0f, "This route's own", "Pre history", "PreHistory (ours). The network's input block also reads its previous answer, moved along the motion vectors, as NVIDIA's DLL does (default). Off: it sees this frame only. Without motion vectors there is no history either way (diagnostic).", nullptr},
+    wilsjo2_keys::kPostHistoryOwn,
 };
 inline constexpr int kCount = int(sizeof kKeys / sizeof kKeys[0]);
 }  // namespace nr::reshade_layer_keys

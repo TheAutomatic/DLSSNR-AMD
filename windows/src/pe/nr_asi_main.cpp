@@ -1,3 +1,5 @@
+#include "nr_frame_reuse_policy.hpp"
+#include "nr_frame_pair.hpp"
 // dlssnr-amd.asi: our NR as a plugin of upstream OptiScaler, which loads every *.asi in <game>\OptiScaler\plugins
 // ([Plugins] LoadAsiPlugins=true) from its own DllMain and calls their InitializeASI there. OptiScaler stays as it
 // is and does the upscaling and frame generation; NR lives in its calls:
@@ -32,6 +34,7 @@
 #include "nr_path_win.hpp"
 #include "MinHook.h"
 #include "nr_asi_wilsjo2.hpp"
+#include "nr_d3d12_direct_state.hpp"
 #include "nr_d3d12_passthrough.hpp"
 #include "nr_d3d12_passthrough_backend.hpp"
 #include "nr_d3d12_shot.hpp"
@@ -87,6 +90,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <array>
 #include <set>
 #include <unordered_set>
 #include <string>
@@ -701,19 +705,32 @@ bool ensure_texture(ID3D12Device* device, ID3D12Resource*& tex, D3D12_RESOURCE_S
     return true;
 }
 
-// A texture of `source`'s own description - size, format and flags (with unordered access, without deny-shader-
-// resource), one mip - in COPY_DEST: what the upscaler is handed before it, as the forked OptiScaler of 0.0.7 hands it
-// (DlssNr_Dx12::CreateBufferResource). A texture of another size and flags handed in the colour's place (the region
-// at base 0) ended a game with FSR 4 on Windows at the first frame. False when `source` is not a plain 2D texture or
-// it cannot be made.
-bool ensure_mirror(ID3D12Device* device, ID3D12Resource*& tex, D3D12_RESOURCE_STATES& state, ID3D12Resource* source) {
+// A typed format the resource can be written in (an sRGB format cannot be a UAV).
+DXGI_FORMAT writable(DXGI_FORMAT f) {
+    switch (f) {
+        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return DXGI_FORMAT_R8G8B8A8_UNORM;
+        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return DXGI_FORMAT_B8G8R8A8_UNORM;
+        case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB: return DXGI_FORMAT_B8G8R8X8_UNORM;
+        default: return f;
+    }
+}
+
+// A texture of `source`'s own description - size, format and flags (with unordered access added when `want_uav`, the
+// source's own flags otherwise; without deny-shader-resource), one mip - in COPY_DEST: what the upscaler is handed before
+// it, as the forked OptiScaler of 0.0.7 hands it (DlssNr_Dx12::CreateBufferResource). A texture of another size and
+// flags handed in the colour's place (the region at base 0) ended a game with FSR 4 on Windows at the first frame. False
+// when `source` is not a plain 2D texture, `want_uav` is requested on an sRGB format (no UAV), or it cannot be made.
+bool ensure_mirror(ID3D12Device* device, ID3D12Resource*& tex, D3D12_RESOURCE_STATES& state, ID3D12Resource* source,
+                   bool want_uav = true) {
     D3D12_RESOURCE_DESC d = source->GetDesc();
     if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.SampleDesc.Count != 1 || d.DepthOrArraySize != 1)
         return false;
+    if (want_uav && d.Format != writable(d.Format)) return false;
     d.MipLevels = 1;
     d.Alignment = 0;
     d.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    d.Flags = (d.Flags | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) & ~D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
+    d.Flags = (want_uav ? (d.Flags | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) : d.Flags) &
+              ~D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
     if (tex) {
         const D3D12_RESOURCE_DESC h = tex->GetDesc();
         if (h.Width == d.Width && h.Height == d.Height && h.Format == d.Format && h.Flags == d.Flags) return true;
@@ -742,6 +759,7 @@ void copy_region(ID3D12GraphicsCommandList* cmd, ID3D12Resource* dst, uint32_t d
 }
 
 
+bool reuse_needs_vectors_only();
 bool read_frame(const NVSDK_NGX_Parameter* p, const Tracked& t, Frame& f) {
     // DLSS-D (Ray Reconstruction) blocks may name them DLSSD.*, as the forked OptiScaler reads them.
     f.color = get_resource(p, "Color", &f.color_as_resource);
@@ -753,7 +771,7 @@ bool read_frame(const NVSDK_NGX_Parameter* p, const Tracked& t, Frame& f) {
     f.motion = get_resource(p, "MotionVectors");
     if (!f.motion) f.motion = get_resource(p, "DLSSD.MotionVectors");
     f.exposure = get_resource(p, "ExposureTexture");
-    if (!f.color || !f.output || !f.depth || !f.motion) return false;
+    if (!f.color || !f.output || !f.motion || (!f.depth && !reuse_needs_vectors_only())) return false;
     f.flags_known = t.flags_known;
     f.flags = t.flags;
     if (!f.flags_known) {
@@ -1080,15 +1098,27 @@ bool depth_twin_of(ID3D12Device* device, ID3D12Resource*& twin, ID3D12Resource* 
 bool depth_read_into(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, ID3D12Resource* depth, D3D12_RESOURCE_STATES from,
                      ID3D12Resource* twin) {
     GuideDepth& g = g_guide_depth;
-    if (g.device != device) { g.pass.reset(new nr::pe::bridge::DepthCopyD3D12()); g.device = device; g.said = false; }
+    const auto kRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    const D3D12_RESOURCE_STATES read = (from & kRead) ? from : depth_read_only(from) ? (from | kRead) : kRead;
     std::string why;
+    const bool direct_depth = nr::pe::d3d12_passthrough::enabled() &&
+                              nr::pe::d3d12_passthrough::canary() == nr::pe::d3d12_passthrough::Canary::kHit &&
+                              nr::pe::d3d12_direct::ready(device, cmd, &why);
+    if (direct_depth) {
+        transition(cmd, depth, from, read);
+        transition(cmd, twin, kRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        const bool ok = nr::pe::d3d12_passthrough::copy_depth_r32(device, cmd, depth, twin, &why);
+        transition(cmd, twin, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kRead);
+        transition(cmd, depth, read, from);
+        if (!ok && !g.said) { g.said = true; log("[nr] Present layers: the game's depth was not read (%s)", why.c_str()); }
+        return ok;
+    }
+    if (g.device != device) { g.pass.reset(new nr::pe::bridge::DepthCopyD3D12()); g.device = device; g.said = false; }
     if (!g.pass->ready(device, &why)) {
         if (!g.said) { g.said = true; log("[nr] Present layers: the game's depth cannot be read by our pass (%s): it is copied as it is", why.c_str()); }
         return false;
     }
     // a read state gains the compute-read bit; a write state (or none) becomes the compute read alone (as the bridge)
-    const auto kRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    const D3D12_RESOURCE_STATES read = (from & kRead) ? from : depth_read_only(from) ? (from | kRead) : kRead;
     transition(cmd, depth, from, read);
     transition(cmd, twin, kRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     const bool ok = g.pass->record(device, cmd, depth, twin, &why);
@@ -1160,16 +1190,6 @@ void late_capture(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, const Fr
     }
     g_late.f = f;
     g_late.armed = true;
-}
-
-// A typed format the back buffer's copy can be written in (an sRGB format cannot be a UAV).
-DXGI_FORMAT writable(DXGI_FORMAT f) {
-    switch (f) {
-        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return DXGI_FORMAT_R8G8B8A8_UNORM;
-        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return DXGI_FORMAT_B8G8R8A8_UNORM;
-        case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB: return DXGI_FORMAT_B8G8R8X8_UNORM;
-        default: return f;
-    }
 }
 
 void late_present(IDXGISwapChain* sc, ID3D12CommandQueue* queue, int encoding) {
@@ -1303,6 +1323,7 @@ constexpr uint64_t kPresentGuideMaxAge = 8;          // kPresentGuideMaxAge (pre
 constexpr ULONGLONG kPresentGuideMaxAgeMs = 250;     // kPresentGuideMaxAgeNs
 
 struct GuideSet {
+    uint32_t feature=0;
     ID3D12Resource *depth = nullptr, *motion = nullptr;   // copies, in COPY_DEST between uses
     Frame f;                                   // the evaluate's contract (its resources are not used at the Present)
     nr::asi::Wilsjo2Frame w2;                  // the same for the wilsjo2 processing (its own guide regions)
@@ -1322,9 +1343,14 @@ struct GuideSet {
     ID3D12Fence* fence = nullptr;
     uint64_t value = 0;
 };
-struct PresentLayer {                          // a Present layer's own
+struct PresentLayer {
+    uint8_t input_age=0;                          // a Present layer's own
     Feature* nr = nullptr;                     // RenoDX: its model feature at the back buffer's extent
     nr::asi::Wilsjo2Owner* w2 = nullptr;       // wilsjo2: its state (the common pipeline's)
+    ID3D12Resource* pq[3]{};
+    D3D12_RESOURCE_STATES pq_state[3]{};
+    uint32_t pq_index = 0;
+    void clear_pq() { for (auto*& p : pq) if (p) release_resource(p); pq_index = 0; }
     bool w2_reset = true;                      // wilsjo2: the last finished picture did not run
     uint32_t w = 0, h = 0;
     bool real_guides = false;                  // its last run had the game's guides (a change restarts its history)
@@ -1333,6 +1359,18 @@ struct PresentLayer {                          // a Present layer's own
     nr::pe::Processing processing = nr::pe::Processing::kRenoDX;   // what it was made for
 };
 struct PresentPath {
+    struct ToolInput {
+        ID3D12Resource* image = nullptr;
+        D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    };
+    ToolInput tool_input[3];
+    nr::frame_pair::History tool_history;
+    void clear_tool_inputs() {
+        if (!tool_history.width) return;
+        for (auto& input : tool_input) release_resource(input.image);
+        tool_history = {};
+    }
+
     GuideSet sets[kD12GuideSets];
     // [Inspect]: the back buffer's copy before and after the compared Present layers (NON_PIXEL_SHADER_RESOURCE)
     ID3D12Resource* inspect_off = nullptr;
@@ -1359,6 +1397,23 @@ struct PresentPath {
     ID3D12Resource *linear = nullptr, *encoded = nullptr;
     // HUD FIX (hudfix.comp): the frame before the layers and the counts (R32_UINT, kHudStatsW x kHudStatsH);
     // UNORDERED_ACCESS between uses
+    struct HudInput {
+        ToolInput back, clean, alpha, stats, fg;
+        uint64_t tick = 0, version = 0, chain_image = 0;
+        uint32_t source = 0, width = 0, height = 0;
+        DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+        bool has_fg = false, from_fg = false;
+    };
+    HudInput hud_inputs[3];
+    uint64_t guide_history[3]{};
+    uint64_t hud_tick = 0;
+    void clear_hud_inputs() {
+        for (HudInput& slot : hud_inputs) {
+            for (auto* t : {&slot.back,&slot.clean,&slot.alpha,&slot.stats,&slot.fg}) release_resource(t->image);
+            slot = {};
+        }
+        std::fill_n(guide_history,3,0); hud_tick = 0;
+    }
     ID3D12Resource *hud_back = nullptr, *hud_stats = nullptr;
     ID3D12Resource* hud_ui = nullptr; // typed copy of the game's authored UI; UNORDERED_ACCESS between uses
     D3D12_RESOURCE_STATES hud_ui_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -1486,6 +1541,70 @@ void hud_report(bool layers, bool follows = false, bool captured = false, const 
     nr::pe::control::hud_facts(now.c_str(), why_game.c_str(), why_capture.c_str(), "");
 }
 bool renodx_layer(const Layer& l) { return l.cfg.processing == nr::pe::Processing::kRenoDX; }
+// A layer with frame reuse switched on (RenoDX's NRFrameReuse, a wilsjo2 layer's FrameReuse): at the Present the frame it
+// shows can be an earlier frame's (even frames), so the screenshot / Compare pair takes the input that frame came from.
+bool reuse_layer(const Layer& l) { return renodx_layer(l) ? l.cfg.renodx.values.frame_reuse : l.w2.frame_reuse; }
+bool reuse_needs_vectors_only() {
+    const auto chain=chain_now();
+    return std::any_of(chain->layers.begin(),chain->layers.end(),[](const Layer& l){return present_layer(l) && reuse_layer(l);});
+}
+// A layer whose picture is shown later: frame reuse - the pair tools, DLSS-G's hand-over, the per-Present age and the
+// guide cuts follow it
+bool delayed_layer(const Layer& l) { return reuse_layer(l); }
+// The delayed Present stages that run in a chain: frame reuse layers only where no Interleaved layer is (beside one each
+// is left out), several of them one group
+unsigned delayed_present_runs(const std::vector<Layer>& layers, bool interleaved_conflict) {
+    if (interleaved_conflict) return 0u;
+    return unsigned(std::count_if(layers.begin(), layers.end(), [](const Layer& l) { return present_layer(l) && reuse_layer(l); }));
+}
+// Two-sided reuse needs the following rendered frame. An upscaler consumes
+// its input and returns its output in the same evaluation.
+bool refuse_reuse_placement(const Layer& layer) {
+    if (present_layer(layer) || !reuse_layer(layer)) return false;
+    const int row=row_number(layer);
+    const unsigned place=layer.cfg.placement==nr::pe::Placement::kBefore?1u:0u;
+    layer_note(layer,place,3,nr::frame_reuse::placement);
+    nr::pe::control::layer_reuse_failed(row,nr::frame_reuse::placement);
+    return true;
+}
+// Contiguous opted-in layers can share their anchors and one budget for
+// network work. Layers outside that interval still evaluate every picture.
+void group_reuse(nr::frame_pair::PresentAge& age,const std::vector<const Layer*>& runs) {
+    if (age.interleaved_conflict) return;
+    unsigned first=unsigned(runs.size()),last=0,count=0;
+    for (unsigned i=0;i<runs.size();++i) if (reuse_layer(*runs[i])) {
+        first=std::min(first,i);last=i;++count;
+    }
+    if (count<2) return;
+    age.group_first=first;age.group_size=last-first+1;
+    age.paired=count!=age.group_size;
+    age.isolate_chain=true;
+
+}
+
+// A real evaluate that omits its guides cuts that feature's stream. Do not
+// extend the previous vector field across loading screens or missing frames.
+template<class Sets> void cut_reuse_guides(Sets& sets,uint32_t feature) {
+    const auto chain=chain_now();
+    for(const auto& layer:chain->layers) {
+        if (refuse_reuse_placement(layer)) continue;
+        if (!present_layer(layer) || !delayed_layer(layer))continue;   // (frame reuse)
+        for(auto& guide:sets) if(guide.feature==feature) guide.serial=0;
+    }
+}
+void no_reuse_motion(const Layer& layer) {
+    layer_note(layer,2,3,nr::frame_reuse::motion_missing);
+    nr::pe::control::layer_reuse_failed(row_number(layer),nr::frame_reuse::motion_missing);
+}
+// With a single delayed layer at the end, its second half can run at the
+// start of the next Present, before any preceding layer touches network scratch.
+bool terminal_chain(const Chain& chain,const std::vector<const Layer*>& runs) {
+    return runs.size()>1 && reuse_layer(*runs.back()) &&
+           std::all_of(chain.layers.begin(),chain.layers.end(),present_layer) &&
+           std::none_of(runs.begin(),runs.end()-1,[](const Layer* l){return delayed_layer(*l);});
+}
+
+
 
 // At a game evaluate, while the chain has Present layers: its motion vectors and depth copied into the oldest set no
 // Present on the GPU still reads (none free: no copy this frame).
@@ -1504,6 +1623,7 @@ void capture_guides(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, const 
         if (s.read_value > done && done != ~0ull) continue;   // a Present on the GPU still reads it
         if (s.read_ticket && !s.read_ticket->ready()) continue;   // DLSS-G's evaluate list still reads it (or may)
         if (&s == last_read) continue;
+        if (s.serial && std::find(std::begin(g_present.guide_history),std::end(g_present.guide_history),s.serial)!=std::end(g_present.guide_history)) continue;
         if (k >= kD12GuideSetsBase && !s.motion) {   // (the motion copy marks a set made; depth may be none)
             if (!spare) spare = &s;
             continue;
@@ -1532,7 +1652,9 @@ void capture_guides(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, const 
                             unsigned(kD12GuideSets));
         return;
     }
+    depth_wanted = depth_wanted && f.depth;
     for (ID3D12Resource* r : {f.depth, f.motion}) {
+        if (!r) continue;
         const D3D12_RESOURCE_DESC d = r->GetDesc();
         if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.DepthOrArraySize != 1 || d.SampleDesc.Count != 1) return;
     }
@@ -1545,10 +1667,17 @@ void capture_guides(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, const 
     std::string depth_why;
     bool depth_by_pass = false;
     if (depth_wanted) {
-        if (g_guide_depth.device != device) { g_guide_depth.pass.reset(new nr::pe::bridge::DepthCopyD3D12()); g_guide_depth.device = device; g_guide_depth.said = false; }
-        depth_by_pass = g_guide_depth.pass->ready(device, &depth_why) &&
-                        nr::pe::bridge::depth_view_format(f.depth->GetDesc().Format) != DXGI_FORMAT_UNKNOWN &&
-                        !(f.depth->GetDesc().Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE);
+        const bool direct_depth = nr::pe::d3d12_passthrough::enabled() &&
+                                  nr::pe::d3d12_passthrough::canary() == nr::pe::d3d12_passthrough::Canary::kHit &&
+                                  nr::pe::d3d12_direct::ready(device, cmd, &depth_why);
+        const bool fmt_ok = nr::pe::bridge::depth_view_format(f.depth->GetDesc().Format) != DXGI_FORMAT_UNKNOWN &&
+                            !(f.depth->GetDesc().Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE);
+        if (direct_depth) {
+            depth_by_pass = fmt_ok;
+        } else {
+            if (g_guide_depth.device != device) { g_guide_depth.pass.reset(new nr::pe::bridge::DepthCopyD3D12()); g_guide_depth.device = device; g_guide_depth.said = false; }
+            depth_by_pass = g_guide_depth.pass->ready(device, &depth_why) && fmt_ok;
+        }
         if (!depth_by_pass && !g_guide_depth.said) {
             g_guide_depth.said = true;
             log("[nr] Present layers: the game's depth (DXGI format %u) cannot be read by our pass%s%s: it is copied as it is",
@@ -1565,9 +1694,15 @@ void capture_guides(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, const 
     // (the full barrier only where the depth is copied - the race it closes was the depth's; a motion-only copy, the
     // usual Present layer (Motion Without Depth), takes the transitions alone, as 0.0.8.3: no GPU-wide wait a frame)
     if (depth_wanted) guide_copy_barrier(cmd);
+    bool depth_copied = depth_wanted;
     if (depth_by_pass && !depth_read_into(cmd, device, f.depth, st.depth, target->depth)) {
-        target->serial = 0;
-        return;
+        static bool depth_fail_said = false;
+        if (!depth_fail_said) {
+            depth_fail_said = true;
+            log("[nr] Present layers: Direct depth readback failed; continuing with motion only");
+        }
+        release_resource(target->depth);
+        depth_copied = false;
     }
     for (const auto& pr : pairs) {
         if (!pr.first) continue;
@@ -1575,7 +1710,9 @@ void capture_guides(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, const 
         cmd->CopyResource(pr.first, pr.second.first);
         transition(cmd, pr.second.first, D3D12_RESOURCE_STATE_COPY_SOURCE, pr.second.second);
     }
+    target->feature=feature;
     target->f = f;
+    if (!depth_copied) target->f.depth = nullptr;
     target->w2 = wf;
     target->serial = ++g_present.serial;
     target->captured_at = g_present.presents;
@@ -1675,6 +1812,7 @@ bool ensure_ring(ID3D12Device* device) {
     if (g_present.fence) { g_present.fence->Release(); g_present.fence = nullptr; }
     if (g_present.hud_rb) { g_present.hud_rb->Release(); g_present.hud_rb = nullptr; }
     for (auto& v : g_present.hud_rb_image) v = 0;
+    g_present.clear_hud_inputs();
     g_present.device = nullptr;
     for (auto*& a : g_present.allocators)
         if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&a)))) return false;
@@ -1762,15 +1900,17 @@ uint32_t present_encoding(const nr::renodx::Settings& s, int space, bool space_s
                                : space == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709 ? 3u : 0u;
     uint32_t e = s.present_encoding;
     if (e != 0 && automatic != 0 &&
-        ((e == 2 && format != DXGI_FORMAT_R10G10B10A2_UNORM && !float_format) || (e == 3 && !float_format)))
-        e = automatic;   // one the back buffer cannot carry takes Auto's
+        ((e == 2 && format != DXGI_FORMAT_R10G10B10A2_UNORM && !float_format) || (e == 3 && !float_format))) {
+        if (s.frame_reuse) return 0;
+        e = automatic;
+    }
     if (e == 0) e = automatic;
     if (e == 2) return format == DXGI_FORMAT_R10G10B10A2_UNORM || float_format ? 2u : 0u;
     if (e == 3) return float_format ? 3u : 0u;
     return e == 1 ? 1u : 0u;
 }
 
-uint32_t w2_present_encoding(int space, bool space_set, DXGI_FORMAT format);
+uint32_t w2_present_encoding(int space, bool space_set, DXGI_FORMAT format,bool extended_sdr=false);
 
 // At the swap chain's Present (NR Control's D3D12 Present hook): the RenoDX layers placed there, in layer order, on the
 // back buffer.
@@ -1790,7 +1930,8 @@ struct PresentShot {
         nr::pe::screenshot::recorded();
         return ok = true;
     }
-    void copy(ID3D12GraphicsCommandList* l, ID3D12Resource* target, int i) {
+    void copy(ID3D12GraphicsCommandList* l, ID3D12Resource* target, int i,
+              D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
         if (!ok) return;
         pair.copy(l, target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, i);
     }
@@ -1847,6 +1988,10 @@ struct DlssgAt {
 void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, const DlssgAt* at = nullptr) {
     nr::pe::watchdog::Phase phase(at ? "Present layers (at DLSS-G's evaluate)" : "Present layers");
     const nr::asi::hudcap::Own own;   // its commands pass HUD FIX's capture hooks unseen
+    // frame reuse's even frames on the D3D12 passthrough: the frame before's second part runs first (after the game's
+    // frame, before this Present's list - where the Vulkan stage runs its secondary buffer); outside g_lock, as every
+    // ExecuteCommandLists of ours (on_execute)
+    nr::pe::d3d12_passthrough::submit_pending(queue);
     std::unique_lock<std::mutex> guard(g_lock);
     tick_retired();
     ++g_present.presents;
@@ -1855,6 +2000,11 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
     for (const Layer& l : chain->layers)
         if (present_layer(l)) layers.push_back(&l);
     g_present.wanted = !layers.empty();
+    if (g_present.hud_tick && std::none_of(layers.begin(), layers.end(), [](const Layer* l){return delayed_layer(*l);}))
+        g_present.clear_hud_inputs();
+    if (g_present.tool_history.width &&
+        (layers.empty() || (!chain->inspect.compare && chain->inspect.apply_model && !nr::pe::screenshot::wants_final())))
+        g_present.clear_tool_inputs();
     // no game evaluate for a second (the game in its menus, Present layers alone): the frame's keys here (NR on / off,
     // the screenshot keys), as an evaluate takes them
     if (!layers.empty() && GetTickCount64() - g_present.evaluate_ms.load() > 1000) nr::dlssnr::frame_keys();
@@ -1868,6 +2018,7 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
             });
             if (keep) { ++it; continue; }
             if (it->second.nr) nr::dlssnr::release_d3d12(it->second.nr);
+            it->second.clear_pq();
             if (it->second.w2) nr::asi::wilsjo2_release(it->second.w2);
             it = g_present.layers.erase(it);
         }
@@ -1913,14 +2064,20 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
                          : int(bd.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ? DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
                                                                           : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
     // (an 8-bit BGRA back buffer too, as on D3D11 / Vulkan - one rule, w2_present_encoding)
-    const uint32_t w2_encoding = plain ? w2_present_encoding(space, space_set, bd.Format) : 0u;
+    const uint32_t w2_default = plain ? w2_present_encoding(space, space_set, format) : 0u;
+    bool w2_served=false;
     static uint32_t w2_said = ~0u;
     bool w2_any = false;
     for (const Layer* l : layers) {
         if (!renodx_layer(*l)) {
+            const uint32_t w2_encoding=w2_default?w2_default:plain && l->w2.frame_reuse?w2_present_encoding(space,space_set,format,true):0;
+            w2_served|=w2_encoding!=0;
             w2_any = true;
             if (w2_encoding != w2_said) {
                 w2_said = w2_encoding;
+                if (w2_encoding)
+                    log("[nr] wilsjo2 Present encoding: %s (DXGI %u, colour space %d)", w2_encoding == 2 ? "HDR10 PQ" :
+                        w2_encoding == 3 ? "scRGB" : "SDR", unsigned(bd.Format), w2_space);
                 if (!w2_encoding)
                     log("[nr] wilsjo2 finished picture: this screen colour format is not supported (colour space %d, "
                         "format %u)", w2_space, unsigned(bd.Format));
@@ -1937,11 +2094,12 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
         if (!e) {
             unusable = true;
             layer_note(*l, 2, 3, "Present cannot serve this swap chain's colour format");
+            if(reuse_layer(*l))nr::pe::control::layer_reuse_failed(row_number(*l),nr::frame_reuse::unsupported_format);
             continue;
         }
         runs.push_back({l, e, e == 1u ? 0.f : present_white_of(rs, windows_white)});
     }
-    g_present.unusable_w2 = w2_any && !w2_encoding;
+    g_present.unusable_w2 = w2_any && !w2_served;
     if (unusable != g_present.unusable.exchange(unusable)) {
         if (unusable)
             log("[nr] Present layers: this swap chain cannot be served (colour space %d%s, format %u); the RenoDX ones do "
@@ -2088,10 +2246,23 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
     }
     // RenoDX's guides: the newest fresh one of the back buffer's aspect
     GuideSet* guides = nullptr;
+    uint64_t newest_any = 0;   // (the newest captured at all: one not yet ordered before this list is said below)
     for (uint32_t k = 0; k < kD12GuideSets; ++k) {
         GuideSet& gs = g_present.sets[k];
+        if (gs.serial && fresh(gs)) newest_any = std::max(newest_any, gs.serial);
         if (!ordered[k] || !fresh(gs) || (guides && gs.serial < guides->serial)) continue;
         guides = &gs;
+    }
+    {   // (diagnostic, at most every 5 s: a newer capture exists than the one this Present may read - the game's frame on
+        // another queue not known done; at DLSS-G's evaluate a picture of this frame then gets an older frame's vectors)
+        static ULONGLONG said_ms = 0;
+        const ULONGLONG now_ms = GetTickCount64();
+        if (newest_any && (!guides || guides->serial < newest_any) && now_ms - said_ms >= 5000) {
+            said_ms = now_ms;
+            log("[nr] Present layers%s: the newest guides (capture %llu) are not yet ordered before this list (its queue %p): "
+                "%s", at ? " at DLSS-G's evaluate" : "", (unsigned long long)newest_any, static_cast<void*>(queue),
+                guides ? ("capture " + std::to_string(guides->serial) + " read instead").c_str() : "none read");
+        }
     }
     ID3D12GraphicsCommandList* l = at ? at->list : g_present.list;
     if (!at) {
@@ -2101,6 +2272,9 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
     nr::gpu::Scope recording(nr::asi::hudcap::d3d12_recording(l));
     nr::asi::hudcap::d3d12_use_chain(hud_cap);
     g_d12_uses.touch();
+    // NRFrameReuse's even frames with frame generation: this frame's inputs it was handed valid until the present,
+    // copied for the next Present (nr_asi_hudcap.hpp fg_delay)
+    if (!at) nr::asi::hudcap::fg_delay_present(l);
     // The first layer, a RenoDX one, reads the back buffer itself (a shader resource view) and stores its answer
     // into our copy, which then goes back as before - the copy of the back buffer into ours goes (4K RGBA16F 0.11 ms,
     // 8-bit 0.03). Only where nothing else reads our copy before that layer: no HUD FIX, comparison, hold, F5 pair or
@@ -2109,8 +2283,11 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
     // NR_PRESENT_READ_BACK=0: the copy as before.
     static const bool read_back_off = [] { const char* e = std::getenv("NR_PRESENT_READ_BACK"); return e && e[0] == '0'; }();
     bool read_back = false;
-    if (!read_back_off && !at && bd.Format == format && renodx_layer(*runs.front().layer) && d12_reads_in_place(device) &&
-        !nr::pe::screenshot::wants_final()) {
+    const bool srgb_back = bd.Format != format;
+    const bool pt_direct = nr::pe::d3d12_passthrough::enabled() &&
+                           nr::pe::d3d12_passthrough::canary() == nr::pe::d3d12_passthrough::Canary::kHit;
+    if (!read_back_off && !at && (bd.Format == format || (srgb_back && pt_direct)) && renodx_layer(*runs.front().layer) && !reuse_layer(*runs.front().layer) &&
+        d12_reads_in_place(device) && !nr::pe::screenshot::wants_final()) {
         std::vector<const Layer*> rl;
         for (const Run& run : runs) rl.push_back(run.layer);
         size_t a0 = 0, b0 = 0;
@@ -2141,8 +2318,37 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
         transition(l, g_present.target, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         transition(l, back, D3D12_RESOURCE_STATE_COPY_SOURCE, back_now);
     };
+    // (a wilsjo2 layer's frame reuse on the D3D12 passthrough evens frames only as this Present's one layer)
+    nr::asi::wilsjo2_note_present_runs(uint32_t(runs.size()));
+    std::vector<const Layer*> run_layers;
+    for (const Run& run : runs) run_layers.push_back(run.layer);
+    size_t ia = 0, ib = 0;
+    const bool inspect = inspect_span(chain->inspect, run_layers, true, &ia, &ib) && inspect_format(format);
+    const long held = chosen_index(chain->inspect, run_layers);
+    const bool want_shot = nr::pe::screenshot::wants_final();
+    // F5 / Compare where a delayed layer (frame reuse) is in the compared span: the picture shown
+    // is paired with the frame it came from (frame_pair tags through the layers), saved where the span starts - a shot's
+    // the chain's input, Compare's its first layer's (both at once when that is the chain's start). HUD FIX: the shown
+    // frame's own inputs (defer_shot, and Compare's off side at its end).
+    const size_t pair_from = inspect ? ia : 0;
+    const bool delayed_span = !runs.empty() && std::any_of(run_layers.begin() + pair_from,
+        run_layers.begin() + (want_shot ? runs.size() : ib + 1), [](const Layer* layer) { return delayed_layer(*layer); });
+    const bool pair_tools = !at && (want_shot || inspect) && !chain->hud.mode && (!inspect || !want_shot || ia == 0) &&
+                            delayed_span;
+    const bool defer_shot = want_shot && !at && chain->hud.mode && !runs.empty() &&
+                            std::any_of(run_layers.begin(), run_layers.end(), [](const Layer* layer) { return delayed_layer(*layer); });
+    // (defer_shot too: a stage's own screenshot - the session's, Direct's - is not taken mid-chain while this one waits)
+    nr::frame_pair::Observation pair(pair_tools || defer_shot);
+    bool pair_copy_failed = false;
+    if (!pair_tools) g_present.clear_tool_inputs();
+    // The final comparison's off side includes the game's HUD, even if HUD FIX runs NR on a HUD-less copy.
+    const bool compare_before_hud = inspect && chain->inspect.layer == 0 && chain->hud.mode != 0;
+    if (compare_before_hud) {
+        fill_target();
+        inspect_copy(l, device, g_present.inspect_off, g_present.inspect_off_state, g_present.target);
+    }
     PresentShot shot;   // F5: the frame as the game presents it
-    if (nr::pe::screenshot::wants_final()) {
+    if (want_shot && !pair_tools && !defer_shot) {
         if (at)   // its pair needs our own submission's fence to read back
             nr::pe::screenshot::fail("unsupported_present", "the Present layers run at DLSS-G's evaluate (DLSS-G through "
                                      "NGX): the final picture's pair is not taken there");
@@ -2161,11 +2367,6 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
     namespace route = nr::pe::renodx_route;
     // [Inspect]: the Present layers compared (the final picture is theirs: Present is the last placement), the frame
     // taken before the first of them and shown after the last
-    std::vector<const Layer*> run_layers;
-    for (const Run& run : runs) run_layers.push_back(run.layer);
-    size_t ia = 0, ib = 0;
-    const bool inspect = inspect_span(chain->inspect, run_layers, true, &ia, &ib) && inspect_format(format);
-    const long held = chosen_index(chain->inspect, run_layers);
     if (held < 0 && g_present.hold.held) {   // the hold moved off these layers: the held one back to live
         g_hold_released.insert(g_present.hold.layer);
         g_present.hold.held = false;
@@ -2254,6 +2455,8 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
         }
     }
     ID3D12Resource* fg_before = nullptr;
+    // NRFrameReuse's even frames: the back buffer gets the answer of the frame before (the frame frame generation is then
+    // handed too): the HUD-less frame gets that frame's change - its frame before the layers, kept from that Present
     if (fg_delta) {
         PresentPath& P = g_present;
         const bool ready = (hud || ensure_texture(device, P.fg_pre, P.fg_pre_state, format, w, h)) &&
@@ -2287,39 +2490,90 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
             }
         }
     }
+    const bool watch_age = std::any_of(run_layers.begin(),run_layers.end(),[](const Layer* layer){return delayed_layer(*layer);});
+    nr::frame_pair::PresentAge age; age.publish=&nr::pe::Session::publish_delay;
+    age.terminal_chain=terminal_chain(*chain,run_layers);
+    age.version=chain->version;
+    age.multiple=chain->layers.size()>1;
+    age.interleaved_conflict=std::any_of(chain->layers.begin(),chain->layers.end(),[](const Layer& l){
+        return renodx_layer(l)?l.cfg.renodx.values.passes_mode==1 && l.cfg.renodx.values.fast_method==0
+                              :l.w2.passes_mode==1 && l.w2.fast_method==0;
+    });
+    age.isolate_chain=age.multiple && !age.terminal_chain && delayed_present_runs(chain->layers,age.interleaved_conflict)==1;
+    group_reuse(age,run_layers);
+    auto& history = g_present;
+    const uint64_t tick = watch_age ? ++history.hud_tick : 0;
+    history.guide_history[tick%3]=age.isolate_chain && guides?guides->serial:0;
+    auto& now = history.hud_inputs[tick % 3];
+    now.tick = 0;
+    // The frame used by NR and the provider's current HUD-less input can be different.
+    // Keep both. The provider destination may already name its delayed ring slot.
+    if (watch_age && (hud || fg_before)) {
+        auto save = [&](PresentPath::ToolInput& out, ID3D12Resource* src) {
+            if (!src) return false;
+            const auto desc=src->GetDesc();
+            if (!ensure_texture(device,out.image,out.state,desc.Format,uint32_t(desc.Width),desc.Height)) return false;
+            transition(l,src,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COPY_SOURCE);
+            transition(l,out.image,out.state,D3D12_RESOURCE_STATE_COPY_DEST);
+            l->CopyResource(out.image,src);
+            transition(l,out.image,D3D12_RESOURCE_STATE_COPY_DEST,out.state);
+            transition(l,src,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            return true;
+        };
+        now.width=w; now.height=h; now.format=format; now.version=chain->version;
+        now.source=hud?hud_source:0; now.chain_image=hud_chain_check?hud_cap.chain_image:0;
+        now.from_fg=hud && hud_fg; now.has_fg=fg_before!=nullptr;
+        const bool saved = save(now.back,hud?history.hud_back:fg_before) &&
+            (!hud || (save(now.clean,hud_hudless) && save(now.stats,history.hud_stats) &&
+                      (hud_source!=1 || save(now.alpha,history.hud_ui)))) &&
+            (!fg_before || save(now.fg,hud_cap.fg.copy));
+        if (saved) now.tick=tick;
+        nr::pe::Session::note_hud_fix(!saved);
+    } else nr::pe::Session::note_hud_fix(false);
+    const auto shown_inputs = [&]() -> PresentPath::HudInput* {
+        if (!watch_age || !age.frames || age.frames>2 || tick<=age.frames) return nullptr;
+        auto& old=history.hud_inputs[(tick-age.frames)%3];
+        return old.tick==tick-age.frames && old.version==chain->version && old.width==w && old.height==h && old.format==format ? &old : nullptr;
+    };
     const auto hud_end = [&] {
         PresentPath& P = g_present;
+        auto* old=shown_inputs();
+        if (age.frames && (!old || !old->source)) return;
+        if (!age.frames && !hud) return;
+        const unsigned source=old?old->source:hud_source;
+        const bool from_fg=old?old->from_fg:hud_fg;
         nr::asi::HudFixD3D12 r;
-        r.back = P.hud_back; r.frame = P.target; r.alpha = hud_source == 1 ? P.hud_ui : nullptr;
-        r.stats = P.hud_stats;
-        r.hudless = hud_captured ? hud_hudless : nullptr;
-        if (hud_fg && hud_cap.fg.substitute) {   // NR's answer on it handed to frame generation in its place
+        r.back=old?old->back.image:P.hud_back; r.frame=P.target;
+        r.alpha=source==1?(old?old->alpha.image:P.hud_ui):nullptr;
+        r.stats=old?old->stats.image:P.hud_stats;
+        r.hudless=old?old->clean.image:hud_hudless;
+        if (from_fg && hud_cap.fg.substitute) {   // NR's answer on it handed to frame generation in its place
             transition(l, P.target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            transition(l, hud_cap.fg.game, hud_cap.fg.state, D3D12_RESOURCE_STATE_COPY_DEST);
-            l->CopyResource(hud_cap.fg.game, P.target);
-            transition(l, hud_cap.fg.game, D3D12_RESOURCE_STATE_COPY_DEST, hud_cap.fg.state);
+            transition(l, hud_cap.fg.destination, hud_cap.fg.destination_state, D3D12_RESOURCE_STATE_COPY_DEST);
+            l->CopyResource(hud_cap.fg.destination, P.target);
+            transition(l, hud_cap.fg.destination, D3D12_RESOURCE_STATE_COPY_DEST, hud_cap.fg.destination_state);
             transition(l, P.target, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         }
-        if (!nr::asi::hudfix_d3d12(l, device, r, w, h, hud_source, chain->hud.show_mask)) {
-            if (hud_captured) {   // the layers ran on the copy without the HUD: the frame as the game drew it goes back
-                transition(l, P.hud_back, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        if (!nr::asi::hudfix_d3d12(l, device, r, w, h, source, chain->hud.show_mask)) {
+            if (r.hudless) {   // the layers ran on the copy without the HUD: the frame as the game drew it goes back
+                transition(l, r.back, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
                 transition(l, P.target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
-                l->CopyResource(P.target, P.hud_back);
+                l->CopyResource(P.target, r.back);
                 transition(l, P.target, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-                transition(l, P.hud_back, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                transition(l, r.back, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             }
-            if (hud_fg && hud_cap.fg.substitute && hud_cap.fg.copy) {   // and frame generation gets its own frame back
-                transition(l, hud_cap.fg.copy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-                transition(l, hud_cap.fg.game, hud_cap.fg.state, D3D12_RESOURCE_STATE_COPY_DEST);
-                l->CopyResource(hud_cap.fg.game, hud_cap.fg.copy);
-                transition(l, hud_cap.fg.game, D3D12_RESOURCE_STATE_COPY_DEST, hud_cap.fg.state);
-                transition(l, hud_cap.fg.copy, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            if (from_fg && hud_cap.fg.substitute && r.hudless) {   // and frame generation gets its own frame back
+                transition(l, r.hudless, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                transition(l, hud_cap.fg.destination, hud_cap.fg.destination_state, D3D12_RESOURCE_STATE_COPY_DEST);
+                l->CopyResource(hud_cap.fg.destination, r.hudless);
+                transition(l, hud_cap.fg.destination, D3D12_RESOURCE_STATE_COPY_DEST, hud_cap.fg.destination_state);
+                transition(l, r.hudless, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             }
             nr::pe::control::hud_facts("nothing this frame: its composition could not be recorded", nullptr, nullptr, nullptr);
             return;
         }
         // the chain capture's check: this frame's HUD count (hudfix.comp's u1.x) read back by this slot's list
-        if (hud_cap.chain && !hud_fg && !at) {
+        if ((old ? old->chain_image != 0 : hud_cap.chain && !hud_fg) && !at) {
             if (!P.hud_rb) {
                 D3D12_HEAP_PROPERTIES hp{};
                 hp.Type = D3D12_HEAP_TYPE_READBACK;
@@ -2332,25 +2586,35 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
                     P.hud_rb = nullptr;
             }
             if (P.hud_rb) {
-                transition(l, P.hud_stats, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                transition(l, r.stats, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
                 D3D12_TEXTURE_COPY_LOCATION to{}, from{};
                 to.pResource = P.hud_rb;
                 to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
                 to.PlacedFootprint.Offset = uint64_t(slot) * 512;
                 to.PlacedFootprint.Footprint = {DXGI_FORMAT_R32_UINT, 4, 1, 1, 256};
-                from.pResource = P.hud_stats;
+                from.pResource = r.stats;
                 from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
                 from.SubresourceIndex = 0;
                 const D3D12_BOX box{0, 0, 0, 4, 1, 1};
                 l->CopyTextureRegion(&to, 0, 0, 0, &from, &box);
-                transition(l, P.hud_stats, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-                P.hud_rb_image[slot] = hud_cap.chain_image;
+                transition(l, r.stats, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                P.hud_rb_image[slot] = old ? old->chain_image : hud_cap.chain_image;
                 P.hud_rb_total[slot] = w * h;
             }
         }
         ran = true;
     };
     for (size_t k = 0; k < runs.size(); ++k) {
+        age.in_group=k>=age.group_first && k<age.group_first+age.group_size;
+        age.group_index=age.in_group?unsigned(k-age.group_first):0;
+        age.before_terminal=k+1<runs.size();
+        age.isolated_layer=age.isolate_chain && (age.in_group || reuse_layer(*runs[k].layer));
+        auto* shown_guides=guides;
+        if (age.frames) {
+            shown_guides=nullptr;
+            const uint64_t wanted=history.guide_history[(tick+3-age.frames)%3];
+            if (wanted) for (auto& gs : history.sets) if (gs.serial==wanted) { shown_guides=&gs; break; }
+        }
         Run run = runs[k];
         const bool holding = long(k) == held && chain->inspect.hold;
         if (long(k) == held) hold_frame(l, device, chain->inspect, g_present.hold, g_present.target, row_number(*run.layer));
@@ -2374,10 +2638,21 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
         };
 
         if (!(k == 0 && renodx_layer(*run.layer))) fill_target();
-        if (inspect && k == ia) inspect_copy(l, device, g_present.inspect_off, g_present.inspect_off_state, g_present.target);
+        if (pair_tools && k == pair_from) {
+            fill_target();
+            auto& history = g_present.tool_history;
+            const int slot = history.begin(w, h, uint32_t(format), inspect);
+            if (slot >= 0) {
+                auto& input = g_present.tool_input[slot];
+                pair_copy_failed = !inspect_copy(l, device, input.image, input.state, g_present.target);
+                history.tags[slot] = pair_copy_failed ? 0 : pair.output;   // (the picture coming into the span)
+            }
+        } else if (inspect && k == ia && !compare_before_hud)
+            inspect_copy(l, device, g_present.inspect_off, g_present.inspect_off_state, g_present.target);
         [&] {
         const Layer& layer = *run.layer;
         PresentLayer& pl = g_present.layers[layer.cfg.number];
+        const bool age_changed=pl.input_age!=age.frames; pl.input_age=uint8_t(age.frames);
         pl.processing = layer.cfg.processing;
         g_present.held = true;
         if (!renodx_layer(layer)) {
@@ -2391,7 +2666,8 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
             GuideSet* g = nullptr;
             for (uint32_t k = 0; k < kD12GuideSets; ++k) {
                 GuideSet& gs = g_present.sets[k];
-                if (!ordered[k] || gs.serial <= pl.consumed || !fresh(gs) || (g && gs.serial < g->serial) || !gs.depth)
+                if (!ordered[k] || gs.serial <= pl.consumed || !fresh(gs) || (g && gs.serial < g->serial) ||
+                    (!gs.depth && !layer.w2.frame_reuse && !age.gathering()))   // (a group's member joins it: below)
                     continue;
                 g = &gs;
             }
@@ -2400,6 +2676,7 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
                 layer_note(layer, 2, 3, "NR is off (toggle key)");
                 return;
             }
+            if (age.frames) g=shown_guides;
             if (!g && holding && hi.inputs_ready) {
                 held_set.f = hi.input; held_set.w2 = hi.w2;
                 held_set.depth = hi.guides[0]; held_set.motion = hi.guides[1];
@@ -2414,9 +2691,10 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
             if (!g && multiplier > 1u && pl.consumed && g_present.presents - pl.consumed_present <= multiplier + 1u)
                 for (uint32_t k = 0; k < kD12GuideSets; ++k) {
                     GuideSet& gs = g_present.sets[k];
-                    if (gs.serial == pl.consumed && ordered[k] && fresh(gs) && gs.depth) { g = &gs; generated = true; }
+                    if (gs.serial == pl.consumed && ordered[k] && fresh(gs) && (gs.depth || layer.w2.frame_reuse || age.gathering())) { g = &gs; generated = true; }
                 }
             if (!g) {
+                if (layer.w2.frame_reuse) {pl.w2_reset=true;no_reuse_motion(layer);return;}
                 // A Present of frame generation between two game frames whose capture can no longer be read: the last
                 // one was taken a moment ago (one capture, one run): nothing to say, the row stays as it is
                 if (pl.consumed && g_present.presents - pl.consumed_present <= multiplier + 1u)
@@ -2442,7 +2720,7 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
             wf.hdr = run.encoding != 1;
             wf.pre_exposure = 1.0f;
             if (auto* h = frozen(g, wf); h == &held_set) wf = h->w2;
-            wf.reset = wf.reset || pl.w2_reset || hold_released(row_number(layer));
+            wf.reset = wf.reset || age_changed || pl.w2_reset || hold_released(row_number(layer));
             // HDR: the absolute display encodings' 203-nit white in 80-nit scRGB units, no exposure measurement
             nr::wilsjo2::Settings ws = layer.w2;
             if (wf.hdr) { ws.white_point_scale = 203.0f / 80.0f; ws.white_point_source = 0; }
@@ -2452,7 +2730,17 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
             // the row before the run: what the model says of it during the run (passed through, building) stays
             layer_note(layer, 2, 3, "not recorded yet");
             bool done_run = false;
-            if (run.encoding == 2) {   // PQ: through linear BT.709 scRGB and back
+            // HDR10 with the picture shown late (frame reuse alone - a group converts its own anchors): the frames' PQ
+            // pictures kept, the shown one's alpha and fallback colour with its picture
+            const bool park_pq = run.encoding == 2 && ws.frame_reuse && !age.gathering();
+            const unsigned frames_before = age.frames;
+            if (!park_pq && pl.pq[0]) pl.clear_pq();
+            if (park_pq && !inspect_copy(l, device, pl.pq[pl.pq_index], pl.pq_state[pl.pq_index], g_present.target)) {
+                pl.w2_reset = true;
+                layer_note(layer, 2, 3, "Frame reuse could not save the HDR10 picture");
+                return;
+            }
+            if (run.encoding == 2 && !age.gathering()) {   // grouped wilsjo2 converts its own computed anchor
                 if (ensure_texture(device, g_present.linear, g_present.linear_state, DXGI_FORMAT_R16G16B16A16_FLOAT, w, h) &&
                     ensure_texture(device, g_present.encoded, g_present.encoded_state, format, w, h)) {
                     transition(l, g_present.target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -2460,10 +2748,15 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
                         done_run = nr::asi::wilsjo2_run(l, device, *pl.w2, wf, ws, g_present.linear, w, h, false);
                         if (done_run) {
                             transition(l, g_present.linear, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                            if (nr::asi::wilsjo2_convert(l, device, g_present.linear, g_present.target, g_present.encoded, w, h, false)) {
+                            // this layer's own delay this Present (the published one is the previous Present's)
+                            const uint32_t lag = park_pq ? std::min<uint32_t>(age.frames - frames_before, 2u) : 0u;
+                            auto* source = park_pq ? pl.pq[(pl.pq_index + 3 - lag) % 3] : g_present.target;
+                            done_run = false;
+                            if (nr::asi::wilsjo2_convert(l, device, g_present.linear, source, g_present.encoded, w, h, false)) {
                                 transition(l, g_present.encoded, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
                                 transition(l, g_present.target, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
                                 l->CopyResource(g_present.target, g_present.encoded);
+                                done_run = true;
                                 transition(l, g_present.target, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                                 transition(l, g_present.encoded, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                             }
@@ -2475,14 +2768,17 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
             } else {
                 done_run = nr::asi::wilsjo2_run(l, device, *pl.w2, wf, ws, g_present.target, w, h, false);
             }
+            if (park_pq && done_run) pl.pq_index = (pl.pq_index + 1) % 3;
             pl.w2_reset = !done_run;
+            // a frame reuse group's member without the game's depth (wilsjo2 needs it): its group runs, it passes the anchor
+            if (done_run && age.gathering() && !layer.w2.frame_reuse && !g->depth) layer_note(layer, 2, 3, "waits for the game's depth");
             if (!done_run) layer_note(layer, 2, 3, "its run could not be recorded (see the log)");
             ran |= done_run;
             return;
         }
         const nr::renodx::Settings& rs = layer.cfg.renodx.values;
         // NRPresentGuides: 2 never the game's; 1 required (none: this layer leaves the frame alone); 0 optional
-        GuideSet* g = rs.present_guides == 2u ? nullptr : guides;
+        GuideSet* g = rs.present_guides == 2u ? nullptr : shown_guides;
         if (g) read(g);
         nr::asi::Wilsjo2Frame hw;
         if (g) { hw = g->w2; hw.depth = g->depth; hw.motion = g->motion; }
@@ -2490,6 +2786,7 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
         hw.depth_state = hw.motion_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         g = frozen(g, hw);
         if (!g && rs.present_guides == 1u) {
+            if (rs.frame_reuse) {pl.real_guides=false;no_reuse_motion(layer);return;}
             layer_note(layer, 2, 3, "waits for the game's depth and motion (NRPresentGuides)");
             return;
         }
@@ -2505,7 +2802,7 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
             pl.w = w; pl.h = h;
         }
         layer_note(layer, 2, 3, "not recorded yet");   // it runs now
-        bool reset = (new_frame && g->f.reset) || hold_released(row_number(layer));   // the game's Reset rides the first Present of its frame only
+        bool reset = age_changed || (new_frame && g->f.reset) || hold_released(row_number(layer));   // the game's Reset rides the first Present of its frame only
         if ((g != nullptr) != pl.real_guides) { pl.real_guides = g != nullptr; reset = true; }
         route::Frame rf;
         rf.present = run.encoding;
@@ -2533,25 +2830,46 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
         if (g) pl.consumed = g->serial;
         ran = true;
             }();
-        if (hud && k + 1 == runs.size()) { fill_target(); hud_end(); }
-        if (inspect && k == ib)
-            inspect_show(l, device, chain->inspect, g_present.inspect_off, g_present.inspect_off_state, g_present.inspect_on,
-                         g_present.inspect_on_state, g_present.target);
+        if (age.gathering() && age.group_index+1==age.group_size)
+            for(unsigned i=0;i<age.group_size;++i) if(reuse_layer(*run_layers[age.group_first+i]))
+                nr::pe::control::layer_reuse_group(row_number(*run_layers[age.group_first+i]),age.group_written,age.group_share,age.group_reason.c_str());
+        if (k + 1 == runs.size() && (hud || (age.frames && shown_inputs() && shown_inputs()->source))) { fill_target(); hud_end(); }
+        if (inspect && k == ib) {
+            const int slot = g_present.tool_history.find(pair.output);
+            if (pair_tools && slot >= 0) {
+                auto& input = g_present.tool_input[slot];
+                inspect_show(l, device, chain->inspect, input.image, input.state, g_present.inspect_on,
+                             g_present.inspect_on_state, g_present.target);
+            } else if (!pair_tools && compare_before_hud && age.frames) {   // HUD FIX, the picture late: its own frame
+                if (auto* old = shown_inputs(); old && old->back.image)
+                    inspect_show(l, device, chain->inspect, old->back.image, old->back.state, g_present.inspect_on,
+                                 g_present.inspect_on_state, g_present.target);
+            } else if (!pair_tools) {
+                inspect_show(l, device, chain->inspect, g_present.inspect_off, g_present.inspect_off_state, g_present.inspect_on,
+                             g_present.inspect_on_state, g_present.target);
+            }
+        }
     }
     for (GuideSet* gs : readable) {
         if (gs->depth) transition(l, gs->depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
         transition(l, gs->motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     }
     int hud_given = 0;   // (counted at DLSS-G's evaluate) 1: DLSS-G's own HUD-less frame got NR's change, 2: another
+    auto* fg_clean = hud_cap.fg.copy;
+    if (fg_before && age.frames) {
+        auto* old=shown_inputs();
+        fg_before=old && old->has_fg?old->back.image:nullptr;
+        fg_clean=old && old->has_fg?old->fg.image:nullptr;
+    }
     if (fg_before && ran) {   // the HUD-less frame + the layers' change, handed to frame generation in its place
         PresentPath& P = g_present;
-        if (nr::asi::wilsjo2_fg_delta(l, device, hud_cap.fg.copy, fg_before, P.target, P.fg_zero, P.hud_stats, P.fg_out, w,
+        if (nr::asi::wilsjo2_fg_delta(l, device, fg_clean, fg_before, P.target, P.fg_zero, P.hud_stats, P.fg_out, w,
                                       h)) {
             transition(l, P.fg_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            transition(l, hud_cap.fg.game, hud_cap.fg.state, D3D12_RESOURCE_STATE_COPY_DEST);
-            l->CopyResource(hud_cap.fg.game, P.fg_out);
+            transition(l, hud_cap.fg.destination, hud_cap.fg.destination_state, D3D12_RESOURCE_STATE_COPY_DEST);
+            l->CopyResource(hud_cap.fg.destination, P.fg_out);
             hud_given = std::strcmp(hud_cap.fg.source, "DLSS frame generation (NGX)") == 0 ? 1 : 2;
-            transition(l, hud_cap.fg.game, D3D12_RESOURCE_STATE_COPY_DEST, hud_cap.fg.state);
+            transition(l, hud_cap.fg.destination, D3D12_RESOURCE_STATE_COPY_DEST, hud_cap.fg.destination_state);
             transition(l, P.fg_out, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             static bool said = false;
             if (!said) {
@@ -2567,6 +2885,19 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
     }
     if (at) ++(hud_given == 1 ? g_pacing.dlssg_hud_own : hud_given == 2 ? g_pacing.dlssg_hud_other : g_pacing.dlssg_hud_none);
     if (ran) fill_target();   // (every run fills it; for certainty)
+    if (pair_tools && want_shot && ran) {
+        const int slot = g_present.tool_history.find(pair.output);
+        if (slot >= 0 && shot.prepare(device, g_present.target)) {
+            auto& input = g_present.tool_input[slot];
+            shot.copy(l, input.image, 0, input.state);
+        } else if (slot < 0 && pair_copy_failed) {
+            nr::pe::screenshot::fail("allocation_failed", "the readback buffers could not be allocated");
+        }
+    }
+    if (defer_shot && ran) {   // HUD FIX with a delayed layer: the shown frame as the game drew it, saved at its Present
+        auto* old = age.frames ? shown_inputs() : (history.hud_inputs[tick % 3].tick == tick ? &history.hud_inputs[tick % 3] : nullptr);
+        if (old && old->back.image && shot.prepare(device, g_present.target)) shot.copy(l, old->back.image, 0);
+    }   // (none saved: the request waits for a frame that has it)
     shot.copy(l, g_present.target, 1);   // F5: the final picture
     transition(l, g_present.target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     transition(l, back, back_now, ran ? D3D12_RESOURCE_STATE_COPY_DEST : back_state);
@@ -2809,6 +3140,7 @@ void debug_present_dump(IDXGISwapChain* sc, ID3D12CommandQueue* queue) {
 // measurement, said as one: a game that presents twice a frame for other reasons reads the same.
 std::atomic<uint64_t> g_fg_frames{0};
 std::atomic<ULONGLONG> g_fg_on_ms{0};   // frame generation last seen on (frame_generation_line), GetTickCount64
+std::atomic<ULONGLONG> g_fg_declared_ms{0};   // ... by DLSS-G's own word through NGX (not only measured)
 
 // Every 10 s while Present layers run, one line in the log (user 10-30: with frame generation on, the frame rate stayed
 // low after heavy NR changes until frame generation was switched off and on): the game's frames, the presents, the
@@ -2985,6 +3317,7 @@ void frame_generation_line() {
     const bool playing = frames >= 10;
     ratio_seconds = playing && presents >= frames * 13 / 10 ? ratio_seconds + 1 : 0;
     if ((decl.multiplier > 1 && now - decl.ms < 2000) || ratio_seconds >= 2) g_fg_on_ms = now;
+    if (decl.multiplier > 1 && now - decl.ms < 2000) g_fg_declared_ms = now;
     if (decl.multiplier > 1 && now - decl.ms < 2000)
         std::snprintf(line, sizeof line, NR_N("Frame generation: the game's DLSS-G, %ux (its own word)"), decl.multiplier);
     else if (!playing)
@@ -3072,7 +3405,7 @@ void dlssg_layers(ID3D12GraphicsCommandList* cmd, ID3D12Resource* back, ID3D12Co
 // A Present of the game's swap chain while the layers run at DLSS-G's evaluate: true when it belongs to a game frame
 // they already ran on (left alone): the presents its evaluates declared (DLSSG.MultiFrameCount + 1 each) are counted
 // down; once none is left (frame generation switched off: no evaluate) the presents take the layers again, from the
-// next one on (a time window as well cost the first frame after frame generation went off its NR in the stand-in).
+// next one on (a time window as well cost the first frame after frame generation went off its NR).
 // A second without such an evaluate ends it whatever is left. Keeps the screen and the capture's back buffers current.
 // With none left but an evaluate within kDlssgHoldMs the Present is still its frame's: the declared presents can run
 // short of those that come (RE Requiem demo under GE-Proton 11-12: the layers then ran at the Present as well -
@@ -3142,11 +3475,42 @@ bool fg_inner(IDXGISwapChain* sc);
 std::atomic<bool> g_fg_proxy_held{false};
 bool game_swapchain(IDXGISwapChain* sc);
 thread_local uint64_t g_probe_shown = 0;   // on_present -> on_shown: the probe's number + 1
+// Frame generation with the game now, for NRFrameReuse's even frames (Session::note_frame_generation): a frame
+// generator's swap chain followed or adopted, or frame generation measured on (frame_generation_line) in the last 2 s.
+// 1: its inputs come through calls followed (nr_asi_hudcap.hpp fg_delay: XeSS frame generation's, FSR frame
+// generation's through the FidelityFX API - the game's own, or OptiScaler's own frame generation's), handed over as
+// many frames later as the frames are shown; 2: another (FSR 3.0 linked into the game, DLSS-G through a library of its
+// own, a game dispatching FSR frame generation itself, measured only). The even frames' state goes to the calls too.
+std::atomic<int> g_fg_kinds{0};   // the adopted proxies' libraries: 1 XeSS frame generation, 2 another, 4 FSR 3.0's swap
+                                  // chain linked into the game (adopt_fg_proxy; its inputs pass through no call of ours)
+namespace dlssg_delay { void collect_unused(); }
+void note_frame_generation() {
+    const ULONGLONG on = g_fg_on_ms.load();
+    const bool fg = g_fg_proxy_active.load() || g_fg_proxy_held.load() || (on && GetTickCount64() - on < 2000);
+    // (the game's own XeSS frame generation's swap chain followed: its calls are, whether it makes any now or not)
+    const char* reason=nullptr;
+    // (FSR 3.0's swap chain linked into the game: its camera, depth and vectors reach it inside the game - never followed)
+    const bool linked = (g_fg_kinds.load() & 4) != 0;
+    const bool followed = !linked && nr::asi::hudcap::fg_followed(g_fg_kinds.load() == 1 && !g_fg_proxy_held.load(),&reason);
+    // (frame generation through a library hooked here - its swap chain adopted or held, or DLSS-G's own word through NGX -
+    // that has made no call yet: none so far, not "another". Frame generation only measured (more presents than game
+    // frames) or FSR 3.0's linked swap chain is frame generation whose inputs pass no call of ours: never "not started")
+    const ULONGLONG declared = g_fg_declared_ms.load();
+    const bool through_hooks = !linked && (g_fg_proxy_active.load() || g_fg_proxy_held.load() ||
+                                           (declared && GetTickCount64() - declared < 2000));
+    nr::pe::Session::note_frame_generation(!fg || (!followed && through_hooks && nr::asi::hudcap::fg_not_started()) ? 0 : followed ? 1 : 2,reason);
+    const auto chain=chain_now();
+    const bool capture=fg && followed && chain && std::any_of(chain->layers.begin(),chain->layers.end(),
+        [](const Layer& l){return present_layer(l) && delayed_layer(l);});
+    if(!capture)dlssg_delay::collect_unused();
+    nr::asi::hudcap::fg_delay(capture ? nr::pe::Session::frames_delay() : 0,capture);
+}
 void on_present(IDXGISwapChain* sc, ID3D12CommandQueue* queue, int encoding) {
     nr::pe::watchdog::beat();
     nr::pe::stats::shown_present();
     nr::pe::watchdog::Phase phase("the system's Present (NR Control's hook)");
     frame_generation_line();
+    note_frame_generation();
     const bool served_above = GetTickCount64() - g_present.top_ms.load() < 1000;
     const bool fg_owned = g_fg_proxy_active.load() || fg_inner(sc) || (g_fg_proxy_held.load() && !game_swapchain(sc));
     const uint64_t probe = present_probe_budget() ? g_probe_presents.fetch_add(1) : ~0ull;
@@ -3437,6 +3801,8 @@ std::string take_game_sources() {   // the pacing thread: the last ten seconds' 
     return text;
 }
 
+void flush_xe_present(IDXGISwapChain*);
+std::atomic<bool> xe_proxies_seen{false};
 template <int K>
 struct ScDetours {
     template <class Fn>
@@ -3445,25 +3811,31 @@ struct ScDetours {
     static HRESULT STDMETHODCALLTYPE present(IDXGISwapChain* sc, UINT sync, UINT flags) {
         nr::pe::watchdog::beat();
         const PresentDepth depth(__builtin_return_address(0), sc);
-        if (!(flags & DXGI_PRESENT_TEST) && depth.game) {
+        const bool game = !(flags & DXGI_PRESENT_TEST) && depth.game;
+        if (nr::asi::hudcap::xefg_any_pending() && xe_proxies_seen.load(std::memory_order_relaxed) && !(flags & DXGI_PRESENT_TEST)) flush_xe_present(sc);
+        if (game) {
             note_game_present(sc, __builtin_return_address(0));
             game_present_before(sc);
         }
         using Fn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
-        const nr::asi::hudcap::PresentCall call;   // frame generation's hand-overs now: OptiScaler's own
-        return original<Fn>(kDetourPresent)(sc, sync, flags);
+        const nr::asi::hudcap::PresentCall hand;   // frame generation's hand-overs now: OptiScaler's own
+        const HRESULT hr = original<Fn>(kDetourPresent)(sc, sync, flags);
+        return hr;
     }
     static HRESULT STDMETHODCALLTYPE present1(IDXGISwapChain1* sc, UINT sync, UINT flags,
                                               const DXGI_PRESENT_PARAMETERS* params) {
         nr::pe::watchdog::beat();
         const PresentDepth depth(__builtin_return_address(0), sc);
-        if (!(flags & DXGI_PRESENT_TEST) && depth.game) {
+        const bool game = !(flags & DXGI_PRESENT_TEST) && depth.game;
+        if (nr::asi::hudcap::xefg_any_pending() && xe_proxies_seen.load(std::memory_order_relaxed) && !(flags & DXGI_PRESENT_TEST)) flush_xe_present(sc);
+        if (game) {
             note_game_present(sc, __builtin_return_address(0));
             game_present_before(sc);
         }
         using Fn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*);
-        const nr::asi::hudcap::PresentCall call;   // frame generation's hand-overs now: OptiScaler's own
-        return original<Fn>(kDetourPresent1)(sc, sync, flags, params);
+        const nr::asi::hudcap::PresentCall hand;   // frame generation's hand-overs now: OptiScaler's own
+        const HRESULT hr = original<Fn>(kDetourPresent1)(sc, sync, flags, params);
+        return hr;
     }
     static HRESULT STDMETHODCALLTYPE create(IDXGIFactory* f, IUnknown* device, DXGI_SWAP_CHAIN_DESC* desc,
                                             IDXGISwapChain** out) {
@@ -3628,6 +4000,7 @@ void on_present11(IDXGISwapChain* sc, ID3D11Device* device) {
     nr::pe::watchdog::beat();
     nr::pe::stats::shown_present();
     frame_generation_line();
+    note_frame_generation();
     if (GetTickCount64() - g_d11_top_ms.load() < 1000) return;   // served at the game's own call
     {   // a swap chain of the game's (adopt_swapchain), not one OptiScaler or an overlay made; while none was seen
         // being made (a creation path not hooked), every one
@@ -3773,6 +4146,12 @@ void hook_game_dxgi() {
 // own Present call), and let go of when the library's context is destroyed.
 std::unordered_map<void*, ID3D12CommandQueue*> g_fg_queue;   // library context -> the game's queue (AddRef; g_sc_lock)
 std::unordered_map<void*, IDXGISwapChain*> g_fg_proxy;       // library context -> its proxy, adopted (g_sc_lock)
+std::unordered_map<void*, int> g_fg_proxy_kind;              // library context -> 1 XeSS frame generation, 2 another
+void fg_kinds_update() {   // (g_sc_lock held)
+    int k = 0;
+    for (const auto& [ctx, kind] : g_fg_proxy_kind) if (g_fg_proxy.count(ctx)) k |= kind;
+    g_fg_kinds = k;
+}
 
 bool game_fg_call(void* caller) {
     return caller && !in_range(g_opti_range, caller) && !in_range(g_self_range, caller) && !in_fg_library(caller);
@@ -3794,6 +4173,8 @@ void fg_forget(void* context) {
         }
         g_fg_proxy.erase(it);
     }
+    g_fg_proxy_kind.erase(context);
+    fg_kinds_update();
     g_fg_proxy_active = !g_fg_proxy.empty();
     if (const auto it = g_fg_queue.find(context); it != g_fg_queue.end()) {
         if (it->second) it->second->Release();
@@ -3823,6 +4204,8 @@ bool adopt_fg_proxy(void* context, IUnknown* proxy, ID3D12CommandQueue* queue, c
                 g_game_swapchains.erase(it);
             }
         was = sc;
+        g_fg_proxy_kind[context] = std::strcmp(who, "XeSS frame generation") == 0 ? 1 : std::strcmp(who, "FSR 3 frame generation") == 0 ? 4 : 2;
+        fg_kinds_update();
         ID3D12CommandQueue*& slot = g_game_swapchains[sc];
         fresh = slot != queue;
         queue->AddRef();
@@ -3851,6 +4234,8 @@ bool adopt_fg_proxy(void* context, IUnknown* proxy, ID3D12CommandQueue* queue, c
             std::lock_guard<std::mutex> guard(g_sc_lock);
             if (const auto it = g_game_swapchains.find(sc); it != g_game_swapchains.end()) { drop = it->second; g_game_swapchains.erase(it); }
             g_fg_proxy.erase(context);
+            g_fg_proxy_kind.erase(context);
+            fg_kinds_update();
             g_fg_proxy_active = !g_fg_proxy.empty();
         }
         if (drop) drop->Release();
@@ -3900,8 +4285,36 @@ void fg_inners_add(const std::vector<IDXGISwapChain*>& inners, const void* proxy
         if (sc && static_cast<const void*>(sc) != proxy) g_fg_inner.insert(sc);
     g_fg_inner_any = !g_fg_inner.empty();
 }
+// Observe the provider's own proxy separately from the game's top-level
+// chain. An until-Present tag received inside the game's Present can still
+// be copied on this proxy's queue before the library starts its Present.
+struct XeProxy { ID3D12CommandQueue* queue=nullptr; IDXGISwapChain* sc=nullptr; IDXGISwapChain1* sc1=nullptr; };
+std::unordered_map<void*,XeProxy> xe_proxies;
+void xe_queue(void* context,ID3D12CommandQueue* queue) {
+    if(!context || !queue)return;
+    std::lock_guard<std::mutex> guard(g_sc_lock);
+    auto& p=xe_proxies[context];
+    if(p.queue==queue)return;
+    queue->AddRef();if(p.queue)p.queue->Release();p.queue=queue;
+}
+void xe_proxy(void* context,IUnknown* object) {
+    IDXGISwapChain* sc=nullptr;
+    if(!object || FAILED(object->QueryInterface(IID_PPV_ARGS(&sc))))return;
+    IDXGISwapChain1* sc1=nullptr;sc->QueryInterface(IID_PPV_ARGS(&sc1));
+    bool hooked=hook_slot(sc,8,kDetourPresent);
+    if(sc1)hooked=hook_slot(sc1,22,kDetourPresent1) && hooked;
+    {
+        std::lock_guard<std::mutex> guard(g_sc_lock);
+        auto it=xe_proxies.find(context);
+        hooked=hooked && it!=xe_proxies.end() && it->second.queue;
+        if(hooked){it->second.sc=sc;it->second.sc1=sc1;xe_proxies_seen.store(true,std::memory_order_relaxed);}
+    }
+    nr::asi::hudcap::xefg_proxy_observed(context,hooked);
+    if(sc1)sc1->Release();sc->Release();
+}
 template <int S>
 int32_t hk_xefg_init(void* context, ID3D12CommandQueue* queue, const void* params) {
+    xe_queue(context,queue);
     if (!game_fg_call(__builtin_return_address(0))) return g_fg_slot[S].xefg_init(context, queue, params);
     fg_note_queue(context, queue);
     // xefg_swapchain_d3d12_init_params_t starts with pApplicationSwapChain: the game's swap chain goes under the proxy
@@ -3913,6 +4326,7 @@ int32_t hk_xefg_init(void* context, ID3D12CommandQueue* queue, const void* param
 template <int S>
 int32_t hk_xefg_init_desc(void* context, HWND hwnd, const void* desc, const void* fs, ID3D12CommandQueue* queue, void* factory,
                           const void* params) {
+    xe_queue(context,queue);
     if (!game_fg_call(__builtin_return_address(0)))
         return g_fg_slot[S].xefg_init_desc(context, hwnd, desc, fs, queue, factory, params);
     fg_note_queue(context, queue);
@@ -3924,13 +4338,22 @@ int32_t hk_xefg_init_desc(void* context, HWND hwnd, const void* desc, const void
 template <int S>
 int32_t hk_xefg_get_ptr(void* context, REFIID riid, void** out) {
     const int32_t rc = g_fg_slot[S].xefg_get_ptr(context, riid, out);
-    if (rc == 0 && out && *out && game_fg_call(__builtin_return_address(0)))
-        adopt_fg_proxy(context, static_cast<IUnknown*>(*out), nullptr, "XeSS frame generation");
+    if(rc==0 && out && *out) {
+        xe_proxy(context,static_cast<IUnknown*>(*out));
+        if(game_fg_call(__builtin_return_address(0))) adopt_fg_proxy(context,static_cast<IUnknown*>(*out),nullptr,"XeSS frame generation");
+    }
     return rc;
 }
 template <int S>
 int32_t hk_xefg_destroy(void* context) {
     if (game_fg_call(__builtin_return_address(0))) fg_forget(context);
+    {
+        std::lock_guard<std::mutex> guard(g_sc_lock);
+        auto it=xe_proxies.find(context);
+        if(it!=xe_proxies.end()){if(it->second.queue)it->second.queue->Release();xe_proxies.erase(it);}
+        xe_proxies_seen.store(!xe_proxies.empty(),std::memory_order_relaxed);
+    }
+    nr::asi::hudcap::xefg_delay_forget(context);   // (anyone's: OptiScaler's own frame generation's inputs are followed too)
     return g_fg_slot[S].xefg_destroy(context);
 }
 
@@ -4164,6 +4587,7 @@ void hook_fg_libraries() {
 
 // Spec 4.5: `wanted` of an allocation from an origin, clipped to what the allocation has (0: all of it).
 Rect guide_subrect(ID3D12Resource* r, uint32_t want_w, uint32_t want_h, uint32_t x, uint32_t y) {
+    if (!r) return {};
     const D3D12_RESOURCE_DESC d = r->GetDesc();
     const uint32_t aw = uint32_t(d.Width), ah = d.Height;
     Rect out;
@@ -4212,6 +4636,367 @@ bool wilsjo2_before_ok(const Frame& f, uint32_t* aw, uint32_t* ah) {
     return !f.color_x && !f.color_y && cd.MipLevels == 1 && active_ok;
 }
 
+// NGX providers receive the same shown-frame inputs in every subframe. Combo's FFX
+// middle and Artur's outer subframes share this block. A standalone FFX replacement
+// can instead be aligned at its public FidelityFX calls. The NGX evaluate is
+// handed that frame's inputs for the call - its depth / motion vector / HUD-less copies (dlssg_input) and numbers - and its
+// own given back after it (the block is Streamline's, set anew each frame). The numbers: what Nukem's and OptiScaler's
+// replacements read of a frame (camera, jitter, vector scale, subrects, flags, reset) and Streamline's other camera numbers.
+// Two steps around the Present layers at the evaluate: prepare() before them copies this frame's inputs (the HUD-less one
+// before the layers put the shown frame's NR change into a HUD-less frame - fg_note_dlssg is then given the shown frame's
+// copy, as FSR frame generation's configure is), apply() after them writes the block. A frame whose frame `lag` before is not
+// in the ring (the even frames just began, a frame without inputs) is handed over as given, reset. Multi-frame generation
+// evaluates once per generated frame (DLSSG.MultiFrameIndex 1, 2, ...): the game frame's hand-over repeated at the others.
+// Nothing at all unless a layer has frame reuse on (delayed_layer).
+namespace dlssg_delay {
+const char* const kFloats[] = {"DLSSG.JitterOffsetX", "DLSSG.JitterOffsetY", "DLSSG.MvecScaleX", "DLSSG.MvecScaleY",
+                               "DLSSG.CameraNear", "DLSSG.CameraFar", "DLSSG.CameraFOV", "DLSSG.CameraAspectRatio",
+                               "DLSSG.CameraPinholeOffsetX", "DLSSG.CameraPinholeOffsetY", "DLSSG.CameraPosX",
+                               "DLSSG.CameraPosY", "DLSSG.CameraPosZ", "DLSSG.CameraUpX", "DLSSG.CameraUpY", "DLSSG.CameraUpZ",
+                               "DLSSG.CameraRightX", "DLSSG.CameraRightY", "DLSSG.CameraRightZ", "DLSSG.CameraFwdX",
+                               "DLSSG.CameraFwdY", "DLSSG.CameraFwdZ"};
+const char* const kUints[] = {"DLSSG.Reset", "DLSSG.DepthInverted", "DLSSG.ColorBuffersHDR", "DLSSG.MvecDilated",
+                              "DLSSG.MvecJittered", "DLSSG.OrthoProjection", "DLSSG.CameraMotionIncluded",
+                              "DLSSG.DepthSubrectBaseX", "DLSSG.DepthSubrectBaseY", "DLSSG.DepthSubrectWidth",
+                              "DLSSG.DepthSubrectHeight", "DLSSG.MVecsSubrectBaseX", "DLSSG.MVecsSubrectBaseY",
+                              "DLSSG.MVecsSubrectWidth", "DLSSG.MVecsSubrectHeight", "DLSSG.HUDLessSubrectBaseX",
+                              "DLSSG.HUDLessSubrectBaseY", "DLSSG.HUDLessSubrectWidth", "DLSSG.HUDLessSubrectHeight"};
+const char* const kMatrices[] = {"DLSSG.CameraViewToClip", "DLSSG.ClipToCameraView", "DLSSG.ClipToLensClip",
+                                 "DLSSG.ClipToPrevClip", "DLSSG.PrevClipToClip"};
+const char* const kResources[nr::asi::hudcap::kDlssgInputs] = {"DLSSG.Depth", "DLSSG.MVecs", "DLSSG.HUDLess", "DLSSG.BidirectionalDistortionField"};
+constexpr size_t kF = sizeof kFloats / sizeof *kFloats, kU = sizeof kUints / sizeof *kUints,
+                 kM = sizeof kMatrices / sizeof *kMatrices, kR = nr::asi::hudcap::kDlssgInputs;
+constexpr uint32_t kRing = 4, kReset = 0;   // (kUints[0])
+// A value of the block as it was read: absent, or of the type it is written back in (doubles and unsigned first: the
+// block converts on reading - a float read of a double would round it)
+enum Kind : uint8_t { kNone, kFloat, kDouble, kUint, kInt, kPtr };
+struct Num { Kind kind = kNone; double v = 0; };
+struct Frame {
+    uint64_t id = 0;
+    bool valid = false;
+    Num f[kF], u[kU];
+    bool m[kM] = {};
+    float mat[kM][16] = {};
+};
+std::mutex mu;
+Frame ring[kRing];
+uint64_t frame = 0;          // the evaluates' game frames (their first evaluate each) while the even frames run
+uint32_t feature = 0;        // whose they are (another feature: the ring starts again)
+// The game frame's hand-over at its first evaluate, repeated at its others (multi-frame generation)
+bool last_valid = false, last_reset = false, last_owned = false;
+uint64_t last_from = 0;
+ID3D12Resource* last_res[kR] = {};
+// A game frame not taken into the ring (the even frames paused, no inputs, not followed here): the frames before it are
+// not this run's - the ring starts again at the next one taken (frame ids only advance while frames are taken)
+bool gap = true;
+void restart() {   // (mu held)
+    for (Frame& f : ring) f = Frame{};
+    nr::asi::hudcap::dlssg_reset_ring();
+    gap = false;
+}
+
+Num read_float(const NVSDK_NGX_Parameter* p, const char* n) {
+    double d = 0.0;
+    if (p->Get(n, &d) == NVSDK_NGX_Result_Success) return {kDouble, d};
+    float f = 0.f;
+    if (p->Get(n, &f) == NVSDK_NGX_Result_Success) return {kFloat, double(f)};
+    return {};
+}
+Num read_uint(const NVSDK_NGX_Parameter* p, const char* n) {
+    unsigned u = 0;
+    if (p->Get(n, &u) == NVSDK_NGX_Result_Success) return {kUint, double(u)};
+    int i = 0;
+    if (p->Get(n, &i) == NVSDK_NGX_Result_Success) return {kInt, double(i)};
+    return {};
+}
+void write(NVSDK_NGX_Parameter* p, const char* n, const Num& v) {
+    switch (v.kind) {
+        case kFloat: p->Set(n, float(v.v)); break;
+        case kDouble: p->Set(n, v.v); break;
+        case kUint: p->Set(n, unsigned(v.v)); break;
+        case kInt: p->Set(n, int(v.v)); break;
+        default: break;
+    }
+}
+
+// One evaluate's hand-over: what prepare() decided, written by apply() and given back when the call returns
+struct Swap {
+    NVSDK_NGX_Parameter* p = nullptr;
+    struct Entry { const char* name; Num was, now; void* ptr_was; void* ptr_now; bool as_res; bool ptr; };
+    std::vector<Entry> entries;
+    bool applied = false;
+    bool owns_inputs=false;
+    bool handed = false;   // the shown frame's inputs (not only a reset)
+    void put(const char* n, const Num& was, const Num& now) {
+        if (now.kind == kNone) return;
+        entries.push_back({n, was, now, nullptr, nullptr, false, false});
+    }
+    void put_ptr(const char* n, void* was, bool as_res, void* now) {
+        entries.push_back({n, {}, {}, was, now, as_res, true});
+    }
+    static void set_ptr(NVSDK_NGX_Parameter* p, const char* n, void* v, bool as_res) {
+        if (as_res) p->Set(n, static_cast<ID3D12Resource*>(v));
+        else p->Set(n, v);
+    }
+    void apply() {
+        if (!p || entries.empty()) return;
+        for (const Entry& e : entries) {
+            if (e.ptr) set_ptr(p, e.name, e.ptr_now, e.as_res);
+            else write(p, e.name, e.now);
+        }
+        applied = true;
+    }
+    ~Swap() {
+        if (!applied) return;
+        for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
+            if (it->ptr) set_ptr(p, it->name, it->ptr_was, it->as_res);
+            else if (it->was.kind != kNone) write(p, it->name, it->was);
+            else write(p, it->name, Num{it->now.kind, 0.0});   // (absent before: back to its default, 0)
+        }
+    }
+};
+
+// Whether a layer of the chain has frame reuse on (else nothing here runs)
+bool wanted() {
+    const std::shared_ptr<const Chain> chain = chain_now();
+    if (!chain) return false;
+    for (const Layer& l : chain->layers)
+        if (present_layer(l) && delayed_layer(l)) return true;
+    return false;
+}
+
+
+// IsRecording=0 gives the provider a closed list that it may Reset. Submit
+// the input copies and Present layers separately before the provider on its
+// declared queue. Cross-queue Wait/Signal orders a compute provider with NR.
+struct PreEvaluation {
+    ID3D12Device* device{};
+    ID3D12CommandQueue *provider{}, *direct{};
+    ID3D12CommandAllocator* alloc{};
+    ID3D12GraphicsCommandList* list{};
+    ID3D12Fence* fence{};
+    uint64_t value=0;
+    bool booked=false, unusable=false;
+    ~PreEvaluation() {
+        if (list) list->Release();
+        if (alloc) alloc->Release();
+        if (fence) fence->Release();
+        if (direct) direct->Release();
+        if (provider) provider->Release();
+        if (device) device->Release();
+    }
+};
+std::mutex pre_mutex;
+std::vector<std::unique_ptr<PreEvaluation>> pre_lists;
+std::atomic<bool> pre_used{false};
+struct PreBatch {
+    PreEvaluation* slot=nullptr;
+    ~PreBatch() {
+        if (!slot) return;
+        std::lock_guard<std::mutex> guard(pre_mutex);
+        slot->booked=false;
+    }
+    bool begin(NVSDK_NGX_Parameter* p,ID3D12Resource* back) {
+        void* raw=nullptr;
+        if (p->Get("DLSSG.CmdQueue",&raw)!=NVSDK_NGX_Result_Success || !raw) return false;
+        auto* q=static_cast<ID3D12CommandQueue*>(raw);
+        ID3D12Device *device=nullptr,*target=nullptr;
+        if (FAILED(q->GetDevice(IID_PPV_ARGS(&device)))) return false;
+        const bool same=SUCCEEDED(back->GetDevice(IID_PPV_ARGS(&target))) && target==device;
+        if (target) target->Release();
+        if (!same) { device->Release(); return false; }
+        return begin(q,device);
+    }
+    // Consumes the caller's device reference.
+    bool begin(ID3D12CommandQueue* q,ID3D12Device* device) {
+        std::lock_guard<std::mutex> guard(pre_mutex);
+        for (auto it=pre_lists.begin();it!=pre_lists.end();) {
+            auto& old=**it;
+            const uint64_t done=old.fence->GetCompletedValue();
+            if (!old.booked && (done==UINT64_MAX || (done>=old.value && (old.provider!=q || old.unusable)))) {
+                it=pre_lists.erase(it); continue;
+            }
+            if (!slot && old.provider==q && !old.booked && !old.unusable && done>=old.value) slot=&old;
+            ++it;
+        }
+        if (!slot) {
+            auto fresh=std::make_unique<PreEvaluation>();
+            fresh->device=device; fresh->provider=q; q->AddRef();
+            if (q->GetDesc().Type==D3D12_COMMAND_LIST_TYPE_DIRECT) { fresh->direct=q; q->AddRef(); }
+            else {
+                D3D12_COMMAND_QUEUE_DESC desc{}; desc.Type=D3D12_COMMAND_LIST_TYPE_DIRECT;
+                if (FAILED(device->CreateCommandQueue(&desc,IID_PPV_ARGS(&fresh->direct)))) return false;
+            }
+            if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&fresh->alloc))) ||
+                FAILED(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,fresh->alloc,nullptr,IID_PPV_ARGS(&fresh->list))) ||
+                FAILED(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fresh->fence)))) return false;
+            slot=fresh.get(); pre_lists.push_back(std::move(fresh)); pre_used.store(true,std::memory_order_relaxed);
+        } else {
+            device->Release();
+            if (FAILED(slot->alloc->Reset()) || FAILED(slot->list->Reset(slot->alloc,nullptr))) {
+                slot->unusable=true; slot=nullptr; return false;
+            }
+        }
+        slot->booked=true;
+        nr::gpu::reset(slot->list);
+        nr::pe::d3d12_direct::own_list_opened(slot->list,slot->alloc);
+        return true;
+    }
+    bool submit() {
+        if (!slot) return true;
+        auto& r=*slot;
+        if (FAILED(r.list->Close())) { r.unusable=true; return false; }
+        if (r.provider!=r.direct) {
+            const uint64_t ready=++r.value;
+            if (FAILED(r.provider->Signal(r.fence,ready)) || FAILED(r.direct->Wait(r.fence,ready))) {r.unusable=true;return false;}
+        }
+        ID3D12CommandList* lists[]={r.list};
+        r.direct->ExecuteCommandLists(1,lists);
+        const uint64_t completed=++r.value;
+        if (FAILED(r.direct->Signal(r.fence,completed)) ||
+            (r.provider!=r.direct && FAILED(r.provider->Wait(r.fence,completed)))) {r.unusable=true;return false;}
+        return true;
+    }
+};
+// The evaluate of a DLSS-G frame (`layers_here`: the Present layers run at it, on `cmd`, after this): this frame's inputs
+// copied, the hand-over decided into `swap`; returns the HUD-less frame the layers are to put the shown frame's NR change
+// into (the shown frame's copy, or the block's own)
+ID3D12Resource* prepare(ID3D12GraphicsCommandList* cmd, NVSDK_NGX_Parameter* p, uint32_t feature_id, bool layers_here,
+                        ID3D12Resource* hudless, Swap& swap) {
+    namespace hc = nr::asi::hudcap;
+    swap.p = p;
+    if (!wanted()) return hudless;
+    const unsigned index = get_uint(p, "DLSSG.MultiFrameIndex", 1u);
+    std::lock_guard<std::mutex> guard(mu);
+    if (feature_id != feature) {
+        feature = feature_id;
+        last_valid = false;
+        gap = true;
+    }
+    if (index > 1) {   // a later generated frame of the same game frame: as its first was
+        swap.owns_inputs=last_owned;
+        if (last_reset) swap.put(kUints[kReset], read_uint(p, kUints[kReset]), Num{kUint, 1.0});
+        if (!last_valid) return hudless;
+        const Frame& old = ring[last_from % kRing];
+        for (size_t k = 0; k < kF; ++k) swap.put(kFloats[k], read_float(p, kFloats[k]), old.f[k]);
+        for (size_t k = 0; k < kU; ++k) swap.put(kUints[k], read_uint(p, kUints[k]), old.u[k]);
+        for (size_t k = 0; k < kM; ++k) {
+            void* was = nullptr;
+            if (old.m[k] && p->Get(kMatrices[k], &was) == NVSDK_NGX_Result_Success && was)
+                swap.put_ptr(kMatrices[k], was, false, const_cast<float*>(old.mat[k]));
+        }
+        for (size_t k = 0; k < kR; ++k) {
+            bool as_res = false;
+            if (ID3D12Resource* was = get_resource(p, kResources[k], &as_res); was && last_res[k])
+                swap.put_ptr(kResources[k], was, as_res, last_res[k]);
+        }
+        swap.handed = true;
+        return last_res[hc::kDlssgHudless] ? last_res[hc::kDlssgHudless] : hudless;
+    }
+    last_valid = last_reset = last_owned = false;
+    const auto skip = [&] { gap = true; return hudless; };   // (this game frame not taken: the ring starts again after it)
+    if (!layers_here) return skip();
+    // Select the boundary that supplies the provider with its inputs.
+    // Combo selects its FFX or DLSS Enabler provider anew on each
+    // MultiFrameIndex. Both receive this evaluate's parameter block.
+    // DlssgHanded suppresses a second delay in nested provider calls.
+    if (get_uint(p,"DLSSG.MultiFrameCount",1u)<=1 && !hc::dlssg_delay_here() &&
+        !GetModuleHandleW(L"dlss-enabler-headless.dll")) return skip();
+    const uint32_t lag = hc::fg_lag();
+    bool as_res[kR] = {};
+    ID3D12Resource* game[kR] = {};
+    for (size_t k = 0; k < kR; ++k) game[k] = get_resource(p, kResources[k], &as_res[k]);
+    if (!game[hc::kDlssgDepth] || !game[hc::kDlssgMotion]) return skip();   // (nothing of a frame to follow)
+    swap.owns_inputs=last_owned=true;
+    hc::dlssg_seen();
+    // this game frame into the ring: its numbers, its inputs copied on the evaluate's list
+    if (gap) restart();
+    const uint64_t id = ++frame;
+    Frame& now = ring[id % kRing];
+    now = Frame{};
+    now.id = id;
+    for (size_t k = 0; k < kF; ++k) now.f[k] = read_float(p, kFloats[k]);
+    for (size_t k = 0; k < kU; ++k) now.u[k] = read_uint(p, kUints[k]);
+    for (size_t k = 0; k < kM; ++k) {
+        void* m = nullptr;
+        if (p->Get(kMatrices[k], &m) == NVSDK_NGX_Result_Success && m) {
+            std::memcpy(now.mat[k], m, sizeof now.mat[k]);
+            now.m[k] = true;
+        }
+    }
+    ID3D12Resource* from[kR] = {};
+    bool copied[kR] = {};
+    for (size_t k = 0; k < kR; ++k)
+        if (game[k]) from[k] = hc::dlssg_input(uint32_t(k), id, lag, game[k], cmd, &copied[k]);
+    now.valid = (!game[hc::kDlssgDistortion] || copied[hc::kDlssgDistortion]) && copied[hc::kDlssgDepth] && copied[hc::kDlssgMotion] && (!game[hc::kDlssgHudless] || copied[hc::kDlssgHudless]);
+    gap = !now.valid;
+    if (!lag) return hudless; // Keep the exact frame numbers/copies ready before any delayed output.
+
+    if (!now.valid) {
+        static std::atomic<int> told{0};
+        if (!told.fetch_add(1)) log("[nr] even frames with DLSS-G through NGX: its inputs could not be copied this frame");
+    }
+    const Frame& old = ring[(id + kRing - lag) % kRing];
+    const bool ready = old.valid && old.id + lag == id && from[hc::kDlssgDepth] && from[hc::kDlssgMotion] &&
+                       (!game[hc::kDlssgHudless] || from[hc::kDlssgHudless]);
+    if (!ready) {   // the even frames just began (or a frame's inputs were missing): as given, frame generation reset
+        swap.put(kUints[kReset], read_uint(p, kUints[kReset]), Num{kUint, 1.0});
+        last_reset = true;
+        return hudless;
+    }
+    for (size_t k = 0; k < kF; ++k) swap.put(kFloats[k], now.f[k], old.f[k]);
+    for (size_t k = 0; k < kU; ++k) swap.put(kUints[k], now.u[k], old.u[k]);
+    for (size_t k = 0; k < kM; ++k) {
+        void* was = nullptr;
+        if (old.m[k] && now.m[k] && p->Get(kMatrices[k], &was) == NVSDK_NGX_Result_Success && was)
+            swap.put_ptr(kMatrices[k], was, false, const_cast<float*>(old.mat[k]));
+    }
+    for (size_t k = 0; k < kR; ++k) {
+        last_res[k] = from[k];
+        if (game[k] && from[k]) swap.put_ptr(kResources[k], game[k], as_res[k], from[k]);
+    }
+    swap.handed = true;
+    last_valid = true;
+    last_from = old.id;
+    static std::atomic<int> told{0};
+    if (!told.fetch_add(1))
+        log("[nr] even frames with DLSS-G through NGX: its evaluate is handed frame %llu's inputs and numbers at frame %llu "
+            "(%u frame(s) later, supplied at the NGX evaluate)", (unsigned long long)old.id,
+            (unsigned long long)id, lag);
+    return from[hc::kDlssgHudless] ? from[hc::kDlssgHudless] : hudless;
+}
+void collect_unused() {
+    if(!pre_used.load(std::memory_order_relaxed))return;
+    std::lock_guard<std::mutex> guard(pre_mutex);
+    for(auto it=pre_lists.begin();it!=pre_lists.end();) {
+        auto& slot=**it;
+        if(!slot.booked && slot.fence->GetCompletedValue()>=slot.value)it=pre_lists.erase(it);
+        else ++it;
+    }
+    pre_used.store(!pre_lists.empty(),std::memory_order_relaxed);
+}
+}  // namespace dlssg_delay
+
+void flush_xe_present(IDXGISwapChain* sc) {
+    ID3D12CommandQueue* q=nullptr;void* context=nullptr;
+    {
+        std::lock_guard<std::mutex> guard(g_sc_lock);
+        for(const auto& [id,p]:xe_proxies) if(p.sc==sc || p.sc1==sc) {
+            q=p.queue;context=id;if(q)q->AddRef();break;
+        }
+    }
+    if(!q)return;
+    if(nr::asi::hudcap::xefg_pending(context)) {
+        ID3D12Device* device=nullptr;
+        dlssg_delay::PreBatch batch;
+        bool ok=SUCCEEDED(q->GetDevice(IID_PPV_ARGS(&device))) && batch.begin(q,device);
+        if(ok){nr::asi::hudcap::xefg_flush_proxy(context,batch.slot->list);ok=batch.submit();}
+        if(!ok)nr::asi::hudcap::dlssg_unfollowed(nr::frame_reuse::xe_list);
+    }
+    q->Release();
+}
+
+
 thread_local int t_inside = 0;   // OptiScaler's own nested calls of the export pass straight through
 
 // After the first evaluate: a line every 200 ms for 10 s from a thread of our own - the presents so far, the network
@@ -4258,10 +5043,27 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_evaluate(ID3D12GraphicsCommandList* cmd, const 
     ID3D12Resource* const dlssg_back = get_resource(p, "DLSSG.Backbuffer");
     ID3D12CommandQueue* const dlssg_queue = dlssg_back ? dlssg_layers_here(h->Id, p) : nullptr;   // (AddRef)
     struct Queue { ID3D12CommandQueue* q; ~Queue() { if (q) q->Release(); } } dlssg_pin{dlssg_queue};
-    {   // HUD FIX: DLSS-G's HUD-less frame (its evaluate through NGX), for the frame-generation method
+    dlssg_delay::PreBatch pre;
+    auto* capture_list=cmd;
+    // IsRecording=0: the list handed in is CLOSED (the provider Resets it with DLSSG.CmdAlloc) - nothing of ours may be
+    // recorded into it, delayed layers or not (0.0.9 to 11-26 recorded the Present layers at this evaluate into it: an access
+    // violation in the D3D12 runtime at the second frame). Our own list on the provider's queue, or nothing here.
+    if (get_uint(p,"DLSSG.IsRecording",1u)==0) {
+        if (dlssg_back && pre.begin(p,dlssg_back)) capture_list=pre.slot->list;
+        else {
+            capture_list=nullptr;
+            if (dlssg_delay::wanted()) nr::asi::hudcap::dlssg_unfollowed(nr::frame_reuse::ngx_queue);
+        }
+    }
+    // NRFrameReuse's even frames: this frame's DLSS-G inputs copied, the shown frame's decided (applied after the layers)
+    dlssg_delay::Swap swap;   // (the block given back after the call)
+    {   // HUD FIX: DLSS-G's HUD-less frame (its evaluate through NGX), for the frame-generation method - while the even
+        // frames run, the shown frame's copy (the layers put that frame's NR change into it)
         ID3D12Resource* hudless = nullptr;
-        if (p->Get("DLSSG.HUDLess", &hudless) == NVSDK_NGX_Result_Success && hudless)
-            nr::asi::hudcap::fg_note_dlssg(cmd, hudless, dlssg_queue != nullptr);
+        if (p->Get("DLSSG.HUDLess", &hudless) != NVSDK_NGX_Result_Success) hudless = nullptr;
+        auto* destination = hudless;
+        if (dlssg_back && capture_list) destination = dlssg_delay::prepare(capture_list, p, h->Id, dlssg_queue != nullptr, hudless, swap);
+        if (hudless && capture_list) nr::asi::hudcap::fg_note_dlssg(capture_list, hudless, dlssg_queue != nullptr, destination);
     }
 
     std::unique_lock<std::mutex> guard(g_lock);
@@ -4291,7 +5093,14 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_evaluate(ID3D12GraphicsCommandList* cmd, const 
             }
         }
         guard.unlock();
-        if (dlssg_queue) dlssg_layers(cmd, dlssg_back, dlssg_queue, generated >= 1 && generated < 8 ? generated : 1u);
+        if (dlssg_queue && capture_list) dlssg_layers(capture_list,dlssg_back,pre.slot?pre.slot->provider:dlssg_queue,
+                                                     generated>=1 && generated<8?generated:1u);
+        if (!pre.submit()) {
+            nr::asi::hudcap::dlssg_unfollowed(nr::frame_reuse::ngx_submit);
+            return real_evaluate(cmd,h,p,callback);
+        }
+        swap.apply();
+        const nr::asi::hudcap::DlssgHanded handed(swap.owns_inputs);
         return real_evaluate(cmd, h, p, callback);
     }
     if (t.feature != kFeatureSuperSampling && t.feature != kFeatureRayReconstruction) {
@@ -4299,7 +5108,9 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_evaluate(ID3D12GraphicsCommandList* cmd, const 
         return real_evaluate(cmd, h, p, callback);
     }
     Frame f;
-    if (!read_frame(p, t, f)) {
+    const bool inputs_ready = read_frame(p, t, f);
+    if (!inputs_ready) {
+        cut_reuse_guides(g_present.sets,h->Id);
         if (!t.said) {
             t.said = true;
             log("[nr] OptiScaler feature %u: no colour, output, depth or motion vectors in its evaluate; NR does not run",
@@ -4323,7 +5134,7 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_evaluate(ID3D12GraphicsCommandList* cmd, const 
     const bool renodx_only = std::all_of(chain->layers.begin(), chain->layers.end(), [](const Layer& l) {
         return l.cfg.processing == nr::pe::Processing::kRenoDX;
     });
-    if (renodx_only && nr::pe::screenshot::wants_final() && !g_present.wanted.load()) {
+    if (f.depth && renodx_only && nr::pe::screenshot::wants_final() && !g_present.wanted.load()) {
         // NR moves to the final picture until the screenshot has its pair (late_present); layers at Present take
         // the pair there (PresentShot)
         late_capture(cmd, device, f, st);
@@ -4354,6 +5165,7 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_evaluate(ID3D12GraphicsCommandList* cmd, const 
     const bool at_present = alive && !g_present.unusable.load(), at_present_w2 = alive && !g_present.unusable_w2.load();
     bool present_wanted = false, present_takes = false;   // Present layers at all; some run at Present now
     for (const Layer& l : chain->layers) {
+        if (refuse_reuse_placement(l)) continue;
         const bool wilsjo2 = l.cfg.processing == nr::pe::Processing::kWilsjo2;
         if (present_layer(l)) {
             present_wanted = true;
@@ -4362,6 +5174,7 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_evaluate(ID3D12GraphicsCommandList* cmd, const 
             else layer_note(l, 2, 3, "Present cannot serve this swap chain's colour format");
             continue;
         }
+        if (!f.depth) { layer_note(l, l.cfg.placement == nr::pe::Placement::kBefore ? 1 : 0, 3, "the game did not supply depth"); continue; }
         if (wilsjo2 && (f.out_x || f.out_y)) {
             layer_note(l, 0, 3, "the output is a region away from the corner");
             continue;
@@ -4380,9 +5193,11 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_evaluate(ID3D12GraphicsCommandList* cmd, const 
         for (const Layer& l : chain->layers)
             // (Passes (fast) Interleaved reads the depth itself - its anti-ghost's disocclusion test and vector
             // dilation - whatever the network does: without the copy those tests never ran at Present)
+            // (NRFrameReuse needs it too: its rebuilt frames' surface tests and the uncovered places)
             depth_wanted |= present_layer(l) && (l.cfg.processing == nr::pe::Processing::kWilsjo2 ||
                                                  (renodx_layer(l) && l.cfg.renodx.values.passes_mode == 1u &&
-                                                  l.cfg.renodx.values.fast_method == 0u));
+                                                  l.cfg.renodx.values.fast_method == 0u) ||
+                                                 (renodx_layer(l) && l.cfg.renodx.values.frame_reuse));
         capture_guides(cmd, device, f, st, wf, h->Id, depth_wanted);
     }
 
@@ -4407,7 +5222,7 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_evaluate(ID3D12GraphicsCommandList* cmd, const 
             d12_reads_in_place(device) &&
             rx == 0 && ry == 0 && uint64_t(rw) == cdesc.Width && rh == cdesc.Height &&
             !inspect_span(chain->inspect, before, after.empty() && !present_takes, &ia0, &ib0) &&
-            chosen_index(chain->inspect, before) < 0 && ensure_mirror(device, t.mirror, t.mirror_state, f.color);
+            chosen_index(chain->inspect, before) < 0 && ensure_mirror(device, t.mirror, t.mirror_state, f.color, true);
         if (before_direct) {
             if (t.copy) release_resource(t.copy);   // (made for frames that went the other way)
             transition(cmd, f.color, st.color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -4455,7 +5270,8 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_evaluate(ID3D12GraphicsCommandList* cmd, const 
             if (handed != f.color) { if (f.color_as_resource) p->Set(f.color_key, f.color); else p->Set(f.color_key, static_cast<void*>(f.color)); }
             goto after_layers;
         }
-        if (!ensure_texture(device, t.copy, t.copy_state, format, rw, rh)) {
+        const DXGI_FORMAT copy_fmt = writable(format);
+        if (!ensure_texture(device, t.copy, t.copy_state, copy_fmt, rw, rh)) {
             // the layers before the upscaler cannot run this frame: the upscaler and the layers after it still do
             // (0.0.7 ran its after-SR NR on its own)
             static bool said = false;
@@ -4473,7 +5289,7 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_evaluate(ID3D12GraphicsCommandList* cmd, const 
         // comparison then goes through the upscaler); a chosen layer's wherever it runs
         size_t ia = 0, ib = 0;
         const bool inspect = inspect_span(chain->inspect, before, after.empty() && !present_takes, &ia, &ib) &&
-                             inspect_format(format);
+                             inspect_format(copy_fmt);
         const long held = chosen_index(chain->inspect, before);
         const Frame live_frame = f; const States live_states = st; const auto live_wf = wf;
         for (size_t k = 0; k < before.size(); ++k) {
@@ -4500,9 +5316,12 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_evaluate(ID3D12GraphicsCommandList* cmd, const 
         }
         // Handed to the upscaler: the colour's mirror (its own size, format and flags), NR's answer copied into the
         // region at its own place, the subrect as the game gave it; without one, the region itself at base 0
+        // (an sRGB colour: our copy is its UNORM twin - the same bytes read as other values - so only the mirror in the
+        // colour's own format may go; without one the game's colour goes, this frame's layers before the upscaler lost)
         ID3D12Resource* copy = t.copy;
         bool moved = false;
-        if (ensure_mirror(device, t.mirror, t.mirror_state, f.color)) {
+        const bool srgb_colour = copy_fmt != format;
+        if (ensure_mirror(device, t.mirror, t.mirror_state, f.color, !srgb_colour)) {
             const D3D12_RESOURCE_DESC cd = f.color->GetDesc();
             transition(cmd, f.color, st.color, D3D12_RESOURCE_STATE_COPY_SOURCE);
             transition(cmd, t.mirror, t.mirror_state, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -4515,6 +5334,10 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_evaluate(ID3D12GraphicsCommandList* cmd, const 
             transition(cmd, t.mirror, D3D12_RESOURCE_STATE_COPY_DEST, st.color);
             t.mirror_state = st.color;
             copy = t.mirror;
+        } else if (srgb_colour) {
+            copy = f.color;
+            static bool said = false;
+            if (!said) { said = true; log("[nr] the sRGB colour's mirror could not be made; the layers before the upscaler skip such frames, the layers after it run"); }
         } else {
             transition(cmd, t.copy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, st.color);
             t.copy_state = st.color;
@@ -4634,12 +5457,29 @@ struct SeenDevice {
     bool present_fences = false;
     bool translator = false;   // made by vkd3d-proton or DXVK (a D3D device's, e.g. OptiScaler's own D3D12 one)
 };
+// Module whose NVSDK_NGX_VULKAN_Init* call we saw directly (fallback for older RTX Remix without remixapi exports).
+std::atomic<HMODULE> g_ngx_vk_client{nullptr};
+// Fast export check so RTX Remix's Vulkan-backed d3d9.dll (which exposes remixapi_*) is recognized at device creation
+// and frame 0 without ever relaxing ordinary DXVK d3d9.dll / translator blocking.
+bool is_rtx_remix_module(HMODULE m) {
+    if (!m) return false;
+    return GetProcAddress(m, "remixapi_InitializeLibrary") != nullptr ||
+           GetProcAddress(m, "writeRemixCategoriesSchemaUsda") != nullptr ||
+           GetProcAddress(m, "remixinternal_GetNrcStatus") != nullptr ||
+           GetProcAddress(m, "RtxSentryShutdown") != nullptr;
+}
+bool is_vulkan_ngx_engine(HMODULE m) {
+    if (!m) return false;
+    const HMODULE client = g_ngx_vk_client.load(std::memory_order_acquire);
+    return (client && m == client) || is_rtx_remix_module(m);
+}
 // Whether `address` (a vkCreateDevice caller) is in vkd3d-proton's or DXVK's modules.
 bool in_translator(void* address) {
     HMODULE m = nullptr;
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                             reinterpret_cast<LPCWSTR>(address), &m) || !m)
         return false;
+    if (is_vulkan_ngx_engine(m)) return false;
     for (const wchar_t* name : {L"d3d12core.dll", L"d3d12.dll", L"d3d11.dll", L"dxgi.dll", L"d3d10core.dll", L"d3d9.dll"})
         if (HMODULE t = GetModuleHandleW(name); t && t == m) return true;
     return false;
@@ -4666,15 +5506,22 @@ using PFN_VkInitProject = NVSDK_NGX_Result(NR_NGX_MSABI*)(const char*, int, cons
 // the chaos / fallback gate NR_TEST_DEVICE_UNSEEN found NR not running.)
 PFN_VkInit real_vk_init[3] = {};
 PFN_VkInitProject real_vk_init_project[2] = {};
-void note_ngx_vk(VkInstance instance, VkPhysicalDevice physical, VkDevice device) {
+void note_ngx_vk(VkInstance instance, VkPhysicalDevice physical, VkDevice device, void* caller = nullptr) {
     if (!instance || !physical || !device) return;
+    if (caller) {
+        HMODULE cm = nullptr;
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCWSTR>(caller), &cm) &&
+            cm && cm != g_opti && cm != g_self)
+            g_ngx_vk_client.store(cm, std::memory_order_release);
+    }
     std::lock_guard<std::mutex> guard(g_devices_lock);
     g_ngx_vk.instance = instance; g_ngx_vk.physical = physical; g_ngx_vk.device = device;
 }
 template <int K>
 NVSDK_NGX_Result NR_NGX_MSABI hk_vk_init(unsigned long long app, const wchar_t* path, VkInstance instance, VkPhysicalDevice physical,
                                         VkDevice device, uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d) {
-    note_ngx_vk(instance, physical, device);
+    note_ngx_vk(instance, physical, device, __builtin_return_address(0));
     return real_vk_init[K](app, path, instance, physical, device, a, b, c, d);
 }
 template <int K>
@@ -4682,7 +5529,7 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_vk_init_project(const char* project, int engine
                                                 VkInstance instance, VkPhysicalDevice physical, VkDevice device, uintptr_t a,
                                                 uintptr_t b, uintptr_t c, uintptr_t d) {
     g_ngx_engine.store(engine);
-    note_ngx_vk(instance, physical, device);
+    note_ngx_vk(instance, physical, device, __builtin_return_address(0));
     return real_vk_init_project[K](project, engine, version, path, instance, physical, device, a, b, c, d);
 }
 
@@ -4700,11 +5547,35 @@ bool int4_wanted() {
 // A native Vulkan game calls winevulkan.dll's exported vkCreateDevice (through vulkan-1.dll) rather than asking
 // vkGetInstanceProcAddr: that export is detoured too, its instance found from the physical device
 // (vkEnumeratePhysicalDevices' export detoured, which instance listed it). A call that came through the wrapped
-// pointer and reaches the export goes straight on (t_in_create).
+// pointer and reaches the export goes straight on (t_in_create / t_in_create_instance / t_in_destroy_instance /
+// t_in_enum_phys).
+PFN_vkCreateInstance real_export_create_instance = nullptr;
+PFN_vkDestroyInstance real_export_destroy_instance = nullptr;
 PFN_vkCreateDevice real_export_create = nullptr;
 PFN_vkEnumeratePhysicalDevices real_enumerate_physical = nullptr;
+std::atomic<PFN_vkCreateInstance> g_next_create_instance{nullptr};
+std::atomic<PFN_vkDestroyInstance> g_next_destroy_instance{nullptr};
+std::atomic<PFN_vkEnumeratePhysicalDevices> g_next_enum_phys{nullptr};
 std::unordered_map<VkPhysicalDevice, VkInstance> g_physical_instance;   // g_devices_lock
+std::unordered_map<VkInstance, PFN_vkDestroyInstance> g_instance_destroy_procs;   // g_devices_lock
+std::unordered_map<VkInstance, PFN_vkEnumeratePhysicalDevices> g_instance_enum_phys_procs;   // g_devices_lock
 thread_local int t_in_create = 0;
+thread_local int t_in_create_instance = 0;
+thread_local int t_in_destroy_instance = 0;
+thread_local int t_in_enum_phys = 0;
+
+void forget_asi_instance(VkInstance instance) {
+    if (!instance) return;
+    nr::pe::vkdevice::forget_instance(instance);
+    VkInstance expected = instance;
+    g_create_instance.compare_exchange_strong(expected, VK_NULL_HANDLE, std::memory_order_acq_rel);
+    std::lock_guard<std::mutex> guard(g_devices_lock);
+    g_instance_destroy_procs.erase(instance);
+    g_instance_enum_phys_procs.erase(instance);
+    for (auto it = g_physical_instance.begin(); it != g_physical_instance.end();)
+        if (it->second == instance) it = g_physical_instance.erase(it);
+        else ++it;
+}
 
 VkResult create_device(PFN_vkCreateDevice create, VkInstance instance, VkPhysicalDevice phys, const VkDeviceCreateInfo* ci,
                        const VkAllocationCallbacks* a, VkDevice* out, void* caller) {
@@ -4712,6 +5583,15 @@ VkResult create_device(PFN_vkCreateDevice create, VkInstance instance, VkPhysica
     struct Inside { Inside() { ++t_in_create; } ~Inside() { --t_in_create; } } inside;
     // The bridge's own device (nr_pe_bridge.hpp) is not the game's: passed straight through, unrecorded.
     if (nr::pe::bridge::creating_device()) return create(phys, ci, a, out);
+    if (instance && phys) {
+        bool known = false;
+        {
+            std::lock_guard<std::mutex> guard(g_devices_lock);
+            known = g_physical_instance.find(phys) != g_physical_instance.end();
+            if (!known) g_physical_instance[phys] = instance;
+        }
+        if (!known) nr::pe::vkdevice::note_physical_devices(instance, 1, &phys);
+    }
     // The network's extensions and features (cooperative matrices, FP8, the explicit workgroup memory layout) and ACO
     // Mode's pipeline binaries: the AMD Windows driver wants them enabled on the device the network runs on.
     bool added = false;
@@ -4776,18 +5656,122 @@ VKAPI_ATTR void VKAPI_CALL hk_destroy_device(VkDevice device, const VkAllocation
     real_destroy_device(device, a);
 }
 
-VKAPI_ATTR VkResult VKAPI_CALL hk_enumerate_physical(VkInstance instance, uint32_t* n, VkPhysicalDevice* list) {
-    const VkResult r = real_enumerate_physical(instance, n, list);
-    if ((r == VK_SUCCESS || r == VK_INCOMPLETE) && list && n) {
+VkResult create_instance_common(PFN_vkCreateInstance create, const VkInstanceCreateInfo* ci,
+                                const VkAllocationCallbacks* a, VkInstance* out) {
+    struct Inside { Inside() { ++t_in_create_instance; } ~Inside() { --t_in_create_instance; } } inside;
+    const VkResult r = create(ci, a, out);
+    if (r == VK_SUCCESS && out && *out && !nr::pe::bridge::creating_device())
+        nr::pe::vkdevice::note_instance(*out, ci);
+    return r;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL hk_export_create_instance(const VkInstanceCreateInfo* ci,
+                                                         const VkAllocationCallbacks* a, VkInstance* out) {
+    if (t_in_create_instance) return real_export_create_instance(ci, a, out);
+    return create_instance_common(real_export_create_instance, ci, a, out);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL hk_gipa_create_instance(const VkInstanceCreateInfo* ci,
+                                                       const VkAllocationCallbacks* a, VkInstance* out) {
+    PFN_vkCreateInstance next = g_next_create_instance.load(std::memory_order_acquire);
+    if (!next) next = real_export_create_instance;
+    if (!next) return VK_ERROR_INITIALIZATION_FAILED;
+    if (t_in_create_instance) return next(ci, a, out);
+    return create_instance_common(next, ci, a, out);
+}
+
+void destroy_instance_common(PFN_vkDestroyInstance destroy, VkInstance instance, const VkAllocationCallbacks* a) {
+    struct Inside { Inside() { ++t_in_destroy_instance; } ~Inside() { --t_in_destroy_instance; } } inside;
+    if (instance && !nr::pe::bridge::creating_device()) forget_asi_instance(instance);
+    destroy(instance, a);
+}
+
+VKAPI_ATTR void VKAPI_CALL hk_export_destroy_instance(VkInstance instance, const VkAllocationCallbacks* a) {
+    if (t_in_destroy_instance) {
+        real_export_destroy_instance(instance, a);
+        return;
+    }
+    destroy_instance_common(real_export_destroy_instance, instance, a);
+}
+
+VKAPI_ATTR void VKAPI_CALL hk_gipa_destroy_instance(VkInstance instance, const VkAllocationCallbacks* a) {
+    PFN_vkDestroyInstance next = nullptr;
+    if (instance) {
         std::lock_guard<std::mutex> guard(g_devices_lock);
-        for (uint32_t i = 0; i < *n; ++i) g_physical_instance[list[i]] = instance;
+        if (const auto it = g_instance_destroy_procs.find(instance); it != g_instance_destroy_procs.end()) {
+            next = it->second;
+            g_instance_destroy_procs.erase(it);
+        }
+    }
+    if (!next) next = g_next_destroy_instance.load(std::memory_order_acquire);
+    if (!next) next = real_export_destroy_instance;
+    if (!next) return;
+    if (t_in_destroy_instance) {
+        next(instance, a);
+        return;
+    }
+    destroy_instance_common(next, instance, a);
+}
+
+VkResult enumerate_physical_common(PFN_vkEnumeratePhysicalDevices enumerate, VkInstance instance, uint32_t* n,
+                                   VkPhysicalDevice* list) {
+    struct Inside { Inside() { ++t_in_enum_phys; } ~Inside() { --t_in_enum_phys; } } inside;
+    const VkResult r = enumerate(instance, n, list);
+    if ((r == VK_SUCCESS || r == VK_INCOMPLETE) && instance && list && n && !nr::pe::bridge::creating_device()) {
+        nr::pe::vkdevice::note_physical_devices(instance, *n, list);
+        std::lock_guard<std::mutex> guard(g_devices_lock);
+        for (uint32_t i = 0; i < *n; ++i)
+            if (list[i] != VK_NULL_HANDLE) g_physical_instance[list[i]] = instance;
     }
     return r;
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL hk_enumerate_physical(VkInstance instance, uint32_t* n, VkPhysicalDevice* list) {
+    if (t_in_enum_phys) return real_enumerate_physical(instance, n, list);
+    return enumerate_physical_common(real_enumerate_physical, instance, n, list);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL hk_gipa_enumerate_physical(VkInstance instance, uint32_t* n, VkPhysicalDevice* list) {
+    PFN_vkEnumeratePhysicalDevices next = nullptr;
+    if (instance) {
+        std::lock_guard<std::mutex> guard(g_devices_lock);
+        if (const auto it = g_instance_enum_phys_procs.find(instance); it != g_instance_enum_phys_procs.end())
+            next = it->second;
+    }
+    if (!next) next = g_next_enum_phys.load(std::memory_order_acquire);
+    if (!next) next = real_enumerate_physical;
+    if (!next) return VK_ERROR_INITIALIZATION_FAILED;
+    if (t_in_enum_phys) return next(instance, n, list);
+    return enumerate_physical_common(next, instance, n, list);
+}
+
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL hk_gipa(VkInstance instance, const char* name) {
     const PFN_vkVoidFunction f = real_gipa(instance, name);
-    if (f && name && !std::strcmp(name, "vkCreateDevice")) {
+    if (!f || !name) return f;
+    if (!std::strcmp(name, "vkCreateInstance")) {
+        if (f == reinterpret_cast<PFN_vkVoidFunction>(&hk_gipa_create_instance)) return f;
+        g_next_create_instance.store(reinterpret_cast<PFN_vkCreateInstance>(f), std::memory_order_release);
+        return reinterpret_cast<PFN_vkVoidFunction>(&hk_gipa_create_instance);
+    }
+    if (!std::strcmp(name, "vkDestroyInstance")) {
+        if (f == reinterpret_cast<PFN_vkVoidFunction>(&hk_gipa_destroy_instance)) return f;
+        if (instance) {
+            std::lock_guard<std::mutex> guard(g_devices_lock);
+            g_instance_destroy_procs[instance] = reinterpret_cast<PFN_vkDestroyInstance>(f);
+        }
+        g_next_destroy_instance.store(reinterpret_cast<PFN_vkDestroyInstance>(f), std::memory_order_release);
+        return reinterpret_cast<PFN_vkVoidFunction>(&hk_gipa_destroy_instance);
+    }
+    if (!std::strcmp(name, "vkEnumeratePhysicalDevices")) {
+        if (f == reinterpret_cast<PFN_vkVoidFunction>(&hk_gipa_enumerate_physical)) return f;
+        if (instance) {
+            std::lock_guard<std::mutex> guard(g_devices_lock);
+            g_instance_enum_phys_procs[instance] = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(f);
+        }
+        g_next_enum_phys.store(reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(f), std::memory_order_release);
+        return reinterpret_cast<PFN_vkVoidFunction>(&hk_gipa_enumerate_physical);
+    }
+    if (!std::strcmp(name, "vkCreateDevice")) {
         g_next_create_device.store(reinterpret_cast<PFN_vkCreateDevice>(f));
         if (instance) g_create_instance.store(instance);
         return reinterpret_cast<PFN_vkVoidFunction>(&hk_create_device);
@@ -4839,40 +5823,56 @@ void hook_device_creation() {
         log("[nr] no vulkan-1.dll in the process yet: a D3D game (NR runs on a Vulkan device of its own)");
         return;
     }
-    g_enumerate = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
-        reinterpret_cast<void*>(GetProcAddress(m, "vkEnumerateDeviceExtensionProperties")));
-    g_features2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
-        reinterpret_cast<void*>(GetProcAddress(m, "vkGetPhysicalDeviceFeatures2")));
-    void* gipa = reinterpret_cast<void*>(GetProcAddress(m, "vkGetInstanceProcAddr"));
-    if (!gipa || MH_CreateHook(gipa, reinterpret_cast<void*>(&hk_gipa), reinterpret_cast<void**>(&real_gipa)) != MH_OK ||
-        MH_EnableHook(gipa) != MH_OK)
-        log("[nr] vulkan-1.dll's vkGetInstanceProcAddr could not be hooked: the network's device features are "
-            "not added");
-    void* create = reinterpret_cast<void*>(GetProcAddress(m, "vkCreateDevice"));
-    void* enumerate = reinterpret_cast<void*>(GetProcAddress(m, "vkEnumeratePhysicalDevices"));
-    void* destroy = reinterpret_cast<void*>(GetProcAddress(m, "vkDestroyDevice"));
-    g_destroy_hooked = destroy && MH_CreateHook(destroy, reinterpret_cast<void*>(&hk_destroy_device),
-                                                reinterpret_cast<void**>(&real_destroy_device)) == MH_OK &&
-                       MH_EnableHook(destroy) == MH_OK;
-    if (!g_destroy_hooked)
-        log("[nr] vulkan-1.dll's vkDestroyDevice could not be hooked: NR does not run on Vulkan games (its objects "
-            "would outlive the game's device)");
-    if (!create || !enumerate ||
-        MH_CreateHook(enumerate, reinterpret_cast<void*>(&hk_enumerate_physical),
-                      reinterpret_cast<void**>(&real_enumerate_physical)) != MH_OK ||
-        MH_EnableHook(enumerate) != MH_OK ||
-        MH_CreateHook(create, reinterpret_cast<void*>(&hk_export_create_device), reinterpret_cast<void**>(&real_export_create)) != MH_OK ||
-        MH_EnableHook(create) != MH_OK)
-        log("[nr] vulkan-1.dll's exported vkCreateDevice could not be hooked: a Vulkan game calling it directly gets no "
-            "int4 extensions and no NR");
-    // the game's queues (optional: without them a present queue the device's creation did not show is looked up
-    // as before)
-    for (auto [name, detour, real] : {std::tuple{"vkGetDeviceQueue", reinterpret_cast<void*>(&hk_get_queue), reinterpret_cast<void**>(&real_get_queue)},
-                                      std::tuple{"vkGetDeviceQueue2", reinterpret_cast<void*>(&hk_get_queue2), reinterpret_cast<void**>(&real_get_queue2)}}) {
-        void* fn = reinterpret_cast<void*>(GetProcAddress(m, name));
-        if (!fn || MH_CreateHook(fn, detour, real) != MH_OK || MH_EnableHook(fn) != MH_OK)
-            log("[nr] vulkan-1.dll's %s could not be hooked: the game's queues are known from its vkCreateDevice only", name);
-    }
+    static std::once_flag once;
+    std::call_once(once, [m] {
+        g_enumerate = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
+            reinterpret_cast<void*>(GetProcAddress(m, "vkEnumerateDeviceExtensionProperties")));
+        g_features2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
+            reinterpret_cast<void*>(GetProcAddress(m, "vkGetPhysicalDeviceFeatures2")));
+        void* gipa = reinterpret_cast<void*>(GetProcAddress(m, "vkGetInstanceProcAddr"));
+        if (!gipa || MH_CreateHook(gipa, reinterpret_cast<void*>(&hk_gipa), reinterpret_cast<void**>(&real_gipa)) != MH_OK ||
+            MH_EnableHook(gipa) != MH_OK)
+            log("[nr] vulkan-1.dll's vkGetInstanceProcAddr could not be hooked: the network's device features are "
+                "not added");
+        void* create_inst = reinterpret_cast<void*>(GetProcAddress(m, "vkCreateInstance"));
+        void* destroy_inst = reinterpret_cast<void*>(GetProcAddress(m, "vkDestroyInstance"));
+        if (!create_inst ||
+            MH_CreateHook(create_inst, reinterpret_cast<void*>(&hk_export_create_instance),
+                          reinterpret_cast<void**>(&real_export_create_instance)) != MH_OK ||
+            MH_EnableHook(create_inst) != MH_OK)
+            log("[nr] vulkan-1.dll's vkCreateInstance could not be hooked: instance API version falls back to "
+                "physical device inference");
+        if (!destroy_inst ||
+            MH_CreateHook(destroy_inst, reinterpret_cast<void*>(&hk_export_destroy_instance),
+                          reinterpret_cast<void**>(&real_export_destroy_instance)) != MH_OK ||
+            MH_EnableHook(destroy_inst) != MH_OK)
+            log("[nr] vulkan-1.dll's vkDestroyInstance could not be hooked: destroyed instance records may linger");
+        void* create = reinterpret_cast<void*>(GetProcAddress(m, "vkCreateDevice"));
+        void* enumerate = reinterpret_cast<void*>(GetProcAddress(m, "vkEnumeratePhysicalDevices"));
+        void* destroy = reinterpret_cast<void*>(GetProcAddress(m, "vkDestroyDevice"));
+        g_destroy_hooked = destroy && MH_CreateHook(destroy, reinterpret_cast<void*>(&hk_destroy_device),
+                                                    reinterpret_cast<void**>(&real_destroy_device)) == MH_OK &&
+                           MH_EnableHook(destroy) == MH_OK;
+        if (!g_destroy_hooked)
+            log("[nr] vulkan-1.dll's vkDestroyDevice could not be hooked: NR does not run on Vulkan games (its objects "
+                "would outlive the game's device)");
+        if (!create || !enumerate ||
+            MH_CreateHook(enumerate, reinterpret_cast<void*>(&hk_enumerate_physical),
+                          reinterpret_cast<void**>(&real_enumerate_physical)) != MH_OK ||
+            MH_EnableHook(enumerate) != MH_OK ||
+            MH_CreateHook(create, reinterpret_cast<void*>(&hk_export_create_device), reinterpret_cast<void**>(&real_export_create)) != MH_OK ||
+            MH_EnableHook(create) != MH_OK)
+            log("[nr] vulkan-1.dll's exported vkCreateDevice could not be hooked: a Vulkan game calling it directly gets no "
+                "int4 extensions and no NR");
+        // the game's queues (optional: without them a present queue the device's creation did not show is looked up
+        // as before)
+        for (auto [name, detour, real] : {std::tuple{"vkGetDeviceQueue", reinterpret_cast<void*>(&hk_get_queue), reinterpret_cast<void**>(&real_get_queue)},
+                                          std::tuple{"vkGetDeviceQueue2", reinterpret_cast<void*>(&hk_get_queue2), reinterpret_cast<void**>(&real_get_queue2)}}) {
+            void* fn = reinterpret_cast<void*>(GetProcAddress(m, name));
+            if (!fn || MH_CreateHook(fn, detour, real) != MH_OK || MH_EnableHook(fn) != MH_OK)
+                log("[nr] vulkan-1.dll's %s could not be hooked: the game's queues are known from its vkCreateDevice only", name);
+        }
+    });
 }
 
 // ---- Vulkan games --------------------------------------------------------------------------------------------------
@@ -5466,11 +6466,14 @@ bool vk_route_ready(VkDevice wanted) {
 }
 
 struct VkLayerState {
+    OwnImage pq[3];
+    uint32_t pq_index = 0;
     nr::pe::Processing processing = nr::pe::Processing::kRenoDX;
     Feature* nr[2] = {};                    // the model's feature for each placement: 0 after, 1 before
     nr::asi::Wilsjo2VkOwner* w2[2] = {};    // wilsjo2: its state for each placement
 };
 void vk_layer_release(VkLayerState& l) {
+    for (auto& p : l.pq) retire_image(p);
     for (Feature*& f : l.nr)
         if (f) { nr::dlssnr::release_vk(f); f = nullptr; }
     for (nr::asi::Wilsjo2VkOwner*& o : l.w2)
@@ -5497,6 +6500,13 @@ struct VkFrame {
 };
 
 struct VkTracked {
+    OwnImage tool_input[3];
+    nr::frame_pair::History tool_history;
+    void clear_tool_inputs() {
+        if (!tool_history.width) return;
+        for (auto& input : tool_input) retire_image(input);
+        tool_history = {};
+    }
     OwnImage hold_guides[3];
     VkFrame hold_input;
     nr::asi::Wilsjo2VkFrame hold_w2;
@@ -5530,6 +6540,7 @@ void vk_forget(VkTracked& t) {
     retire_image(t.out_copy);
     for (auto& im : t.guides) retire_image(im);
     retire_image(t.out_whole);
+    t.clear_tool_inputs();
     retire_image(t.inspect_off);
     retire_image(t.inspect_on);
     retire_image(t.hold);
@@ -5700,7 +6711,9 @@ bool read_vk_frame(const NVSDK_NGX_Parameter* p, const VkTracked& t, VkFrame& f)
     f.depth = vk_resource(p, "Depth", "DLSSD.Depth");
     f.motion = vk_resource(p, "MotionVectors", "DLSSD.MotionVectors");
     f.exposure = vk_resource(p, "ExposureTexture", nullptr);
-    for (const NVSDK_NGX_Resource_VK* r : {f.color, f.output, f.depth, f.motion})
+    if (!f.depth && !reuse_needs_vectors_only()) return false;
+    if (f.depth && (f.depth->Type != NVSDK_NGX_RESOURCE_VK_TYPE_VK_IMAGEVIEW || !f.depth->Resource.ImageViewInfo.Image)) return false;
+    for (const NVSDK_NGX_Resource_VK* r : {f.color, f.output, f.motion})
         if (!r || r->Type != NVSDK_NGX_RESOURCE_VK_TYPE_VK_IMAGEVIEW || !r->Resource.ImageViewInfo.Image) return false;
     if (f.exposure && (f.exposure->Type != NVSDK_NGX_RESOURCE_VK_TYPE_VK_IMAGEVIEW || !f.exposure->Resource.ImageViewInfo.Image))
         f.exposure = nullptr;
@@ -5815,6 +6828,7 @@ nr::asi::Wilsjo2VkImage w2_image(const NVSDK_NGX_Resource_VK* r, VkImageLayout l
     return out;
 }
 Rect vk_guide_subrect(const NVSDK_NGX_Resource_VK* r, uint32_t want_w, uint32_t want_h, uint32_t x, uint32_t y) {
+    if (!r) return {};
     const uint32_t aw = r->Resource.ImageViewInfo.Width, ah = r->Resource.ImageViewInfo.Height;
     Rect out;
     out.x = std::min(x, aw);
@@ -5937,6 +6951,7 @@ void plan_layers_vk(VkTracked& t, const VkFrame& f, bool nr_on, const char* who,
     // layers run at the game's present only (never here).
     const bool w2_before_ok = wilsjo2_vk_before_ok(f, &plan.w2_aw, &plan.w2_ah);
     for (const Layer& l : chain->layers) {
+        if (refuse_reuse_placement(l)) continue;
         const bool wilsjo2 = l.cfg.processing == nr::pe::Processing::kWilsjo2;
         if (present_layer(l)) {
             plan.present = true;
@@ -5944,6 +6959,7 @@ void plan_layers_vk(VkTracked& t, const VkFrame& f, bool nr_on, const char* who,
             else layer_note(l, 2, 3, "waits for a Present of the game's");
             continue;
         }
+        if (!f.depth) { layer_note(l, l.cfg.placement == nr::pe::Placement::kBefore ? 1 : 0, 3, "the game did not supply depth"); continue; }
         if (wilsjo2 && (f.out_x || f.out_y)) {
             layer_note(l, 0, 3, "the output is a region away from the corner");
             continue;
@@ -6060,8 +7076,8 @@ nr::asi::Wilsjo2VkImage w2_of(const OwnImage& im) {
 // After the compared layers: `frame` (GENERAL) shown as [Inspect] asks - the frame before them (ApplyModel off), or
 // the comparison of before (t.inspect_off, taken by vk_inspect_copy) and now.
 void vk_inspect_show(VkCommandBuffer cmd, const nr::pe::InspectConfig& ic, VkTracked& t, VkImage frame, VkFormat format,
-                     uint32_t w, uint32_t h) {
-    OwnImage& off = t.inspect_off;
+                     uint32_t w, uint32_t h, OwnImage* paired = nullptr) {
+    OwnImage& off = paired ? *paired : t.inspect_off;
     if (!off.image || off.format != format || off.width != w || off.height != h) return;
     if (!ic.apply_model) {
         vk_barrier(cmd, off.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
@@ -6233,6 +7249,7 @@ void run_before_one(VkCommandBuffer cmd, VkTracked& t, const Layer& layer, const
 // These presents are the game's own (before OptiScaler's frame generation, where it has one): one game frame
 // a present, so no cadence (D3D12's present_layers counts DLSS-G's generated presents; none reach these).
 struct VkGuideSet {
+    uint32_t feature=0;
     nr::dlssnr::VkImageRef depth, motion;   // as the present reads them (filled by the route before the run)
     nr::asi::Wilsjo2VkFrame w2;             // the wilsjo2 view (its depth / motion = the images above)
     Rect depth_rect, motion_rect;
@@ -6244,6 +7261,7 @@ struct VkGuideSet {
     uint32_t out_w = 0, out_h = 0;          // the upscaler's output
 };
 struct VkPresentLayer {
+    uint8_t input_age=0;
     uint32_t w = 0, h = 0;                  // RenoDX: its feature's extent
     bool real_guides = false;
     uint64_t consumed = 0, consumed_present = 0;
@@ -6253,7 +7271,7 @@ struct VkPresentPath {
     const char* who = "";                   // the games, for the log
     VkTracked vk;                           // the layers' features (nr[0], w2[0]) and the [Inspect] images
     std::map<int, VkPresentLayer> layers;
-    VkGuideSet sets[kPresentGuideSets];
+    std::vector<VkGuideSet> sets = std::vector<VkGuideSet>(kPresentGuideSets);
     uint64_t presents = 0, serial = 0, chain_version = 0;
     OwnImage frame, hudless;                // this swap chain's copies
     OwnImage stage;                         // the blits' way in and out of an *_SRGB swap chain (its UNORM twin)
@@ -6261,6 +7279,20 @@ struct VkPresentPath {
     bool said_xfer = false;
     OwnImage linear, encoded;               // wilsjo2's HDR10 finished picture (as D3D12's)
     // HUD FIX (hudfix.comp): the frame before the layers and the counts (R32_UINT, kHudStatsW x kHudStatsH)
+    struct HudInput {
+        OwnImage back, clean, stats;
+        uint64_t tick=0, version=0;
+    };
+    HudInput hud_inputs[3];
+    uint64_t guide_history[3]{};
+    uint64_t hud_tick=0;
+    void clear_hud_inputs() {
+        for (auto& slot : hud_inputs) {
+            retire_image(slot.back); retire_image(slot.clean); retire_image(slot.stats);
+            slot={};
+        }
+        std::fill_n(guide_history,3,0); hud_tick=0;
+    }
     OwnImage hud_back, hud_stats;
     bool hud_said = false;
     std::atomic<bool> wanted{false};        // the chain has Present layers (evaluates copy guides)
@@ -6288,13 +7320,24 @@ bool vk_present_alive(const VkPresentPath& P) { return GetTickCount64() - P.serv
 
 // The oldest set no present still reads (the route's command buffers are ordered on one queue: none is), for a new
 // capture; its serial etc. set by the caller once the copies are recorded.
-VkGuideSet& vk_guide_slot(VkPresentPath& P) {
-    VkGuideSet* t = &P.sets[0];
-    for (VkGuideSet& s : P.sets)
-        if (s.serial < t->serial) t = &s;
-    return *t;
+// A swap chain can be one or two Presents behind another on the same Vulkan device.
+template<class Retained>
+size_t oldest_free_guide(const VkPresentPath& path, Retained retained) {
+    size_t oldest = path.sets.size();
+    for (size_t i = 0; i < path.sets.size(); ++i) {
+        const uint64_t serial = path.sets[i].serial;
+        if (!serial) return i;
+        if (!retained(serial) && (oldest == path.sets.size() || serial < path.sets[oldest].serial))
+            oldest = i;
+    }
+    return oldest;
 }
-void vk_guide_stamp(VkPresentPath& P, VkGuideSet& g, const VkFrame& f) {
+bool holds_guide(const VkPresentPath& path, uint64_t serial) {
+    const auto& history = path.guide_history;
+    return std::find(std::begin(history), std::end(history), serial) != std::end(history);
+}
+void vk_guide_stamp(VkPresentPath& P, VkGuideSet& g, const VkFrame& f,uint32_t feature) {
+    g.feature=feature;
     g.depth_rect = f.depth_rect;
     g.motion_rect = f.motion_rect;
     g.inverted = (f.flags & kFlagDepthInverted) != 0;
@@ -6312,6 +7355,10 @@ std::vector<const Layer*> vk_present_plan(VkPresentPath& P, const std::shared_pt
     for (const Layer& l : chain->layers)
         if (present_layer(l)) layers.push_back(&l);
     P.wanted = !layers.empty();
+    if (P.hud_tick && std::none_of(layers.begin(),layers.end(),[](const Layer* l){return delayed_layer(*l);})) P.clear_hud_inputs();
+    if (P.vk.tool_history.width &&
+        (layers.empty() || (!chain->inspect.compare && chain->inspect.apply_model && !nr::pe::screenshot::wants_final())))
+        P.vk.clear_tool_inputs();
     if (P.chain_version != chain->version) {
         P.chain_version = chain->version;
         for (auto it = P.vk.layers.begin(); it != P.vk.layers.end();) {
@@ -6331,24 +7378,27 @@ struct VkPresentRun { const Layer* layer; uint32_t encoding; float white; };
 // The back buffer's (or swap-chain image's) encodings, in DXGI's terms (as present_layers on D3D12): RenoDX's by present_encoding, wilsjo2's finished
 // picture 1 SDR, 2 PQ, 3 scRGB, 0 refused - an 8-bit BGRA back buffer taken as its RGBA twin (the stage
 // writes it through a view of its own format).
-uint32_t w2_present_encoding(int space, bool space_set, DXGI_FORMAT format) {
+uint32_t w2_present_encoding(int space, bool space_set, DXGI_FORMAT format,bool extended_sdr) {
     const int s = space_set ? space
                             : int(format == DXGI_FORMAT_R16G16B16A16_FLOAT ? DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
                                                                           : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
     const bool b8or10 = format == DXGI_FORMAT_R8G8B8A8_UNORM || format == DXGI_FORMAT_B8G8R8A8_UNORM ||
                         format == DXGI_FORMAT_R10G10B10A2_UNORM;
+    if (extended_sdr && s==DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709 &&
+        (format==DXGI_FORMAT_R16G16B16A16_FLOAT || format==DXGI_FORMAT_R16G16B16A16_UNORM || format==DXGI_FORMAT_R11G11B10_FLOAT)) return 1;
     return s == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709 ? (format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 3u : 0u)
            : s == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ? (b8or10 ? 2u : 0u)
-           : s == DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709 ? (b8or10 ? 1u : 0u) : 0u;
+           : s == DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709 ? ((b8or10 || format == DXGI_FORMAT_R16G16B16A16_FLOAT || format == DXGI_FORMAT_R11G11B10_FLOAT) ? 1u : 0u) : 0u;
 }
 
 // The runs for `layers` on a back buffer of this encoding (rows of the refused ones say so).
 std::vector<VkPresentRun> present_runs(const std::vector<const Layer*>& layers, int space, bool space_set,
                                        DXGI_FORMAT format, float windows_white, bool plain, bool* unusable) {
     std::vector<VkPresentRun> runs;
-    const uint32_t w2e = plain ? w2_present_encoding(space, space_set, format) : 0u;
+    const uint32_t w2_default=plain?w2_present_encoding(space,space_set,format):0;
     for (const Layer* l : layers) {
         if (!renodx_layer(*l)) {
+            const uint32_t w2e=w2_default?w2_default:plain && l->w2.frame_reuse?w2_present_encoding(space,space_set,format,true):0;
             if (w2e) runs.push_back({l, w2e, 203.0f});
             else layer_note(*l, 2, 3, "Present cannot serve this swap chain's colour format (wilsjo2)");
             continue;
@@ -6358,6 +7408,7 @@ std::vector<VkPresentRun> present_runs(const std::vector<const Layer*>& layers, 
         if (!e) {
             *unusable = true;
             layer_note(*l, 2, 3, "Present cannot serve this swap chain's colour format");
+            if(reuse_layer(*l))nr::pe::control::layer_reuse_failed(row_number(*l),nr::frame_reuse::unsupported_format);
             continue;
         }
         runs.push_back({l, e, e == 1u ? 0.f : present_white_of(rs, windows_white)});
@@ -6399,21 +7450,21 @@ bool vk_hud_begin(VkCommandBuffer cmd, VkPresentPath& P, VkImage frame, VkFormat
     return true;
 }
 // After the layers: the composition into `frame`.
-void vk_hud_end(VkCommandBuffer cmd, VkPresentPath& P, const nr::pe::HudFixConfig& hud, VkImage frame, VkFormat format,
+void vk_hud_end(VkCommandBuffer cmd, OwnImage& back, OwnImage& stats, const nr::pe::HudFixConfig& hud, VkImage frame, VkFormat format,
                 uint32_t w, uint32_t h, const VkHudless& hl) {
     nr::asi::HudFixVkImages im;
-    im.back = w2_of(P.hud_back);
-    im.stats = w2_of(P.hud_stats);
+    im.back = w2_of(back);
+    im.stats = w2_of(stats);
     im.frame.image = frame; im.frame.format = format; im.frame.width = w; im.frame.height = h;
     im.frame.layout = VK_IMAGE_LAYOUT_GENERAL;
     im.hudless = hl.image;
     if (!nr::asi::hudfix_vk(cmd, im, w, h, 2u, hud.show_mask)) {
         if (hl.image.image) {   // the layers ran on the copy without the HUD: the frame as the game drew it goes back
-            vk_barrier(cmd, P.hud_back.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            vk_barrier(cmd, back.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
             vk_barrier(cmd, frame, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-            vk_copy(cmd, P.hud_back.image, 0, 0, frame, 0, 0, w, h);
+            vk_copy(cmd, back.image, 0, 0, frame, 0, 0, w, h);
             vk_barrier(cmd, frame, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
-            vk_barrier(cmd, P.hud_back.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+            vk_barrier(cmd, back.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
         }
         nr::pe::control::hud_facts("nothing this frame: its composition could not be recorded", nullptr, nullptr, nullptr);
     }
@@ -6444,19 +7495,62 @@ bool vk_present_run(VkCommandBuffer cmd, VkPresentPath& P, const std::shared_ptr
     // whatever reads the frame before the first layer (F5's pair, HUD FIX, a comparison, a held frame), or a first
     // layer that is not RenoDX: the picture copied in now
     if (from && (nr::pe::screenshot::wants_final() || hudless.image.image ||
-                 runs.empty() || !renodx_layer(*runs.front().layer) || chain->inspect.compare || chain->inspect.hold))
+                 runs.empty() || !renodx_layer(*runs.front().layer) || reuse_layer(*runs.front().layer) || chain->inspect.compare || chain->inspect.hold))
         fill_frame();
     namespace route = nr::pe::renodx_route;
     // HUD FIX: the frame before the layers kept; the composition after the last of them (before a final-picture
     // comparison shows it)
+    std::vector<const Layer*> run_layers;
+    for (const VkPresentRun& r : runs) run_layers.push_back(r.layer);
+    size_t ia = 0, ib = 0;
+    const bool inspect = inspect_span(chain->inspect, run_layers, true, &ia, &ib);
+    const long held = chosen_index(chain->inspect, run_layers);
+    const bool want_shot = nr::pe::screenshot::wants_final();
+    // F5 / Compare with a delayed layer in the compared span: paired by tags (as on D3D12, its notes)
+    const size_t pair_from = inspect ? ia : 0;
+    const bool delayed_span = !runs.empty() && std::any_of(run_layers.begin() + pair_from,
+        run_layers.begin() + (want_shot ? runs.size() : ib + 1), [](const Layer* l) { return delayed_layer(*l); });
+    const bool pair_tools = (want_shot || inspect) && !chain->hud.mode && (!inspect || !want_shot || ia == 0) && delayed_span;
+    const bool defer_shot = want_shot && chain->hud.mode && !runs.empty() &&
+                            std::any_of(run_layers.begin(), run_layers.end(), [](const Layer* l) { return delayed_layer(*l); });
+    // (defer_shot too: a stage's own screenshot - the session's, Direct's - is not taken mid-chain while this one waits)
+    nr::frame_pair::Observation pair(pair_tools || defer_shot);
+    bool pair_copy_failed = false;
+    if (!pair_tools) P.vk.clear_tool_inputs();
+    const bool compare_before_hud = inspect && chain->inspect.layer == 0 && chain->hud.mode != 0;
+    if (compare_before_hud) {
+        fill_frame();
+        vk_inspect_copy(cmd, P.vk.inspect_off, frame, format, w, h);
+    }
     bool shot_chain = false;
-    if (nr::pe::screenshot::wants_final() && !runs.empty())
+    if (want_shot && !pair_tools && !defer_shot && !runs.empty())
         nr::dlssnr::with_vk_session([&](nr::pe::Session& s) {
             const uint8_t hdr = runs.front().encoding == 2 ? 2 : runs.front().encoding == 1 ? 0 : 1;
             shot_chain = s.capture_begin(cmd, frame, format, w, h, VK_IMAGE_LAYOUT_GENERAL, hdr, "present");
         });
     const bool hud = hudless.image.image && !runs.empty() &&
                      vk_hud_begin(cmd, P, frame, format, w, h, hudless);
+    nr::frame_pair::PresentAge age; age.publish=&nr::pe::Session::publish_delay;
+    age.terminal_chain=terminal_chain(*chain,run_layers);
+    age.version=chain->version;
+    age.multiple=chain->layers.size()>1;
+    age.interleaved_conflict=std::any_of(chain->layers.begin(),chain->layers.end(),[](const Layer& l){
+        return renodx_layer(l)?l.cfg.renodx.values.passes_mode==1 && l.cfg.renodx.values.fast_method==0
+                              :l.w2.passes_mode==1 && l.w2.fast_method==0;
+    });
+    age.isolate_chain=age.multiple && !age.terminal_chain && delayed_present_runs(chain->layers,age.interleaved_conflict)==1;
+    group_reuse(age,run_layers);
+    const bool watch_age = std::any_of(run_layers.begin(),run_layers.end(),[](const Layer* l){return delayed_layer(*l);});
+    const uint64_t tick=watch_age?++P.hud_tick:0;
+    auto& current=P.hud_inputs[tick%3];
+    current.tick=0;
+    if (watch_age && hud) {
+        const bool saved=vk_inspect_copy(cmd,current.back,P.hud_back.image,format,w,h) &&
+                         vk_inspect_copy(cmd,current.clean,frame,format,w,h) &&
+                         vk_inspect_copy(cmd,current.stats,P.hud_stats.image,VK_FORMAT_R32_UINT,kHudStatsW,kHudStatsH);
+        if (saved) { current.tick=tick; current.version=chain->version; }
+        nr::pe::Session::note_hud_fix(!saved);
+    } else nr::pe::Session::note_hud_fix(false);
     const ULONGLONG now = GetTickCount64();
     const auto fresh = [&](const VkGuideSet& gs) {
         return gs.serial && aspect_matches(gs.out_w, gs.out_h, w, h) &&
@@ -6465,6 +7559,7 @@ bool vk_present_run(VkCommandBuffer cmd, VkPresentPath& P, const std::shared_ptr
     VkGuideSet* guides = nullptr;
     for (VkGuideSet& gs : P.sets)
         if (fresh(gs) && (!guides || gs.serial > guides->serial)) guides = &gs;
+    P.guide_history[tick%3]=age.isolate_chain && guides?guides->serial:0;
     nr::dlssnr::VkImageRef target;
     target.image = uint64_t(reinterpret_cast<uintptr_t>(frame));
     target.format = uint32_t(format); target.width = w; target.height = h;
@@ -6475,14 +7570,19 @@ bool vk_present_run(VkCommandBuffer cmd, VkPresentPath& P, const std::shared_ptr
     w2_target.image = frame; w2_target.format = format; w2_target.width = w; w2_target.height = h;
     w2_target.layout = VK_IMAGE_LAYOUT_GENERAL;
     w2_target.usage = VkImageUsageFlags(target.usage);
-    std::vector<const Layer*> run_layers;
-    for (const VkPresentRun& r : runs) run_layers.push_back(r.layer);
-    size_t ia = 0, ib = 0;
-    const bool inspect = inspect_span(chain->inspect, run_layers, true, &ia, &ib);
-    const long held = chosen_index(chain->inspect, run_layers);
     if (held < 0 && P.vk.held) { g_hold_released.insert(P.vk.hold_layer); P.vk.held = false; }
     bool ran = false;
     for (size_t k = 0; k < runs.size(); ++k) {
+        age.in_group=k>=age.group_first && k<age.group_first+age.group_size;
+        age.group_index=age.in_group?unsigned(k-age.group_first):0;
+        age.before_terminal=k+1<runs.size();
+        age.isolated_layer=age.isolate_chain && (age.in_group || reuse_layer(*runs[k].layer));
+        auto* shown_guides=guides;
+        if (age.frames) {
+            shown_guides=nullptr;
+            const uint64_t wanted=P.guide_history[(tick+3-age.frames)%3];
+            if (wanted) for (auto& gs : P.sets) if (gs.serial==wanted) { shown_guides=&gs; break; }
+        }
         VkPresentRun run = runs[k];
         const bool holding = long(k) == held && chain->inspect.hold;
         const Layer& layer = *run.layer;
@@ -6521,8 +7621,18 @@ bool vk_present_run(VkCommandBuffer cmd, VkPresentPath& P, const std::shared_ptr
         };
 
         if (k > 0) fill_frame();
-        if (inspect && k == ia) vk_inspect_copy(cmd, P.vk.inspect_off, frame, format, w, h);
+        if (pair_tools && k == pair_from) {
+            fill_frame();
+            auto& history = P.vk.tool_history;
+            const int slot = history.begin(w, h, uint32_t(format), inspect);
+            if (slot >= 0) {
+                pair_copy_failed = !vk_inspect_copy(cmd, P.vk.tool_input[slot], frame, format, w, h);
+                history.tags[slot] = pair_copy_failed ? 0 : pair.output;   // (the picture coming into the span)
+            }
+        } else if (inspect && k == ia && !compare_before_hud)
+            vk_inspect_copy(cmd, P.vk.inspect_off, frame, format, w, h);
         VkPresentLayer& pl = P.layers[layer.cfg.number];
+        const bool age_changed=pl.input_age!=age.frames; pl.input_age=uint8_t(age.frames);
         VkLayerState& ls = P.vk.layers[layer.cfg.number];
         ls.processing = layer.cfg.processing;
         [&] {
@@ -6538,8 +7648,10 @@ bool vk_present_run(VkCommandBuffer cmd, VkPresentPath& P, const std::shared_ptr
                         continue;
                     g = &gs;
                 }
+                if (age.frames) g=shown_guides;
                 if (!g && holding && hi.hold_inputs_ready) g = frozen(nullptr, hi.hold_w2);
                 if (!g) {
+                    if (layer.w2.frame_reuse) {pl.w2_reset=true;no_reuse_motion(layer);return;}
                     if (pl.consumed && P.presents - pl.consumed_present <= 2u) return;   // one capture, one run
                     pl.w2_reset = true;
                     layer_note(layer, 2, 3, "waits for a recent game frame of the back buffer's aspect ratio");
@@ -6552,7 +7664,7 @@ bool vk_present_run(VkCommandBuffer cmd, VkPresentPath& P, const std::shared_ptr
                 wf.hdr = run.encoding != 1;
                 wf.pre_exposure = 1.0f;
                 if (auto* h = frozen(g, wf); h == &held_set) wf = h->w2;
-                wf.reset = wf.reset || pl.w2_reset || hold_released(row_number(layer));
+                wf.reset = wf.reset || age_changed || pl.w2_reset || hold_released(row_number(layer));
                 nr::wilsjo2::Settings ws = layer.w2;
                 if (wf.hdr) { ws.white_point_scale = 203.0f / 80.0f; ws.white_point_source = 0; }
                 if (!ls.w2[0]) { ls.w2[0] = nr::asi::wilsjo2_vk_owner(); nr::asi::wilsjo2_vk_owner_at_present(*ls.w2[0]); }
@@ -6560,7 +7672,15 @@ bool vk_present_run(VkCommandBuffer cmd, VkPresentPath& P, const std::shared_ptr
                 route::CallLayer number(row_number(layer));
                 layer_note(layer, 2, 3, "not recorded yet");   // before the run: the model's word during it stays (as on D3D12)
                 bool done = false;
-                if (run.encoding == 2) {   // PQ: through linear BT.709 scRGB and back
+                const bool park_pq = run.encoding == 2 && ws.frame_reuse && !age.gathering();
+                const unsigned frames_before = age.frames;   // (as on D3D12)
+                if (!park_pq && ls.pq[0].image) { for (auto& p : ls.pq) retire_image(p); ls.pq_index = 0; }
+                if (park_pq && !vk_inspect_copy(cmd, ls.pq[ls.pq_index], frame, format, w, h)) {
+                    pl.w2_reset = true;
+                    layer_note(layer, 2, 3, "Frame reuse could not save the HDR10 picture");
+                    return;
+                }
+                if (run.encoding == 2 && !age.gathering()) {   // grouped wilsjo2 converts its own computed anchor
                     if (ensure_image(P.linear, VK_FORMAT_R16G16B16A16_SFLOAT, w, h) && ensure_image(P.encoded, format, w, h)) {
                         for (OwnImage* im : {&P.linear, &P.encoded})
                             if (im->layout != VK_IMAGE_LAYOUT_GENERAL) {
@@ -6568,8 +7688,11 @@ bool vk_present_run(VkCommandBuffer cmd, VkPresentPath& P, const std::shared_ptr
                                 im->layout = VK_IMAGE_LAYOUT_GENERAL;
                             }
                         if (nr::asi::wilsjo2_convert_vk(cmd, w2_target, nullptr, w2_of(P.linear), w, h, true) &&
-                            nr::asi::wilsjo2_run_vk(cmd, *ls.w2[0], wf, ws, w2_of(P.linear), w, h, false) &&
-                            nr::asi::wilsjo2_convert_vk(cmd, w2_of(P.linear), &w2_target, w2_of(P.encoded), w, h, false)) {
+                            nr::asi::wilsjo2_run_vk(cmd, *ls.w2[0], wf, ws, w2_of(P.linear), w, h, false) && [&] {
+                                const uint32_t lag = park_pq ? std::min<uint32_t>(age.frames - frames_before, 2u) : 0u;
+                                const auto source = park_pq ? w2_of(ls.pq[(ls.pq_index + 3 - lag) % 3]) : w2_target;
+                                return nr::asi::wilsjo2_convert_vk(cmd, w2_of(P.linear), &source, w2_of(P.encoded), w, h, false);
+                            }()) {
                             vk_barrier(cmd, P.encoded.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
                             vk_barrier(cmd, frame, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
                             vk_copy(cmd, P.encoded.image, 0, 0, frame, 0, 0, w, h);
@@ -6581,18 +7704,22 @@ bool vk_present_run(VkCommandBuffer cmd, VkPresentPath& P, const std::shared_ptr
                 } else {
                     done = nr::asi::wilsjo2_run_vk(cmd, *ls.w2[0], wf, ws, w2_target, w, h, false);
                 }
+                if (park_pq && done) ls.pq_index = (ls.pq_index + 1) % 3;
                 pl.w2_reset = !done;
+                if (done && age.gathering() && !layer.w2.frame_reuse && !g->depth.image)   // (as on D3D12)
+                    layer_note(layer, 2, 3, "waits for the game's depth");
                 if (!done) layer_note(layer, 2, 3, "its run could not be recorded (see the log)");
                 ran |= done;
                 return;
             }
             const nr::renodx::Settings& rs = layer.cfg.renodx.values;
             // NRPresentGuides: 2 never the game's; 1 required (none: this layer leaves the frame alone); 0 optional
-            VkGuideSet* g = rs.present_guides == 2u ? nullptr : guides;
+            VkGuideSet* g = rs.present_guides == 2u ? nullptr : shown_guides;
             auto hw = g ? g->w2 : nr::asi::Wilsjo2VkFrame{};
             hw.exposure = {};
             g = frozen(g, hw);
             if (!g && rs.present_guides == 1u) {
+            if (rs.frame_reuse) {pl.real_guides=false;no_reuse_motion(layer);return;}
                 layer_note(layer, 2, 3, "waits for the game's depth and motion (NRPresentGuides)");
                 return;
             }
@@ -6611,7 +7738,7 @@ bool vk_present_run(VkCommandBuffer cmd, VkPresentPath& P, const std::shared_ptr
                 pl.w = w; pl.h = h;
             }
             layer_note(layer, 2, 3, "not recorded yet");
-            bool reset = (new_frame && g->reset) || hold_released(row_number(layer));   // the game's Reset: its frame's first present only
+            bool reset = age_changed || (new_frame && g->reset) || hold_released(row_number(layer));   // the game's Reset: its frame's first present only
             if ((g != nullptr) != pl.real_guides) { pl.real_guides = g != nullptr; reset = true; }
             route::Frame rf;
             rf.present = run.encoding;
@@ -6637,8 +7764,47 @@ bool vk_present_run(VkCommandBuffer cmd, VkPresentPath& P, const std::shared_ptr
             if (g) pl.consumed = g->serial;
             ran |= recorded_run;
         }();
-        if (hud && k + 1 == runs.size()) vk_hud_end(cmd, P, chain->hud, frame, format, w, h, hudless);
-        if (inspect && k == ib) vk_inspect_show(cmd, chain->inspect, P.vk, frame, format, w, h);
+        if (age.gathering() && age.group_index+1==age.group_size)
+            for(unsigned i=0;i<age.group_size;++i) if(reuse_layer(*run_layers[age.group_first+i]))
+                nr::pe::control::layer_reuse_group(row_number(*run_layers[age.group_first+i]),age.group_written,age.group_share,age.group_reason.c_str());
+        if (k + 1 == runs.size()) {
+            if (!age.frames && hud) vk_hud_end(cmd,P.hud_back,P.hud_stats,chain->hud,frame,format,w,h,hudless);
+            else if (watch_age && age.frames && age.frames<=2 && tick>age.frames) {
+                auto& old=P.hud_inputs[(tick-age.frames)%3];
+                if (old.tick==tick-age.frames && old.version==chain->version && old.back.format==format &&
+                    old.back.width==w && old.back.height==h)
+                    vk_hud_end(cmd,old.back,old.stats,chain->hud,frame,format,w,h,VkHudless{w2_of(old.clean)});
+            }
+        }
+        if (inspect && k == ib) {
+            const int slot = P.vk.tool_history.find(pair.output);
+            if (pair_tools && slot >= 0)
+                vk_inspect_show(cmd, chain->inspect, P.vk, frame, format, w, h, &P.vk.tool_input[slot]);
+            else if (!pair_tools && compare_before_hud && age.frames) {   // HUD FIX, the picture late: its own frame
+                auto& old = P.hud_inputs[(tick - age.frames) % 3];
+                if (tick > age.frames && old.tick == tick - age.frames && old.version == chain->version)
+                    vk_inspect_show(cmd, chain->inspect, P.vk, frame, format, w, h, &old.back);
+            } else if (!pair_tools)
+                vk_inspect_show(cmd, chain->inspect, P.vk, frame, format, w, h);
+        }
+    }
+    if (defer_shot && ran) {   // HUD FIX with a delayed layer: the shown frame as the game drew it, saved at its Present
+        auto& old = P.hud_inputs[(tick - age.frames) % 3];
+        if (tick >= age.frames && old.tick == tick - age.frames && old.version == chain->version && old.back.image &&
+            old.back.format == format && old.back.width == w && old.back.height == h)
+            nr::dlssnr::with_vk_session([&](nr::pe::Session& s) {
+                const uint8_t hdr = runs.front().encoding == 2 ? 2 : runs.front().encoding == 1 ? 0 : 1;
+                shot_chain = s.capture_begin(cmd, old.back.image, format, w, h, old.back.layout, hdr, "present");
+            });
+    }   // (none saved: the request waits for a frame that has it)
+    if (pair_tools && want_shot && ran) {
+        const int slot = P.vk.tool_history.find(pair.output);
+        if (slot >= 0) nr::dlssnr::with_vk_session([&](nr::pe::Session& s) {
+            const uint8_t hdr = runs[0].encoding == 2 ? 2 : runs[0].encoding == 1 ? 0 : 1;
+            shot_chain = s.capture_begin(cmd, P.vk.tool_input[slot].image, format, w, h, VK_IMAGE_LAYOUT_GENERAL, hdr, "present");
+        });
+        else if (pair_copy_failed)
+            nr::pe::screenshot::fail("allocation_failed", "the readback buffers could not be allocated");
     }
     if (shot_chain) nr::dlssnr::with_vk_session([&](nr::pe::Session& s) {
         if (ran) s.capture_end(cmd, frame, VK_IMAGE_LAYOUT_GENERAL); else s.capture_abort();
@@ -6732,7 +7898,7 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_create_swapchain(VkDevice device, const VkSwap
         GetProcAddress(GetModuleHandleW(L"vulkan-1.dll"), "vkGetPhysicalDeviceSurfaceCapabilitiesKHR")));
     if (physical && surface_caps && surface_caps(physical, ci->surface, &caps) == VK_SUCCESS)
         c.imageUsage |= caps.supportedUsageFlags & (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                                                       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+                                                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
     VkResult r = real_create_swapchain(device, &c, a, out);
     if (r != VK_SUCCESS && c.imageUsage != ci->imageUsage) {   // as the game asked, rather than none
         c = *ci;
@@ -6821,24 +7987,38 @@ bool game_caller(void* address) {
         g_game_present_ms = now;
         return true;
     };
-    if (m == last) return served(last_game, last_wrapper);
-    bool game = m != g_opti && m != g_self && !in_translator(address), wrapper = false;
-    if (game) {
-        wchar_t path[MAX_PATH] = {};
-        GetModuleFileNameW(m, path, MAX_PATH);
-        std::wstring name = path;
-        const size_t slash = name.find_last_of(L"\\/");
-        if (slash != std::wstring::npos) name = name.substr(slash + 1);
-        for (wchar_t& c : name) c = wchar_t(std::towlower(c));
-        // by name too: DXVK's / vkd3d-proton's DLLs share their names with OptiScaler's proxy (in_translator finds the
-        // first module of a name only)
-        for (const wchar_t* not_game : {L"fidelityfx", L"ffx", L"sl.", L"nvngx", L"libxess", L"vulkan-1", L"dxgi", L"d3d9",
-                                        L"d3d10", L"d3d11", L"d3d12", L"dxvk", L"vkd3d"})
-            if (name.find(not_game) != std::wstring::npos) game = false;
-        if (!game) {   // a frame generator's or Streamline's only (not a translator's name): may be the game's path
-            wrapper = true;
-            for (const wchar_t* translator : {L"vulkan-1", L"dxgi", L"d3d9", L"d3d10", L"d3d11", L"d3d12", L"dxvk", L"vkd3d"})
-                if (name.find(translator) != std::wstring::npos) wrapper = false;
+    if (m == last && (last_game || m != g_ngx_vk_client.load(std::memory_order_relaxed)))
+        return served(last_game, last_wrapper);
+    const bool vk_ngx_engine = (m != g_opti && m != g_self) && is_vulkan_ngx_engine(m);
+    bool game = false, wrapper = false;
+    if (vk_ngx_engine) {
+        game = true;
+        static std::atomic<HMODULE> logged_ngx_engine{nullptr};
+        if (logged_ngx_engine.exchange(m, std::memory_order_relaxed) != m) {
+            wchar_t path[MAX_PATH] = {};
+            GetModuleFileNameW(m, path, MAX_PATH);
+            log("[nr] Vulkan presents: RTX Remix / Vulkan-NGX module %s accepted as the game's present path",
+                nr::u8::narrow(path).c_str());
+        }
+    } else {
+        game = m != g_opti && m != g_self && !in_translator(address);
+        if (game) {
+            wchar_t path[MAX_PATH] = {};
+            GetModuleFileNameW(m, path, MAX_PATH);
+            std::wstring name = path;
+            const size_t slash = name.find_last_of(L"\\/");
+            if (slash != std::wstring::npos) name = name.substr(slash + 1);
+            for (wchar_t& c : name) c = wchar_t(std::towlower(c));
+            // by name too: DXVK's / vkd3d-proton's DLLs share their names with OptiScaler's proxy (in_translator finds the
+            // first module of a name only)
+            for (const wchar_t* not_game : {L"fidelityfx", L"ffx", L"sl.", L"nvngx", L"libxess", L"vulkan-1", L"dxgi", L"d3d9",
+                                            L"d3d10", L"d3d11", L"d3d12", L"dxvk", L"vkd3d"})
+                if (name.find(not_game) != std::wstring::npos) game = false;
+            if (!game) {   // a frame generator's or Streamline's only (not a translator's name): may be the game's path
+                wrapper = true;
+                for (const wchar_t* translator : {L"vulkan-1", L"dxgi", L"d3d9", L"d3d10", L"d3d11", L"d3d12", L"dxvk", L"vkd3d"})
+                    if (name.find(translator) != std::wstring::npos) wrapper = false;
+            }
         }
     }
     last = m;
@@ -6879,7 +8059,7 @@ bool vk_ring_done_through(uint64_t submission) {
 }
 OwnImage g_vk_frame;       // the swap-chain image's copy the layers run on
 OwnImage g_vk_hudless;     // HUD FIX's capture: the swap-chain image as it was before the game's HUD (GENERAL)
-OwnImage g_vk_guides[kPresentGuideSets][2];   // [set][0 depth, 1 motion]: the evaluates' copies
+std::vector<std::array<OwnImage, 2>> g_vk_guides(kPresentGuideSets);   // [set][0 depth, 1 motion]: the evaluates' copies
 
 // `device_going`: the device is destroyed next (vk_present_forget, after vk_route_teardown idled it) - the ring goes
 // whatever its wait says, no handle of that device is kept.
@@ -7241,7 +8421,7 @@ const VkPresentInfoKHR* vk_present_one(VkQueue queue, const VkPresentInfoKHR* in
     }
     VkPresentPath& P = *rec.path;
     P.presents = g_vk_present.presents;
-    for (size_t i = 0; i < kPresentGuideSets; ++i) P.sets[i] = g_vk_present.sets[i];
+    P.sets = g_vk_present.sets;
     tick_vk_retired();
     nr::asi::wilsjo2_vk_tick();
     const std::shared_ptr<const Chain> chain = chain_now();
@@ -7405,23 +8585,43 @@ const VkPresentInfoKHR* vk_present_one(VkQueue queue, const VkPresentInfoKHR* in
     g_native_uses.touch();
     if (bridge && !copy_bridge) ownership(cmd, image, present_family, nr_family, true);
     const VkImageLayout frame_layout_was = P.frame.layout, stage_layout_was = P.stage.layout;
-    vk_barrier(cmd, pic, pic_rest, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-    vk_barrier(cmd, P.frame.image, P.frame.layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    if (direct) {
-        vk_copy(cmd, pic, 0, 0, P.frame.image, 0, 0, w, h);
-    } else {   // (the blits: the swap chain's picture, through its UNORM twin for *_SRGB, into the wider frame)
-        VkImage from = pic;
-        if (via_stage) {
-            vk_barrier(cmd, P.stage.image, P.stage.layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-            vk_copy(cmd, pic, 0, 0, P.stage.image, 0, 0, w, h);
-            vk_barrier(cmd, P.stage.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-            P.stage.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-            from = P.stage.image;
+    static const bool read_back_off = [] { const char* e = std::getenv("NR_PRESENT_READ_BACK"); return e && e[0] == '0'; }();
+    const bool read_back = !read_back_off && direct && !copy_bridge && rec.format == own_twin &&
+                           (rec.usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
+                           vk_format_has(rec.format, VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) &&
+                           !runs.empty() && renodx_layer(*runs.front().layer);
+    const VkImageLayout pic_now = read_back ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    nr::dlssnr::VkImageRef back_ref{};
+    if (read_back) {
+        vk_barrier(cmd, pic, pic_rest, pic_now);
+        if (P.frame.layout != VK_IMAGE_LAYOUT_GENERAL)
+            vk_barrier(cmd, P.frame.image, P.frame.layout, VK_IMAGE_LAYOUT_GENERAL);
+        P.frame.layout = VK_IMAGE_LAYOUT_GENERAL;
+        back_ref.image = uint64_t(reinterpret_cast<uintptr_t>(pic));
+        back_ref.format = uint32_t(rec.format);
+        back_ref.width = w;
+        back_ref.height = h;
+        back_ref.layout = uint32_t(pic_now);
+        back_ref.usage = uint32_t(rec.usage);
+    } else {
+        vk_barrier(cmd, pic, pic_rest, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        vk_barrier(cmd, P.frame.image, P.frame.layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        if (direct) {
+            vk_copy(cmd, pic, 0, 0, P.frame.image, 0, 0, w, h);
+        } else {   // (the blits: the swap chain's picture, through its UNORM twin for *_SRGB, into the wider frame)
+            VkImage from = pic;
+            if (via_stage) {
+                vk_barrier(cmd, P.stage.image, P.stage.layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                vk_copy(cmd, pic, 0, 0, P.stage.image, 0, 0, w, h);
+                vk_barrier(cmd, P.stage.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+                P.stage.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                from = P.stage.image;
+            }
+            vk_blit(cmd, from, P.frame.image, w, h);
         }
-        vk_blit(cmd, from, P.frame.image, w, h);
+        vk_barrier(cmd, P.frame.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+        P.frame.layout = VK_IMAGE_LAYOUT_GENERAL;
     }
-    vk_barrier(cmd, P.frame.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
-    P.frame.layout = VK_IMAGE_LAYOUT_GENERAL;
     // HUD FIX's capture: armed for Auto and Captured (only where the swap chain's images can be copied: it copies from
     // them in the game's command buffers), copying into P.hudless - made GENERAL here, before the game's next
     // command buffers (they run after this one) copy into it; its verdict on this frame
@@ -7449,10 +8649,12 @@ const VkPresentInfoKHR* vk_present_one(VkQueue queue, const VkPresentInfoKHR* in
     if (hud_captured) {
         hudless.image = w2_of(P.hudless);
     }
-    const bool changed = vk_present_run(cmd, P, chain, runs, P.frame.image, ff, w, h, hudless);
-    if (changed) {
+    bool filled = !read_back;
+    const bool changed = vk_present_run(cmd, P, chain, runs, P.frame.image, ff, w, h, hudless,
+                                        read_back ? &back_ref : nullptr, &filled);
+    if (changed && filled) {
         vk_barrier(cmd, P.frame.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-        vk_barrier(cmd, pic, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        vk_barrier(cmd, pic, pic_now, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         if (direct) {
             vk_copy(cmd, P.frame.image, 0, 0, pic, 0, 0, w, h);
         } else if (via_stage) {
@@ -7467,7 +8669,7 @@ const VkPresentInfoKHR* vk_present_one(VkQueue queue, const VkPresentInfoKHR* in
         vk_barrier(cmd, pic, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, pic_rest);
         vk_barrier(cmd, P.frame.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
     } else {
-        vk_barrier(cmd, pic, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, pic_rest);
+        vk_barrier(cmd, pic, pic_now, pic_rest);
     }
     const uint32_t bpp = rec.format == VK_FORMAT_R16G16B16A16_SFLOAT ? 8u : 4u;
     const bool dump = g_vk_dump.wanted() && g_vk_dump.ensure(R.device, VkDeviceSize(w) * h * bpp);
@@ -7619,6 +8821,7 @@ const VkPresentInfoKHR* vk_present_layers(VkQueue queue, const VkPresentInfoKHR*
 
 void retire_present_path(VkPresentPath& P) {
     vk_forget(P.vk); P.layers.clear();
+    P.clear_hud_inputs();
     for (OwnImage* im : {&P.frame, &P.stage, &P.xfer, &P.hudless, &P.linear, &P.encoded, &P.hud_back, &P.hud_stats})
         retire_image(*im);
     for (auto& set : P.sets) set = VkGuideSet{};
@@ -7632,6 +8835,7 @@ void vk_present_forget() {
     for (VkGuideSet& g : P.sets) g = VkGuideSet{};
     retire_image(P.linear);
     retire_image(P.encoded);
+    P.clear_hud_inputs();
     for (OwnImage* im : {&P.hud_back, &P.hud_stats}) retire_image(*im);
     retire_image(g_vk_frame);
     retire_image(g_vk_hudless);
@@ -7648,17 +8852,31 @@ void vk_present_forget() {
 
 // At a Vulkan evaluate while the chain has Present layers: its depth and motion copied (in the game's command buffer,
 // before the upscaler) into the oldest guide set, kept SHADER_READ_ONLY_OPTIMAL.
-void vk_capture_guides(VkCommandBuffer cmd, const VkFrame& f, const nr::asi::Wilsjo2VkFrame& wf) {
+void vk_capture_guides(VkCommandBuffer cmd, const VkFrame& f, const nr::asi::Wilsjo2VkFrame& wf,uint32_t feature) {
     VkPresentPath& P = g_vk_present;
-    VkGuideSet& g = vk_guide_slot(P);
-    const size_t k = size_t(&g - P.sets);
+    size_t k;
+    {
+        std::lock_guard<std::mutex> lock(g_swap_lock);
+        k = oldest_free_guide(P, [](uint64_t serial) {
+            return std::any_of(g_swaps.begin(), g_swaps.end(), [serial](const auto& entry) {
+                return entry.second.path && holds_guide(*entry.second.path, serial);
+            });
+        });
+    }
+    if (k == P.sets.size()) {
+        g_vk_guides.resize(k + 1);
+        P.sets.emplace_back();
+    }
+    auto& g = P.sets[k];
     const NVSDK_NGX_Resource_VK* src[2] = {f.depth, f.motion};
     const VkImageLayout layout[2] = {f.depth_layout, f.motion_layout};
     for (int i = 0; i < 2; ++i) {
+        if (!src[i]) continue;
         const auto& v = src[i]->Resource.ImageViewInfo;
         if (!ensure_image(g_vk_guides[k][i], VkFormat(v.Format), v.Width, v.Height, true)) { g.serial = 0; return; }
     }
     for (int i = 0; i < 2; ++i) {
+        if (!src[i]) continue;
         const auto& v = src[i]->Resource.ImageViewInfo;
         OwnImage& im = g_vk_guides[k][i];
         const VkFormat fmt = VkFormat(v.Format);
@@ -7689,7 +8907,7 @@ void vk_capture_guides(VkCommandBuffer cmd, const VkFrame& f, const nr::asi::Wil
         barrier(im.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         im.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     }
-    vk_guide_stamp(P, g, f);
+    vk_guide_stamp(P, g, f,feature);
     const auto ref = [](const OwnImage& im) {
         nr::dlssnr::VkImageRef r;
         r.image = uint64_t(reinterpret_cast<uintptr_t>(im.image));
@@ -7698,10 +8916,11 @@ void vk_capture_guides(VkCommandBuffer cmd, const VkFrame& f, const nr::asi::Wil
         r.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         return r;
     };
-    g.depth = ref(g_vk_guides[k][0]);
+    g.depth = f.depth ? ref(g_vk_guides[k][0]) : nr::dlssnr::VkImageRef{};
     g.motion = ref(g_vk_guides[k][1]);
     g.w2 = wf;
     for (int i = 0; i < 2; ++i) {
+        if (!src[i]) continue;
         nr::asi::Wilsjo2VkImage& wi = i ? g.w2.motion : g.w2.depth;
         const OwnImage& im = g_vk_guides[k][i];
         wi.image = im.image; wi.format = im.format; wi.width = im.width; wi.height = im.height;
@@ -7899,7 +9118,9 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_vk_evaluate(VkCommandBuffer cmd, const NVSDK_NG
         return real_vk_evaluate(cmd, h, p, callback);
     }
     VkFrame f;
-    if (!read_vk_frame(p, t, f)) {
+    const bool inputs_ready = read_vk_frame(p, t, f);
+    if (!inputs_ready) {
+        cut_reuse_guides(g_vk_present.sets,h->Id);
         if (!t.said) {
             t.said = true;
             log("[nr] OptiScaler Vulkan feature %u: no colour, output, depth or motion vector image in its evaluate; NR "
@@ -7936,7 +9157,7 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_vk_evaluate(VkCommandBuffer cmd, const NVSDK_NG
     }
     const nr::asi::Wilsjo2VkFrame wf = wilsjo2_vk_frame(p, f);
     if (plan.present) {
-        vk_capture_guides(cmd, f, wf);
+        vk_capture_guides(cmd, f, wf,h->Id);
         if (g_front.load() == 0) decide_front(VK_NULL_HANDLE);   // the game may present through an address of its own
     }
     ++g_fg_frames;
@@ -8062,12 +9283,14 @@ void tick_d11_retired() {
 struct D11Tracked {
     VkTracked vk;                         // the layers' states (the Vulkan route's)
     ID3D11Texture2D* copy = nullptr;      // the colour's region, before the upscaler
+    ID3D11Texture2D* mirror = nullptr;    // _SRGB twin back for the upscaler when colour is _SRGB
 };
 std::unordered_map<uint32_t, D11Tracked> g_d11_features;   // g_lock
 
 void d11_forget(D11Tracked& t) {
     vk_forget(t.vk);
     retire_texture(t.copy);
+    retire_texture(t.mirror);
 }
 
 bool d11_route_release(const char* why);
@@ -8281,13 +9504,17 @@ VkCommandBuffer d11_begin() {
 }
 // Submitted after everything the game's context has recorded so far. False when it was not (the frame then goes on
 // without what was recorded: an in-place change of ours never ran).
+std::string g_d11_submit_reason;   // under g_lock, the most recent actual submit failure
 bool d11_submit(VkCommandBuffer cmd) {
     const int s = g_d11.slot;
     g_d11.recording = false;
     if (g_d11.bdev) {
         bool ran = false;
         std::function<bool()> done;
-        nr::dlssnr::with_vk_session([&](nr::pe::Session& se) { ran = se.bridge11_submit(&done); });
+        nr::dlssnr::with_vk_session([&](nr::pe::Session& se) {
+            ran = se.bridge11_submit(&done);
+            g_d11_submit_reason = ran ? std::string{} : se.status();
+        });
         if (const auto t = nr::gpu::find(cmd)) t->submitted(done);
         g_d11.job_cmd = VK_NULL_HANDLE;
         if (!ran) discard_session_timing();
@@ -8423,13 +9650,16 @@ bool d11_clone(ID3D11Texture2D*& copy, ID3D11Resource* src) {
 
 // At a D3D11 evaluate while the chain has Present layers: its depth and motion copied (by the game's context, before
 // the upscaler) into the oldest guide set.
-void d11_capture_guides(ID3D11DeviceContext* ctx, const D11Image& depth, const D11Image& motion, const VkFrame& f) {
-    VkGuideSet& g = vk_guide_slot(g_d11_present);
-    const size_t k = size_t(&g - g_d11_present.sets);
-    if (!d11_clone(g_d11_guides[k][0], depth.res) || !d11_clone(g_d11_guides[k][1], motion.res)) { g.serial = 0; return; }
-    ctx->CopyResource(g_d11_guides[k][0], depth.res);
+void d11_capture_guides(ID3D11DeviceContext* ctx, const D11Image& depth, const D11Image& motion, const VkFrame& f,uint32_t feature) {
+    // This D3D11 path retains at most three serials.
+    static_assert(kPresentGuideSets > 3);
+    const size_t k = oldest_free_guide(g_d11_present, [](uint64_t serial) { return holds_guide(g_d11_present, serial); });
+    auto& g = g_d11_present.sets[k];
+    if (!depth.res && g_d11_guides[k][0]) retire_texture(g_d11_guides[k][0]);
+    if ((depth.res && !d11_clone(g_d11_guides[k][0], depth.res)) || !d11_clone(g_d11_guides[k][1], motion.res)) { g.serial = 0; return; }
+    if (depth.res) ctx->CopyResource(g_d11_guides[k][0], depth.res);
     ctx->CopyResource(g_d11_guides[k][1], motion.res);
-    vk_guide_stamp(g_d11_present, g, f);
+    vk_guide_stamp(g_d11_present, g, f,feature);
     g.w2 = nr::asi::Wilsjo2VkFrame{};
     g.w2.flags = f.flags_known ? f.flags : 0u;
     g.w2.reset = f.reset;
@@ -8513,8 +9743,16 @@ void d11_present_layers(IDXGISwapChain* sc, ID3D11Device* device) {
         return;
     }
     if (GetTickCount64() - g_present.evaluate_ms.load() > 1000) nr::dlssnr::frame_keys();   // as on D3D12
+    auto publish_failure = [&](const std::string& detail) {
+        const std::string why = "Cannot run: D3D11: " + detail;
+        for (const Layer* layer : layers) if (reuse_layer(*layer)) {
+            layer_note(*layer, 2, 3, why.c_str());
+            nr::pe::control::layer_reuse_failed(row_number(*layer), why.c_str());
+        }
+    };
     if (!d11_route_ready(device)) {
         for (const Layer* l : layers) layer_note(*l, 2, 3, "NR cannot run on this D3D11 device (see the log)");
+        if (!g_d11_submit_reason.empty()) publish_failure(g_d11_submit_reason);
         P.served_ms = GetTickCount64();
         return;
     }
@@ -8572,7 +9810,7 @@ void d11_present_layers(IDXGISwapChain* sc, ID3D11Device* device) {
         VkGuideSet& g = P.sets[k];
         if (!g.serial) continue;
         D11Image d, m;
-        if (!d11_image(g_d11_guides[k][0], d) || !d11_image(g_d11_guides[k][1], m)) { g.serial = 0; continue; }
+        if ((g_d11_guides[k][0] && !d11_image(g_d11_guides[k][0], d)) || !d11_image(g_d11_guides[k][1], m)) { g.serial = 0; continue; }
         g.depth = vk_ref(&d.ngx, d.layout, false, d.usage);
         g.motion = vk_ref(&m.ngx, m.layout, false, m.usage);
         g.w2.depth = w2_image(&d.ngx, d.layout);
@@ -8616,7 +9854,13 @@ void d11_present_layers(IDXGISwapChain* sc, ID3D11Device* device) {
     const bool changed = vk_present_run(cmd, P, chain, runs, ti, tf, w, h, hudless, read_back ? &back_ref : nullptr,
                                         &filled);
     if (target.layout != VK_IMAGE_LAYOUT_GENERAL) vk_barrier(cmd, ti, VK_IMAGE_LAYOUT_GENERAL, target.layout);
-    if (!d11_submit(cmd)) { d11_route_failed(); return; }
+    if (!d11_submit(cmd)) {
+        publish_failure(!g_d11_submit_reason.empty() ? g_d11_submit_reason :
+                        "Vulkan command submission returned " + std::to_string(int(g_d11.last_error)));
+        nr::pe::Session::note_frames_delayed(0);
+        d11_route_failed();
+        return;
+    }
     if (changed && filled) ctx->CopyResource(back, g_d11_target);
 }
 
@@ -8703,7 +9947,7 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_d11_evaluate(ID3D11DeviceContext* ctx, const NV
         ID3D11Resource* m = d11_resource(p, "MotionVectors", &unused);
         if (!m) m = d11_resource(p, "DLSSD.MotionVectors", &unused);
         ID3D11Resource* e = d11_resource(p, "ExposureTexture", &unused);
-        got = d11_image(c, colour) && d11_image(o, output) && d11_image(d, depth) && d11_image(m, motion);
+        got = d11_image(c, colour) && d11_image(o, output) && (d ? d11_image(d, depth) : reuse_needs_vectors_only()) && d11_image(m, motion);
         if (e && d11_image(e, exposure)) {
             // a typeless exposure (DXVK makes it an integer image of that size, its format changeable) read as the
             // float it holds, as the 0.0.7 route's D3D12 view of it (R32_TYPELESS as R32_FLOAT)
@@ -8719,6 +9963,7 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_d11_evaluate(ID3D11DeviceContext* ctx, const NV
         }
     }
     if (!got) {
+        cut_reuse_guides(g_d11_present.sets,h->Id);
         if (!t.vk.said) {
             t.vk.said = true;
             log("[nr] OptiScaler D3D11 feature %u: no colour, output, depth or motion vector texture DXVK can show; NR "
@@ -8727,7 +9972,7 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_d11_evaluate(ID3D11DeviceContext* ctx, const NV
         guard.unlock();
         return real_d11_evaluate(ctx, h, p, callback);
     }
-    f.color = &colour.ngx; f.output = &output.ngx; f.depth = &depth.ngx; f.motion = &motion.ngx;
+    f.color = &colour.ngx; f.output = &output.ngx; f.depth = depth.ok() ? &depth.ngx : nullptr; f.motion = &motion.ngx;
     f.exposure = exposure.ok() ? &exposure.ngx : nullptr;
     f.color_layout = colour.layout; f.output_layout = output.layout; f.depth_layout = depth.layout;
     f.motion_layout = motion.layout; f.exposure_layout = exposure.layout;
@@ -8744,7 +9989,7 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_d11_evaluate(ID3D11DeviceContext* ctx, const NV
     plan_layers_vk(t.vk, f, nr_on, "D3D11 games", plan, g_d11_present);
     g_d11_present.wanted = plan.present;
     g_present.evaluate_ms = GetTickCount64();
-    if (plan.present) d11_capture_guides(ctx, depth, motion, f);
+    if (plan.present) d11_capture_guides(ctx, depth, motion, f,h->Id);
     const nr::asi::Wilsjo2VkFrame wf = wilsjo2_vk_frame(p, f);
     ++g_fg_frames;
     NVSDK_NGX_Result r;
@@ -8761,17 +10006,18 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_d11_evaluate(ID3D11DeviceContext* ctx, const NV
         }
         D3D11_TEXTURE2D_DESC have{};
         if (t.copy) t.copy->GetDesc(&have);
-        if (!t.copy || have.Format != cd.Format || have.Width != rw || have.Height != rh) {
+        const DXGI_FORMAT copy_fmt = writable(cd.Format);
+        if (!t.copy || have.Format != copy_fmt || have.Width != rw || have.Height != rh) {
             retire_texture(t.copy);
             D3D11_TEXTURE2D_DESC d{};
-            d.Width = rw; d.Height = rh; d.MipLevels = 1; d.ArraySize = 1; d.Format = cd.Format;
+            d.Width = rw; d.Height = rh; d.MipLevels = 1; d.ArraySize = 1; d.Format = copy_fmt;
             d.SampleDesc.Count = 1; d.Usage = D3D11_USAGE_DEFAULT;
             d.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
-            if (!cd.Format || FAILED(g_d11.device->CreateTexture2D(&d, nullptr, &t.copy))) {
+            if (!copy_fmt || FAILED(g_d11.device->CreateTexture2D(&d, nullptr, &t.copy))) {
                 t.copy = nullptr;
                 static bool said = false;
                 if (!said) { said = true; log("[nr] D3D11 route: the colour's copy (DXGI format %d) could not be made; NR "
-                                              "before the upscaler does not run", int(cd.Format)); }
+                                              "before the upscaler does not run", int(copy_fmt)); }
             }
         }
         D11Image copy;
@@ -8800,10 +10046,36 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_d11_evaluate(ID3D11DeviceContext* ctx, const NV
             if (copy.layout != VK_IMAGE_LAYOUT_GENERAL) vk_barrier(cmd, ci, VK_IMAGE_LAYOUT_GENERAL, copy.layout);
             if (!d11_submit(cmd)) d11_route_failed();   // the copy holds the colour as it came
             ID3D11Texture2D* mine = t.copy;
+            // (an sRGB colour: our copy is its UNORM twin, the same bytes read as other values - only a mirror in the
+            // colour's format may go; without one the game's colour goes, this frame's layers before the upscaler lost)
+            bool own = false;
+            if (copy_fmt != cd.Format) {
+                D3D11_TEXTURE2D_DESC mh{};
+                if (t.mirror) t.mirror->GetDesc(&mh);
+                if (!t.mirror || mh.Format != cd.Format || mh.Width != rw || mh.Height != rh) {
+                    retire_texture(t.mirror);
+                    D3D11_TEXTURE2D_DESC md{};
+                    md.Width = rw; md.Height = rh; md.MipLevels = 1; md.ArraySize = 1; md.Format = cd.Format;
+                    md.SampleDesc.Count = 1; md.Usage = D3D11_USAGE_DEFAULT;
+                    md.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                    if (FAILED(g_d11.device->CreateTexture2D(&md, nullptr, &t.mirror))) t.mirror = nullptr;
+                }
+                if (t.mirror) {
+                    ctx->CopyResource(t.mirror, t.copy);
+                    mine = t.mirror;
+                } else {
+                    own = true;
+                    static bool said = false;
+                    if (!said) { said = true; log("[nr] D3D11 route: the sRGB colour's mirror could not be made; the layers before "
+                                                  "the upscaler skip such frames, the layers after it run"); }
+                }
+            }
             guard.unlock();
-            if (colour.as_resource) p->Set(f.color_key, static_cast<ID3D11Resource*>(mine));
-            else p->Set(f.color_key, static_cast<void*>(mine));
-            const bool moved = rx || ry;
+            if (!own) {
+                if (colour.as_resource) p->Set(f.color_key, static_cast<ID3D11Resource*>(mine));
+                else p->Set(f.color_key, static_cast<void*>(mine));
+            }
+            const bool moved = !own && (rx || ry);
             if (moved) { p->Set("DLSS.Input.Color.Subrect.Base.X", 0u); p->Set("DLSS.Input.Color.Subrect.Base.Y", 0u); }
             r = real_d11_evaluate(ctx, h, p, callback);
             if (colour.as_resource) p->Set(f.color_key, colour.res); else p->Set(f.color_key, static_cast<void*>(colour.res));
@@ -8917,9 +10189,11 @@ extern "C" __declspec(dllexport) void InitializeASI() {
     g_self_range = range_of(g_self);
     // frame generation's HUD-less hand-overs: the game's own only (not OptiScaler's own frame generation's calls)
     nr::asi::hudcap::set_game_caller(&game_fg_call);
+    // NRFrameReuse's even frames: OptiScaler's own frame generation's inputs are followed too, while it calls
+    nr::asi::hudcap::set_opti_caller([](void* caller) { return in_range(g_opti_range, caller); });
     nr::asi::hudcap::set_capture_wanted_query(&hud_capture_wanted_at_start);
     nr::pe::set_module(g_opti);   // dlssnr-amd.ini, dlssnr-amd\, the log and control.bin sit beside OptiScaler
-    nr::pe::install_crash_watch();
+    nr::pe::install_crash_watch(reinterpret_cast<void*>(g_opti));
     // an exception that leaves one of NR's threads ends the process through std::terminate: said in the log first
     std::set_terminate([] {
         log("[nr] std::terminate: an exception left one of NR's threads; the process ends");
@@ -8940,9 +10214,9 @@ extern "C" __declspec(dllexport) void InitializeASI() {
     nr::pe::d3d12_passthrough::start();
     if (nr::pe::d3d12_passthrough::enabled()) {
         nr::pe::d3d12_passthrough::set_net_planner(
-            [](uint32_t w, uint32_t h, int model, bool experimental, nr::D3d12NetPlan* out, std::string* why) {
+            [](uint32_t w, uint32_t h, int model, bool small_fp8_optimized, nr::D3d12NetPlan* out, std::string* why) {
                 // RDNA3: its lowering, its stand-ins and records
-                return nr::plan_d3d12_network(nr::pe::module_folder(), w, h, experimental, out, why, model,
+                return nr::plan_d3d12_network(nr::pe::module_folder(), w, h, small_fp8_optimized, out, why, model,
                                               nr::pe::d3d12_passthrough::arch());
             },
             &nr::d3d12_net_controls, &nr::dlssnr::frame_network);
@@ -9022,6 +10296,7 @@ BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID reserved) {
         // possibly inside vkd3d-proton's / DXVK's locks, and d3d12 / winevulkan were detached before us (loaded after
         // us). Nothing of NR's GPU state is destroyed or waited for now - that could wait for ever and the game would
         // never end; the process's end frees it all.
+        new decltype(dlssg_delay::pre_lists)(std::move(dlssg_delay::pre_lists));
         nr::dlssnr::abandon_at_exit();
         nr::asi::wilsjo2_abandon_at_exit();
         nr::asi::wilsjo2_vk_abandon_at_exit();

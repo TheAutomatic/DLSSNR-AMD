@@ -136,6 +136,13 @@ inline constexpr Key kKeys[] = {
     {"NRFastHybridFine", kFloat, 2, 0.f, 2.f, 1.f, "Passes", "Fine detail", "NRFastHybridFine. How much of the network's fine detail change Hybrid adds: 1 as made (default), 0 none, 2 twice.", nullptr},
     {"NRFastInterleavedPasses", kUint, 0, 2.f, 8.f, 3.f, "Passes", "Passes (fast)", "NRFastInterleavedPasses. Interleaved: how many legacy passes (2 to 8) take turns, one each frame. Each pass more needs more video memory.", nullptr},
     {"NRFastInterleavedPreset", kUint, 0, 1.f, 2.f, float(nr::fast::kDefaultInterleavedPreset), "Passes", "Interleaved preset", "NRFastInterleavedPreset. Interleaved's processing method.", "~Preset 1\0Preset 1\0Preset 2\0"},
+    // drawn right under NeuralUplift (nr_control_ui.hpp draw_renodx), with its state; appended here: the indices stay
+    {"NRFrameReuse", kBool, 0, 0.f, 0.f, 0.f, "Neural Rendering", "Frame reuse", "NRFrameReuse. At Present, NR runs on alternate frames. Each intermediate frame uses both neighbouring NR results and the game's motion vectors. The network work is split across the pair. Each picture is shown two frames late after startup. Frame reuse and Interleaved cannot be combined.", nullptr},
+    // drawn under NRFastInterleavedPreset (nr_control_ui.hpp), with its hint line; appended here: the indices stay
+    {"NRFastInterleavedDepthDisocclusion", kBool, 0, 0.f, 0.f, 1.f, "Passes", "Depth disocclusion check", "NRFastInterleavedDepthDisocclusion. Interleaved also uses the game's depth to find surfaces that just came into view (on by default; off: only the motion vectors and colours find them).", nullptr},
+    // drawn in the Network group after NRNoiseEveryFrame (the group's keys in table order); appended here: the indices stay
+    {"NRPreHistory", kBool, 0, 0.f, 0.f, 1.f, "Network", "Pre history", "NRPreHistory. The network's input block also reads its previous answer, moved along the motion vectors, as NVIDIA's DLL does (default). Off: it sees this frame only. Without motion vectors there is no history either way (diagnostic).", nullptr},
+    {"NRPostHistory", kFloat, 2, 0.f, 1.f, 1.f, "Network", "Post history", "NRPostHistory. How much the network's output block blends its previous answer, moved along the motion vectors, into this one: 1 = as NVIDIA's DLL (default), 0 = off. Without motion vectors there is no history either way (diagnostic).", nullptr},
 };
 inline constexpr int kCount = int(sizeof kKeys / sizeof kKeys[0]);
 }  // namespace nr::renodx_keys

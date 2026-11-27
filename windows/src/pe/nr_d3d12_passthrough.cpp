@@ -6,7 +6,7 @@
 #include "nr_gpu_arch.hpp"
 #include "nr_pipeline_binary.hpp"
 #include "nr_path_u8.hpp"
-#include "nr_pe_d3d12split.hpp"
+#include "nr_d3d12_direct_state.hpp"
 #include "nr_pe_log.hpp"
 #include "nr_pe_session.hpp"
 #include "nr_pe_vkdevice.hpp"
@@ -38,6 +38,7 @@ std::atomic<int> g_arch{int(nr::arch::GpuArch::unknown)};   // arch(): set by on
 std::atomic<uint32_t> g_gfx11_mach{0};
 std::atomic<uint64_t> g_runs{0}, g_fallbacks{0}, g_waits{0};
 std::atomic<bool> g_produced{false};   // the last recorded frame actually carried NR (not a copy-through)
+std::atomic<ULONGLONG> g_fallback_ms{0};   // note_bridge_fallback: when a frame last went through the bridge instead
 
 std::string hr_text(HRESULT hr) {
     char b[16];
@@ -173,7 +174,7 @@ void finish_canary(Canary c, const std::string& line) {
         nr::pe::set_d3d12_native(false, nr::arch::GpuArch::unknown);
     }
     log("[d3d12] canary %s: %s%s", canary_name(c), line.c_str(),
-        c == Canary::kHit ? " - the D3D12 passthrough may run" : " - the D3D12 passthrough stays off (the Vulkan bridge runs)");
+        c == Canary::kHit ? " - the D3D12 passthrough may run" : " - the D3D12 passthrough stays off");
 }
 
 // The canary of `arch` on `device` with `queue`: kHit or kFail, and the line saying why.
@@ -303,6 +304,11 @@ DWORD WINAPI canary_thread(void* p) {
     delete static_cast<CanaryJob*>(p);
     std::string line;
     const Canary result = run_canary(job.device, job.queue, job.arch, &line);
+    if (result == Canary::kHit) {
+        std::string hook_why;
+        if (!nr::pe::d3d12_direct::install_hooks(job.device, nullptr, &hook_why) && !hook_why.empty())
+            log("[d3d12] %s", hook_why.c_str());
+    }
     job.queue->Release();
     finish_canary(result, line);
     job.device->Release();
@@ -416,7 +422,8 @@ constexpr uint64_t kAskAgainMs = 10000;
 constexpr int kAskTimes = 6;   // (then refused as before: a GPU nothing can identify is not asked about all game long)
 
 void on_device(ID3D12Device* device) {
-    if (!g_enabled || !device || g_canary_started.load()) return;
+    if (!g_enabled || !device) return;
+    if (g_canary_started.load()) return;
     if (const uint64_t at = g_ask_again_ms.load(); at && GetTickCount64() < at) return;
     std::string name;
     const nr::arch::Identity id = adapter_arch(device, &name);
@@ -433,7 +440,7 @@ void on_device(ID3D12Device* device) {
     { std::lock_guard<std::mutex> g(g_lock); g_adapter = name + " (" + nr::arch::name(id.arch) + ")"; }
     // The game's direct queue when this thread has handed it frames (as NR's Present layers find it); otherwise a
     // queue of ours on the game's device. Never a device of ours.
-    ID3D12CommandQueue* queue = nr::pe::split::last_direct_queue();
+    ID3D12CommandQueue* queue = nr::pe::d3d12_direct::last_direct_queue();
     if (queue) {
         ID3D12Device* owner = nullptr;
         if (FAILED(queue->GetDevice(IID_PPV_ARGS(&owner))) || !owner) queue = nullptr;
@@ -514,8 +521,14 @@ Status status() {
 }
 bool backend_produced() { return g_produced.load(); }
 void note_backend_produced(bool produced) { g_produced = produced; }
+void note_bridge_fallback() { g_fallback_ms = GetTickCount64(); }
+bool fell_back_recently() {
+    const ULONGLONG t = g_fallback_ms.load();
+    return g_enabled && t && GetTickCount64() - t < 2000;
+}
 void note_backend(const char* line, bool ran, bool waiting) {
     (ran ? g_runs : waiting ? g_waits : g_fallbacks)++;
+    if (!ran && !waiting) note_bridge_fallback();
     std::lock_guard<std::mutex> g(g_lock);
     if (g_backend != line) {
         g_backend = line;

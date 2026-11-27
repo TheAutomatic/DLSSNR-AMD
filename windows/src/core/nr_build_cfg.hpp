@@ -1,5 +1,5 @@
 #pragma once
-// Settings one network build reads - the installed int4 mixed data's choices (dlssnr-amd/int4/settings.txt) and its
+// Settings one network build reads - the installed int4 data's choices (dlssnr-amd/<level>/settings.txt) and its
 // weights file - set by the runtime around its build, on the building thread. Never the process environment: two
 // sessions may build at once, and an exact build after an int4 one must see none of them. Unset (development trees, the
 // nr_graph tool): the environment, as before.
@@ -25,7 +25,7 @@ struct BuildCfgScope {
     explicit BuildCfgScope(const std::map<std::string, std::string>* cfg) : prev(g_build_cfg) { g_build_cfg = cfg; }
     ~BuildCfgScope() { g_build_cfg = prev; }
 };
-// dlssnr-amd/int4/settings.txt, KEY=VALUE a line ('#' comments): the selective hard-swish - its scales folded into the
+// dlssnr-amd/<level>/settings.txt, KEY=VALUE a line ('#' comments): the selective hard-swish - its scales folded into the
 // next weights (NR_HS_FOLD wide layers, NR_HS_FOLD32 C=32, NR_HS_FOLDPP the pre and post blocks), the blocks that
 // take the fold (NR_HS_FOLD_BLOCKS) and the blocks whose C=32 layers run the hard-swish pipeline (NR_HS_ROUTE).
 inline void int4_settings(const std::string& text, std::map<std::string, std::string>& cfg) {

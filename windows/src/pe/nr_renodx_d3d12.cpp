@@ -1,38 +1,29 @@
-#include "nr_d3dcompiler.hpp"
-#include "nr_path_u8.hpp"
-// The RenoDX stage on the D3D12 passthrough (nr_renodx_d3d12.hpp). The host logic is nr_renodx.cpp's
-// (the Vulkan stage) line for line where it decides what the shaders are given; the shaders are RenoDX's
-// own D3D12 ones (windows/shaders/renodx *.cs_5_1.hlsl), compiled at runtime with d3dcompiler_47 as they are,
-// RENODX_VULKAN not defined. The frame is always taken whole - the colour copied in, the answer stored into the
-// output - which is the Vulkan stage's copied path (its in-place reading and storing are scheduling only, "the same
-// values"); the network runs between the encode and the resolve through the backend's D3D12 network over linear
-// buffers, its guides resampled onto the network's extent (to_motion / to_depth, the frame path's own shaders).
+// The RenoDX stage on the D3D12 passthrough (nr_renodx_d3d12.hpp): host orchestration mirrors nr_renodx.cpp,
+// while outer compute shaders run as pre-captured PAL ELFs from d3d12_outer.nra via mapped upload slots (zero
+// SetDescriptorHeaps calls and zero d3dcompiler_47 dependency).
 #include "nr_renodx_d3d12.hpp"
+#include "nr_d3d12_direct_state.hpp"
 #include "nr_d3d12_il.hpp"
+#include "nr_d3d12_outer_elf.hpp"
 #include "renodx/codec_gain.hpp"   // the codec's divisors and anchors (dlssnr.hpp's, as nr_renodx.cpp includes it)
 #include "nr_d3d12_passthrough.hpp"
 #include "nr_pe_log.hpp"
 #include "nr_vram_ledger.hpp"
 #include <cstdarg>
 #include <cmath>
-#include <fstream>
-#include <iterator>
 
-#include <d3dcompiler.h>
 #include <windows.h>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
-#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <map>
-#include <atomic>
 #include <mutex>
-#include <thread>
-#include <filesystem>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace nr::pe::d3d12_passthrough::renodx12 {
@@ -40,127 +31,6 @@ using Settings = nr::renodx::Settings;   // RenoDX's own (nr_renodx.hpp)
 namespace {
 
 void release(IUnknown* p) { if (p) p->Release(); }
-
-// ---- the inline HLSL: the stage's own plumbing (register layout: t0.. for reads, u0.. for writes, b0 the constants)
-
-
-
-// The plumbing: proxy texture <-> linear buffer (the network's buffers), the stored picture into the output, and the
-// game's guides onto the network's extent (nr_d3d12_passthrough_backend.cpp kShaders' to_motion / to_depth, the same
-// mapping).
-const char kAuxShaders[] = R"hlsl(
-cbuffer AuxC : register(b0) {
-    uint a_w;
-    uint a_h;
-    uint a_what;
-    uint a_pad0;
-    float4 a_region;
-};
-
-Texture2D<float4> aux_tex : register(t0);
-SamplerState aux_linear_clamp : register(s0);
-ByteAddressBuffer aux_raw_in : register(t0);
-ByteAddressBuffer aux_raw_neural : register(t1);
-RWByteAddressBuffer aux_raw_out : register(u0);
-RWStructuredBuffer<float4> aux_out : register(u0);
-RWTexture2D<float4> aux_dst : register(u0);
-
-uint2 pack_f16x4(float4 v) {
-    uint4 h = f32tof16(v);
-    return uint2(h.x | (h.y << 16), h.z | (h.w << 16));
-}
-float4 unpack_f16x4(uint2 p) {
-    return f16tof32(uint4(p.x & 0xffffu, p.x >> 16, p.y & 0xffffu, p.y >> 16));
-}
-
-[numthreads(8, 8, 1)]
-void tex_to_buf(uint3 id : SV_DispatchThreadID) {
-    // a_what 1: RGBA32F texels at lp16 rows (Passes (fast) Interleaved's slot history for an RGBA32F network history)
-    if (id.x < a_w && id.y < a_h) {
-        if (a_what == 1u) aux_raw_out.Store4((id.y * lp16(a_w) + id.x) * 16, asuint(aux_tex.Load(int3(id.xy, 0))));
-        else aux_raw_out.Store2((id.y * a_w + id.x) * 8, pack_f16x4(aux_tex.Load(int3(id.xy, 0))));
-    }
-}
-
-[numthreads(8, 8, 1)]
-void sdr_encode_lin(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= a_w || id.y >= a_h) return;
-    const uint2 src_sz = max(uint2(asuint(a_region.xy)), uint2(1, 1));
-    const uint2 src_px = uint2(asuint(a_region.zw)) + min(uint2(((float2(id.xy) + 0.5f) * float2(src_sz)) / float2(a_w, a_h)), src_sz - 1);
-    const float3 p = max(aux_tex.Load(int3(src_px, 0)).rgb, 0.0f);
-    aux_raw_out.Store2((id.y * a_w + id.x) * 8, pack_f16x4(float4(p, 1.0f)));
-}
-
-[numthreads(8, 8, 1)]
-void sdr_decode_lin(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= a_w || id.y >= a_h) return;
-    const float4 src = a_pad0 != 0 ? aux_dst[id.xy] : aux_tex.Load(int3(id.xy, 0));
-    const uint2 n_sz = max(uint2(asuint(a_region.xy)), uint2(1, 1));
-    const uint2 n_px = min(uint2(((float2(id.xy) + 0.5f) * float2(n_sz)) / float2(a_w, a_h)), n_sz - 1);
-    const float3 neural = unpack_f16x4(aux_raw_neural.Load2((n_px.y * n_sz.x + n_px.x) * 8)).rgb;
-    const float orig_y = dot(src.rgb, float3(0.212639f, 0.715169f, 0.072192f));
-    const float upg_y = dot(neural, float3(0.212639f, 0.715169f, 0.072192f));
-    const float ratio = orig_y == 0.0f ? 1.0f : clamp(upg_y / orig_y, 0.0f, 4.0f);
-    const float3 result = lerp(src.rgb * ratio, neural, asfloat(a_what));
-    aux_dst[id.xy] = float4(result, src.a);
-}
-
-[numthreads(8, 8, 1)]
-void buf_to_tex(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= a_w || id.y >= a_h) return;
-    aux_dst[id.xy] = unpack_f16x4(aux_raw_in.Load2((id.y * a_w + id.x) * 8));
-}
-
-[numthreads(8, 8, 1)]
-void copy_out(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= a_w || id.y >= a_h) return;
-    aux_dst[id.xy] = aux_tex.Load(int3(id.xy, 0));
-}
-
-[numthreads(8, 8, 1)]
-void to_motion(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= a_w || id.y >= a_h) return;
-    const float2 uv = (float2(id.xy) + 0.5f) / float2(a_w, a_h);
-    const float2 mv = aux_tex.SampleLevel(aux_linear_clamp, uv * a_region.xy + a_region.zw, 0).xy;
-    const uint2 h = f32tof16(mv);
-    aux_raw_out.Store2((id.y * a_w + id.x) * 8, uint2(h.x | (h.y << 16), 0u));
-}
-
-[numthreads(8, 8, 1)]
-void to_depth(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= a_w || id.y >= a_h) return;
-    const float2 s = floor((float2(id.xy) + 0.5f) * a_region.xy / float2(a_w, a_h));
-    const int2 t = min(int2(s), int2(a_region.xy) - 1);
-    aux_out[id.y * a_w + id.x] = float4(aux_tex.Load(int3(t + int2(a_region.zw), 0)).r, 0, 0, 0);
-}
-)hlsl";
-
-// The network reads the linear buffers as images whose rows are lin_pitch's (nr_d3d12_passthrough.hpp: RDNA4 128-byte,
-// RDNA3 256-byte aligned), so these programs address rows of lp8 / lp16 texels on both architectures.
-std::string lin_pitch_hlsl() {   // lin_pitch in HLSL (the architecture's row alignment)
-    const std::string m = std::to_string(nr::pe::d3d12_passthrough::lin_row_align() - 1u) + "u";
-    return "uint lp8(uint w) { return ((w * 8u + " + m + ") & ~" + m + ") / 8u; }\n"
-           "uint lp16(uint w) { return ((w * 16u + " + m + ") & ~" + m + ") / 16u; }\n";
-}
-void replace_every(std::string& t, const std::string& a, const std::string& b) {
-    for (size_t at = t.find(a); at != std::string::npos; at = t.find(a, at + b.size())) t.replace(at, a.size(), b);
-}
-// kAuxShaders over rows of lin_pitch texels (both architectures; the alignment is the architecture's)
-std::string aux_shaders_pitched() {
-    std::string t(kAuxShaders, sizeof kAuxShaders - 1);
-    {
-        replace_every(t, "uint2 pack_f16x4(float4 v) {", lin_pitch_hlsl() + "uint2 pack_f16x4(float4 v) {");
-        replace_every(t, "(id.y * a_w + id.x) * 8", "(id.y * lp8(a_w) + id.x) * 8");
-        replace_every(t, "(n_px.y * n_sz.x + n_px.x) * 8", "(n_px.y * lp8(n_sz.x) + n_px.x) * 8");
-        replace_every(t, "aux_out[id.y * a_w + id.x]", "aux_out[id.y * lp16(a_w) + id.x]");
-    }
-    return t;
-}
-// NR_LIN_IO's store of the encoded proxy (both trees of programs below)
-std::string lin_io_store() {
-    return "{ uint4 h = f32tof16(float4(SrgbEncode(proxy), 1.0)); "
-           "OutputLin.Store2((pixel.y * lp8(max(Size.x, 1u)) + pixel.x) * 8u, uint2(h.x | (h.y << 16), h.z | (h.w << 16))); }";
-}
 
 DXGI_FORMAT srv_format_of(DXGI_FORMAT f) {
     switch (f) {
@@ -185,199 +55,6 @@ DXGI_FORMAT uav_format_of(DXGI_FORMAT f) {
         case DXGI_FORMAT_R32G32B32A32_TYPELESS: return DXGI_FORMAT_R32G32B32A32_FLOAT;
         default: return f;
     }
-}
-
-// RenoDX's own files, read from the installed shaders folder (their #includes resolved there).
-std::string read_text(const std::wstring& path) {
-    std::string out;
-    if (FILE* f = _wfopen(path.c_str(), L"rb")) {
-        char buf[16384];
-        size_t n;
-        while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) out.append(buf, n);
-        std::fclose(f);
-    }
-    return out;
-}
-
-struct FolderInclude final : ID3DInclude {
-    std::vector<std::wstring> dirs;
-    static void replace_all(std::string& s, const char* from, const char* to) {
-        const size_t flen = std::strlen(from), tlen = std::strlen(to);
-        size_t pos = 0;
-        while ((pos = s.find(from, pos)) != std::string::npos) {
-            s.replace(pos, flen, to);
-            pos += tlen;
-        }
-    }
-    STDMETHOD(Open)(D3D_INCLUDE_TYPE, LPCSTR name, LPCVOID, LPCVOID* data, UINT* bytes) override {
-        const std::string n(name);
-        std::wstring w(n.begin(), n.end());
-        for (const std::wstring& d : dirs) {
-            std::string text = read_text(d + L"\\" + w);
-            if (text.empty()) continue;
-            if (n == "v6_common.hlsli") {
-                // The file's own texel reads first, through the helpers below (each sits in a function with a
-                // tex_size): done after inserting them, the helpers' own `Proxy.Load(c)` became a call with no
-                // tex_size in scope and every program without NR_LIN_IO failed to compile (X3004) - no HDR stage.
-                replace_all(text, "Proxy.Load(", "LoadProxyTexel(tex_size.x, ");
-                replace_all(text, "Neural.Load(", "LoadNeuralTexel(tex_size.x, ");
-                const char* row = "lp8(max(w, 1u))";   // the rows are lin_pitch's
-                const std::string lin_io =
-                    std::string("#ifdef NR_LIN_IO\nByteAddressBuffer Proxy : register(t1);\nByteAddressBuffer Neural : register(t2);\n"
-                                "RWByteAddressBuffer OutputLin : register(u1);\n") +
-                    lin_pitch_hlsl() +
-                    "float4 LoadProxyTexel(uint w, int3 c) { uint2 p = Proxy.Load2((uint(c.y) * " + row + " + uint(c.x)) * 8u); "
-                    "return f16tof32(uint4(p.x & 0xffffu, p.x >> 16, p.y & 0xffffu, p.y >> 16)); }\n"
-                    "float4 LoadNeuralTexel(uint w, int3 c) { uint2 p = Neural.Load2((uint(c.y) * " + row + " + uint(c.x)) * 8u); "
-                    "return f16tof32(uint4(p.x & 0xffffu, p.x >> 16, p.y & 0xffffu, p.y >> 16)); }\n"
-                    "#else\nVK_BINDING(1) Texture2D<float4> Proxy : register(t1);";
-                replace_all(text, "VK_BINDING(1) Texture2D<float4> Proxy : register(t1);", lin_io.c_str());
-                replace_all(text, "VK_BINDING(2) Texture2D<float4> Neural : register(t2);",
-                            "VK_BINDING(2) Texture2D<float4> Neural : register(t2);\n"
-                            "float4 LoadProxyTexel(uint w, int3 c) { return Proxy.Load(c); }\n"
-                            "float4 LoadNeuralTexel(uint w, int3 c) { return Neural.Load(c); }\n#endif");
-            }
-            auto* copy = new char[text.size()];
-            std::memcpy(copy, text.data(), text.size());
-            *data = copy;
-            *bytes = UINT(text.size());
-            return S_OK;
-        }
-        return E_FAIL;
-    }
-    STDMETHOD(Close)(LPCVOID data) override { delete[] static_cast<const char*>(data); return S_OK; }
-};
-
-ID3DBlob* compile_hlsl(const char* source, size_t bytes, const char* entry, std::string* why, FolderInclude* inc,
-                       const D3D_SHADER_MACRO* macros = nullptr) {
-    using PFN = HRESULT(WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO*, ID3DInclude*, LPCSTR, LPCSTR,
-                                 UINT, UINT, ID3DBlob**, ID3DBlob**);
-    using PFN_CreateBlob = HRESULT(WINAPI*)(SIZE_T, ID3DBlob**);
-    static HMODULE d3dcomp = nr::pe::system_d3dcompiler();   // System32's, not a game's (an old one lacks cs_5_1)
-    static PFN fn = d3dcomp ? reinterpret_cast<PFN>(reinterpret_cast<void*>(GetProcAddress(d3dcomp, "D3DCompile"))) : nullptr;
-    static std::mutex g_compile_mu;
-    std::lock_guard<std::mutex> compile_lk(g_compile_mu);
-    static PFN_CreateBlob fn_blob = d3dcomp ? reinterpret_cast<PFN_CreateBlob>(reinterpret_cast<void*>(GetProcAddress(d3dcomp, "D3DCreateBlob"))) : nullptr;
-    if (!fn) { *why = "d3dcompiler_47.dll (D3DCompile) is not available"; return nullptr; }
-    auto fnv = [](uint64_t h, const void* p, size_t n) {
-        const auto* b = static_cast<const uint8_t*>(p);
-        for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; }
-        return h;
-    };
-    uint64_t h = fnv(1469598103934665603ull, "NR_RENODX_DXBC_V4", 17);
-    h = fnv(h, source, bytes);
-    // Every .hlsli the include handler can hand out (the folders' texts, read once a run): a change to an include
-    // alone (prep_resolve.hlsli's neutral inverse in 0.0.8.4) must not find the old DXBC - the top-level text stays.
-    if (inc) {
-        static std::mutex g_inc_mu;
-        static std::map<std::wstring, uint64_t> g_inc_hash;
-        std::wstring dirs_key;
-        for (const std::wstring& d : inc->dirs) dirs_key += d + L"|";
-        std::lock_guard<std::mutex> lk(g_inc_mu);
-        auto it = g_inc_hash.find(dirs_key);
-        if (it == g_inc_hash.end()) {
-            uint64_t ih = 1469598103934665603ull;
-            for (const std::wstring& d : inc->dirs) {
-                std::vector<std::filesystem::path> files;
-                std::error_code ec;
-                for (const auto& e : std::filesystem::directory_iterator(d, ec))
-                    if (e.path().extension() == L".hlsli") files.push_back(e.path());
-                std::sort(files.begin(), files.end());
-                for (const auto& p : files) {
-                    const std::string name = p.filename().string(), text = read_text(p.wstring());
-                    ih = fnv(ih, name.data(), name.size() + 1);
-                    ih = fnv(ih, text.data(), text.size());
-                }
-            }
-            it = g_inc_hash.emplace(dirs_key, ih).first;
-        }
-        h = fnv(h, &it->second, sizeof it->second);
-    }
-    h = fnv(h, entry, std::strlen(entry) + 1);
-    if (macros && macros[0].Name) {
-        h = fnv(h, macros[0].Name, std::strlen(macros[0].Name) + 1);
-        if (macros[0].Definition) h = fnv(h, macros[0].Definition, std::strlen(macros[0].Definition) + 1);
-    }
-    // The include handler's v6_common.hlsli text carries the architecture's row alignment (lin_pitch_hlsl)
-    {
-        const uint32_t align = nr::pe::d3d12_passthrough::lin_row_align();
-        h = fnv(h, &align, sizeof align);
-    }
-    static std::mutex g_dxbc_mu;
-    static std::map<uint64_t, std::vector<uint8_t>> g_dxbc_mem;
-    static std::wstring g_cache_dir = [] {
-        const char* mf = nr::pe::module_folder();
-        if (!mf || !*mf) return std::wstring{};
-        const int n = MultiByteToWideChar(CP_UTF8, 0, mf, -1, nullptr, 0);
-        if (n <= 1) return std::wstring{};
-        std::wstring w(size_t(n) - 1, L'\0');
-        MultiByteToWideChar(CP_UTF8, 0, mf, -1, w.data(), n);
-        std::wstring dir = w + L"\\dlssnr-amd\\aco-cache";
-        std::error_code ec;
-        std::filesystem::create_directories(dir, ec);
-        return dir;
-    }();
-    wchar_t disk_path[MAX_PATH] = {};
-    if (!g_cache_dir.empty())
-        std::swprintf(disk_path, MAX_PATH, L"%ls\\renodx_%016llx.dxbc", g_cache_dir.c_str(), (unsigned long long)h);
-    if (fn_blob) {
-        std::vector<uint8_t> cached;
-        {
-            std::lock_guard<std::mutex> lk(g_dxbc_mu);
-            auto it = g_dxbc_mem.find(h);
-            if (it != g_dxbc_mem.end()) cached = it->second;
-        }
-        if (cached.empty() && disk_path[0]) {
-            if (FILE* f = _wfopen(disk_path, L"rb")) {
-                std::fseek(f, 0, SEEK_END);
-                const long sz = std::ftell(f);
-                std::fseek(f, 0, SEEK_SET);
-                if (sz > 32) {
-                    cached.resize(size_t(sz));
-                    if (std::fread(cached.data(), 1, cached.size(), f) == cached.size()) {
-                        std::lock_guard<std::mutex> lk(g_dxbc_mu);
-                        g_dxbc_mem[h] = cached;
-                    } else {
-                        cached.clear();
-                    }
-                }
-                std::fclose(f);
-            }
-        }
-        if (!cached.empty()) {
-            ID3DBlob* blob = nullptr;
-            if (SUCCEEDED(fn_blob(cached.size(), &blob)) && blob) {
-                std::memcpy(blob->GetBufferPointer(), cached.data(), cached.size());
-                return blob;
-            }
-        }
-    }
-    ID3DBlob *code = nullptr, *errors = nullptr;
-    const UINT flags = 1u << 15;
-    const HRESULT hr = fn(source, bytes, entry, macros, inc, entry, "cs_5_1", flags, 0, &code, &errors);
-    if (FAILED(hr) || !code) {
-        *why = std::string("the ") + entry + " shader did not compile";
-        if (errors) { *why += ": "; *why += static_cast<const char*>(errors->GetBufferPointer()); }
-        release(errors);
-        release(code);
-        return nullptr;
-    }
-    release(errors);
-    if (code->GetBufferSize() > 32) {
-        const auto* ptr = static_cast<const uint8_t*>(code->GetBufferPointer());
-        std::vector<uint8_t> vec(ptr, ptr + code->GetBufferSize());
-        {
-            std::lock_guard<std::mutex> lk(g_dxbc_mu);
-            g_dxbc_mem[h] = vec;
-        }
-        if (disk_path[0]) {
-            if (FILE* f = _wfopen(disk_path, L"wb")) {
-                std::fwrite(vec.data(), 1, vec.size(), f);
-                std::fclose(f);
-            }
-        }
-    }
-    return code;
 }
 
 // ---- look_stage.hpp's host side, verbatim from nr_renodx.cpp (device-independent) ------------------------
@@ -558,7 +235,9 @@ int64_t now_ns() {
 uint8_t infer_hdr_mode_dxgi(DXGI_FORMAT f) {
     switch (f) {
         case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        case DXGI_FORMAT_R16G16B16A16_TYPELESS:
         case DXGI_FORMAT_R32G32B32A32_FLOAT:
+        case DXGI_FORMAT_R32G32B32A32_TYPELESS:
         case DXGI_FORMAT_R11G11B10_FLOAT:
             return 1;
         case DXGI_FORMAT_R10G10B10A2_UNORM:
@@ -878,21 +557,11 @@ struct Stage::Impl {
              kSdrEncodeLin, kSdrDecodeLin,
              kCount };
     bool codec_sig(P p) const { return p <= kDebug; }
-    ID3D12RootSignature* rs_codec = nullptr;
-    ID3D12RootSignature* rs_aux = nullptr;
-    ID3D12PipelineState* pso[kCount] = {};
-    ID3D12DescriptorHeap* heap = nullptr;          // shader-visible, the dispatches' views
-    ID3D12DescriptorHeap* clear_heap = nullptr;    // one descriptor, for the prep state's zeroing clear
-    UINT inc = 0, slot = 0;
-    static constexpr UINT kSlots = 4096;   // the first heap: one dispatch a slot (20 descriptors); a frame uses tens
-    UINT slots = kSlots;                   // this heap's slots (grows when a frame would outrun completion)
-    UINT kClearSlot = kSlots * 20;          // the clear descriptors at the end of this heap
-    // Each slot carries the frame that last wrote it. A slot is rewritten only when the caller says that frame has
-    // finished on the GPU; otherwise the frame fails to the Vulkan bridge rather than overwriting descriptors a
-    // recorded dispatch still reads.
-    std::vector<uint64_t> slot_frame;
-    static constexpr uint64_t kNoFrame = ~uint64_t(0);   // a slot never written (frame 0 is a real frame)
-    uint64_t frame_no = 0;
+    ID3D12RootSignature* rs_outer = nullptr;
+    d3d12_outer::OuterKernel kernels[kCount]{};
+    d3d12_outer::OuterHeapPool outer_pool;
+    ID3D12Resource* zero_upload = nullptr;   // 512-byte zeroed UPLOAD buffer for CopyBufferRegion / CopyTextureRegion clears
+    nr::gpu::Ticket current_ticket;
     uint64_t pinned = 0;   // the caller's frame number for this record (its own completion watermark's unit)
     std::function<bool(uint64_t)> completed;
 
@@ -903,14 +572,22 @@ struct Stage::Impl {
         uint32_t w = 0, h = 0;
         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
     };
-    Tex original, proxy, neural, look_out, decoded, decoded_alt, block_mean, up_proxy, up_neural, motion, neutral_mv;
+    Tex original, proxy, neural, look_out, decoded, decoded_alt, block_mean, up_proxy, up_neural, motion;
     Tex band_a, band_b, band_max_a, band_max_b;
     Tex prep_keep;              // Preprocess's (SDR): the network's input kept apart, or P
     ID3D12Resource* trace = nullptr;      // the look programs' trace slot, never read
     ID3D12Resource* prep_state = nullptr;
     bool prep_state_fresh = false;
     ID3D12Resource* lin_proxy = nullptr, * lin_neural = nullptr, * lin_mv = nullptr, * lin_depth = nullptr;
-    bool lin_mv_dirty = false;
+    bool heap_alias_ok = false;
+    ID3D12Heap* alias_heap_a = nullptr;   // backs lin_proxy + neural (disjoint when !fast_lin)
+    ID3D12Heap* alias_heap_b = nullptr;   // backs lin_neural + look_out (disjoint when look runs)
+    ID3D12Resource* alias_a_active = nullptr;
+    ID3D12Resource* alias_b_active = nullptr;
+    bool alias_a_dirty = false;
+    bool alias_b_dirty = false;
+    bool neural_aliased = false;
+    bool look_out_aliased = false;
     bool decoded_storage = false;
     bool decoded_load = false;
     bool prep_was_on = false;
@@ -926,6 +603,8 @@ struct Stage::Impl {
     uint32_t st_cur = 0;
     bool st_valid = false;
     bool net_failed_logged = false;
+    bool cmd_touched_ = false;
+    bool rs_outer_bound_ = false;
     Stage::Facts facts;
     // The v6 codec's (HDR): its work surfaces (RGBA16F at the frame's extent; work_b made when a stack first
     // needs it), the 1x1 scale and commit, Preprocess's forward-half image, the exposure texel's copy.
@@ -960,6 +639,7 @@ struct Stage::Impl {
         D3D12_RESOURCE_BARRIER b{};
         b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
         cmd->ResourceBarrier(1, &b);
+        cmd_touched_ = true;
     }
 
     void transition(ID3D12GraphicsCommandList* cmd, ID3D12Resource* r, D3D12_RESOURCE_STATES from,
@@ -975,6 +655,7 @@ struct Stage::Impl {
         b.Transition.StateAfter = to;
         cmd->ResourceBarrier(1, &b);
         states[r] = to;   // the table follows every explicit transition, external resources included
+        cmd_touched_ = true;
     }
 
     Tex make_tex(uint32_t w, uint32_t h, DXGI_FORMAT f, bool uav, std::string* why) {
@@ -996,58 +677,6 @@ struct Stage::Impl {
         nr::vram::track_d3d12(device, t.res, nr::vram::kRenoDX);
         return t;
     }
-    // This frame's slot budget, from its configuration (a pass is tens of dispatches: the stage's encode/decode,
-    // look and fast programs), grown here before the frame's first command. Not an admission cap: the heap simply
-    // keeps the frames' slots larger than any one frame needs.
-    UINT frame_budget = 128;
-    UINT frame_used = 0;
-    bool reserve_frame_slots() {
-        for (int tries = 0; tries < 12; ++tries) {
-            if (slot_frame.size() != slots) slot_frame.assign(slots, kNoFrame);
-            // The run must be within one wrap: a heap smaller than the budget cannot carry a frame.
-            bool free_run = slots >= frame_budget;
-            for (UINT i = 0; i < frame_budget && free_run; ++i) {
-                const UINT at = (slot + i) % slots;
-                if (slot_frame[at] != kNoFrame && !completed(slot_frame[at])) free_run = false;
-            }
-            if (free_run) return true;
-            if (!grow_slots()) return false;
-        }
-        return false;
-    }
-    // A new shader-visible heap of twice the slots, its clear descriptors made, the old one retired through the
-    // caller's watermark (a recorded dispatch may still read it).
-    bool grow_slots() {
-        const UINT grown = slots * 2;
-        D3D12_DESCRIPTOR_HEAP_DESC hd{};
-        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        hd.NumDescriptors = grown * 20 + 2;
-        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-        ID3D12DescriptorHeap* nh = nullptr;
-        if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&nh))) || !nh) return false;
-        const UINT ni = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-        ID3D12DescriptorHeap* old = heap;
-        const UINT old_slots = slots;
-        heap = nh;
-        inc = ni;
-        slots = grown;
-        kClearSlot = grown * 20;
-        // The prep state's clear descriptors of the new heap, as creation made them.
-        D3D12_UNORDERED_ACCESS_VIEW_DESC d{};
-        d.Format = DXGI_FORMAT_UNKNOWN;
-        d.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-        d.Buffer.NumElements = 1;
-        d.Buffer.StructureByteStride = 16;
-        if (prep_state) device->CreateUnorderedAccessView(prep_state, nullptr, &d, main_cpu(kClearSlot));
-        slot_frame.assign(slots, kNoFrame);
-        slot = 0;
-        nr::pe::log("[nr] RenoDX stage: descriptor heap grown to %u slots (was %u; the old one retires on completion; frame %llu)",
-                    grown, old_slots, static_cast<unsigned long long>(pinned));
-        if (old) {
-            if (retire) retire(old);
-        }
-        return true;
-    }
     ID3D12Resource* make_buffer(uint64_t bytes, std::string* why) {
         D3D12_HEAP_PROPERTIES hp{};
         hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -1065,6 +694,81 @@ struct Stage::Impl {
         states[r] = D3D12_RESOURCE_STATE_COMMON;
         nr::vram::track_d3d12(device, r, nr::vram::kRenoDX);
         return r;
+    }
+    bool make_alias_pair_heap(uint64_t buf_bytes, uint32_t tex_w, uint32_t tex_h, DXGI_FORMAT tex_fmt,
+                              ID3D12Heap** out_heap, ID3D12Resource** out_buf) {
+        if (!heap_alias_ok) return false;
+        D3D12_RESOURCE_DESC brd{};
+        brd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        brd.Width = buf_bytes ? buf_bytes : 256; brd.Height = 1; brd.DepthOrArraySize = 1; brd.MipLevels = 1;
+        brd.SampleDesc.Count = 1; brd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        brd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        D3D12_RESOURCE_DESC trd{};
+        trd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        trd.Width = tex_w; trd.Height = tex_h; trd.DepthOrArraySize = 1; trd.MipLevels = 1;
+        trd.Format = tex_fmt; trd.SampleDesc.Count = 1;
+        trd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        const D3D12_RESOURCE_ALLOCATION_INFO bi = device->GetResourceAllocationInfo(0, 1, &brd);
+        const D3D12_RESOURCE_ALLOCATION_INFO ti = device->GetResourceAllocationInfo(0, 1, &trd);
+        if (!bi.SizeInBytes || bi.SizeInBytes == UINT64_MAX || !ti.SizeInBytes || ti.SizeInBytes == UINT64_MAX)
+            return false;
+        D3D12_HEAP_DESC hd{};
+        hd.SizeInBytes = std::max(bi.SizeInBytes, ti.SizeInBytes);
+        hd.Alignment = std::max<uint64_t>({bi.Alignment, ti.Alignment, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT});
+        hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+        hd.Flags = D3D12_HEAP_FLAG_NONE;
+        ID3D12Heap* heap = nullptr;
+        if (FAILED(device->CreateHeap(&hd, IID_PPV_ARGS(&heap))) || !heap) return false;
+        ID3D12Resource* buf = nullptr;
+        if (FAILED(device->CreatePlacedResource(heap, 0, &brd, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                IID_PPV_ARGS(&buf))) || !buf ||
+            (buf->GetGPUVirtualAddress() >> 48) != 0) {
+            release(buf);
+            release(heap);
+            return false;
+        }
+        states[buf] = D3D12_RESOURCE_STATE_COMMON;
+        nr::vram::track_d3d12(device, buf, nr::vram::kRenoDX);
+        *out_heap = heap;
+        *out_buf = buf;
+        return true;
+    }
+    Tex make_placed_tex(ID3D12Heap* heap, uint32_t w, uint32_t h, DXGI_FORMAT f) {
+        if (!heap) return {};
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rd.Width = w; rd.Height = h; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+        rd.Format = f; rd.SampleDesc.Count = 1;
+        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        Tex t;
+        if (FAILED(device->CreatePlacedResource(heap, 0, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                IID_PPV_ARGS(&t.res))) || !t.res)
+            return {};
+        t.w = w; t.h = h; t.format = f;
+        states[t.res] = D3D12_RESOURCE_STATE_COMMON;
+        return t;
+    }
+    void use_alias(ID3D12GraphicsCommandList* cmd, ID3D12Resource*& active, bool& dirty, ID3D12Resource* next) {
+        if (!next || active == next) return;
+        if (active || dirty) {
+            D3D12_RESOURCE_BARRIER b{};
+            b.Type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
+            b.Aliasing.pResourceBefore = active;
+            b.Aliasing.pResourceAfter = next;
+            cmd->ResourceBarrier(1, &b);
+            cmd_touched_ = true;
+        }
+        active = next;
+        dirty = true;
+    }
+    bool sdr_unit_transfers(uint32_t passes) const {
+        if (settings.codec_mode == 0u) return true;
+        for (uint32_t pk = 0; pk < passes; ++pk) {
+            float tr = 1.f, col = 1.f;
+            strengths(settings, pk, &tr, &col);
+            if (tr != 1.0f) return false;
+        }
+        return true;
     }
     // A replaced surface may still be read by a recorded frame another list has not run yet, so the release goes
     // through the caller's completion watermark when it gave one; `states` forgets it either way.
@@ -1106,151 +810,71 @@ struct Stage::Impl {
     // HDR resolves pass k into the work images, SDR into the decoded ones.
     Tex& stack_out(uint32_t pass) { return hdr ? ((pass & 1u) ? work_b : work_a) : ((pass & 1u) ? decoded_alt : decoded); }
 
-    // ClearUnorderedAccessView* reads its GPU handle from the heap bound right now and its CPU handle from a heap the
-    // driver reads beside it (D3D12's signature: ViewGPUHandleInCurrentHeap, ViewCPUHandle). The dispatch slots rotate,
-    // so the clears get two slots of their own after them: a recorded clear must keep the view it was given.
-    // The prep state's clear descriptors sit after the dispatch slots of this heap (a member: a grown heap moves them).
-    D3D12_CPU_DESCRIPTOR_HANDLE main_cpu(UINT i) const {
-        D3D12_CPU_DESCRIPTOR_HANDLE h = heap->GetCPUDescriptorHandleForHeapStart();
-        h.ptr += SIZE_T(i) * inc;
-        return h;
-    }
-    D3D12_GPU_DESCRIPTOR_HANDLE main_gpu(UINT i) const {
-        D3D12_GPU_DESCRIPTOR_HANDLE h = heap->GetGPUDescriptorHandleForHeapStart();
-        h.ptr += UINT64(i) * inc;
-        return h;
-    }
-    D3D12_CPU_DESCRIPTOR_HANDLE clear_cpu(UINT i) const {
-        D3D12_CPU_DESCRIPTOR_HANDLE h = clear_heap->GetCPUDescriptorHandleForHeapStart();
-        h.ptr += SIZE_T(i) * inc;
-        return h;
-    }
-    void bind_heap(ID3D12GraphicsCommandList* cmd) const {
-        ID3D12DescriptorHeap* heaps[1] = {heap};
-        cmd->SetDescriptorHeaps(1, heaps);
-    }
-    // One dispatch. `srv` / `uav` hold the register-numbered slots (t0.. / u0..); a null slot takes the first
-    // non-null one's view (a binding the stage leaves out is one the program never reads, and D3D12 never
-    // validates an unaccessed descriptor).
-    // NR_STAGE_DISPATCH_LIMIT=<n>: record only the first n dispatches of a run (0/unset: all). Bisecting which one
-    // loses the device offline, without the game and without guessing.
     static uint32_t dispatch_limit() {
         static const uint32_t v = [] {
-            char b[16] = {};
-            const DWORD n = GetEnvironmentVariableA("NR_STAGE_DISPATCH_LIMIT", b, sizeof b);
-            return n && n < sizeof b ? uint32_t(std::atoi(b)) : 0u;
+            wchar_t b[16] = {};
+            const DWORD n = GetEnvironmentVariableW(L"NR_STAGE_DISPATCH_LIMIT", b, 16);
+            return n && n < 16 ? uint32_t(std::wcstoul(b, nullptr, 10)) : 0u;
         }();
         return v;
     }
     uint32_t dispatches_done = 0;
+    uint32_t frame_dispatches_ = 0;
     void dispatch(ID3D12GraphicsCommandList* cmd, P p, View srv[8], View uav[14], const void* push,
-                  uint32_t dwords, uint32_t gx, uint32_t gy) {
-        // NR_STAGE_ONLY=<program>: record only that program's dispatches (bisecting a single one in isolation).
+                  uint32_t dwords, uint32_t gx, uint32_t gy, bool barrier = true) {
+        if (!record_ok_) return;
         static const int only = [] {
-            char b[16] = {};
-            const DWORD n = GetEnvironmentVariableA("NR_STAGE_ONLY", b, sizeof b);
-            return n && n < sizeof b ? std::atoi(b) : -1;
+            wchar_t b[16] = {};
+            const DWORD n = GetEnvironmentVariableW(L"NR_STAGE_ONLY", b, 16);
+            return n && n < 16 ? std::stoi(std::wstring(b)) : -1;
         }();
-        if (only >= 0 && int(p) != only) {
-            return;
-        }
+        if (only >= 0 && int(p) != only) return;
         const uint32_t limit = dispatch_limit();
-        if (limit && dispatches_done >= limit) {
-            return;
-        }
+        if (limit && dispatches_done >= limit) return;
         ++dispatches_done;
-        const bool codec = codec_sig(p);
-        const UINT n_srv = codec ? 6 : 8, n_uav = codec ? 14 : 8;
-        // The slot first, on the heap record() reserved the frame's whole budget on: no growth happens here, so no
-        // dispatch can be dropped or written into a heap that was replaced after it was bound.
-        if (frame_used++ >= frame_budget) {
+        ++frame_dispatches_;
+
+        const d3d12_outer::OuterKernel& k = kernels[p];
+        if (!k.pso || !rs_outer) {
             record_ok_ = false;
-            nr::pe::log("[nr] RenoDX stage: a frame needs more than its %u-slot budget; failing it", frame_budget);
+            nr::pe::log("[nr] RenoDX stage: outer kernel %d is missing", int(p));
             return;
         }
-        UINT take = slot % slots;
-        slot_frame[take] = pinned;
-        slot = (slot + 1) % slots;
-        bind_heap(cmd);
-        D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap->GetCPUDescriptorHandleForHeapStart();
-        D3D12_GPU_DESCRIPTOR_HANDLE gpu = heap->GetGPUDescriptorHandleForHeapStart();
-        cpu.ptr += SIZE_T(take) * 20 * inc;
-        gpu.ptr += UINT64(take) * 20 * inc;
-        const auto fill = [&](View* views, UINT n, bool write) {
-            View first{};
-            for (UINT i = 0; i < n; ++i)
-                if (views[i].res) { first = views[i]; break; }
-            for (UINT i = 0; i < n; ++i) {
-                View v = views[i].res ? views[i] : first;
-                if (!v.res) continue;
-                if (v.buffer) {
-                    ensure(cmd, v.res, write ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
-                                             : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                    D3D12_CPU_DESCRIPTOR_HANDLE h = cpu;
-                    if (v.write) {
-                        D3D12_UNORDERED_ACCESS_VIEW_DESC d{};
-                        d.Format = DXGI_FORMAT_UNKNOWN;
-                        d.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-                        if (v.raw) {
-                            d.Buffer.NumElements = UINT(v.bytes / 4);
-                            d.Format = DXGI_FORMAT_R32_TYPELESS;
-                            d.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
-                        } else {
-                            d.Buffer.NumElements = UINT(v.bytes / 16);
-                            d.Buffer.StructureByteStride = 16;
-                        }
-                        h.ptr += SIZE_T(n_srv + i) * inc;
-                        device->CreateUnorderedAccessView(v.res, nullptr, &d, h);
-                    } else {
-                        D3D12_SHADER_RESOURCE_VIEW_DESC d{};
-                        d.Format = DXGI_FORMAT_UNKNOWN;
-                        d.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
-                        d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-                        if (v.raw) {
-                            d.Buffer.NumElements = UINT(v.bytes / 4);
-                            d.Format = DXGI_FORMAT_R32_TYPELESS;
-                            d.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
-                        } else {
-                            d.Buffer.NumElements = UINT(v.bytes / 16);
-                            d.Buffer.StructureByteStride = 16;
-                        }
-                        h.ptr += SIZE_T(i) * inc;
-                        device->CreateShaderResourceView(v.res, &d, h);
-                    }
-                    continue;
-                }
-                ensure(cmd, v.res, write ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
-                                         : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                if (v.write) {
-                    D3D12_UNORDERED_ACCESS_VIEW_DESC d{};
-                    d.Format = v.fmt;
-                    d.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-                    D3D12_CPU_DESCRIPTOR_HANDLE h = cpu;
-                    h.ptr += SIZE_T(n_srv + i) * inc;
-                    device->CreateUnorderedAccessView(v.res, nullptr, &d, h);
-                } else {
-                    D3D12_SHADER_RESOURCE_VIEW_DESC d{};
-                    d.Format = v.fmt;
-                    d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-                    d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-                    d.Texture2D.MipLevels = 1;
-                    D3D12_CPU_DESCRIPTOR_HANDLE h = cpu;
-                    h.ptr += SIZE_T(i) * inc;
-                    device->CreateShaderResourceView(v.res, &d, h);
-                }
+        std::string slot_err;
+        d3d12_outer::OuterSlot s = outer_pool.acquire(current_ticket, &slot_err, k.desc_zero_bytes);
+        if (!s.cpu) {
+            record_ok_ = false;
+            nr::pe::log("[nr] RenoDX stage: %s", slot_err.empty() ? "no outer descriptor slot" : slot_err.c_str());
+            return;
+        }
+
+        const bool glsl = (p == kPrepEncode) || (p >= kDebug && p <= kPrep);
+        const bool aux_hlsl = p >= kTexToBuf;
+        const uint32_t uav_shift = glsl ? 0u : (aux_hlsl ? 8u : 6u);
+        const UINT n_srv = codec_sig(p) ? 6u : 8u;
+        const UINT n_uav = codec_sig(p) ? 14u : 8u;
+
+        for (UINT i = 0; i < n_srv; ++i) {
+            if (!srv[i].res) continue;
+            ensure(cmd, srv[i].res, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            if (const auto* ob = k.find_binding(i)) {
+                if (srv[i].buffer) s.write_buf(ob, srv[i].res, srv[i].bytes);
+                else s.write_srv_tex(device, ob, srv[i].res, srv[i].fmt, 0, 1);
             }
-        };
-        fill(srv, n_srv, false);
-        fill(uav, n_uav, true);
-        D3D12_GPU_DESCRIPTOR_HANDLE gpu_uav = gpu;
-        gpu_uav.ptr += UINT64(n_srv) * inc;
-        cmd->SetComputeRootSignature(codec ? rs_codec : rs_aux);
-        cmd->SetPipelineState(pso[p]);
-        cmd->SetComputeRoot32BitConstants(0, dwords, push, 0);
-        cmd->SetComputeRootDescriptorTable(1, gpu);
-        cmd->SetComputeRootDescriptorTable(2, gpu_uav);
-        cmd->Dispatch(gx, gy, 1);
-        uav_barrier(cmd);
+        }
+        for (UINT j = 0; j < n_uav; ++j) {
+            if (!uav[j].res) continue;
+            ensure(cmd, uav[j].res, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            if (const auto* ob = k.find_binding(uav_shift + j)) {
+                if (uav[j].buffer) s.write_buf(ob, uav[j].res, uav[j].bytes);
+                else s.write_uav_tex(device, ob, uav[j].res, uav[j].fmt, 0);
+            }
+        }
+        s.write_push(push, dwords * 4u, &k);
+        s.dispatch(cmd, rs_outer, k, gx, gy, 1u, !rs_outer_bound_);
+        rs_outer_bound_ = true;
+        cmd_touched_ = true;
+        if (barrier) uav_barrier(cmd);
     }
 
     bool typed_uav(DXGI_FORMAT f) const {
@@ -1338,9 +962,13 @@ struct Stage::Impl {
 
     // ---- Passes (fast) Interleaved (nr_renodx.cpp's il_*: the same programs, as HLSL - nr_d3d12_il.hpp) ----
     static constexpr uint32_t kIlSlots = 8;
-    d3d12_il::Layout il_lay[2], ilpp_lay;
-    ID3D12PipelineState* il_pso[2][7] = {};   // P1 carrier, P2 carrier + display step6
-    ID3D12PipelineState* ilpp_pso = nullptr;
+    d3d12_outer::OuterKernel il_kernels[2][7]{};   // preset 0 (P1) and preset 1 (P2)
+    // the same with the Style grade in closed form ([Network] Style Grade Acceleration; il_ga / il0_ga in the archive);
+    // an archive without them: the table form (il_ga_loaded false)
+    d3d12_outer::OuterKernel il_ga_kernels[2][7]{};
+    bool il_ga_loaded = false;
+    int il_grade_form_said = 0;   // the grade's form last said in the log (1 step by step, 2 closed form)
+    d3d12_outer::OuterKernel ilpp_kernel{};
     bool il_loaded = false;
     Tex il_base, il_base2, il_trust, il_tdbg, il_hist, il_inc[2][kIlSlots], il_pyr[6], il_dpyr[6], il_depth[2];
     Tex il_lf[2];
@@ -1357,47 +985,24 @@ struct Stage::Impl {
     ID3D12Resource* lin_hist = nullptr;   // a slot's history in the network's history layout (NetTemporal::history_va)
     uint32_t il_slots = 0, il_pyr_slots = 0, il_cur = 0, il_bcur = 0, il_dcur = 0, il_frame = 0, il_last[kIlSlots] = {};
     bool il_valid = false, il_graded_last = false, il_missing_logged = false, il_depth_logged = false;
-    // The programs (renodx_il.hlsl's steps, renodx_il_pp.hlsl), from the package's d3d12\renodx folder. Missing or not
-    // compiling: Interleaved cannot run (said once; the stage itself runs).
-    bool load_il(const std::wstring& ours, std::string* why) {
-        const auto program = [&](const char* name, uint32_t dwords, d3d12_il::Layout* lay) -> std::string {
-            const std::string text = read_text(ours + std::wstring(name, name + std::strlen(name)) + L".hlsl");
-            if (text.empty()) { *why = std::string(name) + ".hlsl is missing"; return {}; }
-            d3d12_il::registers(text, lay);
-            lay->dwords = dwords;
-            if (!d3d12_il::make_root_signature(device, lay, why)) return {};
-            return text;
-        };
-        const auto pipeline = [&](const std::string& text, const d3d12_il::Layout& lay, uint32_t step, ID3D12PipelineState** out) {
-            std::string err;
-            char value[16];
-            std::snprintf(value, sizeof value, "%uu", step);
-            const D3D_SHADER_MACRO macros[] = {{"SPIRV_CROSS_CONSTANT_ID_0", value}, {nullptr, nullptr}};
-            ID3DBlob* blob = compile_hlsl(text.data(), text.size(), "main", &err, nullptr, step == ~0u ? nullptr : macros);
-            if (!blob) { *why = "Interleaved: " + err; return false; }
-            D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
-            pd.pRootSignature = lay.rs;
-            pd.CS.pShaderBytecode = blob->GetBufferPointer();
-            pd.CS.BytecodeLength = blob->GetBufferSize();
-            const HRESULT hr = device->CreateComputePipelineState(&pd, IID_PPV_ARGS(out));
-            release(blob);
-            if (FAILED(hr) || !*out) { *why = "Interleaved: a program does not make a pipeline"; return false; }
-            return true;
-        };
-        for (uint32_t preset = 0; preset < 2; ++preset) {
-            const std::string text = program(preset == 0 ? "renodx_il0" : "renodx_il", 24, &il_lay[preset]);
-            if (text.empty()) return false;
-            if (il_lay[preset].srv.empty() || il_lay[preset].uav.empty()) {
-                *why = "Interleaved: a program declares no reads or no writes"; return false;
-            }
-            for (uint32_t step : {0u, 1u, 3u, 4u, 5u, 6u}) {
-                if (preset == 0 && step == 6) continue;
-                if (!pipeline(text, il_lay[preset], step, &il_pso[preset][step])) return false;
-            }
+    int il_docc_said = -1;   // the depth disocclusion check last said in the log
+    bool load_il(d3d12_outer::OuterArchive& arch, std::string* why) {
+        for (uint32_t step : {0u, 1u, 3u, 4u, 5u}) {
+            if (!arch.build_kernel(device, "il/il0_" + std::to_string(step), &il_kernels[0][step], why)) return false;
         }
-        const std::string pp = program("renodx_il_pp", 7, &ilpp_lay);
-        if (pp.empty() || !pipeline(pp, ilpp_lay, ~0u, &ilpp_pso)) return false;
+        for (uint32_t step : {0u, 1u, 3u, 4u, 5u, 6u}) {
+            if (!arch.build_kernel(device, "il/il_" + std::to_string(step), &il_kernels[1][step], why)) return false;
+        }
+        if (!arch.build_kernel(device, "il/il_pp", &ilpp_kernel, why)) return false;
         il_loaded = true;
+        std::string ga_why;
+        il_ga_loaded = true;
+        for (uint32_t step : {0u, 1u, 3u, 4u, 5u})
+            il_ga_loaded = il_ga_loaded && arch.build_kernel(device, "il/il0_ga_" + std::to_string(step), &il_ga_kernels[0][step], &ga_why);
+        for (uint32_t step : {0u, 1u, 3u, 4u, 5u, 6u})
+            il_ga_loaded = il_ga_loaded && arch.build_kernel(device, "il/il_ga_" + std::to_string(step), &il_ga_kernels[1][step], &ga_why);
+        if (!il_ga_loaded)
+            nr::pe::log("[nr] RenoDX stage (D3D12): no closed-form grade programs for Interleaved (%s): the table form", ga_why.c_str());
         return true;
     }
     void drop_il() {
@@ -1464,49 +1069,39 @@ struct Stage::Impl {
         }
         return true;
     }
-    // One Interleaved dispatch: its program's descriptors (layout.descriptors(), packed - nr_d3d12_il.hpp) in as many
-    // contiguous 20-descriptor slots as they take, from the frame's reserved run (a run that would wrap past the heap's
-    // end starts again at slot 0, the slots skipped counted as used).
-    void dispatch_il(ID3D12GraphicsCommandList* cmd, const d3d12_il::Layout& lay, ID3D12PipelineState* pso,
-                     const std::vector<d3d12_il::Bind>& binds, const void* push, uint32_t gx, uint32_t gy) {
-        const UINT k = (lay.descriptors() + 19) / 20;
-        const UINT at = slot % slots;
-        const UINT skip = at + k > slots ? slots - at : 0;
-        if (frame_used + skip + k > frame_budget) {
+    void dispatch_il(ID3D12GraphicsCommandList* cmd, const d3d12_outer::OuterKernel& k,
+                     const std::vector<d3d12_il::Bind>& binds, const void* push, uint32_t dwords,
+                     uint32_t gx, uint32_t gy, bool barrier = true) {
+        if (!k.pso || !rs_outer) {
             record_ok_ = false;
-            nr::pe::log("[nr] RenoDX stage: a frame needs more than its %u-slot budget; failing it", frame_budget);
+            nr::pe::log("[nr] RenoDX stage (D3D12): Interleaved outer kernel missing");
             return;
         }
-        for (UINT i = 0; i < skip; ++i) slot_frame[(at + i) % slots] = pinned;
-        frame_used += skip + k;
-        const UINT take = (at + skip) % slots;
-        for (UINT i = 0; i < k; ++i) slot_frame[take + i] = pinned;
-        slot = (take + k) % slots;
+        std::string slot_err;
+        d3d12_outer::OuterSlot s = outer_pool.acquire(current_ticket, &slot_err, k.desc_zero_bytes);
+        if (!s.cpu) {
+            record_ok_ = false;
+            nr::pe::log("[nr] RenoDX stage (D3D12): %s", slot_err.empty() ? "no outer descriptor slot" : slot_err.c_str());
+            return;
+        }
         for (const auto& b : binds)
             if (b.res) ensure(cmd, b.res, b.write ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        bind_heap(cmd);
-        if (!d3d12_il::write_descriptors(device, main_cpu(take * 20), inc, lay, binds.data(), binds.size())) {
-            record_ok_ = false;
-            nr::pe::log("[nr] RenoDX stage (D3D12): Interleaved bound a binding its program does not declare");
-            return;
-        }
-        cmd->SetComputeRootSignature(lay.rs);
-        cmd->SetPipelineState(pso);
-        cmd->SetComputeRoot32BitConstants(0, lay.dwords, push, 0);
-        cmd->SetComputeRootDescriptorTable(1, main_gpu(take * 20));
-        cmd->SetComputeRootDescriptorTable(2, main_gpu(take * 20 + UINT(lay.srv.size())));
-        cmd->Dispatch(gx, gy, 1);
-        uav_barrier(cmd);
+        d3d12_il::write_outer_binds(device, s, k, binds.data(), binds.size());
+        s.write_push(push, dwords * 4u, &k);
+        s.dispatch(cmd, rs_outer, k, gx, gy, 1u, !rs_outer_bound_);
+        rs_outer_bound_ = true;
+        cmd_touched_ = true;
+        if (barrier) uav_barrier(cmd);
     }
     // The frame's Interleaved work around the network (nr_renodx.cpp's il_on branch, the product path): one slot a frame
     // (every slot in order on a reset = legacy N), its input the frame + the earlier slots' moved increments, the answer
     // the frame + every increment. `in`: the network's input image (the proxy, or SDR Preprocess's image apart).
     template <class NetFn>
-    bool il_run(ID3D12GraphicsCommandList* cmd, const Frame& f, const Settings& s, bool reset, Tex& in, const NetFn& pass_net) {
+    bool il_run(ID3D12GraphicsCommandList* cmd, const Frame& f, const Settings& s, bool reset, Tex& in,
+                bool motion_direct, uint32_t m_rx, uint32_t m_ry, uint32_t m_rw, uint32_t m_rh, const NetFn& pass_net) {
         const uint32_t NW = cfg.nr_width, NH = cfg.nr_height, nx = (NW + 15) / 16, ny = (NH + 15) / 16;
         const uint32_t n = il_slots, pi = il_preset - 1u;
         const bool stable = il_preset == 2u;
-        const d3d12_il::Layout& lay = il_lay[pi];
         // the game's depth for the disocclusion test, the vector dilation and the depth-aware fill (as on Vulkan)
         ID3D12Resource* depth = f.depth;
         DXGI_FORMAT dfmt = DXGI_FORMAT_UNKNOWN;
@@ -1525,9 +1120,14 @@ struct Stage::Impl {
             il_depth_logged = true;
             nr::pe::log("[nr] RenoDX stage (D3D12): Interleaved reads the game's depth (DXGI format %d, %ux%u)", int(dfmt), dw, dh);
         }
+        if (int(s.fast_interleaved_depth_disocclusion) != il_docc_said) {   // (the switch, live: said each time it changes)
+            il_docc_said = int(s.fast_interleaved_depth_disocclusion);
+            nr::pe::log("[nr] RenoDX stage (D3D12): Interleaved depth disocclusion check %s", il_docc_said ? "on" : "off");
+        }
         struct { uint32_t size[2], mbase[2], mgrid[2]; float mscale[2]; uint32_t mode, slot, n, flags; float k0, k1;
                  uint32_t dbase[2], dgrid[2]; uint32_t styles; float pad0; float inten[4]; } ip{
-            {NW, NH}, {0u, 0u}, {f.motion_w, f.motion_h},
+            {NW, NH}, {motion_direct ? m_rx : 0u, motion_direct ? m_ry : 0u},
+            {motion_direct ? m_rw : f.motion_w, motion_direct ? m_rh : f.motion_h},
             {f.motion_scale_x * s.mvec_scale_x * float(NW), f.motion_scale_y * s.mvec_scale_y * float(NH)}, 0u, 0u, n, 0u,
             0.02f, 0.06f, {f.depth_x, f.depth_y}, {dw, dh}, 0u, 0.f, {1.f, 1.f, 1.f, 1.f}};
         static_assert(sizeof ip == 96, "il's push block");
@@ -1542,18 +1142,29 @@ struct Stage::Impl {
             if (k < n && (st != 0 || iv != 1.0f)) graded = true;
         }
         if (graded != il_graded_last) { il_valid = false; il_graded_last = graded; }
+        // a Style graded here in closed form when Style Grade Acceleration is on and the archive has the programs
+        bool styled = false;
+        for (uint32_t k = 0; k < 4 && k < n; ++k) styled = styled || ((ip.styles >> (2 * k)) & 3u) != 0u;
+        const bool grade_closed = styled && f.style_grade_accel && il_ga_loaded;
+        if (styled && il_grade_form_said != (grade_closed ? 2 : 1)) {
+            il_grade_form_said = grade_closed ? 2 : 1;
+            nr::pe::log("[nr] RenoDX stage (D3D12): Interleaved's Style grade %s",
+                        grade_closed ? "in closed form (Style Grade Acceleration)" : "step by step");
+        }
         bool moved = false;
         const auto il = [&](uint32_t mode, uint32_t slot, bool move) {
-            if (mode == 3u) il_bcur ^= 1u;
+            if (mode == 3u) { il_bcur ^= 1u; return; }   // (the proxy kept, il.comp flags & 268435456: no Base copy - the pair's turn only)
             if (mode == 0u) il_cur ^= 1u;
             Tex& base = il_bcur ? il_base2 : il_base;
             Tex& base_prev = il_bcur ? il_base : il_base2;
             const uint32_t d = il_cur, o = d ^ 1u;
             ip.mode = mode; ip.slot = slot;
             // the product's flags (nr_renodx.cpp: fresh history, vector test with its gradient prediction, box test, depth
-            // disocclusion and dilation, edge, the fill and its depth-aware pyramid)
-            ip.flags = (move ? 1u : 0u) | (mode == 0u && move ? 2u : 0u) | (move ? 8u : 0u) | (moved ? 64u : 0u) |
-                       (move ? 128u : 0u) | (depth && move ? 768u : 0u) | (inverted ? 1024u : 0u) | (graded ? 2048u : 0u) |
+            // disocclusion and dilation, edge, the fill and its depth-aware pyramid, the proxy kept, step 0's pyr1)
+            ip.flags = (move ? 1u : 0u) | (mode == 0u && move ? 2u : 0u) | 268435456u | (move ? 8u : 0u) | (moved ? 64u : 0u) |
+                       (mode == 0u && move ? 536870912u : 0u) | (mode == 0u && move && depth ? 1073741824u : 0u) |
+                       (move ? 128u : 0u) | (depth && move ? 256u : 0u) | (depth && move && s.fast_interleaved_depth_disocclusion ? 512u : 0u) |
+                       (inverted ? 1024u : 0u) | (graded ? 2048u : 0u) |
                        (mode == 1u && moved ? 65536u : 0u) | (move ? 524288u | 1048576u : 0u) | (move ? 33554432u : 0u) |
                        (mode == 4u && depth ? 67108864u : 0u) |
                        (stable && depth ? 131072u : 0u) |
@@ -1562,9 +1173,16 @@ struct Stage::Impl {
             const auto rd = [&](uint32_t binding, const Tex& t) { b.push_back({binding, t.res, srv_format_of(t.format), false}); };
             const auto wr = [&](uint32_t binding, const Tex& t) { b.push_back({binding, t.res, uav_format_of(t.format), true}); };
             wr(0, in); wr(1, neural); wr(2, base);
-            rd(3, motion);
+            if (motion_direct) b.push_back({3, f.motion, srv_format_of(f.motion->GetDesc().Format), false});
+            else rd(3, motion);
             wr(20, il_hist); rd(21, base_prev); wr(22, il_trust); wr(43, il_tdbg);
-            for (uint32_t l = 0; l < 6; ++l) { rd(23 + l, il_pyr[l]); rd(37 + l, il_dpyr[l]); }
+            if (mode != 0u) {
+                for (uint32_t l = 0; l < 6; ++l) { rd(23 + l, il_pyr[l]); rd(37 + l, il_dpyr[l]); }
+            }
+            if (mode == 0u) {
+                wr(44, il_pyr[0]);
+                wr(45, il_dpyr[0]);
+            }
             if (stable) { rd(46, il_lf[il_lfcur ^ 1u]); wr(47, il_lf[il_lfcur]); }
             if (depth) b.push_back({29, depth, dfmt, false});
             wr(30, il_depth[il_dcur]); rd(31, il_depth[il_dcur ^ 1u]);
@@ -1572,20 +1190,18 @@ struct Stage::Impl {
                 rd(4 + i, il_inc[o][i < n ? i : 0]);
                 wr(12 + i, il_inc[d][i < n ? i : 0]);
             }
-            // (only what the step declares: its own pipeline's registers; the rest are the other steps')
+            const auto& k = (grade_closed ? il_ga_kernels : il_kernels)[pi][mode];
             std::vector<d3d12_il::Bind> used;
             for (const auto& x : b) {
-                const auto& v = x.write ? lay.uav : lay.srv;
-                if (std::find(v.begin(), v.end(), x.binding) != v.end()) used.push_back(x);
+                if (d3d12_il::has_binding(k, x.binding, x.write)) used.push_back(x);
             }
-            // (one resource is never both read and written by a dispatch here - D3D12 has no state for that: the reads
-            // are last frame's / the other slots' images, the writes this frame's)
-            dispatch_il(cmd, lay, il_pso[pi][mode], used, &ip, nx, ny);
+            dispatch_il(cmd, k, used, &ip, 24u, nx, ny);
         };
         const auto pyramid = [&] {
             uint32_t sw = NW, sh = NH;
             for (uint32_t l = 0; l < 6; ++l) {
                 const uint32_t dw2 = (sw + 1) / 2, dh2 = (sh + 1) / 2;
+                if (l == 0) { sw = dw2; sh = dh2; continue; }   // (step 0's pyr1 already made the first level)
                 const uint32_t pp[7] = {sw, sh, dw2, dh2, l ? 1u : 0u, n, depth ? 1u : 0u};
                 std::vector<d3d12_il::Bind> b;
                 b.push_back({0, il_trust.res, srv_format_of(il_trust.format), false});
@@ -1600,10 +1216,9 @@ struct Stage::Impl {
                 b.push_back({13, il_dpyr[l].res, uav_format_of(il_dpyr[l].format), true});
                 std::vector<d3d12_il::Bind> used;
                 for (const auto& x : b) {
-                    const auto& v = x.write ? ilpp_lay.uav : ilpp_lay.srv;
-                    if (std::find(v.begin(), v.end(), x.binding) != v.end()) used.push_back(x);
+                    if (d3d12_il::has_binding(ilpp_kernel, x.binding, x.write)) used.push_back(x);
                 }
-                dispatch_il(cmd, ilpp_lay, ilpp_pso, used, pp, (dw2 * n + 15) / 16, (dh2 + 15) / 16);
+                dispatch_il(cmd, ilpp_kernel, used, pp, 7u, (dw2 * n + 15) / 16, (dh2 + 15) / 16);
                 sw = dw2; sh = dh2;
             }
         };
@@ -1617,7 +1232,7 @@ struct Stage::Impl {
             srv[0] = tv(il_hist, false);
             View uav[14] = {};
             uav[0] = bv(lin_hist, uint64_t(lin_pitch(NW, hb)) * NH * hb, true, true);
-            dispatch(cmd, kTexToBuf, srv, uav, &c, 8, (NW + 7) / 8, (NH + 7) / 8);
+            dispatch(cmd, kTexToBuf, srv, uav, &c, 8, (NW + 7) / 8, (NH + 7) / 8, false);
             uav_barrier(cmd);
             ensure(cmd, lin_hist, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             return lin_hist->GetGPUVirtualAddress();
@@ -1626,20 +1241,22 @@ struct Stage::Impl {
         // back on every way out
         struct DepthHeld {
             Impl& m; ID3D12GraphicsCommandList* cmd; ID3D12Resource* r; D3D12_RESOURCE_STATES st;
-            ~DepthHeld() { if (r) m.transition(cmd, r, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, st); }
+            ~DepthHeld() { if (r) m.ensure(cmd, r, st); }
         } held{*this, cmd, depth, f.depth_state};
-        if (depth) transition(cmd, depth, f.depth_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        if (depth) ensure(cmd, depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         if (depth) { il_dcur ^= 1u; il(5u, 0u, false); il_depth_const = false; }
         else if (stable && !il_depth_const) {
             il(5u, 0u, false); il_dcur ^= 1u; il(5u, 0u, false);
             il_depth_const = true;
         }
         if (!record_ok_) return false;
+        const bool ext_hist_ok = f.net_history_bytes == 8u || f.net_history_bytes == 16u;
         if (reset || !il_valid) {
             il_lf_valid = false;
             for (uint32_t j = 0; j < n; ++j) {
                 il(3u, j, false); il(0u, j, false);
-                if (!record_ok_ || !pass_net(j, true, graded, 0)) return false;
+                Tex& slot_in = il_bcur ? il_base2 : il_base;
+                if (!record_ok_ || !pass_net(slot_in, j, true, graded, 0, ext_hist_ok)) return false;
                 il(1u, j, false);
                 il_last[j] = 0;
             }
@@ -1653,7 +1270,9 @@ struct Stage::Impl {
             pyramid();
             il(4u, slot, true);
             if (!record_ok_) return false;
-            if (!pass_net(slot, false, graded, history())) return false;
+            const uint64_t hva = history();
+            Tex& slot_in = il_bcur ? il_base2 : il_base;
+            if (!pass_net(slot_in, slot, false, graded, hva, hva != 0)) return false;
             if (stable) { il_lfcur ^= 1u; il(6u, slot, false); il_lf_valid = true; }
             il(1u, slot, false);
             il_last[slot] = il_frame++;
@@ -1663,208 +1282,112 @@ struct Stage::Impl {
 };
 
 bool Stage::Impl::build(std::string* why) {
-    // The codec root signature (RenoDX's own layout): 40 root constants at b0, reads t0..t5, writes u0..u13.
-    {
-        D3D12_DESCRIPTOR_RANGE rsrv{}, ruav{};
-        rsrv.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        rsrv.NumDescriptors = 6;
-        ruav.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-        ruav.NumDescriptors = 14;
-        D3D12_ROOT_PARAMETER p[3]{};
-        p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        p[0].Constants.ShaderRegister = 0;
-        p[0].Constants.Num32BitValues = 40;
-        p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        p[1].DescriptorTable.NumDescriptorRanges = 1;
-        p[1].DescriptorTable.pDescriptorRanges = &rsrv;
-        p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        p[2].DescriptorTable.NumDescriptorRanges = 1;
-        p[2].DescriptorTable.pDescriptorRanges = &ruav;
-        for (auto& x : p) x.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        D3D12_ROOT_SIGNATURE_DESC rd{};
-        rd.NumParameters = 3; rd.pParameters = p;
-        ID3DBlob *blob = nullptr, *errors = nullptr;
-        HRESULT hr = D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors);
-        release(errors);
-        if (FAILED(hr) || !blob) { *why = "renodx: D3D12SerializeRootSignature(codec) failed"; return false; }
-        hr = device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&rs_codec));
-        release(blob);
-        if (FAILED(hr)) { *why = "renodx: CreateRootSignature(codec) failed"; return false; }
-    }
-    // The aux one (Passes (fast)' layout): the same constants, reads t0..t7, writes u0..u7, one linear-clamp sampler.
-    {
-        D3D12_DESCRIPTOR_RANGE rsrv{}, ruav{};
-        rsrv.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        rsrv.NumDescriptors = 8;
-        ruav.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-        ruav.NumDescriptors = 8;
-        D3D12_ROOT_PARAMETER p[3]{};
-        p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        p[0].Constants.ShaderRegister = 0;
-        p[0].Constants.Num32BitValues = 40;
-        p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        p[1].DescriptorTable.NumDescriptorRanges = 1;
-        p[1].DescriptorTable.pDescriptorRanges = &rsrv;
-        p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        p[2].DescriptorTable.NumDescriptorRanges = 1;
-        p[2].DescriptorTable.pDescriptorRanges = &ruav;
-        for (auto& x : p) x.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        D3D12_STATIC_SAMPLER_DESC ss{};
-        ss.Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;   // to_motion's sampler: the frame path's linear clamp
-        ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-        ss.MaxLOD = 0.0f;
-        ss.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        D3D12_ROOT_SIGNATURE_DESC rd{};
-        rd.NumParameters = 3; rd.pParameters = p;
-        rd.NumStaticSamplers = 1; rd.pStaticSamplers = &ss;
-        ID3DBlob *blob = nullptr, *errors = nullptr;
-        HRESULT hr = D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors);
-        release(errors);
-        if (FAILED(hr) || !blob) { *why = "renodx: D3D12SerializeRootSignature(aux) failed"; return false; }
-        hr = device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&rs_aux));
-        release(blob);
-        if (FAILED(hr)) { *why = "renodx: CreateRootSignature(aux) failed"; return false; }
-    }
-    // RenoDX's own programs, from the installed folder (their #include resolved there, and beside it for the prep
-    // resolve's - the HDR builds).
-    FolderInclude includer;
-    includer.dirs = {cfg.shaders, cfg.shaders + L"\\renodx-prep"};
-    struct File { P p; const char* name; const char* macro; };
-    const File files[] = {
-        {kEncodeL, "legacy_encode", nullptr}, {kDecodeL, "legacy_decode", nullptr},
-        {kReduceL, "legacy_reduce", nullptr}, {kReduceLU, "legacy_reduce_unshaped", nullptr},
-        {kApplyL, "legacy_apply", nullptr}, {kDecodeReduceL, "legacy_decode_reduce", nullptr},
-        {kCompose, "look_compose", nullptr}, {kUpsample, "look_upsample", nullptr}, {kBand, "look_band", nullptr},
+    if (!d3d12_outer::create_outer_root_signature(device, &rs_outer, why)) return false;
+    auto arch = d3d12_outer::shared_archive(why);
+    if (!arch) return false;
+
+    struct Entry { P p; const char* key; };
+    const Entry common[] = {
+        {kEncodeL, "renodx/legacy_encode"}, {kDecodeL, "renodx/legacy_decode"},
+        {kReduceL, "renodx/legacy_reduce"}, {kReduceLU, "renodx/legacy_reduce_unshaped"},
+        {kApplyL, "renodx/legacy_apply"}, {kDecodeReduceL, "renodx/legacy_decode_reduce"},
+        {kCompose, "renodx/look_compose"}, {kUpsample, "renodx/look_upsample"}, {kBand, "renodx/look_band"},
+        {kDebug, "renodx/renodx_debug"}, {kPrep, "renodx/renodx_prep"},
+        {kStFbIn, "renodx/renodx_st_fb_in"}, {kStPrep, "renodx/renodx_st_prep"},
+        {kStBox, "renodx/renodx_st_box"}, {kStApply, "renodx/renodx_st_apply"},
+        {kTexToBuf, "renodx_aux/tex_to_buf"}, {kBufToTex, "renodx_aux/buf_to_tex"},
+        {kCopyOut, "renodx_aux/copy_out"}, {kToMotion, "renodx_aux/to_motion"},
+        {kToDepth, "renodx_aux/to_depth"}, {kSdrEncodeLin, "renodx_aux/sdr_encode_lin"},
+        {kSdrDecodeLin, "renodx_aux/sdr_decode_lin"},
     };
-    const File files6[] = {
-        {kLinearize, "v6_linearize", nullptr}, {kAutoscale, "v6_autoscale", nullptr},
-        {kExposureScale, "v6_exposure_scale", nullptr}, {kEncode6, "v6_encode", nullptr},
-        {kResolve6, "v6_resolve", nullptr}, {kReduce6, "v6_pedestal_reduce", nullptr},
-        {kReduce6U, "v6_pedestal_reduce_unshaped", nullptr}, {kCommit6, "v6_commit", nullptr},
-        {kCommitExposure, "v6_commit_exposure", nullptr}, {kResolveCommit6, "v6_resolve_commit", nullptr},
-        // the resolve when [Preprocess] made the proxy (v6_common.hlsli under NR_PREP_RESOLVE)
-        {kResolve6Prep, "v6_resolve", "NR_PREP_RESOLVE"},
-        {kResolveCommit6Prep, "v6_resolve_commit", "NR_PREP_RESOLVE"},
-        {kReduce6UPrep, "v6_pedestal_reduce_unshaped", "NR_PREP_RESOLVE"},
-        {kEncode6Lin, "v6_encode", "NR_LIN_IO"},
-        {kResolve6Lin, "v6_resolve", "NR_LIN_IO"},
-        {kResolveCommit6Lin, "v6_resolve_commit", "NR_LIN_IO"},
+    const Entry hdr_only[] = {
+        {kLinearize, "renodx/v6_linearize"}, {kAutoscale, "renodx/v6_autoscale"},
+        {kExposureScale, "renodx/v6_exposure_scale"}, {kEncode6, "renodx/v6_encode"},
+        {kResolve6, "renodx/v6_resolve"}, {kReduce6, "renodx/v6_pedestal_reduce"},
+        {kReduce6U, "renodx/v6_pedestal_reduce_unshaped"}, {kCommit6, "renodx/v6_commit"},
+        {kCommitExposure, "renodx/v6_commit_exposure"}, {kResolveCommit6, "renodx/v6_resolve_commit"},
+        {kResolve6Prep, "renodx/v6_resolve_prep"},
+        {kResolveCommit6Prep, "renodx/v6_resolve_commit_prep"},
+        {kReduce6UPrep, "renodx/v6_pedestal_reduce_unshaped_prep"},
+        {kEncode6Lin, "renodx/v6_encode_lin"},
+        {kResolve6Lin, "renodx/v6_resolve_lin"},
+        {kResolveCommit6Lin, "renodx/v6_resolve_commit_lin"},
+        {kPrepEncode, "renodx/renodx_prep_encode"},
     };
-    const auto make_file_pso = [&](const File& f) -> bool {
-        std::string text = read_text(cfg.shaders + L"\\" + std::wstring(f.name, f.name + std::strlen(f.name)) +
-                                     L".cs_5_1.hlsl");
-        if (text.empty()) { *why = std::string("renodx: ") + f.name + " is missing"; return false; }
-        if (f.macro && std::strcmp(f.macro, "NR_LIN_IO") == 0) {
-            FolderInclude::replace_all(
-                text, "Output[pixel] = float4(SrgbEncode(proxy), 1.0);", lin_io_store().c_str());
+    for (const Entry& e : common) {
+        if (!arch->build_kernel(device, e.key, &kernels[e.p], why)) return false;
+    }
+    if (hdr) {
+        for (const Entry& e : hdr_only) {
+            if (!arch->build_kernel(device, e.key, &kernels[e.p], why)) return false;
         }
-        const D3D_SHADER_MACRO macros[] = {{f.macro, "1"}, {nullptr, nullptr}};
-        ID3DBlob* code = compile_hlsl(text.data(), text.size(), "main", why, &includer, f.macro ? macros : nullptr);
-        if (!code) return false;
-        D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
-        pd.pRootSignature = rs_codec;
-        pd.CS.pShaderBytecode = code->GetBufferPointer();
-        pd.CS.BytecodeLength = code->GetBufferSize();
-        const HRESULT hr = device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso[f.p]));
-        release(code);
-        if (FAILED(hr) || !pso[f.p]) { *why = std::string("renodx: ") + f.name + " does not make a pipeline"; return false; }
-        return true;
-    };
-    for (const File& f : files)
-        if (!make_file_pso(f)) return false;
-    if (hdr)
-        for (const File& f : files6)
-            if (!make_file_pso(f)) return false;
+    }
     // The transport folded into the decode / the last resolve (nr_renodx.cpp's; NR_RDX_UP_FUSED=0: apart). Optional:
     // without them the stage runs look_upsample into P_up / N'_up as before.
     static const bool up_fused_off = [] { const char* e = std::getenv("NR_RDX_UP_FUSED"); return e && e[0] == '0'; }();
     if (!up_fused_off) {
         std::string up_why;
-        const File up = hdr ? File{kResolveCommit6Up, "v6_resolve_commit_up", nullptr} : File{kDecodeUpL, "legacy_decode_up", nullptr};
-        if (!make_file_pso(up)) {
-            nr::pe::log("[nr] RenoDX stage (D3D12): %s not made (%s); the transport runs apart", up.name, why->c_str());
-            why->clear();
+        const Entry up = hdr ? Entry{kResolveCommit6Up, "renodx/v6_resolve_commit_up"}
+                             : Entry{kDecodeUpL, "renodx/legacy_decode_up"};
+        if (!arch->build_kernel(device, up.key, &kernels[up.p], &up_why)) {
+            nr::pe::log("[nr] RenoDX stage (D3D12): %s not made (%s); the transport runs apart", up.key, up_why.c_str());
         }
     }
-    // NR's own programs, the package's SPIR-V as HLSL (dlssnr-amd\shaders\d3d12\renodx, build_d3d12_hlsl.sh):
-    // Preprocess's encode and the debug views on the codec signature, Preprocess and Passes (fast) on the aux one;
-    // their registers are the SPIR-V's bindings (texture N -> tN, image / buffer N -> uN), the push block cbuffer b0.
-    // Then the plumbing of this route (kAuxShaders).
+    std::string il_why;
+    if (!load_il(*arch, &il_why)) {
+        nr::pe::log("[nr] RenoDX stage (D3D12): Interleaved's programs are not available (%s): Interleaved cannot run",
+                    il_why.c_str());
+    }
+    if (!outer_pool.init(
+            device, 512,
+            [](const nr::gpu::Ticket& t) { return nr::pe::d3d12_direct::completed(t); },
+            [this](IUnknown* r) { if (retire) retire(r); else release(r); }, why)) {
+        return false;
+    }
     {
-        const size_t up = cfg.shaders.find_last_of(L"\\/");
-        const std::wstring ours = (up == std::wstring::npos ? cfg.shaders : cfg.shaders.substr(0, up)) + L"\\d3d12\\renodx\\";
-        std::string err;
-        const struct { P p; const char* name; } programs[] = {
-            {kPrepEncode, "renodx_prep_encode"}, {kDebug, "renodx_debug"}, {kPrep, "renodx_prep"},
-            {kStFbIn, "renodx_st_fb_in"}, {kStPrep, "renodx_st_prep"}, {kStBox, "renodx_st_box"}, {kStApply, "renodx_st_apply"},
-        };
-        for (const auto& pr : programs) {
-            if (pr.p == kPrepEncode && !hdr) continue;   // (HDR only, as the files6 programs)
-            const std::string text = read_text(ours + std::wstring(pr.name, pr.name + std::strlen(pr.name)) + L".hlsl");
-            if (text.empty()) { *why = std::string("renodx: d3d12\\renodx\\") + pr.name + ".hlsl is missing"; return false; }
-            ID3DBlob* blob = compile_hlsl(text.data(), text.size(), "main", &err, nullptr, nullptr);
-            if (!blob) { *why = std::string("renodx: ") + pr.name + ": " + err; return false; }
-            D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
-            pd.pRootSignature = codec_sig(pr.p) ? rs_codec : rs_aux;
-            pd.CS.pShaderBytecode = blob->GetBufferPointer();
-            pd.CS.BytecodeLength = blob->GetBufferSize();
-            const HRESULT hr = device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso[pr.p]));
-            release(blob);
-            if (FAILED(hr) || !pso[pr.p]) { *why = std::string("renodx: ") + pr.name + " does not make a pipeline"; return false; }
+        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_UPLOAD};
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = 512; rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1; rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                                   nullptr, IID_PPV_ARGS(&zero_upload))) || !zero_upload) {
+            *why = "renodx: the zero upload buffer could not be made";
+            return false;
         }
-        const struct { P p; const char* entry; } aux[] = {
-            {kTexToBuf, "tex_to_buf"}, {kBufToTex, "buf_to_tex"}, {kCopyOut, "copy_out"}, {kToMotion, "to_motion"},
-            {kToDepth, "to_depth"}, {kSdrEncodeLin, "sdr_encode_lin"}, {kSdrDecodeLin, "sdr_decode_lin"},
-        };
-        for (const auto& a : aux) {
-            const std::string aux = aux_shaders_pitched();
-            ID3DBlob* blob = compile_hlsl(aux.data(), aux.size(), a.entry, &err, nullptr);
-            if (!blob) { *why = "renodx: " + err; return false; }
-            D3D12_COMPUTE_PIPELINE_STATE_DESC ad{};
-            ad.pRootSignature = rs_aux;
-            ad.CS.pShaderBytecode = blob->GetBufferPointer();
-            ad.CS.BytecodeLength = blob->GetBufferSize();
-            const HRESULT hr = device->CreateComputePipelineState(&ad, IID_PPV_ARGS(&pso[a.p]));
-            release(blob);
-            if (FAILED(hr) || !pso[a.p]) { *why = std::string("renodx: ") + a.entry + " does not make a pipeline"; return false; }
+        void* zm = nullptr;
+        if (FAILED(zero_upload->Map(0, nullptr, &zm)) || !zm) {
+            *why = "renodx: the zero upload buffer could not be mapped";
+            return false;
         }
-        // Passes (fast) Interleaved's programs: without them Interleaved cannot run (NR Control says so), the rest does
-        std::string il_why;
-        if (!load_il(ours, &il_why))
-            nr::pe::log("[nr] RenoDX stage (D3D12): Interleaved's programs are not available (%s): Interleaved cannot run",
-                        il_why.c_str());
+        std::memset(zm, 0, 512);
+        zero_upload->Unmap(0, nullptr);
+        nr::vram::track_d3d12(device, zero_upload, nr::vram::kRenoDX);
     }
-    D3D12_DESCRIPTOR_HEAP_DESC hd{};
-    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = slots * 20 + 2;   // + the two clear slots (kClearSlot)
-    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)))) { *why = "renodx: the descriptor heap failed"; return false; }
-    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
-    hd.NumDescriptors = 2;   // one per cleared resource, beside the GPU ones
-    if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&clear_heap)))) { *why = "renodx: the clear heap failed"; return false; }
-    Impl::inc = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
     const uint32_t W = cfg.width, H = cfg.height, NW = cfg.nr_width, NH = cfg.nr_height;
     const DXGI_FORMAT frame = cfg.frame_format;
     decoded_storage = typed_uav(frame);
     decoded_load = typed_uav_load(frame);
     if (!decoded_storage) decoded = make_tex(W, H, DXGI_FORMAT_R16G16B16A16_FLOAT, true, why);
-    proxy = make_tex(NW, NH, DXGI_FORMAT_R16G16B16A16_FLOAT, true, why);
-    neural = make_tex(NW, NH, DXGI_FORMAT_R16G16B16A16_FLOAT, true, why);
     block_mean = make_tex((W + 31) / 32, (H + 31) / 32, DXGI_FORMAT_R32G32B32A32_FLOAT, true, why);
-    // (P_up / N'_up: made when a frame first wants the transport apart - record(); 4K: 2 x 63 MiB)
-    if ((!decoded_storage && !decoded.res) || !proxy.res || !neural.res || !block_mean.res) {
+    // (proxy / neural: made on demand when a path other than fast_lin runs; P_up / N'_up: record())
+    if ((!decoded_storage && !decoded.res) || !block_mean.res) {
         *why = "renodx: a stage texture could not be made";
         return false;
     }
+    D3D12_FEATURE_DATA_D3D12_OPTIONS opts{};
+    heap_alias_ok = SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &opts, sizeof opts)) &&
+                    opts.ResourceHeapTier >= D3D12_RESOURCE_HEAP_TIER_2;
     trace = make_buffer(16 * 1024, why);
-    lin_proxy = make_buffer(uint64_t(lin_pitch(NW, 8)) * NH * 8, why);
-    lin_neural = make_buffer(uint64_t(lin_pitch(NW, 8)) * NH * 8, why);
-    lin_mv = make_buffer(uint64_t(lin_pitch(NW, 8)) * NH * 8, why);
+    const uint64_t lin_bytes = uint64_t(lin_pitch(NW, 8)) * NH * 8;
+    if (!make_alias_pair_heap(lin_bytes, NW, NH, DXGI_FORMAT_R16G16B16A16_FLOAT, &alias_heap_a, &lin_proxy))
+        lin_proxy = make_buffer(lin_bytes, why);
+    if (!make_alias_pair_heap(lin_bytes, NW, NH, DXGI_FORMAT_R16G16B16A16_FLOAT, &alias_heap_b, &lin_neural))
+        lin_neural = make_buffer(lin_bytes, why);
+    lin_mv = make_buffer(256, why);
     lin_depth = make_buffer(256, why);
     if (!trace || !lin_proxy || !lin_neural || !lin_mv || !lin_depth) return false;
-    neutral_mv = make_tex(1, 1, DXGI_FORMAT_R16G16_FLOAT, false, why);   // zero: the heap guarantees it
-    if (!neutral_mv.res) return false;
     looks.resize(1);
     if (hdr) {
         // The v6 codec's surfaces: the scale and the commit 1x1 RGBA32F; the work images (RGBA16F like the proxy) when
@@ -1898,7 +1421,9 @@ void Stage::Impl::run_look(ID3D12GraphicsCommandList* cmd, uint32_t pass, Tex& r
     if (!shaped_out) return;
     if (!look_out.res) {
         std::string why;
-        look_out = make_tex(NW, NH, DXGI_FORMAT_R16G16B16A16_FLOAT, true, &why);
+        look_out = make_placed_tex(alias_heap_b, NW, NH, DXGI_FORMAT_R16G16B16A16_FLOAT);
+        look_out_aliased = look_out.res != nullptr;
+        if (!look_out.res) look_out = make_tex(NW, NH, DXGI_FORMAT_R16G16B16A16_FLOAT, true, &why);
         if (!look_out.res) { shaped_out = false; transport_out = false; return; }
     }
     if (look::bands_wanted(ls) && !band_a.res) {
@@ -1967,6 +1492,7 @@ void Stage::Impl::run_look(ID3D12GraphicsCommandList* cmd, uint32_t pass, Tex& r
     // RecordCompose: the five band passes at half the network's extent, then the compose.
     ID3D12Resource* hist_out = temporal ? pl.history[pl.hist.written ^ 1u] : nullptr;
     ID3D12Resource* hist_in = temporal ? pl.history[pl.hist.written] : nullptr;
+    if (look_out_aliased) use_alias(cmd, alias_b_active, alias_b_dirty, look_out.res);
     if (lc.flags & look::kFlagBands) {
         look::Constants band = lc;
         band.size[0] = (NW + 1) / 2; band.size[1] = (NH + 1) / 2;
@@ -2052,36 +1578,21 @@ void Stage::Impl::copy_frame(ID3D12GraphicsCommandList* cmd, const Frame& f) {
     cmd->ResourceBarrier(2, b);
     states[f.colour] = f.colour_state;
     states[f.output] = f.output_state;
+    cmd_touched_ = true;
 }
 
 uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, const Frame::Net& net) {
     record_ok_ = true;
     net_ran_ = false;
-    ++frame_no;
-    // Every slot this frame may use is made free before its first command: a frame that would outrun completion
-    // grows the heap here, and a frame that cannot is not recorded at all (rather than losing a dispatch halfway).
-    {
-        // The frame's own stack (Stage::set updates `settings`, not the construction snapshot): the passes it runs,
-        // and per pass the most dispatches any branch of this stage issues: encode (1), tex_to_buf (1), buf_to_tex
-        // (1), decode (legacy 1 + black-level 2 | v6 1 + resolve 1), look (compose 1, upsample 1 when it upsamples,
-        // band 2 when it bands), preprocess (forward 1, inverse 1, meter 1), fast (prep 1, fb_in 1, apply 1) - 16 at
-        // the most in the current code, so 32 is a factor-two margin; plus the fixed per-frame programs (copy_in,
-        // copy_out, commit, pedestal, the clears) counted in the 64.
-        const uint32_t passes = std::max(1u, std::min<uint32_t>(stack_passes(settings), nr::renodx::kMaxUnlockedPasses));
-        frame_budget = 64 + 32 * passes;
-        // Passes (fast) Interleaved: a reset frame runs every slot (3 il dispatches, the network's 2 copies and the
-        // history's), a frame one slot (8 il dispatches); an il dispatch takes up to 3 slots, + 3 a wrap
-        if (settings.passes_mode == 1u && settings.fast_method == 0u) {
-            const uint32_t n = std::clamp(settings.fast_interleaved_passes, 2u, kIlSlots);
-            frame_budget += (4u * n + 12u) * 3u + 3u * n + 3u;
-        }
-        frame_used = 0;
-    }
-    if (completed && !reserve_frame_slots()) {
+    cmd_touched_ = false;
+    frame_dispatches_ = 0;
+    rs_outer_bound_ = false;
+    current_ticket = nr::pe::d3d12_direct::book(cmd);
+    if (!current_ticket) {
         record_ok_ = false;
-        nr::pe::log("[nr] RenoDX stage: no slot budget for this frame (fails before any command)");
         return 0;
     }
+    nr::pe::d3d12_direct::Scope direct_scope(cmd);
     const Settings& s = settings;
     const uint32_t W = cfg.width, H = cfg.height, NW = cfg.nr_width, NH = cfg.nr_height;
     const uint32_t gx = (W + 15) / 16, gy = (H + 15) / 16, nx = (NW + 15) / 16, ny = (NH + 15) / 16;
@@ -2119,15 +1630,13 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
         decoded = make_tex(W, H, decoded_storage ? cfg.frame_format : DXGI_FORMAT_R16G16B16A16_FLOAT, true, &why);
         if (!decoded.res) { record_ok_ = false; return 0; }
     }
-    if (!hdr && passes > 1 && !decoded_alt.res) {
+    if (!hdr && (passes > 2 || (passes == 2 && !direct_out)) && !decoded_alt.res) {
         std::string why;
         decoded_alt = make_tex(W, H, decoded.format, true, &why);
         if (!decoded_alt.res) { record_ok_ = false; return 0; }
     }
-    if (passes == 1 && (work_b.res || decoded_alt.res)) {   // one pass: the stack's images go (nr_renodx.cpp)
-        drop(work_b);
-        drop(decoded_alt);
-    }
+    if (passes == 1 && work_b.res) drop(work_b);
+    if ((passes == 1 || (passes == 2 && direct_out)) && decoded_alt.res) drop(decoded_alt);
     while (looks.size() > passes) {
         drop_buf(looks.back().history[0]);
         drop_buf(looks.back().history[1]);
@@ -2234,16 +1743,37 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
     const bool transport_now = (NW < W || NH < H) && look::transport_wanted(ls, NW, NH, W, H);
     const bool prep_resolve_now = prep_on && hdr && pp.inverse;
     const bool up_fused = transport_now && !debug_show &&
-        (hdr ? pso[kResolveCommit6Up] && !fuse_off_env() && !frame_pedestal_removal(s, hdr, units) && passes == 1 && !prep_resolve_now
-             : pso[kDecodeUpL] && !sdr_restore);
+        (hdr ? kernels[kResolveCommit6Up].pso && !fuse_off_env() && !frame_pedestal_removal(s, hdr, units) && passes == 1 && !prep_resolve_now
+             : kernels[kDecodeUpL].pso && !sdr_restore);
+    D3D12_RESOURCE_DESC motion_desc{};
+    uint32_t motion_rx = 0, motion_ry = 0, motion_rw = 0, motion_rh = 0;
+    if (have_motion) {
+        motion_desc = f.motion->GetDesc();
+        motion_rx = std::min(f.motion_x, uint32_t(motion_desc.Width));
+        motion_ry = std::min(f.motion_y, uint32_t(motion_desc.Height));
+        motion_rw = std::min(f.motion_w, uint32_t(motion_desc.Width) - motion_rx);
+        motion_rh = std::min(f.motion_h, uint32_t(motion_desc.Height) - motion_ry);
+    }
+    const bool il_motion_direct = il_on && motion_rw > 0 && motion_rh > 0 &&
+                                  srv_format_of(motion_desc.Format) != DXGI_FORMAT_UNKNOWN &&
+                                  f.motion != f.colour && f.motion != f.output && (!f.depth || f.motion != f.depth);
+    const bool motion_wanted = (ls.stabilize == 2u && have_motion && look::dispatched(ls, false)) ||
+                               fast_feedback || (il_on && !il_motion_direct);
+    const D3D12_RESOURCE_DESC src_desc = f.colour->GetDesc();
+    const DXGI_FORMAT src_fmt = srv_format_of(src_desc.Format);
+    const bool in_srgb = src_fmt == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || src_fmt == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    const bool linear_float_src = (src_fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ||
+                                   src_fmt == DXGI_FORMAT_R11G11B10_FLOAT ||
+                                   src_fmt == DXGI_FORMAT_R32G32B32A32_FLOAT) &&
+                                  src_desc.Width >= W && src_desc.Height >= H;
     {
         std::string why;
-        const bool motion_wanted = (ls.stabilize == 2u && have_motion && look::dispatched(ls, false)) || fast_feedback || il_on;
         if (motion_wanted && have_motion) {
-            const D3D12_RESOURCE_DESC md = f.motion->GetDesc();
-            if (motion.res && (motion.w != f.motion_w || motion.h != f.motion_h || motion.format != md.Format)) drop(motion);
-            if (!motion.res) motion = make_tex(f.motion_w, f.motion_h, md.Format, false, &why);
+            if (motion.res && (motion.w != f.motion_w || motion.h != f.motion_h || motion.format != motion_desc.Format)) drop(motion);
+            if (!motion.res) motion = make_tex(f.motion_w, f.motion_h, motion_desc.Format, false, &why);
             if (!motion.res) { record_ok_ = false; return 0; }
+        } else if (!motion_wanted && motion.res) {
+            drop(motion);
         }
         // Passes (fast)'s work sets (nr_renodx.cpp ensure_st): made here, before the frame's first command, so that a
         // failure leaves the caller's list as it came; the feedback's go when the method is not Feedback / Hybrid.
@@ -2271,8 +1801,7 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
             float t0 = 0.f, c0 = 0.f;
             strengths(settings, 0, &t0, &c0);
             const bool fuse_now = hdr && !fuse_off_env() && !frame_pedestal_removal(s, hdr, units);
-            const bool w0_now = hdr && f.colour != f.output && !prep_on && f6.encoding == 1u &&
-                                cfg.frame_format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+            const bool w0_now = hdr && f.colour != f.output && !prep_on && f6.encoding == 1u && linear_float_src;
             if (hdr && !w0_now && !work0.res) work0 = make_tex(W, H, DXGI_FORMAT_R16G16B16A16_FLOAT, true, &why);
             if (hdr && !w0_now && !work0.res) { record_ok_ = false; return 0; }
             if (hdr && (passes > 1 || !fuse_now || !(t0 > 0.f || c0 > 0.f)) && !work_a.res)
@@ -2295,22 +1824,56 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
                 if (!exposure_1x1.res) { record_ok_ = false; return 0; }
             }
         }
+        const uint64_t mv_bytes_need = uint64_t(lin_pitch(NW, 8)) * NH * 8;
+        if (have_motion && (!lin_mv || lin_mv->GetDesc().Width < mv_bytes_need)) {
+            if (ID3D12Resource* nm = make_buffer(mv_bytes_need, nullptr)) { drop_buf(lin_mv); lin_mv = nm; }
+        }
+        const bool net_wants_depth_pre = have_motion && f.depth && !f.motion_without_depth;
+        const uint64_t depth_bytes_need = uint64_t(lin_pitch(NW, 16)) * NH * 16;
+        if (net_wants_depth_pre && (!lin_depth || lin_depth->GetDesc().Width < depth_bytes_need)) {
+            if (ID3D12Resource* nd = make_buffer(depth_bytes_need, nullptr)) { drop_buf(lin_depth); lin_depth = nd; }
+        }
+        const bool look_wanted_pre = look::dispatched(ls, transport_now);
+        const bool area_enc_pre = ls.upsample == look::kUpsampleAreaInput && transport_now;
+        const bool sdr_fast_lin_pre = !v6 && !prep_on && !fast && !il_on && !look_wanted_pre && !sdr_restore && !debug_show &&
+                                      !area_enc_pre && sdr_unit_transfers(passes) && NW == W && NH == H;
+        const bool v6_fast_lin_pre = v6 && !prep_on && !fast && !il_on && !look_wanted_pre && !debug_show;
+        const bool fast_lin_pre = sdr_fast_lin_pre || v6_fast_lin_pre;
+        if (!fast_lin_pre) {
+            if (!proxy.res) proxy = make_tex(NW, NH, DXGI_FORMAT_R16G16B16A16_FLOAT, true, &why);
+            if (!neural.res) {
+                neural = make_placed_tex(alias_heap_a, NW, NH, DXGI_FORMAT_R16G16B16A16_FLOAT);
+                neural_aliased = neural.res != nullptr;
+                if (!neural.res) neural = make_tex(NW, NH, DXGI_FORMAT_R16G16B16A16_FLOAT, true, &why);
+            }
+            if (!proxy.res || !neural.res) { neural_aliased = false; drop(proxy); drop(neural); record_ok_ = false; return 0; }
+        } else if (proxy.res || neural.res) {
+            if (alias_a_active == neural.res) alias_a_active = nullptr;
+            neural_aliased = false;
+            drop(proxy);
+            drop(neural);
+        }
+        const bool direct_in_pre = in_srgb ? (f.colour != f.output && sdr_fast_lin_pre)
+                                           : (f.colour != f.output || v6 || sdr_fast_lin_pre);
+        if (!direct_in_pre && !original.res) {
+            original = make_tex(W, H, cfg.frame_format, false, &why);
+            if (!original.res) { record_ok_ = false; return 0; }
+        }
+        const uint32_t slot_budget = 8u + passes * (26u + (il_on ? il_n * 6u + 8u : 0u));
+        std::string pool_err;
+        if (!outer_pool.reserve(slot_budget, &pool_err)) {
+            record_ok_ = false;
+            nr::pe::log("[nr] RenoDX stage: %s", pool_err.empty() ? "no outer descriptor slot" : pool_err.c_str());
+            return 0;
+        }
     }
 
-    // Preprocess's state cleared when it is new - after every allocation above, the frame's first command
+    // Preprocess's state cleared when it is new - after every allocation above, the frame's first command.
     if (prep_on) {
         if (prep_state_fresh) {
-            D3D12_UNORDERED_ACCESS_VIEW_DESC d{};
-            d.Format = DXGI_FORMAT_UNKNOWN;
-            d.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-            d.Buffer.NumElements = 1;
-            d.Buffer.StructureByteStride = 16;
-            device->CreateUnorderedAccessView(prep_state, nullptr, &d, main_cpu(kClearSlot));
-            device->CreateUnorderedAccessView(prep_state, nullptr, &d, clear_cpu(0));
-            ensure(cmd, prep_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);   // the clear writes it
-            bind_heap(cmd);                                                   // the GPU handle's heap
-            const UINT zero[4] = {};
-            cmd->ClearUnorderedAccessViewUint(main_gpu(kClearSlot), clear_cpu(0), prep_state, zero, 0, nullptr);
+            ensure(cmd, prep_state, D3D12_RESOURCE_STATE_COPY_DEST);
+            cmd->CopyBufferRegion(prep_state, 0, zero_upload, 0, 16);
+            ensure(cmd, prep_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             uav_barrier(cmd);
             prep_state_fresh = false;
         }
@@ -2376,13 +1939,11 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
         st_valid = false;
     }
 
-    // The game's motion vectors, for Detail stability: the subrect copied to the origin of an image of ours
-    // (the Vulkan stage's copy; its in-place read is scheduling only).
+    // The game's motion vectors, for Detail stability / Passes (fast) Feedback / Interleaved fallback: the subrect copied
+    // to the origin of `motion.res` when needed (Interleaved normally reads `f.motion` in place via mbase/mgrid).
     bool motion_copied = false;
-    const bool motion_wanted = (ls.stabilize == 2u && have_motion && look::dispatched(ls, false)) || fast_feedback || il_on;
     if (motion_wanted && have_motion) {
-        const D3D12_RESOURCE_DESC md = f.motion->GetDesc();
-        transition(cmd, f.motion, f.motion_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        ensure(cmd, f.motion, D3D12_RESOURCE_STATE_COPY_SOURCE);
         ensure(cmd, motion.res, D3D12_RESOURCE_STATE_COPY_DEST);
         D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
         src.pResource = f.motion;
@@ -2392,24 +1953,22 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
         dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         dst.SubresourceIndex = 0;
         // The caller reports the region; a box outside the source, or an empty one, is not a copy D3D12 accepts.
-        const uint32_t mx = std::min(f.motion_x, uint32_t(md.Width)), my = std::min(f.motion_y, uint32_t(md.Height));
-        const uint32_t mw = std::min(f.motion_w, uint32_t(md.Width) - mx), mh = std::min(f.motion_h, uint32_t(md.Height) - my);
         D3D12_BOX box{};
-        box.left = mx;
-        box.top = my;
-        box.right = mx + mw;
-        box.bottom = my + mh;
+        box.left = motion_rx;
+        box.top = motion_ry;
+        box.right = motion_rx + motion_rw;
+        box.bottom = motion_ry + motion_rh;
         box.back = 1;
-        if (!mw || !mh) {
+        if (!motion_rw || !motion_rh) {
             // An empty or out-of-bounds region is not a copy D3D12 accepts: skip it and let the look run without motion.
             static bool said = false;
             if (!said) { said = true; nr::pe::log("[nr] RenoDX stage (D3D12): the motion region is outside the guide; the look runs without motion"); }
         } else {
             cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+            cmd_touched_ = true;
             motion_copied = true;
         }
         ensure(cmd, motion.res, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        transition(cmd, f.motion, D3D12_RESOURCE_STATE_COPY_SOURCE, f.motion_state);
     }
     const bool recreate_epoch = recreate || history_reset;   // the governor's reset-epoch snap (PlanFrameScale)
     const bool reset_all = f.reset || history_reset;
@@ -2417,11 +1976,28 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
     history_reset = false;
     recreate = false;
 
-    // The network's guides, onto the network's extent (once a frame): the motion through the frame path's own
-    // linear sample, the depth texel for texel (to_motion / to_depth).
+    struct GuideRestore {
+        Impl& m;
+        ID3D12GraphicsCommandList* cmd;
+        ID3D12Resource* motion = nullptr;
+        D3D12_RESOURCE_STATES motion_st = D3D12_RESOURCE_STATE_COMMON;
+        ID3D12Resource* depth = nullptr;
+        D3D12_RESOURCE_STATES depth_st = D3D12_RESOURCE_STATE_COMMON;
+        ~GuideRestore() {
+            if (motion) m.ensure(cmd, motion, motion_st);
+            if (depth) m.ensure(cmd, depth, depth_st);
+        }
+    } guide_restore{*this, cmd};
+
+    const bool lin_mv_ready = have_motion && lin_mv && lin_mv->GetDesc().Width >= uint64_t(lin_pitch(NW, 8)) * NH * 8;
+    const bool net_wants_depth = have_motion && f.depth && !f.motion_without_depth;
+    const bool have_depth = net_wants_depth && lin_depth && lin_depth->GetDesc().Width >= uint64_t(lin_pitch(NW, 16)) * NH * 16;
+
+    // The network's guides, onto the network's extent (once a frame): kToMotion, kToDepth, and the initial encode
+    // write independent buffers and overlap until pass_net's UAV barrier.
     {
         struct { uint32_t w, h, what, pad; float region[4]; } c{NW, NH, 0, 0, {1.f, 1.f, 0.f, 0.f}};
-        if (have_motion) {
+        if (lin_mv_ready) {
             const D3D12_RESOURCE_DESC md = f.motion->GetDesc();
             const float mtw = float(md.Width), mth = float(md.Height);
             c.region[0] = float(f.motion_w) / mtw;
@@ -2434,27 +2010,16 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
             srv[0].write = false;
             View uav[14] = {};
             uav[0] = bv(lin_mv, uint64_t(lin_pitch(NW, 8)) * NH * 8, true, true);
-            transition(cmd, f.motion, f.motion_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-            states[f.motion] = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-            dispatch(cmd, kToMotion, srv, uav, &c, sizeof c / 4, (NW + 7) / 8, (NH + 7) / 8);
-            transition(cmd, f.motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, f.motion_state);
-            states[f.motion] = f.motion_state;
-            lin_mv_dirty = true;
-        } else if (lin_mv_dirty) {
-            View srv[8] = {};
-            srv[0] = tv(neutral_mv, false);
-            View uav[14] = {};
-            uav[0] = bv(lin_mv, uint64_t(lin_pitch(NW, 8)) * NH * 8, true, true);
-            dispatch(cmd, kToMotion, srv, uav, &c, sizeof c / 4, (NW + 7) / 8, (NH + 7) / 8);
-            lin_mv_dirty = false;
+            dispatch(cmd, kToMotion, srv, uav, &c, sizeof c / 4, (NW + 7) / 8, (NH + 7) / 8, false);
+            if (!record_ok_) return 0;
+            if (f.motion != f.colour && f.motion != f.output && (!have_depth || f.motion != f.depth)) {
+                guide_restore.motion = f.motion;
+                guide_restore.motion_st = f.motion_state;
+            } else {
+                ensure(cmd, f.motion, f.motion_state);
+            }
         }
     }
-    const bool net_wants_depth = have_motion && f.depth && !f.motion_without_depth;
-    if (net_wants_depth && lin_depth->GetDesc().Width < uint64_t(lin_pitch(NW, 16)) * NH * 16) {
-
-        if (ID3D12Resource* nd = make_buffer(uint64_t(lin_pitch(NW, 16)) * NH * 16, nullptr)) { drop_buf(lin_depth); lin_depth = nd; }
-    }
-    const bool have_depth = net_wants_depth && lin_depth && lin_depth->GetDesc().Width >= uint64_t(lin_pitch(NW, 16)) * NH * 16;
     if (have_depth) {
         struct { uint32_t w, h, what, pad; float region[4]; } c{NW, NH, 0, 0, {1.f, 1.f, 0.f, 0.f}};
         const D3D12_RESOURCE_DESC dd = f.depth->GetDesc();
@@ -2477,29 +2042,30 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
         srv[0].write = false;
         View uav[14] = {};
         uav[0] = bv(lin_depth, uint64_t(lin_pitch(NW, 16)) * NH * 16, false, true);
-        transition(cmd, f.depth, f.depth_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        dispatch(cmd, kToDepth, srv, uav, &c, sizeof c / 4, (NW + 7) / 8, (NH + 7) / 8);
-        transition(cmd, f.depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, f.depth_state);
+        dispatch(cmd, kToDepth, srv, uav, &c, sizeof c / 4, (NW + 7) / 8, (NH + 7) / 8, false);
+        if (!record_ok_) return 0;
+        if (f.depth != f.colour && f.depth != f.output) {
+            guide_restore.depth = f.depth;
+            guide_restore.depth_st = f.depth_state;
+        } else {
+            ensure(cmd, f.depth, f.depth_state);
+        }
     }
 
     const bool look_wanted = look::dispatched(ls, transport_now);
     const bool area_enc = ls.upsample == look::kUpsampleAreaInput && transport_now;
-    const bool sdr_fast_lin = !v6 && passes == 1 && !prep_on && !fast && !il_on && !look_wanted && !sdr_restore && !debug_show &&
-                              !area_enc && (s.codec_mode == 0u || s.transfer_strength == 1.0f) && NW == W && NH == H;
+    const bool sdr_fast_lin = !v6 && !prep_on && !fast && !il_on && !look_wanted && !sdr_restore && !debug_show &&
+                              !area_enc && sdr_unit_transfers(passes) && NW == W && NH == H;
     const bool v6_fast_lin = v6 && !prep_on && !fast && !il_on && !look_wanted && !debug_show;
     const bool fast_lin = sdr_fast_lin || v6_fast_lin;
 
-    // 1. The frame input: read in place when colour != output, on v6 (where linearize copies into work0 first), or on
-    // the SDR linear-buffer fast path when the output supports typed UAV loads; otherwise copied into `original` so SDR
-    // decode can read `original` while writing `f.output`.
-    const bool direct_in = f.colour != f.output || v6 || (sdr_fast_lin && decoded_load);
-    Tex in_src{f.colour, W, H, cfg.frame_format};
+    // 1. The frame input: read in place when colour != output (including _SRGB on sdr_fast_lin), on v6 (where
+    // linearize copies into work0 first), or on the SDR linear-buffer fast path; otherwise copied into `original`
+    // so SDR decode / multi-pass / look can read `original`.
+    const bool direct_in = in_srgb ? (f.colour != f.output && sdr_fast_lin)
+                                   : (f.colour != f.output || v6 || sdr_fast_lin);
+    Tex in_src{f.colour, W, H, src_fmt};
     if (!direct_in) {
-        if (!original.res) {
-            std::string why;
-            original = make_tex(W, H, cfg.frame_format, false, &why);
-            if (!original.res) { record_ok_ = false; return 0; }
-        }
         in_src = original;
         transition(cmd, f.colour, f.colour_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
         ensure(cmd, original.res, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -2521,8 +2087,7 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
         ensure(cmd, original.res, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
 
-    const bool w0_frame = v6 && f.colour != f.output && !prep_on && f6.encoding == 1u &&
-                          cfg.frame_format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+    const bool w0_frame = v6 && f.colour != f.output && !prep_on && f6.encoding == 1u && linear_float_src;
     Tex& w0 = w0_frame ? in_src : work0;
 
     if (v6) {
@@ -2534,24 +2099,35 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
             View uav[14] = {};
             uav[0] = tv(work0, true);
             dispatch(cmd, kLinearize, srv, uav, &lin, sizeof lin / 4, gx, gy);
+            if (!record_ok_) return 0;
             if (direct_in && f.colour == f.output) ensure(cmd, f.colour, f.colour_state);
         }
         // with Preprocess's exposure the frame is metered after its forward half; without it before (RenoDX's scale)
-        if (prep_on && !prep_normalise) prep_forward_hdr(w0, true);
+        if (prep_on && !prep_normalise) {
+            prep_forward_hdr(w0, true);
+            if (!record_ok_) return 0;
+        }
         Tex& metered = (prep_on && !prep_normalise) ? work_p : w0;
         feed = kFeedV1;
         if (!units.absolute && !prep_exposure) {
             // 2b. this frame's scale texel: the v1 meter and the governor (feed v1).
             if (!commit_cleared) {
-                D3D12_UNORDERED_ACCESS_VIEW_DESC d{};
-                d.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
-                d.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-                device->CreateUnorderedAccessView(commit.res, nullptr, &d, main_cpu(kClearSlot + 1));
-                device->CreateUnorderedAccessView(commit.res, nullptr, &d, clear_cpu(1));
-                ensure(cmd, commit.res, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);   // the clear writes it
-                bind_heap(cmd);                                                   // the GPU handle's heap
-                const float zero[4] = {};
-                cmd->ClearUnorderedAccessViewFloat(main_gpu(kClearSlot + 1), clear_cpu(1), commit.res, zero, 0, nullptr);
+                ensure(cmd, commit.res, D3D12_RESOURCE_STATE_COPY_DEST);
+                D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+                dst.pResource = commit.res;
+                dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                dst.SubresourceIndex = 0;
+                src.pResource = zero_upload;
+                src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                src.PlacedFootprint.Offset = 0;
+                src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+                src.PlacedFootprint.Footprint.Width = 1;
+                src.PlacedFootprint.Footprint.Height = 1;
+                src.PlacedFootprint.Footprint.Depth = 1;
+                src.PlacedFootprint.Footprint.RowPitch = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+                const D3D12_BOX box{0, 0, 0, 1, 1, 1};
+                cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+                ensure(cmd, commit.res, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 uav_barrier(cmd);
                 commit_cleared = true;
             }
@@ -2581,6 +2157,7 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
                 muav[0] = tv(scale, true);
                 muav[1] = tv(commit, true);
                 dispatch(cmd, kAutoscale, msrv, muav, &meter, sizeof meter / 4, 1, 1);
+                if (!record_ok_) return 0;
             }
             if (feed != kFeedV1) {
                 const bool texture = feed == kFeedTexture && readable;
@@ -2616,9 +2193,11 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
                 euav[0] = tv(scale, true);
                 euav[1] = tv(commit, true);
                 dispatch(cmd, kExposureScale, esrv, euav, feed_constants, 7, 1, 1);
+                if (!record_ok_) return 0;
             }
         }
         if (prep_normalise) prep_forward_hdr(w0, false);   // after RenoDX's scale, which it divides by
+        if (!record_ok_) return 0;
     }
 
 
@@ -2639,17 +2218,28 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
     bool final_shaped = false;
     uint32_t ran = 0;
     bool net_ok = true;
-    for (uint32_t k = 0; k < passes && net_ok; ++k) {
+    for (uint32_t k = 0; k < passes && net_ok && record_ok_; ++k) {
         float transfer = 1.f, color = 1.f;
         strengths(settings, k, &transfer, &color);
         Tex& ref = k == 0 ? (v6 ? w0 : in_src) : stack_out(k - 1);
         Tex& write = stack_out(k);
         if (v6 && transfer <= 0.f && color <= 0.f) {
-            // An explicit zero-strength pass carries the running image across exactly.
-            ensure(cmd, ref.res, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            ensure(cmd, write.res, D3D12_RESOURCE_STATE_COPY_DEST);
-            cmd->CopyResource(write.res, ref.res);
-            uav_barrier(cmd);
+            // An explicit zero-strength pass carries the running image across (kCopyOut if source format/size differs, e.g. w0_frame).
+            const D3D12_RESOURCE_DESC rd = ref.res->GetDesc(), wd = write.res->GetDesc();
+            if (rd.Format == wd.Format && rd.Width == wd.Width && rd.Height == wd.Height) {
+                ensure(cmd, ref.res, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                ensure(cmd, write.res, D3D12_RESOURCE_STATE_COPY_DEST);
+                cmd->CopyResource(write.res, ref.res);
+                uav_barrier(cmd);
+            } else {
+                struct { uint32_t w, h, what, pad; float region[4]; } c{W, H, 0, 0, {}};
+                View srv[8] = {};
+                srv[0] = tv(ref, false);
+                View uav[14] = {};
+                uav[0] = tv(write, true);
+                dispatch(cmd, kCopyOut, srv, uav, &c, 8, (W + 7) / 8, (H + 7) / 8);
+                if (!record_ok_) return 0;
+            }
             ensure(cmd, write.res, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             executed = int32_t(k);
             final_transfer = final_color = 0.f;
@@ -2657,8 +2247,13 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
             continue;
         }
         // 3a. encode: the running image -> the proxy at the network's extent.
+        if (fast_lin && alias_heap_a && (neural_aliased || alias_a_dirty))
+            use_alias(cmd, alias_a_active, alias_a_dirty, lin_proxy);
         if (v6) {
-            if (prep_on && k > 0) prep_forward_hdr(ref, false);
+            if (prep_on && k > 0) {
+                prep_forward_hdr(ref, false);
+                if (!record_ok_) return 0;
+            }
             if (prep_on && pp.curve != 0) {
                 // Preprocess's curve in place of RenoDX's: the same footprint and sRGB, no toe or shoulder.
                 const uint32_t push[4] = {NW, NH, W, H};
@@ -2676,19 +2271,19 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
                 View uav[14] = {};
                 if (v6_fast_lin) {
                     uav[1] = bv(lin_proxy, uint64_t(lin_pitch(NW, 8)) * NH * 8, true, true);
-                    dispatch(cmd, kEncode6Lin, srv, uav, &enc, sizeof enc / 4, nx, ny);
+                    dispatch(cmd, kEncode6Lin, srv, uav, &enc, sizeof enc / 4, nx, ny, false);
                 } else {
                     uav[0] = tv(proxy, true);
                     dispatch(cmd, kEncode6, srv, uav, &enc, sizeof enc / 4, nx, ny);
                 }
             }
         } else if (sdr_fast_lin) {
-            struct { uint32_t w, h, what, pad; uint32_t region[4]; } c{NW, NH, 0, 0, {W, H, 0, 0}};
+            struct { uint32_t w, h, what, pad; uint32_t region[4]; } c{NW, NH, 0, (k == 0 && direct_in && in_srgb) ? 1u : 0u, {W, H, 0, 0}};
             View srv[8] = {};
             srv[0] = tv(ref, false);
             View uav[14] = {};
             uav[0] = bv(lin_proxy, uint64_t(lin_pitch(NW, 8)) * NH * 8, true, true);
-            dispatch(cmd, kSdrEncodeLin, srv, uav, &c, 8, (NW + 7) / 8, (NH + 7) / 8);
+            dispatch(cmd, kSdrEncodeLin, srv, uav, &c, 8, (NW + 7) / 8, (NH + 7) / 8, false);
         } else {
             LegacyConstants c{};
             c.size[0] = NW; c.size[1] = NH; c.source_size[0] = W; c.source_size[1] = H;
@@ -2720,6 +2315,7 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
             push.mode = 1;
             dispatch(cmd, kPrep, srv, uav, &push, sizeof push / 4, nx, ny);
         }
+        if (!record_ok_) return 0;
         // Work in the input the network actually reads, including SDR Preprocess APART.
         Tex& fast_input = prep_apart ? prep_keep : proxy;
         if (fast_feedback && motion_copied) {
@@ -2736,17 +2332,21 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
             uav[4] = tv(fast_input, true);
             uav[5] = tv(st_fbadd, true);
             dispatch(cmd, kStFbIn, srv, uav, &fp, sizeof fp / 4, nx, ny);
+            if (!record_ok_) return 0;
         }
         // 3b. the network: the input into a linear buffer, the D3D12 network, its answer back into `neural` (`kk` the pass
         // whose controls and history it runs with; Interleaved runs it once a slot, `hist_va` that slot's history, `raw`
         // plain - Intensity 1, no Style grade)
-        const auto pass_net = [&](uint32_t kk, bool reset, bool raw, uint64_t hist_va) -> bool {
+        const auto pass_net = [&](Tex& net_in, uint32_t kk, bool reset, bool raw, uint64_t hist_va, bool ext_hist) -> bool {
+            if (!record_ok_) return false;
             if (!fast_lin) {
+                if (alias_heap_a && (neural_aliased || alias_a_dirty))
+                    use_alias(cmd, alias_a_active, alias_a_dirty, lin_proxy);
                 if ((NW & 31u) == 0) {
-                    ensure(cmd, fast_input.res, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    ensure(cmd, net_in.res, D3D12_RESOURCE_STATE_COPY_SOURCE);
                     ensure(cmd, lin_proxy, D3D12_RESOURCE_STATE_COPY_DEST);
                     D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
-                    src.pResource = fast_input.res;
+                    src.pResource = net_in.res;
                     src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
                     src.SubresourceIndex = 0;
                     dst.pResource = lin_proxy;
@@ -2761,17 +2361,18 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
                 } else {
                     struct { uint32_t w, h, what, pad; float region[4]; } c{NW, NH, 0, 0, {1.f, 1.f, 0.f, 0.f}};
                     View srv[8] = {};
-                    srv[0] = tv(fast_input, false);
+                    srv[0] = tv(net_in, false);
                     View uav[14] = {};
                     uav[0] = bv(lin_proxy, uint64_t(lin_pitch(NW, 8)) * NH * 8, true, true);
-                    dispatch(cmd, kTexToBuf, srv, uav, &c, 8, (NW + 7) / 8, (NH + 7) / 8);
+                    dispatch(cmd, kTexToBuf, srv, uav, &c, 8, (NW + 7) / 8, (NH + 7) / 8, false);
+                    if (!record_ok_) return false;
                 }
             }
             // Pass k's controls, RenoDX's (record_renodx.cpp's pass_controls): pass 1's, or pass k's once its
             // "Same as pass 1" is off; with NRSkinIndependent and the Character mask on, Structure at most 1 and a
             // stock Skin sent as 1 (SentSkinSteering).
             nr::D3d12NetControls ck = f.base_controls;
-            ck.history_strength = 1.f;
+            ck.history_strength = s.post_history;   // NRPostHistory (0: the post block's gate closed)
             {
                 const uint32_t ki = std::min(kk, 3u);
                 const bool own = ki > 0 && !s.pass_follow[ki - 1];
@@ -2782,6 +2383,7 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
                 ck.skin_structure = own ? s.pass_skin_structure[ki - 1] : s.skin_structure;
                 ck.automatic_mask = own ? s.pass_auto_mask[ki - 1] : s.auto_mask;
                 ck.seed_fixed = !s.noise_every_frame;
+                ck.pre_history = s.pre_history;
                 if (s.skin_independent && ck.automatic_mask) {
                     ck.local_structure = std::min(ck.local_structure, 1.0f);
                     if (ck.skin_structure < 0.0f) ck.skin_structure = 1.0f;
@@ -2790,7 +2392,7 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
             // RenoDX's guides: NRDepthMode overrides the game's depth direction, NRMVecScaleX / Y scale its motion
             // vectors (the network's and the look's).
             NetTemporal nt;
-            nt.motion_va = lin_mv->GetGPUVirtualAddress();
+            nt.motion_va = lin_mv_ready ? lin_mv->GetGPUVirtualAddress() : 0;
             nt.motion_scale_x = f.motion_scale_x * s.mvec_scale_x;
             nt.motion_scale_y = f.motion_scale_y * s.mvec_scale_y;
             nt.depth_va = have_depth ? lin_depth->GetGPUVirtualAddress() : 0;
@@ -2802,17 +2404,33 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
             // (Interleaved: each slot its own feature, as each legacy pass has its own history)
             nt.feature = (cfg.feature || passes > 1 || il_on) ? stack_feature(cfg.feature ? cfg.feature : kUnnamedStack, kk) : 0;
             nt.history_va = hist_va;
+            nt.external_history = ext_hist;
             nt.have_motion = true;
             // The net reaches these by raw address: lin_proxy and the guides are read (UAV), lin_neural is written (UAV).
             // A real barrier each frame entry - the table is not evidence that the GPU moved.
+            if (alias_heap_b && (look_out_aliased || alias_b_dirty))
+                use_alias(cmd, alias_b_active, alias_b_dirty, lin_neural);
             ensure(cmd, lin_proxy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             ensure(cmd, lin_neural, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            ensure(cmd, lin_mv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            ensure(cmd, lin_depth, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            if (lin_mv_ready) ensure(cmd, lin_mv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            if (have_depth) ensure(cmd, lin_depth, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             uav_barrier(cmd);   // the guides and lin_proxy are read by the net by raw address
             if (raw) { ck.intensity = 1.f; ck.no_grade = true; }   // (Interleaved composes each pass's Intensity and Style itself)
+            rs_outer_bound_ = false;
+            cmd_touched_ = true;
             const bool net_ok_here = net(kk, nt.feature, ck, nt, lin_proxy, lin_neural);
             net_ran_ = net_ran_ || net_ok_here;
+            // Frame reuse's even frames: the network went on in the caller's second list - the rest of the frame there
+            // too (its descriptor slots held by that list's recording; a new list has no root signature bound)
+            if (f.cmd_now) {
+                ID3D12GraphicsCommandList* const now = f.cmd_now();
+                if (now && now != cmd) {
+                    cmd = now;
+                    current_ticket = nr::pe::d3d12_direct::book(cmd);
+                    rs_outer_bound_ = false;
+                    cmd_touched_ = true;
+                }
+            }
             if (!net_ok_here) {
                 if (!net_failed_logged) {
                     net_failed_logged = true;
@@ -2821,6 +2439,7 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
                 return false;
             }
             if (!fast_lin) {
+                if (neural_aliased) use_alias(cmd, alias_a_active, alias_a_dirty, neural.res);
                 if ((NW & 31u) == 0) {
                     ensure(cmd, lin_neural, D3D12_RESOURCE_STATE_COPY_SOURCE);
                     ensure(cmd, neural.res, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -2838,7 +2457,6 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
                     D3D12_BOX box{0, 0, 0, NW, NH, 1};
                     cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
                 } else {
-                    uav_barrier(cmd);
                     ensure(cmd, lin_neural, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                     struct { uint32_t w, h, what, pad; float region[4]; } c{NW, NH, 0, 0, {1.f, 1.f, 0.f, 0.f}};
                     View srv[8] = {};
@@ -2846,17 +2464,22 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
                     View uav[14] = {};
                     uav[0] = tv(neural, true);
                     dispatch(cmd, kBufToTex, srv, uav, &c, 8, (NW + 7) / 8, (NH + 7) / 8);
+                    if (!record_ok_) return false;
                 }
             }
             return true;
         };
         const bool reset = reset_all || (k > 0 && !s.chained_history);
-        // (Interleaved moves its increments by the vectors copied above: a region outside the guide leaves none - the
-        // plain pass then, as on Vulkan)
-        if (il_on && motion_copied ? !il_run(cmd, f, s, reset, fast_input, pass_net) : !pass_net(k, reset, false, 0)) {
+        // (Interleaved reads f.motion in place when safe or falls back to the copied subrect; a region outside leaves
+        // none - the plain pass then, as on Vulkan)
+        const bool il_motion_ok = il_motion_direct || motion_copied;
+        if (il_on && il_motion_ok ? !il_run(cmd, f, s, reset, fast_input, il_motion_direct, motion_rx, motion_ry, motion_rw, motion_rh, pass_net)
+                                  : !pass_net(fast_input, k, reset, false, 0, false)) {
+            if (!record_ok_) return 0;
             net_ok = false;
             break;
         }
+        if (!record_ok_) return 0;
         ++ran;   // the network ran this pass
         if (fast) {
             const bool fb = fast_feedback && motion_copied;
@@ -2907,6 +2530,7 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
                 st_valid = true;
             }
         }
+        if (!record_ok_) return 0;
         // SDR with Preprocess: transfer the edit back through the bounded inverse, restore P to the input
         // (mode 2, RESTORE). Not on the last pass while NR Control's debug view shows this layer.
         const bool debug_raw = s.debug_view >= 1u && s.debug_view <= 3u && k + 1 == passes;
@@ -2924,10 +2548,12 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
             uav[2] = tv(kept, true);
             uav[3] = tv(neural, true);
             dispatch(cmd, kPrep, srv, uav, &back, sizeof back / 4, nx, ny);
+            if (!record_ok_) return 0;
         }
         // 3c. the look: Adjust NR's look, Detail stability, edge-aware upsampling.
         bool shaped = false, transport = false;
         run_look(cmd, k, ref, ls, motion_copied, f, reset, shaped, transport, up_fused);
+        if (!record_ok_) return 0;
         const bool decode_up = up_fused && transport;   // the decode / last resolve makes P_up and N'_up (legacy_decode_up)
         if (transport && up_fused_logged != int(decode_up)) {   // said on a change: which way the transport runs
             up_fused_logged = int(decode_up);
@@ -2948,7 +2574,6 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
             View srv[8] = {};
             srv[0] = tv(ref, false);
             if (v6_fast_lin) {
-                uav_barrier(cmd);
                 srv[1] = bv(lin_proxy, uint64_t(lin_pitch(NW, 8)) * NH * 8, true, false);
                 srv[2] = bv(lin_neural, uint64_t(lin_pitch(NW, 8)) * NH * 8, true, false);
             } else {
@@ -2961,8 +2586,9 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
             const V6PrepConstants pres = prep_constants(res);
             const P rc = v6_fast_lin ? kResolveCommit6Lin : decode_up ? kResolveCommit6Up
                        : prep_resolve ? kResolveCommit6Prep : kResolveCommit6;
+            const bool tail_bar = !direct_out || f.output_state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
             dispatch(cmd, rc, srv, uav, prep_resolve ? static_cast<const void*>(&pres) : static_cast<const void*>(&res),
-                     prep_resolve ? sizeof pres / 4 : sizeof res / 4, gx, gy);
+                     prep_resolve ? sizeof pres / 4 : sizeof res / 4, gx, gy, tail_bar);
             fused = true;
         } else if (v6) {
             const V6Constants res = make_v6(s, f6, W, H, W, H, pw, ph, pw, ph, transfer, color,
@@ -2970,7 +2596,6 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
             View srv[8] = {};
             srv[0] = tv(ref, false);
             if (v6_fast_lin) {
-                uav_barrier(cmd);
                 srv[1] = bv(lin_proxy, uint64_t(lin_pitch(NW, 8)) * NH * 8, true, false);
                 srv[2] = bv(lin_neural, uint64_t(lin_pitch(NW, 8)) * NH * 8, true, false);
             } else {
@@ -2987,14 +2612,17 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
         } else if (sdr_fast_lin) {
             Tex& dst_tex = (direct_out && k + 1 == passes) ? out_target : write;
             const bool inplace_uav = ref.res == dst_tex.res;
-            uav_barrier(cmd);
-            struct { uint32_t w, h, what, pad; uint32_t region[4]; } c{W, H, bits(color), inplace_uav ? 1u : 0u, {pw, ph, 0, 0}};
+            const bool proxy_src = (k == 0 && direct_in && in_srgb) || (inplace_uav && !decoded_load);
+            const uint32_t src_mode = proxy_src ? 2u : (inplace_uav ? 1u : 0u);
+            struct { uint32_t w, h, what, pad; uint32_t region[4]; } c{W, H, bits(color), src_mode, {pw, ph, 0, 0}};
             View srv[8] = {};
-            if (!inplace_uav) srv[0] = tv(ref, false);
+            if (src_mode == 0u) srv[0] = tv(ref, false);
             srv[1] = bv(lin_neural, uint64_t(lin_pitch(NW, 8)) * NH * 8, true, false);
+            if (src_mode == 2u) srv[2] = bv(lin_proxy, uint64_t(lin_pitch(NW, 8)) * NH * 8, true, false);
             View uav[14] = {};
             uav[0] = tv(dst_tex, true);
-            dispatch(cmd, kSdrDecodeLin, srv, uav, &c, 8, (W + 7) / 8, (H + 7) / 8);
+            const bool tail_bar = !(direct_out && k + 1 == passes) || f.output_state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            dispatch(cmd, kSdrDecodeLin, srv, uav, &c, 8, (W + 7) / 8, (H + 7) / 8, tail_bar);
         } else {
             // SDR's copied path: decode -> [reduce -> apply], into `write`.
             LegacyConstants c{};
@@ -3007,16 +2635,17 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
             View uav[14] = {};
             uav[0] = tv((direct_out && k + 1 == passes) ? out_target : write, true);
             const bool fuse_decode_reduce = sdr_restore && !shaped && !transport;
+            const bool tail_bar = sdr_restore || !(direct_out && k + 1 == passes) || f.output_state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
             if (fuse_decode_reduce) {
                 uav[1] = tv(block_mean, true);
-                dispatch(cmd, kDecodeReduceL, srv, uav, &c, sizeof c / 4, (W + 31) / 32, (H + 31) / 32);
+                dispatch(cmd, kDecodeReduceL, srv, uav, &c, sizeof c / 4, (W + 31) / 32, (H + 31) / 32, tail_bar);
             } else if (decode_up) {   // legacy_decode_up: N'_up made from P and N' at the network's extent
                 LegacyConstants u = c;
                 u.proxy_size[0] = u.neural_size[0] = NW; u.proxy_size[1] = u.neural_size[1] = NH;
                 srv[1] = tv(proxy, false); srv[2] = tv(look_out, false);
-                dispatch(cmd, kDecodeUpL, srv, uav, &u, sizeof u / 4, gx, gy);
+                dispatch(cmd, kDecodeUpL, srv, uav, &u, sizeof u / 4, gx, gy, tail_bar);
             } else {
-                dispatch(cmd, kDecodeL, srv, uav, &c, sizeof c / 4, gx, gy);
+                dispatch(cmd, kDecodeL, srv, uav, &c, sizeof c / 4, gx, gy, tail_bar);
             }
             if (sdr_restore) {   // RunBlackLevelRestore: the reduce (when not fused), then the apply
                 c.proxy_size[0] = c.neural_size[0] = NW; c.proxy_size[1] = c.neural_size[1] = NH;
@@ -3028,6 +2657,7 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
                 ruav[1] = tv(block_mean, true);
                 if (!fuse_decode_reduce)
                     dispatch(cmd, shaped ? kReduceLU : kReduceL, rsrv, ruav, &c, sizeof c / 4, (W + 31) / 32, (H + 31) / 32);
+                if (!record_ok_) return 0;
                 LegacyConstants a = c;
                 a.padding[0] = s.sdr_black_restore == 1u ? 2.f : 0.061f;
                 a.padding[1] = restore_mode;
@@ -3035,11 +2665,13 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
                 dispatch(cmd, kApplyL, rsrv, ruav, &a, sizeof a / 4, gx, gy);
             }
         }
+        if (!record_ok_) return 0;
         executed = int32_t(k);
         final_transfer = transfer;
         final_color = color;
         final_shaped = shaped;
     }
+    if (!record_ok_) return 0;
 
     // 4. The last pass's result back into the frame's encoding (HDR: the pedestal block means and the commit),
     // into `decoded`; the copy-out below hands it to the output.
@@ -3068,6 +2700,7 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
                 uav[0] = tv(block_mean, true);
                 dispatch(cmd, kReduce6, srv, uav, &red, sizeof red / 4, (W + 31) / 32, (H + 31) / 32);
             }
+            if (!record_ok_) return 0;
         }
         const V6Constants com = make_v6(s, f6, W, H, W, H, W, H, W, H, final_transfer, final_color, 0.f);
         const bool v2 = !units.absolute && feed != kFeedV1;
@@ -3079,9 +2712,12 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
         View uav[14] = {};
         uav[0] = tv(direct_out ? out_target : decoded, true);
         uav[1] = tv(block_mean, true);
-        dispatch(cmd, v2 ? kCommitExposure : kCommit6, srv, uav, &com, sizeof com / 4, gx, gy);
+        const bool tail_bar = !direct_out || f.output_state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        dispatch(cmd, v2 ? kCommitExposure : kCommit6, srv, uav, &com, sizeof com / 4, gx, gy, tail_bar);
+        if (!record_ok_) return 0;
     }
 
+    if (!record_ok_) return 0;
     if (!net_ok) {   // the network recorded nothing: the frame as it came
         if (direct_in && f.colour != f.output) ensure(cmd, f.colour, f.colour_state);
         copy_frame(cmd, f);
@@ -3103,6 +2739,7 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
         View uav[14] = {};
         uav[4] = tv(result, true);
         dispatch(cmd, kDebug, srv, uav, dv, 5, gx, gy);
+        if (!record_ok_) return 0;
     }
     // 4. The result into the output: a store through float (bit-exact where the formats match).
     {
@@ -3114,7 +2751,9 @@ uint32_t Stage::Impl::record(ID3D12GraphicsCommandList* cmd, const Frame& f, con
         uav[0].fmt = uav_format_of(f.output->GetDesc().Format);
         uav[0].write = true;
         ensure(cmd, f.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        dispatch(cmd, kCopyOut, srv, uav, &c, 8, (W + 7) / 8, (H + 7) / 8);
+        dispatch(cmd, kCopyOut, srv, uav, &c, 8, (W + 7) / 8, (H + 7) / 8,
+                 f.output_state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (!record_ok_) return 0;
         ensure(cmd, f.output, f.output_state);
     }
     return ran;
@@ -3141,27 +2780,32 @@ std::unique_ptr<Stage> Stage::make(const Config& c, std::string* why) {
 Stage::~Stage() {
     Impl& m = *impl_;
     for (Impl::Tex* t : {&m.original, &m.proxy, &m.neural, &m.look_out, &m.decoded, &m.decoded_alt, &m.block_mean,
-                   &m.up_proxy, &m.up_neural, &m.motion, &m.neutral_mv, &m.band_a, &m.band_b, &m.band_max_a,
+                   &m.up_proxy, &m.up_neural, &m.motion, &m.band_a, &m.band_b, &m.band_max_a,
                    &m.band_max_b, &m.prep_keep, &m.st_fineh, &m.st_fbadd, &m.st_d0, &m.st_d1, &m.st_t0, &m.st_t1,
                    &m.st_g0, &m.st_g1, &m.st_f0[0], &m.st_f0[1], &m.st_f1[0], &m.st_f1[1],
                    &m.work0, &m.work_a, &m.work_b, &m.scale, &m.commit, &m.work_p, &m.exposure_1x1})
         m.drop(*t);
     m.drop_buf(m.trace);
     m.drop_buf(m.prep_state);
+    m.drop_buf(m.zero_upload);
     m.drop_buf(m.lin_proxy);
     m.drop_buf(m.lin_neural);
     m.drop_buf(m.lin_mv);
     m.drop_buf(m.lin_depth);
     for (auto& pl : m.looks) { m.drop_buf(pl.history[0]); m.drop_buf(pl.history[1]); }
     m.drop_il();
-    for (auto& bank : m.il_pso) for (auto& p : bank) release(p);
-    for (auto& lay : m.il_lay) release(lay.rs);
-    release(m.ilpp_pso); release(m.ilpp_lay.rs);
-    for (auto& p : m.pso) release(p);
-    release(m.rs_codec);
-    release(m.rs_aux);
-    release(m.heap);
-    release(m.clear_heap);
+    for (ID3D12Heap** hp : {&m.alias_heap_a, &m.alias_heap_b}) {
+        if (!*hp) continue;
+        if (m.retire) m.retire(*hp); else release(*hp);
+        *hp = nullptr;
+    }
+    m.alias_a_active = m.alias_b_active = nullptr;
+    m.outer_pool.reset();
+    for (auto& bank : m.il_kernels) for (auto& k : bank) release(k.pso);
+    for (auto& bank : m.il_ga_kernels) for (auto& k : bank) release(k.pso);
+    release(m.ilpp_kernel.pso);
+    for (auto& k : m.kernels) release(k.pso);
+    release(m.rs_outer);
 }
 
 bool Stage::set(const Settings& s) {
@@ -3181,6 +2825,7 @@ bool Stage::set(const Settings& s) {
 }
 
 bool Stage::record_ok() const { return impl_ ? impl_->record_ok_ : false; }
+bool Stage::cmd_touched() const { return impl_ ? impl_->cmd_touched_ : false; }
 bool Stage::net_ran() const { return impl_ ? impl_->net_ran_ : false; }
 void Stage::set_completed(std::function<bool(uint64_t)> f) { impl_->completed = std::move(f); }
 void Stage::set_frame(uint64_t f) { impl_->pinned = f; }
@@ -3196,52 +2841,10 @@ void Stage::set_retire(std::function<void(IUnknown*)> f) {
     if (impl_) impl_->retire = std::move(f);
 }
 
-void prewarm_shaders(const std::wstring& shaders) {
+void prewarm_shaders(const std::wstring& /*shaders*/) {
     static std::atomic<bool> started{false};
     if (started.exchange(true)) return;
-    std::thread([shaders] {
-        FolderInclude includer;
-        includer.dirs = {shaders, shaders + L"\\renodx-prep"};
-        struct File { const char* name; const char* macro; };
-        const File files[] = {
-            {"legacy_encode", nullptr}, {"legacy_decode", nullptr},
-            {"legacy_reduce", nullptr}, {"legacy_reduce_unshaped", nullptr},
-            {"legacy_apply", nullptr}, {"legacy_decode_reduce", nullptr},
-            {"look_compose", nullptr}, {"look_upsample", nullptr}, {"look_band", nullptr},
-            {"v6_linearize", nullptr}, {"v6_autoscale", nullptr},
-            {"v6_exposure_scale", nullptr}, {"v6_encode", nullptr},
-            {"v6_resolve", nullptr}, {"v6_pedestal_reduce", nullptr},
-            {"v6_pedestal_reduce_unshaped", nullptr}, {"v6_commit", nullptr},
-            {"v6_commit_exposure", nullptr}, {"v6_resolve_commit", nullptr},
-            {"v6_resolve", "NR_PREP_RESOLVE"},
-            {"v6_resolve_commit", "NR_PREP_RESOLVE"},
-            {"v6_pedestal_reduce_unshaped", "NR_PREP_RESOLVE"},
-            {"v6_encode", "NR_LIN_IO"},
-            {"v6_resolve", "NR_LIN_IO"},
-            {"v6_resolve_commit", "NR_LIN_IO"},
-        };
-        std::string why;
-        for (const auto& f : files) {
-            std::string text = read_text(shaders + L"\\" + std::wstring(f.name, f.name + std::strlen(f.name)) + L".cs_5_1.hlsl");
-            if (text.empty()) continue;
-            if (f.macro && std::strcmp(f.macro, "NR_LIN_IO") == 0) {
-                FolderInclude::replace_all(
-                    text, "Output[pixel] = float4(SrgbEncode(proxy), 1.0);", lin_io_store().c_str());
-            }
-            const D3D_SHADER_MACRO macros[] = {{f.macro, "1"}, {nullptr, nullptr}};
-            release(compile_hlsl(text.data(), text.size(), "main", &why, &includer, f.macro ? macros : nullptr));
-        }
-        const size_t up = shaders.find_last_of(L"\\/");
-        const std::wstring ours = (up == std::wstring::npos ? shaders : shaders.substr(0, up)) + L"\\d3d12\\renodx\\";
-        for (const char* name : {"renodx_prep_encode", "renodx_debug", "renodx_prep", "renodx_st_fb_in",
-                                 "renodx_st_prep", "renodx_st_box", "renodx_st_apply"}) {
-            const std::string text = read_text(ours + std::wstring(name, name + std::strlen(name)) + L".hlsl");
-            if (!text.empty()) release(compile_hlsl(text.data(), text.size(), "main", &why, nullptr, nullptr));
-        }
-        const std::string aux = aux_shaders_pitched();
-        for (const char* entry : {"tex_to_buf", "buf_to_tex", "copy_out", "to_motion", "to_depth", "sdr_encode_lin", "sdr_decode_lin"})
-            release(compile_hlsl(aux.data(), aux.size(), entry, &why, nullptr));   // the text build() compiles
-    }).detach();
+    std::thread([] { (void)d3d12_outer::shared_archive(nullptr); }).detach();
 }
 
 }  // namespace nr::pe::d3d12_passthrough::renodx12

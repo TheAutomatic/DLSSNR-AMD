@@ -192,6 +192,24 @@ uint nr_out_ch(uint head, uint d) {
 #ifndef NR_VPRENORMALIZED
 #define NR_VPRENORMALIZED 0
 #endif
+#ifndef NR_VKPOOL
+#define NR_VKPOOL 0
+#endif
+#if NR_VKPOOL && !NR_VTRANS
+#error "NR_VKPOOL: the transposed (NR_VTRANS) key loop only"
+#endif
+// NR_VTAIL (CC_SMALL_FP8_OPTIMIZED): mode bits 20..31 = M / 16, the tokens the ViT computes when the raster ends in
+// rows of identical padding tokens (4K: 2160 tokens, the last 120 all zero at the first ViT block and equal to each
+// other at every later one). Queries stop at M (the host launches M / NR_QT tiles); the keys and values from M on are
+// read as token M - 1 - a padding token, bit for bit what they hold - by a fragment load with stride 0, so the sums
+// see the same keys in the same order and the output is the full computation's byte for byte.
+#ifndef NR_VTAIL
+#define NR_VTAIL 0
+#endif
+#if NR_VTAIL && !NR_VTRANS
+#error "NR_VTAIL: the transposed (NR_VTRANS) key loop only"
+#endif
+#define NR_VT_PAD 0
 #ifndef NR_VPACKED_DEN
 #define NR_VPACKED_DEN 0
 #endif
@@ -378,7 +396,11 @@ void main() {
     if (nr_tc_rec != 0xFFFFFFFFu && nr_tc_w[nr_tc_rec + 2u] != 0xFFFFFFFFu) {
         const uint nr_twt = nr_tc_w[nr_tc_rec], nr_ttb = nr_tc_w[nr_tc_rec + 2u];
         const uint nr_te = subgroupBroadcastFirst(atomicAdd(nr_tc_u[nr_tc_w[nr_tc_rec + 4u]], 0u));
+#if NR_VTAIL
+        const uint nr_nt = (pc.mode >> 20u) != 0u ? (pc.mode >> 20u) : (pc.tokens + 15u) / 16u;   // the QKV ran M tokens
+#else
         const uint nr_nt = (pc.tokens + 15u) / 16u;
+#endif
         uint nr_tb = NR_TCHAIN_BOUND;
         bool nr_ok;
         do {
@@ -474,14 +496,42 @@ void main() {
 #endif
 #endif
 
-    for (uint j0 = 0u; j0 < pc.tokens; j0 += uint(NR_KC)) {
+    // NR_VKPOOL (CC_SMALL_FP8_OPTIMIZED Performance, 4K-class frames): this layer pools some heads' keys and values
+    // (mode bit 16). A pooled head's factor f (2, 4, 8 or 16; 0 = the full keys) is the float after its temperature;
+    // its T/f keys are the tokens of its own region in the QKV slot, after token align(T,32) (vit_kvpool.comp writes
+    // them; regions of f = 2, 4, 8, 16 in that order, align(T/f,32) tokens each). One pooled key stands for f: the
+    // log(f) its logit would need cancels in the softmax, every key of the head being pooled alike. Without
+    // NR_VKPOOL the macros are the original names and the module is the original's byte for byte.
+#if NR_VKPOOL
+    const uint nr_pf = (pc.mode & 0x10000u) != 0u ? uint(wgt_f32[pc.s_off + 32u + head]) : 0u;
+    uint nr_kt = (pc.tokens + 31u) & ~31u;
+    for (uint g = 2u; g < nr_pf; g *= 2u) nr_kt += (pc.tokens / g + 31u) & ~31u;
+    const uint nr_ktok = nr_pf >= 2u ? pc.tokens / nr_pf : pc.tokens;
+    const uint nr_kx = nr_pf >= 2u ? pc.x_off + nr_kt * X3 : pc.x_off;
+    const uint nr_kjlast = (nr_ktok - 1u) & ~15u;
+#define NR_KTOK nr_ktok
+#define NR_KX nr_kx
+#define NR_KJLAST nr_kjlast
+#else
+#define NR_KTOK pc.tokens
+#define NR_KX pc.x_off
+#define NR_KJLAST jlast
+#endif
+#if NR_VTAIL   // the full keys only: a pooled head's pooled tokens were built from token M - 1 already
+#if NR_VKPOOL
+    const uint nr_vt = nr_pf >= 2u ? 0u : (pc.mode >> 20u) * 16u;
+#else
+    const uint nr_vt = (pc.mode >> 20u) * 16u;
+#endif
+#endif
+    for (uint j0 = 0u; j0 < NR_KTOK; j0 += uint(NR_KC)) {
 #if !NR_VPRENORMALIZED
         for (uint ki = lane; ki < uint(NR_KC); ki += uint(NR_VTHREADS)) {
-            const uint j = min(j0 + ki, pc.tokens - 1u);
-            const bool live = j0 + ki < pc.tokens;
+            const uint j = min(j0 + ki, NR_KTOK - 1u);
+            const bool live = j0 + ki < NR_KTOK;
             float nk = 0.0;
             for (uint h = 0u; h < 2u; ++h) {
-                const uint kb = nr_at(pc.x_off, j, kbase + h * 16u, X3) >> 2;
+                const uint kb = nr_at(NR_KX, j, kbase + h * 16u, X3) >> 2;
                 for (uint i = 0u; i < 4u; ++i) {
                     const vec4 kf = live ? vec4(act_x4[kb + i]) : vec4(0.0);
                     nk += dot(kf, kf);
@@ -491,12 +541,44 @@ void main() {
         }
         barrier();
 #endif
+#if NR_VTAIL
+        if (nr_vt != 0u && j0 >= nr_vt) {   // a chunk of the padding tail: every key and value = token nr_vt - 1
+            const uint nr_krep = nr_at16(NR_KX, nr_vt - 16u, kbase, X3) + 240u;   // row 15 of its tile
+            const uint nr_vrep = nr_at16(NR_KX, nr_vt - 16u, vbase, X3) + 240u;
+#undef NR_VT_PAD
+#define NR_VT_PAD 1
+#if NR_VSPLIT_TAIL
+            if (j0 + uint(NR_KC) <= NR_KTOK) {
+#if NR_VADDR
+                const uint kcb = nr_krep, vcb = nr_vrep;
+#endif
+#if NR_VKMAN
+                const uint kc4 = (nr_krep >> 2) + (sl >> 4u) * 2u;   // every lane on row 15, its own 8 channels
+#endif
+#define NR_VT_GUARD 0
+#include "vit_attn_vt_chunk.glsl"
+#undef NR_VT_GUARD
+            } else {
+#define NR_VT_GUARD 1
+#include "vit_attn_vt_chunk.glsl"
+#undef NR_VT_GUARD
+            }
+#else
+#define NR_VT_GUARD 1
+#include "vit_attn_vt_chunk.glsl"
+#undef NR_VT_GUARD
+#endif
+#undef NR_VT_PAD
+#define NR_VT_PAD 0
+            continue;
+        }
+#endif
 #if NR_VSPLIT_TAIL
         // Full chunks take the unguarded body; only a final partial
         // chunk pays for the tile tests. Same arithmetic, same order.
-        if (j0 + uint(NR_KC) <= pc.tokens) {
+        if (j0 + uint(NR_KC) <= NR_KTOK) {
 #if NR_VADDR
-            const uint kcb = nr_at16(pc.x_off, j0, kbase, X3), vcb = nr_at16(pc.x_off, j0, vbase, X3);
+            const uint kcb = nr_at16(NR_KX, j0, kbase, X3), vcb = nr_at16(NR_KX, j0, vbase, X3);
 #endif
 #if NR_VKMAN
             const uint kc4 = (kcb >> 2) + vkl4;
@@ -518,7 +600,7 @@ void main() {
 
     // The original subtracts exp(0) for padded keys after summation.
 #if !NR_VKMASK
-    const uint pad_keys = ((pc.tokens + uint(NR_KC)-1u)/uint(NR_KC))*uint(NR_KC)-pc.tokens;
+    const uint pad_keys = ((NR_KTOK + uint(NR_KC)-1u)/uint(NR_KC))*uint(NR_KC)-NR_KTOK;
     const NR_F16 padding = NR_F16(float(pad_keys)*nr_vit_exp(0.0));
     for (uint b = 0u; b < uint(NR_QB); ++b)
         den[b] = float(NR_F16(NR_F16(den[b])-padding));

@@ -9,8 +9,8 @@ namespace nr {
 namespace {
 enum class Kind { Plain, Pre, Post, Down, SwinUp, DecoderUp, FinalHead };
 struct Record { const char* row; Kind kind; int skip; bool original; int sx, sy; };
-#include "nr_native_plan_data.hpp"
-#include "nr_native_plan_data_small.hpp"
+#include "nr_native_plan_data_cc_silver_aardwold.hpp"
+#include "nr_native_plan_data_cc_small_fp8.hpp"
 struct Shape { uint32_t w, h; }; // host tensor scalars, not raster axes
 struct LayerShape { Shape before, after; };
 struct Walk { std::string text; uint32_t nx{}, ny{}; };
@@ -51,7 +51,7 @@ Walk walk(const Record (&records)[N], uint32_t source_width, uint32_t source_hei
             if (record.kind == Kind::FinalHead) plan = out;
             if (record.kind == Kind::DecoderUp) plan = {up(out.w, 4), up(out.h, 4)};
             if (record.kind == Kind::Post) plan = {source_height / 2, source_width / 2};
-            // ViT layers (310.8 blocks 31..38, small model 11..18) keep their token count unaligned.
+            // ViT layers (CC_SILVER_AARDWOLD blocks 31..38, CC_SMALL_FP8 11..18) keep their token count unaligned.
             const uint64_t tokens = row[17].rfind("CCVit1D", 0) == 0
                 ? uint64_t(plan.w) * plan.h : uint64_t(up(plan.w, 8)) * up(plan.h, 8);
             row[3] = std::to_string(plan.w); row[4] = std::to_string(plan.h); row[5] = std::to_string(tokens);
@@ -75,7 +75,7 @@ NativePlan plan_for(const Record (&records)[N], const char* fingerprint, uint32_
     uint32_t ax = 1u << probe.nx, ay = 1u << probe.ny;
     // The real DLL aligns an axis to twice that when the pre block's output along it,
     // up((n + 1) / 2, 4), is 4 mod 8 (measured against nvngx_dlssnr 310.9: 1080 -> 1152).
-    // Small model only; the 310.8 model keeps its previous extents.
+    // CC_SMALL_FP8 only; CC_SILVER_AARDWOLD keeps its previous extents.
     if (dll_align) {
         if (up((width + 1) / 2, 4) % 8 == 4) ax *= 2;
         if (up((height + 1) / 2, 4) % 8 == 4) ay *= 2;
@@ -89,7 +89,7 @@ NativePlan plan_for(const Record (&records)[N], const char* fingerprint, uint32_
     return result;
 }
 NativePlan make_native_plan(uint32_t width, uint32_t height, NetworkModel model) {
-    return model == NetworkModel::Small ? plan_for(records_small, model_fingerprint_small, width, height, true)
+    return model == NetworkModel::SmallFp8 ? plan_for(records_small_fp8, model_fingerprint_small_fp8, width, height, true)
                                         : plan_for(records, model_fingerprint, width, height, false);
 }
 } // namespace nr

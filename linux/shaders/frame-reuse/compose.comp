@@ -1,0 +1,540 @@
+#version 460
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+// Frame reuse: one shader, four modes (push constant `mode`):
+//   0  the vectors of the last frames composed into one field (the network's vectors after a rebuilt frame)
+//   1  a completed answer's edit (answer - its input) stored in the anchor's coordinates
+//   2  a rebuilt frame: the last answer's edit carried along the game's vectors onto this frame
+//   3  the fill: pixels the carried edit cannot be trusted on (just uncovered) take it from trusted pixels nearby
+// Bit 134217728 of `protection` shows mode 2's decisions instead of the picture (direct, uncovered, donor mass).
+// The two-sided rebuild: `side` 1 = mode 2 stores (edit, trust) into Side0 instead of the picture, `side` 2 merges its
+// own with them into Side0 (merge_sides); mode 4 = the forward field (where this frame's pixels are in the NEXT frame) by
+// inverting the next frame's backward vectors; mode 3 with side 3 fills from Side0.
+// Two-sided rebuild with rebuild_flags & 2: mode 2 weighs each side by its outline context (context.comp's classes of this
+// frame's depth and of the anchors' depths), carried in MatchOut0 / in side 2's registers; the merge applies the weights.
+// Mode 7 = this frame's depth at every pixel (depth_at, the bilinear read of Depth) into DepthFullOut: modes 6, 2 and 3
+// read a pixel's depth from it instead of filtering again - run first. Mode 6 = the nearer surface near each pixel of the
+// frame (its depth alone decides it: the same for both sides) into PickOut, read by mode 2 - run before it.
+layout(local_size_x=16,local_size_y=16) in;
+layout(binding=0) uniform sampler2D Current;
+layout(binding=1) uniform sampler2D Anchor0;
+layout(binding=2) uniform sampler2D Anchor1;
+layout(binding=3) uniform sampler2D Edit0;
+layout(binding=4) uniform sampler2D Edit1;
+layout(binding=5) uniform sampler2D Motion0;
+layout(binding=6) uniform sampler2D Motion1;
+layout(binding=7) uniform sampler2D Motion2;
+layout(binding=8) uniform sampler2D Rendered;
+// Match the native 16-bit UNORM display precision on those swapchains.
+#ifdef UNORM16_OUTPUT
+layout(binding=9,rgba16) uniform writeonly image2D Out;
+#else
+layout(binding=9,rgba16f) uniform writeonly image2D Out;
+#endif
+layout(binding=10,rgba16f) uniform writeonly image2D OutEdit0;
+layout(binding=11,rgba16f) uniform writeonly image2D OutEdit1;
+layout(binding=12,rg32f) uniform writeonly image2D Composed;
+layout(binding=13) uniform sampler2D Depth;
+layout(binding=14) uniform sampler2D AnchorDepth0;
+layout(binding=15) uniform sampler2D AnchorDepth1;
+layout(binding=16,rgba16f) uniform writeonly image2D SideOut0;
+layout(binding=18) uniform sampler2D Side0;
+layout(binding=20,r16f) uniform writeonly image2D MatchOut0;
+layout(binding=22) uniform sampler2D Match0;
+layout(binding=24) uniform sampler2D ContextNow;   // context.comp's classes of this frame's depth / the anchors' depths
+layout(binding=25) uniform sampler2D Context0;
+layout(binding=26) uniform sampler2D Context1;
+layout(binding=27,r8) uniform writeonly image2D PickOut;   // mode 6: near_tap() of each pixel (/ 255)
+layout(binding=28) uniform sampler2D Pick;
+layout(binding=29,r32f) uniform writeonly image2D DepthFullOut;   // mode 7: depth_at(Depth) at every pixel
+layout(binding=30) uniform sampler2D DepthFull;
+layout(push_constant) uniform Push {
+    uvec2 size, grid;
+    uint mode, current_motion, bank, age, valid, previous;
+    float blend, stay_margin;
+    uint protection, inverted;
+    uint side; float merge_k;
+    float stay_fixed;   // a fixed overlay's pixel changes at most this much in place (the hosts: 6/255)
+    uint rebuild_flags; // 1 = the future side checks its source (on screen, maps back onto the pixel by the next
+                        // frame's own vectors in bank `previous` within ~2 px) - else it counts as uncovered;
+                        // 2 = the two sides are weighted by their outline context (context.comp's classes; mode 2 stores the
+                        // weight in MatchOut, mode 5 applies it)
+} pc;
+const uint kShowDecisions=134217728u,kFillStore=268435456u,kContextWeight=2u;
+vec4 fetch_clamp(sampler2D s,ivec2 p) {return texelFetch(s,clamp(p,ivec2(0),textureSize(s,0)-1),0);}
+vec4 bilinear(sampler2D s,vec2 p) {
+    ivec2 a=ivec2(floor(p));vec2 w=fract(p);
+    return mix(mix(fetch_clamp(s,a),fetch_clamp(s,a+ivec2(1,0)),w.x),
+               mix(fetch_clamp(s,a+ivec2(0,1)),fetch_clamp(s,a+ivec2(1)),w.x),w.y);
+}
+vec2 motion(uint bank,vec2 p) {
+    ivec2 q=ivec2(floor((p+.5)/vec2(pc.size)*vec2(pc.grid)));
+    return (bank==0u?fetch_clamp(Motion0,q):bank==1u?fetch_clamp(Motion1,q):fetch_clamp(Motion2,q)).rg*vec2(pc.size);
+}
+vec2 chain(vec2 p,uint age) {
+    for(uint k=0u;k<age;++k) p+=motion((pc.current_motion+3u-k)%3u,p);
+    return p;
+}
+// Anchors, edits and the anchors' depths through the texture unit's bilinear filter (linear, clamp-to-edge samplers; 8
+// sub-texel bits) in place of 4 fetches each; this frame's depth by 4 fetches (Mesa 26.2.6 crashes compiling a filtered
+// read of it - binding 13, also read per texel; filtering it gained nothing measurable anyway)
+vec3 anchor(uint bank,vec2 p) {vec2 uv=(p+.5)/vec2(pc.size);return (bank==0u?textureLod(Anchor0,uv,0):textureLod(Anchor1,uv,0)).rgb;}
+vec3 edit(uint bank,vec2 p) {vec2 uv=(p+.5)/vec2(pc.size);return (bank==0u?textureLod(Edit0,uv,0):textureLod(Edit1,uv,0)).rgb;}
+float near_depth(float z) {return pc.inverted!=0u?z:1.0-z;}
+// The pixel's own surface: depth bilinear on the depth grid (a boundary gets intermediate depths, so the surface choice
+// fades with the picture's own, often motion-blurred, edge); rel = relative difference.
+float depth_at(sampler2D s,vec2 p) {vec2 n=vec2(textureSize(s,0));return near_depth(bilinear(s,(p+.5)/vec2(pc.size)*n-.5).r);}
+// depth_at(Depth, p) of a pixel p of the frame (mode 7's image); one outside the frame filtered here as before
+float depth_px(ivec2 p) {
+    return all(greaterThanEqual(p,ivec2(0))) && all(lessThan(p,ivec2(pc.size)))?texelFetch(DepthFull,p,0).r:depth_at(Depth,vec2(p));
+}
+float anchor_depth(uint bank,vec2 p) {vec2 uv=(p+.5)/vec2(pc.size);return near_depth((bank==0u?textureLod(AnchorDepth0,uv,0.0):textureLod(AnchorDepth1,uv,0.0)).r);}
+float rel_depth(float a,float b) {return (a-b)/max(max(abs(a),abs(b)),1e-7);}
+// The source position refined by one pixel where that matches the current colour better (centre + 4 taps 2 px apart).
+float source_patch_error(uint bank,vec2 p,vec2 q) {
+    const ivec2 offsets[5]=ivec2[5](ivec2(0),ivec2(-2,0),ivec2(2,0),ivec2(0,-2),ivec2(0,2));
+    float error=0;
+    for(int k=0;k<5;++k){vec3 d=fetch_clamp(Current,ivec2(p)+offsets[k]).rgb-anchor(bank,q+vec2(offsets[k]));error+=dot(d,d);}
+    return error/15;
+}
+vec2 refine_correspondence(uint bank,vec2 p,vec2 q) {
+    // Preserve fixed overlays and already exact source correspondence.
+    if(dot(q-p,q-p)<1e-8 || any(lessThan(q,vec2(3))) || any(greaterThan(q,vec2(pc.size)-4)))return q;
+    float base=source_patch_error(bank,p,q),best=base;vec2 selected=q;
+    if(base<=1.0/(255.0*255.0))return q;
+    const vec2 shifts[4]=vec2[4](vec2(-1,0),vec2(1,0),vec2(0,-1),vec2(0,1));
+    for(int k=0;k<4;++k){vec2 v=q+shifts[k];float cost=source_patch_error(bank,p,v)+1.0/(255.0*255.0);if(cost<best){best=cost;selected=v;}}
+    return selected;
+}
+// A motion-blurred edge's halo carries the moving object's colour but the background's vector and depth. The vector of
+// the nearest nearer surface within kDilate pixels is tried as well; whichever source position matches the current
+// colour better (centre + 4 taps 2 px apart) is kept.
+const float kDilate=24.0;
+float match_error(uint bank,vec2 p,vec2 q) {
+    float e=0;
+    for(int k=0;k<5;++k){ivec2 o=k==0?ivec2(0):k==1?ivec2(-2,0):k==2?ivec2(2,0):k==3?ivec2(0,-2):ivec2(0,2);
+        vec3 d=abs(fetch_clamp(Current,ivec2(p)+o).rgb-anchor(bank,q+vec2(o)));e+=max(d.r,max(d.g,d.b));}
+    return e/5;
+}
+// The search: 3 rings x 8 directions; the tap (1 + 8 (ring - 1) + direction) where a surface more than 5 % nearer than the
+// nearest one so far was found last, 0: none. It depends on the frame's depth alone: mode 6 runs it once a rebuilt frame
+// and both sides' mode 2 read it.
+vec2 near_tap_position(vec2 p,int r,int k) {
+    vec2 o=vec2(k==0||k==1||k==7?1:k==3||k==4||k==5?-1:0,k==1||k==2||k==3?1:k==5||k==6||k==7?-1:0)*(kDilate*float(r)/3.0);
+    return clamp(p+o,vec2(0),vec2(pc.size)-1);
+}
+uint near_tap(vec2 p) {
+    float best=texelFetch(DepthFull,ivec2(p),0).r;uint tap=0u;
+    for(int r=1;r<=3;++r)for(int k=0;k<8;++k){
+        float z=texelFetch(DepthFull,ivec2(near_tap_position(p,r,k)),0).r;
+        if(z>best*1.05){best=z;tap=uint(8*(r-1)+k+1);}
+    }
+    return tap;
+}
+vec2 near_pick;      // the nearest nearer surface found (else p), whether or not its vector won
+vec2 dilated_source(uint bank,vec2 p,vec2 q) {
+    uint tap=uint(texelFetch(Pick,ivec2(p),0).r*255.0+.5);
+    vec2 pick=tap==0u?p:near_tap_position(p,int(tap-1u)/8+1,int(tap-1u)%8);
+    near_pick=pick;
+    if(pick==p)return q;
+    vec2 alt=p+motion(pc.current_motion,pick);
+    if(match_error(bank,p,alt)+1.0/255.0<match_error(bank,p,q))return alt;
+    return q;
+}
+// A deep edit (Legacy 3 darkens a person ~130 -> ~30) behaves as a ratio: moved additively it carries every texture /
+// blur difference between the frames at full size. The moved edit with the input difference scaled by the answer's
+// ratio (blended in from no edit to kRatioFull deep), k = 4 codes.
+const float kRatioFull=.235,kDeepLo=.04,kDeepHi=.16,kHalo=24.0;
+vec3 ratio_edit(vec3 e,vec3 a,vec3 c) {
+    float g=clamp(-dot(e,vec3(.2126,.7152,.0722))/kRatioFull,0.0,1.0);
+    return e+g*(c-a)*e/(abs(a)+4.0/255.0);
+}
+// nearer surface within ~2 px of the pixel (an occluder's edge): the moved edit is not trusted there
+float near_edge(vec2 p) {
+    ivec2 n=textureSize(Depth,0),d=ivec2((p+.5)/vec2(pc.size)*vec2(n));float zc=near_depth(fetch_clamp(Depth,d).r),close=zc;
+    for(int y=-1;y<=1;++y)for(int x=-1;x<=1;++x)close=max(close,near_depth(fetch_clamp(Depth,d+ivec2(x,y)).r));
+    return smoothstep(.03,.10,rel_depth(close,zc));
+}
+// The outline context (context.comp): class = the first ring (2, 4, 8, 16 px at 720p) that reaches a surface nearer by
+// more than 5 % (4: none). In the two-sided merge a side whose source lies 2 classes nearer an outline than the pixel now
+// weighs .3, 3 or more .05 - it would bring that outline's rim (the network's context) to a place one frame of relative
+// motion away (an orbit camera: the figure stays, the wall slides behind it - rings around the figure). Faded out from 60 to
+// 80 px of motion a frame (at 720p): in a whip turn's motion blur nearly every source lies near some outline and the
+// weights only cost (outlines and edges further from every-frame NR).
+const float kContextFade0=60.0,kContextFade1=80.0;
+float context_at(sampler2D s,vec2 p) {
+    ivec2 n=textureSize(s,0);
+    return floor(texelFetch(s,clamp(ivec2((p+.5)/vec2(pc.size)*vec2(n)),ivec2(0),n-1),0).r*4.0+.5);
+}
+float context_weight(uint bank,vec2 p,vec2 q) {
+    if(q==p)return 1.0;
+    float d=context_at(ContextNow,p)-(bank==0u?context_at(Context0,q):context_at(Context1,q));
+    return mix(d<=1.0?1.0:d<=2.0?.3:.05,1.0,smoothstep(kContextFade0,kContextFade1,length(q-p)*(720.0/float(pc.size.y))));
+}
+vec4 dbg=vec4(0);   // decision map (kShowDecisions): direct, uncovered, own-surface donor mass, used
+float match_err=0;  // the source's input mismatch (3x3 patch, max channel) of mode 2's pixel
+// What the donor search of a pixel needs from the steps before it (handed to another invocation of the tile).
+struct Tail {vec2 q;float zc;vec3 halo_e;float halo_w;vec3 moved;float deep;float direct;};
+// The edit up to the direct test: true with `e` set when the moved edit is taken directly; false with `t` set when the
+// pixel needs the donor search (reconstruct_tail).
+bool reconstruct_head(uint bank,vec2 p,vec2 q,out vec3 e,out Tail t) {
+    dbg.w=1;
+    vec2 q_own=q;
+    near_pick=p;
+    if(pc.age==1u && q!=p)q=dilated_source(bank,p,q);
+    q=refine_correspondence(bank,p,q);
+    vec3 c=fetch_clamp(Current,ivec2(p)).rgb;
+    // A motion-blur halo - the game blurs a moving surface's colour past its depth / vector edge, onto pixels whose
+    // depth and vector are the surface behind. This pixel's colour fitted as a mix of the two sources (own vector, the
+    // nearer surface's vector) and their edits mixed alike, where the two differ and the fit is good - only right at a
+    // depth edge (the blur rim).
+    float halo_w=0;vec3 halo_e=vec3(0);
+    if(pc.age==1u && near_pick!=p && q_own!=p) {
+        vec2 qn=p+motion(pc.current_motion,near_pick);
+        vec3 cf=anchor(bank,q_own),cn=anchor(bank,qn),dv=cn-cf;float dd=dot(dv,dv);
+        float al=clamp(dot(c-cf,dv)/max(dd,1e-8),0.0,1.0);vec3 res=abs(c-(cf+al*dv));
+        halo_w=smoothstep(10.0/255.0,16.0/255.0,sqrt(dd))*(1.0-smoothstep(kHalo*.5/255.0,kHalo/255.0,max(res.r,max(res.g,res.b))));
+        halo_e=mix(edit(bank,q_own),edit(bank,qn),al);
+    }
+    float direct=0;
+    float zc=texelFetch(DepthFull,ivec2(p),0).r;
+    // Uncovered: what stood at the source position is nearer than this pixel now (an occluder moved off it):
+    // never take that occluder's edit directly.
+    float uncovered_w=smoothstep(.03,.10,rel_depth(anchor_depth(bank,q),zc));
+    if(pc.side==2u && (pc.rebuild_flags&1u)!=0u && q_own!=p) {   // (a pixel that stays - HUD - has no vector to check)
+        bool off=any(lessThan(q_own,vec2(0)))||any(greaterThan(q_own,vec2(pc.size)-1));
+        float back=length(q_own+motion(pc.previous,q_own)-p);
+        uncovered_w=max(uncovered_w,off?1.0:smoothstep(1.5,4.0,back));
+    }
+    vec3 moved=ratio_edit(edit(bank,q),anchor(bank,q),c);
+    vec3 dc=abs(c-anchor(bank,q));float err=max(dc.r,max(dc.g,dc.b));
+    float patch_error=0;
+    for(int y=-1;y<=1;++y)for(int x=-1;x<=1;++x) {
+        vec2 off=vec2(x,y)*2.0;
+        vec3 d=abs(fetch_clamp(Current,ivec2(p+off)).rgb-anchor(bank,q+off));
+        patch_error+=max(d.r,max(d.g,d.b));
+    }
+    err=max(err,patch_error/9.0);match_err=err;
+    if(pc.side!=0u && (pc.rebuild_flags&kContextWeight)!=0u)match_err=context_weight(bank,p,q);   // (MatchOut: the weight)
+    direct=(1.0-uncovered_w)*(1.0-smoothstep(.01,.04,err));
+    dbg.x=direct;dbg.y=uncovered_w;
+    halo_w*=near_edge(p);
+    dbg.y=uncovered_w*(1.0-halo_w);   // the fill leaves what the halo fit took
+    e=moved;
+    if(direct==1.0)return true;
+    // a deep edit on the pixel's own surface (source not nearer, no occluder edge close by): the moved edit, ratio-scaled,
+    // in place of the donors (mixed in by the tail)
+    float deep=smoothstep(kDeepLo,kDeepHi,-dot(edit(bank,q),vec3(.2126,.7152,.0722)));
+    t=Tail(q,zc,halo_e,halo_w,moved,deep*(1.0-uncovered_w)*(1.0-near_edge(p)),direct);
+    return false;
+}
+struct Donors {vec3 total;float mass,top,absolute;};
+// Local donors: right around the source position, 1 px apart (5 x 5), weighted by colour and distance only. A pixel at a
+// moving edge whose own anti-aliased value changed between the frames - or whose guides (the game's depth and vectors,
+// often at the render size: their edge sits on that grid, up to a texel off the picture's edge) belong to the surface
+// beside it - is still next to its source: the answer's own edge profile there holds its edit. The wide donors (a grid
+// step away, weighted by the coarse depth) gave such pixels the other surface's edit - with Legacy 3's edits (a lit pane
+// +100 codes, the post in front of it -40) a notch along the edge on every rebuilt frame. They are taken as far as their
+// colours match (their absolute mass); where they do not (a surface just uncovered, a colour not near the source) the
+// wide donors decide. A long vector's end is no pixel-exact source (motion blur along it): they fade out from 40 to 80 px
+// of motion (at 720p).
+const float kLocalLo=.01,kLocalHi=.05,kLocalFade0=40.0,kLocalFade1=80.0;
+void local_donor(inout Donors d,uint bank,vec3 c,vec2 q,int x,int y) {
+    vec2 v=q+vec2(x,y);
+    if(any(lessThan(v,vec2(0)))||any(greaterThan(v,vec2(pc.size)-1)))return;
+    vec3 delta=c-anchor(bank,v);
+    float logit=-dot(delta,delta)/(3.0*.06*.06)-float(x*x+y*y)/8.0;
+    d.absolute+=exp(logit);
+    if(logit>d.top){float k=exp(d.top-logit);d.total*=k;d.mass*=k;d.top=logit;}
+    float w=exp(logit-d.top);d.total+=w*edit(bank,v);d.mass+=w;
+}
+float local_fade(vec2 p,vec2 q) {return 1.0-smoothstep(kLocalFade0,kLocalFade1,length(q-p)*(720.0/float(pc.size.y)));}
+// Wide donors on the pixel's own surface around the source position. Their weights relative to the best one (an online
+// softmax): a pixel whose colour matches no donor well (a motion-blurred edge) still takes the closest ones instead of
+// no edit at all - with a strong NR edit "no edit" shows as a white burr. Rings 2x / 4x wider only while the absolute
+// match stays poor. In a tile with few such pixels one pixel's donors are shared by 8 or 4 lanes (every 8th / 4th donor
+// each; reconstruct_tail8 / 4) and their partial softmax sums combined over the lanes; a crowded tile runs one lane a
+// pixel (reconstruct_tail). The local donors first, the wide ones only where the local ones do not fully decide.
+vec3 reconstruct_tail(uint bank,vec2 p,Tail t) {
+    vec3 c=fetch_clamp(Current,ivec2(p)).rgb;vec2 q=t.q;float zc=t.zc;
+    vec3 rebuilt;
+    Donors l=Donors(vec3(0),0,-1e30,0);
+    for(int y=-2;y<=2;++y)for(int x=-2;x<=2;++x)local_donor(l,bank,c,q,x,y);
+    float wl=l.mass>0?smoothstep(kLocalLo,kLocalHi,l.absolute):0.0;
+    wl*=local_fade(p,q);
+    vec3 local_e=l.mass>0?l.total/l.mass:vec3(0);
+    if(wl>=1.0)rebuilt=local_e;
+    else {
+    float step_size=float(pc.size.y)*(16.0/720.0);
+    vec3 total=vec3(0);float mass=0;float top=-1e30;float absolute=0;
+    for(int scale=1;scale<=4;scale*=2) {
+        if(scale>1 && absolute>=.05)break;
+        for(int y=-2;y<=2;++y)for(int x=-2;x<=2;++x) {
+            if(scale>1 && max(abs(x),abs(y))<2)continue;
+            vec2 v=q+vec2(x,y)*step_size*float(scale);
+            if(any(lessThan(v,vec2(0)))||any(greaterThan(v,vec2(pc.size)-1)))continue;
+            vec3 delta=c-anchor(bank,v);
+            float logit=-dot(delta,delta)/(3.0*.06*.06)-float(x*x+y*y)/8.0;
+            {float r=rel_depth(anchor_depth(bank,v),zc)/.05;logit-=r*r;}
+            absolute+=exp(logit);
+            if(logit>top){float k=exp(top-logit);total*=k;mass*=k;top=logit;}
+            float w=exp(logit-top);total+=w*edit(bank,v);mass+=w;
+        }
+    }
+    dbg.z=clamp(absolute/.05,0.0,1.0);
+    rebuilt=mix(mass>0?total/mass:edit(bank,q),local_e,wl);
+    }
+    dbg.z=wl;
+    rebuilt=mix(rebuilt,t.halo_e,t.halo_w);
+    rebuilt=mix(rebuilt,t.moved,t.deep);
+    return mix(rebuilt,t.moved,t.direct);
+}
+const ivec2 kRing[16]=ivec2[16](ivec2(-2,-2),ivec2(-1,-2),ivec2(0,-2),ivec2(1,-2),ivec2(2,-2),ivec2(-2,-1),ivec2(2,-1),ivec2(-2,0),
+                                ivec2(2,0),ivec2(-2,1),ivec2(2,1),ivec2(-2,2),ivec2(-1,2),ivec2(0,2),ivec2(1,2),ivec2(2,2));
+void donor(inout Donors d,uint bank,vec3 c,vec2 q,float zc,float step,int x,int y) {
+    vec2 v=q+vec2(x,y)*step;
+    if(any(lessThan(v,vec2(0)))||any(greaterThan(v,vec2(pc.size)-1)))return;
+    vec3 delta=c-anchor(bank,v);
+    float logit=-dot(delta,delta)/(3.0*.06*.06)-float(x*x+y*y)/8.0;
+    {float r=rel_depth(anchor_depth(bank,v),zc)/.05;logit-=r*r;}
+    d.absolute+=exp(logit);
+    if(logit>d.top){float k=exp(d.top-logit);d.total*=k;d.mass*=k;d.top=logit;}
+    float w=exp(logit-d.top);d.total+=w*edit(bank,v);d.mass+=w;
+}
+// `part` = this lane's share; every lane of the pixel returns the same edit
+vec3 reconstruct_tail8(uint bank,vec2 p,Tail t,uint part) {
+    vec3 c=fetch_clamp(Current,ivec2(p)).rgb;vec2 q=t.q;float zc=t.zc;
+    vec3 rebuilt;
+    Donors l=Donors(vec3(0),0,-1e30,0);   // (wl: the same in all lanes of the pixel)
+    for(uint j=part;j<25u;j+=8u)local_donor(l,bank,c,q,int(j%5u)-2,int(j/5u)-2);
+    float ltop=subgroupClusteredMax(l.top,8u),lshare=exp(l.top-ltop);
+    vec3 ltotal=subgroupClusteredAdd(l.total*lshare,8u);float lmass=subgroupClusteredAdd(l.mass*lshare,8u);
+    float wl=lmass>0?smoothstep(kLocalLo,kLocalHi,subgroupClusteredAdd(l.absolute,8u)):0.0;
+    wl*=local_fade(p,q);
+    vec3 local_e=lmass>0?ltotal/lmass:vec3(0);
+    if(wl>=1.0)rebuilt=local_e;
+    else {
+    float step_size=float(pc.size.y)*(16.0/720.0);
+    Donors d=Donors(vec3(0),0,-1e30,0);
+    for(uint j=part;j<25u;j+=8u)donor(d,bank,c,q,zc,step_size,int(j%5u)-2,int(j/5u)-2);
+    for(int scale=2;scale<=4;scale*=2) {
+        if(subgroupClusteredAdd(d.absolute,8u)>=.05)break;
+        for(uint j=part;j<16u;j+=8u)donor(d,bank,c,q,zc,step_size*float(scale),kRing[j].x,kRing[j].y);
+    }
+    float top=subgroupClusteredMax(d.top,8u),share=exp(d.top-top);   // a lane without donors: share 0
+    vec3 total=subgroupClusteredAdd(d.total*share,8u);float mass=subgroupClusteredAdd(d.mass*share,8u);
+    dbg.z=clamp(subgroupClusteredAdd(d.absolute,8u)/.05,0.0,1.0);
+    rebuilt=mix(mass>0?total/mass:edit(bank,q),local_e,wl);
+    }
+    dbg.z=wl;
+    rebuilt=mix(rebuilt,t.halo_e,t.halo_w);
+    rebuilt=mix(rebuilt,t.moved,t.deep);
+    return mix(rebuilt,t.moved,t.direct);
+}
+vec3 reconstruct_tail4(uint bank,vec2 p,Tail t,uint part) {
+    vec3 c=fetch_clamp(Current,ivec2(p)).rgb;vec2 q=t.q;float zc=t.zc;
+    vec3 rebuilt;
+    Donors l=Donors(vec3(0),0,-1e30,0);   // (wl: the same in all lanes of the pixel)
+    for(uint j=part;j<25u;j+=4u)local_donor(l,bank,c,q,int(j%5u)-2,int(j/5u)-2);
+    float ltop=subgroupClusteredMax(l.top,4u),lshare=exp(l.top-ltop);
+    vec3 ltotal=subgroupClusteredAdd(l.total*lshare,4u);float lmass=subgroupClusteredAdd(l.mass*lshare,4u);
+    float wl=lmass>0?smoothstep(kLocalLo,kLocalHi,subgroupClusteredAdd(l.absolute,4u)):0.0;
+    wl*=local_fade(p,q);
+    vec3 local_e=lmass>0?ltotal/lmass:vec3(0);
+    if(wl>=1.0)rebuilt=local_e;
+    else {
+    float step_size=float(pc.size.y)*(16.0/720.0);
+    Donors d=Donors(vec3(0),0,-1e30,0);
+    for(uint j=part;j<25u;j+=4u)donor(d,bank,c,q,zc,step_size,int(j%5u)-2,int(j/5u)-2);
+    for(int scale=2;scale<=4;scale*=2) {
+        if(subgroupClusteredAdd(d.absolute,4u)>=.05)break;
+        for(uint j=part;j<16u;j+=4u)donor(d,bank,c,q,zc,step_size*float(scale),kRing[j].x,kRing[j].y);
+    }
+    float top=subgroupClusteredMax(d.top,4u),share=exp(d.top-top);   // a lane without donors: share 0
+    vec3 total=subgroupClusteredAdd(d.total*share,4u);float mass=subgroupClusteredAdd(d.mass*share,4u);
+    dbg.z=clamp(subgroupClusteredAdd(d.absolute,4u)/.05,0.0,1.0);
+    rebuilt=mix(mass>0?total/mass:edit(bank,q),local_e,wl);
+    }
+    dbg.z=wl;
+    rebuilt=mix(rebuilt,t.halo_e,t.halo_w);
+    rebuilt=mix(rebuilt,t.moved,t.deep);
+    return mix(rebuilt,t.moved,t.direct);
+}
+float luma(vec3 x) {return dot(x,vec3(.2126,.7152,.0722));}
+// Mode 2's shared memory: first the tile's 18 x 18 neighbourhood (source position, mismatch, fixed-overlay error), then
+// the state of the tile's pixels that need the donor search (kSlot words each), gathered onto the first invocations so
+// that the search runs on as few waves as the tile needs instead of on every wave holding one such pixel.
+const uint kSlot=15u,kMismatch=648u,kFixed=1296u;
+shared float pool[256*15];
+shared uint donor_count;
+// What an rgba16f / r16f store keeps of a value: RDNA's store rounds toward zero and keeps half denormals (the largest
+// finite half beyond it). Side 2 merges its values as the store of them would have kept them.
+float half_kept(float x) {
+    float a=abs(x);
+    if(a>=6.103515625e-05)return uintBitsToFloat(floatBitsToUint(sign(x)*min(a,65504.0))&0xffffe000u);
+    return trunc(x*16777216.0)*5.9604644775390625e-08;
+}
+// The two sides merged: trust-weighted; merge_k > 0 leans toward the side whose input matches this frame better (weight
+// 1 / (err^2 + k^2) per side, k in codes; large k = the midpoint); with the outline context (rebuild_flags & 2) the match terms
+// are the sides' context weights (merge_k 0). a / ma: side 1 as stored, b / mb: side 2.
+vec4 merge_sides(vec4 a,vec4 b,float ma,float mb) {
+    float wa=a.a,wb=b.a,trust=max(a.a,b.a);   // (the fill's trust: the sides' own, whatever the weighting)
+    if(pc.merge_k>0) {
+        float k=pc.merge_k/255.0;
+        wa/=ma*ma+k*k;wb/=mb*mb+k*k;float s=max(wa,wb);if(s>0){wa/=s;wb/=s;}
+    }
+    if((pc.rebuild_flags&kContextWeight)!=0u){wa*=ma;wb*=mb;}
+    float w=wa+wb;
+    return w>1e-3?vec4((wa*a.rgb+wb*b.rgb)/w,trust):vec4(.5*(a.rgb+b.rgb),0);
+}
+void store_pixel(ivec2 p,vec3 e) {
+    if(pc.side==1u){imageStore(SideOut0,p,vec4(e,1.0-dbg.y));imageStore(MatchOut0,p,vec4(match_err));return;}
+    if(pc.side==2u) {   // merged with side 1's (stored at this pixel by the dispatch before) into Side0
+        vec4 b=vec4(half_kept(e.r),half_kept(e.g),half_kept(e.b),half_kept(1.0-dbg.y));
+        imageStore(SideOut0,p,merge_sides(texelFetch(Side0,p,0),b,texelFetch(Match0,p,0).r,half_kept(match_err)));
+        return;
+    }
+    vec4 c=fetch_clamp(Current,p);
+    if((pc.protection&kShowDecisions)!=0u){imageStore(Out,p,vec4(dbg.w>0?dbg.xyz:vec3(1,1,0),c.a));return;}
+    if((pc.protection&kFillStore)!=0u) {
+        // the edit and how far it can be trusted (uncovered: not at all) into the bank the next computed frame overwrites
+        // anyway; mode 3 fills the untrusted pixels from the trusted ones around them in THIS frame
+        vec4 v=vec4(e,1.0-dbg.y);
+        if(pc.bank==0u)imageStore(OutEdit1,p,v);else imageStore(OutEdit0,p,v);
+    }
+    imageStore(Out,p,vec4(c.rgb+e,c.a));
+}
+// When depth is absent, colour matches can cross a silhouette. In HDR, a
+// moderate error in PQ can become a very bright flash. Bound the transported
+// answer by this pixel and the two observed NR answers at its correspondences.
+// The envelope follows scene values, including negative and above-white RGB.
+vec3 bounded_answer(ivec2 p,vec3 input_rgb,vec3 change) {
+    vec3 predicted=input_rgb+change;
+    if((pc.rebuild_flags&4u)==0u || pc.side!=3u)return predicted;
+    vec2 xy=vec2(p);
+    vec2 past=xy+motion((pc.current_motion+2u)%3u,xy);
+    vec2 next=xy+motion((pc.current_motion+1u)%3u,xy);
+    vec3 a=anchor(pc.bank^1u,past)+edit(pc.bank^1u,past);
+    vec3 b=anchor(pc.bank,next)+edit(pc.bank,next);
+    return clamp(predicted,min(input_rgb,min(a,b)),max(input_rgb,max(a,b)));
+}
+void main() {
+    ivec2 p=ivec2(gl_GlobalInvocationID.xy);
+    if(pc.mode==0u) { // Compose two real-frame vectors, with no repeated edit resampling.
+        if(any(greaterThanEqual(p,ivec2(pc.grid)))) return;
+        vec2 q=(vec2(p)+.5)/vec2(pc.grid)*vec2(pc.size)-.5;
+        imageStore(Composed,p,vec4((chain(q,pc.age)-q)/vec2(pc.size),0,0));
+        return;
+    }
+    if(pc.mode==7u) { // this frame's depth at every pixel
+        if(any(greaterThanEqual(p,ivec2(pc.size)))) return;
+        imageStore(DepthFullOut,p,vec4(depth_at(Depth,vec2(p))));
+        return;
+    }
+    if(pc.mode==6u) { // the nearer surface near each pixel (mode 2's dilated_source)
+        if(any(greaterThanEqual(p,ivec2(pc.size)))) return;
+        imageStore(PickOut,p,vec4(float(near_tap(vec2(p)))/255.0));
+        return;
+    }
+    if(pc.mode==4u) { // forward field of this frame (bank `previous`) into the next one (bank current_motion)
+        if(any(greaterThanEqual(p,ivec2(pc.grid)))) return;
+        vec2 q=(vec2(p)+.5)/vec2(pc.grid)*vec2(pc.size)-.5;
+        vec2 f=-motion(pc.previous,q);
+        for(int k=0;k<4;++k) f=-motion(pc.current_motion,q+f);
+        imageStore(Composed,p,vec4(f/vec2(pc.size),0,0));
+        return;
+    }
+    if(pc.mode==3u) { // the fill of untrusted (uncovered) pixels of a rebuilt frame from trusted ones nearby
+        if(any(greaterThanEqual(p,ivec2(pc.size)))) return;
+        uint scratch=pc.bank^1u;
+        vec4 a=pc.side==3u?texelFetch(Side0,p,0):scratch==0u?texelFetch(Edit0,p,0):texelFetch(Edit1,p,0);
+        vec4 cc=fetch_clamp(Current,p);
+        if(a.a>=.999){imageStore(Out,p,vec4(bounded_answer(p,cc.rgb,a.rgb),cc.a));return;}
+        float zp=texelFetch(DepthFull,p,0).r;
+        float unit=float(pc.size.y)/720.0;vec3 sum=vec3(0);float wsum=0;float radius_last=3.0*unit;
+        const float kSigma=0.1,kSameDepth=.05;
+        for(int r=0;r<4;++r) {
+            float radius=3.0*unit*float(1<<r);   // 3 .. 24 px at 720p
+            for(int k=0;k<8;++k) {
+                vec2 dir=vec2(k==0||k==1||k==7?1:k==3||k==4||k==5?-1:0,k==1||k==2||k==3?1:k==5||k==6||k==7?-1:0);
+                if(dir.x!=0&&dir.y!=0)dir*=.7071;
+                ivec2 t=p+ivec2(round(dir*radius));vec4 b=pc.side==3u?fetch_clamp(Side0,t):scratch==0u?fetch_clamp(Edit0,t):fetch_clamp(Edit1,t);
+                float w=b.a*b.a/radius;
+                // only from trusted pixels that look like this one now (a wall fills from the wall, not from a dark
+                // object beside it; a blurred edge, mixing both, takes from both)
+                vec3 dc=fetch_clamp(Current,t).rgb-cc.rgb;w*=exp(-dot(dc,dc)/(2.0*kSigma*kSigma));
+                // only from the pixel's own surface now (a distant figure and the wall right behind it differ by a
+                // few per cent of depth; the wall must not take the figure's edit)
+                {float r=rel_depth(depth_px(t),zp)/kSameDepth;w*=exp(-r*r);}
+                sum+=w*b.rgb;wsum+=w;
+            }
+            radius_last=radius;
+            if(wsum>2.0/radius)break;   // enough trusted pixels at this distance: nearer ones decide
+        }
+        float have=clamp(wsum*radius_last/2.0,0.0,1.0);   // little trusted evidence nearby: keep the donor edit
+        vec3 fill=wsum>0?mix(a.rgb,sum/wsum,have):a.rgb;
+        imageStore(Out,p,vec4(bounded_answer(p,cc.rgb,mix(fill,a.rgb,a.a)),cc.a));
+        return;
+    }
+    if(pc.mode==1u) { // One completed answer in its original anchor coordinates.
+        if(any(greaterThanEqual(p,ivec2(pc.size)))) return;
+        vec3 e=fetch_clamp(Rendered,p).rgb-anchor(pc.bank,vec2(p));
+        if(pc.bank==0u) imageStore(OutEdit0,p,vec4(e,1));
+        else imageStore(OutEdit1,p,vec4(e,1));
+        return;
+    }
+    // Mode 2. The 3x3 stay decision: the neighbourhood shared instead of fetching nine complete motion paths
+    // independently for every output pixel.
+    uint lane=gl_LocalInvocationIndex;
+    if(lane==0u)donor_count=0u;
+    for(uint k=lane;k<324u;k+=256u) {
+        ivec2 q=clamp(ivec2(gl_WorkGroupID.xy)*16+ivec2(k%18u,k/18u)-1,ivec2(0),ivec2(pc.size)-1);
+        vec2 a=pc.valid!=0u?chain(vec2(q),pc.age):vec2(q);
+        pool[2u*k]=a.x;pool[2u*k+1u]=a.y;
+        vec3 c=fetch_clamp(Current,q).rgb;
+        vec2 mm=vec2(abs(luma(c-anchor(pc.bank,vec2(q)))),abs(luma(c-anchor(pc.bank,a))));
+        pool[kMismatch+2u*k]=mm.x;pool[kMismatch+2u*k+1u]=mm.y;
+        vec3 d0=abs(c-anchor(pc.bank,vec2(q)));
+        pool[kFixed+k]=max(d0.r,max(d0.g,d0.b));
+    }
+    barrier();
+    bool inside=all(lessThan(p,ivec2(pc.size))),work=inside && pc.valid!=0u;
+    uint centre=(gl_LocalInvocationID.y+1u)*18u+gl_LocalInvocationID.x+1u;
+    vec2 source=vec2(p);
+    if(work) {
+        vec2 sums=vec2(0);
+        for(int y=-1;y<=1;++y) for(int x=-1;x<=1;++x){uint i=uint(int(centre)+y*18+x);sums+=vec2(pool[kMismatch+2u*i],pool[kMismatch+2u*i+1u]);}
+        // a fixed overlay (HUD, crosshair): the pixel and at least 3 of its 3x3 neighbours unchanged in place
+        uint n0=0u;
+        for(int y=-1;y<=1;++y)for(int x=-1;x<=1;++x)n0+=pool[kFixed+uint(int(centre)+y*18+x)]<=pc.stay_fixed?1u:0u;
+        bool fixed_new=pool[kFixed+centre]<=pc.stay_fixed&&n0>=3u;
+        bool stay=fixed_new && sums.x+9*pc.stay_margin<sums.y;
+        source=stay?vec2(p):vec2(pool[2u*centre],pool[2u*centre+1u]);
+    }
+    barrier();   // the neighbourhood read: the pool takes the donor search's state
+    vec3 e=vec3(0);bool done=true;
+    if(work) {
+        Tail t;done=reconstruct_head(pc.bank,vec2(p),source,e,t);
+        if(!done) {
+            uint b=atomicAdd(donor_count,1u)*kSlot;
+            pool[b]=uintBitsToFloat(uint(p.x)|(uint(p.y)<<16));pool[b+1u]=t.q.x;pool[b+2u]=t.q.y;pool[b+3u]=t.zc;
+            pool[b+4u]=t.halo_e.r;pool[b+5u]=t.halo_e.g;pool[b+6u]=t.halo_e.b;pool[b+7u]=t.halo_w;
+            pool[b+8u]=t.moved.r;pool[b+9u]=t.moved.g;pool[b+10u]=t.moved.b;pool[b+11u]=t.deep;pool[b+12u]=t.direct;pool[b+13u]=dbg.y;pool[b+14u]=match_err;
+        }
+    }
+    if(inside && done)store_pixel(p,e);
+    barrier();
+    // up to 32 such pixels: 8 lanes a pixel, up to 64: 4, more: one lane a pixel (the tile's count: the same branch for
+    // the whole tile)
+    // (a pixel's lanes = one cluster of its subgroup: counted by subgroup and lane in it, not by the local index)
+    uint n=donor_count,lanes=n<=32u?8u:n<=64u?4u:1u,at_lane=gl_SubgroupID*gl_SubgroupSize+gl_SubgroupInvocationID,slot=at_lane/lanes;
+    if(slot<n) {
+        uint b=slot*kSlot,packed=floatBitsToUint(pool[b]);ivec2 at=ivec2(packed&65535u,packed>>16);
+        Tail t=Tail(vec2(pool[b+1u],pool[b+2u]),pool[b+3u],vec3(pool[b+4u],pool[b+5u],pool[b+6u]),pool[b+7u],
+                    vec3(pool[b+8u],pool[b+9u],pool[b+10u]),pool[b+11u],pool[b+12u]);
+        dbg=vec4(t.direct,pool[b+13u],0,1);match_err=pool[b+14u];
+        vec3 e=lanes==8u?reconstruct_tail8(pc.bank,vec2(at),t,at_lane%8u):lanes==4u?reconstruct_tail4(pc.bank,vec2(at),t,at_lane%4u):
+               reconstruct_tail(pc.bank,vec2(at),t);
+        if(at_lane%lanes==0u)store_pixel(at,e);
+    }
+}

@@ -51,40 +51,42 @@ common=(-std=c++17 -O2 -DNDEBUG -DNR_BUILD_STAMP="\"$stamp\"" -Itoolchain/Vulkan
 # The network the package ships (windows/build/arch/rdna4.sh): the host must be built
 # with the same constants as the shaders in dlssnr-amd/shaders.
 source windows/build/arch/rdna4.sh
-"$cxx" "${common[@]}" "${NR_PRODUCT_DEFINES[@]}" -c windows/src/core/nr_runtime.cpp -o "$out/nr_runtime.o"
-"$cxx" "${common[@]}" -c windows/src/core/nr_native_plan.cpp -o "$out/nr_native_plan.o"
-"$cxx" "${common[@]}" -c windows/src/core/nr_renodx.cpp -o "$out/nr_renodx.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_pe_log.cpp -o "$out/log.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_pe_crash.cpp -o "$out/crash.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_pe_interop.cpp -o "$out/interop.o"
-"$cxx" "${common[@]}" -I"$minhook/include" -c windows/src/pe/nr_pe_vkdevice.cpp -o "$out/vkdevice.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_pe_session.cpp -o "$out/session.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_pe_bridge.cpp -o "$out/bridge.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_pe_d3d12split.cpp -o "$out/d3d12split.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_pe_config.cpp -o "$out/config.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_dlssnr_model.cpp -o "$out/model.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_pe_renodx_route.cpp -o "$out/renodx_route.o"
-"$cxx" "${common[@]}" -I"$minhook/include" -c windows/src/pe/nr_pe_control.cpp -o "$out/control.o"
+source windows/build/parallel.sh
+par "$cxx" "${common[@]}" "${NR_PRODUCT_DEFINES[@]}" -c windows/src/core/nr_runtime.cpp -o "$out/nr_runtime.o"
+par "$cxx" "${common[@]}" -c windows/src/core/nr_native_plan.cpp -o "$out/nr_native_plan.o"
+par "$cxx" "${common[@]}" -c windows/src/core/nr_renodx.cpp -o "$out/nr_renodx.o"
+par "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_log.cpp -o "$out/log.o"
+par "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_crash.cpp -o "$out/crash.o"
+par "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_interop.cpp -o "$out/interop.o"
+par "$cxx" "${common[@]}" -I"$minhook/include" -c windows/src/pe/nr_pe_vkdevice.cpp -o "$out/vkdevice.o"
+par "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_session.cpp -o "$out/session.o"
+par "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_bridge.cpp -o "$out/bridge.o"
+par "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_d3d12split.cpp -o "$out/d3d12split.o"
+par "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_config.cpp -o "$out/config.o"
+par "$cxx" "${common[@]}" -c windows/src/pe/nr_dlssnr_model.cpp -o "$out/model.o"
+par "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_renodx_route.cpp -o "$out/renodx_route.o"
+par "$cxx" "${common[@]}" -I"$minhook/include" -c windows/src/pe/nr_pe_control.cpp -o "$out/control.o"
 # NR Control (End), drawn by the DLL over the game's swap chain: ImGui with its D3D11 and D3D12 backends.
 imgui=${NR_IMGUI_ROOT:-toolchain/imgui-nr}
 [[ -f "$imgui/imgui_impl_dx12.cpp" ]] || { echo "missing $imgui (ImGui with its D3D backends)" >&2; exit 1; }
-"$cxx" "${common[@]}" -I"$minhook/include" -I"$imgui" -Iwindows/src/ui -c windows/src/pe/nr_pe_menu.cpp -o "$out/menu.o"
+par "$cxx" "${common[@]}" -I"$minhook/include" -I"$imgui" -Iwindows/src/ui -c windows/src/pe/nr_pe_menu.cpp -o "$out/menu.o"
 for unit in imgui imgui_draw imgui_tables imgui_widgets imgui_impl_dx11; do
-    "$cxx" -std=c++17 -O2 -DNDEBUG -I"$imgui" -c "$imgui/$unit.cpp" -o "$out/im_$unit.o"
+    par "$cxx" -std=c++17 -O2 -DNDEBUG -I"$imgui" -c "$imgui/$unit.cpp" -o "$out/im_$unit.o"
 done
-"$cxx" -std=c++17 -O2 -DNDEBUG -I"$imgui" -include windows/src/pe/mingw_d3d12_compat.h -c "$imgui/imgui_impl_dx12.cpp" \
+par "$cxx" -std=c++17 -O2 -DNDEBUG -I"$imgui" -include windows/src/pe/mingw_d3d12_compat.h -c "$imgui/imgui_impl_dx12.cpp" \
     -o "$out/im_imgui_impl_dx12.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_screenshot.cpp -o "$out/screenshot.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_dlssnr_forwarder.cpp -o "$out/forwarder.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_ngx_core.cpp -o "$out/ngx_core.o"
-"$cxx" "${common[@]}" -I"$minhook/include" -c windows/src/pe/nr_pe_optifix.cpp -o "$out/optifix.o"
+par "$cxx" "${common[@]}" -c windows/src/pe/nr_screenshot.cpp -o "$out/screenshot.o"
+par "$cxx" "${common[@]}" -c windows/src/pe/nr_dlssnr_forwarder.cpp -o "$out/forwarder.o"
+par "$cxx" "${common[@]}" -c windows/src/pe/nr_ngx_core.cpp -o "$out/ngx_core.o"
+par "$cxx" "${common[@]}" -I"$minhook/include" -c windows/src/pe/nr_pe_optifix.cpp -o "$out/optifix.o"
 
 # MinHook, for the device watcher the Vulkan path asks for a queue through.
 for unit in hook buffer trampoline; do
-    "$cc" -O2 -I"$minhook/include" -I"$minhook/src" -c "$minhook/src/$unit.c" -o "$out/mh_$unit.o"
+    par "$cc" -O2 -I"$minhook/include" -I"$minhook/src" -c "$minhook/src/$unit.c" -o "$out/mh_$unit.o"
 done
 hde=hde64; [[ "$arch" == i686 ]] && hde=hde32
-"$cc" -O2 -I"$minhook/include" -I"$minhook/src" -c "$minhook/src/hde/$hde.c" -o "$out/mh_hde.o"
+par "$cc" -O2 -I"$minhook/include" -I"$minhook/src" -c "$minhook/src/hde/$hde.c" -o "$out/mh_hde.o"
+par_wait
 
 ldflags=(-ld3d12 -ldxgi -lole32 -static -static-libgcc -static-libstdc++)
 [[ "$arch" == i686 ]] && ldflags+=(-Wl,--kill-at)

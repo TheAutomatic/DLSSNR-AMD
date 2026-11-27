@@ -19,22 +19,21 @@
 # If the package has no model file, point --dll at NVIDIA's nvngx_dlssnr.dll (310.9.16 or 310.8.0, or a
 # zip containing it); the model is extracted from it during installation and kept in this
 # package's dlssnr-amd/, so later installs from this package (into other games too) need no --dll.
-# The 310.9.16 DLL holds two models, the new and the old one; the 310.8.0 DLL only the old one.
+# The 310.9.16 DLL holds two models, CC_SMALL_FP8 and CC_SILVER_AARDWOLD; the 310.8.0 DLL only CC_SILVER_AARDWOLD.
 #
 # All four networks are installed and can be switched in game at any time (the drop-down in NR Control or on
 # ReShade's Add-ons page, or Ctrl+F11 to cycle). The choice below only sets the one a game starts with ([Network] Model):
 # --model CC_SMALL_FP8                  the default network of 310.9.16 (default)
-# --model CC_SMALL_FP8_EXPERIMENTAL     this project's experimental network: CC_SMALL_FP8 made faster;
-#                                       its weights are made from CC_SMALL_FP8's model at install
-# --model CC_SILVER_AARDWOLD            the network of 310.8.0
-# --model CC_SILVER_AARDWOLD_OPTIMIZED  this project's faster CC_SILVER_AARDWOLD (RX 9000); its weights are made from
-#                                       CC_SILVER_AARDWOLD's model at install. Optimized layers: Quality / Balanced /
-#                                       Performance / Ultra Performance (default) ([Network] OptimizedLayers in
+# --model CC_SMALL_FP8_OPTIMIZED        this project's network: CC_SMALL_FP8 made faster; its weights are made
+#                                       from CC_SMALL_FP8's model at install. Optimized layers: Quality (default) /
+#                                       Performance / Ultra Performance ([CC_SMALL_FP8_OPTIMIZED] Layers in
 #                                       dlssnr-amd.ini; a switch in game)
+# --model CC_SILVER_AARDWOLD            the network of 310.8.0
+# --model CC_SILVER_AARDWOLD_OPTIMIZED  this project's faster CC_SILVER_AARDWOLD; its weights are made from
+#                                       CC_SILVER_AARDWOLD's model at install. Optimized layers: Quality / Balanced /
+#                                       Performance / Ultra Performance (default) ([CC_SILVER_AARDWOLD_OPTIMIZED] Layers
+#                                       in dlssnr-amd.ini; a switch in game)
 # Without it, the installer asks once; Enter = CC_SMALL_FP8 (not asked when not run in a terminal: CC_SMALL_FP8).
-# The earlier options still work: --new-model = CC_SMALL_FP8, --old-model = CC_SILVER_AARDWOLD, --int4 and
-# --model CC_SILVER_AARDWOLD_INT4_MIXED (the network CC_SILVER_AARDWOLD_OPTIMIZED replaced) = CC_SILVER_AARDWOLD_OPTIMIZED;
-# --no-int4 is no longer needed and is ignored.
 # On the ReShade routes its int4 layers need a Vulkan layer in the launch options: the installer prints that line.
 #
 # The processing of the picture before and after NR (the NR network itself is the same):
@@ -48,7 +47,6 @@
 #   --wilsjo2    the wilsjo2 style: OptiScaler-NR's (wilsjo2) settings and names ([DlssNr]), this route's own processing. --no-renodx means the same.
 #   With neither, the installer asks once after the network; Enter = the RenoDX style (not asked when not run in a terminal: RenoDX).
 #   Later the Add-ons page switches it ([RenoDX] Enabled, applied after a game restart). For stacking use Passes.
-# The old route name optiscaler-renodx still works and means optiscaler --renodx.
 #
 # --lumenite     (ReShade routes only) motion vectors from LumeniteFX Kernel (by Afzaal (Kaidō),
 #                https://github.com/umar-afzaal/LumeniteFX, AGNYA licence). LumeniteFX is not in this package: the installer
@@ -64,12 +62,12 @@ here=$(cd -- "$(dirname -- "$0")" && pwd)
 # The package's models: bundled, or kept there by the first --dll install. Checked by SHA256.
 # CC_SILVER_AARDWOLD.bin = CC_SILVER_AARDWOLD (310.8.0, also preset 1 of 310.9.16), CC_SMALL_FP8.bin = CC_SMALL_FP8 (310.9.16's default)
 pkg_model=$here/dlssnr-amd/CC_SILVER_AARDWOLD.bin
-pkg_small=$here/dlssnr-amd/CC_SMALL_FP8.bin
+pkg_small_fp8=$here/dlssnr-amd/CC_SMALL_FP8.bin
 model_sha256=2b41c888cf4155b8958c665ba64018ab0bd25c85fc71a2b6db86d0d04d1f7fbd
-small_sha256=7e966e2639dbec6596aa0bac3b8761137d2c40ca8cb4aca30df7ca10043c6e33
+small_fp8_sha256=7e966e2639dbec6596aa0bac3b8761137d2c40ca8cb4aca30df7ca10043c6e33
 sha_ok() { [[ -f "$1" && "$(sha256sum -- "$1" | cut -d' ' -f1)" == "$2" ]]; }
 model_ok() { sha_ok "$1" "$model_sha256"; }
-small_ok() { sha_ok "$1" "$small_sha256"; }
+small_fp8_ok() { sha_ok "$1" "$small_fp8_sha256"; }
 
 game="" route="" dll=""
 lumenite="" lumenite_zip=""
@@ -81,26 +79,21 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --dll) dll=${2:?--dll needs a file path}; shift 2;;
         --model) model=${2:?--model needs a network name}; shift 2
-            case "$model" in CC_SMALL_FP8|CC_SMALL_FP8_EXPERIMENTAL|CC_SILVER_AARDWOLD|CC_SILVER_AARDWOLD_OPTIMIZED) ;;
-                CC_SILVER_AARDWOLD_INT4_MIXED) model=CC_SILVER_AARDWOLD_OPTIMIZED;;
-                *) echo "--model takes CC_SMALL_FP8, CC_SMALL_FP8_EXPERIMENTAL, CC_SILVER_AARDWOLD or CC_SILVER_AARDWOLD_OPTIMIZED" >&2
+            case "$model" in CC_SMALL_FP8|CC_SMALL_FP8_OPTIMIZED|CC_SILVER_AARDWOLD|CC_SILVER_AARDWOLD_OPTIMIZED) ;;
+                *) echo "--model takes CC_SMALL_FP8, CC_SMALL_FP8_OPTIMIZED, CC_SILVER_AARDWOLD or CC_SILVER_AARDWOLD_OPTIMIZED" >&2
                    exit 1;; esac;;
-        --new-model) model=CC_SMALL_FP8; shift;;
-        --old-model) model=CC_SILVER_AARDWOLD; shift;;
-        --int4) model=CC_SILVER_AARDWOLD_OPTIMIZED; shift;;
-        --no-int4) echo "Note: --no-int4 is no longer needed and is ignored."; shift;;
         --renodx) renodx=1; shift;;
         --lumenite) lumenite=1
             if [[ $# -gt 1 && "$2" == *.zip ]]; then lumenite_zip=$2; shift; fi
             shift;;
         --no-lumenite) lumenite=0; shift;;
         --no-renodx|--wilsjo2) renodx=0; shift;;
-        -h|--help) sed -n '2,57p' "$0"; exit 0;;
+        -h|--help) sed -n '2,/^# Every installed file is listed/p' "$0"; exit 0;;
         *) if [[ -z "$game" ]]; then game=$1; elif [[ -z "$route" ]]; then route=$1;
            else echo "unexpected argument: $1" >&2; exit 1; fi; shift;;
     esac
 done
-[[ -n "$game" ]] || { sed -n '2,57p' "$0"; exit 1; }
+[[ -n "$game" ]] || { sed -n '2,/^# Every installed file is listed/p' "$0"; exit 1; }
 [[ -d "$game" ]] || { echo "no such folder: $game" >&2; exit 1; }
 game=$(cd -- "$game" && pwd)
 manifest="$game/dlssnr-amd-install.txt"
@@ -205,7 +198,6 @@ case "$route" in
     remove) remove_installed; exit 0;;
     logs) collect_logs; exit 0;;
     optiscaler) kind=optiscaler;;
-    optiscaler-renodx) kind=optiscaler; route=optiscaler; [[ -z "$renodx" ]] && renodx=1;;
     reshade-feeder) kind=reshade;;
     reshade-feeder-vulkan) kind=vulkan;;
     reshade-feeder-dx9) kind=dx9;;
@@ -216,7 +208,7 @@ esac
 if [[ "$kind" == optiscaler && ! -d "$here/optiscaler" ]]; then
     echo "The OptiScaler route is only in the 64-bit package." >&2; exit 1
 fi
-model_src="" small_src=""
+model_src="" small_fp8_src=""
 # the extracted model is kept in the package; when it cannot be (package folder not writable?) this install goes on and the next one needs --dll again
 keep() {   # <extracted file> <place in the package>
     if cp -- "$1" "$2.part" && mv -f -- "$2.part" "$2"; then
@@ -224,16 +216,16 @@ keep() {   # <extracted file> <place in the package>
     fi
     rm -f -- "$2.part"; echo "Note: the model could not be kept in $2 (package folder not writable?); the next install needs --dll again." >&2; return 1
 }
-if [[ -n "$dll" ]] && ! { model_ok "$pkg_model" && small_ok "$pkg_small"; }; then
+if [[ -n "$dll" ]] && ! { model_ok "$pkg_model" && small_fp8_ok "$pkg_small_fp8"; }; then
     model_tmp=$(mktemp -d)
-    trap 'rm -rf -- "$model_tmp"; rm -f -- "$pkg_model.part" "$pkg_small.part"' EXIT
+    trap 'rm -rf -- "$model_tmp"; rm -f -- "$pkg_model.part" "$pkg_small_fp8.part"' EXIT
     echo "Extracting the model from $dll ..."
     bash "$here/model-tools/extract_model.sh" "$dll" "$model_tmp"
     model_ok "$model_tmp/CC_SILVER_AARDWOLD.bin" || { echo "The extracted model has the wrong checksum; nothing was installed." >&2; exit 1; }
     keep "$model_tmp/CC_SILVER_AARDWOLD.bin" "$pkg_model" || model_src=$model_tmp/CC_SILVER_AARDWOLD.bin
     if [[ -f "$model_tmp/CC_SMALL_FP8.bin" ]]; then
-        small_ok "$model_tmp/CC_SMALL_FP8.bin" || { echo "The extracted CC_SMALL_FP8 model has the wrong checksum; nothing was installed." >&2; exit 1; }
-        keep "$model_tmp/CC_SMALL_FP8.bin" "$pkg_small" || small_src=$model_tmp/CC_SMALL_FP8.bin
+        small_fp8_ok "$model_tmp/CC_SMALL_FP8.bin" || { echo "The extracted CC_SMALL_FP8 model has the wrong checksum; nothing was installed." >&2; exit 1; }
+        keep "$model_tmp/CC_SMALL_FP8.bin" "$pkg_small_fp8" || small_fp8_src=$model_tmp/CC_SMALL_FP8.bin
     fi
 elif model_ok "$pkg_model"; then
     :   # the package has the model; it is installed with dlssnr-amd/
@@ -244,57 +236,57 @@ else
     echo "Only the first time: the extracted model is kept in this package's dlssnr-amd/ and used by later installs." >&2
     exit 1
 fi
-if [[ -f "$pkg_small" ]] && ! small_ok "$pkg_small"; then
-    echo "$pkg_small is damaged or from another version; delete it or extract it again with --dll." >&2; exit 1
+if [[ -f "$pkg_small_fp8" ]] && ! small_fp8_ok "$pkg_small_fp8"; then
+    echo "$pkg_small_fp8 is damaged or from another version; delete it or extract it again with --dll." >&2; exit 1
 fi
-have_small=1
-if [[ -z "$small_src" ]] && ! small_ok "$pkg_small"; then
-    have_small=0
+have_small_fp8=1
+if [[ -z "$small_fp8_src" ]] && ! small_fp8_ok "$pkg_small_fp8"; then
+    have_small_fp8=0
     echo "Note: the package has no model for CC_SMALL_FP8 (CC_SMALL_FP8.bin, in the 310.9.16 nvngx_dlssnr.dll); it is greyed out in game."
     echo "To add it, install again with --dll pointing at the 310.9.16 nvngx_dlssnr.dll or its zip."
 fi
 int4=0; [[ -x "$here/int4/dlssnr-int4-weights" ]] && int4=1   # both the x86_64 and the i686 package have it
-experimental=0; [[ -f "$here/experimental/dlssnr-small-experimental.delta" ]] && experimental=1
-optimized=0; [[ -f "$here/optimized/dlssnr-optimized.delta" ]] && optimized=1
+small_fp8_optimized=0; [[ -f "$here/CC_SMALL_FP8_OPTIMIZED/CC_SMALL_FP8_OPTIMIZED.delta" ]] && small_fp8_optimized=1
+silver_aardwold_optimized=0; [[ -f "$here/CC_SILVER_AARDWOLD_OPTIMIZED/CC_SILVER_AARDWOLD_OPTIMIZED.delta" ]] && silver_aardwold_optimized=1
 # the network a game starts with: all four are installed, this only sets [Network] Model in dlssnr-amd.ini
 if [[ -z "$model" ]]; then
-    model=CC_SMALL_FP8; [[ $have_small == 0 ]] && model=CC_SILVER_AARDWOLD
+    model=CC_SMALL_FP8; [[ $have_small_fp8 == 0 ]] && model=CC_SILVER_AARDWOLD
     if [[ -t 0 ]]; then
         echo
         echo "All four networks are installed and can be switched in game at any time (the drop-down in NR Control or on ReShade's Add-ons page, or Ctrl+F11 to cycle)."
         echo "Choose only the one a game starts with:"
-        if [[ $have_small == 1 ]]; then
+        if [[ $have_small_fp8 == 1 ]]; then
             echo "  1) CC_SMALL_FP8                    the default network of 310.9.16 (default)"
         else
             echo "  1) CC_SMALL_FP8                    not available: needs the 310.9.16 nvngx_dlssnr.dll (install again with --dll)"
         fi
-        if [[ $have_small == 1 && $experimental == 1 ]]; then
-            echo "  2) CC_SMALL_FP8_EXPERIMENTAL       this project's experimental network: 1) made faster"
-        elif [[ $have_small == 1 ]]; then
-            echo "  2) CC_SMALL_FP8_EXPERIMENTAL       not available: this package does not have it"
+        if [[ $have_small_fp8 == 1 && $small_fp8_optimized == 1 ]]; then
+            echo "  2) CC_SMALL_FP8_OPTIMIZED          this project's network: 1) made faster"
+        elif [[ $have_small_fp8 == 1 ]]; then
+            echo "  2) CC_SMALL_FP8_OPTIMIZED          not available: this package does not have it"
         else
-            echo "  2) CC_SMALL_FP8_EXPERIMENTAL       not available: needs the 310.9.16 nvngx_dlssnr.dll (install again with --dll)"
+            echo "  2) CC_SMALL_FP8_OPTIMIZED          not available: needs the 310.9.16 nvngx_dlssnr.dll (install again with --dll)"
         fi
         echo "  3) CC_SILVER_AARDWOLD              the network of 310.8.0"
-        if [[ $optimized == 1 ]]; then
-            echo "  4) CC_SILVER_AARDWOLD_OPTIMIZED    this project's network: 3) made faster (RX 9000)"
+        if [[ $silver_aardwold_optimized == 1 ]]; then
+            echo "  4) CC_SILVER_AARDWOLD_OPTIMIZED    this project's network: 3) made faster"
         else
             echo "  4) CC_SILVER_AARDWOLD_OPTIMIZED    not available: this package does not have it"
         fi
         echo "Later: [Network] Model in dlssnr-amd.ini."
-        def=1; [[ $have_small == 0 ]] && def=3
+        def=1; [[ $have_small_fp8 == 0 ]] && def=3
         read -r -p "Start with which one? [1/2/3/4, Enter = $def] " pick || pick=""
         case "${pick:-$def}" in
-            1) model=CC_SMALL_FP8;; 2) model=CC_SMALL_FP8_EXPERIMENTAL;; 3) model=CC_SILVER_AARDWOLD;;
+            1) model=CC_SMALL_FP8;; 2) model=CC_SMALL_FP8_OPTIMIZED;; 3) model=CC_SILVER_AARDWOLD;;
             4) model=CC_SILVER_AARDWOLD_OPTIMIZED;;
             *) echo "invalid choice, using $def.";;
         esac
     fi
 fi
-if [[ ($model == CC_SMALL_FP8 || $model == CC_SMALL_FP8_EXPERIMENTAL) && $have_small == 0 ]]; then
+if [[ ($model == CC_SMALL_FP8 || $model == CC_SMALL_FP8_OPTIMIZED) && $have_small_fp8 == 0 ]]; then
     echo "$model is not available (no CC_SMALL_FP8 model); the game starts with CC_SILVER_AARDWOLD."; model=CC_SILVER_AARDWOLD
 fi
-if [[ $model == CC_SILVER_AARDWOLD_OPTIMIZED && $optimized == 0 ]]; then
+if [[ $model == CC_SILVER_AARDWOLD_OPTIMIZED && $silver_aardwold_optimized == 0 ]]; then
     echo "This package has no CC_SILVER_AARDWOLD_OPTIMIZED; games start with CC_SILVER_AARDWOLD."; model=CC_SILVER_AARDWOLD
 fi
 if [[ -z "$renodx" && "$kind" == optiscaler ]]; then
@@ -370,66 +362,95 @@ if [[ $lumenite == 1 ]]; then
         echo "Note: this LumeniteFX is commit ${lumenite_got:0:7}, not ${lumenite_commit:0:7} this package was tested with. Its interface checks passed; installing it."
     fi
 fi
-opt_weights=0
-if [[ $optimized == 1 ]]; then
+silver_opt_weights=0
+if [[ $silver_aardwold_optimized == 1 ]]; then
     # CC_SILVER_AARDWOLD_OPTIMIZED's weights are not in the package: made here from CC_SILVER_AARDWOLD's model and the
     # package's difference file, installed only when their SHA-256 matches. When that fails the other networks are
     # installed as usual and it is greyed out in game (with the reason).
     echo "Making CC_SILVER_AARDWOLD_OPTIMIZED's weights ..."
-    opt_tmp=$(mktemp -d)
-    trap 'rm -rf -- "$opt_tmp"; [[ -n "${model_tmp:-}" ]] && rm -rf -- "$model_tmp"; rm -f -- "$pkg_model.part" "$pkg_small.part"' EXIT
-    if ! python3 "$here/optimized/experimental_weights.py" apply "${model_src:-$pkg_model}" \
-            "$here/optimized/dlssnr-optimized.delta" "$opt_tmp/CC_SILVER_AARDWOLD_OPTIMIZED.bin" > "$opt_tmp/log.txt" 2>&1; then
-        cat "$opt_tmp/log.txt" >&2
+    silver_opt_tmp=$(mktemp -d)
+    trap 'rm -rf -- "$silver_opt_tmp"; [[ -n "${model_tmp:-}" ]] && rm -rf -- "$model_tmp"; rm -f -- "$pkg_model.part" "$pkg_small_fp8.part"' EXIT
+    if ! python3 "$here/CC_SILVER_AARDWOLD_OPTIMIZED/delta_weights.py" apply "${model_src:-$pkg_model}" \
+            "$here/CC_SILVER_AARDWOLD_OPTIMIZED/CC_SILVER_AARDWOLD_OPTIMIZED.delta" "$silver_opt_tmp/CC_SILVER_AARDWOLD_OPTIMIZED.bin" > "$silver_opt_tmp/log.txt" 2>&1; then
+        cat "$silver_opt_tmp/log.txt" >&2
         echo "Note: CC_SILVER_AARDWOLD_OPTIMIZED's weights could not be made; it is not available in game. The other networks are installed as usual." >&2
-    elif [[ "$(sha256sum -- "$opt_tmp/CC_SILVER_AARDWOLD_OPTIMIZED.bin" | cut -d' ' -f1)" != \
-            "$(cut -d' ' -f1 "$here/optimized/CC_SILVER_AARDWOLD_OPTIMIZED.bin.sha256")" ]]; then
+    elif [[ "$(sha256sum -- "$silver_opt_tmp/CC_SILVER_AARDWOLD_OPTIMIZED.bin" | cut -d' ' -f1)" != \
+            "$(cut -d' ' -f1 "$here/CC_SILVER_AARDWOLD_OPTIMIZED/CC_SILVER_AARDWOLD_OPTIMIZED.bin.sha256")" ]]; then
         echo "Note: CC_SILVER_AARDWOLD_OPTIMIZED's weights have the wrong checksum (model or package incomplete?); it is not available in game. The other networks are installed as usual." >&2
     else
-        opt_weights=1
+        silver_opt_weights=1
     fi
 fi
-if [[ $opt_weights == 0 && $model == CC_SILVER_AARDWOLD_OPTIMIZED ]]; then
+if [[ $silver_opt_weights == 0 && $model == CC_SILVER_AARDWOLD_OPTIMIZED ]]; then
     echo "Games start with CC_SILVER_AARDWOLD."; model=CC_SILVER_AARDWOLD
 fi
-int4_weights=0
-if [[ $int4 == 1 && $opt_weights == 1 ]]; then
+silver_int4_weights=0
+if [[ $int4 == 1 && $silver_opt_weights == 1 ]]; then
     # its int4 layers' weights are not in the package either: made here from CC_SILVER_AARDWOLD_OPTIMIZED's weights (just
     # made) and the package's restore tables, and installed only if their SHA-256 matches. One file for its three levels
     # with int4 layers (Balanced, Performance, Ultra Performance): made with Ultra Performance's tables, which cover the
     # others'. If that fails, it runs at Quality (the other levels are greyed out in game, with the reason).
     echo "Making the weights of CC_SILVER_AARDWOLD_OPTIMIZED's int4 layers ..."
-    int4_tmp=$(mktemp -d)
-    trap 'rm -rf -- "$int4_tmp" "$opt_tmp"; [[ -n "${model_tmp:-}" ]] && rm -rf -- "$model_tmp"; rm -f -- "$pkg_model.part" "$pkg_small.part"' EXIT
-    if ! "$here/int4/dlssnr-int4-weights" "$opt_tmp/CC_SILVER_AARDWOLD_OPTIMIZED.bin" "$here/int4/dlssnr-amd/int4-ultra" "$int4_tmp/CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin" \
-            > "$int4_tmp/log.txt" 2>&1; then
-        cat "$int4_tmp/log.txt" >&2
+    silver_int4_tmp=$(mktemp -d)
+    trap 'rm -rf -- "$silver_int4_tmp" "$silver_opt_tmp"; [[ -n "${model_tmp:-}" ]] && rm -rf -- "$model_tmp"; rm -f -- "$pkg_model.part" "$pkg_small_fp8.part"' EXIT
+    if ! "$here/int4/dlssnr-int4-weights" --network CC_SILVER_AARDWOLD_OPTIMIZED "$silver_opt_tmp/CC_SILVER_AARDWOLD_OPTIMIZED.bin" "$here/int4/dlssnr-amd/CC_SILVER_AARDWOLD_OPTIMIZED-ultra" "$silver_int4_tmp/CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin" \
+            > "$silver_int4_tmp/log.txt" 2>&1; then
+        cat "$silver_int4_tmp/log.txt" >&2
         echo "Note: making the int4 layers' weights failed; CC_SILVER_AARDWOLD_OPTIMIZED runs at Quality only." >&2
-    elif [[ "$(sha256sum -- "$int4_tmp/CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin" | cut -d' ' -f1)" != "$(cut -d' ' -f1 "$here/int4/CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin.sha256")" ]]; then
+    elif [[ "$(sha256sum -- "$silver_int4_tmp/CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin" | cut -d' ' -f1)" != "$(cut -d' ' -f1 "$here/int4/CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin.sha256")" ]]; then
         echo "Note: the int4 layers' weights have the wrong checksum (model or package incomplete?); CC_SILVER_AARDWOLD_OPTIMIZED runs at Quality only." >&2
     else
-        int4_weights=1
+        silver_int4_weights=1
     fi
 fi
-exp_weights=0
-if [[ $experimental == 1 && $have_small == 1 ]]; then
-    # CC_SMALL_FP8_EXPERIMENTAL's weights are not in the package: made here from CC_SMALL_FP8's model and the package's difference file,
+small_fp8_opt_weights=0
+if [[ $small_fp8_optimized == 1 && $have_small_fp8 == 1 ]]; then
+    # CC_SMALL_FP8_OPTIMIZED's weights are not in the package: made here from CC_SMALL_FP8's model and the package's difference file,
     # installed only when their SHA-256 matches. When that fails the other networks are installed as usual and it is greyed out in game (with the reason).
-    echo "Making CC_SMALL_FP8_EXPERIMENTAL's weights ..."
-    exp_tmp=$(mktemp -d)
-    trap 'rm -rf -- "$exp_tmp" ${int4_tmp:+"$int4_tmp"} ${opt_tmp:+"$opt_tmp"}; [[ -n "${model_tmp:-}" ]] && rm -rf -- "$model_tmp"; rm -f -- "$pkg_model.part" "$pkg_small.part"' EXIT
-    if ! python3 "$here/experimental/experimental_weights.py" apply "${small_src:-$pkg_small}" \
-            "$here/experimental/dlssnr-small-experimental.delta" "$exp_tmp/CC_SMALL_FP8_EXPERIMENTAL.bin" > "$exp_tmp/log.txt" 2>&1; then
-        cat "$exp_tmp/log.txt" >&2
-        echo "Note: CC_SMALL_FP8_EXPERIMENTAL's weights could not be made; it is not available in game. The other networks are installed as usual." >&2
-    elif [[ "$(sha256sum -- "$exp_tmp/CC_SMALL_FP8_EXPERIMENTAL.bin" | cut -d' ' -f1)" != \
-            "$(cut -d' ' -f1 "$here/experimental/CC_SMALL_FP8_EXPERIMENTAL.bin.sha256")" ]]; then
-        echo "Note: CC_SMALL_FP8_EXPERIMENTAL's weights have the wrong checksum (model or package incomplete?); it is not available in game. The other networks are installed as usual." >&2
+    echo "Making CC_SMALL_FP8_OPTIMIZED's weights ..."
+    small_fp8_opt_tmp=$(mktemp -d)
+    trap 'rm -rf -- "$small_fp8_opt_tmp" ${silver_int4_tmp:+"$silver_int4_tmp"} ${silver_opt_tmp:+"$silver_opt_tmp"}; [[ -n "${model_tmp:-}" ]] && rm -rf -- "$model_tmp"; rm -f -- "$pkg_model.part" "$pkg_small_fp8.part"' EXIT
+    if ! python3 "$here/CC_SMALL_FP8_OPTIMIZED/delta_weights.py" apply "${small_fp8_src:-$pkg_small_fp8}" \
+            "$here/CC_SMALL_FP8_OPTIMIZED/CC_SMALL_FP8_OPTIMIZED.delta" "$small_fp8_opt_tmp/CC_SMALL_FP8_OPTIMIZED.bin" > "$small_fp8_opt_tmp/log.txt" 2>&1; then
+        cat "$small_fp8_opt_tmp/log.txt" >&2
+        echo "Note: CC_SMALL_FP8_OPTIMIZED's weights could not be made; it is not available in game. The other networks are installed as usual." >&2
+    elif [[ "$(sha256sum -- "$small_fp8_opt_tmp/CC_SMALL_FP8_OPTIMIZED.bin" | cut -d' ' -f1)" != \
+            "$(cut -d' ' -f1 "$here/CC_SMALL_FP8_OPTIMIZED/CC_SMALL_FP8_OPTIMIZED.bin.sha256")" ]]; then
+        echo "Note: CC_SMALL_FP8_OPTIMIZED's weights have the wrong checksum (model or package incomplete?); it is not available in game. The other networks are installed as usual." >&2
     else
-        exp_weights=1
+        small_fp8_opt_weights=1
     fi
 fi
-if [[ $exp_weights == 0 && $model == CC_SMALL_FP8_EXPERIMENTAL ]]; then
+small_fp8_int4_weights=0
+if [[ $int4 == 1 && $small_fp8_opt_weights == 1 ]]; then
+    # its int4 layers' weights (Ultra Performance) are not in the package either: made here from CC_SMALL_FP8_OPTIMIZED's
+    # weights (just made) and the package's restore tables, installed only if their SHA-256 matches. If that fails, its
+    # Ultra Performance is greyed out in game (with the reason) and Performance runs.
+    echo "Making the weights of CC_SMALL_FP8_OPTIMIZED's int4 layers ..."
+    small_fp8_int4_tmp=$(mktemp -d)
+    trap 'rm -rf -- "$small_fp8_int4_tmp" "$small_fp8_opt_tmp" ${silver_int4_tmp:+"$silver_int4_tmp"} ${silver_opt_tmp:+"$silver_opt_tmp"}; [[ -n "${model_tmp:-}" ]] && rm -rf -- "$model_tmp"; rm -f -- "$pkg_model.part" "$pkg_small_fp8.part"' EXIT
+    if ! "$here/int4/dlssnr-int4-weights" --network CC_SMALL_FP8_OPTIMIZED "$small_fp8_opt_tmp/CC_SMALL_FP8_OPTIMIZED.bin" "$here/int4/dlssnr-amd/CC_SMALL_FP8_OPTIMIZED-ultra" \
+            "$small_fp8_int4_tmp/CC_SMALL_FP8_OPTIMIZED_INT4.bin" > "$small_fp8_int4_tmp/log.txt" 2>&1; then
+        cat "$small_fp8_int4_tmp/log.txt" >&2
+        echo "Note: making the int4 layers' weights failed; CC_SMALL_FP8_OPTIMIZED runs at Performance for Ultra Performance." >&2
+    elif [[ "$(sha256sum -- "$small_fp8_int4_tmp/CC_SMALL_FP8_OPTIMIZED_INT4.bin" | cut -d' ' -f1)" != "$(cut -d' ' -f1 "$here/int4/CC_SMALL_FP8_OPTIMIZED_INT4.bin.sha256")" ]]; then
+        echo "Note: the int4 layers' weights have the wrong checksum (model or package incomplete?); CC_SMALL_FP8_OPTIMIZED runs at Performance for Ultra Performance." >&2
+    else
+        small_fp8_int4_weights=1
+        # the 1440p-class frames' own (CC_SMALL_FP8_OPTIMIZED-ultra/vit-sink): without them Ultra Performance runs as
+        # Performance there
+        if ! "$here/int4/dlssnr-int4-weights" --network CC_SMALL_FP8_OPTIMIZED --sink "$small_fp8_opt_tmp/CC_SMALL_FP8_OPTIMIZED.bin" "$here/int4/dlssnr-amd/CC_SMALL_FP8_OPTIMIZED-ultra" \
+                "$small_fp8_int4_tmp/CC_SMALL_FP8_OPTIMIZED_INT4_SINK.bin" > "$small_fp8_int4_tmp/log-sink.txt" 2>&1; then
+            cat "$small_fp8_int4_tmp/log-sink.txt" >&2
+            echo "Note: making the int4 layers' weights for 1440p-class resolutions failed; CC_SMALL_FP8_OPTIMIZED runs at Performance there for Ultra Performance." >&2
+            rm -f -- "$small_fp8_int4_tmp/CC_SMALL_FP8_OPTIMIZED_INT4_SINK.bin"
+        elif [[ "$(sha256sum -- "$small_fp8_int4_tmp/CC_SMALL_FP8_OPTIMIZED_INT4_SINK.bin" | cut -d' ' -f1)" != "$(cut -d' ' -f1 "$here/int4/CC_SMALL_FP8_OPTIMIZED_INT4_SINK.bin.sha256")" ]]; then
+            echo "Note: the int4 layers' weights for 1440p-class resolutions have the wrong checksum (model or package incomplete?); CC_SMALL_FP8_OPTIMIZED runs at Performance there for Ultra Performance." >&2
+            rm -f -- "$small_fp8_int4_tmp/CC_SMALL_FP8_OPTIMIZED_INT4_SINK.bin"
+        fi
+    fi
+fi
+if [[ $small_fp8_opt_weights == 0 && $model == CC_SMALL_FP8_OPTIMIZED ]]; then
     echo "The game starts with CC_SMALL_FP8 instead."; model=CC_SMALL_FP8
 fi
 if [[ -f "$manifest" ]]; then
@@ -443,9 +464,9 @@ fi
 : > "$manifest"; record "dlssnr-amd-install.txt"
 put_tree "$here/dlssnr-amd" dlssnr-amd
 [[ -n "$model_src" ]] && cp -- "$model_src" "$game/dlssnr-amd/CC_SILVER_AARDWOLD.bin"
-[[ -n "$small_src" ]] && cp -- "$small_src" "$game/dlssnr-amd/CC_SMALL_FP8.bin"
-[[ $exp_weights == 1 ]] && mv -- "$exp_tmp/CC_SMALL_FP8_EXPERIMENTAL.bin" "$game/dlssnr-amd/CC_SMALL_FP8_EXPERIMENTAL.bin"
-[[ $opt_weights == 1 ]] && mv -- "$opt_tmp/CC_SILVER_AARDWOLD_OPTIMIZED.bin" "$game/dlssnr-amd/CC_SILVER_AARDWOLD_OPTIMIZED.bin"
+[[ -n "$small_fp8_src" ]] && cp -- "$small_fp8_src" "$game/dlssnr-amd/CC_SMALL_FP8.bin"
+[[ $small_fp8_opt_weights == 1 ]] && mv -- "$small_fp8_opt_tmp/CC_SMALL_FP8_OPTIMIZED.bin" "$game/dlssnr-amd/CC_SMALL_FP8_OPTIMIZED.bin"
+[[ $silver_opt_weights == 1 ]] && mv -- "$silver_opt_tmp/CC_SILVER_AARDWOLD_OPTIMIZED.bin" "$game/dlssnr-amd/CC_SILVER_AARDWOLD_OPTIMIZED.bin"
 
 case "$kind" in
     optiscaler)
@@ -505,19 +526,23 @@ if [[ $lumenite == 1 ]]; then
 fi
 if [[ $int4 == 1 ]]; then
     # the programs that run all four networks (the int4 layers built in) replace the ReShade route's files of the same name just installed (the OptiScaler route's NR plugin runs all four as it is);
-    # dlssnr-amd/int4 (Balanced), int4-performance, int4-ultra: network, quantisers, settings, Vulkan layer (int4/ only; the recovery tables *.fix.bin, *.mu.bin stay in the package); the weights made go into dlssnr-amd/
+    # dlssnr-amd/int4/layer (the Vulkan layer) and each level with int4 layers (CC_SILVER_AARDWOLD_OPTIMIZED-balanced, -performance, -ultra, CC_SMALL_FP8_OPTIMIZED-ultra): network, quantisers, settings (the recovery tables *.fix.bin, *.mu.bin stay in the package); the weights made go into dlssnr-amd/
     if [[ "$kind" != optiscaler ]]; then
         for f in "$here/int4/reshade"/*; do
             name=$(basename -- "$f")
             [[ -e "$game/$name" ]] && cp -- "$f" "$game/$name"
         done
     fi
-    for lv in int4 int4-performance int4-ultra; do
+    for lv in int4 CC_SILVER_AARDWOLD_OPTIMIZED-balanced CC_SILVER_AARDWOLD_OPTIMIZED-performance CC_SILVER_AARDWOLD_OPTIMIZED-ultra \
+              CC_SMALL_FP8_OPTIMIZED-ultra; do
         mkdir -p -- "$game/dlssnr-amd/$lv"
         (cd -- "$here/int4/dlssnr-amd/$lv" && find . -type f ! -name '*.fix.bin' ! -name '*.mu.bin' -print0 |
             while IFS= read -r -d '' f; do mkdir -p -- "$game/dlssnr-amd/$lv/$(dirname -- "$f")"; cp -- "$f" "$game/dlssnr-amd/$lv/$f"; done)
     done
-    [[ $int4_weights == 1 ]] && mv -- "$int4_tmp/CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin" "$game/dlssnr-amd/CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin"
+    [[ $silver_int4_weights == 1 ]] && mv -- "$silver_int4_tmp/CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin" "$game/dlssnr-amd/CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin"
+    [[ $small_fp8_int4_weights == 1 ]] && mv -- "$small_fp8_int4_tmp/CC_SMALL_FP8_OPTIMIZED_INT4.bin" "$game/dlssnr-amd/CC_SMALL_FP8_OPTIMIZED_INT4.bin"
+    [[ $small_fp8_int4_weights == 1 && -f "$small_fp8_int4_tmp/CC_SMALL_FP8_OPTIMIZED_INT4_SINK.bin" ]] &&
+        mv -- "$small_fp8_int4_tmp/CC_SMALL_FP8_OPTIMIZED_INT4_SINK.bin" "$game/dlssnr-amd/CC_SMALL_FP8_OPTIMIZED_INT4_SINK.bin"
 fi
 # dlssnr-amd.ini is put in place at install, with every setting and its description (a reinstall puts a fresh default)
 ini_dir=$here/ini
@@ -546,9 +571,9 @@ if [[ "$kind" == optiscaler ]]; then
 else
     echo "Installed the $route route into: $game$([[ $renodx == 1 ]] && echo " (RenoDX style)")"
 fi
-echo "Networks installed: $([[ $have_small == 1 ]] && echo "CC_SMALL_FP8, ")$([[ $exp_weights == 1 ]] && echo "CC_SMALL_FP8_EXPERIMENTAL, ")CC_SILVER_AARDWOLD$([[ $opt_weights == 1 ]] && echo ", CC_SILVER_AARDWOLD_OPTIMIZED$([[ $int4_weights == 0 ]] && echo " (Quality only: no int4 layers)")"); the game starts with $model."
+echo "Networks installed: $([[ $have_small_fp8 == 1 ]] && echo "CC_SMALL_FP8, ")$([[ $small_fp8_opt_weights == 1 ]] && echo "CC_SMALL_FP8_OPTIMIZED, ")CC_SILVER_AARDWOLD$([[ $silver_opt_weights == 1 ]] && echo ", CC_SILVER_AARDWOLD_OPTIMIZED$([[ $silver_int4_weights == 0 ]] && echo " (Quality only: no int4 layers)")"); the game starts with $model."
 echo "Switch the network in game at any time: the drop-down in $([[ "$kind" == optiscaler ]] && echo "NR Control (End)" || echo "ReShade's Add-ons page"), or Ctrl+F11 to cycle; settings: [Network] in dlssnr-amd.ini."
-# the Vulkan layer in the launch options: only CC_SILVER_AARDWOLD_OPTIMIZED's int4 layers on the ReShade routes need it (in the main launch line only when it is the starting network, else printed as a line of its own);
+# the Vulkan layer in the launch options: only the int4 layers (CC_SILVER_AARDWOLD_OPTIMIZED's, CC_SMALL_FP8_OPTIMIZED's Ultra Performance) on the ReShade routes need it (in the main launch line only when CC_SILVER_AARDWOLD_OPTIMIZED is the starting network, else printed as a line of its own);
 # the OptiScaler route needs no layer (the NR plugin draws NR Control itself and adds the device extensions the int4 layers need)
 launch() {   # <with the int4 layer: 0/1>
     local paths=() names=()
@@ -559,10 +584,10 @@ launch() {   # <with the int4 layer: 0/1>
         echo "WINEDLLOVERRIDES=\"$overrides\" %command%"
     fi
 }
-main_int4=0; [[ $model == CC_SILVER_AARDWOLD_OPTIMIZED && $int4_weights == 1 ]] && main_int4=1
+main_int4=0; [[ $model == CC_SILVER_AARDWOLD_OPTIMIZED && $silver_int4_weights == 1 ]] && main_int4=1
 echo "Steam launch options:  $(launch $main_int4)"
-if [[ $int4_weights == 1 && $main_int4 == 0 && "$kind" != optiscaler ]]; then
-    echo "For CC_SILVER_AARDWOLD_OPTIMIZED with its int4 layers in game, use this line instead (every network can be switched to):"
+if [[ ( $silver_int4_weights == 1 || $small_fp8_int4_weights == 1 ) && $main_int4 == 0 && "$kind" != optiscaler ]]; then
+    echo "For CC_SILVER_AARDWOLD_OPTIMIZED's int4 levels and CC_SMALL_FP8_OPTIMIZED's Ultra Performance in game, use this line instead (every network can be switched to):"
     echo "                 $(launch 1)"
 fi
 if [[ "$kind" == optiscaler ]]; then

@@ -5,15 +5,15 @@
 #   vulkan/              ReShade as a Vulkan layer, for Vulkan and D3D9 games
 #   optiscaler/          OptiScaler (the official nightly, unmodified) and our NR plugin for it (x86_64 only)
 #   model-tools/         rebuilds the model from nvngx_dlssnr.dll at install time
-#   experimental/        makes CC_SMALL_FP8_EXPERIMENTAL's weights from the small model at install time
-#   optimized/           makes CC_SILVER_AARDWOLD_OPTIMIZED's weights from the 310.8 model at install time
+#   CC_SMALL_FP8_OPTIMIZED/        makes CC_SMALL_FP8_OPTIMIZED's weights from CC_SMALL_FP8's at install time
+#   CC_SILVER_AARDWOLD_OPTIMIZED/  makes CC_SILVER_AARDWOLD_OPTIMIZED's weights from CC_SILVER_AARDWOLD's at install time
 #   install.sh, README.txt
 #
 #   NR_ARCH=x86_64|i686 bash linux/build/build_package.sh [build dir]
-#   NR_MODEL=CC_SILVER_AARDWOLD.bin put this model in the package (made from your own DLL by
+#   NR_MODEL_SILVER_AARDWOLD=CC_SILVER_AARDWOLD.bin  put this model in the package (made from your own DLL by
 #                       linux/package/model-tools/extract_model.sh); without it
 #                       install.sh needs --dll
-#   NR_MODEL_SMALL=CC_SMALL_FP8.bin  with NR_MODEL: the new model too (from the 310.9.16 DLL)
+#   NR_MODEL_SMALL_FP8=CC_SMALL_FP8.bin  with NR_MODEL_SILVER_AARDWOLD: CC_SMALL_FP8 too (from the 310.9.16 DLL)
 #   NR_VERSION=...      override the version (default: from the git tags, linux/build/version.sh)
 #   NR_LANG_EXTRA=<dir> test packages only: extra language files (and fonts/) into dlssnr-amd/lang
 #   NR_SIGN=1           the package's Windows binaries signed (self-signed, linux/build/sign_pe.py)
@@ -22,8 +22,8 @@
 # built again with NR_INT4=1 (this script with NR_INT4=1 NR_PROGRAMS_ONLY=1), the network with them, their data, the
 # Vulkan layer and the install-time weights generator (build_int4.sh).
 set -euo pipefail
-model=${NR_MODEL:+$(realpath -- "$NR_MODEL")}
-small=${NR_MODEL_SMALL:+$(realpath -- "$NR_MODEL_SMALL")}
+model=${NR_MODEL_SILVER_AARDWOLD:+$(realpath -- "$NR_MODEL_SILVER_AARDWOLD")}
+model_small_fp8=${NR_MODEL_SMALL_FP8:+$(realpath -- "$NR_MODEL_SMALL_FP8")}
 cd -- "$(dirname -- "$0")/../.."
 bash linux/build/check_paths.sh   # UTF-8 paths only in the Windows code (a game folder with any letters)
 bash linux/build/check_imgui.sh   # ReShade's ImGui is MSVC's: no ImVec2-returning call from the add-on's code
@@ -36,6 +36,7 @@ mkdir -p -- "$out"
 
 cxx=${NR_MINGW:-$arch-w64-mingw32-g++}
 cc=${NR_MINGW_CC:-$arch-w64-mingw32-gcc}
+source linux/build/parallel.sh
 command -v "$cxx" >/dev/null || { echo "no mingw cross compiler ($cxx)" >&2; exit 1; }
 minhook=artifacts/ref/DLSS5-Feeder/external/minhook
 reshade_inc=artifacts/ref/DLSS5-Feeder/external/reshade/include
@@ -49,25 +50,26 @@ common=(-std=c++17 -O2 -DNDEBUG -Itoolchain/Vulkan-Headers/include -Ilinux/src -
 # (NR_RESHADE_ROUTE: these are the ReShade add-on's objects, all of them - the route's defaults, nr_fast_passes.hpp)
 common+=(-DNR_RESHADE_ROUTE=1)
 [[ "${NR_INT4:-0}" == 1 ]] && common+=(-DNR_INT4=1)   # the build of the programs with the int4 layers (int4/ below)
-"$cxx" "${common[@]}" "${NR_PRODUCT_DEFINES[@]}" -c linux/src/core/nr_runtime.cpp -o "$out/nr_runtime.o"
-"$cxx" "${common[@]}" -c linux/src/core/nr_native_plan.cpp -o "$out/nr_native_plan.o"
-"$cxx" "${common[@]}" -c linux/src/core/nr_renodx.cpp -o "$out/nr_renodx.o"
-"$cxx" "${common[@]}" -c linux/src/core/nr_wilsjo2.cpp -o "$out/nr_wilsjo2.o"   # its Stage: HUD FIX on this route
-"$cxx" "${common[@]}" -c linux/src/pe/nr_pe_log.cpp -o "$out/log.o"
-"$cxx" "${common[@]}" -c linux/src/pe/nr_pe_interop.cpp -o "$out/interop.o"
-"$cxx" "${common[@]}" -c linux/src/pe/nr_vram_ledger.cpp -o "$out/vram_ledger.o"
-"$cxx" "${common[@]}" -I"$minhook/include" -c linux/src/pe/nr_pe_vkdevice.cpp -o "$out/vkdevice.o"
-"$cxx" "${common[@]}" -c linux/src/pe/nr_pe_session.cpp -o "$out/session.o"
-"$cxx" "${common[@]}" -c linux/src/pe/nr_pe_config.cpp -o "$out/config.o"
-"$cxx" "${common[@]}" -c linux/src/pe/nr_screenshot.cpp -o "$out/screenshot.o"
+par "$cxx" "${common[@]}" "${NR_PRODUCT_DEFINES[@]}" -c linux/src/core/nr_runtime.cpp -o "$out/nr_runtime.o"
+par "$cxx" "${common[@]}" -c linux/src/core/nr_native_plan.cpp -o "$out/nr_native_plan.o"
+par "$cxx" "${common[@]}" -c linux/src/core/nr_renodx.cpp -o "$out/nr_renodx.o"
+par "$cxx" "${common[@]}" -c linux/src/core/nr_frame_reuse.cpp -o "$out/nr_frame_reuse.o"   # NRFrameReuse
+par "$cxx" "${common[@]}" -c linux/src/core/nr_wilsjo2.cpp -o "$out/nr_wilsjo2.o"   # its Stage: HUD FIX on this route
+par "$cxx" "${common[@]}" -c linux/src/pe/nr_pe_log.cpp -o "$out/log.o"
+par "$cxx" "${common[@]}" -c linux/src/pe/nr_pe_interop.cpp -o "$out/interop.o"
+par "$cxx" "${common[@]}" -c linux/src/pe/nr_vram_ledger.cpp -o "$out/vram_ledger.o"
+par "$cxx" "${common[@]}" -I"$minhook/include" -c linux/src/pe/nr_pe_vkdevice.cpp -o "$out/vkdevice.o"
+par "$cxx" "${common[@]}" -c linux/src/pe/nr_pe_session.cpp -o "$out/session.o"
+par "$cxx" "${common[@]}" -c linux/src/pe/nr_pe_config.cpp -o "$out/config.o"
+par "$cxx" "${common[@]}" -c linux/src/pe/nr_screenshot.cpp -o "$out/screenshot.o"
 # ReShade's headers include <Windows.h>; the case shim maps that onto mingw's.
-"$cxx" "${common[@]}" -Ilinux/src/pe/reshade_compat -I"$reshade_inc" -I"$minhook/include" \
+par "$cxx" "${common[@]}" -Ilinux/src/pe/reshade_compat -I"$reshade_inc" -I"$minhook/include" \
     -Iartifacts/ref/DLSS5-Feeder/external/imgui -Ilinux/src/ui -c linux/src/pe/nr_reshade_addon.cpp -o "$out/reshade_addon.o"
 for unit in hook buffer trampoline; do
-    "$cc" -O2 -I"$minhook/include" -I"$minhook/src" -c "$minhook/src/$unit.c" -o "$out/mh_$unit.o"
+    par "$cc" -O2 -I"$minhook/include" -I"$minhook/src" -c "$minhook/src/$unit.c" -o "$out/mh_$unit.o"
 done
 hde=hde64; [[ "$arch" == i686 ]] && hde=hde32
-"$cc" -O2 -I"$minhook/include" -I"$minhook/src" -c "$minhook/src/hde/$hde.c" -o "$out/mh_$hde.o"
+par "$cc" -O2 -I"$minhook/include" -I"$minhook/src" -c "$minhook/src/hde/$hde.c" -o "$out/mh_$hde.o"
 ldflags=(-ld3d12 -ldxgi -ldwmapi -lgdi32 -lole32 -static -static-libgcc -static-libstdc++)
 [[ "$arch" == i686 ]] && ldflags+=(-Wl,--kill-at)   # undecorated stdcall exports
 
@@ -77,8 +79,9 @@ ldflags=(-ld3d12 -ldxgi -ldwmapi -lgdi32 -lole32 -static -static-libgcc -static-
 # Hunter Wilds dies from that). Every vk* call goes through a pointer instead,
 # filled by nr_vk_load() once the game has loaded Vulkan. The symbol list is
 # whatever a trial link reports as undefined, so it cannot go stale.
+par_wait
 runtime_objs=("$out/session.o" "$out/config.o" "$out/screenshot.o" "$out/interop.o" "$out/vram_ledger.o" "$out/log.o" "$out/vkdevice.o"
-              "$out/nr_runtime.o" "$out/nr_native_plan.o" "$out/nr_renodx.o" "$out/nr_wilsjo2.o")
+              "$out/nr_runtime.o" "$out/nr_native_plan.o" "$out/nr_renodx.o" "$out/nr_frame_reuse.o" "$out/nr_wilsjo2.o")
 undefined=$({ "$cxx" -shared -o /dev/null "$out/reshade_addon.o" "${runtime_objs[@]}" \
     "$out"/mh_*.o "${ldflags[@]}" 2>&1 || true; } |
     grep -o "undefined reference to \`_*vk[A-Za-z0-9_@]*'" | sed "s/.*\`//; s/'//" | sort -u)
@@ -218,7 +221,8 @@ lazy=("$out/vulkan_lazy_s.o" "$out/vulkan_lazy_c.o")
 # ---- package ------------------------------------------------------------------
 pkg="$out/package"
 rm -rf -- "$pkg"; mkdir -p -- "$pkg"
-bash linux/build/assemble_product_data.sh "$pkg" ${model:+--model "$model"} ${model:+${small:+--small-model "$small"}}
+bash linux/build/assemble_product_data.sh "$pkg" ${model:+--silver-aardwold-model "$model"} \
+    ${model:+${model_small_fp8:+--small-fp8-model "$model_small_fp8"}}
 # NR_LANG_EXTRA=<dir> (test packages only): its language files (*.txt) into dlssnr-amd/lang and its fonts with their
 # licences (fonts/) into dlssnr-amd/lang/fonts, for a language file's @font = fonts/<file> (as the Windows package)
 if [[ -n "${NR_LANG_EXTRA:-}" ]]; then
@@ -343,9 +347,10 @@ fi
 # dlssnr-amd.ini, put in place at install (the text the programs write themselves, linux/package/make_ini.py)
 python3 linux/package/make_ini.py linux/src/pe/nr_pe_config.cpp "$pkg/ini" > /dev/null
 
-# int4/: CC_SILVER_AARDWOLD_OPTIMIZED's int4 layers. The int4 build of the programs that differ, dlssnr-amd/int4
-# (network, quantisers, recovery tables, settings, layer), the weights generator and the SHA-256 of what it must make
-# from CC_SILVER_AARDWOLD_OPTIMIZED's weights (linux/data/int4/<arch>/dlssnr-int4.sha256, checked by install.sh).
+# int4/: the int4 layers of CC_SILVER_AARDWOLD_OPTIMIZED and CC_SMALL_FP8_OPTIMIZED. The int4 build of the programs that
+# differ, dlssnr-amd/int4/layer (the Vulkan layer), CC_SILVER_AARDWOLD_OPTIMIZED's levels with int4 layers (network,
+# quantisers, recovery tables, settings), the weights generator and the SHA-256 of what it must make
+# from CC_SILVER_AARDWOLD_OPTIMIZED's weights (linux/data/CC_SILVER_AARDWOLD_OPTIMIZED-balanced/<arch>/CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin.sha256, checked by install.sh).
 # i686: no OptiScaler route, so only the add-on; the layer comes in both widths (build_int4.sh NR_LAYER32).
 if [[ "$arch" == x86_64 || "$arch" == i686 ]]; then
     i4="$pkg/int4"
@@ -354,25 +359,36 @@ if [[ "$arch" == x86_64 || "$arch" == i686 ]]; then
     NR_LAYER32=$layer32 bash linux/build/build_int4.sh "$out/int4/parts" > /dev/null
     mkdir -p -- "$i4/reshade" "$i4/dlssnr-amd"
     cp -- "$out/int4/dlssnr_amd.addon$bits" "$i4/reshade/"
-    cp -r -- "$out/int4/parts/data" "$i4/dlssnr-amd/int4"
-    cp -r -- "$out/int4/parts/data-performance" "$i4/dlssnr-amd/int4-performance"
-    cp -r -- "$out/int4/parts/data-ultra" "$i4/dlssnr-amd/int4-ultra"
+    mkdir -p -- "$i4/dlssnr-amd/int4"
+    cp -r -- "$out/int4/parts/layer" "$i4/dlssnr-amd/int4/layer"
+    for n in CC_SILVER_AARDWOLD_OPTIMIZED-balanced CC_SILVER_AARDWOLD_OPTIMIZED-performance CC_SILVER_AARDWOLD_OPTIMIZED-ultra; do
+        cp -r -- "$out/int4/parts/$n" "$i4/dlssnr-amd/$n"
+    done
+    # CC_SMALL_FP8_OPTIMIZED's int4 layers (Ultra Performance): dlssnr-amd/CC_SMALL_FP8_OPTIMIZED-ultra and the SHA-256
+    # of the weights the generator (--network CC_SMALL_FP8_OPTIMIZED) must make from CC_SMALL_FP8_OPTIMIZED's
+    # (linux/data/CC_SMALL_FP8_OPTIMIZED-ultra/<arch>/CC_SMALL_FP8_OPTIMIZED_INT4.bin.sha256)
+    cp -r -- "$out/int4/parts/CC_SMALL_FP8_OPTIMIZED-ultra" "$i4/dlssnr-amd/CC_SMALL_FP8_OPTIMIZED-ultra"
+    cp -- "linux/data/CC_SMALL_FP8_OPTIMIZED-ultra/$NR_GPU_ARCH/CC_SMALL_FP8_OPTIMIZED_INT4.bin.sha256" "$i4/CC_SMALL_FP8_OPTIMIZED_INT4.bin.sha256"
+    # ... and of the 1440p-class frames' (--sink, from CC_SMALL_FP8_OPTIMIZED-ultra/vit-sink)
+    cp -- "linux/data/CC_SMALL_FP8_OPTIMIZED-ultra/$NR_GPU_ARCH/CC_SMALL_FP8_OPTIMIZED_INT4_SINK.bin.sha256" "$i4/CC_SMALL_FP8_OPTIMIZED_INT4_SINK.bin.sha256"
     cp -- "$out/int4/parts/dlssnr-int4-weights" "$i4/"
-    cp -- "linux/data/int4/$NR_GPU_ARCH/dlssnr-int4.sha256" "$i4/CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin.sha256"
+    cp -- "linux/data/CC_SILVER_AARDWOLD_OPTIMIZED-balanced/$NR_GPU_ARCH/CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin.sha256" "$i4/CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin.sha256"
 fi
-# experimental/: what install.sh makes CC_SMALL_FP8_EXPERIMENTAL's weights with - the difference of its fitted weights
-# from the small model's (linux/data/experimental: each changed entry XOR the small model's, so it holds none of
-# NVIDIA's weights), the program that applies it, and the SHA-256 of the result. Its shaders are in
-# dlssnr-amd/experimental/.
-mkdir -p -- "$pkg/experimental"
-cp -- linux/data/experimental/dlssnr-small-experimental.delta "$pkg/experimental/"
-cp -- linux/build/experimental_weights.py "$pkg/experimental/"
-cp -- linux/data/experimental/dlssnr-small-experimental.sha256 "$pkg/experimental/CC_SMALL_FP8_EXPERIMENTAL.bin.sha256"
-# optimized/: the same for CC_SILVER_AARDWOLD_OPTIMIZED, from the 310.8 model's weights (linux/data/optimized). Its shaders
-# are in dlssnr-amd/optimized/; its int4 layers' weights are made from the result (int4/ above).
-mkdir -p -- "$pkg/optimized"
-cp -- linux/data/optimized/dlssnr-optimized.delta linux/build/experimental_weights.py "$pkg/optimized/"
-cp -- linux/data/optimized/dlssnr-optimized.sha256 "$pkg/optimized/CC_SILVER_AARDWOLD_OPTIMIZED.bin.sha256"
+# CC_SMALL_FP8_OPTIMIZED/: what install.sh makes CC_SMALL_FP8_OPTIMIZED's weights with - the difference of its fitted
+# weights from CC_SMALL_FP8's (linux/data/CC_SMALL_FP8_OPTIMIZED: each changed entry XOR CC_SMALL_FP8's, so it holds none
+# of NVIDIA's weights; Performance's own entries added as "performance/<name>"), the program that applies it, and the
+# SHA-256 of the result. Its shaders are in dlssnr-amd/CC_SMALL_FP8_OPTIMIZED/ (Quality) and
+# dlssnr-amd/CC_SMALL_FP8_OPTIMIZED-performance/.
+mkdir -p -- "$pkg/CC_SMALL_FP8_OPTIMIZED"
+cp -- linux/data/CC_SMALL_FP8_OPTIMIZED/CC_SMALL_FP8_OPTIMIZED.delta linux/data/CC_SMALL_FP8_OPTIMIZED/CC_SMALL_FP8_OPTIMIZED.bin.sha256 \
+    linux/build/delta_weights.py "$pkg/CC_SMALL_FP8_OPTIMIZED/"
+# CC_SILVER_AARDWOLD_OPTIMIZED/: the same for CC_SILVER_AARDWOLD_OPTIMIZED, from CC_SILVER_AARDWOLD's weights
+# (linux/data/CC_SILVER_AARDWOLD_OPTIMIZED). Its shaders are in dlssnr-amd/CC_SILVER_AARDWOLD_OPTIMIZED/; its int4 layers'
+# weights are made from the result (int4/ above).
+mkdir -p -- "$pkg/CC_SILVER_AARDWOLD_OPTIMIZED"
+cp -- linux/data/CC_SILVER_AARDWOLD_OPTIMIZED/CC_SILVER_AARDWOLD_OPTIMIZED.delta \
+    linux/data/CC_SILVER_AARDWOLD_OPTIMIZED/CC_SILVER_AARDWOLD_OPTIMIZED.bin.sha256 linux/build/delta_weights.py \
+    "$pkg/CC_SILVER_AARDWOLD_OPTIMIZED/"
 cp -- linux/package/install.sh linux/package/README.txt linux/package/lumenite.py "$pkg/"
 chmod +x "$pkg/install.sh" "$mt/extract_model.sh"
 

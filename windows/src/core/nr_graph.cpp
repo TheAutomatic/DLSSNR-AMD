@@ -186,7 +186,7 @@ static bool tchain_active(bool rdna3 = false) {
 // exists, so this looks only at the kernels; the build checks the data offsets.
 static bool tchain_kern(const std::string& k);
 #if NR_INT4
-// int4 mixed: per Swin block whether its MLP weights took the hard-swish fold, and the e_off values that are int4
+// CC_SILVER_AARDWOLD_OPTIMIZED's int4 layers: per Swin block whether its MLP weights took the hard-swish fold, and the e_off values that are int4
 // records (never packed as matrices).
 static std::map<int, bool> g_hs_folded;
 // The blocks whose Swin layer got its int4 QKV tables (record words 10-12; NR_SWQ4 pipelines read them): the guard
@@ -206,6 +206,41 @@ static std::string i4base(const std::string& k) {
 #define NR_KBASE(k) i4base(k)
 #else
 #define NR_KBASE(k) (k)
+#endif
+// CC_SMALL_FP8_OPTIMIZED Performance (marker vit-kv-pool.txt, build_network.py --network CC_SMALL_FP8_OPTIMIZED-performance): the ViT layers
+// whose attention reads pooled keys and values, and per head the pooling factor (2, 4, 8, 16: 1 / f of the keys; 0:
+// all of them), at frames whose ViT has at least min_tokens tokens (4K class; the ViT attention is quadratic in them).
+// Read per graph build; vit_kvpool.comp pools, vit_attn.comp (NR_VKPOOL) reads.
+struct VitKvPool { size_t min_tokens = 0; std::map<int, std::array<float, 32>> heads; };
+static VitKvPool g_vkpool;
+// CC_SMALL_FP8_OPTIMIZED: the ViT raster's padding is all computed from the image's edge, none of it plain zeros
+// (2560x1440, 2720x1530, 2240x1260, 1707x960, 5120x1440). There a few heads attend almost only to the padding tokens, and
+// on some content that "sink" sits between two configurations: the key / value pooling and int4 noise in the early ViT
+// blocks tip it (5120x1440 Performance 40.3 dB / Ultra 43.0 vs 48.2). Where any padding token is plain zeros, the sink
+// holds on to those and nothing tips (measured at 11 extents). Set per graph build.
+static bool g_vit_sink = false;
+static const float* vkpool_heads(int block, size_t tokens) {   // null: the layer's attention reads every key
+    const auto it = g_vkpool.heads.find(block);
+    return it == g_vkpool.heads.end() || tokens < g_vkpool.min_tokens || g_vit_sink ? nullptr : it->second.data();
+}
+// CC_SMALL_FP8_OPTIMIZED (marker vit-tail.txt, every level): a ViT token raster that ends in rows whose C=512 sources lie
+// past the C=512 grid (4K: rows 34-35 of 36) holds those tokens all zero at the first ViT block (FinalHead never writes
+// them) and equal to each other at every later block (a token's update reads only itself and the keys every token
+// shares). So does a column past the grid (1080p: columns 30-31 of 32), so where the raster has both, the last token
+// before the zero rows (a zero column's) stands for them already. The ViT then computes g_vit_tail tokens - the first
+// 64-token tile past that token, 0 = all of them: its GEMMs and the attention's queries stop there, and the attention
+// (vit_attn.comp NR_VTAIL) and the key / value pooling read the keys and values past it as its last token, which equals
+// them. The decoder reads none of those rows. The output is the full computation's byte for byte.
+static uint32_t g_vit_tail = 0;
+// CC_SMALL_FP8_OPTIMIZED Ultra Performance (marker vit-int4.txt, "min_tokens N"): the ViT's int4 layers run on frames
+// whose ViT has at least N tokens; below, every lookup of the int4 tables comes back empty and the network runs as
+// Performance. At a sink raster (g_vit_sink) they read the tables and weights of NR_I4_DIR_SINK / NR_I4_WEIGHTS_SINK
+// instead (the later blocks only, calibrated with the padding rows), or none without them.
+static bool g_i4_off = false;
+#if NR_INT4
+static const char* i4_dir() {
+    return g_i4_off ? nullptr : nr::build_cfg(g_vit_sink ? "NR_I4_DIR_SINK" : "NR_I4_DIR");
+}
 #endif
 static bool tchain_pair(const std::string& p, const std::string& q) {
 #if NR_INT4
@@ -238,7 +273,7 @@ static bool tchain_pair(const std::string& p, const std::string& q) {
 // after their push block as this file declares it (gemm1x1 pipelines therefore
 // all build NR_GEMM_REMAP_PC=1, so their block ends with `remap` like PushGemm).
 static bool tchain_kern(const std::string& k00) {
-    // the decoder's copies (block-routes.txt, CC_SMALL_FP8_EXPERIMENTAL's fswin32nhd) chain like their base kernels
+    // the decoder's copies (block-routes.txt, CC_SMALL_FP8_OPTIMIZED's fswin32nhd) chain like their base kernels
     if (k00 == "fswin32d" || k00 == "fswin32v") return tchain_kern("fswin32");
     if (k00 == "fswin32nhd" || k00 == "fswin32nhv") return tchain_kern("fswin32nh");
     // Optimized layers Performance: encoder block 2 keeps its real attention on these copies (route "e")
@@ -329,9 +364,9 @@ bool flag(int c, char** v, const char* k) {
     for (int i = 1; i < c; ++i) if (!std::strcmp(v[i], k)) return true;
     return false;
 }
-// The network's SPIR-V: --spv-dir; with ACO Mode on, the bundle's (int4 mixed: its int4 folder, nr::binary::directory),
-// unless --spv-dir-aco says --spv-dir is ACO SPIR-V itself (CC_SMALL_FP8_EXPERIMENTAL's experimental/shaders, its records
-// among the bundle's). Without that the experimental network ran the small network's programs on its own weights.
+// The network's SPIR-V: --spv-dir; with ACO Mode on, the bundle's (int4 layers: its int4 folder, nr::binary::directory),
+// unless --spv-dir-aco says --spv-dir is ACO SPIR-V itself (CC_SMALL_FP8_OPTIMIZED's CC_SMALL_FP8_OPTIMIZED/shaders, its
+// records among the bundle's). Without that CC_SMALL_FP8_OPTIMIZED ran CC_SMALL_FP8's programs on its own weights.
 std::string network_spv_dir(int c, char** v) {
     std::string d = arg(c, v, "--spv-dir", "build");
     if (!nr::binary::directory().empty() && !flag(c, v, "--spv-dir-aco")) d = nr::binary::directory() + "/shaders";
@@ -401,7 +436,7 @@ std::vector<uint8_t> slurp(const std::string& p) {
 #if NR_INT4
 }
 
-// ---- int4_mixed: weight-free correction tables -------------------------------------------------------------------
+// ---- int4 layers: weight-free correction tables -------------------------------------------------------------------
 // The int4 weights are GPTQ solutions of the user's own (DLL) weights, so they are never shipped. What is shipped per
 // matrix (<prefix>.fix.bin + <prefix>.mu.bin) carries no weight value: per row the clip step index, per weight the GPTQ
 // correction (-1/0/+1, rarely more) against plain rounding, and per input channel two calibration means. From the
@@ -465,7 +500,7 @@ static void i4_store_reset() { g_i4_store.reset(); g_i4_store_read = false; }
 static const I4Store* i4_store() {
     if (g_i4_store_read) return g_i4_store.get();
     g_i4_store_read = true;
-    const char* path = nr::build_cfg("NR_I4_WEIGHTS");
+    const char* path = nr::build_cfg(g_vit_sink ? "NR_I4_WEIGHTS_SINK" : "NR_I4_WEIGHTS");
     if (!path) return nullptr;
     // Checked in one pass with a small buffer, and only each entry's place in the file kept: i4_obtain reads a
     // matrix when the build reaches it, so the file is never in host memory as a whole.
@@ -518,7 +553,7 @@ static I4Mat i4_obtain(const std::string& prefix, const std::vector<uint8_t>& ws
                        const std::vector<uint8_t>& aqb) {
     I4Mat r;
     if (wsel.size() != N * K4 || aqb.size() != K4 * 8 || (B > 1 && K4 % size_t(B))) throw std::runtime_error("int4 table: shapes " + prefix);
-    // Installed int4_mixed: the weights come from dlssnr-amd/CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin, which the installer made with this
+    // Installed int4 layers: the weights come from dlssnr-amd/CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin, which the installer made with this
     // same decoder (NR_I4_WEIGHTS; the recovery tables are not installed). An entry holds the weights and the key of
     // what they were made from - this model's weights and these input quantisers - so a different model never
     // matches and the build stops (exact runs).
@@ -1484,7 +1519,7 @@ struct NrSession {
     std::vector<const Step*> run;
     std::map<int, size_t> reader_tokens;   // block -> tokens of whoever reads it
     std::map<int, int> last_layer;   // block -> its final layer
-    // The ViT blocks (CCVit1D*): 310.8 b31..b38, 310.9 small b11..b18. The block
+    // The ViT blocks (CCVit1D*): 310.8 b31..b38, 310.9 (CC_SMALL_FP8) b11..b18. The block
     // before them ends in the C512 FinalHead, the one after is the decoder input.
     int vit_first = -1, vit_last = -1, vit_last_layer = -1;
     std::function<int(const Step&)> x_src;
@@ -1604,7 +1639,7 @@ struct GraphStaging {
 // ---- one lowered network, several source extents (the resize path) ----------
 //
 // The native plan pads the source to its working extent (nr_native_plan.cpp: 1918x1078 and 1920x1080 are both
-// 1920x1152 for the small model), and everything a build lowers - the dispatches, the arena layout, the weight blob
+// 1920x1152 for CC_SMALL_FP8), and everything a build lowers - the dispatches, the arena layout, the weight blob
 // with its records and noise field - is a function of the working extent alone, except three things: the pre block's
 // source extent (PushPreImage source_W/H), the images sized by it (tex_in, surf0, surf1), and the dead padded rows
 // trimmed below the picture (g_post_out_h). Measured 2026-10-18: identical weight blob and dispatches but for the
@@ -1734,9 +1769,24 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         }
     }
     const bool swin_bias_f16 = swin_bias_storage == "fp16";
-    // CC_SMALL_FP8_EXPERIMENTAL (build_network.py --experimental): fixed-attention.txt lists the pipelines whose window
+    // CC_SMALL_FP8_OPTIMIZED (build_network.py --network CC_SMALL_FP8_OPTIMIZED): fixed-attention.txt lists the pipelines whose window
     // attention is a fixed probability table (NR_FIXP); the table follows each one-head C=32 layer's bias.
     const bool fixed_attention = std::filesystem::exists(spv_dir + "/fixed-attention.txt");
+    g_vkpool = {};
+    if (const std::string vm = spv_dir + "/vit-kv-pool.txt"; std::filesystem::exists(vm)) {
+        std::ifstream f(nr::u8::path(vm));
+        std::string key, code;
+        int block = 0;
+        if (!(f >> key >> g_vkpool.min_tokens) || key != "min_tokens")
+            throw std::runtime_error("vit-kv-pool.txt: no min_tokens line");
+        while (f >> block >> code) {
+            if (code.size() != 32 || code.find_first_not_of("01234") != std::string::npos)
+                throw std::runtime_error("vit-kv-pool.txt: block " + std::to_string(block) + " needs 32 digits 0-4");
+            std::array<float, 32> h{};
+            for (int i = 0; i < 32; ++i) h[size_t(i)] = code[size_t(i)] == '0' ? 0.0f : float(1 << (code[size_t(i)] - '0'));
+            g_vkpool.heads[block] = h;
+        }
+    }
     std::printf("Swin position bias storage: %s; FP32 logit addition\n", swin_bias_storage.c_str());
     const uint32_t repeats = uint32_t(std::atoi(arg(argc, argv, "--repeats", "1")));
     const uint32_t warm = uint32_t(std::atoi(arg(argc, argv, "--warmup", "0")));
@@ -1794,7 +1844,8 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     g_host_shapes = host_boundary;
     g_nohi.clear(); g_audit_bias.clear();
 #if NR_INT4
-    // the int4 state too - one process may build the exact and the int4_mixed network in turn ([Int4Mixed] Hotkey)
+    // the int4 state too - one process may build a network with and one without int4 layers in turn (an Optimized
+    // layers switch)
     // The installed int4 weights file is read once per build (the arena probe build inside it uses the same copy) and
     // let go when the build ends, as are the ViT weight copies: nothing int4 stays in host memory after a build.
     g_hs_folded.clear(); g_qkv4_blocks.clear(); g_swi4_eoff.clear();
@@ -1823,6 +1874,58 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             vit_last = s.block; vit_last_layer = s.layer;
         }
     if (vit_first < 0) throw std::runtime_error("plan has no ViT blocks");
+    // ---- the ViT raster's padding (CC_SMALL_FP8_OPTIMIZED; the working extent's own, so a network shared by the resize
+    // path's other source extents decides the same): rows / columns at or past the working extent's C=512 cells (ih,
+    // iw) but inside the C=512 grid (hc, wc) are padding computed with the image's edge in b9 / b10's windows; past the
+    // grid, padding of plain zeros.
+    {
+        g_vit_tail = 0; g_i4_off = false; g_vit_sink = false;
+        int hw = 0, ww = 0, hc = 0, wc = 0, rh = 0, rw = 0;
+        for (const Step& s : plan) {
+            if (s.block == 0 && s.layer == 0) { hw = s.W; ww = s.H; }
+            if (s.block == vit_first - 1 && s.layer == 0) { hc = s.W; wc = s.H; }
+            if (s.block == vit_first && s.layer == 0) { rh = s.W; rw = s.H; }
+        }
+        const int ih = (hw + 31) / 32, iw = (ww + 31) / 32;
+        const int zr = (ih + 1) / 2, zc = (iw + 1) / 2, gr = (hc + 1) / 2, gc = (wc + 1) / 2;
+        const int edge_rows = std::max(0, std::min(rh, gr) - zr), zero_rows = std::max(0, rh - std::max(zr, gr));
+        const int edge_cols = std::max(0, std::min(rw, gc) - zc), zero_cols = std::max(0, rw - std::max(zc, gc));
+        const bool small_fp8_optimized = std::filesystem::exists(spv_dir + "/vit-tail.txt");   // the marker of all its levels
+        if (small_fp8_optimized && zero_rows > 0) {
+            // the token that stands for the zero rows: their first, or with zero columns the one before it (its row's
+            // last, a zero column's)
+            const uint32_t rep = uint32_t(std::max(zr, gr) * rw) - (zero_cols > 0 ? 1u : 0u);
+            const uint32_t m = (rep + 1u + 63u) / 64u * 64u;
+            if (m < uint32_t(rh * rw)) g_vit_tail = m;
+        }
+        g_vit_sink = small_fp8_optimized && (edge_rows > 0 || edge_cols > 0) && zero_rows == 0 && zero_cols == 0;
+        // ... and of those, the ones with an edge-padded COLUMN only (2720x1530, 2240x1260): there any change in the ViT
+        // (the sink pre block below, even int4 on its last five blocks) drifts away over a moving scene, the error growing
+        // frame by frame through the history (4K DL:TB capture resized: 52 -> 38 dB in 98 frames); the plain Performance
+        // network holds (52). With an edge-padded row (2560x1440, 5120x1440, 1707x960) both hold.
+        const bool sink_cols_only = g_vit_sink && edge_rows == 0;
+        if (const std::string im = spv_dir + "/vit-int4.txt"; std::filesystem::exists(im)) {
+            std::ifstream f(nr::u8::path(im));
+            std::string key; size_t min_tokens = 0;
+            if (!(f >> key >> min_tokens) || key != "min_tokens") throw std::runtime_error("vit-int4.txt: no min_tokens line");
+            g_i4_off = size_t(rh) * size_t(rw) < min_tokens || sink_cols_only;
+        }
+        // CC_SMALL_FP8_OPTIMIZED Performance / Ultra Performance: where every padding token comes from the image's edge
+        // (1440p class: none of plain zeros), a few ViT heads that attend almost only to them pass any error of the
+        // pre block on to every token; the pack's "<variant>-sink/" entries hold a pre block fitted for that (its
+        // window means kept), read there in place of "<variant>/" (not at the column-only rasters, see above).
+        if (g_vit_sink && !sink_cols_only && !g_pack.variant.empty() && g_pack.variant.find('-') == std::string::npos) {
+            const std::string v = g_pack.variant + "-sink";
+            const auto it = g_pack.index.lower_bound(v + "/");
+            if (it != g_pack.index.end() && it->first.compare(0, v.size() + 1, v + "/") == 0) g_pack.variant = v;
+        }
+        std::printf("ViT raster %dx%d: padding rows %d edge / %d zero, columns %d / %d; tokens computed %u%s%s%s\n", rw, rh,
+                    edge_rows, zero_rows, edge_cols, zero_cols, g_vit_tail ? g_vit_tail : uint32_t(rh * rw),
+                    g_vit_sink ? "; padding all from the image's edge (sink raster)" : "",
+                    g_i4_off ? (sink_cols_only ? "; int4 layers off (edge-padded columns only)" : "; int4 layers off (vit-int4.txt)") : "",
+                    g_pack.variant.size() > 5 && g_pack.variant.compare(g_pack.variant.size() - 5, 5, "-sink") == 0
+                        ? "; pack variant at the edge-padded raster" : "");
+    }
 
     // ---- what runs ---------------------------------------------------------
     for (const Step& s : plan) {
@@ -1991,13 +2094,16 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         const size_t stored_tokens = s.type.rfind("CCVit1D",0)==0
             ? align(size_t(s.tokens),32) : size_t(s.tokens);
         size_t n = stored_tokens * size_t(sh.fam == F_NONE ? s.co : sh.N);
+        // ViT key/value pooling: the pooled keys and values follow the QKV tokens in its own slot, a region a factor
+        if (s.type == "CCVit1DQKV" && vkpool_heads(s.block, size_t(s.tokens)))
+            for (size_t f = 2; f <= 16; f *= 2) n += align(size_t(s.tokens) / f, 32) * size_t(sh.N);
 #if NR_INT4
         // NR_I4_DIR: the contraction's and the projection's output also carry an int4 copy
         // (M x N/2 bytes, after the e4m3 tensor) for the next GEMM.
-        if (nr::build_cfg("NR_I4_DIR") && (s.type == "CCVit1DFfnContract" || s.type == "CCVit1DProjection"))
+        if (i4_dir() && (s.type == "CCVit1DFfnContract" || s.type == "CCVit1DProjection"))
             n += stored_tokens * size_t(sh.N) / 2;
         // C=512: the tile grid's tokens (the GEMM's M), e4m3 then the int4 copy.
-        if (nr::build_cfg("NR_I4_DIR") && (s.type == "CCSplitSwin16HFfwdProj" || s.type == "CCSplitSwin16HProj")) {
+        if (i4_dir() && (s.type == "CCSplitSwin16HFfwdProj" || s.type == "CCSplitSwin16HProj")) {
             const size_t mt = std::max(stored_tokens, size_t(tiles_of(s.H)) * size_t(tiles_of(s.W)) * 16);
             n = std::max(n, mt * size_t(sh.N) * 3 / 2);
         }
@@ -2368,7 +2474,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             const int Kc = heads > 1 ? C : H;
             PushFSwin p{};
 #if NR_INT4
-            // int4 mixed: the hard-swish's output scale (fswin_t NR_ACT_HS=2 drops it) folded into the weights that
+            // int4 layers: the hard-swish's output scale (fswin_t NR_ACT_HS=2 drops it) folded into the weights that
             // read the hidden - the middle (heads > 1) or the contraction (one head) - re-rounded to e4m3. NR_HS_FOLD
             // for the wide layers, NR_HS_FOLD32 for C=32, NR_HS_FOLDPP for the pre and post blocks; NR_HS_FOLD_BLOCKS
             // (b+b+..), when set, the only blocks that take any fold.
@@ -2395,7 +2501,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                 load_e4m3_requantised(std::string(base) + ".mlp_expand.bin", size_t(H) * C).data(),
                 size_t(H), size_t(C)), 256));
 #if NR_INT4
-            // int4 mixed, NR_SWI4_DIR: the multi-head MLP's expansion on int4 (fswin_t NR_SWI4). Files
+            // int4 layers, NR_SWI4_DIR: the multi-head MLP's expansion on int4 (fswin_t NR_SWI4). Files
             // b<block>l<layer>.x.aq.bin (C (1/step, zero)) and the .ex recovery tables (i4_obtain); with .y.aq.bin and
             // the .qkv tables also the QKV projection (fswin_t NR_SWQ4). e_off then points at the record
             // {magic, quantiser vec2 index, W4 bytes, scale index, .., QKV quantiser, QKV W4, QKV scales}.
@@ -3507,8 +3613,13 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             }
             std::vector<float> hscale(32);
             std::memcpy(hscale.data(), qrec.data(), 128);
+            // ViT key/value pooling: the heads' factors after the temperatures (vit_attn.comp NR_VKPOOL), mode bit 16
+            const float* const pooled = vkpool_heads(s.block, size_t(s.W) * size_t(s.H));
+            if (pooled) hscale.insert(hscale.end(), pooled, pooled + 32);
             p.s_off = uint32_t(put_f32(hscale) / 4);
             p.mode = vattn_mode & ~1u; // QKV has already normalized and scaled Q/K
+            if (pooled) p.mode |= 0x10000u;
+            if (g_vit_tail) p.mode |= g_vit_tail / 16u << 20;   // vit_attn.comp NR_VTAIL: M / 16
             d.kern = "vitattn";
             // One workgroup per (**tile of 32 query tokens**, head). One query
             // per workgroup was correct and read every byte of K and V 1980
@@ -3520,7 +3631,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             // sets from the same constant. A mismatch is a kernel that quietly computes a
             // fraction of the sequence, so both ends are a knob rather than a
             // constant on one side.
-            d.gx = (p.tokens + vattn_qt - 1u) / vattn_qt;
+            d.gx = ((g_vit_tail ? g_vit_tail : p.tokens) + vattn_qt - 1u) / vattn_qt;   // the queries stop at the tail
             d.gy = 32u;   // 32 heads of dim 32; the plan's `heads` is blockDim.y
             d.gz = 1;
             d.push.resize(sizeof p);
@@ -3651,7 +3762,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
 #if NR_INT4
             // NR_I4_DIR: the QKV projection on int4 (b<b>.attn.w4.bin [1536][512], .attn.sc.bin [2][1536]);
             // its input is the FFN projection's int4 side copy. pc.w_off -> {magic, X offset, W4, scale index}.
-            if (const char* idir = nr::build_cfg("NR_I4_DIR")) {
+            if (const char* idir = i4_dir()) {
                 char fn[512]; std::snprintf(fn, sizeof fn, "%s/b%d.attn", idir, s.block);
                 if (i4_have(fn)) {
                     char an[512]; std::snprintf(an, sizeof an, "%s/b%d.attn.aq.bin", idir, s.block);
@@ -3733,7 +3844,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             const size_t M = (s.type.rfind("CCSplitSwin16H", 0) == 0 &&
                               !flag(argc, argv, "--ffwd-full"))
                 ? size_t(tiles_of(s.H)) * size_t(tiles_of(s.W)) * 16
-                : size_t(s.tokens);
+                : g_vit_tail && s.type.rfind("CCVit1D", 0) == 0 ? size_t(g_vit_tail) : size_t(s.tokens);
             // `--no-resid B:L` runs this step as a plain projection. A residual
             // that should not be there is not a small error: at b023l3 the
             // residual's rms is 11.7 against a reference output of 4.91, so
@@ -3774,16 +3885,16 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                             w[(which*1024+row)*1024+k] = record[vit_qkv_weight_byte(which,row,k)];
             }
 #if NR_INT4
-            // int4_mixed: the ViT weights as the solver saw them (canonical [N][K] e4m3), for the correction tables.
+            // int4 layers: the ViT weights as the solver saw them (canonical [N][K] e4m3), for the correction tables.
             // Kept only for the expansion and the QKV, which read them below and then drop them.
-            if (nr::build_cfg("NR_I4_DIR") && (s.type == "CCVit1DFfnExpand" || s.type == "CCVit1DQKV") &&
+            if (i4_dir() && (s.type == "CCVit1DFfnExpand" || s.type == "CCVit1DQKV") &&
                 w.size() >= N * K)
                 g_i4_wsave[{s.block, s.layer}] = std::vector<uint8_t>(w.begin(), w.begin() + std::ptrdiff_t(N * K));
             // int4 helpers. A [N][K] int8 (-8..7) matrix -> nibble pairs, tile-blocked or in the
             // NR_I4_PAIR records; a side quantiser (1/step, zero) per
             // rotated channel -> the kernel's (a / sqrt(B), zero + 1.5*2^23) for an unnormalised H_B.
             auto i4file = [&](const char* fmt, int b) {
-                const char* idir = nr::build_cfg("NR_I4_DIR"); if (!idir) return std::vector<uint8_t>();
+                const char* idir = i4_dir(); if (!idir) return std::vector<uint8_t>();
                 char fn[512], nm[64]; std::snprintf(nm, sizeof nm, fmt, b); std::snprintf(fn, sizeof fn, "%s/%s", idir, nm);
                 return std::filesystem::exists(fn) ? slurp(fn) : std::vector<uint8_t>();
             };
@@ -3817,7 +3928,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             int i4_k4 = 0;
             std::vector<uint8_t> i4_w4;
             std::vector<float> i4_aq, i4_sc;
-            if (const char* idir = nr::build_cfg("NR_I4_DIR"))
+            if (const char* idir = i4_dir())
                 if (s.type == "CCVit1DFfnExpand" || s.type == "CCVit1DFfnContract") {
                     char fn[512];
                     std::snprintf(fn, sizeof fn, "%s/b%d.perm.bin", idir, s.block);
@@ -4015,7 +4126,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                 }
                 if (s.type == "CCVit1DFfnExpand" && d.kern == "gemmvact4") {
                     std::vector<uint8_t> q, scb;
-                    if (const char* idir = nr::build_cfg("NR_I4_DIR")) {
+                    if (const char* idir = i4_dir()) {
                         char pf[512]; std::snprintf(pf, sizeof pf, "%s/b%d.ex", idir, s.block);
                         const auto sv = g_i4_wsave.find({s.block, s.layer});
                         const auto pb = i4file("b%d.perm.bin", s.block);
@@ -4080,7 +4191,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                         std::filesystem::exists(spv_dir + "/g_gemmvqkvnorms.spv")) ? "gemmvqkvnorms" : "gemmvqkvnorm";
 #if NR_INT4
                 // NR_I4_DIR: the QKV reads the contraction's int4 copy (b<b>.qkv.w4.bin / .qkv.sc.bin).
-                if (const char* idir = nr::build_cfg("NR_I4_DIR")) {
+                if (const char* idir = i4_dir()) {
                     char fn[512];
                     std::snprintf(fn, sizeof fn, "%s/b%d.qkv", idir, s.block);
                     const auto sv = g_i4_wsave.find({s.block, s.layer});
@@ -4112,8 +4223,28 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
 #endif
                 std::memcpy(d.push.data(),&p,sizeof p);
                 disp.push_back(std::move(d));
+                // ViT key/value pooling: one vit_kvpool.comp dispatch (y = the shape) between the QKV and the attention
+                if (const float* vk = vkpool_heads(s.block, size_t(s.tokens))) {
+                    if (uint32_t(s.H) * uint32_t(s.W) != uint32_t(s.tokens) || s.W % 4 || s.H % 4 || p.N != 3072)
+                        throw std::runtime_error("ViT key/value pooling: unexpected token raster");
+                    uint32_t hmask = 0, codes[2] = {0, 0}, flags = 1u;   // bit 0: the pooled keys back to unit length
+                    for (int h = 0; h < 32; ++h) {
+                        if (vk[h] < 2.0f) continue;
+                        const uint32_t c = vk[h] == 2.0f ? 0u : vk[h] == 4.0f ? 1u : vk[h] == 8.0f ? 2u : 3u;
+                        hmask |= 1u << h; codes[h / 16] |= c << (2 * (h % 16)); flags |= 256u << c;
+                    }
+                    if (g_vit_tail) flags |= g_vit_tail / 16u << 16;   // bits 16..31: tokens past M read as token M - 1
+                    const uint32_t pw[7] = {pn.dst, uint32_t(s.H), uint32_t(s.W), hmask, flags, codes[0], codes[1]};
+                    static_assert(sizeof pw == sizeof(PushPool), "vit_kvpool.comp's push is created with PushPool's size");
+                    Disp pd{&s}; pd.kern = "poolvkv";
+                    pd.gx = (uint32_t(s.tokens) / 2u + 31u) / 32u * 32u; pd.gy = 4u; pd.gz = 1;   // the 1x2 region with its padding
+                    pd.push.resize(sizeof pw); std::memcpy(pd.push.data(), pw, sizeof pw);
+                    disp.push_back(std::move(pd));
+                }
                 continue;
             }
+            if (vkpool_heads(s.block, size_t(s.tokens)))
+                throw std::runtime_error("ViT key/value pooling needs the fused QKV norm (qkv_fused_norm 1)");
             disp.push_back(std::move(d));
             Disp norm{&s}; norm.kern="qkvnorm";
             // 32 lanes own one (token, head) and a 256-thread workgroup owns
@@ -4319,7 +4450,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             if(pd.push.size()<sizeof p) throw std::runtime_error("packed Swin push mismatch");
             std::memcpy(&p,pd.push.data(),sizeof p);
 #if NR_INT4
-            if (!g_swi4_eoff.count(p.e_off))   // int4 mixed: an int4 expansion is a record, not a matrix
+            if (!g_swi4_eoff.count(p.e_off))   // int4 layers: an int4 expansion is a record, not a matrix
 #endif
             pack_matrix(p.e_off,4*C,C);
             pack_matrix(p.mid_off,C,128);
@@ -4687,7 +4818,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         };
         // **Inside a dependency-driven persistent run, a layer's output takes the bytes of the output two layers
         // before it.** A run executes all its layers at once, so the values made and read inside it are all live
-        // across its one dispatch - and in a tile-counter stretch held to its end (4K original model: the C=128
+        // across its one dispatch - and in a tile-counter stretch held to its end (4K CC_SILVER_AARDWOLD: the C=128
         // run's five and the C=256 run's seven, 142 MB, to the C=512 stretch's end). But a window of layer L+1 starts
         // only once every window of layer L overlapping it has finished (the DF queue: its producers, release /
         // acquire counters), and those are exactly the windows that read layer L-1's output where it writes: a
@@ -4840,7 +4971,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         // whose lifetime it meets (the greedy-by-size arena planner of TensorFlow Lite). The rules are the first
         // fit's, as a pair rule: two values share bytes only when one's last dispatch comes before the other's first,
         // and a slot smaller than NR_ARENA_COLD_MAX that comes second only NR_ARENA_COLD dispatches after that.
-        // The smaller arena of the two is kept (the first fit on a tie): 4K small model 596 -> 566 MB, the first
+        // The smaller arena of the two is kept (the first fit on a tie): 4K CC_SMALL_FP8 596 -> 566 MB, the first
         // fit's holes between long-lived values.
         {
             struct Placed { int a, z; size_t off, size; };
@@ -5080,7 +5211,8 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                 for (uint32_t k = 0; k < P.gx * (mw.first / 16u); ++k) t.at(k) = ent(k, P.gy * mw.second);
             } else if (P.kern == "vitattn") {                            // a workgroup a query tile and head
                 PushVAttn pv{}; std::memcpy(&pv, P.push.data(), sizeof pv);
-                for (uint32_t k = 0; k < (pv.tokens + 15u) / 16u; ++k) t.at(k) = ent(k, P.gy);
+                const uint32_t nq = (pv.mode >> 20) ? (pv.mode >> 20) : (pv.tokens + 15u) / 16u;   // NR_VTAIL: M / 16
+                for (uint32_t k = 0; k < nq; ++k) t.at(k) = ent(k, P.gy);
             } else if (P.kern == "fswindsp32" || P.kern.rfind("fswinpds", 0) == 0) {   // DS windows -> next-level tiles
                 PushFSwin fs{}; PushDsProj dp{}; uint32_t gx = P.gx, gy = P.gy;
                 if (P.kern == "fswindsp32") {
@@ -5441,7 +5573,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     // Decoder layers on pipelines of their own, so they can differ from the encoder's layers of the same kernel.
     // CC_SILVER_AARDWOLD_OPTIMIZED: block-routes.txt (build_network.py, the overlay's "routes"), lines
     // "<suffix> <kernel>... : <block>...": a dispatch of one of those blocks on one of those kernels runs on
-    // "<kernel><suffix>". Without it, CC_SMALL_FP8_EXPERIMENTAL's rule: the plain C=32 layers after the ViT on
+    // "<kernel><suffix>". Without it, CC_SMALL_FP8_OPTIMIZED's rule: the plain C=32 layers after the ViT on
     // fswin32nhd when the network has it (fixed attention on the decoder's only).
     if (const std::string rf = spv_dir + "/block-routes.txt"; std::filesystem::exists(rf)) {
         std::ifstream f(nr::u8::path(rf));

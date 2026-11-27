@@ -169,6 +169,8 @@ def render(sig, scope, n=None):
 
 
 config = struct("Config")
+# Config's controls (= config_controls(), nr_pe_config.hpp): nr::Controls' defaults with NoiseEveryFrame on
+config.setdefault("controls", dict(struct("Controls"), noise_every_frame=True))
 renodx_cfg = config["renodx"]
 network = render("void write_network(", {"n": config["network"]})[0]
 preprocess = render("void write_preprocess(", {"p": config["preprocess"], "v": config["preprocess"]["values"]})[0]

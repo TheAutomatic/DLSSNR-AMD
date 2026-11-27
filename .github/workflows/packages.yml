@@ -56,7 +56,7 @@ jobs:
       - name: Check that no model was packaged
         run: |
           for f in linux/package/*.tar.gz; do
-            if tar -tzf "$f" | grep -q 'dlssnr\(-small\)\?\.bin$'; then echo "model found in $f" >&2; exit 1; fi
+            if tar -tzf "$f" | grep -q -E '(CC_SILVER_AARDWOLD|CC_SMALL_FP8)\.bin$'; then echo "model found in $f" >&2; exit 1; fi
           done
 
       - uses: actions/upload-artifact@v4
@@ -99,7 +99,7 @@ jobs:
           python3 - windows/package/*.zip <<'PY'
           import sys, zipfile
           for f in sys.argv[1:]:
-              if any(n.endswith(('CC_SILVER_AARDWOLD.bin', 'CC_SMALL_FP8.bin', 'dlssnr.bin', 'dlssnr-small.bin')) for n in zipfile.ZipFile(f).namelist()):
+              if any(n.endswith(('CC_SILVER_AARDWOLD.bin', 'CC_SMALL_FP8.bin')) for n in zipfile.ZipFile(f).namelist()):
                   sys.exit(f'model found in {f}')
           PY
 

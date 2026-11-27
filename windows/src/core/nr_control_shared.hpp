@@ -13,7 +13,7 @@
 namespace nr::control {
 
 inline constexpr uint32_t kMagic = 0x4C4F5243u;   // "CROL"
-inline constexpr uint32_t kVersion = 17;   // 17: six networks (CC_SILVER_AARDWOLD_OPTIMIZED's three levels)
+inline constexpr uint32_t kVersion = 19;   // 19: nine networks (CC_SMALL_FP8_OPTIMIZED's three levels) and frame reuse in the layer rows (Linux 16-18); 17: six networks (CC_SILVER_AARDWOLD_OPTIMIZED's three levels)
 inline constexpr uint32_t kPanelLines = 10;
 inline constexpr uint32_t kMaxLayers = 8;
 // The engine-data line nr_engine_panel.hpp writes when the game gives no exposure and nothing covers it (its start;
@@ -57,6 +57,11 @@ struct LayerStatus {
     uint32_t panel_lines;           // the engine-data panel of this layer's runs (as Shared::panel)
     char panel[kPanelLines][192];
     uint32_t panel_at;              // GetTickCount (low 32 bits) of its last write
+    // Frame reuse (NRFrameReuse): 0 off, 1 runs (reuse_share: the share of frames NR ran on lately, < 0 not measured
+    // yet), 2 cannot run (reuse_note says why)
+    uint32_t reuse;
+    float reuse_share;
+    char reuse_note[160];
 };
 
 struct Shared {
@@ -129,7 +134,7 @@ struct Shared {
     uint32_t aco_state, aco_rdna3;
     char aco_why[160];
     // DLL -> menu: the device the network runs on (nr::pe::Session::State::device_path: 0 not known yet, 1 the bridge,
-    // 2 the game's own Vulkan device, 3 the game's D3D12 device)
+    // 2 the game's own Vulkan device, 3 the game's D3D12 device, 4 the bridge as the D3D12 passthrough's fallback)
     uint32_t device_path;
     // DLL watcher -> menu: the keys pressed (up -> down) since the menu last took them, by virtual-key code. The menu
     // looks at `keys` once a drawn frame: at a few frames a second (a game over its video memory: 1 fps in a main menu)

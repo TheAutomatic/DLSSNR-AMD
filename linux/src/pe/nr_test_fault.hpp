@@ -74,7 +74,7 @@ inline bool test_fault(const char* site) {
 }
 
 // NR_TEST_PLAN_DELAY_MS=<ms> (tests only): every background plan build (the resize path) waits this long first, so a
-// stand-in reproduces a slower machine's plan time (Windows in a busy game: ~1.1 s a plan against ~0.3 s here).
+// test game reproduces a slower machine's plan time (Windows in a busy game: ~1.1 s a plan against ~0.3 s here).
 inline void test_plan_delay() {
     static const long ms = [] {
         const char* e = std::getenv("NR_TEST_PLAN_DELAY_MS");

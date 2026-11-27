@@ -18,6 +18,9 @@
 
 namespace nr::pe::split {
 
+std::atomic<SplitBeginFn> g_split_begin{nullptr};
+std::atomic<SplitEndFn> g_split_end{nullptr};
+
 #if !defined(_M_X64) && !defined(__x86_64__)
 bool prepare(ID3D12GraphicsCommandList*, std::string* why) {
     *why = "the command-list cut is x86-64 only";
@@ -31,6 +34,13 @@ bool cut(ID3D12GraphicsCommandList*, Job, const std::shared_ptr<Snapshot>&, std:
     *why = "the command-list cut is x86-64 only";
     return false;
 }
+bool is_split_list(ID3D12GraphicsCommandList*, bool* active_cut) {
+    if (active_cut) *active_cut = false;
+    return false;
+}
+void* orig_list_method(void** vt, unsigned slot) { return vt ? vt[slot] : nullptr; }
+void* orig_device_create_cl(void** dvt) { return dvt ? dvt[12] : nullptr; }
+void* orig_queue_execute(void** qvt) { return qvt ? qvt[10] : nullptr; }
 #else
 
 namespace {
@@ -1125,7 +1135,16 @@ void execute_cut(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists,
             if (held != g_held.end()) work.push_back({i, Cut{}, held->second});
         }
     }
-    if (work.empty()) return execute(q, n, lists);
+    if (work.empty()) {
+        execute(q, n, lists);
+        // Another list can still own a cut/continuation after a Present layer went away. These ordinary lists
+        // still carry native NR work: Reset must not turn an unstamped execution into a discarded recording.
+        if (g_booked.load(std::memory_order_acquire)) {
+            std::lock_guard<std::recursive_mutex> guard(g_mutex);
+            stamp_bookings_locked(q, n, lists);
+        }
+        return;
+    }
     // The first executions of cut lists, step by step (PBZ: the game ended right after the first frame with a layer
     // before the upscaler, with nothing logged)
     static std::atomic<int> traced{0};
@@ -1135,6 +1154,14 @@ void execute_cut(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists,
     if (tr) log("[nr] trace: lists with %zu cut(s) executed on queue %p (%u lists), thread %lu", segments,
                 static_cast<void*>(q), n, GetCurrentThreadId());
     static bool said_again = false;
+    struct SplitBookGuard {
+        ID3D12CommandQueue* queue;
+        UINT count;
+        ID3D12CommandList* const* lists;
+        SplitEndFn end_fn;
+        ~SplitBookGuard() { if (end_fn) end_fn(queue, count, lists); }
+    } split_book{q, n, lists, g_split_end.load(std::memory_order_acquire)};
+    if (const auto begin_fn = g_split_begin.load(std::memory_order_acquire)) begin_fn();
     std::vector<ID3D12CommandList*> batch;
     std::vector<Cont*> ran;
     size_t next = 0;
@@ -1161,10 +1188,16 @@ void execute_cut(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists,
     QueueFence* f = completion_fence(q);
     const bool signalled = f && SUCCEEDED(q->Signal(f->fence, f->value + 1));
     if (signalled) ++f->value;
-    if (signalled && !g_recordings.empty()) {
+    if (!g_recordings.empty()) {
         for (UINT i = 0; i < n; ++i) {
             auto it = g_recordings.find(lists[i]);
             if (it == g_recordings.end() || !it->second || it->second->sealed) continue;
+            // The lists ran even when their completion signal failed. Keep an unknown execution, as on the
+            // ordinary path, rather than treating them as never submitted when their owner later resets them.
+            if (!signalled) {
+                it->second->submitted(nullptr);
+                continue;
+            }
             ID3D12Fence* fence = f->fence;
             fence->AddRef();
             const uint64_t value = f->value;
@@ -1590,7 +1623,74 @@ bool disabled() {
     return g_disabled;
 }
 
+ListClass* find_class_for_vtable(void** vt) {
+    if (!vt) return nullptr;
+    if (ListClass* cls = class_by_vtable(vt)) return cls;
+    const int n = g_class_count.load(std::memory_order_acquire);
+    for (int i = 0; i < n; ++i) {
+        ListClass* c = g_classes[i];
+        if (c && c->slots > kReset && vt[kClose] == c->entry[kClose] && vt[kReset] == c->entry[kReset])
+            return c;
+    }
+    return nullptr;
+}
+
+bool is_split_list(ID3D12GraphicsCommandList* list, bool* active_cut) {
+    if (active_cut) *active_cut = false;
+    if (!list) return false;
+    void** vt = *reinterpret_cast<void***>(list);
+    if (!vt) return false;
+    ListClass* cls = find_class_for_vtable(vt);
+    if (!cls || vt[kClose] != cls->entry[kClose] || vt[kReset] != cls->entry[kReset]) return false;
+    if (active_cut) {
+        bool cut_now = (target_of(list) != list);
+        if (!cut_now && g_pending.load(std::memory_order_acquire) != 0) {
+            std::lock_guard<std::recursive_mutex> guard(g_mutex);
+            cut_now = (g_cuts.find(list) != g_cuts.end());
+        }
+        *active_cut = cut_now;
+    }
+    return true;
+}
+
+void* orig_list_method(void** vt, unsigned slot) {
+    if (!vt) return nullptr;
+    if (ListClass* cls = find_class_for_vtable(vt)) {
+        return (slot < cls->slots) ? cls->orig[slot] : vt[slot];
+    }
+    return vt[slot];
+}
+
+void* orig_device_create_cl(void** dvt) {
+    if (!dvt) return nullptr;
+    const int n = g_device_count.load(std::memory_order_acquire);
+    for (int i = 0; i < n; ++i) {
+        if (g_device_classes[i].vtable == dvt) return g_device_classes[i].create;
+    }
+    return dvt[kDeviceCreateCommandList];
+}
+
+void* orig_queue_execute(void** qvt) {
+    if (!qvt) return nullptr;
+    const int n = g_queue_count.load(std::memory_order_acquire);
+    for (int i = 0; i < n; ++i) {
+        if (g_queue_classes[i].vtable == qvt) return g_queue_classes[i].execute;
+    }
+    return qvt[kQueueExecute];
+}
+
 #endif
+
+// The public API below works on the 64-bit implementation's state; the 32-bit build (where the cut above is a stub) has
+// none, so it gets the same answers without one: no queue known, no recordings, nothing complete.
+#if !defined(_M_X64) && !defined(__x86_64__)
+ID3D12CommandQueue* last_direct_queue() { return nullptr; }
+std::shared_ptr<nr::gpu::Recording> book(ID3D12CommandList*) { return nullptr; }
+bool completed(const std::shared_ptr<nr::gpu::Recording>&) { return false; }
+void note_execution(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*) {}
+void seal(const std::shared_ptr<nr::gpu::Recording>&) {}
+void invalidate(const std::shared_ptr<nr::gpu::Recording>&) {}
+#else
 
 ID3D12CommandQueue* last_direct_queue() { return t_last_direct; }
 
@@ -1631,6 +1731,12 @@ void seal(const std::shared_ptr<nr::gpu::Recording>& rec) { if (rec) rec->seal()
 
 void invalidate(const std::shared_ptr<nr::gpu::Recording>& rec) {
     if (rec) rec->seal();   // no further submissions; the waits it already has are still waited on
+}
+#endif
+
+void set_split_execution_hooks(SplitBeginFn begin_fn, SplitEndFn end_fn) {
+    g_split_begin.store(begin_fn, std::memory_order_release);
+    g_split_end.store(end_fn, std::memory_order_release);
 }
 
 }  // namespace nr::pe::split

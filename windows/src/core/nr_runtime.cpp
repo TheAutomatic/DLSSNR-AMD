@@ -14,9 +14,7 @@
 #include <string>
 #include <mutex>
 #include "nr_ini_network.hpp"
-#if NR_INT4
-#include "nr_ini_int4.hpp"
-#endif
+#include "nr_ini_int4.hpp"   // [CC_SILVER_AARDWOLD_OPTIMIZED] / [CC_SMALL_FP8_OPTIMIZED] Layers
 #ifdef _WIN32
 extern "C" __declspec(dllimport) unsigned long __stdcall GetEnvironmentVariableA(const char*, char*, unsigned long);
 #endif
@@ -247,9 +245,9 @@ constexpr float kTemporalReject = 0.50f;
 // the model's own f16 weight <post block>.layer0.blend_scale (the post kernel's
 // +104 pointer; the DLL looks it up next to the layer's weights). Both models
 // are pinned by their SHA-256, so these are constants: 310.8.0 block70 0x39EB,
-// the 310.9 small model's block30 0x3A23. TemporalConfig::history_strength scales it.
+// CC_SMALL_FP8's (310.9) block30 0x3A23. TemporalConfig::history_strength scales it.
 constexpr float kPostBlendScale = 0.73974609375f;
-constexpr float kPostBlendScaleSmall = 0.76708984375f;
+constexpr float kPostBlendScaleSmallFp8 = 0.76708984375f;
 // The pre block's push, PushFSwin + PushPreImage (nr_graph.cpp).
 constexpr uint32_t kPrePushBytes = sizeof(PushFSwin) + sizeof(PushPreImage);
 constexpr uint32_t kPreSeedAt = sizeof(PushFSwin) + offsetof(PushPreImage, seed);
@@ -359,6 +357,8 @@ struct Temporal {
     bool h16{};
     bool h16_ok{}, h16_want{true};
     nrvk::Kernel post16_pp[2], post16_grade_pp[2];
+    // the grade twins in closed form (*_grade_accel.spv, [Network] Style Grade Acceleration): Impl::accel_of
+    nrvk::Kernel post16_grade_accel_pp[2];
     bool pingpong{};
     uint32_t hcur{};
     // the history images rotate among the features (NR passes, layers) instead of one bound pair with every
@@ -367,7 +367,7 @@ struct Temporal {
     // which becomes the feature's; the one it read is free again. One feature: hist(0) / hist(1) in turn, as before.
     // N features: N + 1 images (extra = the third and later), sets for each (read, write) pair made when first used.
     std::vector<nrvk::Context::Image> extra;
-    struct Var { nrvk::Kernel pre, post, post_grade, post16, post16_grade; };
+    struct Var { nrvk::Kernel pre, post, post_grade, post16, post16_grade, post_grade_accel, post16_grade_accel; };
     std::map<std::pair<uint32_t, uint32_t>, Var> vars;
     uint32_t hread{}, hwrite{1};
     bool hfresh{};   // hread starts from zeros this recording (a feature without history yet)
@@ -380,11 +380,16 @@ struct Temporal {
     // depth.
     nrvk::Context::Image depth{};
     nrvk::Buffer params;
+    // The pre block's own copy of `params` (binding 6 of the temporal pre): the same bytes but the gate, which is
+    // Controls::pre_history's - the post reads `params`, its gate closed at history strength 0. No shader tells the two
+    // blocks' gates apart; they read the same term from two buffers.
+    nrvk::Buffer pre_params;
     nrvk::Kernel luma_kernel[2][kTemporalLevels];
     nrvk::Kernel flow_kernel[2][kTemporalLevels];
     nrvk::Kernel pre, post;
     // post / post_pp with the Style grade (temporal_post_*_grade.spv), when the folder has them.
     nrvk::Kernel post_grade, post_grade_pp[2];
+    nrvk::Kernel post_grade_accel, post_grade_accel_pp[2];
     const nrvk::Kernel* original_pre{};
     const nrvk::Kernel* original_post{};
     float history_strength{1.0f};
@@ -409,17 +414,20 @@ struct Temporal {
         if (pre.device) pre.destroy();
         if (post.device) post.destroy();
         if (post_grade.device) post_grade.destroy();
+        if (post_grade_accel.device) post_grade_accel.destroy();
         for (unsigned c = 0; c < 2; ++c) {
             if (pre_pp[c].device) pre_pp[c].destroy();
             if (post_pp[c].device) post_pp[c].destroy();
             if (post_grade_pp[c].device) post_grade_pp[c].destroy();
             if (post16_pp[c].device) post16_pp[c].destroy();
             if (post16_grade_pp[c].device) post16_grade_pp[c].destroy();
+            if (post_grade_accel_pp[c].device) post_grade_accel_pp[c].destroy();
+            if (post16_grade_accel_pp[c].device) post16_grade_accel_pp[c].destroy();
         }
         if (history_b.handle) ctx.destroy(history_b);
         for (auto& v : vars)
             for (nrvk::Kernel* k : {&v.second.pre, &v.second.post, &v.second.post_grade, &v.second.post16,
-                                    &v.second.post16_grade})
+                                    &v.second.post16_grade, &v.second.post_grade_accel, &v.second.post16_grade_accel})
                 if (k->device) k->destroy();
         vars.clear();
         for (auto& e : extra) { e.sampler = VK_NULL_HANDLE; ctx.destroy(e); }   // (the sampler is history's)
@@ -430,11 +438,12 @@ struct Temporal {
         if (motion_point_sampler) vkDestroySampler(ctx.device, motion_point_sampler, nullptr);
         ctx.destroy(history);
         ctx.destroy(params);
+        ctx.destroy(pre_params);
     }
 };
 
 struct Runtime::Impl {
-    NetworkModel network = NetworkModel::Original;
+    NetworkModel network = NetworkModel::SilverAardwold;
     float post_blend_scale = kPostBlendScale;   // this network's blend_scale
     NrSession session;
     nrvk::Kernel alpha, mask_pre, mask_resolve;
@@ -488,7 +497,9 @@ struct Runtime::Impl {
             nrvk::Kernel* ks[] = {&alpha, &mask_pre, &mask_resolve, &post_grade, &t.pre, &t.post, &t.post_grade,
                                   &t.pre_pp[0], &t.pre_pp[1], &t.post_pp[0], &t.post_pp[1],
                                   &t.post_grade_pp[0], &t.post_grade_pp[1], &t.post16_pp[0], &t.post16_pp[1],
-                                  &t.post16_grade_pp[0], &t.post16_grade_pp[1]};
+                                  &t.post16_grade_pp[0], &t.post16_grade_pp[1], &post_grade_accel, &t.post_grade_accel,
+                                  &t.post_grade_accel_pp[0], &t.post_grade_accel_pp[1], &t.post16_grade_accel_pp[0],
+                                  &t.post16_grade_accel_pp[1]};
             for (nrvk::Kernel* k : ks) k->retarget(stand, im, retired_pools);
             for (auto& row : t.luma_kernel) for (auto& k : row) k.retarget(stand, im, retired_pools);
             retired_images.push_back(stand);
@@ -553,10 +564,11 @@ struct Runtime::Impl {
         auto store = [](nrvk::Context::Image im) { im.sampler = VK_NULL_HANDLE; return im; };
         for (unsigned c = 0; c < 2; ++c) {
             nrvk::Kernel* reads[] = {&t.pre_pp[c], &t.post_pp[c], &t.post_grade_pp[c], &t.post16_pp[c],
-                                     &t.post16_grade_pp[c]};
+                                     &t.post16_grade_pp[c], &t.post_grade_accel_pp[c], &t.post16_grade_accel_pp[c]};
             for (nrvk::Kernel* k : reads) k->retarget(old[c], made[c], retired_pools);
             nrvk::Kernel* writes[] = {&t.post_pp[c ^ 1u], &t.post_grade_pp[c ^ 1u], &t.post16_pp[c ^ 1u],
-                                      &t.post16_grade_pp[c ^ 1u]};
+                                      &t.post16_grade_pp[c ^ 1u], &t.post_grade_accel_pp[c ^ 1u],
+                                      &t.post16_grade_accel_pp[c ^ 1u]};
             for (nrvk::Kernel* k : writes) k->retarget(store(old[c]), store(made[c]), retired_pools);
         }
         t.history = made[0];
@@ -701,6 +713,9 @@ struct Runtime::Impl {
         f.cleared = false;   // still UNDEFINED: record_all brings it to GENERAL before its first copy
     }
     uint64_t bound_feature{};
+    // Frame reuse: each feature's last recording's history slots (read, written); the history weight hook
+    std::map<uint64_t, std::pair<uint32_t, uint32_t>> slot_pairs;
+    Runtime::HistoryWeightHook weight_hook;
     // History rotation (Temporal::extra): on for the one-pass ping-pong history (the product's), off for the
     // research NR_HPASS path, which keeps the copies.
     bool rotation() const { return temporal.pingpong && !temporal.hp; }
@@ -805,6 +820,8 @@ struct Runtime::Impl {
         post(t.post_grade_pp[0], v.post_grade);
         post(t.post16_pp[0], v.post16);
         post(t.post16_grade_pp[0], v.post16_grade);
+        post(t.post_grade_accel_pp[0], v.post_grade_accel);
+        post(t.post16_grade_accel_pp[0], v.post16_grade_accel);
         return v;
     }
     const nrvk::Kernel& pre_for(uint32_t r, uint32_t w) {
@@ -830,12 +847,29 @@ struct Runtime::Impl {
         }
         return nullptr;
     }
+    // The closed-form twin of a grade kernel ([Network] Style Grade Acceleration), when it was built; else g itself.
+    const nrvk::Kernel* accel_of(const nrvk::Kernel* g) {
+        auto& t = temporal;
+        const nrvk::Kernel* a = nullptr;
+        if (g == &post_grade) a = &post_grade_accel;
+        else if (g == &t.post_grade) a = &t.post_grade_accel;
+        for (unsigned c = 0; c < 2 && !a; ++c) {
+            if (g == &t.post_grade_pp[c]) a = &t.post_grade_accel_pp[c];
+            if (g == &t.post16_grade_pp[c]) a = &t.post16_grade_accel_pp[c];
+        }
+        for (auto& v : t.vars) {
+            if (a) break;
+            if (g == &v.second.post_grade) a = &v.second.post_grade_accel;
+            if (g == &v.second.post16_grade) a = &v.second.post16_grade_accel;
+        }
+        return a && a->device ? a : g;
+    }
     // The history images and sets beyond the pair, all at once (a precision switch).
     void drop_rotation() {
         auto& t = temporal;
         for (auto& v : t.vars)
             for (nrvk::Kernel* k : {&v.second.pre, &v.second.post, &v.second.post_grade, &v.second.post16,
-                                    &v.second.post16_grade})
+                                    &v.second.post16_grade, &v.second.post_grade_accel, &v.second.post16_grade_accel})
                 if (k->pool) { retired_pools.push_back(k->pool); k->pool = VK_NULL_HANDLE; k->set = VK_NULL_HANDLE; k->shared.reset(); }
         t.vars.clear();
         for (auto& e : t.extra) { e.sampler = VK_NULL_HANDLE; retiring.emplace_back(e, recordings + kRetireAfter, gpu_uses); }
@@ -870,6 +904,13 @@ struct Runtime::Impl {
     bool style_grade{};
     // [Network] Style Grade (Runtime::set_style_grade): false = the post block without the grade, as 0.0.6 ran it
     bool style_grade_on{true};
+    // The grade in closed form (g_fswinimagepost32_grade_accel.spv and the temporal *_grade_accel twins, built when the
+    // folder has them: style_grade_accel); [Network] Style Grade Acceleration (Runtime::set_style_grade_acceleration):
+    // true (default) dispatches them for Natural / Cinematic, false the table form (*_grade.spv) as before.
+    nrvk::Kernel post_grade_accel;
+    bool style_grade_accel{};
+    bool style_grade_accel_on{true};
+    int grade_form_said{};   // the grade's form last said in the log (1 step by step, 2 closed form)
     nrvk::Context::Image encoded;
     // An 8-bit frame: the answer is rounded as frame_image.py does before the
     // format-converting blit (alpha pass or the post block's store).
@@ -880,10 +921,12 @@ struct Runtime::Impl {
     bool direct_in{};
 #if NR_INT4
     bool int4{};   // CC_SILVER_AARDWOLD_OPTIMIZED's int4 layers (Runtime::int4)
-    int layers{};  // and its level (Runtime::layers)
 #endif
-    bool experimental{};   // CC_SMALL_FP8_EXPERIMENTAL (Runtime::experimental)
-    bool optimized{};   // CC_SILVER_AARDWOLD_OPTIMIZED (Runtime::optimized)
+    int layers{};  // an optimized network's level (Runtime::layers)
+    bool small_fp8_optimized{};   // CC_SMALL_FP8_OPTIMIZED (Runtime::experimental)
+    bool small_fp8_performance{};   // it at Performance or Ultra Performance (CC_SMALL_FP8_OPTIMIZED-performance/)
+    bool small_fp8_ultra{};   // it at Ultra Performance (Runtime::layers: kLayersUltra; CC_SMALL_FP8_OPTIMIZED-ultra/)
+    bool silver_aardwold_optimized{};   // CC_SILVER_AARDWOLD_OPTIMIZED (Runtime::optimized)
     // The post block stores into an image in the frame's (UNORM) format and the
     // write-back is a copy; see the graph's --out0-format.
     bool direct_out{};
@@ -1306,6 +1349,7 @@ struct Runtime::Impl {
         for (auto& r : retiring) if (r.first.handle) session.ctx.destroy(r.first);
         if (mask_pre.device) mask_pre.destroy();
         if (post_grade.device) post_grade.destroy();
+        if (post_grade_accel.device) post_grade_accel.destroy();
         if (mask_resolve.device) mask_resolve.destroy();
         if (timing) { vkDestroyQueryPool(s.ctx.device, timing, nullptr); timing = VK_NULL_HANDLE; }
         if (check.buf.handle) s.ctx.destroy(check.buf);
@@ -1429,19 +1473,20 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     const uint32_t mw = config.width, mh = config.height;
     impl_->mw = mw; impl_->mh = mh;
     // The model: the caller's choice over DLSSNR_MODEL over dlssnr-amd.ini [Network] Model; none of them: the
-    // small model. Its weights (CC_SMALL_FP8.bin, made by install.ps1 from the 310.9 DLL) are only in an installed
-    // tree; missing: the original model, and the log says why.
-    NetworkModel network = NetworkModel::Small;
-    bool experimental = false, optimized = false;
+    // CC_SMALL_FP8. Its weights (CC_SMALL_FP8.bin, made by install.ps1 from the 310.9 DLL) are only in an installed
+    // tree; missing: CC_SILVER_AARDWOLD, and the log says why.
+    NetworkModel network = NetworkModel::SmallFp8;
+    bool small_fp8_optimized = false, silver_aardwold_optimized = false;
     // Their SPIR-V: the Linux network's in a dlssnr-amd folder on RDNA4, and on RDNA3 the bundle's own gfx11 builds
-    // (aco/rdna3/experimental/shaders, .../optimized/shaders: the records are aco/rdna3/records, found by hash).
+    // (aco/rdna3/CC_SMALL_FP8_OPTIMIZED/shaders, .../CC_SILVER_AARDWOLD_OPTIMIZED/shaders: the records are
+    // aco/rdna3/records, found by hash).
     const bool aco_rdna3 = host.arch == nr::arch::GpuArch::rdna3 && !aco.empty();
-    const std::filesystem::path xroot = aco_rdna3 ? std::filesystem::path(aco) / "experimental" : data / "experimental";
-    const std::filesystem::path oroot = aco_rdna3 ? std::filesystem::path(aco) / "optimized" : data / "optimized";
-    const std::string x_incomplete = aco_rdna3 ? "dlssnr-amd/aco/rdna3/experimental/ is incomplete"
-                                               : "dlssnr-amd/experimental/ is incomplete";
-    const std::string o_incomplete = aco_rdna3 ? "dlssnr-amd/aco/rdna3/optimized/ is incomplete"
-                                               : "dlssnr-amd/optimized/ is incomplete";
+    const std::filesystem::path xroot = aco_rdna3 ? std::filesystem::path(aco) / "CC_SMALL_FP8_OPTIMIZED" : data / "CC_SMALL_FP8_OPTIMIZED";
+    const std::filesystem::path oroot = aco_rdna3 ? std::filesystem::path(aco) / "CC_SILVER_AARDWOLD_OPTIMIZED" : data / "CC_SILVER_AARDWOLD_OPTIMIZED";
+    const std::string x_incomplete = aco_rdna3 ? "dlssnr-amd/aco/rdna3/CC_SMALL_FP8_OPTIMIZED/ is incomplete"
+                                               : "dlssnr-amd/CC_SMALL_FP8_OPTIMIZED/ is incomplete";
+    const std::string o_incomplete = aco_rdna3 ? "dlssnr-amd/aco/rdna3/CC_SILVER_AARDWOLD_OPTIMIZED/ is incomplete"
+                                               : "dlssnr-amd/CC_SILVER_AARDWOLD_OPTIMIZED/ is incomplete";
     {
         std::string env;
 #ifdef _WIN32
@@ -1453,33 +1498,33 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         const int iv = config.network >= 0 || ev >= 0 ? -1 : nr::ini_network((data.parent_path() / "dlssnr-amd.ini").string());
         const char* from = config.network >= 0 ? "caller" : ev >= 0 ? "DLSSNR_MODEL" : iv >= 0 ? "dlssnr-amd.ini" : "default";
         const int v = config.network >= 0 ? config.network : ev >= 0 ? ev : iv;
-        if (v == 0) network = NetworkModel::Original;
+        if (v == 0) network = NetworkModel::SilverAardwold;
         std::error_code ec;
-        // CC_SMALL_FP8_EXPERIMENTAL: the small model with its own weights (CC_SMALL_FP8_EXPERIMENTAL.bin, made by
-        // install.ps1 from the small model) and shaders (experimental/shaders: the Linux network's, run as ACO's
-        // machine code - ACO Mode only, as int4 mixed; RDNA3: the bundle's own aco/rdna3/experimental/shaders);
-        // anything missing: the small model.
+        // CC_SMALL_FP8_OPTIMIZED: CC_SMALL_FP8 with its own weights (CC_SMALL_FP8_OPTIMIZED.bin, made by install.ps1
+        // from CC_SMALL_FP8.bin) and shaders (CC_SMALL_FP8_OPTIMIZED/shaders: Quality; Performance below - the Linux
+        // network's, run as ACO's machine code, ACO Mode only; RDNA3: the bundle's own
+        // aco/rdna3/CC_SMALL_FP8_OPTIMIZED/shaders); anything missing: CC_SMALL_FP8.
         if (v == 2) {
             const char* missing = !installed ? "not an installed tree"
                 : aco.empty() ? "it needs ACO Mode (a driver with pipeline binaries)"
                 : !std::filesystem::is_regular_file(xroot / "shaders" / "fixed-attention.txt", ec) ||
                           !std::filesystem::is_directory(xroot / "shaders" / "temporal", ec) ? x_incomplete.c_str()
-                : !std::filesystem::is_regular_file(data / "CC_SMALL_FP8_EXPERIMENTAL.bin", ec)
-                          ? "dlssnr-amd/CC_SMALL_FP8_EXPERIMENTAL.bin is missing (run install.ps1 with the 310.9.16 nvngx_dlssnr.dll)"
+                : !std::filesystem::is_regular_file(data / "CC_SMALL_FP8_OPTIMIZED.bin", ec)
+                          ? "dlssnr-amd/CC_SMALL_FP8_OPTIMIZED.bin is missing (run install.ps1 with the 310.9.16 nvngx_dlssnr.dll)"
                 : nullptr;
             if (missing) {
-                nr::logf("[nr] CC_SMALL_FP8_EXPERIMENTAL (%s) but %s: CC_SMALL_FP8", from, missing);
+                nr::logf("[nr] CC_SMALL_FP8_OPTIMIZED (%s) but %s: CC_SMALL_FP8", from, missing);
                 impl_->network_note = missing;
             } else {
-                experimental = true;
+                small_fp8_optimized = true;
             }
         }
-        // CC_SILVER_AARDWOLD_OPTIMIZED: the 310.8 model with its own weights (CC_SILVER_AARDWOLD_OPTIMIZED.bin, made by install.ps1
-        // from CC_SILVER_AARDWOLD.bin) and shaders (optimized/shaders: the Linux network's, run as ACO's machine code - ACO Mode
-        // only; with its int4 layers int4/, below; RDNA3: the bundle's own aco/rdna3/optimized/shaders);
-        // anything missing: the 310.8 model as it is.
+        // CC_SILVER_AARDWOLD_OPTIMIZED: CC_SILVER_AARDWOLD with its own weights (CC_SILVER_AARDWOLD_OPTIMIZED.bin, made by
+        // install.ps1 from CC_SILVER_AARDWOLD.bin) and shaders (CC_SILVER_AARDWOLD_OPTIMIZED/shaders: the Linux network's,
+        // run as ACO's machine code - ACO Mode only; with its int4 layers its level's folder, below; RDNA3: the bundle's
+        // own aco/rdna3/CC_SILVER_AARDWOLD_OPTIMIZED/shaders); anything missing: CC_SILVER_AARDWOLD as it is.
         if (v == 3) {
-            network = NetworkModel::Original;
+            network = NetworkModel::SilverAardwold;
             const char* missing = !installed ? "not an installed tree"
                 : aco.empty() ? "it needs ACO Mode (a driver with pipeline binaries)"
                 : !std::filesystem::is_regular_file(oroot / "shaders" / "fixed-attention.txt", ec) ||
@@ -1491,27 +1536,27 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
                 nr::logf("[nr] CC_SILVER_AARDWOLD_OPTIMIZED (%s) but %s: CC_SILVER_AARDWOLD", from, missing);
                 impl_->network_note = missing;
             } else {
-                optimized = true;
+                silver_aardwold_optimized = true;
             }
         }
-        const char* missing = network != NetworkModel::Small || experimental ? nullptr
+        const char* missing = network != NetworkModel::SmallFp8 || small_fp8_optimized ? nullptr
             : !installed ? "not an installed tree"
             : !std::filesystem::is_regular_file(data / "CC_SMALL_FP8.bin", ec) ? "dlssnr-amd/CC_SMALL_FP8.bin is missing (run install.ps1 with the 310.9.16 nvngx_dlssnr.dll)"
             : nullptr;
         if (missing) {
-            nr::logf("[nr] small model (%s) but %s: original model", from, missing);
+            nr::logf("[nr] CC_SMALL_FP8 (%s) but %s: CC_SILVER_AARDWOLD", from, missing);
             impl_->network_note = missing;
-            network = NetworkModel::Original;
+            network = NetworkModel::SilverAardwold;
         } else {
-            nr::logf("[nr] %s model (%s)", network == NetworkModel::Small ? experimental ? "small experimental" : "small"
-                                                                         : optimized ? "original optimized" : "original", from);
+            nr::logf("[nr] network %s (%s)", network == NetworkModel::SmallFp8 ? small_fp8_optimized ? "CC_SMALL_FP8_OPTIMIZED" : "CC_SMALL_FP8"
+                                       : silver_aardwold_optimized ? "CC_SILVER_AARDWOLD_OPTIMIZED" : "CC_SILVER_AARDWOLD", from);
         }
-        if (network != NetworkModel::Small) experimental = false;
+        if (network != NetworkModel::SmallFp8) small_fp8_optimized = false;
     }
     impl_->network = network;
-    impl_->experimental = experimental;
-    impl_->optimized = optimized;
-    impl_->post_blend_scale = network == NetworkModel::Small ? kPostBlendScaleSmall : kPostBlendScale;
+    impl_->small_fp8_optimized = small_fp8_optimized;
+    impl_->silver_aardwold_optimized = silver_aardwold_optimized;
+    impl_->post_blend_scale = network == NetworkModel::SmallFp8 ? kPostBlendScaleSmallFp8 : kPostBlendScale;
     // [Network] Motion Without Depth = 1, the default: the pre block reads each pixel's own motion vector, as NVIDIA's
     // DLLs (310.8, 310.9) do - their host never binds the depth, so the kernel's nearest-of-five depth pick never runs
     // there (measured on an RTX 5090); it is also the closer and steadier one at moving edges (edge band vs NVIDIA,
@@ -1568,7 +1613,7 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     if (transfer != Transfer::Identical && !(props[host.queue_family].queueFlags & VK_QUEUE_GRAPHICS_BIT))
         throw std::invalid_argument("NR colour format conversion requires a graphics-capable queue");
     std::string why;
-    if (!s.ctx.adopt(host.instance, host.physical, host.device, host.queue, host.queue_family, &why))
+    if (!s.ctx.adopt(host.instance, host.physical, host.device, host.queue, host.queue_family, host.pipeline_robustness, &why))
         throw std::runtime_error("NR device unsupported: " + why);
     s.ctx.queue_lock = host.queue_lock; s.ctx.queue_unlock = host.queue_unlock;
     s.ctx.buffer_device_address = host.buffer_device_address;
@@ -1598,8 +1643,9 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     s.ctx.require_matrix_config();
 #if NR_INT4
     // CC_SILVER_AARDWOLD_OPTIMIZED's level of optimized layers (the caller's choice - the in-game switch - over
-    // DLSSNR_INT4 over dlssnr-amd.ini [Network] OptimizedLayers; none of them: Ultra Performance). Balanced, Performance and Ultra
-    // Performance run int4 layers; installed, they need their data directory (int4/, int4-performance/, int4-ultra/:
+    // DLSSNR_INT4 over dlssnr-amd.ini [CC_SILVER_AARDWOLD_OPTIMIZED] Layers; none of them: Ultra Performance). Balanced, Performance and Ultra
+    // Performance run int4 layers; installed, they need their data directory (CC_SILVER_AARDWOLD_OPTIMIZED-balanced/,
+    // CC_SILVER_AARDWOLD_OPTIMIZED-performance/, CC_SILVER_AARDWOLD_OPTIMIZED-ultra/:
     // shaders, quantisers, settings.txt), the int4 weights the installer made (CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin, one file for the three:
     // their int4 layers' FP8 weights are the same; Ultra Performance's tables cover the others'), Performance and Ultra
     // Performance their own FP8 weights for some layers (the "performance/" entries of the optimized pack) and ACO Mode
@@ -1612,29 +1658,29 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
 #endif
     if (int4_env.empty()) if (const char* e = std::getenv("DLSSNR_INT4")) int4_env = e;
     const char* int4_from = config.layers >= 0 ? "switch" : int4_env.empty() ? "dlssnr-amd.ini" : "DLSSNR_INT4";
-    int level = config.layers >= 0 ? config.layers : nr::optimized_layers_value(int4_env);
+    int level = config.layers >= 0 ? config.layers : nr::layers_value(int4_env);
     if (config.layers < 0 && int4_env.empty()) {
-        // no OptimizedLayers: Ultra Performance (nr_ini_int4.hpp) - but only an installed tree has int4 data; a development
+        // no Layers: Ultra Performance (nr_ini_int4.hpp) - but only an installed tree has int4 data; a development
         // tree stays at Quality
-        const int iv = nr::ini_optimized_layers((data.parent_path() / "dlssnr-amd.ini").string());
+        const int iv = nr::ini_layers((data.parent_path() / "dlssnr-amd.ini").string(), "cc_silver_aardwold_optimized");
         level = iv >= 0 ? iv : installed ? nr::kLayersDefault : nr::kLayersQuality;
     }
     if (level < 0) level = nr::kLayersQuality;   // DLSSNR_INT4 neither a level nor a level's word
     // What the build reads for int4 (nr_build_cfg.hpp): installed, only this map - empty without int4 layers, so
     // nothing in the environment reaches it; a development tree keeps reading the environment.
     std::map<std::string, std::string> int4_cfg;
-    const std::filesystem::path i4root = data / (level == nr::kLayersPerformance ? "int4-performance"
-                                                 : level == nr::kLayersUltra ? "int4-ultra" : "int4");
+    std::filesystem::path i4root = data / (level == nr::kLayersPerformance ? "CC_SILVER_AARDWOLD_OPTIMIZED-performance"
+                                           : level == nr::kLayersUltra ? "CC_SILVER_AARDWOLD_OPTIMIZED-ultra"
+                                           : "CC_SILVER_AARDWOLD_OPTIMIZED-balanced");
     // The int4 levels' SPIR-V: the Linux network's in i4root/shaders on RDNA4; on RDNA3 the bundle's own gfx11 builds
-    // (aco/rdna3/<int4 | int4-performance | int4-ultra>/shaders, stand-ins naming their records in aco/rdna3/int4/
-    // records). The tables (vit/, swin/, settings.txt) are i4root's on both: the same int4 network.
-    const std::filesystem::path i4spv = (aco_rdna3 ? std::filesystem::path(aco) / i4root.filename() : i4root) / "shaders";
-    const std::filesystem::path i4weights = data / "CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin";
-    if (level >= nr::kLayersBalanced && (optimized || !installed)) {
+    // (aco/rdna3/<the level's folder>/shaders, stand-ins naming their records in aco/rdna3/int4/records). The tables (vit/, swin/, settings.txt) are i4root's on both: the same int4 network.
+    std::filesystem::path i4spv = (aco_rdna3 ? std::filesystem::path(aco) / i4root.filename() : i4root) / "shaders";
+    std::filesystem::path i4weights = data / "CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin";
+    if (level >= nr::kLayersBalanced && (silver_aardwold_optimized || !installed)) {
         std::error_code ec;
         const std::string incomplete = "dlssnr-amd/" + i4root.filename().string() + "/ is incomplete";
         const std::string no_weights = "dlssnr-amd/" + i4weights.filename().string() + " is missing (run install.ps1 again)";
-        const char* missing = network == NetworkModel::Small ? "the small model has no int4 layers"
+        const char* missing = network == NetworkModel::SmallFp8 ? "CC_SMALL_FP8 has no int4 layers"
             : !installed ? "not an installed tree"
             : !std::filesystem::is_directory(i4spv / "temporal", ec) || !std::filesystem::is_directory(i4root / "vit", ec) ||
                       !std::filesystem::is_regular_file(i4root / "settings.txt", ec) ? incomplete.c_str()
@@ -1663,6 +1709,79 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     impl_->int4 = int4;
     impl_->layers = int4 ? level : nr::kLayersQuality;
 #endif
+    // CC_SMALL_FP8_OPTIMIZED's level (the caller's choice - the in-game switch - over dlssnr-amd.ini
+    // [CC_SMALL_FP8_OPTIMIZED] Layers; none of them: Quality): Performance runs its own shaders
+    // (CC_SMALL_FP8_OPTIMIZED-performance/: the
+    // fixed-attention pre block, the ViT's pooled keys on 4K-class frames but 5120x1440) and the "performance/" entries of
+    // CC_SMALL_FP8_OPTIMIZED.bin; its shaders missing: Quality, and the log says why. Ultra Performance: Performance's
+    // weights with the ViT's int4 layers - their data directory CC_SMALL_FP8_OPTIMIZED-ultra/ (shaders, tables,
+    // settings.txt; vit-sink/
+    // for the 1440p-class frames), the int4 weights the installer made (CC_SMALL_FP8_OPTIMIZED_INT4.bin, _SINK.bin) and VK_KHR_pipeline_binary,
+    // as CC_SILVER_AARDWOLD_OPTIMIZED's int4 levels; anything missing: Performance, and the log says why.
+    // (RDNA3: the bundle's own gfx11 builds, aco/rdna3/CC_SMALL_FP8_OPTIMIZED-performance/shaders - stand-ins naming their
+    // records)
+    const std::filesystem::path sroot = aco_rdna3 ? std::filesystem::path(aco) / "CC_SMALL_FP8_OPTIMIZED-performance" : data / "CC_SMALL_FP8_OPTIMIZED-performance";
+    if (small_fp8_optimized) {
+        int lv = config.layers;
+        if (lv < 0) {
+            const int iv = nr::ini_layers((data.parent_path() / "dlssnr-amd.ini").string(), "cc_small_fp8_optimized");
+            lv = iv >= 0 ? iv : nr::kSmallFp8LayersDefault;
+        }
+        const int want = nr::network_with_layers(nr::kSmallFp8Optimized, lv);
+        bool perf = want != nr::kSmallFp8Optimized, ultra = want == nr::kSmallFp8OptimizedUltra;
+        std::error_code ec;
+        if (perf && (!std::filesystem::is_regular_file(sroot / "shaders" / "vit-kv-pool.txt", ec) ||
+                     !std::filesystem::is_directory(sroot / "shaders" / "temporal", ec))) {
+            nr::logf("[nr] CC_SMALL_FP8_OPTIMIZED (layers: performance) requested but dlssnr-amd/CC_SMALL_FP8_OPTIMIZED-performance/ is "
+                     "incomplete: quality");
+            impl_->network_note = "dlssnr-amd/CC_SMALL_FP8_OPTIMIZED-performance/ is incomplete";
+            perf = ultra = false;
+        }
+#if NR_INT4
+        if (ultra) {
+            const std::filesystem::path uroot = data / "CC_SMALL_FP8_OPTIMIZED-ultra", uweights = data / "CC_SMALL_FP8_OPTIMIZED_INT4.bin";
+            const char* missing = !installed ? "not an installed tree"
+                : !std::filesystem::is_directory(uroot / "shaders" / "temporal", ec) || !std::filesystem::is_directory(uroot / "vit", ec) ||
+                          !std::filesystem::is_regular_file(uroot / "settings.txt", ec) ? "dlssnr-amd/CC_SMALL_FP8_OPTIMIZED-ultra/ is incomplete"
+                : !std::filesystem::is_regular_file(uweights, ec) ? "dlssnr-amd/CC_SMALL_FP8_OPTIMIZED_INT4.bin is missing (run install.ps1 again)"
+                : aco_rdna3 ? "its int4 layers do not run on RDNA3 / RDNA3.5 yet"
+                : nr::binary::directory().empty() || !nr::binary::enabled(host.device) ? "ACO Mode is off or pipeline binaries are unavailable"
+                : !std::filesystem::is_directory(std::filesystem::path(aco) / "int4/records", ec) ? "the ACO INT4 records are missing"
+                : nullptr;
+            if (missing) {
+                nr::logf("[nr] CC_SMALL_FP8_OPTIMIZED (layers: ultra performance) requested but %s: performance", missing);
+                impl_->network_note = missing;
+                ultra = false;
+            } else {
+                int4 = true; i4root = uroot; i4spv = uroot / "shaders"; i4weights = uweights;
+                int4_cfg.clear();
+                int4_cfg["NR_I4_DIR"] = (i4root / "vit").string();
+                int4_cfg["NR_I4_WEIGHTS"] = i4weights.string();
+                // at rasters padded only from the image's edge (1440p class) the later ViT blocks' own tables and weights
+                // (nr_graph.cpp g_vit_sink); without them the int4 layers stay off there and Performance runs
+                const std::filesystem::path sweights = data / "CC_SMALL_FP8_OPTIMIZED_INT4_SINK.bin";
+                if (std::filesystem::is_directory(i4root / "vit-sink", ec) && std::filesystem::is_regular_file(sweights, ec)) {
+                    int4_cfg["NR_I4_DIR_SINK"] = (i4root / "vit-sink").string();
+                    int4_cfg["NR_I4_WEIGHTS_SINK"] = sweights.string();
+                } else {
+                    nr::logf("[nr] CC_SMALL_FP8_OPTIMIZED ultra performance: no int4 weights for 1440p-class frames "
+                             "(CC_SMALL_FP8_OPTIMIZED_INT4_SINK.bin; run install.ps1 again): Performance there");
+                }
+                std::filesystem::create_directories(i4root / "pipeline-binaries", ec);
+                if (!ec) int4_cfg["NR_I4_CACHE"] = (i4root / "pipeline-binaries").string();
+                const auto t = slurp((i4root / "settings.txt").string());
+                nr::int4_settings(std::string(t.begin(), t.end()), int4_cfg);
+            }
+        }
+        impl_->int4 = int4;
+#else
+        ultra = false;
+#endif
+        nr::logf("[nr] CC_SMALL_FP8_OPTIMIZED (layers: %s)", ultra ? "ultra performance" : perf ? "performance" : "quality");
+        impl_->small_fp8_performance = perf;
+        impl_->small_fp8_ultra = ultra;
+        impl_->layers = ultra ? nr::kLayersUltra : perf ? nr::kLayersPerformance : nr::kLayersQuality;
+    }
     // Where the pass's own cost is measured. Two queries per ring slot. A queue
     // family is allowed to report no timestamp bits - then there is no pool, and
     // every accessor answers zero rather than a number made up from a clock.
@@ -1691,10 +1810,11 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         "--source-height", std::to_string(mh), "--accumulation", config.accumulation,
         "--pipeline-cache", (installed ? data / "pipeline.cache" : root / "dlssnr-amd.pipelinecache").string(),
         "--lazy-images"};
-    if (experimental || optimized) {   // CC_SMALL_FP8_EXPERIMENTAL, CC_SILVER_AARDWOLD_OPTIMIZED: their own shaders (ACO SPIR-V: kept with ACO Mode on) and pipeline caches
+    if (small_fp8_optimized || silver_aardwold_optimized) {   // CC_SMALL_FP8_OPTIMIZED, CC_SILVER_AARDWOLD_OPTIMIZED: their own shaders (ACO SPIR-V: kept with ACO Mode on) and pipeline caches
+        const std::filesystem::path own = small_fp8_optimized ? impl_->small_fp8_performance ? sroot : xroot : oroot;
         for (size_t i = 0; i + 1 < arguments.size(); ++i) {
-            if (arguments[i] == "--spv-dir") arguments[i + 1] = ((experimental ? xroot : oroot) / "shaders").string();
-            if (arguments[i] == "--pipeline-cache") arguments[i + 1] = ((experimental ? xroot : oroot) / "pipeline.cache").string();
+            if (arguments[i] == "--spv-dir") arguments[i + 1] = (own / "shaders").string();
+            if (arguments[i] == "--pipeline-cache") arguments[i + 1] = (own / "pipeline.cache").string();
         }
         arguments.push_back("--spv-dir-aco");
     }
@@ -1714,13 +1834,15 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     const bool perf_pack = false;
 #endif
     if (installed) {
-        const auto pack = data / (experimental ? "CC_SMALL_FP8_EXPERIMENTAL.bin"
-                                  : optimized ? "CC_SILVER_AARDWOLD_OPTIMIZED.bin"
-                                  : network == NetworkModel::Small ? "CC_SMALL_FP8.bin" : "CC_SILVER_AARDWOLD.bin");
+        const auto pack = data / (small_fp8_optimized ? "CC_SMALL_FP8_OPTIMIZED.bin"
+                                  : silver_aardwold_optimized ? "CC_SILVER_AARDWOLD_OPTIMIZED.bin"
+                                  : network == NetworkModel::SmallFp8 ? "CC_SMALL_FP8.bin" : "CC_SILVER_AARDWOLD.bin");
         if (!std::filesystem::is_regular_file(pack))
             throw std::runtime_error("missing " + pack.string() + " (run install.ps1 again)");
         arguments.push_back("--model-pack"); arguments.push_back(pack.string());
-        if (optimized && perf_pack) { arguments.push_back("--model-pack-variant"); arguments.push_back("performance"); }
+        if ((silver_aardwold_optimized && perf_pack) || (small_fp8_optimized && impl_->small_fp8_performance)) {
+            arguments.push_back("--model-pack-variant"); arguments.push_back("performance");
+        }
     }
     // One pass at the frame's own extent, not linear: every kernel only samples
     // the input image, so it can be the frame's own format filled by a copy.
@@ -1880,6 +2002,12 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
                                  {s.act.handle, s.act.handle, s.wgt.handle, s.wgt.handle, s.wgt.handle},
                                  impl_->graph_post->push_range, {&s.surf0, &s.surf1, &s.tex_in});
         impl_->style_grade = true;
+        const std::filesystem::path accel_spv = grade_spv.parent_path() / "g_fswinimagepost32_grade_accel.spv";
+        impl_->style_grade_accel = std::filesystem::exists(accel_spv);
+        if (impl_->style_grade_accel)
+            impl_->post_grade_accel.create(s.ctx, accel_spv.string(),
+                                           {s.act.handle, s.act.handle, s.wgt.handle, s.wgt.handle, s.wgt.handle},
+                                           impl_->graph_post->push_range, {&s.surf0, &s.surf1, &s.tex_in});
     }
     if (temporal_config.enable) {
         auto& t = impl_->temporal;
@@ -1888,10 +2016,10 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
             ? (!aco.empty() ? std::filesystem::path(aco) / "shaders/temporal"
                : installed ? data / "shaders/temporal" : root / "build/windows/rdna4/network/temporal")
             : std::filesystem::path(temporal_config.shaders));
-        if (experimental) shaders = std::filesystem::canonical(xroot / "shaders" / "temporal");
-        if (optimized) shaders = std::filesystem::canonical(oroot / "shaders" / "temporal");
+        if (small_fp8_optimized) shaders = std::filesystem::canonical((impl_->small_fp8_performance ? sroot : xroot) / "shaders" / "temporal");
+        if (silver_aardwold_optimized) shaders = std::filesystem::canonical(oroot / "shaders" / "temporal");
 #if NR_INT4
-        // with the int4 layers, the temporal pre/post variants built with their network's defines: int4/shaders/temporal
+        // with the int4 layers, the temporal pre/post variants built with their network's defines: <level>/shaders/temporal
         if (int4) shaders = std::filesystem::canonical(i4spv / "temporal");
 #endif
         require_variant_profile(shaders);
@@ -1980,6 +2108,7 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
                                      {&t.depth, &depth_store});
         }
         t.params = s.ctx.buffer(48);
+        t.pre_params = s.ctx.buffer(48);
 
         for (unsigned p = 0; p < 2; ++p) {
             for (unsigned k = 0; k < kTemporalLevels; ++k) {
@@ -2024,7 +2153,7 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         nrvk::Context::Image (&hist_store)[2] = t.hist_store;
         hist_store[0] = storage_of(t.hist(0)); hist_store[1] = storage_of(t.hist(1));
         t.pre_buffers = {s.act.handle, s.act.handle, s.wgt.handle, s.wgt.handle, s.wgt.handle,
-                         s.noise_buf.handle, t.params.handle};   // binding 5: the noise table (image_input.glsl)
+                         s.noise_buf.handle, t.pre_params.handle};   // binding 5: the noise table (image_input.glsl)
         t.post_buffers = {s.act.handle, s.act.handle, s.wgt.handle, s.wgt.handle, s.wgt.handle,
                           t.params.handle};
         for (unsigned c = 0; c < (t.pingpong ? 2u : 1u); ++c) {
@@ -2058,6 +2187,14 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
                          t.params.handle},
                         sizeof(PushFSwin) + sizeof(PushUps) + sizeof(PushImageTail), post_images);
             else impl_->style_grade = false;
+            // and its closed-form twin (Style Grade Acceleration); a folder without them grades in the table form
+            if (impl_->style_grade && impl_->style_grade_accel && std::filesystem::exists(shaders / (post_name + "_grade_accel.spv")))
+                (t.pingpong ? t.post_grade_accel_pp[c] : t.post_grade_accel).create(s.ctx,
+                        (shaders / (post_name + "_grade_accel.spv")).string(),
+                        {s.act.handle, s.act.handle, s.wgt.handle, s.wgt.handle, s.wgt.handle,
+                         t.params.handle},
+                        sizeof(PushFSwin) + sizeof(PushUps) + sizeof(PushImageTail), post_images);
+            else impl_->style_grade_accel = false;
             // The RGBA16F history's post (History Precision 16), over the same images: the sets are the same,
             // only the history store's format differs (Impl::switch_history).
             if (t.h16_ok && !t.hp && t.pingpong) {
@@ -2068,6 +2205,13 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
                     t.post16_grade_pp[c].create(s.ctx, (shaders / "temporal_post_fp32h16_grade.spv").string(),
                         {s.act.handle, s.act.handle, s.wgt.handle, s.wgt.handle, s.wgt.handle, t.params.handle},
                         sizeof(PushFSwin) + sizeof(PushUps) + sizeof(PushImageTail), post_images);
+                if (impl_->style_grade && impl_->style_grade_accel) {
+                    if (std::filesystem::exists(shaders / "temporal_post_fp32h16_grade_accel.spv"))
+                        t.post16_grade_accel_pp[c].create(s.ctx, (shaders / "temporal_post_fp32h16_grade_accel.spv").string(),
+                            {s.act.handle, s.act.handle, s.wgt.handle, s.wgt.handle, s.wgt.handle, t.params.handle},
+                            sizeof(PushFSwin) + sizeof(PushUps) + sizeof(PushImageTail), post_images);
+                    else impl_->style_grade_accel = false;
+                }
             }
         }
         if (!t.post16_pp[0].device) t.h16_ok = t.h16 = false;
@@ -2075,6 +2219,10 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         t.enabled = true;
         // Later-pass histories are allocated when a caller actually runs those passes.
     }
+    // Style Grade Acceleration needs every grade twin in closed form; a shader folder without them grades step by step
+    if (impl_->style_grade && !impl_->style_grade_accel)
+        nr::logf("[nr] Style grade acceleration: the shader folder has no *_grade_accel pipelines; Natural and "
+                 "Cinematic are graded step by step");
     if(transfer != Transfer::Identical) {
         for(VkFormat format : {transfer == Transfer::Encoded ? unorm : config.colour_format,
                                VK_FORMAT_R32G32B32A32_SFLOAT}) {
@@ -2272,7 +2420,7 @@ static bool adopt_for(nrvk::Context& ctx, const HostDevice& host) {
         nr::logf("[nr] the network's memory cannot be moved: %s", why.c_str());
         return false;
     }
-    if (!ctx.adopt(host.instance, host.physical, host.device, host.queue, host.queue_family, &why)) {
+    if (!ctx.adopt(host.instance, host.physical, host.device, host.queue, host.queue_family, host.pipeline_robustness, &why)) {
         nr::logf("[nr] the network's memory cannot be moved: %s", why.c_str());
         return false;
     }
@@ -2400,6 +2548,17 @@ bool Runtime::owns_image_memory() const {
     return impl_->session.share && !impl_->heap;
 }
 
+bool Runtime::history_slots(uint64_t feature, ColourFrame* read, ColourFrame* write) const {
+    const auto it = impl_->slot_pairs.find(feature);
+    if (it == impl_->slot_pairs.end()) return false;
+    auto& t = impl_->temporal;
+    const auto& r = t.hist(it->second.first);
+    const auto& w = t.hist(it->second.second);
+    *read = {}; read->image = r.handle; read->format = r.format; read->width = r.w; read->height = r.h;
+    *write = {}; write->image = w.handle; write->format = w.format; write->width = w.w; write->height = w.h;
+    return true;
+}
+void Runtime::set_history_weight_hook(HistoryWeightHook hook) { impl_->weight_hook = std::move(hook); }
 bool Runtime::carry_history(VkCommandBuffer cmd, const Runtime& from, uint64_t feature) {
     auto& t = impl_->temporal;
     auto& ft = from.impl_->temporal;
@@ -2494,15 +2653,19 @@ bool Runtime::stale() const {
 uint32_t Runtime::model_width() const { return impl_->mw; }
 uint32_t Runtime::model_height() const { return impl_->mh; }
 NetworkModel Runtime::network() const { return impl_->network; }
-bool Runtime::experimental() const { return impl_->experimental; }
-bool Runtime::optimized() const { return impl_->optimized; }
+bool Runtime::small_fp8_optimized() const { return impl_->small_fp8_optimized; }
+bool Runtime::silver_aardwold_optimized() const { return impl_->silver_aardwold_optimized; }
 #if NR_INT4
 bool Runtime::int4() const { return impl_->int4; }
-int Runtime::layers() const { return impl_->layers; }
 #endif
+int Runtime::layers() const { return impl_->layers; }
 
 void Runtime::set_style_grade(bool on) { impl_->style_grade_on = on; }
 bool Runtime::style_grade_active() const { return impl_->style_grade && impl_->style_grade_on; }
+void Runtime::set_style_grade_acceleration(bool on) { impl_->style_grade_accel_on = on; }
+bool Runtime::style_grade_accelerated() const {
+    return impl_->style_grade && impl_->style_grade_on && impl_->style_grade_accel && impl_->style_grade_accel_on;
+}
 void Runtime::set_history_f16(bool on) { if (!std::getenv("NR_HIST16")) impl_->temporal.h16_want = on; }
 
 void Runtime::set_history_strength(float v) {
@@ -2531,7 +2694,8 @@ void Runtime::release_feature(uint64_t feature) {
             for (auto v = t.vars.begin(); v != t.vars.end();) {
                 if (v->first.first != last && v->first.second != last) { ++v; continue; }
                 for (nrvk::Kernel* k : {&v->second.pre, &v->second.post, &v->second.post_grade, &v->second.post16,
-                                        &v->second.post16_grade})
+                                        &v->second.post16_grade, &v->second.post_grade_accel,
+                                        &v->second.post16_grade_accel})
                     if (k->pool) { impl_->retired_pools.push_back(k->pool); k->pool = VK_NULL_HANDLE; k->shared.reset(); }
                 v = t.vars.erase(v);
             }
@@ -2640,9 +2804,39 @@ EngineResult Runtime::record_engine(VkCommandBuffer cmd, const EngineFrame& fram
     return result;
 }
 
+uint32_t Runtime::network_steps() const { return uint32_t(impl_->session.steps.size()); }
+
+void Runtime::touch_submission() {
+    impl_->gpu_uses.touch();
+    if (impl_->heap) impl_->heap->uses[impl_->heap_region].touch();
+}
+
+EngineResult Runtime::record_engine_split(VkCommandBuffer cmd, const EngineFrame& frame,
+                                         const Controls& c, NetworkSplit& split) {
+    if (!impl_->temporal.enabled || !frame.motion.image)
+        throw std::invalid_argument("split NR requires the engine temporal path");
+    if (!split.second || split.second == cmd || !c.enabled || !c.apply_model)
+        throw std::invalid_argument("invalid split NR command buffers or controls");
+    const auto& s = impl_->session;
+    const size_t wanted = std::min<size_t>(split.before_step, s.steps.size());
+    // Tile-counter chains are indivisible. A persistent run is already one step.
+    size_t best = 0, distance = s.steps.size() + 1;
+    for (size_t i = 0; i <= s.steps.size(); ++i) {
+        if (i && i < s.steps.size() && i - 1 < s.runner.no_barrier_after.size() && s.runner.no_barrier_after[i - 1])
+            continue;
+        const size_t d = i > wanted ? i - wanted : wanted - i;
+        if (d < distance) { best = i; distance = d; }
+    }
+    split.actual_before_step = uint32_t(best);
+    EngineResult result{};
+    TemporalFrame temporal{frame.reset, frame.feature};
+    result.frame = record_all(cmd, frame.colour, c, nullptr, &temporal, &result.history_consumed, &frame, &split).frame;
+    return result;
+}
+
 ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& frame, const Controls& c,
                              const ControlMaskFrame* mask, const TemporalFrame* temporal,
-                             bool* history_consumed, const EngineFrame* engine) {
+                             bool* history_consumed, const EngineFrame* engine, NetworkSplit* split) {
     impl_->gpu_uses.touch();
     if (impl_->heap) impl_->heap->uses[impl_->heap_region].touch();
     if (stale()) throw std::logic_error("a runtime whose images another one has taken over (Runtime::stale)");
@@ -2654,8 +2848,11 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
     const bool int4 = false;
     const int layers = 0;
 #endif
-    nr::vram::Scope owner(nr::vram::kUnset, impl_->experimental ? 3 : impl_->network == NetworkModel::Small ? 0
-                                            : impl_->optimized ? nr::network_with_layers(2, int4 ? layers : 0) : 1);
+    nr::vram::Scope owner(nr::vram::kUnset, impl_->small_fp8_optimized ? impl_->small_fp8_ultra ? nr::kSmallFp8OptimizedUltra
+                                                                  : impl_->small_fp8_performance ? nr::kSmallFp8OptimizedPerformance
+                                                                  : nr::kSmallFp8Optimized
+                                            : impl_->network == NetworkModel::SmallFp8 ? 0
+                                            : impl_->silver_aardwold_optimized ? nr::network_with_layers(2, int4 ? layers : 0) : 1);
     validate(c);
     if (!cmd || !frame.image || frame.format != impl_->colour_format ||
         frame.width != impl_->width || frame.height != impl_->height ||
@@ -2732,7 +2929,7 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
     }
     // Timed from here: a disabled pass records nothing and is not a cost.
     const uint32_t timing_slot = impl_->timing_slot;
-    if (impl_->timing_ok) {
+    if (impl_->timing_ok && !split) {
         vkCmdResetQueryPool(cmd, impl_->timing, timing_slot * impl_->timing_stride, impl_->timing_stride);
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, impl_->timing, timing_slot * impl_->timing_stride);
     }
@@ -2967,8 +3164,16 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         pre_seed = counter++;
         if (c.seed_fixed) pre_seed = 0;
         // diagnostics (wrong picture): price the per-frame noise and the history.
-        if (std::getenv("NR_DIAG_SEED0")) pre_seed = 0;
-        if (std::getenv("NR_DIAG_TGATE0")) gate = false;
+        static const bool diag_seed0 = [] {
+            const char* e = std::getenv("NR_DIAG_SEED0");
+            return e && e[0] && e[0] != '0';
+        }();
+        static const bool diag_tgate0 = [] {
+            const char* e = std::getenv("NR_DIAG_TGATE0");
+            return e && e[0] && e[0] != '0';
+        }();
+        if (diag_seed0) pre_seed = 0;
+        if (diag_tgate0) gate = false;
         const uint32_t p = fs ? fs->parity : t.parity;
         if (engine) {
             // Engine motion: sampled in place (mv_direct, put back after the
@@ -3116,10 +3321,14 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
                              : engine ? engine->motion_x + engine->motion.width : 1;
         const uint32_t mth = engine && engine->motion_texture_height ? engine->motion_texture_height
                              : engine ? engine->motion_y + engine->motion.height : 1;
-        const float params[12] = {gate ? 1.0f : 0.0f,
+        // [0]: the gate - the post's closed at history strength 0 (a layer's Post history), the pre's (pre_params) with
+        // Controls::pre_history. A closed gate is what the original does without a history: the pre's history features
+        // hold this frame's colour, the post blends nothing in (its arithmetic then the production one).
+        const float post_strength = c.history_strength >= 0.f ? std::clamp(c.history_strength, 0.f, 1.f) : t.history_strength;
+        float params[12] = {gate && post_strength > 0.f ? 1.0f : 0.0f,
                                   engine ? engine->motion_scale_x : 1.0f,
                                   engine ? engine->motion_scale_y : 1.0f,
-                                  (c.history_strength >= 0.f ? std::clamp(c.history_strength, 0.f, 1.f) : t.history_strength) * impl_->post_blend_scale,
+                                  post_strength * impl_->post_blend_scale,
                                   float(t.history.w), float(t.history.h),
                                   have_depth ? 1.0f : 0.0f,
                                   have_depth && engine->depth_inverted ? 1.0f : 0.0f,
@@ -3127,19 +3336,30 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
                                   mv_direct ? float(engine->motion.height) / float(mth) : 1.0f,
                                   mv_direct ? float(engine->motion_x) / float(mtw) : 0.0f,
                                   mv_direct ? float(engine->motion_y) / float(mth) : 0.0f};
-        VkBufferMemoryBarrier b{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
-        b.srcAccessMask=VK_ACCESS_SHADER_READ_BIT;b.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;
-        b.srcQueueFamilyIndex=b.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
-        b.buffer=t.params.handle;b.size=VK_WHOLE_SIZE;
-        vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,1,&b,0,nullptr);
+        VkBufferMemoryBarrier b[2]{{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER}, {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER}};
+        for (int i = 0; i < 2; ++i) {
+            b[i].srcAccessMask=VK_ACCESS_SHADER_READ_BIT;b[i].dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;
+            b[i].srcQueueFamilyIndex=b[i].dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
+            b[i].buffer=i ? t.pre_params.handle : t.params.handle;b[i].size=VK_WHOLE_SIZE;
+        }
+        vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,2,b,0,nullptr);
         vkCmdUpdateBuffer(cmd,t.params.handle,0,sizeof params,params);
-        b.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;b.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;
-        vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,0,nullptr,1,&b,0,nullptr);
+        const float post_gate = params[0];
+        params[0] = gate && c.pre_history ? 1.0f : 0.0f;
+        vkCmdUpdateBuffer(cmd,t.pre_params.handle,0,sizeof params,params);
+        params[0] = post_gate;
+        for (int i = 0; i < 2; ++i) { b[i].srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;b[i].dstAccessMask=VK_ACCESS_SHADER_READ_BIT; }
+        vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,0,nullptr,2,b,0,nullptr);
+        if (impl_->weight_hook) impl_->weight_hook(cmd, t.params.handle, 3u * 4u, params[3]);
     }
     if (!temporal && !mask) {
         // No motion source: the seed is 0 unless Controls::noise_every_frame, then the DLL's counter.
+        static const bool diag_seed0 = [] {
+            const char* e = std::getenv("NR_DIAG_SEED0");
+            return e && e[0] && e[0] != '0';
+        }();
         uint32_t& seed = c.feature ? impl_->plain_seeds[c.feature] : impl_->plain_seed;
-        if (c.noise_every_frame && !c.seed_fixed) pre_seed = seed++;
+        if (c.noise_every_frame && !c.seed_fixed && !diag_seed0) pre_seed = seed++;
         else seed = 0;
     }
     // Bind this feature's history: copy the previously bound feature's state out
@@ -3244,11 +3464,18 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
             shot_out.before = shot_out.after = VK_IMAGE_LAYOUT_GENERAL;
             c.model_capture(cmd, shot_in, shot_out, false);
         }
-        const bool time_net = impl_->timing_ok && impl_->split_timing;
+        const bool time_net = impl_->timing_ok && impl_->split_timing && !split;
         const uint32_t net_query = timing_slot * impl_->timing_stride + 2 + 2 * pass;
         if (c.network_timestamp) c.network_timestamp(cmd, true);
         if (time_net) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, impl_->timing, net_query);
         for (size_t i = 0; i < s.steps.size(); ++i) {
+            if (split && i == split->actual_before_step) {   // (a network timestamp: the first part ends, the second begins)
+                compute_barrier(cmd);
+                if (c.network_timestamp) c.network_timestamp(cmd, false);
+                cmd = split->second;
+                compute_barrier(cmd);
+                if (c.network_timestamp) c.network_timestamp(cmd, true);
+            }
             const auto& step = s.steps[i];
             const nrvk::Kernel* use = step.k;
             if (mask && step.k==impl_->original_pre) use = &impl_->mask_pre;
@@ -3275,6 +3502,14 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
                     else if (use == &t.post) use = &t.post_grade;
                     else if (nrvk::Kernel* g = impl_->grade_of(use)) use = g;
                     else throw std::runtime_error("Style grade: no grade pipeline for this post block");
+                    // Style Grade Acceleration: the same grade in closed form (its twin, the same set)
+                    const nrvk::Kernel* table = use;
+                    if (impl_->style_grade_accel && impl_->style_grade_accel_on) use = impl_->accel_of(use);
+                    const int form = use != table ? 2 : 1;   // (said in the log when it changes)
+                    if (form != impl_->grade_form_said) {
+                        impl_->grade_form_said = form;
+                        nr::logf("[nr] Style grade: %s", form == 2 ? "in closed form (Style Grade Acceleration)" : "step by step");
+                    }
                 }
             }
             // This frame's noise seed, computed in the shader: the precomputed
@@ -3302,11 +3537,18 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
             // stays full, because the passes that follow it are not part of
             // either contract - they were not built with device-scoped loads
             // and the arena is not the only thing they read.
-            const bool last = i + 1 >= s.steps.size();
+            const bool last = i + 1 >= s.steps.size() || (split && i + 1 == split->actual_before_step);
             // C=512 dispatches joined by tile counters (nr_graph.cpp NR_TCHAIN) have no barrier.
             if (!last && i < s.runner.no_barrier_after.size() && s.runner.no_barrier_after[i]) continue;
             compute_barrier(cmd, s.runner.exec_barrier && !last,
                             s.runner.inv_barrier && !last);
+        }
+        if (split && split->actual_before_step == s.steps.size()) {
+            compute_barrier(cmd);
+            if (c.network_timestamp) c.network_timestamp(cmd, false);
+            cmd = split->second;
+            compute_barrier(cmd);
+            if (c.network_timestamp) c.network_timestamp(cmd, true);
         }
         if (time_net) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, impl_->timing, net_query + 1);
         if (c.network_timestamp) c.network_timestamp(cmd, false);
@@ -3320,7 +3562,7 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         // The post variant wrote this frame's history into the other image (hwrite, now the feature's).
         if (t.pingpong) {
             t.hcur = t.hwrite;
-            if (fs && impl_->rotation()) fs->slot = int(t.hwrite);
+            if (fs && impl_->rotation()) { impl_->slot_pairs[temporal->feature] = {t.hread, t.hwrite}; fs->slot = int(t.hwrite); }
         }
         if (history_consumed) *history_consumed = gate;
     }
@@ -3421,7 +3663,7 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         impl_->incheck.end(s.ctx, cmd, tgt && (tgt->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) ? *tgt : frame, *engine, impl_->temporal.flow[0], impl_->temporal.depth,
                            depth_direct, game_depth && !impl_->depth_unread,
                            history_consumed && *history_consumed, impl_->mw, impl_->mh, mv_direct);
-    if (impl_->timing_ok) {
+    if (impl_->timing_ok && !split) {
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, impl_->timing,
                             timing_slot * impl_->timing_stride + 1);
         impl_->slot_passes[timing_slot] = impl_->split_timing ? passes : 0;
@@ -3454,7 +3696,7 @@ void Runtime::discard_timing() { impl_->timings_recorded = 0; }
 // pipelines), for a caller that runs the dispatches itself. Divergences from the constructor, all of them about the
 // Vulkan host this has not got: no device checks or adopt, no pipeline binaries check (ACO Mode is the configured
 // directory alone), no --tex-in-format / --out0-format (the D3D12 side hands the network RGBA32F), no int4 network.
-bool plan_d3d12_network(const std::string& root_in, uint32_t mw, uint32_t mh, bool allow_experimental, D3d12NetPlan* out,
+bool plan_d3d12_network(const std::string& root_in, uint32_t mw, uint32_t mh, bool allow_small_fp8_optimized, D3d12NetPlan* out,
                         std::string* why, int model_choice, nr::arch::GpuArch arch) {
     try {
         *out = D3d12NetPlan{};
@@ -3488,13 +3730,16 @@ bool plan_d3d12_network(const std::string& root_in, uint32_t mw, uint32_t mh, bo
             if (!std::filesystem::is_directory(nr::u8::path(aco + "/records"), ec)) { *why = "the RDNA3 records are missing (" + aco + ")"; return false; }
         }
         const auto network_shaders = std::filesystem::path(aco) / "shaders";
-        // The model, as the constructor picks it: DLSSNR_MODEL over dlssnr-amd.ini [Network] Model; none: the small one.
-        NetworkModel network = NetworkModel::Small;
-        bool experimental = false, optimized = false, int4 = false;
+        // The model, as the constructor picks it: DLSSNR_MODEL over dlssnr-amd.ini [Network] Model; none: CC_SMALL_FP8.
+        NetworkModel network = NetworkModel::SmallFp8;
+        bool small_fp8_optimized = false, silver_aardwold_optimized = false, int4 = false;
+        bool small_fp8_performance = false;   // CC_SMALL_FP8_OPTIMIZED at Performance or Ultra Performance
+                                              // (CC_SMALL_FP8_OPTIMIZED-performance/)
         int level = nr::kLayersQuality;
-        const std::filesystem::path xroot = rdna3 ? std::filesystem::path(aco) / "experimental" : data / "experimental";
-        const std::filesystem::path oroot = rdna3 ? std::filesystem::path(aco) / "optimized" : data / "optimized";
-        std::filesystem::path i4root = data / "int4";
+        const std::filesystem::path xroot = rdna3 ? std::filesystem::path(aco) / "CC_SMALL_FP8_OPTIMIZED" : data / "CC_SMALL_FP8_OPTIMIZED";
+        const std::filesystem::path sroot = rdna3 ? std::filesystem::path(aco) / "CC_SMALL_FP8_OPTIMIZED-performance" : data / "CC_SMALL_FP8_OPTIMIZED-performance";
+        const std::filesystem::path oroot = rdna3 ? std::filesystem::path(aco) / "CC_SILVER_AARDWOLD_OPTIMIZED" : data / "CC_SILVER_AARDWOLD_OPTIMIZED";
+        std::filesystem::path i4root = data / "CC_SILVER_AARDWOLD_OPTIMIZED-balanced";
         // the int4 levels' SPIR-V: i4root's on RDNA4; RDNA3's own stand-ins in aco/rdna3/<level>/shaders (the tables -
         // vit/, swin/, settings.txt - are i4root's on both, as the Vulkan runtime's i4spv)
         const auto i4spv = [&] { return rdna3 ? std::filesystem::path(aco) / i4root.filename() / "shaders" : i4root / "shaders"; };
@@ -3509,13 +3754,13 @@ bool plan_d3d12_network(const std::string& root_in, uint32_t mw, uint32_t mh, bo
             const int ev = env.empty() ? -1 : nr::network_value(env);
             const int iv = model_choice >= 0 || ev >= 0 ? -1 : nr::ini_network(ini);
             from = model_choice >= 0 ? "caller" : ev >= 0 ? "DLSSNR_MODEL" : iv >= 0 ? "dlssnr-amd.ini" : "default";
-            int v = model_choice >= 0 ? (model_choice == nr::kSmallFp8 ? 1 : model_choice == nr::kSmallFp8Experimental ? 2 : nr::network_optimized(model_choice) ? 3 : 0)
+            int v = model_choice >= 0 ? (model_choice == nr::kSmallFp8 ? 1 : nr::network_small_fp8_optimized(model_choice) ? 2 : nr::network_silver_aardwold_optimized(model_choice) ? 3 : 0)
                                       : (ev >= 0 ? ev : iv);
-            if (v == 0 || v == 3) network = NetworkModel::Original;
+            if (v == 0 || v == 3) network = NetworkModel::SilverAardwold;
             std::error_code ec;
             if (v == 3) {
                 const char* missing = !std::filesystem::is_regular_file(oroot / "shaders" / "fixed-attention.txt", ec) ||
-                                      !std::filesystem::is_directory(oroot / "shaders" / "temporal", ec) ? "dlssnr-amd/optimized/ is incomplete"
+                                      !std::filesystem::is_directory(oroot / "shaders" / "temporal", ec) ? "dlssnr-amd/CC_SILVER_AARDWOLD_OPTIMIZED/ is incomplete"
                     : !std::filesystem::is_regular_file(data / "CC_SILVER_AARDWOLD_OPTIMIZED.bin", ec)
                               ? "dlssnr-amd/CC_SILVER_AARDWOLD_OPTIMIZED.bin is missing"
                     : nullptr;
@@ -3523,24 +3768,25 @@ bool plan_d3d12_network(const std::string& root_in, uint32_t mw, uint32_t mh, bo
                     out->note = std::string("CC_SILVER_AARDWOLD_OPTIMIZED, but ") + missing + ": CC_SILVER_AARDWOLD";
                     v = 0;
                 } else {
-                    optimized = true;
+                    silver_aardwold_optimized = true;
                 }
             }
 #if NR_INT4
-            if (optimized) {
+            if (silver_aardwold_optimized) {
                 std::string int4_env;
 #ifdef _WIN32
                 { char b[16] = {}; const unsigned long n = GetEnvironmentVariableA("DLSSNR_INT4", b, sizeof b); if (n && n < sizeof b) int4_env = b; }
 #endif
                 if (int4_env.empty()) if (const char* e = std::getenv("DLSSNR_INT4")) int4_env = e;
-                level = nr::network_optimized(model_choice) ? nr::network_layers(model_choice) : nr::optimized_layers_value(int4_env);
-                if (!nr::network_optimized(model_choice) && int4_env.empty()) {
-                    const int il = nr::ini_optimized_layers(ini);
+                level = nr::network_silver_aardwold_optimized(model_choice) ? nr::network_layers(model_choice) : nr::layers_value(int4_env);
+                if (!nr::network_silver_aardwold_optimized(model_choice) && int4_env.empty()) {
+                    const int il = nr::ini_layers(ini, "cc_silver_aardwold_optimized");
                     level = il >= 0 ? il : nr::kLayersDefault;
                 }
                 if (level < 0) level = nr::kLayersQuality;
-                i4root = data / (level == nr::kLayersPerformance ? "int4-performance"
-                                 : level == nr::kLayersUltra ? "int4-ultra" : "int4");
+                i4root = data / (level == nr::kLayersPerformance ? "CC_SILVER_AARDWOLD_OPTIMIZED-performance"
+                                 : level == nr::kLayersUltra ? "CC_SILVER_AARDWOLD_OPTIMIZED-ultra"
+                                 : "CC_SILVER_AARDWOLD_OPTIMIZED-balanced");
                 const auto i4weights = data / "CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin";
                 if (level >= nr::kLayersBalanced) {
                     const std::string incomplete = "dlssnr-amd/" + i4root.filename().string() + "/ is incomplete";
@@ -3564,27 +3810,77 @@ bool plan_d3d12_network(const std::string& root_in, uint32_t mw, uint32_t mh, bo
             }
 #endif
             if (v == 2) {
-                const char* missing = !allow_experimental ? "its kernels have no ACO records"
+                const char* missing = !allow_small_fp8_optimized ? "its kernels have no ACO records"
                     : !std::filesystem::is_regular_file(xroot / "shaders" / "fixed-attention.txt", ec) ||
-                              !std::filesystem::is_directory(xroot / "shaders" / "temporal", ec) ? "dlssnr-amd/experimental/ is incomplete"
-                    : !std::filesystem::is_regular_file(data / "CC_SMALL_FP8_EXPERIMENTAL.bin", ec)
-                              ? "dlssnr-amd/CC_SMALL_FP8_EXPERIMENTAL.bin is missing"
+                              !std::filesystem::is_directory(xroot / "shaders" / "temporal", ec) ? "dlssnr-amd/CC_SMALL_FP8_OPTIMIZED/ is incomplete"
+                    : !std::filesystem::is_regular_file(data / "CC_SMALL_FP8_OPTIMIZED.bin", ec)
+                              ? "dlssnr-amd/CC_SMALL_FP8_OPTIMIZED.bin is missing"
                     : nullptr;
                 if (missing) {
-                    out->note = std::string("CC_SMALL_FP8_EXPERIMENTAL, but ") + missing + ": CC_SMALL_FP8";
+                    out->note = std::string("CC_SMALL_FP8_OPTIMIZED, but ") + missing + ": CC_SMALL_FP8";
                     v = 1;
                 } else {
-                    experimental = true;
+                    small_fp8_optimized = true;
                 }
             }
-            if (network == NetworkModel::Small && !experimental &&
+            // CC_SMALL_FP8_OPTIMIZED's level, as the constructor picks it: the caller's choice over
+            // [CC_SMALL_FP8_OPTIMIZED] Layers; Performance its own shaders (CC_SMALL_FP8_OPTIMIZED-performance/), Ultra
+            // Performance Performance's with the ViT's int4 layers (CC_SMALL_FP8_OPTIMIZED-ultra/, RDNA4); anything
+            // missing: the level below.
+            if (small_fp8_optimized) {
+                int lv = nr::network_small_fp8_optimized(model_choice) ? nr::network_layers(model_choice) : -1;
+                if (lv < 0) {
+                    const int il = nr::ini_layers(ini, "cc_small_fp8_optimized");
+                    lv = il >= 0 ? il : nr::kSmallFp8LayersDefault;
+                }
+                const int want = nr::network_with_layers(nr::kSmallFp8Optimized, lv);
+                bool perf = want != nr::kSmallFp8Optimized, ultra = want == nr::kSmallFp8OptimizedUltra;
+                if (perf && (!std::filesystem::is_regular_file(sroot / "shaders" / "vit-kv-pool.txt", ec) ||
+                             !std::filesystem::is_directory(sroot / "shaders" / "temporal", ec))) {
+                    out->note = "CC_SMALL_FP8_OPTIMIZED performance, but dlssnr-amd/CC_SMALL_FP8_OPTIMIZED-performance/ is incomplete: quality";
+                    perf = ultra = false;
+                }
+#if NR_INT4
+                if (ultra) {
+                    const auto uroot = data / "CC_SMALL_FP8_OPTIMIZED-ultra", uweights = data / "CC_SMALL_FP8_OPTIMIZED_INT4.bin";
+                    const char* missing = rdna3 ? "its int4 layers do not run on RDNA3 / RDNA3.5 yet"
+                        : !std::filesystem::is_directory(uroot / "shaders" / "temporal", ec) || !std::filesystem::is_directory(uroot / "vit", ec) ||
+                                  !std::filesystem::is_regular_file(uroot / "settings.txt", ec) ? "dlssnr-amd/CC_SMALL_FP8_OPTIMIZED-ultra/ is incomplete"
+                        : !std::filesystem::is_regular_file(uweights, ec) ? "dlssnr-amd/CC_SMALL_FP8_OPTIMIZED_INT4.bin is missing"
+                        : !std::filesystem::is_directory(std::filesystem::path(aco) / "int4/records", ec) ? "the ACO INT4 records are missing"
+                        : nullptr;
+                    if (missing) {
+                        out->note = std::string("CC_SMALL_FP8_OPTIMIZED ultra performance, but ") + missing + ": performance";
+                        ultra = false;
+                    } else {
+                        int4 = true;
+                        i4root = uroot;
+                        int4_cfg["NR_I4_DIR"] = (i4root / "vit").string();
+                        int4_cfg["NR_I4_WEIGHTS"] = uweights.string();
+                        const auto sweights = data / "CC_SMALL_FP8_OPTIMIZED_INT4_SINK.bin";
+                        if (std::filesystem::is_directory(i4root / "vit-sink", ec) && std::filesystem::is_regular_file(sweights, ec)) {
+                            int4_cfg["NR_I4_DIR_SINK"] = (i4root / "vit-sink").string();
+                            int4_cfg["NR_I4_WEIGHTS_SINK"] = sweights.string();
+                        }
+                        const auto t = slurp((i4root / "settings.txt").string());
+                        nr::int4_settings(std::string(t.begin(), t.end()), int4_cfg);
+                    }
+                }
+#else
+                ultra = false;
+#endif
+                small_fp8_performance = perf;
+                level = ultra ? nr::kLayersUltra : perf ? nr::kLayersPerformance : nr::kLayersQuality;
+            }
+            if (network == NetworkModel::SmallFp8 && !small_fp8_optimized &&
                 !std::filesystem::is_regular_file(data / "CC_SMALL_FP8.bin", ec)) {
-                out->note = "dlssnr-amd/CC_SMALL_FP8.bin is missing: the original model";
-                network = NetworkModel::Original;
+                out->note = "dlssnr-amd/CC_SMALL_FP8.bin is missing: CC_SILVER_AARDWOLD";
+                network = NetworkModel::SilverAardwold;
             }
         }
-        out->model = optimized ? nr::network_label(nr::network_with_layers(nr::kSilverAardwoldOptimized, level))
-                               : network == NetworkModel::Small ? (experimental ? "CC_SMALL_FP8_EXPERIMENTAL" : "CC_SMALL_FP8") : "original";
+        out->model = silver_aardwold_optimized ? nr::network_label(nr::network_with_layers(nr::kSilverAardwoldOptimized, level))
+                   : small_fp8_optimized ? nr::network_label(nr::network_with_layers(nr::kSmallFp8Optimized, level))
+                   : network == NetworkModel::SmallFp8 ? "CC_SMALL_FP8" : "CC_SILVER_AARDWOLD";
         out->model += " (" + from + ")";
         auto ini_on = [&](const char* key) {
             std::string v = nr::ini_network_key(ini, key);
@@ -3610,10 +3906,11 @@ bool plan_d3d12_network(const std::string& root_in, uint32_t mw, uint32_t mh, bo
         // This planner has already selected the architecture's ACO folder. Do not let
         // network_spv_dir replace RDNA3's base shaders with a process-global directory.
         if (rdna3) arguments.push_back("--spv-dir-aco");
-        if (experimental || optimized) {
+        if (small_fp8_optimized || silver_aardwold_optimized) {
             for (size_t i = 0; i + 1 < arguments.size(); ++i) {
-                if (arguments[i] == "--spv-dir") arguments[i + 1] = ((experimental ? xroot : oroot) / "shaders").string();
-                if (arguments[i] == "--pipeline-cache") arguments[i + 1] = ((experimental ? xroot : oroot) / "pipeline.cache").string();
+                const auto& own = small_fp8_optimized ? small_fp8_performance ? sroot : xroot : oroot;
+                if (arguments[i] == "--spv-dir") arguments[i + 1] = (own / "shaders").string();
+                if (arguments[i] == "--pipeline-cache") arguments[i + 1] = (own / "pipeline.cache").string();
             }
             arguments.push_back("--spv-dir-aco");
         }
@@ -3624,12 +3921,12 @@ bool plan_d3d12_network(const std::string& root_in, uint32_t mw, uint32_t mh, bo
             }
         }
         {
-            const auto pack = data / (experimental ? "CC_SMALL_FP8_EXPERIMENTAL.bin"
-                                      : optimized ? "CC_SILVER_AARDWOLD_OPTIMIZED.bin"
-                                      : network == NetworkModel::Small ? "CC_SMALL_FP8.bin" : "CC_SILVER_AARDWOLD.bin");
+            const auto pack = data / (small_fp8_optimized ? "CC_SMALL_FP8_OPTIMIZED.bin"
+                                      : silver_aardwold_optimized ? "CC_SILVER_AARDWOLD_OPTIMIZED.bin"
+                                      : network == NetworkModel::SmallFp8 ? "CC_SMALL_FP8.bin" : "CC_SILVER_AARDWOLD.bin");
             if (!std::filesystem::is_regular_file(pack)) { *why = "missing " + pack.string(); return false; }
             arguments.push_back("--model-pack"); arguments.push_back(pack.string());
-            if (optimized && int4 && level >= nr::kLayersPerformance) {
+            if ((silver_aardwold_optimized && int4 && level >= nr::kLayersPerformance) || (small_fp8_optimized && small_fp8_performance)) {
                 arguments.push_back("--model-pack-variant"); arguments.push_back("performance");
             }
         }
@@ -3663,7 +3960,7 @@ bool plan_d3d12_network(const std::string& root_in, uint32_t mw, uint32_t mh, bo
             out->disp.push_back(std::move(x));
         }
         // The temporal path, as Runtime::Runtime sets it up (temporal_config.enable): the ACO bundle's shaders/temporal
-        // (experimental: its own), the no-upper-clamp pre when the graph's pre is fswinimagepreds32nh and the package has
+        // (CC_SMALL_FP8_OPTIMIZED: its own), the no-upper-clamp pre when the graph's pre is fswinimagepreds32nh and the package has
         // it, the post's Style-grade twin when it exists (else no grading), the RGBA16F history's posts when the folder
         // has them (and the grade twin where the RGBA32F post has one: the runtime's h16_ok).
         {
@@ -3677,8 +3974,8 @@ bool plan_d3d12_network(const std::string& root_in, uint32_t mw, uint32_t mh, bo
             if (t.pre < 0 || t.post < 0) { *why = "the temporal path requires the fused FP32 image kernels"; return false; }
             if (c.disp[size_t(t.pre)].push.size() != kPrePushBytes) { *why = "temporal pre block: unexpected push size"; return false; }
             const auto shaders = int4 ? i4spv() / "temporal"
-                               : optimized ? oroot / "shaders" / "temporal"
-                               : experimental ? xroot / "shaders" / "temporal"
+                               : silver_aardwold_optimized ? oroot / "shaders" / "temporal"
+                               : small_fp8_optimized ? (small_fp8_performance ? sroot : xroot) / "shaders" / "temporal"
                                : network_shaders / "temporal";
             std::error_code ec;
             auto have = [&](const char* name) { return std::filesystem::is_regular_file(shaders / name, ec); };
@@ -3695,6 +3992,14 @@ bool plan_d3d12_network(const std::string& root_in, uint32_t mw, uint32_t mh, bo
                 if (grade32) t.post16_grade_spv = (shaders / "temporal_post_fp32h16_grade.spv").string();
             }
             if (!grade32) out->style_grade = false;
+            // and their closed-form twins (Style Grade Acceleration; as the runtime: every grade twin or none)
+            if (grade32 && have("temporal_post_fp32_grade_accel.spv") &&
+                (t.post16_grade_spv.empty() || have("temporal_post_fp32h16_grade_accel.spv"))) {
+                t.post_grade_accel_spv = (shaders / "temporal_post_fp32_grade_accel.spv").string();
+                if (!t.post16_grade_spv.empty())
+                    t.post16_grade_accel_spv = (shaders / "temporal_post_fp32h16_grade_accel.spv").string();
+            }
+            out->style_grade_accel = ini_on("style grade acceleration");
             // [Network] History Precision: 16 (the default) or 32; NR_HIST16 in the environment wins (Runtime::Runtime)
             {
                 std::string v = nr::ini_network_key(ini, "history precision");
@@ -3705,7 +4010,7 @@ bool plan_d3d12_network(const std::string& root_in, uint32_t mw, uint32_t mh, bo
             t.pre_push_bytes = kPrePushBytes;
             t.seed_at = kPreSeedAt;
             t.noise_field_at = kPreNoiseFieldAt;
-            t.blend_scale = network == NetworkModel::Small ? kPostBlendScaleSmall : kPostBlendScale;
+            t.blend_scale = network == NetworkModel::SmallFp8 ? kPostBlendScaleSmallFp8 : kPostBlendScale;
             t.motion_without_depth = ini_on("motion without depth");
         }
         for (const NoiseJob& j : c.noise) out->noise.push_back({j.off, j.width, j.height, j.seed, j.noise});

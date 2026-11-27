@@ -38,6 +38,8 @@ struct Wilsjo2Owner;
 Wilsjo2Owner* wilsjo2_owner();
 // The owner of a layer placed at Present (its log says so, not "after the upscaler").
 void wilsjo2_owner_at_present(Wilsjo2Owner& o);
+// The layers the D3D12 Present runs now (frame reuse's even frames on the D3D12 passthrough need one), before them.
+void wilsjo2_note_present_runs(uint32_t runs);
 // A run of layer `row` (its NR Control row) with spatial compression on, done (either API); whether that layer ran so
 // since the preceding presentation (NR Control draws outlines for that presented frame).
 void wilsjo2_note_spatial(int row, const nr::wilsjo2::SpatialLayout& layout);
@@ -90,7 +92,7 @@ bool wilsjo2_fg_delta(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, ID3D
 // BT.709 scRGB, RGBA16F); else `source` (linear) with `original` (the PQ picture) -> `target` (PQ, the original's
 // format). `source` and `original` NON_PIXEL_SHADER_RESOURCE, `target` UNORDERED_ACCESS. False when not recorded.
 bool wilsjo2_convert(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, ID3D12Resource* source,
-                     ID3D12Resource* original, ID3D12Resource* target, uint32_t w, uint32_t h, bool to_linear);
+                     ID3D12Resource* original, ID3D12Resource* target, uint32_t w, uint32_t h, bool to_linear, bool direct_only = false);
 
 // ---- Vulkan games (nr_asi_wilsjo2_vk.cpp): the same flow on the game's own VkCommandBuffer ------------------------
 // Step for step the flow above, with images of the game's (in the layouts the call hands them: the guides and the

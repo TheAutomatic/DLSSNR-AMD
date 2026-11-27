@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
 """Build the Linux network for one GPU architecture from linux/shaders/<arch>/pipelines.json.
 
-    build_network.py <arch> [--int4 | --performance | --ultra | --optimized | --experimental] [--out DIR] [--check DIR]
+    build_network.py <arch> [--network NAME] [--out DIR] [--check DIR]
 
-Writes (default build/linux/<arch>/network, with --int4 build/linux/<arch>/network-int4, with --performance
-build/linux/<arch>/network-performance, with --optimized
-build/linux/<arch>/network-optimized, with --experimental build/linux/<arch>/network-experimental):
+Writes (default build/linux/<arch>/network, with --network build/linux/<arch>/network-NAME):
     g_<name>.spv + the four marker files   the network, what --spv-dir points at
     runtime/                                 the arch-neutral passes (linux/shaders/passes)
     g_<name>_grade.spv                      style_grade: the post block with the Natural/Cinematic grade
+    g_<name>_grade_accel.spv                the same grade in closed form ([Network] Style Grade Acceleration)
     temporal/                                the temporal variants (+ their _grade twins) and the motion estimator
 
 The host must be compiled with the same constants: linux/build/arch/<arch>.sh.
---optimized: CC_SILVER_AARDWOLD_OPTIMIZED (pipelines.json with pipelines-optimized.json applied; the same host).
---int4: CC_SILVER_AARDWOLD_OPTIMIZED with its int4 layers (pipelines.json with pipelines-int4.json applied; the host
-built with NR_INT4=1); also the host's g_<name>.spv.iu4 markers and hs-pipelines.txt (the pipelines built with the
-hard-swish, for the host's guard).
---performance / --ultra: CC_SILVER_AARDWOLD_OPTIMIZED at Optimized layers Performance / Ultra Performance
-(pipelines-performance.json / pipelines-ultra.json; as --int4; out network-performance / network-ultra).
---experimental: CC_SMALL_FP8_EXPERIMENTAL (pipelines.json with pipelines-experimental.json applied; the same host).
-Each of the three: the network and temporal/ (the runtime passes are the default network's), fixed-attention.txt (the
+Without --network: the network of CC_SMALL_FP8 and CC_SILVER_AARDWOLD. --network NAME: pipelines.json with
+pipelines-NAME.json applied, NAME one of
+CC_SILVER_AARDWOLD_OPTIMIZED: CC_SILVER_AARDWOLD_OPTIMIZED at Optimized layers Quality (the same host).
+CC_SILVER_AARDWOLD_OPTIMIZED-balanced: at Balanced, with its int4 layers (the host built with NR_INT4=1); also the
+host's g_<name>.spv.iu4 markers and hs-pipelines.txt (the pipelines built with the hard-swish, for the host's guard).
+CC_SILVER_AARDWOLD_OPTIMIZED-performance / CC_SILVER_AARDWOLD_OPTIMIZED-ultra: at Performance / Ultra Performance (as
+-balanced).
+CC_SMALL_FP8_OPTIMIZED: CC_SMALL_FP8_OPTIMIZED at Optimized layers Quality (the same host).
+CC_SMALL_FP8_OPTIMIZED-performance: at Performance: its "new" pipelines may name a source of their own, and its
+"markers" are written too (vit-kv-pool.txt: the ViT heads whose keys and values are pooled, read by the host).
+CC_SMALL_FP8_OPTIMIZED-ultra: at Ultra Performance: Performance plus the ViT's int4 layers, with the g_<name>.spv.iu4
+markers but no hs-pipelines.txt (Performance's weights carry the hard-swish scale already).
+Each of them: the network and temporal/ (the runtime passes are the default network's), fixed-attention.txt (the
 pipelines whose fixed probability tables the host writes), and when the overlay says so const-heads.txt (the host
 proves and marks the constant C=512 attention heads, NR_CONSTH) and block-routes.txt (blocks whose layers run on a
 pipeline of their own: "<suffix> <kernel>... : <block>...", from the overlay's "routes").
@@ -38,6 +42,11 @@ R = Path(__file__).resolve().parents[2]
 # wilsjo2 flow's): the alpha restore, the depth guide's copy and the blit for compute-only command buffers
 RUNTIME = ['runtime_alpha', 'runtime_depth', 'runtime_blit']
 MOTION = ['motion_luma', 'motion_estimate']
+# --network: CC_SILVER_AARDWOLD_OPTIMIZED's levels, then CC_SMALL_FP8_OPTIMIZED's (pipelines-<name>.json each)
+NETWORKS = ['CC_SILVER_AARDWOLD_OPTIMIZED', 'CC_SILVER_AARDWOLD_OPTIMIZED-balanced', 'CC_SILVER_AARDWOLD_OPTIMIZED-performance',
+            'CC_SILVER_AARDWOLD_OPTIMIZED-ultra', 'CC_SMALL_FP8_OPTIMIZED', 'CC_SMALL_FP8_OPTIMIZED-performance',
+            'CC_SMALL_FP8_OPTIMIZED-ultra']
+SILVER_AARDWOLD_INT4 = NETWORKS[1:4]   # with int4 layers: the iu4 markers and hs-pipelines.txt
 
 
 def glslang(arch, src, defines, out):
@@ -52,19 +61,12 @@ def glslang(arch, src, defines, out):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('arch')
-    ap.add_argument('--int4', action='store_true')
-    ap.add_argument('--performance', action='store_true')
-    ap.add_argument('--ultra', action='store_true')
-    ap.add_argument('--optimized', action='store_true')
-    ap.add_argument('--experimental', action='store_true')
+    ap.add_argument('--network', choices=NETWORKS)
     ap.add_argument('--out', type=Path)
     ap.add_argument('--check', type=Path)
     a = ap.parse_args()
     table = json.loads((R / 'linux/shaders' / a.arch / 'pipelines.json').read_text())
-    if a.int4 + a.performance + a.ultra + a.optimized + a.experimental > 1:
-        sys.exit('one of --int4, --performance, --ultra, --optimized, --experimental')
-    overlay = ('int4' if a.int4 else 'performance' if a.performance else 'ultra' if a.ultra else 'optimized' if a.optimized
-               else 'experimental' if a.experimental else '')
+    overlay = a.network or ''
     if overlay:
         i4 = json.loads((R / 'linux/shaders' / a.arch / f'pipelines-{overlay}.json').read_text())
         default = table['pipelines']
@@ -72,7 +74,10 @@ def main():
             return dict(e, defines=[x for x in e['defines'] if x not in c.get('remove', [])] + c.get('add', []))
         assert not set(i4['change']) - set(default), 'pipelines-%s.json changes unknown pipelines' % overlay
         table['pipelines'] = {k: derive(e, i4['change'].get(k, {})) for k, e in default.items()}
-        table['pipelines'].update({k: derive(default[c['base']], c) for k, c in i4['new'].items()})
+        # a new pipeline: a base pipeline's source and defines plus "add", or a source of its own with its own defines
+        table['pipelines'].update({k: dict(source=c['source'], defines=list(c['defines'])) if 'source' in c
+                                   else derive(default[c['base']], c) for k, c in i4['new'].items()})
+        table['markers'].update(i4.get('markers', {}))
     out = a.out or R / 'build/linux' / a.arch / (f'network-{overlay}' if overlay else 'network')
     if out.exists():
         shutil.rmtree(out)
@@ -94,19 +99,21 @@ def main():
         glslang(a.arch, R / 'linux/shaders' / a.arch / base['source'], base['defines'] + v['add'],
                 out / 'temporal' / f'{name}.spv')
     grade = table['style_grade']
-    for name in grade['pipelines']:
-        e = pipelines[name]
-        glslang(a.arch, R / 'linux/shaders' / a.arch / e['source'], e['defines'] + grade['add'], out / f'g_{name}_grade.spv')
-    for name in grade['variants']:
-        base = pipelines[table['variants'][name]['base']]
-        glslang(a.arch, R / 'linux/shaders' / a.arch / base['source'],
-                base['defines'] + table['variants'][name]['add'] + grade['add'], out / 'temporal' / f'{name}_grade.spv')
+    for suffix, add in (('_grade', grade['add']), ('_grade_accel', grade['accel_add'])):
+        for name in grade['pipelines']:
+            e = pipelines[name]
+            glslang(a.arch, R / 'linux/shaders' / a.arch / e['source'], e['defines'] + add, out / f'g_{name}{suffix}.spv')
+        for name in grade['variants']:
+            base = pipelines[table['variants'][name]['base']]
+            glslang(a.arch, R / 'linux/shaders' / a.arch / base['source'],
+                    base['defines'] + table['variants'][name]['add'] + add, out / 'temporal' / f'{name}{suffix}.spv')
     for k in MOTION:
         glslang(a.arch, R / 'linux/shaders/passes' / f'{k}.comp', [], out / 'temporal' / f'{k}.spv')
     shutil.copy2(out / 'shader-constants.txt', out / 'temporal' / 'shader-constants.txt')
-    if a.int4 or a.performance or a.ultra:
+    if overlay in SILVER_AARDWOLD_INT4 or overlay == 'CC_SMALL_FP8_OPTIMIZED-ultra':
         for name in i4['iu4']:
             (out / f'g_{name}.spv.iu4').write_text('0\n')
+    if overlay in SILVER_AARDWOLD_INT4:
         hs = sorted(k for k, e in pipelines.items() if 'NR_ACT_HS=2' in e['defines'])
         (out / 'hs-pipelines.txt').write_text('\n'.join(hs) + '\n')
     if overlay:

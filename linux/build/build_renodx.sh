@@ -43,4 +43,9 @@ for k in st_fb_in st_prep st_box st_apply il il0 il_mv il_pp; do
     "$glslang" -V --target-env vulkan1.3 -Ilinux/shaders/renodx-fast linux/shaders/renodx-fast/$k.comp -o "$out/renodx_$k.spv" \
         > "$tmp/log" || { cat "$tmp/log" >&2; exit 1; }
 done
+# Interleaved with the Style grade in closed form ([Network] Style Grade Acceleration)
+for k in il il0; do
+    "$glslang" -V --target-env vulkan1.3 -DNR_STYLE_GRADE_CLOSED -Ilinux/shaders/renodx-fast linux/shaders/renodx-fast/$k.comp \
+        -o "$out/renodx_${k}_ga.spv" > "$tmp/log" || { cat "$tmp/log" >&2; exit 1; }
+done
 echo "$out: $(ls "$out"/renodx_*.spv | wc -l) RenoDX shaders"

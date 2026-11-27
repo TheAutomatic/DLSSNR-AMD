@@ -1,0 +1,18 @@
+#version 460
+// Frame reuse: how fast the picture moves - per workgroup the sum of min(|vector|, 1) over the guides' motion grid
+// (vectors in fractions of the screen); the host adds the groups up a few frames later and divides by the grid size.
+layout(local_size_x=16,local_size_y=16) in;
+layout(binding=0) buffer Sums {float sums[];};
+layout(binding=1) uniform sampler2D Motion;
+layout(push_constant) uniform Push {uvec2 grid;uint offset,groups_x;} pc;
+shared float part[256];
+void main() {
+    uvec2 p=gl_GlobalInvocationID.xy;float v=0;
+    if(all(lessThan(p,pc.grid))) {
+        vec2 m=texelFetch(Motion,ivec2(p),0).rg;float l=length(m);
+        v=isnan(l)||isinf(l)?1.0:min(l,1.0);
+    }
+    uint lane=gl_LocalInvocationIndex;part[lane]=v;barrier();
+    for(uint s=128u;s>0u;s>>=1u){if(lane<s)part[lane]+=part[lane+s];barrier();}
+    if(lane==0u)sums[pc.offset+gl_WorkGroupID.y*pc.groups_x+gl_WorkGroupID.x]=part[0];
+}

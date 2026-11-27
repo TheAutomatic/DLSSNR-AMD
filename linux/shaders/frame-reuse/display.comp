@@ -1,0 +1,105 @@
+#version 460
+// Frame reuse's display filter: the shown edit (answer - input, 8-bit codes) smoothed over time along the game's vectors,
+// clipped to the edit's own 3 x 3 neighbourhood. History in half precision (at most 1 code apart from a full-precision
+// one); no model feedback; no read of an uninitialized history. InputPrev = the frame before's input (the stage's own
+// copy of that frame's colour).
+// display10.spv (TEN_BIT): the same filter on 10-bit frames - codes of 1/1023, every threshold in 8-bit codes as above
+// (K of its codes each), the output stored with 10 bits.
+#ifdef TEN_BIT
+#define CODES 1023.0
+#define K(x) ((x)*(1023.0/255.0))
+#define OUT_FORMAT rgb10_a2
+#else
+#define CODES 255.0
+#define K(x) x
+#ifdef FLOAT_OUTPUT
+#define OUT_FORMAT FLOAT_OUTPUT
+#else
+#define OUT_FORMAT rgba8
+#endif
+#endif
+layout(local_size_x=16,local_size_y=16) in;
+layout(set=0,binding=0) uniform sampler2D Input;
+layout(set=0,binding=1) uniform sampler2D Nr;
+layout(set=0,binding=2) uniform sampler2D Motion;
+layout(set=0,binding=3) uniform sampler2D Depth;
+layout(set=0,binding=4) uniform sampler2D HistPrev;
+layout(set=0,binding=5) uniform sampler2D InputPrev;
+layout(set=0,binding=6,rgba16f) uniform writeonly image2D HistCur;
+layout(set=0,binding=7,OUT_FORMAT) uniform writeonly image2D Output;
+layout(push_constant) uniform Push {
+    uvec2 size,mbase,mgrid;vec2 mscale;uvec2 dbase,dgrid;
+    uint flags,p0,p1,p2;
+} pc;
+#ifdef FLOAT_OUTPUT
+// A declared SDR float frame contains normalized display codes. Keep the fraction
+// of a code and the frame's alpha. Linear scRGB and PQ never enter this kernel.
+vec3 rgb8(sampler2D t,ivec2 p) {return texelFetch(t,p,0).rgb*CODES;}
+#else
+vec3 rgb8(sampler2D t,ivec2 p) {return roundEven(clamp(texelFetch(t,p,0).rgb,0,1)*CODES);}
+#endif
+// The 3 x 3 neighbourhoods of Input and Nr: each workgroup reads its 18 x 18 codes once (the texel each pixel would read,
+// clamped to the frame as before) instead of nine fetches of each per pixel
+shared vec3 tile_in[324],tile_nr[324];
+float reject(float x,float lo,float hi) {
+    precise float a=clamp((x-lo)/(hi-lo),0,1);
+    return 1-a*a*(3-2*a);
+}
+void main() {
+    uvec2 px=gl_GlobalInvocationID.xy;
+    ivec2 ip=ivec2(px),hi=ivec2(pc.size)-1,base=ivec2(gl_WorkGroupID.xy)*16-1;
+    for(uint k=gl_LocalInvocationIndex;k<324u;k+=256u) {
+        ivec2 t=clamp(base+ivec2(k%18u,k/18u),ivec2(0),hi);
+        tile_in[k]=rgb8(Input,t);tile_nr[k]=rgb8(Nr,t);
+    }
+    barrier();
+    if(any(greaterThanEqual(px,pc.size)))return;
+    uint centre=(gl_LocalInvocationID.y+1u)*18u+gl_LocalInvocationID.x+1u;
+    precise vec3 I=tile_in[centre],E=tile_nr[centre]-I,filtered=E;
+    uvec2 dt=pc.dbase+min(uvec2((vec2(px)+.5)*vec2(pc.dgrid)/vec2(pc.size)),pc.dgrid-1u);
+    float raw_depth=texelFetch(Depth,ivec2(dt),0).r;
+    float z=(pc.flags&4u)!=0u?raw_depth:1-raw_depth;
+    if(isnan(z)||isinf(z))z=-1;
+    if((pc.flags&1u)!=0u && (pc.flags&2u)==0u && z>=0) {
+        uvec2 mt=pc.mbase+min(uvec2((vec2(px)+.5)*vec2(pc.mgrid)/vec2(pc.size)),pc.mgrid-1u);
+        precise vec2 normalized_motion=texelFetch(Motion,ivec2(mt),0).xy*pc.mscale;
+        precise vec2 pixel_motion=normalized_motion*vec2(pc.size);
+        precise vec2 q=vec2(px)+pixel_motion;
+        if(all(greaterThanEqual(q,vec2(0))) && all(lessThan(q,vec2(pc.size)-1))) {
+            q=clamp(q,vec2(0),vec2(pc.size)-1.001);
+            ivec2 p=ivec2(q);precise vec2 f=q-vec2(p);
+            precise vec4 ha=texelFetch(HistPrev,p,0),hb=texelFetch(HistPrev,p+ivec2(1,0),0);
+            precise vec4 hc=texelFetch(HistPrev,p+ivec2(0,1),0),hd=texelFetch(HistPrev,p+ivec2(1,1),0);
+            precise vec4 top=ha*(1-f.x)+hb*f.x,bottom=hc*(1-f.x)+hd*f.x;
+            precise vec4 history=top*(1-f.y)+bottom*f.y;
+            precise vec3 ia=rgb8(InputPrev,p),ib=rgb8(InputPrev,p+ivec2(1,0));
+            precise vec3 ic=rgb8(InputPrev,p+ivec2(0,1)),id=rgb8(InputPrev,p+ivec2(1,1));
+            precise vec3 it=ia*(1-f.x)+ib*f.x,bt=ic*(1-f.x)+id*f.x;
+            precise vec3 oldI=it*(1-f.y)+bt*f.y;
+            precise vec3 si=vec3(0),si2=vec3(0),se=vec3(0),se2=vec3(0);
+            for(int y=-1;y<=1;y++)for(int x=-1;x<=1;x++) {
+                uint i=uint(int(centre)+y*18+x);
+                precise vec3 v=tile_in[i],e=tile_nr[i]-v;
+                si+=v;si2+=v*v;se+=e;se2+=e*e;
+            }
+            precise vec3 mi=si/9.0,me=se/9.0;
+            precise vec3 vi=max(si2/9.0-mi*mi,vec3(0)),ve=max(se2/9.0-me*me,vec3(0));
+            precise vec3 input_error=max(abs(oldI-mi)-2*sqrt(vi)-K(2),vec3(0));
+            precise vec3 centre_error=abs(oldI-I);
+            precise float dz=abs(history.a-z)/max(max(history.a,z),1e-7);
+            precise float weight=history.a>=0?.75*reject(dz,.03,.12)*reject(max(input_error.r,max(input_error.g,input_error.b)),K(1),K(8))*reject(max(centre_error.r,max(centre_error.g,centre_error.b)),K(3),K(12)):0;
+            precise vec3 radius=max(sqrt(ve),vec3(K(.5)));
+            precise vec3 carried=history.rgb+(oldI-I);
+            precise vec3 clipped=clamp(carried,min(me-radius,E),max(me+radius,E));
+            // No NR edit anywhere in this channel's 3x3 support: motion of
+            // the input by itself must not introduce a display correction.
+            filtered=mix(E,E+(clipped-E)*weight,greaterThan(se2,vec3(0)));
+        }
+    }
+    imageStore(HistCur,ip,vec4(filtered,z));
+#ifdef FLOAT_OUTPUT
+    imageStore(Output,ip,vec4(texelFetch(Nr,ip,0).rgb+(filtered-E)/CODES,texelFetch(Nr,ip,0).a));
+#else
+    imageStore(Output,ip,vec4(roundEven(clamp(I+filtered,0,CODES))/CODES,texelFetch(Nr,ip,0).a));
+#endif
+}

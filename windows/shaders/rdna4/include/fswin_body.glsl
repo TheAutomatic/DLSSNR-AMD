@@ -1,4 +1,4 @@
-// CC_SMALL_FP8_EXPERIMENTAL (pipelines-experimental.json): NR_FIXP, the window's probability matrix is one fixed
+// CC_SMALL_FP8_OPTIMIZED (pipelines-CC_SMALL_FP8_OPTIMIZED.json): NR_FIXP, the window's probability matrix is one fixed
 // 64x64 e4m3 table a layer ([query][key], 16384 bytes after the bias; written by the host for fixed-attention.txt's
 // pipelines) read as the PV product's B fragments - no QK^T, no softmax, the Q/K projections dead. NR_VOMERGE, with
 // it: the attention is linear, so the V and output projections are one matrix (in the V rows of qkv.bin); the f32

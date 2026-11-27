@@ -2379,7 +2379,7 @@ shared fe4m3vec4 nr_wl[3072];
 #define NR_HS_B 0.505
 #endif
 float nr_act_horner(float x) {
-#if defined(NR_SACT) && NR_SACT == 1   // CC_SMALL_FP8_EXPERIMENTAL: ReLU (pipelines-experimental.json)
+#if defined(NR_SACT) && NR_SACT == 1   // CC_SMALL_FP8_OPTIMIZED: ReLU (pipelines-CC_SMALL_FP8_OPTIMIZED.json)
     return max(x,0.0);
 #endif
 
@@ -2411,7 +2411,7 @@ float nr_act_horner(float x) {
 #define NR_ALT_M (NR_ACT_ALT == 1 || NR_ACT_ALT == 2)
 #endif
 float nr_act_horner_b(float x) {
-#if defined(NR_SACT) && NR_SACT == 1   // CC_SMALL_FP8_EXPERIMENTAL: ReLU (pipelines-experimental.json)
+#if defined(NR_SACT) && NR_SACT == 1   // CC_SMALL_FP8_OPTIMIZED: ReLU (pipelines-CC_SMALL_FP8_OPTIMIZED.json)
     return max(x,0.0);
 #endif
 
@@ -2613,6 +2613,8 @@ float nr_fast_exp(float x) {
 // source's alpha instead of 1, bit 30 applies the alpha pass's 8-bit rounding.
 // NR_STYLE_GRADE (the *_grade pipelines, used for Natural and Cinematic only): bits 28-29 carry the Style whose
 // grade the DLL applies after the post block (nr_style_grade.glsl). Standard keeps the pipeline without it.
+// NR_STYLE_GRADE=2 (the *_grade_accel pipelines, [Network] Style Grade Acceleration): the same grade in closed form
+// (nr_style_grade_closed.glsl).
 #ifndef NR_POST_ALPHA
 #define NR_POST_ALPHA 0
 #endif
@@ -2629,7 +2631,9 @@ float nr_fast_exp(float x) {
 #ifdef NR_FUSED_IMAGE_INPUT
 #include "image_input.glsl"
 #endif
-#if NR_STYLE_GRADE
+#if NR_STYLE_GRADE == 2
+#include "nr_style_grade_closed.glsl"
+#elif NR_STYLE_GRADE
 #include "nr_style_grade.glsl"
 #endif
 
@@ -3565,7 +3569,11 @@ void main() {
     // Intensity again (cg2r_post_process_kernel, include/nr_style_grade.glsl). Standard does not run it.
     {
         const uint nr_style=(pc.image_w_off>>28u)&3u;
+#if NR_STYLE_GRADE == 2
+        if(nr_style!=0u) rgb=nr_style_grade_closed(nr_style,base,rgb,pc.image_intensity);
+#else
         if(nr_style!=0u) rgb=nr_style_grade(nr_style,base,rgb,pc.image_intensity);
+#endif
     }
 #endif
 #if NR_DIAG_POSTSTORE == 3

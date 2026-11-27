@@ -13,7 +13,12 @@
 //    frame's BasePrev; mode 3 is not run)
 #extension GL_EXT_samplerless_texture_functions : require
 #extension GL_GOOGLE_include_directive : require
+// NR_STYLE_GRADE_CLOSED ([Network] Style Grade Acceleration, the *_ga programs): the grade in closed form
+#ifdef NR_STYLE_GRADE_CLOSED
+#include "../rdna4/include/nr_style_grade_closed.glsl"
+#else
 #include "../rdna4/include/nr_style_grade.glsl"
+#endif
 layout(local_size_x = 16, local_size_y = 16) in;
 // The step as a specialization constant: each step its own pipeline, compiled for its own path only (one pipeline for
 // all of them takes the registers of the heaviest - the fill's - and every step runs at its occupancy). Unspecialised:
@@ -86,7 +91,11 @@ vec3 post(uint k, vec3 base, vec3 rgb) {
         const float amp = clamp(pow(max(ratio, 1e-6), I), 1.0 / guard, guard);
         rgb = clamp(rgb * (amp / max(ratio, 1e-6)), vec3(0.0), vec3(1.0));
     }
+#ifdef NR_STYLE_GRADE_CLOSED
+    if (st != 0u) rgb = nr_style_grade_closed(st, base, rgb, I);
+#else
     if (st != 0u) rgb = nr_style_grade(st, base, rgb, I);
+#endif
     return rgb;
 }
 float near_at(uvec2 mt) {   // the game's nearness at motion texel mt (its place in the depth's region)

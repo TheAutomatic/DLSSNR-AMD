@@ -6,6 +6,7 @@
 // (nr_asi_wilsjo2.cpp D3D12 resources, nr_asi_wilsjo2_vk.cpp the game's Vulkan images, the ReShade route's session).
 // The arithmetic is in the programs (nr_wilsjo2.hpp Stage); this file only orders them.
 #include "nr_wilsjo2.hpp"
+#include "nr_frame_reuse_policy.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -48,6 +49,7 @@ struct NetCall {
     // last frame, made from the slots' increments; 16-bit float RGBA at the model's extent, Access::kWrite); empty: its own
     Surf history;
     bool raw = false;   // (Interleaved with a Style / Intensity) the network plain: no Style grade (Intensity 1 in controls)
+    bool external_history = false;   // Interleaved owns the pass's history across frames (no internal ping-pong pair needed)
 };
 
 // What NR Control is told of a run (the route forwards it).
@@ -56,6 +58,8 @@ struct FlowFacts {
     uint32_t exposure = 0;      // 0 manual, 1 the game's exposure, 3 automatic
     uint32_t asked = 0;         // WhitePointSource as set
     float white = 1.0f, history = 1.0f;
+    bool pre_history = true;          // the layer's PreHistory (the network's controls)
+    bool noise_every_frame = true;    // its NoiseEveryFrame (off: the network's seed fixed on every frame)
     uint32_t mode = 0, passes = 0;
     bool prep_outside = false, prep_missing = false;
     float fast_passes = 0.f;    // Passes (fast) running: its strength (0: legacy passes)
@@ -91,6 +95,8 @@ public:
     virtual bool stage_made() const { return true; }
     // Whether the network grades its answer by the Style ([Network] Style Grade).
     virtual bool style_graded() const { return false; }
+    // Whether that grade is in closed form ([Network] Style Grade Acceleration): Interleaved's programs with it then.
+    virtual bool style_grade_accelerated() const { return false; }
     virtual bool stage_failed() const = 0;
     // Pass k's model for `pc` at the model extent: made if missing (kMade: the frame is left as it came).
     virtual PassReady pass(uint32_t k, const PassControls& pc, uint32_t model_w, uint32_t model_h) = 0;
@@ -150,6 +156,7 @@ struct IlState1 {
     uint32_t w = 0, h = 0, n = 0, cur = 0, bcur = 0, dcur = 0, frame = 0, last[8] = {};
     uint32_t pyr_n = 0;   // the passes the pyramid was made for (a wider one serves fewer)
     bool valid = false, graded_last = false, lf_valid = false, depth_const = false;
+    int grade_form = 0;   // the Style grade's form last said (1 step by step, 2 closed form)
     uint32_t preset = 0, lfcur = 0;
 };
 struct IlPpPush { uint32_t ssize[2], dsize[2], mode, n, flags; };   // il_pp.comp's (28 bytes)
@@ -161,6 +168,7 @@ inline uint32_t il_preset(const Settings& s) {
 
 // One layer's state on one route: its surfaces, the passes' controls, the latch.
 struct FlowState {
+    const char* reuse_failure = nullptr;
     Surf proxy, keep, answer, scratch, clamp, small, native;
     Surf small_raw, small_keep;   // Downscale "bilinear before encoding": the frame at the work extent, its kept copy
     Surf classic;                 // Enlargement Classic: the answer enlarged to the frame's extent
@@ -346,14 +354,19 @@ inline bool il_run1(FlowIo& io, FlowState& o, const FlowFrame& f, const Settings
     // networks run plain and the passes are composed here (their histories must be the network's own output, or the
     // grade comes round again every frame)
     const bool grade_on = io.style_graded();
-    bool graded = false;
+    bool graded = false, styled = false;
     for (uint32_t k = 0; k < 4; ++k) {
         const PassControls pc = pass_controls(s, k);
         const uint32_t st = grade_on ? std::min(pc.style, 2u) : 0u;
         ip.styles |= st << (2 * k);
         ip.inten[k] = pc.intensity;
         if (k < n && (st != 0 || pc.intensity != 1.0f)) graded = true;
+        if (k < n && st != 0) styled = true;
     }
+    // [Network] Style Grade Acceleration: a pass with a Style is graded by il / il0 with the grade in closed form
+    // (programs 3 / 4; the same grade); a frame without a Style keeps the plain programs
+    // (said in the log by the form the stage records: a stage without the closed-form programs grades step by step)
+    const bool grade_closed = styled && io.style_grade_accelerated();
     if (graded != L.graded_last) { L.valid = false; L.graded_last = graded; }
     if (o.latch) L.valid = false;
     for (uint32_t k = 0; k < n && k < o.fresh.size(); ++k) if (o.fresh[k]) L.valid = false;
@@ -371,7 +384,14 @@ inline bool il_run1(FlowIo& io, FlowState& o, const FlowFrame& f, const Settings
                 im.push_back({u.binding, image_of(u.surf)});
                 if (!im.back().image.format) return false;
             }
-            stage.record_il(vk, program, step, im.data(), uint32_t(im.size()), push, bytes, gx, gy);
+            const uint32_t p = grade_closed && (program == 0u || program == 2u) && stage.has_il_ga()
+                ? (program == 0u ? 3u : 4u) : program;
+            if (styled && (program == 0u || program == 2u) && L.grade_form != (p != program ? 2 : 1)) {
+                L.grade_form = p != program ? 2 : 1;
+                io.say(p != program ? "Interleaved's Style grade in closed form (Style Grade Acceleration)"
+                                    : "Interleaved's Style grade step by step");
+            }
+            stage.record_il(vk, p, step, im.data(), uint32_t(im.size()), push, bytes, gx, gy);
             return true;
         });
     };
@@ -383,7 +403,7 @@ inline bool il_run1(FlowIo& io, FlowState& o, const FlowFrame& f, const Settings
         ip.mode = mode; ip.slot = slot;
         ip.flags = (stable && (mode == 6u || mode == 1u) && L.lf_valid ? 16u : 0u) | (stable && depth ? 131072u : 0u) | (move ? 1u : 0u) | (mode == 0u && move ? 2u : 0u) | 268435456u | (move ? 8u : 0u) | (moved ? 64u : 0u) |
                    (mode == 0u && move ? 536870912u : 0u) | (mode == 0u && move && depth ? 1073741824u : 0u) |
-                   (move ? 128u : 0u) | (depth && move ? 768u : 0u) | (tmpl.depth_inverted ? 1024u : 0u) |
+                   (move ? 128u : 0u) | (depth && move ? 256u : 0u) | (depth && move && s.fast_interleaved_depth_disocclusion ? 512u : 0u) | (tmpl.depth_inverted ? 1024u : 0u) |
                    (graded ? 2048u : 0u) | (mode == 1u && moved ? 65536u : 0u) | (move ? 524288u | 1048576u : 0u) |
                    (move ? 33554432u : 0u) | (mode == 4u && depth ? 67108864u : 0u) |
                    (mode == 1u && moved && dbg ? 262144u : 0u) | (mode == 1u && moved && dbg == 3 ? 4194304u : 0u);
@@ -429,6 +449,7 @@ inline bool il_run1(FlowIo& io, FlowState& o, const FlowFrame& f, const Settings
         c.raw = graded;
         c.last = true;
         c.history = history ? L.hist : Surf{};
+        c.external_history = true;
         return io.network(c) == 0;
     };
     if (depth) { L.dcur ^= 1u; if (!il(5u, 0u, false)) return false; L.depth_const = false; }
@@ -472,7 +493,7 @@ inline void flow_model_extent(const Settings& s, uint32_t w, uint32_t h, const F
     work_h = std::max(work_h, 1u);
     const SpatialLayout layout = spatial_layout(s, w, h, scale);
     const bool failed = layout.signature == o.spatial_signature && o.spatial_failed;
-    const bool spatial = layout.active && !failed && guides;
+    const bool spatial = layout.active && (s.frame_reuse || !failed) && guides;
     *mw = spatial ? layout.model_w : work_w;
     *mh = spatial ? layout.model_h : work_h;
     if (spatial_out) *spatial_out = spatial;
@@ -495,6 +516,7 @@ inline Fmt flow_network_format(const Settings& s, bool spatial, bool fast_progra
 // remakes the surfaces and the passes). False when the frame was left as it came.
 inline bool flow_run(FlowIo& io, FlowState& o, const FlowFrame& f, const Settings& s, uint64_t format_key) {
     using flow_detail::once;
+    o.reuse_failure = nullptr;
     struct Finish { FlowIo& io; ~Finish() { io.finish(); } } finish{io};
     const uint32_t w = f.width, h = f.height;
     if (!w || !h || !f.target) return false;
@@ -521,7 +543,7 @@ inline bool flow_run(FlowIo& io, FlowState& o, const FlowFrame& f, const Setting
         o.spatial_requested = s.spatial;
         o.spatial_failed = false;
     }
-    const bool spatial = layout.active && !o.spatial_failed && f.depth && f.motion;
+    const bool spatial = layout.active && (s.frame_reuse || !o.spatial_failed) && f.motion && (f.depth || s.frame_reuse);
     if (spatial && o.guide_signature != f.guide_signature) {   // the fork's spatial signature counts the guides' too
         if (!o.guide_signature.empty()) o.latch = true;
         o.guide_signature = f.guide_signature;
@@ -537,7 +559,7 @@ inline bool flow_run(FlowIo& io, FlowState& o, const FlowFrame& f, const Setting
     const bool half = flow_model_half(s, spatial, io.has_fast());
     const Fmt model_format = half ? Fmt::kHalf : Fmt::kFrame;
     if (o.w != w || o.h != h || o.frame_format_key != format_key || o.scale != scale || o.spatial != spatial ||
-        o.half != half || o.model_w != model_w || o.model_h != model_h || !o.proxy || !o.keep || !o.answer) {
+        o.half != half || o.model_w != model_w || o.model_h != model_h) {
         if (o.frame_format_key != format_key || o.scale != scale || o.spatial != spatial || o.half != half)
             flow_detail::release_from(io, o, 0);
         flow_detail::release_fast(io, o);
@@ -546,10 +568,7 @@ inline bool flow_run(FlowIo& io, FlowState& o, const FlowFrame& f, const Setting
                         &o.p_light_m, &o.p_in, &o.p_out, &o.p_scratch, &o.p_clamp, &o.p_m, &o.small_raw, &o.small_keep,
                         &o.classic})
             io.retire(*r);
-        o.proxy = io.make(Fmt::kFrame, w, h);
-        o.keep = io.make(Fmt::kFrame, w, h);
-        o.answer = io.make(model_format, model_w, model_h);
-        bool made = o.proxy && o.keep && o.answer;
+        bool made = true;
         if (spatial) {
             o.sp_colour = io.make(Fmt::kHalf, model_w, model_h);
             o.sp_depth = io.make(Fmt::kR32F, model_w, model_h);
@@ -610,7 +629,10 @@ inline bool flow_run(FlowIo& io, FlowState& o, const FlowFrame& f, const Setting
             break;
         }
     if (o.built.size() > requested) flow_detail::release_from(io, o, requested);
-    if (requested == 1) { io.retire(o.scratch); io.retire(o.clamp); }
+    if (requested == 1 || il_on) {
+        io.retire(o.scratch); io.retire(o.clamp);
+        io.retire(o.p_scratch); io.retire(o.p_clamp);
+    }
     uint32_t ready = 0;
     for (uint32_t k = 0; k < requested; ++k) {
         if (k < o.failed.size() && o.failed[k]) break;
@@ -624,7 +646,7 @@ inline bool flow_run(FlowIo& io, FlowState& o, const FlowFrame& f, const Setting
                 if (spatial) {
                     o.spatial_failed = true;
                     o.failed[k] = false;
-                    once(io, o.said, 12, "the spatial compression's model could not be made; NR runs on the whole picture");
+                    once(io, o.said, 12, s.frame_reuse ? (o.reuse_failure = nr::frame_reuse::packed_model) : "the spatial compression's model could not be made; NR runs on the whole picture");
                 }
                 return false;
             }
@@ -644,8 +666,8 @@ inline bool flow_run(FlowIo& io, FlowState& o, const FlowFrame& f, const Setting
         }
         ++ready;
     }
-    if (!ready) return false;
-    if (ready > 1 && (!o.scratch || !o.clamp)) {   // the textures between passes, made at first use
+    if (!ready || (s.frame_reuse && ready != requested)) return false;
+    if (ready > 1 && !il_on && (!o.scratch || !o.clamp)) {   // the textures between passes, made at first use
         if (!o.scratch) o.scratch = io.make(model_format, model_w, model_h);
         if (!o.clamp) o.clamp = io.make(model_format, model_w, model_h);
         if (!o.scratch || !o.clamp) {
@@ -662,6 +684,19 @@ inline bool flow_run(FlowIo& io, FlowState& o, const FlowFrame& f, const Setting
     static const bool w2_direct_off = [] { const char* e = std::getenv("NR_W2_DIRECT"); return e && e[0] == '0'; }();
     const bool direct = !w2_direct_off && passthrough && f.unorm && f.direct_ok && !spatial && !reduced && !super;
     { static bool said = false; if (direct && !said) { said = true; io.say("the SDR frame read where it is (no encode)"); } }
+    if (direct) {
+        io.retire(o.proxy);
+        io.retire(o.keep);
+    } else {
+        if (!o.proxy) o.proxy = io.make(Fmt::kFrame, w, h);
+        if (!o.keep) o.keep = io.make(Fmt::kFrame, w, h);
+        if (!o.proxy || !o.keep) {
+            io.retire(o.proxy);
+            io.retire(o.keep);
+            once(io, o.said, 2, "its textures could not be made; NR skips the frame");
+            return false;
+        }
+    }
     bool measure = false;
     const bool automatic = s.white_point_source == 3;
     if (!passthrough && s.white_point_source == 1 && f.exposure) measure = f.exposure_valid;
@@ -680,15 +715,20 @@ inline bool flow_run(FlowIo& io, FlowState& o, const FlowFrame& f, const Setting
     // Step 8: the encode (8.5) - the frame into the proxy and the kept original.
     Constants exposure{};
     io.use(f.target, Access::kWrite);
-    io.use(o.proxy, Access::kWrite);
-    io.use(o.keep, Access::kWrite);
+    if (!direct) {
+        io.use(o.proxy, Access::kWrite);
+        io.use(o.keep, Access::kWrite);
+    }
     if (automatic && o.meter) io.use(o.meter, Access::kWrite);
     const bool encoded = io.record([&](VkCommandBuffer vk, Stage& stage, const FlowIo::ImageOf& image_of) {
         Dispatch d;
         d.t0 = image_of(f.target);
-        d.u0 = image_of(o.proxy);
-        d.u1 = image_of(o.keep);
-        if (!d.t0.format || !d.u0.format || !d.u1.format) return false;
+        if (!d.t0.format) return false;
+        if (!direct) {
+            d.u0 = image_of(o.proxy);
+            d.u1 = image_of(o.keep);
+            if (!d.u0.format || !d.u1.format) return false;
+        }
         bool measured = measure;
         if (measured) {
             d.t3 = image_of(exposure_texture);
@@ -742,11 +782,11 @@ inline bool flow_run(FlowIo& io, FlowState& o, const FlowFrame& f, const Setting
         if (light_m_needed && !o.p_light_m) o.p_light_m = io.make(Fmt::kF32, model_w, model_h);
         for (Surf* r : {&o.p_in, &o.p_out, &o.p_m})
             if (!*r) *r = io.make(Fmt::kF32, model_w, model_h);
-        if (ready > 1) for (Surf* r : {&o.p_scratch, &o.p_clamp})
+        if (ready > 1 && !il_on) for (Surf* r : {&o.p_scratch, &o.p_clamp})
             if (!*r) *r = io.make(Fmt::kF32, model_w, model_h);
         if (!o.p_state) o.p_state = io.make(Fmt::kF32, 1, 1);
         prep = o.p_light && (!light_m_needed || o.p_light_m) && o.p_in && o.p_out && o.p_m && o.p_state &&
-               (ready < 2 || (o.p_scratch && o.p_clamp));
+               (ready < 2 || il_on || (o.p_scratch && o.p_clamp));
     }
     // [Preprocess]'s programs or textures unavailable: NR runs without it (not the runtime's proxy-domain Preprocess,
     // which would bring back the encoding errors this layer's Preprocess avoids).
@@ -768,8 +808,8 @@ inline bool flow_run(FlowIo& io, FlowState& o, const FlowFrame& f, const Setting
     io.use(direct ? f.target : o.proxy, Access::kRead);
     if (f.depth) io.use(f.depth, Access::kRead);
     if (f.motion) io.use(f.motion, Access::kRead);
-    const float depth_rect[4] = {float(f.depth_rect.x), float(f.depth_rect.y), float(f.depth_rect.width),
-                                 float(f.depth_rect.height)};
+    const float depth_rect[4] = {float(f.depth_rect.x), float(f.depth_rect.y), f.depth ? float(f.depth_rect.width) : 0.f,
+                                 f.depth ? float(f.depth_rect.height) : 0.f};
     const float motion_rect[4] = {float(f.motion_rect.x), float(f.motion_rect.y), float(f.motion_rect.width),
                                   float(f.motion_rect.height)};
     // spatial packing works in native pixels of the active guide region
@@ -792,8 +832,9 @@ inline bool flow_run(FlowIo& io, FlowState& o, const FlowFrame& f, const Setting
             c.u0 = image_of(o.sp_colour);
             Dispatch g;
             g.t0 = c.t0;
-            g.t1 = image_of(f.depth);
             g.t2 = image_of(f.motion);
+            // Keep a valid sampled descriptor. SpatialGuides skips the depth fetch for an empty depth rectangle.
+            g.t1 = f.depth ? image_of(f.depth) : g.t2;
             g.u0 = image_of(o.sp_depth);
             g.u1 = image_of(o.sp_motion);
             if (!c.t0.format || !c.u0.format || !g.t1.format || !g.t2.format || !g.u0.format || !g.u1.format) return false;
@@ -947,14 +988,20 @@ inline bool flow_run(FlowIo& io, FlowState& o, const FlowFrame& f, const Setting
     const bool fast_on = fast_requested(s) && fast_programs;
     if (!fast_on && (o.f_in || o.f_out)) flow_detail::release_fast(io, o);
     if (fast_requested(s) && !fast_programs) {
+        if (s.frame_reuse) { once(io, o.fast_said, 1, (o.reuse_failure = nr::frame_reuse::fast_programs)); return false; }
         if (stage_made) once(io, o.fast_said, 1, "Passes (fast)'s programs are unavailable; one network pass runs");
         // the first frame only (the stage was not made when the model's images were chosen 16-bit float): the network's
         // input and answer differ in format; from the next frame they are the frame's
         if (half && !spatial) return false;
     }
     const bool history_method = fs.method == 1 || fs.method == 2;   // Feedback / Hybrid (Edit strength: none)
-    const bool feedback = fast_on && history_method && f.motion && f.fast_motion && !spatial;
+    // SpatialGuides writes displacement in packed model pixels. Reused
+    // anchors and their feedback history live on that same packed grid.
+    const bool packed_feedback=spatial && s.frame_reuse;
+    const Surf feedback_motion=packed_feedback?o.sp_motion:f.motion;
+    const bool feedback = fast_on && history_method && feedback_motion && f.fast_motion && (!spatial || packed_feedback);
     const bool fb_missing = fast_on && history_method && !feedback;
+    if (s.frame_reuse && fb_missing) { once(io, o.fast_said, 2, (o.reuse_failure = nr::frame_reuse::packed_motion)); return false; }
     const bool plain = il_want || fb_missing;   // the half copy and the network alone (Interleaved has its own work)
     // The fast work's arithmetic takes a display-encoded picture in [0, 1]. A float frame passed through as it is (no
     // HDR flag; without [Preprocess], whose input is its own) can go above 1: the fast work then runs in a bounded domain
@@ -964,6 +1011,15 @@ inline bool flow_run(FlowIo& io, FlowState& o, const FlowFrame& f, const Setting
     // Interleaved (and a frame it cannot run on) works in the values the network is shown: no mapped domain.
     const bool fast_map = fast_on && !plain && passthrough && !f.unorm && !prep;
     if (fast_on && !fast_map) { io.retire(o.f_net); io.retire(o.f_ans); }
+    if (il_on || fast_on || prep) {
+        io.retire(o.answer);
+    } else if (!o.answer) {
+        o.answer = io.make(model_format, model_w, model_h);
+        if (!o.answer) {
+            once(io, o.said, 2, "its textures could not be made; NR skips the frame");
+            return false;
+        }
+    }
     if (fast_on) {
         const uint32_t lw = nr::fast::low(model_w), lh = nr::fast::low(model_h);
         if (!o.f_in) o.f_in = io.make(Fmt::kHalf, model_w, model_h);
@@ -996,7 +1052,13 @@ inline bool flow_run(FlowIo& io, FlowState& o, const FlowFrame& f, const Setting
         // the history restarts where the network's does, and is not kept without feedback
         if (o.latch || o.fresh.empty() || o.fresh[0] || !feedback) o.fast_history.valid = false;
         nr::fast::Motion motion;
-        if (feedback) {
+        if (feedback && packed_feedback) {
+            motion.grid[0]=model_w;motion.grid[1]=model_h;
+            // (SpatialGuides' displacement is already in packed model pixels - wilsjo2_spatial.comp - the unit the fast
+            // work moves in: as it is)
+            motion.scale[0]=1.f;motion.scale[1]=1.f;
+            io.use(feedback_motion,Access::kRead);
+        } else if (feedback) {
             motion.base[0] = f.motion_rect.x; motion.base[1] = f.motion_rect.y;
             motion.grid[0] = f.motion_rect.width; motion.grid[1] = f.motion_rect.height;
             // the NGX scale gives pixels of the vectors' region; the fast work moves the network's pixels
@@ -1022,7 +1084,7 @@ inline bool flow_run(FlowIo& io, FlowState& o, const FlowFrame& f, const Setting
             };
             if (!copy(net_input, o.f_in, fast_map ? 1u : 0u)) return false;
             if (plain) return true;   // Interleaved / a plain pass: the input in 16-bit float is all it needs here
-            flow_detail::FastRecorder d(vk, stage, image_of, o, f.motion);
+            flow_detail::FastRecorder d(vk, stage, image_of, o, feedback_motion);
             if (!nr::fast::feed(d, fs, model_w, model_h, motion, o.fast_history, feedback)) return false;
             // the network's own input: the light as it came, or with the feedback brought back from the domain
             return !fast_map || copy(feedback ? o.f_in : net_input, o.f_net, feedback ? 2u : 0u);
@@ -1033,14 +1095,14 @@ inline bool flow_run(FlowIo& io, FlowState& o, const FlowFrame& f, const Setting
         }
     }
     // the network's guides (9.1): the packed ones at the model extent (motion already in its pixels), else the game's
-    const Surf model_depth = spatial ? o.sp_depth : f.depth;
+    const Surf model_depth = spatial && f.depth ? o.sp_depth : f.depth;
     const Surf model_motion = spatial ? o.sp_motion : f.motion;
     const Rect packed_rect{0, 0, model_w, model_h};
     NetCall call;
     call.depth = model_depth;
     call.motion = model_motion;
     call.width = model_w; call.height = model_h;
-    call.depth_rect = spatial ? packed_rect : f.depth_rect;
+    call.depth_rect = spatial && f.depth ? packed_rect : f.depth_rect;
     call.motion_texture_rect = f.motion_rect;
     call.motion_rect = spatial ? packed_rect : f.motion_rect;
     call.depth_inverted = (f.flags & (1u << 3)) != 0;
@@ -1057,6 +1119,8 @@ inline bool flow_run(FlowIo& io, FlowState& o, const FlowFrame& f, const Setting
         facts.asked = s.white_point_source;
         facts.white = s.white_point_scale;
         facts.history = s.history_strength;
+        facts.pre_history = s.pre_history;
+        facts.noise_every_frame = s.noise_every_frame;
         facts.mode = s.reversible_mode;
         facts.passes = ready;
         facts.prep_outside = prep || prep_missing;
@@ -1129,7 +1193,7 @@ inline bool flow_run(FlowIo& io, FlowState& o, const FlowFrame& f, const Setting
                 o.latch = true;   // its history starts again with the next run
                 if (spatial) {
                     o.spatial_failed = true;
-                    once(io, o.said, 13, "the spatial compression's model did not run; NR runs on the whole picture");
+                    once(io, o.said, 13, s.frame_reuse ? (o.reuse_failure = nr::frame_reuse::packed_eval) : "the spatial compression's model did not run; NR runs on the whole picture");
                 }
                 break;
             }
@@ -1160,7 +1224,7 @@ inline bool flow_run(FlowIo& io, FlowState& o, const FlowFrame& f, const Setting
                 return true;
             };
             if (fast_map && !copy(o.f_ans, o.f_out, 1u)) return false;   // the answer into the domain
-            flow_detail::FastRecorder d(vk, stage, image_of, o, f.motion);
+            flow_detail::FastRecorder d(vk, stage, image_of, o, feedback_motion);
             if (!nr::fast::apply(d, fs, model_w, model_h, o.fast_history, feedback)) return false;
             return !fast_map || copy(o.f_out, o.f_ans, 2u);              // and the strengthened answer back
         });
@@ -1170,6 +1234,7 @@ inline bool flow_run(FlowIo& io, FlowState& o, const FlowFrame& f, const Setting
             return false;
         }
     }
+    if (s.frame_reuse && !all_ran) return false;
     if (all_ran) o.latch = false;   // 5.2: cleared once every pass of the frame ran
     // [Preprocess]: the network's change taken back into the proxy's domain (M = P + E(p + d) - E(p), P the proxy at
     // the model's extent); everything after works on M as on an answer. With NR Control's debug view of this layer the
@@ -1312,7 +1377,7 @@ inline bool flow_run(FlowIo& io, FlowState& o, const FlowFrame& f, const Setting
     // copy), against the pass-0 input (the proxy). Direct: the frame is the proxy and the original, read and written.
     io.use(resolve_proxy, Access::kRead);
     io.use(resolve_answer, Access::kRead);
-    io.use(o.keep, Access::kRead);
+    if (!direct) io.use(o.keep, Access::kRead);
     io.use(f.target, Access::kWrite);
     const bool resolved = io.record([&](VkCommandBuffer vk, Stage& stage, const FlowIo::ImageOf& image_of) {
         Dispatch d;

@@ -66,7 +66,7 @@ def main():
     assert REGIONS[-1][2] == len(p), (
         "region map gives %d, record is %d" % (REGIONS[-1][2], len(p)))
 
-    base = src.name[:-len(".bin")]   # block70.layer0.layer (310.8), block30.layer0.layer (small model)
+    base = src.name[:-len(".bin")]   # block70.layer0.layer (CC_SILVER_AARDWOLD), block30.layer0.layer (CC_SMALL_FP8)
     print("%-20s %6s %6s  %-11s %8s %s" % ("region", "start", "bytes", "shape",
                                            "col-norm", "e4m3 NaN"))
     bad = 0

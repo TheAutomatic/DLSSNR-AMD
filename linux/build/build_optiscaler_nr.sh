@@ -44,35 +44,38 @@ minhook=artifacts/ref/DLSS5-Feeder/external/minhook
 # way to tell from a game whether a fix is in the binary that ran.
 stamp=$(bash linux/build/version.sh)
 common=(-std=c++17 -O2 -DNDEBUG -DNR_BUILD_STAMP="\"$stamp\"" -Itoolchain/Vulkan-Headers/include -Ilinux/src -Ilinux/src/core -Ilinux/src/layer -Ilinux/src/pe -I"$out")
-[[ "${NR_INT4:-0}" == 1 ]] && common+=(-DNR_INT4=1)   # the int4 mixed build (installed only with it; build_package.sh)
+[[ "${NR_INT4:-0}" == 1 ]] && common+=(-DNR_INT4=1)   # the build with the int4 layers (installed only with it; build_package.sh)
 
 # The network the package ships (linux/build/arch/rdna4.sh): the host must be built
 # with the same constants as the shaders in dlssnr-amd/shaders.
 source linux/build/arch/rdna4.sh
-"$cxx" "${common[@]}" "${NR_PRODUCT_DEFINES[@]}" -c linux/src/core/nr_runtime.cpp -o "$out/nr_runtime.o"
-"$cxx" "${common[@]}" -c linux/src/core/nr_native_plan.cpp -o "$out/nr_native_plan.o"
-"$cxx" "${common[@]}" -c linux/src/core/nr_renodx.cpp -o "$out/nr_renodx.o"
-"$cxx" "${common[@]}" -c linux/src/pe/nr_pe_log.cpp -o "$out/log.o"
-"$cxx" "${common[@]}" -c linux/src/pe/nr_pe_interop.cpp -o "$out/interop.o"
-"$cxx" "${common[@]}" -c linux/src/pe/nr_vram_ledger.cpp -o "$out/vram_ledger.o"
-"$cxx" "${common[@]}" -I"$minhook/include" -c linux/src/pe/nr_pe_vkdevice.cpp -o "$out/vkdevice.o"
-"$cxx" "${common[@]}" -c linux/src/pe/nr_pe_session.cpp -o "$out/session.o"
-"$cxx" "${common[@]}" -c linux/src/core/nr_wilsjo2.cpp -o "$out/nr_wilsjo2.o"   # the session's wilsjo2 flow (ReShade layers)
-"$cxx" "${common[@]}" -c linux/src/pe/nr_pe_config.cpp -o "$out/config.o"
-"$cxx" "${common[@]}" -c linux/src/pe/nr_dlssnr_model.cpp -o "$out/model.o"
-"$cxx" "${common[@]}" -c linux/src/pe/nr_pe_renodx_route.cpp -o "$out/renodx_route.o"
-"$cxx" "${common[@]}" -I"$minhook/include" -c linux/src/pe/nr_pe_control.cpp -o "$out/control.o"
-"$cxx" "${common[@]}" -c linux/src/pe/nr_screenshot.cpp -o "$out/screenshot.o"
-"$cxx" "${common[@]}" -c linux/src/pe/nr_dlssnr_forwarder.cpp -o "$out/forwarder.o"
-"$cxx" "${common[@]}" -c linux/src/pe/nr_ngx_core.cpp -o "$out/ngx_core.o"
-"$cxx" "${common[@]}" -I"$minhook/include" -c linux/src/pe/nr_pe_optifix.cpp -o "$out/optifix.o"
+source linux/build/parallel.sh
+par "$cxx" "${common[@]}" "${NR_PRODUCT_DEFINES[@]}" -c linux/src/core/nr_runtime.cpp -o "$out/nr_runtime.o"
+par "$cxx" "${common[@]}" -c linux/src/core/nr_native_plan.cpp -o "$out/nr_native_plan.o"
+par "$cxx" "${common[@]}" -c linux/src/core/nr_renodx.cpp -o "$out/nr_renodx.o"
+par "$cxx" "${common[@]}" -c linux/src/core/nr_frame_reuse.cpp -o "$out/nr_frame_reuse.o"   # NRFrameReuse
+par "$cxx" "${common[@]}" -c linux/src/pe/nr_pe_log.cpp -o "$out/log.o"
+par "$cxx" "${common[@]}" -c linux/src/pe/nr_pe_interop.cpp -o "$out/interop.o"
+par "$cxx" "${common[@]}" -c linux/src/pe/nr_vram_ledger.cpp -o "$out/vram_ledger.o"
+par "$cxx" "${common[@]}" -I"$minhook/include" -c linux/src/pe/nr_pe_vkdevice.cpp -o "$out/vkdevice.o"
+par "$cxx" "${common[@]}" -c linux/src/pe/nr_pe_session.cpp -o "$out/session.o"
+par "$cxx" "${common[@]}" -c linux/src/core/nr_wilsjo2.cpp -o "$out/nr_wilsjo2.o"   # the session's wilsjo2 flow (ReShade layers)
+par "$cxx" "${common[@]}" -c linux/src/pe/nr_pe_config.cpp -o "$out/config.o"
+par "$cxx" "${common[@]}" -c linux/src/pe/nr_dlssnr_model.cpp -o "$out/model.o"
+par "$cxx" "${common[@]}" -c linux/src/pe/nr_pe_renodx_route.cpp -o "$out/renodx_route.o"
+par "$cxx" "${common[@]}" -I"$minhook/include" -c linux/src/pe/nr_pe_control.cpp -o "$out/control.o"
+par "$cxx" "${common[@]}" -c linux/src/pe/nr_screenshot.cpp -o "$out/screenshot.o"
+par "$cxx" "${common[@]}" -c linux/src/pe/nr_dlssnr_forwarder.cpp -o "$out/forwarder.o"
+par "$cxx" "${common[@]}" -c linux/src/pe/nr_ngx_core.cpp -o "$out/ngx_core.o"
+par "$cxx" "${common[@]}" -I"$minhook/include" -c linux/src/pe/nr_pe_optifix.cpp -o "$out/optifix.o"
 
 # MinHook, for the device watcher the Vulkan path asks for a queue through.
 for unit in hook buffer trampoline; do
-    "$cc" -O2 -I"$minhook/include" -I"$minhook/src" -c "$minhook/src/$unit.c" -o "$out/mh_$unit.o"
+    par "$cc" -O2 -I"$minhook/include" -I"$minhook/src" -c "$minhook/src/$unit.c" -o "$out/mh_$unit.o"
 done
 hde=hde64; [[ "$arch" == i686 ]] && hde=hde32
-"$cc" -O2 -I"$minhook/include" -I"$minhook/src" -c "$minhook/src/hde/$hde.c" -o "$out/mh_hde.o"
+par "$cc" -O2 -I"$minhook/include" -I"$minhook/src" -c "$minhook/src/hde/$hde.c" -o "$out/mh_hde.o"
+par_wait
 
 ldflags=(-ld3d12 -ldxgi -lole32 -static -static-libgcc -static-libstdc++)
 [[ "$arch" == i686 ]] && ldflags+=(-Wl,--kill-at)
@@ -81,7 +84,7 @@ ldflags=(-ld3d12 -ldxgi -lole32 -static -static-libgcc -static-libstdc++)
 # import of vulkan-1.dll forces winevulkan up before the game's graphics stack, which has killed a
 # real game. This link is expected to fail; its failure is the input to the next step.
 shared_objs=("$out/model.o" "$out/session.o" "$out/config.o" "$out/interop.o" "$out/vram_ledger.o" "$out/log.o" "$out/vkdevice.o"
-             "$out/nr_runtime.o" "$out/nr_native_plan.o" "$out/nr_renodx.o" "$out/nr_wilsjo2.o" "$out/renodx_route.o" "$out/control.o" "$out/screenshot.o" "$out"/mh_*.o)
+             "$out/nr_runtime.o" "$out/nr_native_plan.o" "$out/nr_renodx.o" "$out/nr_frame_reuse.o" "$out/nr_wilsjo2.o" "$out/renodx_route.o" "$out/control.o" "$out/screenshot.o" "$out"/mh_*.o)
 forwarder_objs=("$out/forwarder.o" "${shared_objs[@]}")
 core_objs=("$out/ngx_core.o" "$out/optifix.o" "${shared_objs[@]}")
 # Both links contribute undefined vk* names; the probe link takes every object either DLL uses so one

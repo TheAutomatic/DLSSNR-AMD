@@ -5,6 +5,7 @@
 #include <string>
 
 namespace nr::renodx { struct Settings; }
+namespace nr::wilsjo2 { struct Settings; }
 
 namespace nr::pe {
 
@@ -50,6 +51,8 @@ struct Wilsjo2Facts {
     int exposure = 0;            // the white point in effect: 0 manual, 1 the game's exposure texture, 3 metered
     uint32_t asked = 0;          // WhitePointSource as set
     float history = 1.0f;        // this layer's post-block previous-frame blend
+    bool pre_history = true;          // its PreHistory (Controls::pre_history)
+    bool noise_every_frame = true;    // its NoiseEveryFrame (off: Controls::seed_fixed)
     float white = 1.0f;          // WhitePointScale (the manual white point)
     uint32_t mode = 0;           // ReversibleMode
     uint32_t passes = 1;         // model passes this frame
@@ -59,6 +62,10 @@ struct Wilsjo2Facts {
     bool fast_fallback = false;  // Feedback / Hybrid asked for and not run (one network pass)
     bool fast_fallback_spatial = false;   // ... because of peripheral compression
     uint8_t il_missing = 0;      // Interleaved asked for and not run (nr::wilsjo2::FlowFacts::il_missing)
+    // its FrameReuse in NR Control as Session::State::reuse / reuse_note say a RenoDX layer's (0: off or said elsewhere)
+    uint32_t reuse = 0;
+    float reuse_share = -1.f;   // frames with NR lately (reuse 1; < 0 not yet)
+    const char* reuse_note = "";
 };
 struct CallWilsjo2 {
     explicit CallWilsjo2(const Wilsjo2Facts* facts);
@@ -68,6 +75,25 @@ struct CallWilsjo2 {
     const Wilsjo2Facts* previous;
 };
 const Wilsjo2Facts* call_wilsjo2();
+// The .asi's wilsjo2 Present layer with FrameReuse on: this call runs the layer's whole flow inside the session (frame
+// reuse around it, nr_pe_session.cpp record_wilsjo2) rather than the .asi running the flow around this call's network.
+// `settings`: the layer's (white point already set for HDR); `hdr`: the frame is linear light (scRGB, a decoded HDR10
+// frame). Null outside such a call.
+struct W2Present {
+    const nr::wilsjo2::Settings* settings = nullptr;
+    bool hdr = false;
+    bool at_present = true, before_upscale = false;   // where the layer runs (else at the upscaler, before it or after)
+    float pre_exposure = 1.0f;                         // DLSS's, as given
+    mutable bool ran = false;   // set by the call: the layer's frame was recorded (NR's or rebuilt)
+};
+struct CallW2Present {
+    explicit CallW2Present(const W2Present* present);
+    ~CallW2Present();
+    CallW2Present(const CallW2Present&) = delete;
+    CallW2Present& operator=(const CallW2Present&) = delete;
+    const W2Present* previous;
+};
+const W2Present* call_w2_present();
 // The .asi's NR chain: the network a layer asked for (its Network key, nr::NetworkChoice) for this call on the calling
 // thread; -1 (and outside such a call): [Network] Model. One the run cannot serve falls back to [Network] Model.
 struct CallNetwork {

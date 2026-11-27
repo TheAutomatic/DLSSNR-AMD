@@ -3,7 +3,7 @@
 // frame generation's evaluate on one, and the Present layers are recorded into it there). A blit is a graphics
 // operation (RADV draws it): recorded into a compute queue's command buffer it is an illegal packet and the queue hangs.
 // One region, offsets[0] < offsets[1] on both images (no flips), one mip, one layer. As RADV's blit does it, so that the
-// two give the same bits (tools/rounds/fgn01/blittest.cpp): the destination texel centre scaled into the source region
+// two give the same bits: the destination texel centre scaled into the source region
 // and normalised, sampled with the filter's sampler (clamped to the edge); into a destination of at most 10 bits a
 // channel (8-bit and 10-bit UNORM) RADV's blit exports 16-bit colour, each value first converted to FP16 toward zero
 // (v_cvt_pkrtz) - `rtz16` asks for that here; wider ones (16-bit, 11/11/10, FP16, FP32) take the value as it is.

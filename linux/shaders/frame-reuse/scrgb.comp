@@ -1,0 +1,31 @@
+#version 460
+// scRGB is linear RGB with 80 nits per unit. Only the private correspondence
+// images use perceptual coordinates. Preserve sign for wide-gamut colours and
+// extend PQ beyond nominal peak so finite FP16 highlights remain distinct.
+layout(local_size_x=16,local_size_y=16) in;
+layout(binding=0) uniform sampler2D Source;
+layout(binding=1,rgba16f) uniform writeonly image2D Target;
+
+const float m1=2610.0/16384.0, m2=2523.0/32.0;
+const float c1=3424.0/4096.0, c2=2413.0/128.0, c3=2392.0/128.0;
+const float slope=m1*m2*(c2-c3)/(1.0+c3);
+float transfer(float v) {
+#ifdef DECODE
+    float u=abs(v);
+    float p=pow(min(u,1.0),1.0/m2);
+    float l=u>1.0 ? exp2(min((u-1.0)/(slope*log(2.0)),log2(65504.0/125.0)))
+                  : pow(max(p-c1,0.0)/(c2-c3*p),1.0/m1);
+    return sign(v)*min(l*125.0,65504.0);
+#else
+    float l=abs(v)/125.0;
+    float p=pow(min(l,1.0),m1);
+    float u=l>1.0 ? 1.0+slope*log(l) : pow((c1+c2*p)/(1.0+c3*p),m2);
+    return sign(v)*u;
+#endif
+}
+void main() {
+    ivec2 p=ivec2(gl_GlobalInvocationID.xy);
+    if(any(greaterThanEqual(p,imageSize(Target))))return;
+    vec4 v=texelFetch(Source,p,0);
+    imageStore(Target,p,vec4(transfer(v.r),transfer(v.g),transfer(v.b),v.a));
+}

@@ -2777,6 +2777,7 @@ nr::wilsjo2::Settings w2_settings(const nr::Controls& c, const nr::pe::Config& c
     s.auto_mask = c.automatic_mask;
     s.history_strength = cfg.history;
     s.noise_every_frame = c.noise_every_frame;
+    s.pre_history = c.pre_history;
     s.debug_view = c.debug_view;
     s.show_skin_mask = c.show_skin_mask;
     s.transfer_strength = c.detail_strength;
@@ -2792,6 +2793,7 @@ nr::wilsjo2::Settings w2_settings(const nr::Controls& c, const nr::pe::Config& c
     s.fast_method = std::min(cfg.fast_method, 4u);   // (both RenoDX's numbering: 0 Interleaved .. 4 Edit strength)
     s.fast_interleaved_passes = std::clamp(cfg.fast_interleaved_passes, 2u, 8u);
     s.fast_interleaved_preset = cfg.fast_interleaved_preset == 1u ? 1u : cfg.fast_interleaved_preset == 2u ? 2u : nr::fast::kDefaultInterleavedPreset;
+    s.fast_interleaved_depth_disocclusion = cfg.fast_interleaved_depth_disocclusion;
     for (int m = 0; m < 3; ++m) {   // each method's own
         s.fast_passes[m] = cfg.fast_passes[m]; s.fast_halo_limit[m] = cfg.fast_halo_limit[m]; s.fast_fine[m] = cfg.fast_fine[m];
     }
@@ -2808,6 +2810,20 @@ nr::wilsjo2::Settings w2_settings(const nr::Controls& c, const nr::pe::Config& c
     s.skin_detail = c.skin_detail; s.skin_colour = c.skin_colour;
     s.environment_detail = c.environment_detail; s.environment_colour = c.environment_colour;
     return s;
+}
+
+// Frame reuse is not run on this route (user 11-25): a layer with it on is left out and says why (never NR on every
+// frame in its place - no fallback)
+bool layer_refused(const AddonLayer& layer) { return layer.renodx ? layer.rdx.values.frame_reuse : layer.cfg.frame_reuse; }
+
+void skip_reshade_reuse(int number, bool renodx, unsigned w, unsigned h, float white_point) {
+    const char* reason = nr::control_ui::reshade_reuse_reason();
+    const auto* last = view_row(number, false);
+    if (!last || last->state != 3u || std::strcmp(last->note, reason) != 0) {
+        log("[nr] Layer %d is off: %s", number, reason);
+        if (session) session->release_feature(uint64_t(number) * 2u + (renodx ? 1u : 0u));
+    }
+    note_layer(number, !renodx, 3u, reason, w, h, 0, white_point);
 }
 
 template <class RunOne, class Around, class RunPq>
@@ -2831,6 +2847,10 @@ bool run_layers(effect_runtime* rt, nr::pe::Session& s, const nr::pe::Session::R
                                           [](const AddonLayer& a) { return a.number == chain.inspect.layer; })
                           ? chain.inspect.layer : 0;
     for (const AddonLayer& l : layers_now) {
+        if (layer_refused(l)) {
+            skip_reshade_reuse(l.number, l.renodx, w, h, l.renodx ? 1.f : l.cfg.white_point);
+            continue;
+        }
         if (shown && l.number > shown) {
             note_layer(l.number, !l.renodx, 3, ("not run while Layer " + std::to_string(shown) + "'s debug view is shown").c_str(),
                        w, h, 0, l.renodx ? 1.f : l.cfg.white_point);
@@ -2842,6 +2862,7 @@ bool run_layers(effect_runtime* rt, nr::pe::Session& s, const nr::pe::Session::R
         if (l.renodx) {
             nr::pe::Session::RenoDXFrame f = base;
             f.settings = l.rdx.values;
+            f.settings.frame_reuse = false;   // (not on the ReShade route: user 11-25; NR Control greys it)
             f.settings.nr_enabled = true;
             f.present = present_encoding(f.settings, format);
             if (!f.present) {
@@ -2955,6 +2976,23 @@ void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
     // in a transfer function it has never seen and hand back a worse one, which
     // is a failure worth naming rather than a picture worth shipping.
     if (!layered) view_layers({1});   // the route without [LayerN]: its one layer
+    static nr::pe::NrToggle toggle;
+    const bool nr_on = toggle.frame(config.renodx);
+    nr::pe::layer_keys_frame();
+    view.nr_on = nr_on ? 1u : 0u;
+    // Refuse the layer before HDR conversion, HUD composition, Inspect, or any network work.
+    // A mixed chain handles each blocked layer in run_layers and runs the others normally.
+    if (!layered && (renodx_on ? config.renodx.values.frame_reuse : config.frame_reuse)) {
+        skip_reshade_reuse(1, renodx_on, w, h_, renodx_on ? 1.f : config.white_point);
+        ++frames_declined;
+        return;
+    }
+    if (layered && !layers_now.empty() && std::all_of(layers_now.begin(), layers_now.end(), layer_refused)) {
+        for (const AddonLayer& l : layers_now)
+            skip_reshade_reuse(l.number, l.renodx, w, h_, l.renodx ? 1.f : l.cfg.white_point);
+        ++frames_declined;
+        return;
+    }
     // HDR10 (PQ) is decoded for the wilsjo2 processing around its run (run_pq); HLG is not.
     if (!layered && !renodx_on && back_buffer_space == color_space::hdr10_hlg) {
         report("the swapchain is HLG; this pass has no decode for it, so the frame is left alone - switch the game to "
@@ -2989,12 +3027,9 @@ void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
         ? provider_technique.handle && rt->get_technique_state(provider_technique) : provider != 0);
     renodx_frame.after_upscale = true;
     renodx_frame.settings = config.renodx.values;
+    renodx_frame.settings.frame_reuse = false;   // (not on the ReShade route: user 11-25; NR Control greys it)
     if (!layered && chain.inspect.layer == 1) renodx_frame.settings.debug_view = chain.inspect.debug_view;
-    {   // NeuralUplift as NRToggleKey left it
-        static nr::pe::NrToggle toggle;
-        renodx_frame.settings.nr_enabled = toggle.frame(config.renodx);
-        nr::pe::layer_keys_frame();   // [LayerN] ToggleKey
-    }
+    renodx_frame.settings.nr_enabled = nr_on;
     {   // RenoDX's NR screenshot (nr_screenshot.hpp), taken by a RenoDX layer: this route's final picture is the presented frame
         static nr::pe::KeyPress screenshot_key;
         const auto& r = config.renodx;
@@ -3025,7 +3060,6 @@ void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
         return;
     }
     // NR on / off (NeuralUplift as NRToggleKey left it) is every layer's, this route's one without [LayerN] too
-    view.nr_on = renodx_frame.settings.nr_enabled ? 1u : 0u;
     if (!layered && !renodx && !renodx_frame.settings.nr_enabled) {
         note_layer(1, true, 3, "NR is off (toggle key)", w, h_, 0, config.white_point);
         return;
@@ -3090,7 +3124,7 @@ void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
         }
         // a wilsjo2 layer: its flow, on linear light when the target is (scRGB, a decoded HDR10 frame)
         nr::pe::Session::Wilsjo2Frame w2frame;
-        if (w2f) { w2frame = *w2f; w2frame.hdr = tgt.linear; w2frame.fast_motion = renodx_frame.fast_motion_available; }
+        if (w2f) { w2frame = *w2f; w2frame.present_id = presents; w2frame.hdr = tgt.linear; w2frame.fast_motion = renodx_frame.fast_motion_available; }
         const nr::pe::Session::Wilsjo2Frame* const w2run = w2f ? &w2frame : nullptr;
         bool ran = false;
         switch (dev->get_api()) {
@@ -3404,12 +3438,14 @@ void dlssnr_as_layer(nr::ini_edit::Ini& ini, const std::string& sec) {
     num("WhitePointScale", config.white_point);
     flag("SkinProtection", c.skin_protection); num("SkinDetail", c.skin_detail); num("SkinColour", c.skin_colour);
     num("EnvironmentDetail", c.environment_detail); num("EnvironmentColour", c.environment_colour);
-    num("History", config.history); flag("NoiseEveryFrame", c.noise_every_frame); flag("ApplyModel", c.apply_model);
+    num("PostHistory", config.history); flag("NoiseEveryFrame", c.noise_every_frame); flag("ApplyModel", c.apply_model);
+    flag("PreHistory", c.pre_history);
     num("Passes", float(c.passes)); flag("UnlockPasses", config.unlock_passes); flag("ColourLimit", config.colour_limit);
     ini.set(sec, "PassesMode", config.passes_mode == 1 ? "fast" : "legacy");
     num("FastMethod", float(config.fast_method));
     num("FastInterleavedPasses", float(config.fast_interleaved_passes));
     num("FastInterleavedPreset", float(config.fast_interleaved_preset));
+    flag("FastInterleavedDepthDisocclusion", config.fast_interleaved_depth_disocclusion);
     for (int m = 0; m < 3; ++m) {   // each method's own (Fast<Method>Passes / HaloLimit / Fine)
         static const char* const names[] = {"FastExtrapolation", "FastFeedback", "FastHybrid"};
         const std::string n = names[m];

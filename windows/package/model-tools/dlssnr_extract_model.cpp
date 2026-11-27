@@ -1,5 +1,5 @@
 // dlssnr_extract_model: make the model files from NVIDIA's nvngx_dlssnr.dll, written into <output folder>:
-//   310.9.16: CC_SILVER_AARDWOLD.bin (the old model, the DLL's preset 1) and CC_SMALL_FP8.bin (the new model, the DLL's default)
+//   310.9.16: CC_SILVER_AARDWOLD.bin (the DLL's preset 1) and CC_SMALL_FP8.bin (the DLL's default)
 //   310.8.0:  CC_SILVER_AARDWOLD.bin only
 //
 //   dlssnr_extract_model <nvngx_dlssnr.dll> <output folder>
@@ -8,11 +8,11 @@
 // unpack_swin_family.py --max-c 256, unpack_splitswin.py, unpack_vit.py,
 // unpack_preblock.py, unpack_postblock.py, pack_model.py --verify). Only reads the
 // weight data in the DLL; never loads or runs it. Every entry is checked against the
-// embedded model-files.sha256 / model-files-small.sha256 and a file is written only if all
+// embedded model-files-CC_SILVER_AARDWOLD.sha256 / model-files-CC_SMALL_FP8.sha256 and a file is written only if all
 // of them match the tested model byte for byte (to <file>.tmp, renamed at the end).
 //
-// The layer tables, entry lists and checksums are generated into dlssnr_extract_tables.hpp and
-// dlssnr_extract_small_tables.hpp by gen_extract_tables.py. C++17, standard library only.
+// The layer tables, entry lists and checksums are generated into dlssnr_extract_tables_cc_silver_aardwold.hpp and
+// dlssnr_extract_tables_cc_small_fp8.hpp by gen_extract_tables.py. C++17, standard library only.
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -26,8 +26,8 @@
 #include <utility>
 #include <vector>
 
-#include "dlssnr_extract_tables.hpp"
-#include "dlssnr_extract_small_tables.hpp"
+#include "dlssnr_extract_tables_cc_silver_aardwold.hpp"
+#include "dlssnr_extract_tables_cc_small_fp8.hpp"
 
 namespace fs = std::filesystem;
 using u8 = std::uint8_t;
@@ -36,8 +36,10 @@ using u32 = std::uint32_t;
 using u64 = std::uint64_t;
 using i64 = std::int64_t;
 
-static const char kSmallDllSha256[] = "2bc19bc09a7b89dd44f73e2ac0108fcc586e2154bdd0830f242f4f040e28789f";
-static const char kDllSha256[] = "e16bcf15e16e13f527491cdf7845b2fe6521a738d8f7c9c721866a8496e1fc8e";
+static const char kDll3109Sha256[] =   // 310.9.16: CC_SILVER_AARDWOLD and CC_SMALL_FP8
+    "2bc19bc09a7b89dd44f73e2ac0108fcc586e2154bdd0830f242f4f040e28789f";
+static const char kDll3108Sha256[] =   // 310.8.0: CC_SILVER_AARDWOLD
+    "e16bcf15e16e13f527491cdf7845b2fe6521a738d8f7c9c721866a8496e1fc8e";
 
 struct FormatError : std::runtime_error {  // inspect_nr.py's FormatError (and its crashes)
     using std::runtime_error::runtime_error;
@@ -513,9 +515,9 @@ struct ModelTables {
     unsigned entry_count;
     const char* const* verify_extra;
 };
-static ModelTables model_tables(bool small) {
-    if (small) return {small_tables::kLayers, small_tables::kLayerCount, small_tables::kTypes,
-        small_tables::kEntries, small_tables::kEntryCount, small_tables::kVerifyExtra};
+static ModelTables model_tables(bool small_fp8) {
+    if (small_fp8) return {small_fp8_tables::kLayers, small_fp8_tables::kLayerCount, small_fp8_tables::kTypes,
+        small_fp8_tables::kEntries, small_fp8_tables::kEntryCount, small_fp8_tables::kVerifyExtra};
     return {tables::kLayers, tables::kLayerCount, tables::kTypes,
         tables::kEntries, tables::kEntryCount, tables::kVerifyExtra};
 }
@@ -706,9 +708,9 @@ static void plan_preblock(const std::vector<Record>& records, Plan& plan) {
                plan);
 }
 
-static void plan_postblock(const std::vector<Record>& records, Plan& plan, bool small) {
+static void plan_postblock(const std::vector<Record>& records, Plan& plan, bool small_fp8) {
     const int C = 32, H = 4 * C;
-    plan_fixed(records, small ? "block30.layer0.layer" : "block70.layer0.layer", "unpacked-postblock",
+    plan_fixed(records, small_fp8 ? "block30.layer0.layer" : "block70.layer0.layer", "unpacked-postblock",
                {{"mlp_expand", 0, 4096, H, C, H / 16, 'm'},
                 {"mlp_contract", 4096, 8192, C, H, C / 16, 'm'},
                 {"residual_scale", 8208, 8272, 0, 0, 0, 'r'},
@@ -741,16 +743,16 @@ static std::vector<u8> read_file(const fs::path& path) {
     return data;
 }
 
-// One model's pack from the DLL's bytes: the 310.8.0 model (resource WEIGHTS_HT, in both DLLs) or the new model of
-// 310.9.16 (WEIGHTS_CC_SMALL_FP8).
-static void extract(const std::vector<u8>& dll, const fs::path& src, bool small, const fs::path& out) {
+// One model's pack from the DLL's bytes: CC_SILVER_AARDWOLD (resource WEIGHTS_HT, in both DLLs) or CC_SMALL_FP8
+// (310.9.16, WEIGHTS_CC_SMALL_FP8).
+static void extract(const std::vector<u8>& dll, const fs::path& src, bool small_fp8, const fs::path& out) {
     const Span data{dll.data(), dll.size()};
-    const auto selected = model_tables(small);
+    const auto selected = model_tables(small_fp8);
 
     // inspect_nr.py --extract
     std::vector<Record> records;
     try {
-        Pe pe(data, small ? "WEIGHTS_CC_SMALL_FP8" : "WEIGHTS_HT");
+        Pe pe(data, small_fp8 ? "WEIGHTS_CC_SMALL_FP8" : "WEIGHTS_HT");
         std::vector<Span> matches = pe.weights_ht();
         if (matches.size() != 1) throw FormatError(std::string("expected exactly one ") + pe.resource_name + " resource");
         records = parse_weights(matches[0]);
@@ -778,7 +780,7 @@ static void extract(const std::vector<u8>& dll, const fs::path& src, bool small,
     plan_splitswin(records, layers, plan);
     plan_vit(records, layers, plan);
     plan_preblock(records, plan);
-    plan_postblock(records, plan, small);
+    plan_postblock(records, plan, small_fp8);
 
     // pack_model.py --verify
     const unsigned count = selected.entry_count;
@@ -855,21 +857,21 @@ static void extract(const std::vector<u8>& dll, const fs::path& src, bool small,
     std::printf("%s: %u entries, %.1f MiB\n", out.u8string().c_str(), count, double(file_size) / 1048576.0);
 }
 
-// 310.9.16: CC_SILVER_AARDWOLD.bin (the old model, the DLL's preset 1) and CC_SMALL_FP8.bin (the new model, its default);
+// 310.9.16: CC_SILVER_AARDWOLD.bin (the DLL's preset 1) and CC_SMALL_FP8.bin (its default);
 // 310.8.0: CC_SILVER_AARDWOLD.bin only. As extract_model.sh.
 static int run(const fs::path& src, const fs::path& out) {
     std::error_code ec;
     if (!fs::is_directory(out, ec)) throw Failure("no such output folder: " + out.u8string());
     const std::vector<u8> dll = read_file(src);
     const std::string got = Sha256::of(dll.data(), dll.size());
-    if (got != kDllSha256 && got != kSmallDllSha256) {
+    if (got != kDll3108Sha256 && got != kDll3109Sha256) {
         const bool zip = dll.size() >= 4 && std::memcmp(dll.data(), "PK\3\4", 4) == 0;
         throw Failure(zip ? "This is a zip: extract nvngx_dlssnr.dll from it first."
                           : "This is not nvngx_dlssnr 310.9.16 or 310.8.0 (SHA256 " + got +
                                 "). One of these two DLL versions is required.");
     }
     extract(dll, src, false, out / "CC_SILVER_AARDWOLD.bin");
-    if (got == kSmallDllSha256) extract(dll, src, true, out / "CC_SMALL_FP8.bin");
+    if (got == kDll3109Sha256) extract(dll, src, true, out / "CC_SMALL_FP8.bin");
     return 0;
 }
 

@@ -45,11 +45,14 @@ struct NetworkConfig {
     bool resize_history = false;
     int osd = 1;   // OSD: 0 off, 1 after a switch, 2 always, 3 always with each layer's cost
     bool style_grade = true;   // Style Grade: Natural / Cinematic graded as NVIDIA's DLL (false: the older picture)
+    bool style_grade_accel = true;   // Style Grade Acceleration: that grade in closed form (false: step by step)
     bool memory_guard = false;  // Memory Guard (off by default since 0.0.8.3): a network only where its video memory is free (false: no such check)
     bool history_f16 = true;   // History Precision: 16 the history images RGBA16F (default), 32 RGBA32F
-    // OptimizedLayers: CC_SILVER_AARDWOLD_OPTIMIZED's level (nr::kLayersQuality / Balanced / Performance / Ultra (default));
+    // [CC_SILVER_AARDWOLD_OPTIMIZED] Layers: its level (nr::kLayersQuality / Balanced / Performance / Ultra (default));
     // `model` is already the one it picks (nr::network_with_layers)
-    int optimized_layers = 3;   // nr::kLayersDefault (Ultra Performance); a number: make_ini.py reads these defaults
+    int silver_aardwold_layers = 3;   // nr::kLayersDefault (Ultra Performance); a number: make_ini.py reads these defaults
+    // [CC_SMALL_FP8_OPTIMIZED] Layers: its level (Quality / Performance / Ultra; Balanced runs Quality)
+    int small_fp8_layers = 0;   // nr::kSmallFp8LayersDefault (Quality)
 };
 void write_network(FILE* f, const NetworkConfig& n);
 const char* residency_name(int r);   // auto, resident, offload, minimal
@@ -245,8 +248,8 @@ class NetworkSwitch {
   public:
     // The network wanted now. `ini`: the game's dlssnr-amd.ini.
     int frame(const std::string& ini);
-    // From a host's UI (or the hotkey): switch to `n`, and write Model (and for CC_SILVER_AARDWOLD_OPTIMIZED
-    // OptimizedLayers) to the file.
+    // From a host's UI (or the hotkey): switch to `n`, and write Model (and for an optimized network its Layers) to the
+    // file.
     void set(int n);
     // `n` cannot run in this run, and why (in a UI's words); an empty reason makes it available again.
     void unavailable(int n, const std::string& why);
@@ -255,7 +258,7 @@ class NetworkSwitch {
     const NetworkConfig& file() const { return file_; }   // [Network] as last read
   private:
     void write(int n);
-    void write_key(const char* key, const std::string& value);
+    void write_key(const char* section_name, const char* key, const std::string& value);
     int listed(int c) const;
     int next_available(int from) const;
     int fallback(int n) const;
@@ -272,8 +275,11 @@ class NetworkSwitch {
 // The ReShade add-on's settings, dlssnr-amd.ini next to it. Section [DlssNr]
 // with OptiScaler DLSS-NR's key names (ranges as the file's comments say), plus
 // ClassicScaler, History and WhitePoint, which are this project's.
+// A ReShade-route layer's network controls by default: nr::Controls' with NoiseEveryFrame on (as RenoDX's; the other routes
+// set it themselves). make_ini.py renders the default file with the same (it reads no function).
+inline Controls config_controls() { Controls c; c.noise_every_frame = true; return c; }
 struct Config {
-    Controls controls{};          // pass 1, Passes, Enabled, ApplyModel, the apply-edit controls
+    Controls controls = config_controls();   // pass 1, Passes, Enabled, ApplyModel, the apply-edit controls
     bool unlock_passes = false;
     bool colour_limit = true;     // ColourLimit (stacking: the edit's colour bounded, RenoDX's +/-1 stop)
     std::array<PassOverride, kMaxPasses - 1> pass{};   // pass[0] is pass 2
@@ -284,6 +290,8 @@ struct Config {
     uint32_t fast_method = fast::kDefaultMethod;   // as NRFastMethod: 0 Interleaved, 1 Extrapolation, 2 Feedback, 3 Hybrid, 4 Edit strength (the route's default)
     uint32_t fast_interleaved_passes = 3;   // FastInterleavedPasses 2..8
     uint32_t fast_interleaved_preset = fast::kDefaultInterleavedPreset;   // FastInterleavedPreset 1 | 2 (as NRFastInterleavedPreset)
+    bool fast_interleaved_depth_disocclusion = true;   // FastInterleavedDepthDisocclusion (as NRFastInterleavedDepthDisocclusion)
+    bool frame_reuse = false;     // FrameReuse (a wilsjo2 layer's): read so the ReShade route can leave such a layer out and say why
     // each method's own: [0] Extrapolation, [1] Feedback, [2] Hybrid
     float fast_passes[3] = {3.0f, 3.0f, 3.0f};       // 1..8
     bool fast_halo_limit[3] = {false, false, false};

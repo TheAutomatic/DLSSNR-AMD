@@ -255,7 +255,7 @@ struct Context {
         }
         di.enabledExtensionCount = uint32_t(ext_list.size()); di.ppEnabledExtensionNames = ext_list.data();
 #if NR_INT4
-        // int4 mixed: pipeline binaries for the int4 pipelines (Kernel::create rewrites their WMMA opcode in a
+        // int4 layers: pipeline binaries for the int4 pipelines (Kernel::create rewrites their WMMA opcode in a
         // captured binary), enabled when the driver has them.
         std::vector<const char*> exts_i4(di.ppEnabledExtensionNames, di.ppEnabledExtensionNames + di.enabledExtensionCount);
         VkPhysicalDevicePipelineBinaryFeaturesKHR pbf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR};

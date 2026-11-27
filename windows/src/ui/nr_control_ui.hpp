@@ -24,6 +24,8 @@
 namespace nr::control_ui {
 
 enum class Route { kOptiScaler, kReShade, kOptiScalerPresent };
+// A layer with frame reuse on, on the ReShade route: left out with this (the add-on does not run frame reuse)
+inline const char* reshade_reuse_reason() { return NR_N("Frame reuse requires the OptiScaler Present route."); }
 
 inline int key_index(const char* name) {
     for (int i = 0; i < renodx_keys::kCount; ++i)
@@ -92,7 +94,9 @@ bool draw_key_in(const renodx_keys::Key* table, int i, A& a, float hi_limit = 0.
                 const int v = int(a.u(i));
                 std::vector<std::pair<int, const char*>> items;
                 for (const char* p = k.items; *p; p += std::strlen(p) + 1) items.push_back({int(items.size()), p});
-                const char* shown = v >= 0 && v < int(items.size()) ? items[size_t(v)].second : "";
+                // (a value outside the list runs the key's default - the stage's enum parse - and is shown as that)
+                const int shown_v = v >= 0 && v < int(items.size()) ? v : int(k.def);
+                const char* shown = shown_v >= 0 && shown_v < int(items.size()) ? items[size_t(shown_v)].second : "";
                 if (*shown == '~') ++shown;
                 if (ImGui::BeginCombo(tr(k.label), tr(shown))) {
                     for (const auto& [n, name] : items) {
@@ -173,6 +177,7 @@ bool draw_table(const renodx_keys::Key* table, int count, A& a, const std::funct
         for (int i = 0; i < count; ++i) {
             if (std::strcmp(table[i].group, g) != 0) continue;
             const char* n = table[i].name;
+            if (std::strcmp(n, "FrameReuse") == 0) continue;   // the layer page's own line (draw_frame_reuse_in)
             const char* why = nullptr;
             if (working >= 0) {
                 const float scale = a.f(working);
@@ -195,6 +200,8 @@ bool draw_table(const renodx_keys::Key* table, int count, A& a, const std::funct
 
 // Placement, output rectangles, game exposure and frame-generation timing belong to the OptiScaler route.
 inline bool on_route(const char* name, Route route) {
+    // frame reuse: the .asi's routes only (the ReShade route hands no motion vectors / depth to it)
+    if (std::strcmp(name, "NRFrameReuse") == 0) return route != Route::kReShade;
     if (route == Route::kOptiScaler) return true;
     // Present is still the OptiScaler route: its frame-generation controls remain available.
     if (route == Route::kOptiScalerPresent &&
@@ -236,6 +243,7 @@ bool draw_renodx(A& a, Route route, bool running, const std::function<void()>& s
             const Key& k = kKeys[i];
             if (std::strcmp(k.group, g) != 0 || !on_route(k.name, route) || (keep && !keep(k.name))) continue;
             if (!running && std::strcmp(k.name, "Enabled") != 0) continue;
+            if (std::strcmp(k.name, "NRFrameReuse") == 0) continue;   // the layer page's own line (draw_frame_reuse)
             bool off = false;   // greyed out: the value is kept but does nothing now
             if (std::strncmp(k.name, "NRLook", 6) == 0 && std::strcmp(k.name, "NRLookMode") != 0 &&
                 std::strcmp(k.name, "NRLookUpsample") != 0)
@@ -270,6 +278,7 @@ bool draw_renodx(A& a, Route route, bool running, const std::function<void()>& s
         bool any = false;   // a group with nothing left to show (the .asi's layer page) gets no header
         for (int i = 0; i < kCount && !any; ++i)
             any = std::strcmp(kKeys[i].group, g) == 0 && on_route(kKeys[i].name, route) && (!keep || keep(kKeys[i].name)) &&
+                  std::strcmp(kKeys[i].name, "NRFrameReuse") != 0 &&
                   (running || std::strcmp(kKeys[i].name, "Enabled") == 0);
         if (!any && !(screenshot && std::strcmp(g, "Screenshot") == 0)) continue;
         if (std::strcmp(g, "Passes") == 0) {
@@ -321,7 +330,12 @@ bool draw_renodx(A& a, Route route, bool running, const std::function<void()>& s
                 if (!have_motion && m == 0u) ImGui::TextDisabled(tr("No motion vectors: Interleaved cannot run (one network pass)."));
                 // the chosen method's own settings (each method keeps its own)
                 if (m == 4u) changed |= draw_key(a, key_index("NRFastEditStrength"));
-                else if (m == 0u) { changed |= draw_key(a, key_index("NRFastInterleavedPreset")); changed |= draw_key(a, key_index("NRFastInterleavedPasses")); }
+                else if (m == 0u) {
+                    changed |= draw_key(a, key_index("NRFastInterleavedPreset"));
+                    changed |= draw_key(a, key_index("NRFastInterleavedPasses"));
+                    changed |= draw_key(a, key_index("NRFastInterleavedDepthDisocclusion"));
+                    ImGui::TextDisabled("%s", tr("If a grid of light squares appears (with strong upscaling, e.g. Ray Reconstruction), turn Depth disocclusion check off."));
+                }
                 else {
                     const std::string pre = std::string("NRFast") + names[m];
                     changed |= draw_key(a, key_index((pre + "Passes").c_str()));

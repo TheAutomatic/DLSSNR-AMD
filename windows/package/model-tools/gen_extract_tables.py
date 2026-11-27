@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Generate dlssnr_extract_tables.hpp for dlssnr_extract_model.cpp.
+"""Generate a dlssnr_extract_tables_<network>.hpp for dlssnr_extract_model.cpp.
 
 Embeds what the Python model tools read from disk at run time:
 
-  descriptor.json     each layer's (block, layer) key, type and channel counts,
+  descriptor-*.json   each layer's (block, layer) key, type and channel counts,
                       resolved as the unpackers resolve them (a dict keyed by
                       (block index, layer index); a later duplicate wins)
-  model-files.txt     the packed entries, in order, parsed as pack_model.py does
-  model-files.sha256  the expected sha256 per entry, parsed as pack_model.py
+  model-files-*.txt   the packed entries, in order, parsed as pack_model.py does
+  model-files-*.sha256  the expected sha256 per entry, parsed as pack_model.py
                       --verify does (a later duplicate wins), plus any names
-                      it lists that model-files.txt does not (pack fails on them)
+                      it lists that the .txt does not (pack fails on them)
 
     gen_extract_tables.py --descriptor D --list L --sums S --out H
 
@@ -36,11 +36,11 @@ def cstr(s):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--descriptor", type=Path, default=ROOT / "linux/package/model-tools/descriptor.json")
-    ap.add_argument("--list", type=Path, default=ROOT / "linux/package/model-tools/model-files.txt")
-    ap.add_argument("--sums", type=Path, default=ROOT / "linux/package/model-tools/model-files.sha256")
+    ap.add_argument("--descriptor", type=Path, default=ROOT / "linux/package/model-tools/descriptor-CC_SILVER_AARDWOLD.json")
+    ap.add_argument("--list", type=Path, default=ROOT / "linux/package/model-tools/model-files-CC_SILVER_AARDWOLD.txt")
+    ap.add_argument("--sums", type=Path, default=ROOT / "linux/package/model-tools/model-files-CC_SILVER_AARDWOLD.sha256")
     ap.add_argument("--out", type=Path,
-                    default=ROOT / "windows/package/model-tools/dlssnr_extract_tables.hpp")
+                    default=ROOT / "windows/package/model-tools/dlssnr_extract_tables_cc_silver_aardwold.hpp")
     ap.add_argument("--namespace", default="tables")
     ap.add_argument("--shared-types", action="store_true")
     a = ap.parse_args()
@@ -89,12 +89,12 @@ def main():
     out += ["};", "static const Layer kLayers[] = {"]
     out += ["    {%d, %d, %d, %d, %d}," % r for r in rows]
     out += ["};", "static const unsigned kLayerCount = %d;" % len(rows),
-            "// Entry name and expected sha256 (\"\" when model-files.sha256 lacks it).",
+            "// Entry name and expected sha256 (\"\" when %s lacks it)." % a.sums.name,
             "using Entry = tables::Entry;" if a.shared_types else "struct Entry { const char* name; const char* sha256; };",
             "static const Entry kEntries[] = {"]
     out += ["    {%s, %s}," % (cstr(n), cstr(want.get(n, ""))) for n in names]
     out += ["};", "static const unsigned kEntryCount = %d;" % len(names),
-            "// Names in model-files.sha256 that model-files.txt lacks.",
+            "// Names in %s that %s lacks." % (a.sums.name, a.list.name),
             "static const char* const kVerifyExtra[] = {"]
     out += ["    %s," % cstr(n) for n in extra]
     out += ["    nullptr,", "};", "}  // namespace %s" % a.namespace, ""]

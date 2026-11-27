@@ -1,3 +1,5 @@
+#include "nr_frame_pair.hpp"
+#include "nr_frame_chain.hpp"
 #include "nr_path_win.hpp"
 #include "nr_pe_session.hpp"
 #include "nr_pe_events.hpp"
@@ -6,6 +8,8 @@
 #include "nrvk.hpp"   // nrvk::blit, compute_only_recording
 #include "nr_wilsjo2.hpp"
 #include "nr_wilsjo2_flow.hpp"
+#include "nr_frame_reuse.hpp"
+#include "nr_frame_reuse_policy.hpp"
 #include "nr_vram_tag.hpp"
 #include "nr_vram_ledger.hpp"
 #include "nr_ini_network.hpp"
@@ -31,10 +35,18 @@
 #include <new>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 namespace nr::pe {
 namespace {
+// Session::note_frame_generation / note_hud_fix / frames_delayed (NRFrameReuse's even frames at the Present)
+std::atomic<const char*> g_fg_reason{frame_reuse::fg_unsynced};
+std::atomic<int> g_frame_generation{0};
+std::atomic<bool> g_hud_fix{false};
+std::atomic<int64_t> g_frames_delayed_ms{0};   // when a Present's NRFrameReuse last ran even (steady clock, ms; 0 not)
+std::atomic<int> g_next_frames_delay{0};
+std::atomic<int> g_frames_delay{0};            // ... and by how many frames its pictures came late then (1, or 2 two-sided)
 
 using nr::pe::log;
 
@@ -96,7 +108,8 @@ static int config_net(const RuntimeConfig& c) {
 #else
     if (c.network == 3) return nr::kSilverAardwoldOptimizedFp8;
 #endif
-    return c.network == 2 ? nr::kSmallFp8Experimental : c.network == 1 ? nr::kSmallFp8 : nr::kSilverAardwold;
+    if (c.network == 2) return nr::network_with_layers(nr::kSmallFp8Optimized, std::max(c.layers, 0));
+    return c.network == 1 ? nr::kSmallFp8 : nr::kSilverAardwold;
 }
 
 struct Session::Impl {
@@ -150,7 +163,7 @@ struct Session::Impl {
         for (const auto& [layer, at] : b.layers) if (now - at < kNetIdle) return true;
         return false;
     }
-    // Networks of one [Int4Mixed] kind kept at once (see the adoption in ensure_runtime_), and runtimes: those built
+    // Networks of one kind (a network at one level of its optimized layers) kept at once (see the adoption in ensure_runtime_), and runtimes: those built
     // from another's network (Runtime::share_for, an extent with the same working extent) hold their own images only.
     static constexpr size_t kMaxResident = 2;
     static constexpr size_t kMaxEntries = 4;
@@ -184,11 +197,11 @@ struct Session::Impl {
     // The network a runtime runs (nr::NetworkChoice).
     static int net_of(const Runtime& r) {
 #if NR_INT4
-        if (r.optimized()) return nr::network_with_layers(nr::kSilverAardwoldOptimized, r.layers());
+        if (r.silver_aardwold_optimized()) return nr::network_with_layers(nr::kSilverAardwoldOptimized, r.layers());
 #endif
-        if (r.optimized()) return nr::kSilverAardwoldOptimizedFp8;
-        if (r.experimental()) return nr::kSmallFp8Experimental;
-        return r.network() == NetworkModel::Small ? nr::kSmallFp8 : nr::kSilverAardwold;
+        if (r.silver_aardwold_optimized()) return nr::kSilverAardwoldOptimizedFp8;
+        if (r.small_fp8_optimized()) return nr::network_with_layers(nr::kSmallFp8Optimized, r.layers());
+        return r.network() == NetworkModel::SmallFp8 ? nr::kSmallFp8 : nr::kSilverAardwold;
     }
     RuntimeConfig make_config(uint32_t w, uint32_t h, VkFormat f) const;
     HostDevice make_host() const;
@@ -255,6 +268,9 @@ struct Session::Impl {
     // The last RenoDX-style frame's decisions (renodx::Stage::facts), for the menus' engine-data panel.
     renodx::Stage::Facts renodx_facts{};
     bool renodx_facts_known{};
+    uint32_t reuse_state{};          // frame reuse on the last RenoDX run (Session::State::reuse)
+    float reuse_share{-1.f};
+    std::string reuse_note_ui;
     bool carry(VkCommandBuffer cmd, uint64_t feature);
     // The feature being evaluated, and the network memory each feature last ran in: a new frame size of a feature
     // takes its memory again when it fits (OptiScaler's NR before and after the upscaler keep one each, and one
@@ -292,7 +308,7 @@ struct Session::Impl {
     // Evicted networks wait here before they are destroyed. run_after and run_present record the network into
     // the game's own command list (vkd3d-proton's command buffer), which the game submits and the GPU runs frames
     // later: a network that served the previous frame can still be read by the GPU when its replacement is
-    // adopted (the [Int4Mixed] switch, a resolution change). Destroying it then frees memory under in-flight work
+    // adopted (an Optimized layers switch, a resolution change). Destroying it then frees memory under in-flight work
     // and hangs the GPU. Freed after kRetireCalls more evaluations and kRetireTime, far past any frame in flight.
     struct Retired { std::unique_ptr<Runtime> runtime; uint64_t call; std::chrono::steady_clock::time_point at; };
     std::vector<Retired> retired;
@@ -354,9 +370,29 @@ struct Session::Impl {
     void poll_offload();
     // RAM below max(2 GiB, 10 %) available: offloaded networks are freed, the oldest first.
     static bool ram_short();
+    // NRFrameReuse / a wilsjo2 layer's FrameReuse: around the layer's NR (made at the frame's first use, at its extent,
+    // format and guide sizes); the settings it last ran with (any change restarts it); why it cannot run (noted once per
+    // change). `S`: the layer's settings (renodx::Settings, nr::wilsjo2::Settings).
+    template <class S> struct ReuseFields {
+        std::unique_ptr<frame_reuse::Stage> reuse;
+        S reuse_settings{};
+        std::string reuse_note;
+        std::set<std::string> reuse_said;   // the reasons it could not run, said once each
+        std::string reuse_ui;               // NR Control's line while it cannot run
+        std::chrono::steady_clock::time_point alloc_retry_after{};
+        std::string reuse_failed;           // last allocation error, while the retry interval elapses
+        frame_reuse::Stage::Stats reuse_window{};   // the GPU's decisions at the start of NR Control's window
+        float reuse_share = -1.f;           // the share of frames with NR over the last window, < 0 none yet
+        uint64_t reuse_pauses{};            // frames it was paused for a passing reason (no vectors / depth: menus)
+        uint32_t reuse_passing{};           // frames in a row with a passing reason (said from kReusePassingSaid on)
+        uint64_t reuse_frames{}, reuse_epoch{};
+        frame_reuse::Stage::Stats reuse_logged{};   // the GPU's decisions at the last log line
+        VkFormat reuse_motion_format{}, reuse_depth_format{};   // the guides' formats it was made for (a change remakes it)
+    };
     // The RenoDX-style option: one stage per feature, made at the frame's extent, format and HDR judgement.
     // A replaced or released one is kept for kRetireCalls more evaluations and kRetireTime, as networks are.
-    struct RenoDXEntry {
+    struct RenoDXEntry : ReuseFields<renodx::Settings> {
+        ReuseFields<renodx::Settings> pair_fields;
         std::unique_ptr<renodx::Stage> stage;
         uint32_t w{}, h{}, nw{}, nh{}, present{};
         VkFormat format{VK_FORMAT_UNDEFINED};
@@ -367,13 +403,21 @@ struct Session::Impl {
         float scale{-1.0f};
         bool follow{};
         uint32_t stack{1};   // the model passes its stack last ran: pass k > 0 keeps a history of its own
+        // A replacement with an unsubmitted split still owns both its images and its network recording.
+        std::unique_ptr<renodx::Stage> finishing_stage;
+        std::unique_ptr<frame_reuse::Stage> finishing_reuse;
     };
     std::map<uint64_t, RenoDXEntry> renodx;
     // ---- wilsjo2 layers of the ReShade route: nr_wilsjo2_flow.hpp, the flow the .asi runs, around the network (which
     // runs network-only, as for RenoDX). Per feature: the flow's state; the surfaces ours, retired once the GPU is done
     // with them (or, without a proof, after 64 evaluations and 2 s).
     struct W2Surface { VkImage image{}; VkDeviceMemory memory{}; VkFormat format{VK_FORMAT_UNDEFINED}; uint32_t w{}, h{}; };
-    struct W2Entry { nr::wilsjo2::FlowState flow; W2Surface* work{}; uint32_t passes{}; };
+    // (FrameReuse on a wilsjo2 layer of the .asi's Present: ReuseFields, as a RenoDX layer's)
+    struct W2Entry : ReuseFields<nr::wilsjo2::Settings> {
+        ReuseFields<nr::wilsjo2::Settings> pair_fields;
+        nr::wilsjo2::FlowState flow; uint64_t last_present = 0; W2Surface *work{}, *pq_linear{}, *pq_result{}; uint32_t passes{};
+        Preprocess reuse_prep{};   // [Preprocess] its frame reuse last ran with (a change restarts it, as a setting's)
+    };
     std::map<uint64_t, W2Entry> w2;
     std::unique_ptr<nr::wilsjo2::Stage> w2_stage;
     // the wilsjo2 Stage could not be made: when (steady ms; 0 never), tried again 5 s later; said once
@@ -383,6 +427,8 @@ struct Session::Impl {
     bool w2_fast_fallback = false, w2_motion = false;
     uint8_t w2_il_missing = 0;
     bool w2_fast_fallback_spatial = false;
+    nr::wilsjo2::FlowFacts w2_facts{};          // the last wilsjo2 run's flow facts (Session::state())
+    bool w2_facts_known = false;
     nr::wilsjo2::SpatialLayout w2_spatial{};    // the last wilsjo2 run's peripheral compression (Session::spatial_layout)
     bool w2_spatial_on = false;
     struct W2Retired { W2Surface* s; nr::gpu::Uses uses; uint64_t call; std::chrono::steady_clock::time_point at; };
@@ -415,6 +461,11 @@ struct Session::Impl {
                          const Controls& controls, Controls* net);
     bool record_wilsjo2(VkCommandBuffer cmd, const ColourFrame& colour, const EngineFrame& engine, const Controls& net,
                         const Session::Wilsjo2Frame& wf);
+    // The flow itself on `colour` in place. `cmd` follows frame reuse's split into its second part (W2Split: the even
+    // frames' network split; `history` < 0 the layer's history strength, else this one).
+    struct W2Split { VkCommandBuffer tail; float share; };
+    bool record_wilsjo2_flow(VkCommandBuffer& cmd, const ColourFrame& colour, const EngineFrame& engine, const Controls& net,
+                             const Session::Wilsjo2Frame& wf, const W2Split* split = nullptr, float history = -1.f);
     // The history pass k of a feature's stack runs on (pass 0: the feature's own).
     static uint64_t stack_feature(uint64_t feature, uint32_t k) {
         return k == 0 ? feature : (uint64_t(1) << 62) | (feature << 8) | k;
@@ -443,7 +494,11 @@ struct Session::Impl {
     // The RenoDX-style option's cost for NR Control and the log: a timestamp pair around the whole stage and one
     // around each pass's network, in the same frame, a ring of frames read back without waiting, averaged as the
     // runtime averages its own (the runtime's own timing covers one pass at a time).
-    static constexpr uint32_t kStageSlots = 8, kStageQueries = 2 + 2 * renodx::kMaxUnlockedPasses;
+    // A slot: start, end, a pair a network pass (its first part when split), then the pairs of the second parts the
+    // recording before left to run in this one (NRFrameReuse's even frames: their network time is this slot's).
+    static constexpr uint32_t kStageSlots = 8, kStageCarriedAt = 2 + 2 * renodx::kMaxUnlockedPasses,
+                              kStageQueries = kStageCarriedAt + 2 * renodx::kMaxUnlockedPasses;
+    uint32_t stage_slot_carried[kStageSlots] = {};   // second-part pairs written into the slot
     VkQueryPool stage_timing{};
     bool stage_timing_tried{};
     double stage_timestamp_ns{};
@@ -474,6 +529,10 @@ struct Session::Impl {
     int outer_slot_layer[kOuterSlots]{};
     uint32_t outer_slot_gen[kOuterSlots]{};
     uint32_t outer_slot_passes[kOuterSlots]{};
+    // a frame reuse stage ran in the open outer run (a wilsjo2 layer's): a rebuilt frame's run has no network and
+    // counts as 0 ms of it, as a RenoDX stage's (a split network's second part is timed in its first part's slot)
+    bool outer_reuse{};
+    bool outer_slot_reuse[kOuterSlots]{};
     std::map<int, float> outer_avg, outer_net_avg;
     // When each layer's outer run was last recorded: an average is the layer's only while its runs go on (a layer that
     // was wilsjo2 and is RenoDX now, or removed and added again, must not show the old run's time for good)
@@ -516,7 +575,7 @@ struct Session::Impl {
         const float ms = float(double(stamps[1] - stamps[0]) * stage_timestamp_ns / 1e6);
         float& a = outer_avg[outer_slot_layer[outer_slot]];
         a = a > 0.0f ? a + (ms - a) * 0.1f : ms;
-        if (!outer_slot_passes[outer_slot]) return;
+        if (!outer_slot_passes[outer_slot] && !outer_slot_reuse[outer_slot]) return;
         uint64_t net = 0;
         for (uint32_t p = 0; p < outer_slot_passes[outer_slot]; ++p)
             if (stamps[3 + 2 * p] > stamps[2 + 2 * p]) net += stamps[3 + 2 * p] - stamps[2 + 2 * p];
@@ -540,6 +599,14 @@ struct Session::Impl {
         uint64_t net = 0;
         for (uint32_t p = 0; p < stage_slot_passes[stage_slot]; ++p)
             if (stamps[3 + 2 * p] > stamps[2 + 2 * p]) net += stamps[3 + 2 * p] - stamps[2 + 2 * p];
+        if (const uint32_t c = stage_slot_carried[stage_slot]) {   // the second parts run in this recording
+            uint64_t carried[2 * renodx::kMaxUnlockedPasses] = {};
+            if (vkGetQueryPoolResults(handles.device, stage_timing, stage_slot * kStageQueries + kStageCarriedAt, 2 * c,
+                                      2 * c * sizeof(uint64_t), carried, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS)
+                return;
+            for (uint32_t p = 0; p < c; ++p)
+                if (carried[1 + 2 * p] > carried[2 * p]) net += carried[1 + 2 * p] - carried[2 * p];
+        }
         const float ms = float(double(stamps[1] - stamps[0]) * stage_timestamp_ns / 1e6);
         const float net_ms = float(double(net) * stage_timestamp_ns / 1e6);
         if (std::getenv("NR_LAYER_TIMING_DIAG"))
@@ -601,6 +668,10 @@ struct Session::Impl {
         sh.mapped = nullptr; sh.buffer = VK_NULL_HANDLE; sh.memory = VK_NULL_HANDLE; sh.done = VK_NULL_HANDLE;
     }
     // Readbacks for a w x h pair of `format`, stamped (nr_screenshot.hpp); null when anything fails.
+    // The NR screenshot of a session wilsjo2 layer at the upscaler (as Session::capture_begin / capture_end): the frame
+    // before NR copied out (null: none wanted, or it cannot be taken), then after it
+    std::unique_ptr<Shot> w2_capture_begin(VkCommandBuffer cmd, const ColourFrame& f, uint8_t hdr_mode, const char* path);
+    void w2_capture_end(VkCommandBuffer cmd, std::unique_ptr<Shot> sh, const ColourFrame& f);
     std::unique_ptr<Shot> shot_prepare(uint32_t w, uint32_t h, VkFormat format, VkFormat pre = VK_FORMAT_UNDEFINED) {
         auto sh = std::make_unique<Shot>();
         sh->bytes = uint64_t(w) * h * std::max(screenshot::bytes_per_pixel(format), screenshot::bytes_per_pixel(pre));
@@ -941,11 +1012,50 @@ struct Session::Impl {
         diag_slot->pending = true;
         diag_slot = nullptr;
     }
-    struct RenoDXRetired { std::unique_ptr<renodx::Stage> stage; uint64_t call; std::chrono::steady_clock::time_point at; };
+    // (a stage's frame reuse goes with it: its anchored answers belong to that stage's histories)
+    struct RenoDXRetired { std::unique_ptr<renodx::Stage> stage; uint64_t call; std::chrono::steady_clock::time_point at;
+                           std::unique_ptr<frame_reuse::Stage> reuse; };
     std::vector<RenoDXRetired> renodx_retired;
-    void retire_stage(std::unique_ptr<renodx::Stage> stage) {
-        if (stage) renodx_retired.push_back({std::move(stage), calls, std::chrono::steady_clock::now()});
+    void retire_stage(std::unique_ptr<renodx::Stage> stage, std::unique_ptr<frame_reuse::Stage> reuse = {}) {
+        if (reuse) reuse->cancel();
+        if (stage || reuse) renodx_retired.push_back({std::move(stage), calls, std::chrono::steady_clock::now(), std::move(reuse)});
     }
+    uint64_t last_advanced_present=0;
+    void advance_terminal(VkCommandBuffer cmd) {
+        auto* at = frame_pair::PresentAge::active;
+        if (!at || at->id==last_advanced_present) return;
+        last_advanced_present=at->id;
+        const auto advance = [&](auto& entries) {
+            for (auto& item : entries) {
+                auto& r = item.second.reuse;
+                if (r && r->pending() && r->can_flush_on(handles.device, access.family)) r->advance(cmd);
+            }
+        };
+        advance(renodx);
+        advance(w2);
+    }
+    void replace_stage(RenoDXEntry& e) {
+        if (e.reuse && e.reuse->pending()) {
+            // The next record drains this pair before it can schedule another tail for this feature.
+            e.finishing_stage = std::move(e.stage);
+            e.finishing_reuse = std::move(e.reuse);
+        } else {
+            retire_stage(std::move(e.stage), std::move(e.reuse));
+        }
+    }
+    bool finish_replacement(RenoDXEntry& e, VkCommandBuffer cmd) {
+        if (!e.finishing_reuse) return true;
+        const bool compatible = cmd && e.finishing_reuse->can_flush_on(handles.device, access.family);
+        if (compatible) e.finishing_reuse->flush(cmd);
+        retire_stage(std::move(e.finishing_stage), std::move(e.finishing_reuse));
+        return compatible;
+    }
+    frame_reuse::Stage* reuse_stage(VkCommandBuffer cmd, RenoDXEntry& e, const renodx::StageFrame& sf,
+                                    const renodx::Settings& rs, bool neutral, const char* blocked, bool scrgb);
+    // The same for any layer's ReuseFields: `legacy` its Passes legacy, `equal` its settings' compare (a change restarts it).
+    template <class S, class Equal>
+    frame_reuse::Stage* reuse_stage_for(VkCommandBuffer cmd, ReuseFields<S>& e, const renodx::StageFrame& sf, const S& rs,
+                                        bool neutral, const char* blocked, bool scrgb, Equal equal, bool kernel=false);
     bool renodx_runtime(const Controls& controls, uint32_t w, uint32_t h, Controls* c);
     void renodx_extent(uint64_t feature, uint32_t w, uint32_t h, uint32_t guide_w, uint32_t guide_h,
                        const renodx::Settings& settings, uint32_t* nw, uint32_t* nh);
@@ -957,8 +1067,13 @@ struct Session::Impl {
     void free_retired_stages() {
         const auto now = std::chrono::steady_clock::now();
         for (size_t i = renodx_retired.size(); i-- > 0;)
-            if (calls - renodx_retired[i].call > kRetireCalls && now - renodx_retired[i].at > kRetireTime && renodx_retired[i].stage->recordings_done())
+            if (calls - renodx_retired[i].call > kRetireCalls && now - renodx_retired[i].at > kRetireTime &&
+                (!renodx_retired[i].stage || renodx_retired[i].stage->recordings_done()) &&
+                (!renodx_retired[i].reuse || renodx_retired[i].reuse->recordings_done())) {
+                if (renodx_retired[i].reuse)
+                    log("[nr] frame reuse's %llu MiB freed", (unsigned long long)(renodx_retired[i].reuse->image_bytes() >> 20));
                 renodx_retired.erase(renodx_retired.begin() + std::ptrdiff_t(i));
+            }
     }
     // The entry in `cache` the run paths are using. Raw, because the cache owns
     // them; null until the first build lands.
@@ -1089,9 +1204,11 @@ struct Session::Impl {
     // shared one is zero-filled at every turn).
     std::map<int, std::map<int, std::chrono::steady_clock::time_point>> net_users;
     int wanted_network_(int model) {
-        // a layer's CC_SILVER_AARDWOLD_OPTIMIZED: at the level [Network] OptimizedLayers says (lower when it cannot run)
+        // a layer's optimized network: at the level its Layers key says (lower when it cannot run)
         int layer = call_net < 0 || call_net >= nr::kNetworkChoices ? call_net
-                  : nr::network_with_layers(call_net, net_switch.file().optimized_layers);
+                  : nr::network_with_levels(call_net, net_switch.file().silver_aardwold_layers, net_switch.file().small_fp8_layers);
+        if (layer == nr::kSmallFp8OptimizedUltra && !net_switch.available(layer)) layer = nr::kSmallFp8OptimizedPerformance;
+        if (layer == nr::kSmallFp8OptimizedPerformance && !net_switch.available(layer)) layer = nr::kSmallFp8Optimized;
         if (layer == nr::kSilverAardwoldOptimizedUltra && !net_switch.available(layer)) layer = nr::kSilverAardwoldOptimizedPerformance;
         if (layer == nr::kSilverAardwoldOptimizedPerformance && !net_switch.available(layer)) layer = nr::kSilverAardwoldOptimized;
         if (layer == nr::kSilverAardwoldOptimized && !net_switch.available(layer)) layer = nr::kSilverAardwoldOptimizedFp8;
@@ -1147,7 +1264,7 @@ struct Session::Impl {
     // Make `entry` the one the run paths use. Returns false when there is no
     // such entry.
     bool select_runtime(uint32_t w, uint32_t h, VkFormat format);
-    // The running network serves while another builds (an [Int4Mixed] or pass-count switch): it is in use.
+    // The running network serves while another builds (an Optimized layers or pass-count switch): it is in use.
     void touch_running() {
         for (auto& e : cache)
             if (e.runtime.get() == runtime) { e.last = std::chrono::steady_clock::now(); e.used = ++use_stamp; }
@@ -1395,7 +1512,7 @@ bool Session::Impl::ensure_slots(uint32_t count) {
 // kept) is not checked here (Runtime::share_for); one whose weights went to RAM is, as a whole build (an upper bound).
 // NR_ARENA_REUSE=0 (no sharing in the arena): the old 520 bytes a pixel + 300 MB.
 // {fixed MiB, MiB per padded megapixel}: measured on an RX 9070 XT (Mesa 26.2.6, cold builds), MiB at
-// 1920x1080 / 2560x1440 / 3840x2160: CC_SMALL_FP8 and _EXPERIMENTAL 320 / 461 / 806, CC_SILVER_AARDWOLD and OPTIMIZED
+// 1920x1080 / 2560x1440 / 3840x2160: CC_SMALL_FP8 and _OPTIMIZED 320 / 461 / 806, CC_SILVER_AARDWOLD and OPTIMIZED
 // Quality 397 / 569 / 934, OPTIMIZED Balanced 421 / 598 / 978; the least-squares line raised to the highest point.
 // Performance and Ultra Performance: Balanced's (the biggest measured). Other GPUs can need much more (RDNA3); the
 // first build measured on the GPU takes over.
@@ -1409,7 +1526,8 @@ bool Session::Impl::ensure_slots(uint32_t count) {
 struct BuildMemory { double fixed_mib, mib_per_mpx; };
 static BuildMemory build_memory(int net) {
     switch (net) {
-        case nr::kSmallFp8: case nr::kSmallFp8Experimental: return {NR_MEM_SMALL};
+        case nr::kSmallFp8: case nr::kSmallFp8Optimized: case nr::kSmallFp8OptimizedPerformance:
+        case nr::kSmallFp8OptimizedUltra: return {NR_MEM_SMALL};
         case nr::kSilverAardwold: return {NR_MEM_ORIGINAL};
         case nr::kSilverAardwoldOptimizedFp8: return {NR_MEM_OPT_QUALITY};
         case nr::kSilverAardwoldOptimized: return {NR_MEM_OPT_BALANCED};
@@ -1815,7 +1933,7 @@ std::shared_ptr<ActArenaRef> Session::Impl::act_for(int net) const {
     return best;
 }
 
-// At most kMaxResident networks of each [Int4Mixed] kind: one per extent the session serves at once (OptiScaler's NR
+// At most kMaxResident networks of each kind (a network at one level of its optimized layers): one per extent the session serves at once (OptiScaler's NR
 // before and after the upscaler), and kMaxEntries runtimes (several extents of one working extent share a network).
 // Extents left behind - a resolution change, a RenoDX-style resolution scale, a game's dynamic resolution - go least
 // recently used first, once unused for kIdleDrop: more extents in use at once than the caps stay, rather than being
@@ -1932,6 +2050,7 @@ bool Session::Impl::ensure_runtime(const Controls& controls, uint32_t w, uint32_
     last_w = w; last_h = h; last_format = format;
     if (ok && runtime) {
         runtime->set_style_grade(net_switch.file().style_grade && !raw_call);   // [Network] Style Grade, live (not on a raw call)
+        runtime->set_style_grade_acceleration(net_switch.file().style_grade_accel);   // [Network] Style Grade Acceleration, live
         runtime->set_history_f16(net_switch.file().history_f16);   // [Network] History Precision, live
         feature_slot[current_feature] = runtime->network_id();
         Runtime*& last = feature_runtime[current_feature];
@@ -2311,12 +2430,14 @@ RuntimeConfig Session::Impl::make_config(uint32_t w, uint32_t h, VkFormat f) con
     RuntimeConfig config;
     config.root = root; config.width = w; config.height = h; config.colour_format = f;
     config.motion_point = motion_point;
-    // RuntimeConfig::network: 1 the small model, 2 CC_SMALL_FP8_EXPERIMENTAL, 3 CC_SILVER_AARDWOLD_OPTIMIZED, 0 the
-    // 310.8 one
-    config.network = net_want == nr::kSmallFp8 ? 1 : net_want == nr::kSmallFp8Experimental ? 2
-                   : nr::network_optimized(net_want) ? 3 : 0;
+    // RuntimeConfig::network: 1 CC_SMALL_FP8, 2 CC_SMALL_FP8_OPTIMIZED, 3 CC_SILVER_AARDWOLD_OPTIMIZED, 0
+    // CC_SILVER_AARDWOLD; layers: the optimized networks' level (CC_SILVER_AARDWOLD_OPTIMIZED's above Quality: int4 builds only)
+    config.network = net_want == nr::kSmallFp8 ? 1 : nr::network_small_fp8_optimized(net_want) ? 2
+                   : nr::network_silver_aardwold_optimized(net_want) ? 3 : 0;
 #if NR_INT4
-    config.layers = nr::network_optimized(net_want) ? nr::network_layers(net_want) : nr::kLayersQuality;
+    config.layers = nr::network_levelled(net_want) ? nr::network_layers(net_want) : nr::kLayersQuality;
+#else
+    if (nr::network_small_fp8_optimized(net_want)) config.layers = nr::network_layers(net_want);
 #endif
     return config;
 }
@@ -2607,6 +2728,9 @@ void Session::Impl::heap_poll() {
 // [Network] Resize History = 1: the feature's history from the runtime at its previous size, scaled into the one it
 // runs on now, instead of starting afresh (Runtime::carry_history). False: a fresh start (Reset), as NVIDIA's DLL.
 bool Session::Impl::carry(VkCommandBuffer cmd, uint64_t feature) {
+    // A resize can carry the old network history before record_renodx is reached.
+    const auto previous = renodx.find(feature);
+    if (previous != renodx.end() && !finish_replacement(previous->second, cmd)) return false;
     const auto now = std::chrono::steady_clock::now();
     if (now - resize_history_read > std::chrono::seconds(1)) {
         resize_history_read = now;
@@ -2646,21 +2770,40 @@ void Session::Impl::check_availability() {
         net_switch.unavailable(nr::kSmallFp8, "needs the model of the 310.9.16 nvngx_dlssnr.dll (install.sh --dll)");
     if (!exists("dlssnr-amd\\CC_SILVER_AARDWOLD.bin"))
         net_switch.unavailable(nr::kSilverAardwold, "the model file is missing (run install.sh again)");
-    if (!exists("dlssnr-amd\\experimental\\shaders\\fixed-attention.txt"))
-        net_switch.unavailable(nr::kSmallFp8Experimental, "not installed (run install.sh again)");
-    else if (!exists("dlssnr-amd\\CC_SMALL_FP8_EXPERIMENTAL.bin"))
-        net_switch.unavailable(nr::kSmallFp8Experimental, "needs the model of the 310.9.16 nvngx_dlssnr.dll (install.sh --dll)");
+    // CC_SMALL_FP8_OPTIMIZED (Quality), then Performance: Quality's needs and its own shaders
+    if (!exists("dlssnr-amd\\CC_SMALL_FP8_OPTIMIZED\\shaders\\fixed-attention.txt"))
+        net_switch.unavailable(nr::kSmallFp8Optimized, "not installed (run install.sh again)");
+    else if (!exists("dlssnr-amd\\CC_SMALL_FP8_OPTIMIZED.bin"))
+        net_switch.unavailable(nr::kSmallFp8Optimized, "needs the model of the 310.9.16 nvngx_dlssnr.dll (install.sh --dll)");
+    if (!net_switch.reason(nr::kSmallFp8Optimized).empty())
+        net_switch.unavailable(nr::kSmallFp8OptimizedPerformance, net_switch.reason(nr::kSmallFp8Optimized));
+    else if (!exists("dlssnr-amd\\CC_SMALL_FP8_OPTIMIZED-performance\\shaders\\vit-kv-pool.txt"))
+        net_switch.unavailable(nr::kSmallFp8OptimizedPerformance, "not installed (run install.sh again)");
+    // its Ultra Performance: Performance's needs and its int4 layers (as CC_SILVER_AARDWOLD_OPTIMIZED's)
+    if (!net_switch.reason(nr::kSmallFp8OptimizedPerformance).empty())
+        net_switch.unavailable(nr::kSmallFp8OptimizedUltra, net_switch.reason(nr::kSmallFp8OptimizedPerformance));
+#if NR_INT4
+    else if (!exists("dlssnr-amd\\CC_SMALL_FP8_OPTIMIZED-ultra\\settings.txt"))
+        net_switch.unavailable(nr::kSmallFp8OptimizedUltra, "its int4 layers are not installed (run install.sh again)");
+    else if (!exists("dlssnr-amd\\CC_SMALL_FP8_OPTIMIZED_INT4.bin"))
+        net_switch.unavailable(nr::kSmallFp8OptimizedUltra, "its int4 weights were not made at install (run install.sh again)");
+    else if (!vkGetDeviceProcAddr(handles.device, "vkCreatePipelineBinariesKHR"))
+        net_switch.unavailable(nr::kSmallFp8OptimizedUltra, "its int4 layers need the INT4 launch option install.sh printed");
+#else
+    else
+        net_switch.unavailable(nr::kSmallFp8OptimizedUltra, "its int4 layers are not in this build");
+#endif
     // CC_SILVER_AARDWOLD_OPTIMIZED (Quality), then its int4 layers on top (Balanced, then Performance, Ultra Performance)
     if (!exists("dlssnr-amd\\CC_SILVER_AARDWOLD.bin"))
         net_switch.unavailable(nr::kSilverAardwoldOptimizedFp8, "the model file is missing (run install.sh again)");
-    else if (!exists("dlssnr-amd\\optimized\\shaders\\fixed-attention.txt"))
+    else if (!exists("dlssnr-amd\\CC_SILVER_AARDWOLD_OPTIMIZED\\shaders\\fixed-attention.txt"))
         net_switch.unavailable(nr::kSilverAardwoldOptimizedFp8, "not installed (run install.sh again)");
     else if (!exists("dlssnr-amd\\CC_SILVER_AARDWOLD_OPTIMIZED.bin"))
         net_switch.unavailable(nr::kSilverAardwoldOptimizedFp8, "its weights were not made at install (run install.sh again)");
     if (!net_switch.reason(nr::kSilverAardwoldOptimizedFp8).empty())
         net_switch.unavailable(nr::kSilverAardwoldOptimized, net_switch.reason(nr::kSilverAardwoldOptimizedFp8));
 #if NR_INT4
-    else if (!exists("dlssnr-amd\\int4\\settings.txt"))
+    else if (!exists("dlssnr-amd\\CC_SILVER_AARDWOLD_OPTIMIZED-balanced\\settings.txt"))
         net_switch.unavailable(nr::kSilverAardwoldOptimized, "its int4 layers are not installed (run install.sh again)");
     else if (!exists("dlssnr-amd\\CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin"))
         net_switch.unavailable(nr::kSilverAardwoldOptimized, "its int4 weights were not made at install (run install.sh again)");
@@ -2672,8 +2815,8 @@ void Session::Impl::check_availability() {
 #endif
     // Performance and Ultra Performance: Balanced's needs (the int4 weights are one file, their FP8 weights in the
     // optimized pack) and their own data
-    for (const auto& [lv, dir] : {std::pair<int, const char*>{nr::kSilverAardwoldOptimizedPerformance, "dlssnr-amd\\int4-performance\\settings.txt"},
-                                  std::pair<int, const char*>{nr::kSilverAardwoldOptimizedUltra, "dlssnr-amd\\int4-ultra\\settings.txt"}}) {
+    for (const auto& [lv, dir] : {std::pair<int, const char*>{nr::kSilverAardwoldOptimizedPerformance, "dlssnr-amd\\CC_SILVER_AARDWOLD_OPTIMIZED-performance\\settings.txt"},
+                                  std::pair<int, const char*>{nr::kSilverAardwoldOptimizedUltra, "dlssnr-amd\\CC_SILVER_AARDWOLD_OPTIMIZED-ultra\\settings.txt"}}) {
         if (!net_switch.reason(nr::kSilverAardwoldOptimized).empty())
             net_switch.unavailable(lv, net_switch.reason(nr::kSilverAardwoldOptimized));
         else if (!exists(dir))
@@ -2972,6 +3115,32 @@ void Session::reset_layer_timing(int layer) {
     s.outer_seen.erase(layer);
 }
 
+void Session::note_frame_generation(int kind, const char* reason) {
+    g_fg_reason.store(reason?reason:frame_reuse::fg_unsynced,std::memory_order_relaxed);
+    g_frame_generation.store(kind,std::memory_order_release);
+}
+void Session::note_hud_fix(bool on) { g_hud_fix.store(on, std::memory_order_relaxed); }
+// (a Present's even frames lately: stopped - no layers run any more - it goes false by itself)
+bool Session::frames_delayed() {
+    const int64_t at = g_frames_delayed_ms.load(std::memory_order_relaxed);
+    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    return at && now - at < 200;
+}
+int Session::frames_delay() { return frames_delayed() ? g_frames_delay.load(std::memory_order_relaxed) : 0; }
+int Session::next_frames_delay(){return g_next_frames_delay.load(std::memory_order_acquire);}
+void Session::publish_delay(unsigned frames,unsigned next) {
+    g_frames_delay.store(int(frames),std::memory_order_relaxed);
+    g_next_frames_delay.store(int(next),std::memory_order_release);
+    g_frames_delayed_ms.store(frames?std::max<int64_t>(1,std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count()):0,std::memory_order_relaxed);
+}
+void Session::note_frames_delayed(int frames,int next) {
+    if (auto* age=frame_pair::PresentAge::active) {
+        age->frames+=unsigned(frames);age->next_frames+=unsigned(next);
+    } else publish_delay(unsigned(frames),unsigned(next));
+}
+
 void Session::set_call_layer(int layer) {
     impl_->call_layer = layer;
     const auto a = impl_->stage_avg.find(layer);   // a run not timed by the RenoDX stage: the runtime's timing
@@ -3104,6 +3273,37 @@ bool Session::capture_begin(VkCommandBuffer cmd, VkImage image, VkFormat format,
     return true;
 }
 
+std::unique_ptr<Session::Impl::Shot> Session::Impl::w2_capture_begin(VkCommandBuffer cmd, const ColourFrame& f, uint8_t hdr_mode,
+                                                                     const char* path) {
+    shot_poll();
+    if (outside_shot || shot || !cmd || !f.image || !screenshot::wants_final()) return nullptr;
+    if (!screenshot::readable(f.format)) {
+        screenshot::fail("unsupported_present", "the frame's format cannot be read back");
+        return nullptr;
+    }
+    std::unique_ptr<Shot> sh = shot_prepare(f.width, f.height, f.format);
+    if (!sh) {
+        screenshot::abandon("allocation_failed", "the readback buffers could not be allocated");
+        return nullptr;
+    }
+    sh->pair.hdr_mode = hdr_mode;
+    sh->pair.linear_unit_nits = 80.0f;
+    sh->pair.meta = std::string("path=") + path + "\ncomparison=frame-nr-runs-on-before-after-nr\nprocessing=wilsjo2\nwidth=" +
+                    std::to_string(f.width) + "\nheight=" + std::to_string(f.height) + "\nsource_format=" +
+                    std::to_string(int(f.format)) + "\nhdr_mode=" + std::to_string(hdr_mode) + "\n";
+    shot_copy(cmd, *sh, f.image, f.before, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+              VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, 0);
+    screenshot::recorded();
+    return sh;
+}
+
+void Session::Impl::w2_capture_end(VkCommandBuffer cmd, std::unique_ptr<Shot> sh, const ColourFrame& f) {
+    if (!sh || !cmd || !f.image) return;
+    shot_copy(cmd, *sh, f.image, f.after, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+              VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, sh->bytes);
+    shot_recorded(cmd, std::move(sh));
+}
+
 void Session::capture_abort() {
     if (!impl_->outside_shot) return;
     impl_->shots_out.push_back(std::move(impl_->outside_shot));
@@ -3129,6 +3329,7 @@ void Session::outer_begin(VkCommandBuffer cmd) {
                         s.outer_slot * Impl::kOuterQueries);   // after the work before it
     s.outer_open = true;
     s.outer_passes = 0;
+    s.outer_reuse = false;
 }
 
 void Session::outer_end(VkCommandBuffer cmd) {
@@ -3139,6 +3340,7 @@ void Session::outer_end(VkCommandBuffer cmd) {
     s.outer_slot_layer[s.outer_slot] = s.call_layer;
     s.outer_slot_gen[s.outer_slot] = s.layer_gen[s.call_layer];
     s.outer_slot_passes[s.outer_slot] = s.outer_passes;
+    s.outer_slot_reuse[s.outer_slot] = s.outer_reuse;
     if (!s.outer_fresh(s.call_layer)) {   // runs again after a pause (or as another processing): its average anew
         s.outer_avg.erase(s.call_layer);
         s.outer_net_avg.erase(s.call_layer);
@@ -3200,7 +3402,12 @@ Session::State Session::state() const {
     s.carried = m.carried;
     s.renodx_known = m.renodx_facts_known;
     s.renodx = m.renodx_facts;
+    s.reuse = m.reuse_state; s.reuse_share = m.reuse_share; s.reuse_note = m.reuse_note_ui;
     s.wilsjo2_fast_passes = m.w2_fast_passes; s.wilsjo2_fast_fallback = m.w2_fast_fallback; s.wilsjo2_il_missing = m.w2_il_missing; s.wilsjo2_fast_fallback_spatial = m.w2_fast_fallback_spatial; s.wilsjo2_motion = m.w2_motion;
+    s.wilsjo2_known = m.w2_facts_known;
+    s.wilsjo2_hdr = m.w2_facts.hdr; s.wilsjo2_prep_outside = m.w2_facts.prep_outside; s.wilsjo2_prep_missing = m.w2_facts.prep_missing;
+    s.wilsjo2_exposure = m.w2_facts.exposure; s.wilsjo2_asked = m.w2_facts.asked; s.wilsjo2_mode = m.w2_facts.mode;
+    s.wilsjo2_passes = m.w2_facts.passes; s.wilsjo2_white = m.w2_facts.white; s.wilsjo2_history = m.w2_facts.history;
     s.motion_without_depth = m.runtime ? m.runtime->motion_without_depth() : m.net_switch.file().motion_without_depth;
     s.building = m.building && !m.build_plan;   // a plan is no network to wait for
     s.passed = !m.last_ok;
@@ -3256,7 +3463,9 @@ void Session::release_feature(uint64_t feature) {
             impl_->release_everywhere(Impl::stack_feature(feature, k));
             forget(Impl::stack_feature(feature, k));
         }
-        impl_->retire_stage(std::move(stage->second.stage));
+        impl_->finish_replacement(stage->second, VK_NULL_HANDLE);   // terminal release: no successor history
+        impl_->retire_stage(std::move(stage->second.stage), std::move(stage->second.reuse));
+        impl_->retire_stage({},std::move(stage->second.pair_fields.reuse));
         impl_->renodx.erase(stage);
     }
     impl_->wilsjo2_release(feature);
@@ -3387,6 +3596,7 @@ ID3D12Resource* Session::run(ID3D12Device* device, ID3D12GraphicsCommandList* li
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              0, 0, nullptr, 0, nullptr, 1, &out);
 
+        s.advance_terminal(cmd);
         if (motion_vk) s.runtime->record_engine(cmd, engine, s.capture_controls(controls));
         else s.runtime->record(cmd, frame, s.capture_controls(controls), engine.reset);
 
@@ -3404,6 +3614,9 @@ void Session::set_raw_call(bool raw) {
     if (impl_->runtime) impl_->runtime->set_style_grade(impl_->net_switch.file().style_grade && !raw);
 }
 bool Session::style_grade_active() const { return impl_->net_switch.file().style_grade; }
+bool Session::style_grade_accelerated() const {
+    return impl_->net_switch.file().style_grade && impl_->net_switch.file().style_grade_accel;
+}
 
 bool Session::run_after(ID3D12Device* device, ID3D12GraphicsCommandList* list,
                         ID3D12Resource* output, D3D12_RESOURCE_STATES output_state,
@@ -3522,6 +3735,7 @@ bool Session::run_after(ID3D12Device* device, ID3D12GraphicsCommandList* list,
     try {
         OwnOuterRun timing(*this, cmd, s.call_layer > 0 && !s.outer_open);
 
+        s.advance_terminal(cmd);
         if (motion_vk) s.runtime->record_engine(cmd, engine, s.capture_controls(controls));
         else s.runtime->record(cmd, frame, s.capture_controls(controls), engine.reset);
 
@@ -3610,7 +3824,7 @@ renodx::Stage* Session::Impl::renodx_stage(uint64_t feature, uint32_t w, uint32_
     auto& e = renodx[feature];
     if (!e.stage || e.w != w || e.h != h || e.nw != nw || e.nh != nh || e.format != format || e.hdr != rf.hdr_flag ||
         e.present != rf.present) {
-        retire_stage(std::move(e.stage));
+        replace_stage(e);
         renodx::StageConfig sc;
         sc.shaders = root + "\\dlssnr-amd\\shaders\\renodx";
         sc.width = w; sc.height = h; sc.nr_width = nw; sc.nr_height = nh;
@@ -3637,7 +3851,7 @@ renodx::Stage* Session::Impl::renodx_stage(uint64_t feature, uint32_t w, uint32_
         e.stage->set(rf.settings);
     } catch (const std::exception&) {
         // Relative <-> absolute units (NRLinearUnitNits, NRSourceEncoding): a new stage next frame.
-        retire_stage(std::move(e.stage));
+        replace_stage(e);
         return nullptr;
     }
     return e.stage.get();
@@ -3706,11 +3920,214 @@ bool Session::Impl::neutral_motion(VkCommandBuffer cmd, uint32_t w, uint32_t h, 
     return true;
 }
 
+namespace {
+// Frame reuse restarts on any settings change (the research adapter's rule, the settings as nr_renodx.hpp has them).
+bool reuse_settings_equal(const renodx::Settings& a, const renodx::Settings& b) {
+    return a.nr_enabled==b.nr_enabled &&
+           a.intensity==b.intensity &&
+           a.style==b.style &&
+           a.local_tone==b.local_tone &&
+           a.local_structure==b.local_structure &&
+           a.skin_structure==b.skin_structure &&
+           a.auto_mask==b.auto_mask &&
+           a.passes==b.passes &&
+           a.passes_mode==b.passes_mode &&
+           a.fast_method==b.fast_method &&
+           std::equal(std::begin(a.fast_passes),std::end(a.fast_passes),std::begin(b.fast_passes)) &&
+           std::equal(std::begin(a.fast_halo_limit),std::end(a.fast_halo_limit),std::begin(b.fast_halo_limit)) &&
+           std::equal(std::begin(a.fast_fine),std::end(a.fast_fine),std::begin(b.fast_fine)) &&
+           a.fast_edit_strength==b.fast_edit_strength &&
+           a.fast_interleaved_passes==b.fast_interleaved_passes &&
+           a.fast_interleaved_preset==b.fast_interleaved_preset &&
+           a.fast_interleaved_depth_disocclusion==b.fast_interleaved_depth_disocclusion &&
+           a.unlock_passes==b.unlock_passes &&
+           std::equal(std::begin(a.pass_intensity),std::end(a.pass_intensity),std::begin(b.pass_intensity)) &&
+           std::equal(std::begin(a.pass_follow),std::end(a.pass_follow),std::begin(b.pass_follow)) &&
+           std::equal(std::begin(a.pass_style),std::end(a.pass_style),std::begin(b.pass_style)) &&
+           std::equal(std::begin(a.pass_local_tone),std::end(a.pass_local_tone),std::begin(b.pass_local_tone)) &&
+           std::equal(std::begin(a.pass_local_structure),std::end(a.pass_local_structure),std::begin(b.pass_local_structure)) &&
+           std::equal(std::begin(a.pass_skin_structure),std::end(a.pass_skin_structure),std::begin(b.pass_skin_structure)) &&
+           std::equal(std::begin(a.pass_auto_mask),std::end(a.pass_auto_mask),std::begin(b.pass_auto_mask)) &&
+           a.hook_point==b.hook_point &&
+           a.present_guides==b.present_guides &&
+           a.present_frames==b.present_frames &&
+           a.present_fg_source==b.present_fg_source &&
+           a.depth_mode==b.depth_mode &&
+           a.mvec_scale_x==b.mvec_scale_x &&
+           a.codec_mode==b.codec_mode &&
+           a.source_encoding==b.source_encoding &&
+           a.linear_unit_nits==b.linear_unit_nits &&
+           a.proxy_anchor_nits==b.proxy_anchor_nits &&
+           a.paper_white_scale==b.paper_white_scale &&
+           a.diffuse_white_nits==b.diffuse_white_nits &&
+           a.pq_calibration==b.pq_calibration &&
+           a.transfer_strength==b.transfer_strength &&
+           a.color_strength==b.color_strength &&
+           a.chroma_clamp_stops==b.chroma_clamp_stops &&
+           a.transfer_mode==b.transfer_mode &&
+           a.style_highlight_guard==b.style_highlight_guard &&
+           a.display_pedestal==b.display_pedestal &&
+           a.sdr_black_restore==b.sdr_black_restore &&
+           a.neural_floor_guard==b.neural_floor_guard &&
+           a.feed_mode==b.feed_mode &&
+           a.norm_governor==b.norm_governor &&
+           a.norm_cut_aware==b.norm_cut_aware &&
+           a.norm_attack_stops==b.norm_attack_stops &&
+           a.norm_release_stops==b.norm_release_stops &&
+           a.norm_slew_stops==b.norm_slew_stops &&
+           a.detail_stability==b.detail_stability &&
+           a.resolution_scale==b.resolution_scale &&
+           a.follow_input_res==b.follow_input_res &&
+           a.look_upsample==b.look_upsample &&
+           a.look_mode==b.look_mode &&
+           a.look_strength==b.look_strength &&
+           a.look_brighten==b.look_brighten &&
+           a.look_darken==b.look_darken &&
+           a.look_max_brighten==b.look_max_brighten &&
+           a.look_max_darken==b.look_max_darken &&
+           a.look_colour==b.look_colour &&
+           a.look_hue==b.look_hue &&
+           a.look_max_colour==b.look_max_colour &&
+           a.look_shadows==b.look_shadows &&
+           a.look_midtones==b.look_midtones &&
+           a.look_highlights==b.look_highlights &&
+           a.look_tone==b.look_tone &&
+           a.look_detail==b.look_detail &&
+           a.look_detail_radius==b.look_detail_radius &&
+           a.look_halo==b.look_halo &&
+           a.look_halo_bright==b.look_halo_bright &&
+           a.look_stabilize==b.look_stabilize &&
+           a.look_stabilize_ms==b.look_stabilize_ms &&
+           a.look_stabilize_detail==b.look_stabilize_detail &&
+           std::equal(std::begin(a.pass_transfer),std::end(a.pass_transfer),std::begin(b.pass_transfer)) &&
+           std::equal(std::begin(a.pass_color),std::end(a.pass_color),std::begin(b.pass_color)) &&
+           a.chained_history==b.chained_history &&
+           a.noise_every_frame==b.noise_every_frame &&
+           a.pre_history==b.pre_history && a.post_history==b.post_history &&
+           a.debug_view==b.debug_view &&
+           a.skin_independent==b.skin_independent &&
+           a.present_encoding==b.present_encoding &&
+           a.present_white_nits==b.present_white_nits &&
+           a.present_white_source==b.present_white_source &&
+           a.mvec_scale_y==b.mvec_scale_y;
+}
+}
+
+// This feature's frame reuse for the frame (made at its extent, format and guide sizes; a new one when they change),
+// or null with the reason noted once: it runs on Passes (legacy), on 8-bit frames with the game's motion vectors and
+// depth when available. The selected layer reports any admission failure.
+// Even frames (`even`: at the Present with one NR layer running): the network split over two frames, every frame shown
+// one frame later (frame_reuse::Stage::Config::delay). A stage given up or remade first runs what its frame before left
+// (flush: the network's state then is all on the GPU before NR runs without it).
+template <class S, class Equal>
+frame_reuse::Stage* Session::Impl::reuse_stage_for(VkCommandBuffer cmd, ReuseFields<S>& e, const renodx::StageFrame& sf,
+                                                   const S& rs, bool neutral, const char* blocked, bool scrgb, Equal equal, bool kernel) {
+    const bool batch=!kernel && frame_pair::PresentAge::active && frame_pair::PresentAge::active->gathering() && frame_pair::PresentAge::active->paired;
+    const bool missing_motion = neutral || !sf.motion.image || !sf.fast_motion_available;
+    const char* why = blocked ? blocked
+                    : rs.passes_mode == 1u && rs.fast_method == 0u ? frame_reuse::interleaved
+                    : !frame_reuse::Stage::supports(sf.colour.format, sf.output.format) ? frame_reuse::unsupported_format
+                    : missing_motion ? frame_reuse::motion_missing : nullptr;
+    if (!e.reuse_failed.empty() && std::chrono::steady_clock::now() >= e.alloc_retry_after) e.reuse_failed.clear();
+    if (why || !e.reuse_failed.empty()) {
+        const bool passing = why == frame_reuse::motion_missing;
+        e.reuse_ui = why ? std::string(why) : "Cannot run: " + e.reuse_failed;
+        if (e.reuse && passing) {
+            if (!e.reuse_passing) { e.reuse->flush(cmd); e.reuse->reset(); }   // the first frame of the pause: afresh after it
+            ++e.reuse_pauses;
+        } else if (e.reuse) {
+            e.reuse->flush(cmd);
+            retire_stage({}, std::move(e.reuse));
+        }
+        // a passing reason is said once it lasts: the first frame after the switch went on can come without the depth
+        // the Present copies only from then on (and a menu's frame or two is no news)
+        e.reuse_passing = passing ? e.reuse_passing + 1 : 0;
+        if (e.reuse_note != e.reuse_ui) {
+            e.reuse_note = e.reuse_ui;
+            log("[nr] frame reuse: %s (format %d)", e.reuse_ui.c_str(), int(sf.colour.format));
+            events::note(events::kSettings, "Frame reuse: %s", e.reuse_ui.c_str());
+        }
+        return nullptr;
+    }
+    e.reuse_note.clear();
+    e.reuse_passing = 0;
+    if (e.reuse) {
+        const auto& k = e.reuse->config();
+        if (k.width != sf.colour.width || k.height != sf.colour.height || k.frame_format != sf.colour.format ||
+            k.guides.motion_width != sf.motion.width || k.guides.motion_height != sf.motion.height ||
+            k.guides.depth_width != std::max(1u, sf.depth.width) || k.guides.depth_height != std::max(1u, sf.depth.height) || k.scrgb != scrgb || k.batch_only!=batch || k.pair_kernel!=kernel ||
+            e.reuse_motion_format != sf.motion.format || e.reuse_depth_format != sf.depth.format) {
+            e.reuse->flush(cmd);
+            retire_stage({}, std::move(e.reuse));
+        }
+    }
+    if (!e.reuse) {
+        frame_reuse::Stage::Config k;
+        k.width = sf.colour.width; k.height = sf.colour.height; k.frame_format = sf.colour.format;
+        k.guides = {sf.motion.width, sf.motion.height, std::max(1u, sf.depth.width), std::max(1u, sf.depth.height)};
+        k.delay = true;
+        k.scrgb = scrgb; k.batch_only=batch; k.pair_kernel=kernel;
+        k.context = sf.depth.image != VK_NULL_HANDLE;
+        k.fwd_check = !k.context;
+        // NR on every other frame whatever the motion (user 11-19: the fast-motion rule took NR back to every frame as
+        // soon as the view moved): the cadence alone, decided on the CPU
+        k.fast_speed = 0.0f;
+        // with the even frames the rebuilt frames are made from the NR frames before AND after them (every frame shown
+        // two frames later), and a fixed overlay may change a little in place (a translucent HUD over a moving world)
+        k.bidi = true;
+        k.stay_fixed = 6.0f;
+        HostDevice host{};
+        host.instance = handles.instance; host.physical = handles.physical; host.device = handles.device;
+        host.queue = access.queue; host.queue_family = access.family;
+        try {
+            nr::vram::Scope kind(nr::vram::kRenoDX, -1);   // the RenoDX processing's memory, not a network's
+            e.reuse = std::make_unique<frame_reuse::Stage>(host, k, root + "\\dlssnr-amd\\shaders\\frame-reuse");
+        } catch (const std::exception& x) {   // NR goes on every frame; the switch's line says it cannot run
+            e.reuse_failed = x.what();
+            e.alloc_retry_after = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+            log("[nr] frame reuse could not be made: %s (retrying after one second)", x.what());
+            events::note(events::kSettings, "Frame reuse could not be made: %s", x.what());
+            e.reuse_note = "could not be made";
+            e.reuse_said.insert(e.reuse_note);
+            e.reuse_ui = "Cannot run: " + e.reuse_failed;
+            return nullptr;
+        }
+        e.reuse_settings = rs;
+        e.reuse_frames = 0; e.reuse_logged = {}; e.reuse_window = {}; e.reuse_share = -1.f;
+        e.reuse_motion_format = sf.motion.format; e.reuse_depth_format = sf.depth.format;
+        log("[nr] frame reuse at %ux%u, format %d, guides %ux%u / %ux%u: NR on 1 frame of %u (%llu MiB)%s", k.width, k.height,
+            int(k.frame_format), k.guides.motion_width,
+            k.guides.motion_height, k.guides.depth_width, k.guides.depth_height, k.period,
+            (unsigned long long)(e.reuse->image_bytes() >> 20),
+            "; even frames: the network split over two frames, each rebuilt frame made from the NR frames before and "
+                      "after it, every frame shown two frames later");
+    } else if (!equal(e.reuse_settings, rs)) {
+        e.reuse->reset();
+        e.reuse_settings = rs;
+    }
+    return e.reuse.get();
+}
+frame_reuse::Stage* Session::Impl::reuse_stage(VkCommandBuffer cmd, RenoDXEntry& e, const renodx::StageFrame& sf,
+                                               const renodx::Settings& rs, bool neutral, const char* blocked, bool scrgb) {
+    return reuse_stage_for(cmd, e, sf, rs, neutral, blocked, scrgb, reuse_settings_equal);
+}
+
 // The stage around the network, `colour` read and `output` written (they may be one image). `engine` carries
 // the motion and depth; its colour and target are the stage's.
 bool Session::Impl::record_renodx(VkCommandBuffer cmd, renodx::Stage& stage, const ColourFrame& colour,
                                   const ColourFrame& output, EngineFrame engine, const Controls& c,
                                   const Session::RenoDXFrame& rf, const ColourFrame* exposure) {
+    // NR Control's stage timing of this recording: its slot reset and its start stamped BEFORE frame reuse's waiting
+    // second part runs here (advance_terminal), so that part is timed with this frame - and its carried network pairs
+    // (written into this slot's carried range, reset where the part was recorded: the end of the recording before) are
+    // not wiped (else the rebuilt frames' timings would be dropped and NR Control would show the computed frames alone).
+    const bool timed = stage_timing_ready();
+    const uint32_t slot = stage_slot, base = slot * kStageQueries;
+    if (timed) {
+        vkCmdResetQueryPool(cmd, stage_timing, base, kStageCarriedAt);
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, stage_timing, base);
+    }
+    advance_terminal(cmd);
     // The Present path without the game's motion vectors (NRPresentGuides Optional), or set to Never: neutral guides
     // for the network - zero motion, no depth - and none for the look (its Detail stability is the game's vectors').
     const bool neutral = rf.present && (rf.settings.present_guides == 2u || !engine.motion.image);
@@ -3752,6 +4169,7 @@ bool Session::Impl::record_renodx(VkCommandBuffer cmd, renodx::Stage& stage, con
     const uint32_t histories = rs.passes_mode == 1u && rs.fast_method == 0u ? std::clamp(rs.fast_interleaved_passes, 2u, 8u) : passes;
     const auto pass_feature = [&](uint32_t k) { return engine.feature || histories > 1 ? stack_feature(named, k) : 0; };
     auto& entry = renodx[engine.feature];
+    if (!finish_replacement(entry, cmd)) sf.reset = engine.reset = true;
     for (uint32_t k = histories; k < entry.stack; ++k) release_everywhere(stack_feature(named, k));
     if (!engine.feature && histories == 1 && entry.stack > 1) release_everywhere(named);
     entry.stack = histories;
@@ -3764,6 +4182,7 @@ bool Session::Impl::record_renodx(VkCommandBuffer cmd, renodx::Stage& stage, con
     sf.motion_scale_x = engine.motion_scale_x; sf.motion_scale_y = engine.motion_scale_y;
     sf.depth_inverted = engine.depth_inverted;
     sf.style_grade = runtime && runtime->style_grade_active();
+    sf.style_grade_accel = runtime && runtime->style_grade_accelerated();
     // Pass k's controls, RenoDX's (the route's own do not apply with the option on): pass 1's, or pass k's once its
     // "Same as pass 1" is off (PassModel; the intensity is always the pass's own, PassIntensity); with
     // NRSkinIndependent and the Character mask on, Structure at most 1 and a stock Skin sent as 1 (SentSkinSteering).
@@ -3772,7 +4191,7 @@ bool Session::Impl::record_renodx(VkCommandBuffer cmd, renodx::Stage& stage, con
         Controls ck = c;
         ck.per_pass.clear();
         ck.passes = 1;
-        ck.history_strength = 1.f;
+        ck.history_strength = rs.post_history;   // NRPostHistory (0: the post block's gate closed)
         const bool own = k > 0 && !rs.pass_follow[k - 1];
         ck.intensity = k == 0 ? rs.intensity : rs.pass_intensity[k - 1];
         ck.style = int(own ? rs.pass_style[k - 1] : rs.style);
@@ -3781,15 +4200,77 @@ bool Session::Impl::record_renodx(VkCommandBuffer cmd, renodx::Stage& stage, con
         ck.skin_structure = own ? rs.pass_skin_structure[k - 1] : rs.skin_structure;
         ck.automatic_mask = own ? rs.pass_auto_mask[k - 1] : rs.auto_mask;
         ck.seed_fixed = !rs.noise_every_frame;
+        ck.pre_history = rs.pre_history;
         if (rs.skin_independent && ck.automatic_mask) {
             ck.local_structure = std::min(ck.local_structure, 1.0f);
             if (ck.skin_structure < 0.0f) ck.skin_structure = 1.0f;
         }
         return ck;
     };
-    const bool timed = stage_timing_ready();
-    const uint32_t slot = stage_slot, base = slot * kStageQueries;
-    uint32_t timed_passes = 0;
+    using VkJobs=frame_pair::ChainJobs<VkCommandBuffer,renodx::StageFrame>;
+    VkJobs* jobs=nullptr;
+    auto* age=frame_pair::PresentAge::active;
+    if ((!age || !age->paired || !age->gathering() || !rs.frame_reuse) && entry.pair_fields.reuse)
+        retire_stage({},std::move(entry.pair_fields.reuse));
+    if (age && age->gathering()) {
+        if (!runtime || !rs.nr_enabled || !c.enabled || !c.apply_model) {
+            reuse_state=2; reuse_note_ui="Waiting for the other frame reuse layers"; return true;
+        }
+        VkJobs::Pair pair;
+        if (age->paired && rs.frame_reuse) {
+            auto* kernel=reuse_stage_for(cmd,entry.pair_fields,sf,rs,neutral,nullptr,rf.present==3,reuse_settings_equal,true);
+            if (!kernel) { reuse_state=2;reuse_note_ui=entry.pair_fields.reuse_ui;return true; }
+            pair=[kernel](VkCommandBuffer& c,renodx::StageFrame* o,renodx::StageFrame& e,const VkJobs::Execute& run){
+                return kernel->render_pair(c,o,e,run);
+            };
+        }
+        std::vector<Controls> controls;
+        std::vector<uint64_t> features;
+        for (uint32_t k=0;k<passes;++k) { controls.push_back(pass_controls(k)); features.push_back(pass_feature(k)); }
+        Runtime* rt=runtime;
+        rt->touch_submission();
+        stage.touch_submission();
+        const uint32_t steps=rt->network_steps();
+        jobs=VkJobs::add(handles.device,uint32_t(colour.format),steps*passes,uintptr_t(&stage)^uintptr_t(rt),
+            [rt,&stage,sf,engine,controls,features,steps](VkCommandBuffer& cur,const renodx::StageFrame& a,
+                                                        VkCommandBuffer tail,uint32_t cut,uint32_t gap) {
+                auto f=sf; f.colour=a.colour; f.output=a.output; f.reset=a.reset;
+                f.motion=a.motion; f.motion_x=a.motion_x; f.motion_y=a.motion_y;
+                f.motion_scale_x=a.motion_scale_x; f.motion_scale_y=a.motion_scale_y;
+                f.depth=a.depth; f.depth_x=a.depth_x; f.depth_y=a.depth_y; f.exposure=a.exposure;
+                rt->touch_submission(); stage.touch_submission();
+                return stage.record_split(cur,f,[&](uint32_t k,const ColourFrame& proxy,const ColourFrame& target,bool reset){
+                    auto e=engine;
+                    e.colour=proxy; e.target=target; e.reset=reset; e.feature=features.at(k);
+                    e.motion=f.motion; e.motion_x=f.motion_x; e.motion_y=f.motion_y;
+                    e.motion_texture_width=e.motion.width; e.motion_texture_height=e.motion.height;
+                    e.motion_scale_x=f.motion_scale_x; e.motion_scale_y=f.motion_scale_y;
+                    e.depth=f.depth; e.depth_x=f.depth_x; e.depth_y=f.depth_y;
+                    auto c=controls.at(k);
+                    if (gap>=2) c.history_strength=.5f*(c.history_strength>=0.f?c.history_strength:1.f);
+                    auto nm=stage.network_motion();
+                    if (nm.use) {
+                        e.motion=nm.motion; e.motion_texture_width=e.motion.width; e.motion_texture_height=e.motion.height;
+                        e.motion_x=e.motion_y=0; e.motion_scale_x=e.motion_scale_y=1.f;
+                    }
+                    if (nm.history.image) e.history=nm.history;
+                    const bool grade=rt->style_grade_active();
+                    if (nm.raw) { c.intensity=1; rt->set_style_grade(false); }
+                    const uint32_t start=k*steps;
+                    if (tail && cut<=start) cur=tail;
+                    if (tail && cur!=tail && cut<start+steps) {
+                        NetworkSplit part{tail,cut-start,0}; rt->record_engine_split(cur,e,c,part); cur=tail;
+                    } else rt->record_engine(cur,e,c);
+                    if (nm.raw) rt->set_style_grade(grade);
+                },[&](VkCommandBuffer){return cur;});
+            },std::move(pair));
+        if (!jobs || !jobs->ready) {
+            frame_reuse::Stage::pass_input(cmd,sf);
+            reuse_state=2; reuse_share=-1.f; reuse_note_ui="Waiting for the other frame reuse layers";
+            return true;
+        }
+    }
+    uint32_t timed_passes = 0, carried_passes = 0;   // (carried: second parts' pairs, written into the next slot)
     // NR_DIAG_EXPOSURE: the game's exposure and the frame before NR (before the stage's own transitions).
     diag_begin(rs, rf, engine.reset);
     if (exposure)
@@ -3803,7 +4284,7 @@ bool Session::Impl::record_renodx(VkCommandBuffer cmd, renodx::Stage& stage, con
     shot_poll();
     std::unique_ptr<Shot> capture;
     const bool final_frame = rf.present != 0 || rf.finished || rf.capture_at;
-    if (!shot && rs.nr_enabled && screenshot::wants_final() && final_frame && rf.clean) {
+    if (!shot && rs.nr_enabled && !nr::frame_pair::Observation::current && screenshot::wants_final() && final_frame && rf.clean) {
         if (!screenshot::readable(colour.format)) {
             screenshot::fail("unsupported_present", "the frame's format cannot be read back");
         } else if ((colour.usage && !(colour.usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) ||
@@ -3846,12 +4327,41 @@ bool Session::Impl::record_renodx(VkCommandBuffer cmd, renodx::Stage& stage, con
         screenshot::fail("nr_disabled", "enable NR before taking a comparison");
     }
     const bool model_capture = !shot && !capture && rs.nr_enabled && screenshot::wants_model();
+    // Frame reuse: the frame it hands the stage (an anchored copy, its guides: two frames' vectors after a rebuilt frame)
+    // (made in the try below: a frame reuse that cannot be made is a failure, shown)
+    frame_reuse::Stage* reuse = nullptr;
+    // switched off: what its frame before left runs once this frame's timing began (its second part's timestamps go into
+    // this recording's slot, reset there), then the stage goes
+    std::unique_ptr<frame_reuse::Stage> reuse_going;
+    if (!rs.frame_reuse) {   // switched off (NR Control, live): the stage and its memory go; on again starts afresh
+        if (entry.reuse) {
+            log("[nr] frame reuse switched off: its %llu MiB go once the GPU is done with them",
+                (unsigned long long)(entry.reuse->image_bytes() >> 20));
+            reuse_going = std::move(entry.reuse);
+        }
+        entry.reuse_note.clear(); entry.reuse_said.clear(); entry.reuse_failed.clear(); entry.reuse_ui.clear();
+    }
+    const renodx::StageFrame* reuse_frame = nullptr;
+    // Frame reuse's even frames: the recording the network goes on in after its split (the stage's second part), where
+    // (the share of the steps of every pass together), and the recording in use now
+    frame_reuse::Stage::Split reuse_split{};
+    VkCommandBuffer net_cmd = cmd;
+    uint32_t net_steps = 0, net_cut = 0;
     const renodx::Stage::Network network = [&](uint32_t k, const ColourFrame& proxy, const ColourFrame& neural, bool reset) {
         EngineFrame e = engine;
         e.colour = proxy;
         e.target = neural;
         e.reset = reset;
         e.feature = pass_feature(k);
+        if (reuse_frame) {
+            const renodx::StageFrame& f = *reuse_frame;
+            e.motion = f.motion; e.motion_x = f.motion_x; e.motion_y = f.motion_y;
+            e.motion_scale_x = f.motion_scale_x; e.motion_scale_y = f.motion_scale_y;
+            if (f.motion.image != engine.motion.image) {   // (the game's own: its allocation's extent, as read above)
+                e.motion_texture_width = f.motion.width; e.motion_texture_height = f.motion.height;
+            }
+            e.depth = f.depth; e.depth_x = f.depth_x; e.depth_y = f.depth_y;
+        }
         // Interleaved: the history the stage made for this pass (one frame old, the frame's own vectors)
         const renodx::Stage::NetworkMotion nm = stage.network_motion();
         if (nm.use) {
@@ -3863,20 +4373,44 @@ bool Session::Impl::record_renodx(VkCommandBuffer cmd, renodx::Stage& stage, con
         if (nm.history.image) e.history = nm.history;
         const bool time_net = timed && timed_passes < renodx::kMaxUnlockedPasses;
         Controls controls = pass_controls(k);
+        // Frame reuse: a history two frames old (after a rebuilt frame) is followed half as strongly
+        if (reuse_frame && reuse->gap() >= 2)
+            controls.history_strength = 0.5f * (controls.history_strength >= 0.f ? controls.history_strength : 1.f);
         // Interleaved composes the passes itself: the network's own output, no Intensity compose, no grade (the Style
         // stays: the network takes it as an input too)
         if (nm.raw) { controls.intensity = 1.0f; runtime->set_style_grade(false); }
         if (time_net) controls.network_timestamp = [&](VkCommandBuffer c, bool begin) {
+            if (reuse_split.tail && c == reuse_split.tail) {   // a second part: it runs in the next recording, after
+                // that one's reset of its slot - its pair goes there (the next stage recording is this layer's alone)
+                if (carried_passes >= renodx::kMaxUnlockedPasses) return;
+                vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, stage_timing,
+                                    ((slot + 1) % kStageSlots) * kStageQueries + kStageCarriedAt + 2 * carried_passes +
+                                        (begin ? 0u : 1u));
+                if (!begin) ++carried_passes;
+                return;
+            }
             vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, stage_timing,
                                 base + 2 + 2 * timed_passes + (begin ? 0u : 1u));
             if (!begin) ++timed_passes;
         };
-        runtime->record_engine(cmd, e, controls);
+        if (reuse_split.tail) {   // the passes before the cut here, the one with it split, the rest in the second part
+            const uint32_t lo = k * net_steps;
+            if (net_cmd != reuse_split.tail && net_cut <= lo) net_cmd = reuse_split.tail;
+            if (net_cmd != reuse_split.tail && net_cut < lo + net_steps) {
+                NetworkSplit part{reuse_split.tail, net_cut - lo, 0};
+                runtime->record_engine_split(net_cmd, e, controls, part);
+                net_cmd = reuse_split.tail;
+            } else {
+                runtime->record_engine(net_cmd, e, controls);
+            }
+        } else {
+            runtime->record_engine(cmd, e, controls);
+        }
         if (nm.raw) runtime->set_style_grade(net_switch.file().style_grade);
         if (k == 0) {
-            diag_copy(cmd, 2, proxy.image, proxy.format, proxy.width, proxy.height, proxy.usage, proxy.after,
+            diag_copy(net_cmd, 2, proxy.image, proxy.format, proxy.width, proxy.height, proxy.usage, proxy.after,
                       proxy.after_stage, proxy.after_access);
-            diag_copy(cmd, 3, neural.image, neural.format, neural.width, neural.height, neural.usage, neural.after,
+            diag_copy(net_cmd, 3, neural.image, neural.format, neural.width, neural.height, neural.usage, neural.after,
                       neural.after_stage, neural.after_access);
         }
         // RenoDX's model diagnostic: the last pass's proxy and network output, sRGB previews (not the displayed frame).
@@ -3895,20 +4429,103 @@ bool Session::Impl::record_renodx(VkCommandBuffer cmd, renodx::Stage& stage, con
                                 "\nstack_pass=" + std::to_string(k + 1) + "\nstack=" + std::to_string(passes) +
                                 "\nwidth=" + std::to_string(proxy.width) + "\nheight=" + std::to_string(proxy.height) +
                                 "\nsource_format=" + std::to_string(int(proxy.format)) + "\n";
-                shot_copy(cmd, *sh, proxy.image, proxy.after, proxy.after_stage, proxy.after_access, 0);
-                shot_copy(cmd, *sh, neural.image, neural.after, neural.after_stage, neural.after_access, sh->bytes);
-                shot_recorded(cmd, std::move(sh));
+                shot_copy(net_cmd, *sh, proxy.image, proxy.after, proxy.after_stage, proxy.after_access, 0);
+                shot_copy(net_cmd, *sh, neural.image, neural.after, neural.after_stage, neural.after_access, sh->bytes);
+                shot_recorded(net_cmd, std::move(sh));
             } else {
                 screenshot::abandon("allocation_failed", "model diagnostic readback buffers could not be allocated");
             }
         }
     };
-    if (timed) {
-        vkCmdResetQueryPool(cmd, stage_timing, base, kStageQueries);
-        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, stage_timing, base);
-    }
+    if (reuse_going) { reuse_going->flush(cmd); retire_stage({}, std::move(reuse_going)); }
     try {
-        stage.record(cmd, sf, network);
+        // even frames at the Present while it is the only NR layer running (another layer's network between a frame's
+        // two parts could take the scratch memory the second part continues from)
+        const char* blocked = !rf.present ? frame_reuse::placement
+            : rs.present_guides==2 ? frame_reuse::guides_off
+            : age && age->interleaved_conflict ? frame_reuse::interleaved
+            : ((frame_pair::PresentAge::active ? frame_pair::PresentAge::active->multiple : chain_active(std::chrono::steady_clock::now())) && !frame_pair::PresentAge::terminal() && !frame_pair::PresentAge::isolated()) ? frame_reuse::chain_busy
+            : g_frame_generation.load(std::memory_order_acquire) == 2 ? g_fg_reason.load(std::memory_order_relaxed)
+            : g_hud_fix.load(std::memory_order_relaxed) ? frame_reuse::hud_unsynced : nullptr;
+        bool delayed_now = false;   // (frames_delayed: this Present's)
+        // (SDR: the frame in display codes - frame reuse's rules are in codes; an HDR frame is linear or PQ)
+        if (rs.frame_reuse)
+            reuse = reuse_stage(cmd, entry, sf, rs, neutral, blocked, rf.present == 3);
+        if (reuse && entry.reuse_epoch!=(jobs?jobs->epoch:0)) {
+            reuse->reset(); entry.reuse_epoch=jobs?jobs->epoch:0;
+        }
+        reuse_state = !rs.frame_reuse ? 0u : reuse ? 1u : 2u;
+        reuse_note_ui = reuse_state == 2u ? entry.reuse_ui : std::string();
+    if (age && age->gathering() && reuse_state==2) age->group_reason=entry.reuse_ui;
+        reuse_share = reuse_state == 1u ? entry.reuse_share : -1.f;
+        if (reuse && rs.nr_enabled && c.enabled && c.apply_model) {
+            // the passes' features this recording (their history slots: carried when the GPU skips the network); the
+            // GPU's choice of the history weight after a GPU-decided frame (the runtime's hook, this recording only)
+            const auto paired=[&](VkCommandBuffer& c,renodx::StageFrame* o,renodx::StageFrame& e,VkCommandBuffer tail,float share){
+                return jobs->record_pair(c,o,e,tail,share);
+            };
+            const frame_reuse::Stage::Result r = jobs && age->paired ? reuse->record_batch(cmd,sf,paired) : reuse->record(cmd, sf, [&](VkCommandBuffer, const renodx::StageFrame& f) {
+                if (jobs) {
+                    const auto part=reuse->split();
+                    return jobs->record(cmd,f,part.tail,part.share,reuse->gap());
+                }
+                reuse_frame = &f;
+                reuse_split = reuse->split();
+                net_cmd = cmd;
+                uint32_t n = 0;
+                if (reuse_split.tail) {
+                    net_steps = runtime->network_steps();
+                    const uint32_t total = std::max(1u, passes) * net_steps;
+                    net_cut = uint32_t(std::lround(double(reuse_split.share) * total));
+                    n = stage.record_split(cmd, f, network, [&](VkCommandBuffer) { return net_cmd; });
+                } else {
+                    n = stage.record(cmd, f, network);
+                }
+                reuse_frame = nullptr;
+                reuse_split = {};
+                net_cmd = cmd;
+                return n;
+            }, {});
+            if (jobs) {
+                age->group_written=r.ok; age->group_share=entry.reuse_share;
+                if (entry.reuse_frames==118 && r.completed)
+                    log("[nr] frame reuse anchor: %u network calls across %u layers",r.network_calls,unsigned(jobs->members.size()));
+            }
+            if (!r.ok) {
+                reuse_state=2;
+                reuse_note_ui=entry.reuse_ui=age && !age->group_reason.empty() ? age->group_reason : frame_reuse::anchor_error;
+                if(age)age->group_reason=entry.reuse_ui;
+                log("[nr] frame reuse: %s",entry.reuse_ui.c_str());
+            }
+            delayed_now = r.shown_late != 0;
+            if (delayed_now) g_frames_delay.store(r.shown_late, std::memory_order_relaxed);
+            if (auto* a=frame_pair::PresentAge::active)a->next_frames+=r.next_late;
+            if (delayed_now) frame_pair::PresentAge::record(r.shown_late);
+            // NR Control's share of frames with NR: over windows of 60 frames (the GPU's counters, read a frame late)
+            if ((entry.reuse_frames + 1) % 60 == 0) {
+                const frame_reuse::Stage::Stats st = reuse->stats();
+                if (st.frames > entry.reuse_window.frames)
+                    entry.reuse_share = float(double(st.computed - entry.reuse_window.computed) / double(st.frames - entry.reuse_window.frames));
+                entry.reuse_window = st;
+            }
+            if (++entry.reuse_frames == 120 || entry.reuse_frames % 600 == 0) {   // (early once: it runs at all)
+                const frame_reuse::Stage::Stats st = reuse->stats(), d{st.frames - entry.reuse_logged.frames,
+                    st.computed - entry.reuse_logged.computed, st.planned - entry.reuse_logged.planned};
+                log("[nr] feature #%u: frame reuse, last %llu frames: NR on %llu, rebuilt %llu", unsigned(engine.feature),
+                        (unsigned long long)d.frames, (unsigned long long)d.computed, (unsigned long long)(d.frames - d.computed));
+                entry.reuse_logged = st;
+            }
+        } else if (rs.frame_reuse && !reuse) {
+            frame_reuse::Stage::pass_input(cmd, sf);
+        } else {
+            if (reuse) { reuse->flush(cmd); reuse->reset(); }   // NR off for this frame: the next frame with NR starts afresh
+            else if (entry.reuse) entry.reuse->flush(cmd);      // paused (no vectors / depth): what waits runs first
+            stage.record(cmd, sf, network);
+        }
+        if (rf.present)
+            g_frames_delayed_ms.store((delayed_now || (frame_pair::PresentAge::active && frame_pair::PresentAge::active->frames)) ? std::max<int64_t>(1, std::chrono::duration_cast<std::chrono::milliseconds>(
+                                          std::chrono::steady_clock::now().time_since_epoch()).count()) : 0,
+                                      std::memory_order_relaxed);
         renodx_facts = stage.facts();
         renodx_facts_known = true;
         diag_copy(cmd, 4, output.image, output.format, output.width, output.height, output.usage, output.after,
@@ -3925,7 +4542,11 @@ bool Session::Impl::record_renodx(VkCommandBuffer cmd, renodx::Stage& stage, con
             stage_slot_gen[slot] = layer_gen[call_layer];
             ++stage_recorded;
             stage_slot = (slot + 1) % kStageSlots;
-            read_stage_timing();
+            read_stage_timing();   // (the oldest recording's, in the slot the next one takes)
+            stage_slot_carried[stage_slot] = carried_passes;
+            // (the next slot's carried range, reset here - before the second part recorded now runs, wherever it runs)
+            if (carried_passes)
+                vkCmdResetQueryPool(cmd, stage_timing, stage_slot * kStageQueries + kStageCarriedAt, 2 * carried_passes);
         }
         stage_avg[call_layer].renodx_timed = timed;
     } catch (const std::exception& x) {
@@ -4056,16 +4677,23 @@ Session::Impl::W2Surface* Session::Impl::w2_make(VkCommandBuffer cmd, VkFormat f
 }
 
 namespace {
+// SessionW2Io's split (frame reuse's even frames): the network's steps before `cut` in the recording it began in, the rest
+// in `tail` (with everything the flow records after them)
+struct W2IoSplit { VkCommandBuffer tail; uint32_t cut, steps; };
 // The flow's route inside the session (the ReShade route's wilsjo2 layers): our surfaces GENERAL throughout, the frame
 // moved to GENERAL for the run and back after, the guides read in their layouts, the stage on the session's device and
 // the network through the session's runtime, network-only (Session::Impl::wilsjo2_runtime).
 class SessionW2Io final : public nr::wilsjo2::FlowIo {
 public:
     using Impl = Session::Impl;
-    SessionW2Io(Impl& s, VkCommandBuffer cmd, const ColourFrame& target, const EngineFrame& engine, const Controls& net,
-                const nr::wilsjo2::Settings& settings, uint64_t feature, bool estimate)
+    // Frame reuse's even frames (Impl::W2Reuse): the network split at `cut` of all its passes' steps; from there on this
+    // flow records into the stage's second part (`cmd_` is the caller's: the copy back after the flow follows it).
+    // `history`: the network's history strength in its place (frame reuse: a history two frames old), < 0 the layer's.
+    SessionW2Io(Impl& s, VkCommandBuffer& cmd, const ColourFrame& target, const EngineFrame& engine, const Controls& net,
+                const nr::wilsjo2::Settings& settings, uint64_t feature, bool estimate,
+                W2IoSplit split = W2IoSplit{VK_NULL_HANDLE, 0, 0}, float history = -1.f, bool asi = false)
         : s_(s), cmd_(cmd), target_(target), engine_(engine), net_(net), settings_(settings), feature_(feature),
-          estimate_(estimate) {
+          estimate_(estimate), split_(split), history_(history), asi_(asi) {
         target_now_ = target.before;
     }
     nr::wilsjo2::Surf target() { return {&target_}; }
@@ -4129,6 +4757,9 @@ public:
     bool has_fast() const override { return !s_.w2_stage || s_.w2_stage->has_fast(); }
     bool has_il() const override { return !s_.w2_stage || s_.w2_stage->has_il(); }
     bool style_graded() const override { return s_.net_switch.file().style_grade; }
+    bool style_grade_accelerated() const override {
+        return s_.net_switch.file().style_grade && s_.net_switch.file().style_grade_accel;
+    }
     bool stage_failed() const override { return !s_.w2_stage; }
     nr::wilsjo2::PassReady pass(uint32_t, const nr::wilsjo2::PassControls&, uint32_t, uint32_t) override {
         return nr::wilsjo2::PassReady::kReady;   // the network runtime is made before the recording (wilsjo2_prepare)
@@ -4144,7 +4775,7 @@ public:
         e.reset = c.reset;
         e.feature = Impl::stack_feature(feature_, c.pass);
         if (c.history) e.history = frame_of(c.history);   // Interleaved: the history it made for this pass (GENERAL)
-        if (c.depth.h != &engine_.depth) {   // peripheral compression: the packed guides at the model extent
+        if (c.depth.h && c.depth.h != &engine_.depth) {   // peripheral compression: the packed guides at the model extent
             e.depth = frame_of(c.depth);
             e.motion = frame_of(c.motion);
             e.depth_x = e.depth_y = e.motion_x = e.motion_y = 0;
@@ -4152,7 +4783,15 @@ public:
             e.motion_scale_x = c.motion_rect.width ? c.mv_x / float(c.motion_rect.width) : c.mv_x;
             e.motion_scale_y = c.motion_rect.height ? c.mv_y / float(c.motion_rect.height) : c.mv_y;
         }
-        // Otherwise the route's own scales (normalized screen units, at any model extent), as this route ran them.
+        // Otherwise the route's own scales (normalized screen units, at any model extent), as this route ran them - an
+        // .asi layer's as the .asi's flow hands them to the model (NetCall.mv_x over the vectors' region,
+        // nr_dlssnr_model.cpp normalized_mv_scale): the two routes of one layer the same
+        else if (asi_) {
+            const uint32_t mw = c.motion_rect.width ? c.motion_rect.width : e.motion_texture_width;
+            const uint32_t mh = c.motion_rect.height ? c.motion_rect.height : e.motion_texture_height;
+            e.motion_scale_x = mw ? c.mv_x / float(mw) : c.mv_x;
+            e.motion_scale_y = mh ? c.mv_y / float(mh) : c.mv_y;
+        }
         Controls k = net_;
         k.intensity = c.controls.intensity;
         k.style = int(c.controls.style);
@@ -4163,9 +4802,21 @@ public:
         k.noise_every_frame = c.noise_every_frame;
         k.reversible_mode = int(c.proxy_curve);
         k.model_capture_allowed = c.last;
-        k.history_strength = settings_.history_strength;
+        k.history_strength = history_ >= 0.f ? history_ : settings_.history_strength;
+        k.pre_history = settings_.pre_history;
+        k.seed_fixed = !c.noise_every_frame;   // (a wilsjo2 layer's NoiseEveryFrame off: the same seed always)
         try {
-            if (e.motion.image) {
+            if (e.motion.image && split_.tail) {   // frame reuse's even frames: the passes before the cut here, the rest after
+                const uint32_t lo = c.pass * split_.steps;
+                if (cmd_ != split_.tail && split_.cut <= lo) cmd_ = split_.tail;
+                if (cmd_ != split_.tail && split_.cut < lo + split_.steps) {
+                    NetworkSplit part{split_.tail, split_.cut - lo, 0};
+                    s_.runtime->record_engine_split(cmd_, e, s_.capture_controls(k), part);
+                    cmd_ = split_.tail;
+                } else {
+                    s_.runtime->record_engine(cmd_, e, s_.capture_controls(k));
+                }
+            } else if (e.motion.image) {
                 // Interleaved with a Style / Intensity: the network plain (no Style grade; Intensity 1 came in controls)
                 if (c.raw) s_.runtime->set_style_grade(false);
                 s_.runtime->record_engine(cmd_, e, s_.capture_controls(k));
@@ -4193,6 +4844,8 @@ public:
         return 0;
     }
     void passes_begin(const nr::wilsjo2::FlowFacts& x) override {
+        s_.w2_facts = x;
+        s_.w2_facts_known = true;
         s_.w2_fast_passes = x.fast_passes;
         s_.w2_fast_fallback = x.fast_fallback;
         s_.w2_il_missing = x.il_missing;
@@ -4213,6 +4866,7 @@ public:
 private:
     ColourFrame frame_of(nr::wilsjo2::Surf x) const {
         ColourFrame f{};
+        if (!x) return f;
         if (x.h == &target_) {
             f = target_;
             f.before = f.after = target_now_;
@@ -4227,7 +4881,7 @@ private:
         return f;
     }
     Impl& s_;
-    VkCommandBuffer cmd_;
+    VkCommandBuffer& cmd_;
     ColourFrame target_;
     VkImageLayout target_now_;
     EngineFrame engine_;
@@ -4235,13 +4889,25 @@ private:
     const nr::wilsjo2::Settings& settings_;
     uint64_t feature_;
     bool estimate_;
+    W2IoSplit split_;
+    float history_;
+    bool asi_;
 };
 }  // namespace
 
 void Session::Impl::wilsjo2_release(uint64_t feature) {
     const auto it = w2.find(feature);
     if (it == w2.end()) return;
+    // its frame reuse (a wilsjo2 layer's FrameReuse) goes with the GPU's last use of it, as a RenoDX layer's does
+    retire_stage({},std::move(it->second.pair_fields.reuse));
+    if (it->second.reuse) retire_stage({}, std::move(it->second.reuse));
     nr::wilsjo2::FlowState& o = it->second.flow;
+    {   // Passes (fast) Interleaved's surfaces too (the flow's il_release1, through the surfaces' own retirement)
+        VkCommandBuffer none = VK_NULL_HANDLE;
+        static const nr::wilsjo2::Settings kNone{};
+        SessionW2Io io(*this, none, ColourFrame{}, EngineFrame{}, Controls{}, kNone, feature, false);
+        nr::wilsjo2::il_release1(io, o.il1);
+    }
     for (W2Surface** x : {reinterpret_cast<W2Surface**>(&o.proxy.h), reinterpret_cast<W2Surface**>(&o.keep.h),
                           reinterpret_cast<W2Surface**>(&o.answer.h), reinterpret_cast<W2Surface**>(&o.scratch.h),
                           reinterpret_cast<W2Surface**>(&o.clamp.h), reinterpret_cast<W2Surface**>(&o.small.h),
@@ -4260,7 +4926,7 @@ void Session::Impl::wilsjo2_release(uint64_t feature) {
                           reinterpret_cast<W2Surface**>(&o.f_net.h), reinterpret_cast<W2Surface**>(&o.f_ans.h)})
         w2_retire(*x);
     for (nr::wilsjo2::Surf& x : o.fast) w2_retire(*reinterpret_cast<W2Surface**>(&x.h));
-    w2_retire(it->second.work);
+    w2_retire(it->second.work); w2_retire(it->second.pq_linear); w2_retire(it->second.pq_result);
     for (uint32_t k = 1; k < nr::wilsjo2::kMaxPasses; ++k) release_everywhere(stack_feature(feature, k));
     w2.erase(it);
 }
@@ -4283,6 +4949,7 @@ bool Session::Impl::wilsjo2_prepare(const Session::Wilsjo2Frame& wf, uint64_t fe
                                     bool guides, const Controls& controls, Controls* net) {
     if (!wf.settings) return false;
     w2_free_retired();
+    free_retired_stages();   // (frame reuse's retired stages: a session running wilsjo2 layers only sweeps them here)
     const auto& e = w2[feature];
     uint32_t mw = w, mh = h;
     bool spatial = false;
@@ -4290,6 +4957,8 @@ bool Session::Impl::wilsjo2_prepare(const Session::Wilsjo2Frame& wf, uint64_t fe
     // the network made for the format the flow will show it (its input and answer)
     namespace w2f = nr::wilsjo2;
     const bool prep = wf.preprocess.active() && (!w2_stage || w2_stage->has(w2f::kPrepBack));
+    if (wf.hdr && frame_pair::PresentAge::active && frame_pair::PresentAge::active->gathering() &&
+        f==VK_FORMAT_A2B10G10R10_UNORM_PACK32) f=VK_FORMAT_R16G16B16A16_SFLOAT;
     const w2f::Fmt nf = w2f::flow_network_format(*wf.settings, spatial, !w2_stage || w2_stage->has_fast(), prep);
     const VkFormat vf = nf == w2f::Fmt::kHalf ? VK_FORMAT_R16G16B16A16_SFLOAT
                       : nf == w2f::Fmt::kF32 ? VK_FORMAT_R32G32B32A32_SFLOAT : [&] {
@@ -4300,8 +4969,9 @@ bool Session::Impl::wilsjo2_prepare(const Session::Wilsjo2Frame& wf, uint64_t fe
     return wilsjo2_runtime(controls, mw, mh, vf, net);
 }
 
-bool Session::Impl::record_wilsjo2(VkCommandBuffer cmd, const ColourFrame& colour, const EngineFrame& engine,
-                                   const Controls& net, const Session::Wilsjo2Frame& wf) {
+bool Session::Impl::record_wilsjo2_flow(VkCommandBuffer& cmd, const ColourFrame& colour, const EngineFrame& engine,
+                                        const Controls& net, const Session::Wilsjo2Frame& wf, const W2Split* split,
+                                        float history) {
     if (!wf.settings || !runtime) return false;
     const uint64_t now_ms = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
                                          std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -4318,6 +4988,38 @@ bool Session::Impl::record_wilsjo2(VkCommandBuffer cmd, const ColourFrame& colou
     if (!w2_stage) return false;
     w2_uses.touch();
     W2Entry& entry = w2[engine.feature];
+    if (wf.hdr && (colour.format==VK_FORMAT_A2B10G10R10_UNORM_PACK32 || colour.format==VK_FORMAT_A2R10G10B10_UNORM_PACK32) &&
+        frame_pair::PresentAge::active && frame_pair::PresentAge::active->gathering()) {
+        const uint32_t width=colour.width,height=colour.height;
+        auto& buffers=w2[engine.feature];
+        const auto surface=[&](W2Surface*& im,VkFormat format) {
+            if (im && (im->w!=width || im->h!=height || im->format!=format)) w2_retire(im);
+            if (!im) im=w2_make(cmd,format,width,height);
+            return im!=nullptr;
+        };
+        if (!w2_stage || !surface(buffers.pq_linear,VK_FORMAT_R16G16B16A16_SFLOAT) ||
+            !surface(buffers.pq_result,colour.format)) return false;
+        ColourFrame linear=colour;
+        linear.image=buffers.pq_linear->image;linear.format=VK_FORMAT_R16G16B16A16_SFLOAT;
+        linear.before=linear.after=VK_IMAGE_LAYOUT_GENERAL;
+        ColourFrame encoded=colour; encoded.image=buffers.pq_result->image;
+        encoded.before=encoded.after=VK_IMAGE_LAYOUT_GENERAL;
+        nr::wilsjo2::Dispatch pass{};
+        pass.t0={colour.image,colour.format,width,height,colour.before};
+        pass.u0={linear.image,linear.format,width,height,VK_IMAGE_LAYOUT_GENERAL};
+        pass.constants.width=width;pass.constants.height=height;
+        pass.constants.mode=nr::wilsjo2::kFinishedToLinear;
+        w2_everything(cmd); w2_stage->record(cmd,pass); w2_everything(cmd);
+        EngineFrame e=engine;e.colour=linear;
+        if (!record_wilsjo2_flow(cmd,linear,e,net,wf,split,history)) return false;
+        pass.t2=pass.t0;pass.t0=pass.u0;
+        pass.u0={encoded.image,encoded.format,width,height,VK_IMAGE_LAYOUT_GENERAL};
+        pass.constants.mode=nr::wilsjo2::kFinishedToPq;
+        w2_stage->record(cmd,pass); w2_everything(cmd);
+        renodx::StageFrame copy{};copy.colour=encoded;copy.output=colour;
+        frame_reuse::Stage::pass_input(cmd,copy);
+        return true;
+    }
     w2_everything(cmd);
     // The frame read and written in place when the stage can (sampled + storage, a storable format); else through an
     // image of ours (an sRGB view's bytes as UNORM), copied in before and back after.
@@ -4369,8 +5071,15 @@ bool Session::Impl::record_wilsjo2(VkCommandBuffer cmd, const ColourFrame& colou
         target.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                        VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     }
-    SessionW2Io io(*this, cmd, target, engine, net, *wf.settings, engine.feature, wf.estimate_motion);
+    W2IoSplit io_split{VK_NULL_HANDLE, 0, 0};
+    if (split && split->tail) {   // the cut in all the passes' steps together, as a RenoDX layer's (record_renodx)
+        const uint32_t steps = runtime->network_steps();
+        const uint32_t passes = std::max(1u, nr::wilsjo2::passes_requested(*wf.settings));
+        io_split = {split->tail, uint32_t(std::lround(double(split->share) * double(passes * steps))), steps};
+    }
+    SessionW2Io io(*this, cmd, target, engine, net, *wf.settings, engine.feature, wf.estimate_motion, io_split, history, wf.asi);
     w2_fast_passes = 0.f; w2_fast_fallback = false; w2_il_missing = 0; w2_fast_fallback_spatial = false; w2_spatial_on = false;
+    w2_facts_known = false;
     w2_motion = engine.motion.image != VK_NULL_HANDLE && wf.fast_motion;
     nr::wilsjo2::FlowFrame ff;
     ff.target = io.target();
@@ -4380,28 +5089,232 @@ bool Session::Impl::record_wilsjo2(VkCommandBuffer cmd, const ColourFrame& colou
     ff.depth = io.depth();
     ff.motion = io.motion();
     char g[160];
-    std::snprintf(g, sizeof g, "%d:%ux%u:%d:%ux%u", int(engine.depth.format), engine.depth.width, engine.depth.height,
-                  int(engine.motion.format), engine.motion.width, engine.motion.height);
+    if (wf.asi)   // (as the .asi's flow: a region that moves restarts the history too)
+        std::snprintf(g, sizeof g, "%d:%ux%u:%d:%ux%u:%u,%u,%u,%u:%u,%u,%u,%u", int(engine.depth.format), engine.depth.width,
+                      engine.depth.height, int(engine.motion.format), engine.motion_texture_width, engine.motion_texture_height,
+                      engine.depth_x, engine.depth_y, engine.depth.width, engine.depth.height, engine.motion_x, engine.motion_y,
+                      engine.motion.width, engine.motion.height);
+    else
+        std::snprintf(g, sizeof g, "%d:%ux%u:%d:%ux%u", int(engine.depth.format), engine.depth.width, engine.depth.height,
+                      int(engine.motion.format), engine.motion.width, engine.motion.height);
     ff.guide_signature = g;
     ff.depth_rect = {engine.depth_x, engine.depth_y, engine.depth.width, engine.depth.height};
     ff.motion_rect = {engine.motion_x, engine.motion_y, engine.motion.width, engine.motion.height};
     ff.flags = engine.depth_inverted ? (1u << 3) : 0u;
     ff.hdr = wf.hdr;
-    ff.reset = engine.reset;
+    ff.reset = engine.reset || (wf.present_id && entry.last_present + 1 != wf.present_id);
+    entry.last_present = wf.present_id;
     // the flow's MV scale in pixels of the motion region (as an NGX scale is), so that its peripheral compression maps
     // them to native pixels; the network is given this route's own normalized scale (SessionW2Io::network)
     ff.mv_x = engine.motion_scale_x * float(std::max(engine.motion.width, 1u));
     ff.mv_y = engine.motion_scale_y * float(std::max(engine.motion.height, 1u));
     ff.preprocess = wf.preprocess;
-    ff.at_present = true;
+    ff.pre_exposure = wf.pre_exposure;
+    ff.before_upscale = wf.before_upscale;
+    ff.at_present = wf.at_present;
     ff.fast_motion = wf.fast_motion;
     const bool ran = nr::wilsjo2::flow_run(io, entry.flow, ff, *wf.settings, uint64_t(target.format));
+    if (!ran && entry.flow.reuse_failure && frame_pair::PresentAge::active && frame_pair::PresentAge::active->gathering())
+        frame_pair::PresentAge::active->group_reason=entry.flow.reuse_failure;
     w2_everything(cmd);
     if (!in_place) {   // the answer (or the frame as it came) back into the frame
         w2_layout(cmd, colour.image, colour.before, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         copy(entry.work->image, VK_IMAGE_LAYOUT_GENERAL, colour.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         w2_layout(cmd, colour.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, colour.after);
     }
+    return ran;
+}
+
+// A wilsjo2 layer: the flow (record_wilsjo2_flow); an .asi layer with FrameReuse, inside frame reuse as a RenoDX layer's
+// runs (record_renodx): two neighbouring NR results per reconstructed frame, shown at Present.
+bool Session::Impl::record_wilsjo2(VkCommandBuffer cmd, const ColourFrame& colour, const EngineFrame& engine,
+                                   const Controls& net, const Session::Wilsjo2Frame& wf) {
+    advance_terminal(cmd);
+    if (!wf.asi || !wf.settings) {   // the ReShade route: the flow alone
+        VkCommandBuffer c = cmd;
+        return record_wilsjo2_flow(c, colour, engine, net, wf);
+    }
+    const nr::wilsjo2::Settings& ws = *wf.settings;
+    W2Entry& entry = w2[engine.feature];
+    if (!ws.frame_reuse && (entry.reuse || !entry.reuse_failed.empty() || !entry.reuse_ui.empty())) {   // switched off (NR Control, live): the stage and its memory go; on again: afresh
+        if (entry.reuse) {
+            log("[nr] frame reuse switched off (wilsjo2 layer): its %llu MiB go once the GPU is done with them",
+                (unsigned long long)(entry.reuse->image_bytes() >> 20));
+            entry.reuse->flush(cmd);
+            retire_stage({}, std::move(entry.reuse));
+        }
+        entry.reuse_note.clear(); entry.reuse_said.clear(); entry.reuse_failed.clear(); entry.reuse_ui.clear();
+    }
+    // F5 (nr_screenshot.hpp): a layer at the upscaler - the frame NR runs on before and after it (the .asi's own flow
+    // took the pair in its run_begin / run_end); a Present layer's pair is the Present's
+    struct Capture {   // (a pair begun and not finished - the run failed or threw - is abandoned, its buffers retired)
+        Impl& s;
+        std::unique_ptr<Shot> sh;
+        ~Capture() {
+            if (!sh) return;
+            s.shots_out.push_back(std::move(sh));
+            screenshot::abandon("run_failed", "the frame's run could not finish");
+        }
+    } capture{*this, wf.at_present ? nullptr
+                     : w2_capture_begin(cmd, colour, wf.hdr ? 1 : 0, wf.before_upscale ? "nr-before-upscaler" : "nr-after-upscaler")};
+    frame_reuse::Stage* reuse = nullptr;
+    renodx::StageFrame sf;
+    sf.colour = colour; sf.output = colour; sf.reset = engine.reset;
+    sf.motion = engine.motion; sf.motion_x = engine.motion_x; sf.motion_y = engine.motion_y;
+    sf.motion_scale_x = engine.motion_scale_x; sf.motion_scale_y = engine.motion_scale_y;
+    sf.fast_motion_available = wf.fast_motion && engine.motion.image != VK_NULL_HANDLE;
+    sf.depth = engine.depth; sf.depth_x = engine.depth_x; sf.depth_y = engine.depth_y;
+    sf.depth_inverted = engine.depth_inverted;
+    // (even frames: as record_renodx's at the Present - no other NR layer running, frame generation off or followed,
+    // HUD FIX off)
+    const char* blocked = !wf.at_present ? frame_reuse::placement
+            : frame_pair::PresentAge::active && frame_pair::PresentAge::active->interleaved_conflict ? frame_reuse::interleaved
+            : ((frame_pair::PresentAge::active ? frame_pair::PresentAge::active->multiple : chain_active(std::chrono::steady_clock::now())) && !frame_pair::PresentAge::terminal() && !frame_pair::PresentAge::isolated()) ? frame_reuse::chain_busy
+            : g_frame_generation.load(std::memory_order_acquire) == 2 ? g_fg_reason.load(std::memory_order_relaxed)
+            : g_hud_fix.load(std::memory_order_relaxed) ? frame_reuse::hud_unsynced : nullptr;
+    using VkJobs=frame_pair::ChainJobs<VkCommandBuffer,renodx::StageFrame>;
+    VkJobs* jobs=nullptr;
+    auto* age=frame_pair::PresentAge::active;
+    if ((!age || !age->paired || !age->gathering() || !ws.frame_reuse) && entry.pair_fields.reuse)
+        retire_stage({},std::move(entry.pair_fields.reuse));
+    if (age && age->gathering()) {
+        if (!runtime) { reuse_state=2; reuse_note_ui="Waiting for the other frame reuse layers"; return true; }
+        VkJobs::Pair pair;
+        if (age->paired && ws.frame_reuse) {
+            auto* kernel=reuse_stage_for(cmd,entry.pair_fields,sf,ws,!sf.motion.image,nullptr,
+                                         wf.hdr && colour.format==VK_FORMAT_R16G16B16A16_SFLOAT,wilsjo2::reuse_equal,true);
+            if (!kernel) {reuse_state=2;reuse_note_ui=entry.pair_fields.reuse_ui;return true;}
+            pair=[kernel](VkCommandBuffer& c,renodx::StageFrame* o,renodx::StageFrame& e,const VkJobs::Execute& run){
+                return kernel->render_pair(c,o,e,run);
+            };
+        }
+        Runtime* rt=runtime;
+        rt->touch_submission();
+        const int row=call_layer;
+        const uint32_t count=std::max(1u,wilsjo2::passes_requested(ws));
+        const uint32_t steps=rt->network_steps()*count;
+        jobs=VkJobs::add(handles.device,uint32_t(colour.format),steps,uintptr_t(rt)^engine.feature,
+            [this,row,rt,engine,wf,net,ws,steps,count](VkCommandBuffer& cur,const renodx::StageFrame& a,
+                                                      VkCommandBuffer tail,uint32_t cut,uint32_t gap) {
+                struct Restore { Impl& impl; Runtime* rt; int layer;
+                    ~Restore(){impl.runtime=rt;impl.call_layer=layer;}
+                } restore{*this,runtime,call_layer};
+                runtime=rt; call_layer=row; rt->touch_submission();
+                auto e=engine;
+                e.colour=a.output; e.reset=a.reset; e.motion=a.motion; e.motion_x=a.motion_x; e.motion_y=a.motion_y;
+                e.motion_texture_width=e.motion.width; e.motion_texture_height=e.motion.height;
+                e.motion_scale_x=a.motion_scale_x; e.motion_scale_y=a.motion_scale_y;
+                e.depth=a.depth; e.depth_x=a.depth_x; e.depth_y=a.depth_y;
+                if(a.output.image!=a.colour.image) frame_reuse::Stage::pass_input(cur,a);
+                // a member without the game's depth (wilsjo2 needs it; frame reuse's own run does not): the anchor as it is
+                if (!a.depth.image && !ws.frame_reuse) { if (tail) cur = tail; return 0u; }   // (the cursor past the cut)
+                const W2Split part{tail,steps?float(cut)/float(steps):0.f};
+                auto frame=wf; frame.settings=&ws;
+                if (!record_wilsjo2_flow(cur,a.output,e,net,frame,tail?&part:nullptr,gap>=2?.5f*ws.history_strength:-1.f))
+                    return frame_pair::failed_calls;
+                return count;
+            },std::move(pair));
+        if (!jobs || !jobs->ready) {
+            reuse_state=2; reuse_share=-1.f; reuse_note_ui="Waiting for the other frame reuse layers";
+            return true;
+        }
+    }
+    if (ws.frame_reuse)
+        reuse = reuse_stage_for(cmd, entry, sf, ws, engine.motion.image == VK_NULL_HANDLE, blocked, wf.hdr && sf.colour.format==VK_FORMAT_R16G16B16A16_SFLOAT, nr::wilsjo2::reuse_equal);
+    if (reuse && entry.reuse_epoch!=(jobs?jobs->epoch:0)) {
+        reuse->reset(); entry.reuse_epoch=jobs?jobs->epoch:0;
+    }
+    if (reuse) {   // ([Preprocess] changed: as a setting's change, afresh)
+        const Preprocess& a = entry.reuse_prep;
+        const Preprocess& b = wf.preprocess;
+        if (a.enabled != b.enabled || a.exposure != b.exposure || a.bias_ev != b.bias_ev || a.curve != b.curve ||
+            a.contrast != b.contrast || a.saturation != b.saturation || a.inverse != b.inverse) {
+            reuse->reset();
+            entry.reuse_prep = b;
+        }
+    }
+    reuse_state = !ws.frame_reuse ? 0u : reuse ? 1u : 2u;
+    reuse_note_ui = reuse_state == 2u ? entry.reuse_ui : std::string();
+    if (age && age->gathering() && reuse_state==2) age->group_reason=entry.reuse_ui;
+    reuse_share = reuse_state == 1u ? entry.reuse_share : -1.f;
+    bool ran = false, delayed_now = false;
+    if (reuse) {
+        const auto paired=[&](VkCommandBuffer& c,renodx::StageFrame* o,renodx::StageFrame& e,VkCommandBuffer tail,float share){
+            return jobs->record_pair(c,o,e,tail,share);
+        };
+        const auto r = jobs && age->paired ? reuse->record_batch(cmd,sf,paired) : reuse->record(cmd, sf, [&](VkCommandBuffer c, const renodx::StageFrame& f) -> uint32_t {
+            if (jobs) {
+                const auto part=reuse->split();
+                return jobs->record(c,f,part.tail,part.share,reuse->gap());
+            }
+            // the stage's copy of the frame (its anchor, kept for the rebuilt frames) into its answer image; the flow runs
+            // in place there
+            w2_everything(c);
+            VkImageCopy region{};
+            region.srcSubresource = region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            region.extent = {f.colour.width, f.colour.height, 1};
+            vkCmdCopyImage(c, f.colour.image, VK_IMAGE_LAYOUT_GENERAL, f.output.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+            w2_everything(c);
+            EngineFrame e = engine;
+            e.colour = f.output; e.reset = f.reset;
+            e.motion = f.motion; e.motion_x = f.motion_x; e.motion_y = f.motion_y;
+            e.motion_scale_x = f.motion_scale_x; e.motion_scale_y = f.motion_scale_y;
+            // (the game's own vectors: their allocation's extent, as run_after read it; the stage's images: theirs)
+            if (f.motion.image != engine.motion.image) {
+                e.motion_texture_width = f.motion.width; e.motion_texture_height = f.motion.height;
+            }
+            e.depth = f.depth; e.depth_x = f.depth_x; e.depth_y = f.depth_y;
+            const frame_reuse::Stage::Split sp = reuse->split();
+            VkCommandBuffer cur = c;
+            // a history two frames old (after a rebuilt frame) followed half as strongly (the layer's History halved)
+            const W2Split part{sp.tail, sp.share};
+            const bool ok = record_wilsjo2_flow(cur, f.output, e, net, wf, &part,
+                                                reuse->gap() >= 2 ? 0.5f * ws.history_strength : -1.f);
+            return ok ? std::max(1u, nr::wilsjo2::passes_requested(ws)) : frame_pair::failed_calls;
+        }, {});
+        if (jobs) {
+            age->group_written=r.ok; age->group_share=entry.reuse_share;
+            if (entry.reuse_frames==118 && r.completed)
+                log("[nr] frame reuse anchor: %u network calls across %u layers",r.network_calls,unsigned(jobs->members.size()));
+        }
+        if (!r.ok) {
+            reuse_state=2;
+            const char* detail=entry.flow.reuse_failure ? entry.flow.reuse_failure : frame_reuse::anchor_error;
+            reuse_note_ui=entry.reuse_ui=age && !age->group_reason.empty() ? age->group_reason : detail;
+            if(age)age->group_reason=entry.reuse_ui;
+            log("[nr] frame reuse: %s",entry.reuse_ui.c_str());
+        }
+        ran = r.ok;   // (the frame the stage shows: NR's or rebuilt)
+        outer_reuse = outer_open;
+        delayed_now = r.shown_late != 0;
+        if (delayed_now) g_frames_delay.store(r.shown_late, std::memory_order_relaxed);
+        if (auto* a=frame_pair::PresentAge::active)a->next_frames+=r.next_late;
+        if (delayed_now) frame_pair::PresentAge::record(r.shown_late);
+        // NR Control's share of frames with NR: over windows of 60 frames (the GPU's counters, read a frame late)
+        if ((entry.reuse_frames + 1) % 60 == 0) {
+            const frame_reuse::Stage::Stats st = reuse->stats();
+            if (st.frames > entry.reuse_window.frames)
+                entry.reuse_share = float(double(st.computed - entry.reuse_window.computed) / double(st.frames - entry.reuse_window.frames));
+            entry.reuse_window = st;
+        }
+        if (++entry.reuse_frames == 120 || entry.reuse_frames % 600 == 0) {   // (early once: it runs at all)
+            const frame_reuse::Stage::Stats st = reuse->stats();
+            log("[nr] wilsjo2 layer %d: frame reuse, last %llu frames: NR on %llu, rebuilt %llu", call_layer,
+                (unsigned long long)(st.frames - entry.reuse_logged.frames),
+                (unsigned long long)(st.computed - entry.reuse_logged.computed),
+                (unsigned long long)((st.frames - entry.reuse_logged.frames) - (st.computed - entry.reuse_logged.computed)));
+            entry.reuse_logged = st;
+        }
+    } else {
+        if (entry.reuse) entry.reuse->flush(cmd);   // paused (no vectors / depth): what waits runs first
+        VkCommandBuffer c = cmd;
+        if (!ws.frame_reuse) ran = record_wilsjo2_flow(c, colour, engine, net, wf);
+    }
+    if (wf.at_present)   // (the Present's pictures: only a Present layer says how late they come)
+        g_frames_delayed_ms.store((delayed_now || (frame_pair::PresentAge::active && frame_pair::PresentAge::active->frames)) ? std::max<int64_t>(1, std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      std::chrono::steady_clock::now().time_since_epoch()).count()) : 0,
+                                  std::memory_order_relaxed);
+    if (capture.sh && ran) w2_capture_end(cmd, std::move(capture.sh), colour);
     return ran;
 }
 
@@ -4505,6 +5418,7 @@ bool Session::run_renodx(ID3D12Device* device, ID3D12GraphicsCommandList* list,
 
 bool Session::record_raw(ID3D12Device* device, ID3D12GraphicsCommandList* list, const RawRecorder& recorder) {
     auto& s = *impl_;
+    s.free_retired_stages();   // (frame reuse switched off on the .asi's wilsjo2 layers: their stages go here)
     if (!device || !list || !recorder) return false;
     if (!s.ensure_d3d12_device(device)) return false;
     Impl::Recording rec;
@@ -4550,6 +5464,7 @@ bool Session::record_raw(ID3D12Device* device, ID3D12GraphicsCommandList* list, 
 
 bool Session::record_raw_vk(VkCommandBuffer cmd, const RawRecorderVk& recorder) {
     auto& s = *impl_;
+    s.free_retired_stages();   // (frame reuse switched off on the .asi's wilsjo2 layers: their stages go here)
     if (!cmd || !recorder || !s.handles.valid() || !s.access.queue) return false;
     HostDevice host{};
     host.instance = s.handles.instance; host.physical = s.handles.physical; host.device = s.handles.device;
@@ -4810,6 +5725,7 @@ bool Session::run_d3d11(const D3D11Frame& frame, const Controls& controls) {
         } else {
             OwnOuterRun timing(*this, s.own_cmd, s.call_layer > 0 && !s.outer_open);
 
+            s.advance_terminal(s.own_cmd);
             if (motion) s.runtime->record_engine(s.own_cmd, engine, s.capture_controls(controls));
             else if (frame.estimate_motion) {
                 TemporalFrame temporal{engine.reset, frame.feature};
@@ -5140,6 +6056,7 @@ VkImage Session::run_vulkan(const DeviceHandles& handles, VkCommandBuffer cmd,
     if (frame.in_place) {
         try {
 
+            s.advance_terminal(cmd);
             if (frame.motion) s.runtime->record_engine(cmd, engine, s.capture_controls(controls));
             else s.runtime->record(cmd, colour, s.capture_controls(controls), engine.reset);
 
@@ -5172,6 +6089,7 @@ VkImage Session::run_vulkan(const DeviceHandles& handles, VkCommandBuffer cmd,
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                              0, 0, nullptr, 0, nullptr, 1, &b);
 
+        s.advance_terminal(cmd);
         if (frame.motion) s.runtime->record_engine(cmd, engine, s.capture_controls(controls));
         else s.runtime->record(cmd, colour, s.capture_controls(controls), engine.reset);
 

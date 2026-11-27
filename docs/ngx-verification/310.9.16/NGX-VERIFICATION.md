@@ -1,6 +1,6 @@
-# Checking DLSSNR-AMD against NVIDIA's own DLL: 310.9.16, the new model
+# Checking DLSSNR-AMD against NVIDIA's own DLL: 310.9.16, `CC_SMALL_FP8`
 
-This compares the picture DLSSNR-AMD produces with the new model against the picture NVIDIA's DLSS 5
+This compares the picture DLSSNR-AMD produces with `CC_SMALL_FP8` against the picture NVIDIA's DLSS 5
 Neural Rendering DLL 310.9.16 produces for the same input and the same settings: single frames, and
 short moving sequences where motion vectors and the previous frame (history) are used. The inputs,
 settings and measures are the ones of the [310.8.0 check](../310.8.0/NGX-VERIFICATION.md).
@@ -8,8 +8,8 @@ settings and measures are the ones of the [310.8.0 check](../310.8.0/NGX-VERIFIC
 ## The two models in 310.9.16
 
 `nvngx_dlssnr.dll` 310.9.16 holds two models and picks one with the `DLSSNR.Hint.Render.Preset`
-creation parameter: preset 1 is the old model, the one of 310.8.0; preset 2, which is also the default,
-is the new model. On the RTX 5090, through NGX:
+creation parameter: preset 1 is `CC_SILVER_AARDWOLD`, the model of 310.8.0; preset 2, which is also the default,
+is `CC_SMALL_FP8`. On the RTX 5090, through NGX:
 
 - 310.9.16 with preset 1 gives byte-identical output to 310.8.0 at 1920x1080, 2560x1440 and 3840x2160.
 - 310.9.16 with its default preset and with preset 2 give byte-identical output: the default is the new
@@ -21,13 +21,13 @@ settings below):
 
 | | 1920x1080 | 2560x1440 | 3840x2160 |
 |---|---|---|---|
-| 310.8.0 (old model) | 2.825 ms | 3.816 ms | 7.708 ms |
-| 310.9.16 (new model) | 1.671 ms | 2.149 ms | 4.197 ms |
+| 310.8.0 (`CC_SILVER_AARDWOLD`) | 2.825 ms | 3.816 ms | 7.708 ms |
+| 310.9.16 (`CC_SMALL_FP8`) | 1.671 ms | 2.149 ms | 4.197 ms |
 
 ## What ran on each side
 
 **NVIDIA side (the reference).** The unmodified `nvngx_dlssnr.dll` 310.9.16.0, called through NVIDIA NGX
-the way a game calls it, with its default preset (the new model). The DLL ran its own host code and its
+the way a game calls it, with its default preset (`CC_SMALL_FP8`). The DLL ran its own host code and its
 own GPU kernels end to end; nothing was extracted from it, re-implemented or replayed.
 
 - GPU: NVIDIA GeForce RTX 5090, Linux driver 595.71.05.
@@ -37,7 +37,7 @@ own GPU kernels end to end; nothing was extracted from it, re-implemented or rep
   GE-Proton 11-7), on NVIDIA's Vulkan driver.
 - Host programs: the same small D3D12 programs as for 310.8.0.
 
-**DLSSNR-AMD side.** The Linux build of DLSSNR-AMD 0.0.6-linux-preview with the new model, on an AMD
+**DLSSNR-AMD side.** The Linux build of DLSSNR-AMD 0.0.6-linux-preview with `CC_SMALL_FP8`, on an AMD
 Radeon RX 9070 XT (Mesa 26.2.4 RADV), through the same code path a game on the OptiScaler route uses:
 its NGX core under GE-Proton 11-7 Wine and vkd3d-proton, driven by the same host programs with the same
 input files and parameters. DLSSNR-AMD builds its network in the background from the first evaluate on
@@ -69,7 +69,7 @@ Both outputs compared as 8-bit RGB. SSIM is the mean over R, G and B (11x11 Gaus
 
 For scale, the input itself (Neural Rendering off) against NVIDIA's output: PSNR 28.88 / 28.21 / 30.09 dB,
 SSIM 0.9736 / 0.9696 / 0.9774. Size of the edit (RMS, 1/255): NVIDIA 9.18 / 9.91 / 7.98,
-DLSSNR-AMD 9.36 / 9.77 / 8.04. The new model changes the picture less than the old one (NVIDIA's edit
+DLSSNR-AMD 9.36 / 9.77 / 8.04. `CC_SMALL_FP8` changes the picture less than `CC_SILVER_AARDWOLD` (NVIDIA's edit
 with 310.8.0: 12.15 / 10.48 / 9.37).
 
 NVIDIA's DLL gave byte-identical output in separate runs of the same input, so the differences above are

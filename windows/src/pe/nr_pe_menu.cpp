@@ -20,6 +20,7 @@
 #include "nr_vram_ledger.hpp"
 
 #include "MinHook.h"
+#include "nr_hud_method_hook.hpp"
 #include "imgui.h"
 #include "imgui_impl_dx11.h"
 #include "imgui_impl_dx12.h"
@@ -1672,6 +1673,7 @@ struct D3D12Overlay {
 // hooked to know it (watch_queues).
 using ExecuteFn = void(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
 ExecuteFn g_execute = nullptr;
+std::atomic<bool> g_queue_hooked{false};
 std::atomic<ExecuteObserver> g_execute_observer{nullptr};   // on_execute
 thread_local ID3D12CommandQueue* t_last_direct = nullptr;
 thread_local ID3D12CommandQueue* t_last_seen = nullptr;
@@ -1710,7 +1712,7 @@ template <class T> void let_go_idle(std::map<void*, Kept<T>>& m, std::chrono::st
 
 // The queue a D3D12 swap chain was made with, as the .asi saw it made (note_swapchain_queue), in a table of our own:
 // not in the swap chain's private data - set on OptiScaler's XeFG output's swap chain, that changed the frames XeFG
-// generated (1/255 on every generated frame with NR at Present, stand-in, 11-05). Each entry holds a reference to its
+// generated (1/255 on every generated frame with NR at Present). Each entry holds a reference to its
 // queue. Not let go by time: a swap chain that stops presenting (a minimised game) and presents again from a thread
 // that executed nothing would have no other way to its queue. Let go when a swap chain is made again at the same
 // address, when its queue's device is removed, and the oldest beyond kCreatedKept (a game making chain after chain).
@@ -1961,6 +1963,15 @@ template <int N> HRESULT STDMETHODCALLTYPE colour_space_hook(IDXGISwapChain3* sc
 // The methods as nr_present_probe.exe found them in a process of its own (see there), hooked in the same modules here.
 void install_now() {
     const std::string folder = nr::pe::module_folder();
+    {
+        char v[16] = {};
+        const std::string ini_path = folder + "\\dlssnr-amd.ini";
+        nr::u8::profile("NRControl", "SystemPresentHook", "1", v, sizeof v, ini_path.c_str());
+        if (v[0] == '0' && v[1] == '\0') {
+            say("[NRControl] SystemPresentHook = 0 in dlssnr-amd.ini; skipping System32\\dxgi.dll Present hooks");
+            return;
+        }
+    }
     std::wstring probe, out;
     {
         probe = nr::u8::wide(folder + "\\dlssnr-amd\\nr_present_probe.exe");
@@ -2026,8 +2037,15 @@ void install_now() {
         char here[33] = {};
         for (int i = 0; i < 16; ++i) std::snprintf(here + 2 * i, 3, "%02x", static_cast<const unsigned char*>(fn)[i]);
         if (bytes != here) say(name + " in " + path + " is already patched in this process (another hook); hooked over it");
-        if (MH_CreateHook(fn, t->detour[t->used], t->real[t->used]) != MH_OK || MH_EnableHook(fn) != MH_OK) {
+        if (MH_CreateHook(fn, t->detour[t->used], t->real[t->used]) != MH_OK) {
+            *t->real[t->used] = nullptr;
             say(name + " could not be hooked");
+            continue;
+        }
+        if (MH_EnableHook(fn) != MH_OK) {
+            MH_RemoveHook(fn);
+            *t->real[t->used] = nullptr;
+            say(name + " could not be enabled");
             continue;
         }
         ++t->used;
@@ -2160,13 +2178,14 @@ void watch_queues(ID3D12Device* device) {
         // ExecuteCommandLists
         void* fn = (*reinterpret_cast<void***>(q))[10];
         q->Release();
-        const MH_STATUS init = MH_Initialize();
-        if ((init != MH_OK && init != MH_ERROR_ALREADY_INITIALIZED) ||
-            MH_CreateHook(fn, reinterpret_cast<void*>(&execute_hook), reinterpret_cast<void**>(&g_execute)) != MH_OK ||
-            MH_EnableHook(fn) != MH_OK)
+        if (nr::hudcap::MethodHook<ExecuteFn>::install_raw(fn, &execute_hook, &g_execute) == MH_OK)
+            g_queue_hooked.store(true, std::memory_order_release);
+        else
             say("ExecuteCommandLists could not be hooked; no menu over D3D12 swap chains");
     });
 }
+
+bool queue_hooked() { return g_queue_hooked.load(std::memory_order_acquire); }
 
 void on_d3d12_present(D3D12PresentHook hook) { g_d3d12_hook.store(hook); }
 void on_d3d12_shown(D3D12ShownHook hook) { g_d3d12_shown.store(hook); }

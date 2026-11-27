@@ -1,0 +1,34 @@
+#version 460
+layout(local_size_x=16,local_size_y=16) in;
+layout(binding=0) uniform sampler2D Motion;
+layout(binding=1) uniform sampler2D Depth;
+layout(binding=2) uniform sampler2D Exposure;
+layout(binding=3,rg32f) uniform writeonly image2D OutMotion;
+layout(binding=4,r32f) uniform writeonly image2D OutDepth;
+layout(binding=5,r32f) uniform writeonly image2D OutExposure;
+layout(push_constant) uniform Push {
+    uvec2 motion_grid, depth_grid;
+    uvec2 motion_base, motion_size, depth_base, depth_size;
+    vec2 motion_scale;
+    uint flags;
+} pc;
+void main() {
+    uvec2 p=gl_GlobalInvocationID.xy;
+    if(all(lessThan(p,pc.motion_grid))) {
+        vec2 uv=(vec2(p)+.5)/vec2(pc.motion_grid);
+        ivec2 mp=ivec2(pc.motion_base)+min(ivec2(uv*pc.motion_size),ivec2(pc.motion_size)-1);
+        vec2 mv=texelFetch(Motion,mp,0).rg*pc.motion_scale;
+        if(any(isnan(mv))||any(isinf(mv))) mv=vec2(0);
+        imageStore(OutMotion,ivec2(p),vec4(mv,0,0));
+    }
+    if(all(lessThan(p,pc.depth_grid))) {
+        float z=1;
+        if((pc.flags&1u)!=0u) {
+            vec2 uv=(vec2(p)+.5)/vec2(pc.depth_grid);
+            ivec2 dp=ivec2(pc.depth_base)+min(ivec2(uv*pc.depth_size),ivec2(pc.depth_size)-1);
+            z=texelFetch(Depth,dp,0).r;
+        }
+        imageStore(OutDepth,ivec2(p),vec4(z));
+    }
+    if(all(equal(p,uvec2(0)))) imageStore(OutExposure,ivec2(0),vec4((pc.flags&2u)!=0u?texelFetch(Exposure,ivec2(0),0).r:1));
+}

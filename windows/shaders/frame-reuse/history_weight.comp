@@ -1,0 +1,9 @@
+#version 460
+// Frame reuse: the network's history weight chosen on the GPU. Its parameters were just written with the weight for a
+// history one frame old; when the frame before was rebuilt (decision word 0) the history is two frames old and is
+// followed half as strongly.
+layout(local_size_x=1) in;
+layout(binding=0) readonly buffer Decision {uint words[];};
+layout(binding=1) buffer Params {float params[];};
+layout(push_constant) uniform Push {uint slot, offset; float weight;} pc;
+void main() {params[pc.offset]=words[pc.slot]!=0u?pc.weight:pc.weight*0.5;}

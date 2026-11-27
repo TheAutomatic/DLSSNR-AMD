@@ -14,7 +14,7 @@
 namespace nr::control {
 
 inline constexpr uint32_t kMagic = 0x4C4F5243u;   // "CROL"
-inline constexpr uint32_t kVersion = 15;   // 15: six networks (CC_SILVER_AARDWOLD_OPTIMIZED's three levels)
+inline constexpr uint32_t kVersion = 18;   // 18: nine networks (CC_SMALL_FP8_OPTIMIZED at Ultra Performance); 17: eight networks (CC_SMALL_FP8_OPTIMIZED at Performance); 16: frame reuse in the layer rows; 15: six networks (CC_SILVER_AARDWOLD_OPTIMIZED's three levels)
 inline constexpr uint32_t kPanelLines = 10;
 inline constexpr uint32_t kMaxLayers = 8;
 // The engine-data line nr_engine_panel.hpp writes when the game gives no exposure and nothing covers it (its start;
@@ -58,6 +58,11 @@ struct LayerStatus {
     uint32_t panel_lines;           // the engine-data panel of this layer's runs (as Shared::panel)
     char panel[kPanelLines][192];
     uint32_t panel_at;              // GetTickCount (low 32 bits) of its last write
+    // Frame reuse (NRFrameReuse): 0 off, 1 runs (reuse_share: the share of frames NR ran on lately, < 0 not measured
+    // yet), 2 cannot run (reuse_note says why)
+    uint32_t reuse;
+    float reuse_share;
+    char reuse_note[160];
 };
 
 struct Shared {

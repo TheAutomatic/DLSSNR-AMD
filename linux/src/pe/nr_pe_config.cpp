@@ -257,7 +257,12 @@ bool dlssnr_key(Config& c, int& passes, const std::string& key, const std::strin
         else if (v == "edit strength" || v == "editstrength" || v == "4") c.fast_method = 4;
     }
     else if (key == "fastinterleavedpasses") c.fast_interleaved_passes = uint32_t(number(value, 2, 8, float(c.fast_interleaved_passes)));
-    else if (key == "fastinterleavedpreset") c.fast_interleaved_preset = uint32_t(number(value, 1, 2, float(c.fast_interleaved_preset)));
+    else if (key == "fastinterleavedpreset") {   // 1 | 2 (another value: the default, as the .asi's wilsjo2 parse)
+        const float n = number(value, 0, 9, float(nr::fast::kDefaultInterleavedPreset));
+        c.fast_interleaved_preset = n == 1.f || n == 2.f ? uint32_t(n) : nr::fast::kDefaultInterleavedPreset;
+    }
+    else if (key == "fastinterleaveddepthdisocclusion") { if (auto b = parse_bool(value)) c.fast_interleaved_depth_disocclusion = *b; }
+    else if (key == "framereuse") { if (auto b = parse_bool(value)) c.frame_reuse = *b; }
     else if (fast_method_key("fast", key, value, c.fast_passes, c.fast_halo_limit, c.fast_fine, false)) {}
     else if (key == "fasteditstrength") c.fast_edit_strength = number(value, 0, 4, c.fast_edit_strength);
     else if (key == "scalingdownscaler") { const int v = nr::parse_integer<int>(value, -1); if (v >= 0 && v <= 7) k.scaling_downscaler = v; }
@@ -281,8 +286,9 @@ bool dlssnr_key(Config& c, int& passes, const std::string& key, const std::strin
         else if (v == "lanczos" || v == "lanczos3" || v == "2") k.classic_scaler = 2;
         else if (v == "fsr1" || v == "fsr" || v == "3") k.classic_scaler = 3;
     }
-    else if (key == "history") c.history = number(value, 0, 1, c.history);
+    else if (key == "posthistory") c.history = number(value, 0, 1, c.history);
     else if (key == "noiseeveryframe") { if (auto b = parse_bool(value)) k.noise_every_frame = *b; }
+    else if (key == "prehistory") { if (auto b = parse_bool(value)) k.pre_history = *b; }
     else if (key == "spatialcompression") { if (auto b = parse_bool(value)) c.spatial.on = *b; }
     else if (key == "spatialcenterx") c.spatial.centre[0] = number(value, 1, 99, c.spatial.centre[0]);
     else if (key == "spatialcentery") c.spatial.centre[1] = number(value, 1, 99, c.spatial.centre[1]);
@@ -334,10 +340,6 @@ bool parse(const std::string& path, Config& c, bool& legacy) {
     int passes = c.controls.passes;
     bool section = false;
     std::string name;   // the current section, lower case
-    // An old file: [Network] Model = small / original and [Int4Mixed] Enabled / Hotkey / Sound (before 0.0.7).
-    bool model_old_word = false, have_hotkey = false, have_sound = false;
-    int old_int4 = -1;
-    std::string old_hotkey; bool old_sound = true;
     char line[512];
     while (std::fgets(line, sizeof line, file)) {
         std::string text = line;
@@ -364,12 +366,9 @@ bool parse(const std::string& path, Config& c, bool& legacy) {
         }
         if (name == "network") {
             auto& n = c.network;
-            if (key == "model") {
-                const int m = nr::network_choice(value);
-                if (m >= 0) { n.model = m; model_old_word = lower(value) == "small" || lower(value) == "original"; }
-            }
-            else if (key == "hotkey") { n.hotkey = value; have_hotkey = true; }
-            else if (key == "sound") { if (auto b = parse_bool(value)) { n.sound = *b; have_sound = true; } }
+            if (key == "model") { if (const int m = nr::network_choice(value); m >= 0) n.model = m; }
+            else if (key == "hotkey") n.hotkey = value;
+            else if (key == "sound") { if (auto b = parse_bool(value)) n.sound = *b; }
             else if (key == "residency") {
                 const std::string v = lower(value);
                 for (int r = 0; r < 4; ++r) if (v == residency_name(r)) n.residency = r;
@@ -377,8 +376,8 @@ bool parse(const std::string& path, Config& c, bool& legacy) {
             else if (key == "motion without depth") { if (auto b = parse_bool(value)) n.motion_without_depth = *b; }
             else if (key == "resize history") { if (auto b = parse_bool(value)) n.resize_history = *b; }
             else if (key == "style grade") { if (auto b = parse_bool(value)) n.style_grade = *b; }
+            else if (key == "style grade acceleration") { if (auto b = parse_bool(value)) n.style_grade_accel = *b; }
             else if (key == "memory guard") { if (auto b = parse_bool(value)) n.memory_guard = *b; }
-            else if (key == "optimizedlayers") { if (const int v = nr::optimized_layers_value(value); v >= 0) n.optimized_layers = v; }
             else if (key == "history precision") {
                 const std::string v = lower(value);
                 if (v == "16" || v == "fp16" || v == "half" || v == "rgba16f") n.history_f16 = true;
@@ -390,10 +389,11 @@ bool parse(const std::string& path, Config& c, bool& legacy) {
             }
             continue;
         }
-        if (name == "int4mixed") {   // the old section
-            if (key == "enabled") { if (auto b = parse_bool(value)) old_int4 = *b ? 1 : 0; }
-            else if (key == "hotkey") old_hotkey = value;
-            else if (key == "sound") { if (auto b = parse_bool(value)) old_sound = *b; }
+        // an optimized network's level of its optimized layers: Layers in the section of its codename
+        if (name == "cc_silver_aardwold_optimized" || name == "cc_small_fp8_optimized") {
+            if (key == "layers")
+                if (const int v = nr::layers_value(value); v >= 0)
+                    (name == "cc_small_fp8_optimized" ? c.network.small_fp8_layers : c.network.silver_aardwold_layers) = v;
             continue;
         }
         // "auto" (every [wilsjo2] key a new file writes): the key's default, as layer_config takes it - not a bad number
@@ -406,11 +406,7 @@ bool parse(const std::string& path, Config& c, bool& legacy) {
     legacy = !section;
     if (legacy && passes > 3) c.unlock_passes = true;   // the old file allowed up to 16
     finish(c, passes);
-    // An old file: int4 mixed (now CC_SILVER_AARDWOLD_OPTIMIZED) was its own section on top of the original model.
-    if (model_old_word && c.network.model == nr::kSilverAardwold && old_int4 == 1) c.network.model = nr::kSilverAardwoldOptimized;
-    c.network.model = nr::network_with_layers(c.network.model, c.network.optimized_layers);
-    if (!have_hotkey && !old_hotkey.empty()) c.network.hotkey = old_hotkey;
-    if (!have_sound) c.network.sound = old_sound;
+    c.network.model = nr::network_with_levels(c.network.model, c.network.silver_aardwold_layers, c.network.small_fp8_layers);
     return true;
 }
 
@@ -596,6 +592,10 @@ void* renodx_field(RenoDXConfig& r, int index) {
         case 114: return &v.fast_fine[2];
         case 115: return &v.fast_interleaved_passes;
         case 116: return &v.fast_interleaved_preset;
+        case 117: return &v.frame_reuse;
+        case 118: return &v.fast_interleaved_depth_disocclusion;
+        case 119: return &v.pre_history;
+        case 120: return &v.post_history;
         default: return nullptr;
     }
 }
@@ -624,12 +624,16 @@ bool parse_renodx_key(RenoDXConfig& r, const std::string& key, const std::string
     else if (key == "nrfastmethod") v.fast_method = renodx_enum(value, d.fast_method, 0, 4);
     else if (key == "nrfastinterleavedpasses") v.fast_interleaved_passes = renodx_enum(value, d.fast_interleaved_passes, 2, 8);
     else if (key == "nrfastinterleavedpreset") v.fast_interleaved_preset = renodx_enum(value, d.fast_interleaved_preset, 1, 2);
+    else if (key == "nrfastinterleaveddepthdisocclusion") { if (auto b = parse_bool(value)) v.fast_interleaved_depth_disocclusion = *b; }
     else if (fast_method_key("nrfast", key, value, v.fast_passes, v.fast_halo_limit, v.fast_fine, true)) {}
     else if (key == "nrfasteditstrength") v.fast_edit_strength = renodx_float(value, d.fast_edit_strength, 0.f, 4.f);
     else if (key == "nrpasses") v.passes = renodx_enum(value, d.passes, 1, 30);
     else if (key == "nrunlockpasses") { if (auto b = parse_bool(value)) v.unlock_passes = *b; }
+    else if (key == "nrframereuse") { if (auto b = parse_bool(value)) v.frame_reuse = *b; }
     else if (key == "nrchainedhistory") { if (auto b = parse_bool(value)) v.chained_history = *b; }
     else if (key == "nrnoiseeveryframe") { if (auto b = parse_bool(value)) v.noise_every_frame = *b; }
+    else if (key == "nrprehistory") { if (auto b = parse_bool(value)) v.pre_history = *b; }
+    else if (key == "nrposthistory") v.post_history = renodx_float(value, d.post_history, 0.0f, 1.0f);
     else if (key == "nrpass2transfer") v.pass_transfer[0] = renodx_float(value, d.pass_transfer[0], 0.0f, 1.0f);
     else if (key == "nrpass2color") v.pass_color[0] = renodx_float(value, d.pass_color[0], 0.0f, 1.0f);
     else if (key == "nrpass2intensity") v.pass_intensity[0] = renodx_float(value, d.pass_intensity[0], 0.0f, 2.0f);
@@ -803,6 +807,9 @@ void write_renodx(FILE* f, const RenoDXConfig& r) {
         "; Interleaved: 2 .. 8 (default 3) legacy passes, one of them each frame. Every pass more holds two more pictures at the network's size in video memory.\n"
         "NRFastInterleavedPreset = %u\n"
         "; Interleaved's processing method: 1 or 2 (default %u).\n"
+        "NRFastInterleavedDepthDisocclusion = %d\n"
+        "; Interleaved also uses the game's depth to find surfaces that just came into view (its depth disocclusion check):\n"
+        "; 1 = on (default); 0 = off, for games where Interleaved shows a grid of light squares (strong upscaling, e.g. Ray Reconstruction).\n"
         "\n"
         "NRPasses = %u\n"
         "; 1 .. 4, default 1; 1 .. 30 with NRUnlockPasses = 1\n"
@@ -816,6 +823,12 @@ void write_renodx(FILE* f, const RenoDXConfig& r) {
         "\n"
         "NRNoiseEveryFrame = %d\n"
         "; ours. 1 = the network's noise seed changes every frame, as NVIDIA's original does (default); 0 = the same seed every frame\n"
+        "\n"
+        "NRPreHistory = %d\n"
+        "; ours. 1 = the network's input block also reads its previous answer, moved along the motion vectors, as NVIDIA's original (default); 0 = off\n"
+        "NRPostHistory = %.2f\n"
+        "; ours. 0 .. 1: how much the network's output block blends its previous answer into this one; 1 = as NVIDIA's original (default), 0 = off\n"
+        "; Without motion vectors there is no history either way.\n"
         "\n"
         "; settings of passes 2, 3 and 4 (passes after 4 use pass 4's):\n"
         "; Transfer / Color: how strongly this pass is put back, as NRTransferStrength / NRColorStrength, 0 .. 1, default 1;\n"
@@ -1053,8 +1066,9 @@ void write_renodx(FILE* f, const RenoDXConfig& r) {
         v.local_tone, v.local_structure, v.skin_structure, v.auto_mask ? 1 : 0, v.skin_independent ? 1 : 0, v.passes_mode == 1u ? "fast" : "legacy", v.fast_method,
         fast::kDefaultMethod == 0u ? " (default)" : "", fast::kDefaultMethod == 1u ? " (default)" : "",
         v.fast_passes[0], v.fast_halo_limit[0] ? 1 : 0, v.fast_fine[0], v.fast_passes[1], v.fast_halo_limit[1] ? 1 : 0,
-        v.fast_fine[1], v.fast_passes[2], v.fast_halo_limit[2] ? 1 : 0, v.fast_fine[2], double(v.fast_edit_strength), v.fast_interleaved_passes, v.fast_interleaved_preset, fast::kDefaultInterleavedPreset, v.passes,
-        v.unlock_passes ? 1 : 0, v.chained_history ? 1 : 0, v.noise_every_frame ? 1 : 0, v.pass_transfer[0], v.pass_color[0], v.pass_intensity[0],
+        v.fast_fine[1], v.fast_passes[2], v.fast_halo_limit[2] ? 1 : 0, v.fast_fine[2], double(v.fast_edit_strength), v.fast_interleaved_passes, v.fast_interleaved_preset, fast::kDefaultInterleavedPreset,
+        v.fast_interleaved_depth_disocclusion ? 1 : 0, v.passes,
+        v.unlock_passes ? 1 : 0, v.chained_history ? 1 : 0, v.noise_every_frame ? 1 : 0, v.pre_history ? 1 : 0, double(v.post_history), v.pass_transfer[0], v.pass_color[0], v.pass_intensity[0],
         v.pass_follow[0] ? 1 : 0, v.pass_style[0], v.pass_local_tone[0], v.pass_local_structure[0],
         v.pass_skin_structure[0], v.pass_auto_mask[0] ? 1 : 0, v.pass_transfer[1], v.pass_color[1],
         v.pass_intensity[1], v.pass_follow[1] ? 1 : 0, v.pass_style[1], v.pass_local_tone[1],
@@ -1127,8 +1141,12 @@ void write_wilsjo2(FILE* f) {
         "AutoMask = auto\n"
         "; true = automatic mask (Character mask, default); false = off\n"
         "NoiseEveryFrame = auto\n"
-        "; ours. true = on frames without motion vectors the network's noise seed changes every frame (as NVIDIA's original, default); false = a fixed seed.\n"
-        "; On frames with motion vectors the seed always changes every frame\n"
+        "; ours. true = the network's noise seed changes every frame, as NVIDIA's original (default); false = the same seed every frame\n"
+        "PreHistory = auto\n"
+        "; ours. true = the network's input block also reads its previous answer, moved along the motion vectors, as NVIDIA's original (default); false = off\n"
+        "PostHistory = auto\n"
+        "; ours. 0 .. 1: how much the network's output block blends its previous answer into this one; 1 = as NVIDIA's original (default), 0 = off\n"
+        "; Without motion vectors there is no history either way.\n"
         "\n"
         "TransferStrength = auto\n"
         "; 0 .. 2, default 1. How much of the network's detail change is kept\n"
@@ -1562,21 +1580,12 @@ void write_network(FILE* f, const NetworkConfig& n) {
         "\n"
         "Model = %s\n"
         "; CC_SMALL_FP8                  = the default network of NVIDIA 310.9.16\n"
-        "; CC_SMALL_FP8_EXPERIMENTAL     = this project's experimental network: CC_SMALL_FP8 made faster; its weights are\n"
+        "; CC_SMALL_FP8_OPTIMIZED        = this project's network: CC_SMALL_FP8 made faster; its weights are\n"
         ";                                 made from CC_SMALL_FP8's model at install\n"
         "; CC_SILVER_AARDWOLD            = the network of 310.8.0 (also preset 1 of 310.9.16)\n"
         "; CC_SILVER_AARDWOLD_OPTIMIZED  = this project's faster CC_SILVER_AARDWOLD, its picture very close to it; its weights\n"
-        ";                                 are made from CC_SILVER_AARDWOLD's model at install (RX 9000)\n"
+        ";                                 are made from CC_SILVER_AARDWOLD's model at install\n"
         "; A network that cannot run (e.g. no 310.9.16 model file) is greyed out in the menus with the reason, and the hotkey skips it.\n"
-        "\n"
-        "OptimizedLayers = %d\n"
-        "; CC_SILVER_AARDWOLD_OPTIMIZED only: how many of its layers run in a faster form. It changes only how the network\n"
-        "; computes, not the resolution; every level's picture stays very close to CC_SILVER_AARDWOLD's. 0 = Quality: none\n"
-        "; in int4, every layer at CC_SILVER_AARDWOLD's precision;\n"
-        "; 1 = Balanced: some of them in int4; 2 = Performance: also fixed attention on the first full-resolution\n"
-        "; layers; 3 = Ultra Performance (default): also more int4 layers, the fastest.\n"
-        "; On the ReShade routes 1, 2 and 3 need the INT4 launch options the installer printed (without\n"
-        "; them it runs with 0). Changed in game, the network is built again\n"
         "\n"
         "Hotkey = %s\n"
         "; Cycles through the networks that can run, to compare them on the same picture. Empty = no hotkey. Ctrl,\n"
@@ -1584,7 +1593,7 @@ void write_network(FILE* f, const NetworkConfig& n) {
         "\n"
         "Sound = %d\n"
         "; A sound when the network changes (hotkey, menu or this file): one note = CC_SMALL_FP8, two notes going down = CC_SILVER_AARDWOLD,\n"
-        "; two notes going up = CC_SILVER_AARDWOLD_OPTIMIZED, one high note = CC_SMALL_FP8_EXPERIMENTAL. 0 = silent\n"
+        "; two notes going up = CC_SILVER_AARDWOLD_OPTIMIZED, one high note = CC_SMALL_FP8_OPTIMIZED. 0 = silent\n"
         "\n"
         "Residency = %s\n"
         "; What is kept of a network that is no longer running. The networks share one activation memory, so what is kept is mainly the weights.\n"
@@ -1616,6 +1625,11 @@ void write_network(FILE* f, const NetworkConfig& n) {
         "; 0 = the picture of 0.0.6 and earlier (without that step after the network). Standard is not affected;\n"
         ";     applied at once\n"
         "\n"
+        "Style Grade Acceleration = %d\n"
+        "; The Style grade's calculation (only with Style Grade = 1):\n"
+        "; 1 = an equivalent formula that takes less GPU time (default)\n"
+        "; 0 = computed step by step; applied at once\n"
+        "\n"
         "OSD = %s\n"
         "; the running network in the corner of the picture:\n"
         "; switch = while a switch builds, its progress; then the new network for 3 s (default)\n"
@@ -1634,9 +1648,26 @@ void write_network(FILE* f, const NetworkConfig& n) {
         "; 16 = 16-bit, as NVIDIA's DLL keeps it; half the memory (default)\n"
         "; 32 = 32-bit, as up to 0.0.8.1 (4K: 133 MB more a network, 66 MB more each further pass)\n"
         "; With several passes the two can differ in fine detail. Applied at once (the previous result starts afresh)\n"
-        "\n", nr::network_codename(n.model), n.optimized_layers, n.hotkey.c_str(), n.sound ? 1 : 0, residency_name(n.residency),
-        n.motion_without_depth ? 1 : 0, n.resize_history ? 1 : 0, n.style_grade ? 1 : 0, osd_name(n.osd),
-        n.memory_guard ? 1 : 0, n.history_f16 ? 16 : 32);
+        "\n"
+        "[CC_SILVER_AARDWOLD_OPTIMIZED]\n"
+        "Layers = %d\n"
+        "; How many of CC_SILVER_AARDWOLD_OPTIMIZED's layers run in a faster form. It changes only how the network\n"
+        "; computes, not the resolution; every level's picture stays very close to CC_SILVER_AARDWOLD's. 0 = Quality: none\n"
+        "; in int4, every layer at CC_SILVER_AARDWOLD's precision;\n"
+        "; 1 = Balanced: some of them in int4; 2 = Performance: also fixed attention on the first full-resolution\n"
+        "; layers; 3 = Ultra Performance (default): also more int4 layers, the fastest.\n"
+        "; On the ReShade routes 1, 2 and 3 need the INT4 launch options the installer printed (without\n"
+        "; them it runs with 0). Changed in game, the network is built again\n"
+        "\n"
+        "[CC_SMALL_FP8_OPTIMIZED]\n"
+        "Layers = %d\n"
+        "; The same for CC_SMALL_FP8_OPTIMIZED. 0 and 1 = Quality (default); 2 = Performance: fixed attention on\n"
+        "; the first full-resolution layer and, at 4K-class resolutions, fewer keys in some attention heads; 3 = Ultra\n"
+        "; Performance: also int4 layers in the middle of the network, the fastest (on the ReShade routes it needs the INT4\n"
+        "; launch options; without them it runs with 2). Changed in game, the network is built again\n"
+        "\n", nr::network_codename(n.model), n.hotkey.c_str(), n.sound ? 1 : 0, residency_name(n.residency),
+        n.motion_without_depth ? 1 : 0, n.resize_history ? 1 : 0, n.style_grade ? 1 : 0, n.style_grade_accel ? 1 : 0, osd_name(n.osd),
+        n.memory_guard ? 1 : 0, n.history_f16 ? 16 : 32, n.silver_aardwold_layers, n.small_fp8_layers);
 }
 
 void write_preprocess(FILE* f, const PreprocessConfig& p) {
@@ -1886,33 +1917,37 @@ Preprocess PreprocessSwitch::frame(const PreprocessConfig& file) {
     return p;
 }
 
-// The network switch's cue: one note for CC_SMALL_FP8 (a higher one for CC_SMALL_FP8_EXPERIMENTAL), two going down
-// for CC_SILVER_AARDWOLD, two going up for CC_SILVER_AARDWOLD_OPTIMIZED (int4 mixed's cue before it).
+// The network switch's cue: one note for CC_SMALL_FP8 (a higher one for CC_SMALL_FP8_OPTIMIZED), two going down
+// for CC_SILVER_AARDWOLD, two going up for CC_SILVER_AARDWOLD_OPTIMIZED.
 void play_network_cue(int n) {
-    if (nr::network_optimized(n)) play_cue(true);
+    if (nr::network_silver_aardwold_optimized(n)) play_cue(true);
     else if (n == nr::kSilverAardwold) play_cue(false);
-    else play_note(n == nr::kSmallFp8Experimental ? 1320.0f : 880.0f);
+    else play_note(nr::network_small_fp8_optimized(n) ? 1320.0f : 880.0f);
 }
 
-// What runs instead of a network that cannot: the same model's other network first (CC_SILVER_AARDWOLD_OPTIMIZED at
-// a lower level - Ultra Performance, Performance, Balanced, Quality - before CC_SILVER_AARDWOLD), else the other model.
+// What runs instead of a network that cannot: the same model's other network first (an optimized network at a lower
+// level - Ultra Performance, Performance, Balanced, Quality - before its model), else the other model.
 int NetworkSwitch::fallback(int n) const {
     static const int order[nr::kNetworkChoices][4] = {
         {nr::kSilverAardwold, nr::kSilverAardwoldOptimizedFp8, nr::kSilverAardwoldOptimized, nr::kSilverAardwoldOptimizedFp8},  // kSmallFp8
         {nr::kSmallFp8, nr::kSilverAardwoldOptimizedFp8, nr::kSilverAardwoldOptimized, nr::kSmallFp8},          // kSilverAardwold
         {nr::kSilverAardwoldOptimizedFp8, nr::kSilverAardwold, nr::kSmallFp8, nr::kSmallFp8},                  // kSilverAardwoldOptimized
-        {nr::kSmallFp8, nr::kSilverAardwold, nr::kSilverAardwoldOptimizedFp8, nr::kSilverAardwoldOptimized},   // kSmallFp8Experimental
+        {nr::kSmallFp8, nr::kSilverAardwold, nr::kSilverAardwoldOptimizedFp8, nr::kSilverAardwoldOptimized},   // kSmallFp8Optimized
         {nr::kSilverAardwold, nr::kSmallFp8, nr::kSmallFp8, nr::kSmallFp8},                                    // kSilverAardwoldOptimizedFp8
         {nr::kSilverAardwoldOptimized, nr::kSilverAardwoldOptimizedFp8, nr::kSilverAardwold, nr::kSmallFp8},   // kSilverAardwoldOptimizedPerformance
-        {nr::kSilverAardwoldOptimizedPerformance, nr::kSilverAardwoldOptimized, nr::kSilverAardwoldOptimizedFp8, nr::kSilverAardwold}};  // kSilverAardwoldOptimizedUltra
+        {nr::kSilverAardwoldOptimizedPerformance, nr::kSilverAardwoldOptimized, nr::kSilverAardwoldOptimizedFp8, nr::kSilverAardwold},  // kSilverAardwoldOptimizedUltra
+        {nr::kSmallFp8Optimized, nr::kSmallFp8, nr::kSilverAardwold, nr::kSilverAardwoldOptimizedFp8},        // kSmallFp8OptimizedPerformance
+        {nr::kSmallFp8OptimizedPerformance, nr::kSmallFp8Optimized, nr::kSmallFp8, nr::kSilverAardwold}};     // kSmallFp8OptimizedUltra
     for (int c : order[n]) if (available(c)) return c;
     return n;
 }
 
-// A list entry as it runs now: CC_SILVER_AARDWOLD_OPTIMIZED as OptimizedLayers picks it (a lower level when that one
-// cannot run here).
+// A list entry as it runs now: an optimized network as its Layers key picks it (a lower level when that one cannot
+// run here).
 int NetworkSwitch::listed(int c) const {
-    int n = nr::network_with_layers(c, file_.optimized_layers);
+    int n = nr::network_with_levels(c, file_.silver_aardwold_layers, file_.small_fp8_layers);
+    if (n == nr::kSmallFp8OptimizedUltra && !available(n)) n = nr::kSmallFp8OptimizedPerformance;
+    if (n == nr::kSmallFp8OptimizedPerformance && !available(n)) return nr::kSmallFp8Optimized;
     if (n == nr::kSilverAardwoldOptimizedUltra && !available(n)) n = nr::kSilverAardwoldOptimizedPerformance;
     if (n == nr::kSilverAardwoldOptimizedPerformance && !available(n)) n = nr::kSilverAardwoldOptimized;
     return n == nr::kSilverAardwoldOptimized && !available(n) ? nr::kSilverAardwoldOptimizedFp8 : n;
@@ -1939,8 +1974,9 @@ void NetworkSwitch::unavailable(int n, const std::string& why) {
     }
 }
 
-// One [Network] key in the file, everything else as it was (the line rewritten in place, or added to [Network]).
-void NetworkSwitch::write_key(const char* key, const std::string& value) {
+// One key of section `section_name` in the file, everything else as it was (the line rewritten in place, or added to the
+// section; the section added at the end when the file has none).
+void NetworkSwitch::write_key(const char* section_name, const char* key, const std::string& value) {
     if (ini_.empty()) return;
     std::string text;
     if (FILE* f = nr::u8::fopen(ini_.c_str(), "rb")) {
@@ -1948,7 +1984,7 @@ void NetworkSwitch::write_key(const char* key, const std::string& value) {
         while ((got = std::fread(buf, 1, sizeof buf, f)) > 0) text.append(buf, got);
         std::fclose(f);
     }
-    const std::string lkey = lower(key);
+    const std::string lkey = lower(key), lsection = lower(section_name);
     std::string out, section;
     bool done = false;
     size_t at = 0;
@@ -1958,10 +1994,10 @@ void NetworkSwitch::write_key(const char* key, const std::string& value) {
         at = eol == std::string::npos ? text.size() : eol + 1;
         std::string t = trim(line.substr(0, line.find_first_of(";#")));
         if (!t.empty() && t.front() == '[') {
-            if (!done && lower(section) == "network") { out += std::string(key) + " = " + value + "\n"; done = true; }
+            if (!done && lower(section) == lsection) { out += std::string(key) + " = " + value + "\n"; done = true; }
             const auto e = t.find(']');
             section = trim(t.substr(1, e == std::string::npos ? std::string::npos : e - 1));
-        } else if (!done && lower(section) == "network") {
+        } else if (!done && lower(section) == lsection) {
             const auto eq = t.find('=');
             if (eq != std::string::npos && lower(trim(t.substr(0, eq))) == lkey) {
                 out += std::string(key) + " = " + value + (line.size() && line.back() == '\n' ? "\n" : "");
@@ -1971,7 +2007,7 @@ void NetworkSwitch::write_key(const char* key, const std::string& value) {
         }
         out += line;
     }
-    if (!done) out += (lower(section) == "network" ? "" : "\n[Network]\n") + std::string(key) + " = " + value + "\n";
+    if (!done) out += (lower(section) == lsection ? "" : "\n[" + std::string(section_name) + "]\n") + std::string(key) + " = " + value + "\n";
     if (FILE* f = nr::u8::fopen(ini_.c_str(), "wb")) {
         std::fwrite(out.data(), 1, out.size(), f);
         std::fclose(f);
@@ -1979,12 +2015,14 @@ void NetworkSwitch::write_key(const char* key, const std::string& value) {
     stamp_ = stamp_of(ini_);
 }
 
-// Model in the file (and OptimizedLayers for CC_SILVER_AARDWOLD_OPTIMIZED).
+// Model in the file (and an optimized network's level: Layers in the section of its codename; a level that stands for
+// two values - CC_SMALL_FP8_OPTIMIZED's Quality - leaves the key as it is when it already picks it).
 void NetworkSwitch::write(int n) {
-    write_key("Model", nr::network_codename(n));
-    if (nr::network_optimized(n)) {
-        write_key("OptimizedLayers", std::to_string(nr::network_layers(n)));
-        file_.optimized_layers = nr::network_layers(n);
+    write_key("Network", "Model", nr::network_codename(n));
+    if (nr::network_levelled(n) && nr::network_with_levels(n, file_.silver_aardwold_layers, file_.small_fp8_layers) != n) {
+        const bool small_fp8 = nr::network_small_fp8_optimized(n);
+        write_key(nr::network_codename(n), "Layers", std::to_string(nr::network_layers(n)));
+        (small_fp8 ? file_.small_fp8_layers : file_.silver_aardwold_layers) = nr::network_layers(n);
     }
     file_.model = n;
 }
@@ -2010,12 +2048,12 @@ int NetworkSwitch::frame(const std::string& ini) {
         Config c;
         bool legacy = false;
         parse(ini, c, legacy);
-        const bool changed = c.network.model != file_.model;   // (OptimizedLayers included: it picks the optimized one)
+        const bool changed = c.network.model != file_.model;   // (the Layers keys included: they pick the optimized ones' levels)
         file_ = c.network;
         if (want_ < 0) {
             char e[48] = {};
             const unsigned long n = GetEnvironmentVariableA("DLSSNR_MODEL", e, sizeof e);
-            const int env = n && n < sizeof e ? nr::network_with_layers(nr::network_choice(e), file_.optimized_layers) : -1;
+            const int env = n && n < sizeof e ? nr::network_with_levels(nr::network_choice(e), file_.silver_aardwold_layers, file_.small_fp8_layers) : -1;
             want_ = env >= 0 ? env : file_.model;
             if (!available(want_)) want_ = fallback(want_);
             log("[nr] network %s at start (%s)%s", nr::network_label(want_), env >= 0 ? "DLSSNR_MODEL" : "dlssnr-amd.ini",
@@ -2193,18 +2231,20 @@ void Config::save(const std::string& path, bool whole) {
     }
     std::fprintf(f,
         "\n; This project's own settings\n"
-        "; How strongly the previous frame's result is blended into this one, 0..1\n"
-        "History=%.3f\n"
+        "; 0..1: how much the network's output block blends its previous answer into this one; 1 = as NVIDIA's original (default), 0 = off\n"
+        "PostHistory=%.3f\n"
         "; White point of linear-light input\n"
         "WhitePoint=%.3f\n"
-        "; Frames without motion vectors (DLSS5_MV not bound): the network's noise seed changes every frame, as in\n"
-        "; NVIDIA's original. With no previous frame to average the noise, a still picture shimmers slightly. false (default): a fixed seed\n"
+        "; true (default): the network's noise seed changes every frame, as in NVIDIA's original; false: the same seed every frame\n"
         "NoiseEveryFrame=%s\n"
+        "; true (default): the network's input block also reads its previous answer, moved along the motion vectors, as\n"
+        "; NVIDIA's original; false: off. Without motion vectors there is no history either way\n"
+        "PreHistory=%s\n"
         "; Where the ReShade routes' motion vectors come from: vort (in this package) or lumenite (LumeniteFX Kernel by\n"
         "; Afzaal, installed from its author's GitHub with install.sh --lumenite; when it is missing or cannot be used,\n"
         "; vort runs and dlssnr-amd.log says why)\n"
         "MotionVectors=%s\n",
-        history, white_point, flag(k.noise_every_frame), motion_vectors == 1 ? "lumenite" : "vort");
+        history, white_point, flag(k.noise_every_frame), flag(k.pre_history), motion_vectors == 1 ? "lumenite" : "vort");
     std::fputs("\n", f);
     write_network(f, network);
     write_preprocess(f, preprocess);

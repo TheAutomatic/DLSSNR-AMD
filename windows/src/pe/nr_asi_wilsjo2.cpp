@@ -1,3 +1,7 @@
+#include "nr_frame_pair.hpp"
+#include "nr_frame_chain.hpp"
+#include "../core/nr_frame_reuse_policy.hpp"
+#include "nr_pe_control.hpp"
 #include "nr_path_u8.hpp"
 #include "nr_gpu_completion.hpp"
 // The wilsjo2 style's per-frame flow on the .asi route: see nr_asi_wilsjo2.hpp. Section numbers are those of
@@ -5,11 +9,15 @@
 // specification by one of our OptiScaler fixes (nr_pe_optifix.cpp), the fix is what is followed, and said so below.
 #include "nr_asi_wilsjo2.hpp"
 #include "nr_asi_wilsjo2_d3d12.hpp"
+#include "nr_d3d12_direct_state.hpp"
 #include "nr_d3d12_passthrough.hpp"
 #include "nr_d3d12_passthrough_backend.hpp"
-#include "nr_pe_d3d12split.hpp"
+#include "nr_frame_reuse_d3d12.hpp"
 
+#include "nr_frame_pair.hpp"
+#include "nr_frame_chain.hpp"
 #include "nr_pe_config.hpp"
+#include "nr_pe_interop.hpp"
 #include "nr_pe_log.hpp"
 #include "nr_pe_renodx_route.hpp"
 #include "nr_pe_session.hpp"
@@ -19,9 +27,13 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cmath>
+#include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <map>
@@ -157,20 +169,16 @@ nr::dlssnr::Controls6 controls_of(const w2::PassControls& pc, bool noise = false
 
 // ---- the native D3D12 route: the stage's programs as D3D12 compute --------------------------------------------
 // On the D3D12 passthrough (nr_d3d12_passthrough.hpp) once its check passed, the flow below records into the game's own
-// list: the
-// wilsjo2 programs - the very SPIR-V the Vulkan stage loads, its 256-byte constant block moved from push constants to a
-// read-only buffer (windows/build/w2_spv_d3d12.py), written as HLSL by SPIRV-Cross (windows/build/build_d3d12_hlsl.sh)
-// and compiled in the game - created by the D3D12 driver as ordinary compute pipelines, as the bridge has the Vulkan
-// driver compile them; the network through nr::dlssnr::evaluate_d3d12, i.e. the D3D12 passthrough's ACO network.
-// The layout is the Vulkan one's: t0..t3 (SRVs, static linear-clamp samplers s0..s3), u4 / u5 (UAVs), the constants at
-// t6 (a root SRV into an upload ring).
+// list: the wilsjo2 programs loaded as pre-captured PAL ELFs from d3d12_outer.nra (zero SetDescriptorHeaps, zero
+// d3dcompiler_47), with the network through nr::dlssnr::evaluate_d3d12 (the D3D12 passthrough's ACO network).
 }  // namespace
 namespace native {   // with the stage (nr_asi_wilsjo2_d3d12.hpp)
 
-// The programs, made once on a thread of ours (no frame waits on the driver's compiler); the frames before take the
+// The programs, made once on a thread of ours (no frame waits on the archive loader); the frames before take the
 // bridge.
 struct Programs {
     std::mutex m;
+    std::condition_variable cv;
     int state = 0;   // 0 not started, 1 making, 2 made, 3 failed
     std::string why;
     ID3D12Device* device = nullptr;
@@ -189,7 +197,7 @@ nr::gpu::Uses pending_uses() {
     }
     nr::gpu::Uses u;
     for (auto& t : all)
-        if (t && !nr::pe::split::completed(t)) u.tickets.push_back(t);
+        if (t && !nr::pe::d3d12_direct::completed(t)) u.tickets.push_back(t);
     return u;
 }
 nr::gpu::Uses merged_uses(nr::gpu::Uses a, const nr::gpu::Uses& b) {
@@ -207,18 +215,19 @@ void sweep_retired_stages() {
     for (size_t i = 0; i < g_retired_stages.size();) {
         bool done = true;
         for (const auto& t : g_retired_stages[i].uses.tickets)
-            if (t && !nr::pe::split::completed(t)) { done = false; break; }
+            if (t && !nr::pe::d3d12_direct::completed(t)) { done = false; break; }
         if (done) g_retired_stages.erase(g_retired_stages.begin() + long(i));
         else ++i;
     }
 }
 
 // Ready on `device`: the stage; else null and why (making them is started on the first call).
-w2::Stage* programs(ID3D12Device* device, std::string* why) {
+w2::Stage* programs(ID3D12Device* device, std::string* why, bool* building = nullptr) {
+    if (building) *building = false;
     std::lock_guard<std::mutex> l(g_programs.m);
     if (g_programs.state == 2 && g_programs.device == device) return g_programs.stage.get();
     if (g_programs.state == 3 && g_programs.device == device) { *why = "its D3D12 programs: " + g_programs.why; return nullptr; }
-    if (g_programs.state == 1) { *why = "its D3D12 programs are being made"; return nullptr; }
+    if (g_programs.state == 1) { if (building) *building = true; *why = "its D3D12 programs are being made"; return nullptr; }
     // first use, or another device: (re)made
     sweep_retired_stages();
     if (g_programs.stage) {
@@ -233,18 +242,16 @@ w2::Stage* programs(ID3D12Device* device, std::string* why) {
     device->AddRef();
     g_programs.device = device;
     g_programs.state = 1;
+    if (building) *building = true;
     *why = "its D3D12 programs are being made";
     const std::wstring folder = nr::u8::wide(std::string(nr::pe::module_folder()) + "\\dlssnr-amd\\shaders\\d3d12");
-    nr::pe::log("[d3d12] wilsjo2 on D3D12: making its programs from %ls (until they are made these frames pass through "
-                "with no NR; the bridge is not used)",
-                folder.c_str());
+    nr::pe::log("[d3d12] wilsjo2 on D3D12: making its programs (until they are made these frames pass through "
+                "with no NR; the bridge is not used)");
     device->AddRef();
     std::thread([device, folder] {
         auto s = std::make_unique<Stage12>();
-        // The stage's slots are reused only once the split says the recording that used them finished (the same strict
-        // answer every retirement path asks), instead of nothing knowing what a slot's last user was.
-        s->set_tickets([](ID3D12GraphicsCommandList* l) { return nr::pe::split::book(l); },
-                       [](const nr::gpu::Ticket& t) { return nr::pe::split::completed(t); });
+        s->set_tickets([](ID3D12GraphicsCommandList* l) { return nr::pe::d3d12_direct::book(l); },
+                       [](const nr::gpu::Ticket& t) { return nr::pe::d3d12_direct::completed(t); });
         std::string e;
         const auto t0 = std::chrono::steady_clock::now();
         bool ok = false;
@@ -262,17 +269,26 @@ w2::Stage* programs(ID3D12Device* device, std::string* why) {
                     g_programs.state = 3;
                 }
             }
+            g_programs.cv.notify_all();
         }
-        if (ok) nr::pe::log("[d3d12] wilsjo2 on D3D12: its programs are made (%.0f ms; the D3D12 driver's compute pipelines)", ms);
+        if (ok) nr::pe::log("[d3d12] wilsjo2 on D3D12: its programs are made (%.0f ms; PAL ELF compute pipelines)", ms);
         else nr::pe::log("[d3d12] ERROR: wilsjo2 on D3D12: its programs cannot be made: %s (the bridge runs it)", e.c_str());
         device->Release();
     }).detach();
     return nullptr;
 }
-bool programs_failed() {   // the programs cannot be made on this device (the bridge runs wilsjo2)
-    std::lock_guard<std::mutex> l(g_programs.m);
-    return g_programs.state == 3;
+// Standalone Present/utility callers wait briefly if the background loader just started so frame 1 stays on Direct.
+w2::Stage* programs_wait(ID3D12Device* device, std::string* why) {
+    if (w2::Stage* st = programs(device, why)) return st;
+    std::unique_lock<std::mutex> l(g_programs.m);
+    g_programs.cv.wait_for(l, std::chrono::milliseconds(250), [&] {
+        return g_programs.device != device || g_programs.state != 1;
+    });
+    if (g_programs.device == device && g_programs.state == 2) return g_programs.stage.get();
+    if (why) *why = g_programs.state == 3 ? ("its D3D12 programs: " + g_programs.why) : "its D3D12 programs are being made";
+    return nullptr;
 }
+
 Stage12* programs_impl() {
     std::lock_guard<std::mutex> l(g_programs.m);
     return g_programs.state == 2 ? g_programs.impl : nullptr;
@@ -338,7 +354,7 @@ private:
         if (!map_) nr::pe::log("[d3d12] wilsjo2 on D3D12: its GPU time cannot be measured (no timestamp queries)");
     }
     void read(uint32_t slot) {
-        if (ticket_[slot] && !nr::pe::split::completed(ticket_[slot])) return;   // not written yet: no sample, not a guess
+        if (ticket_[slot] && !nr::pe::d3d12_direct::completed(ticket_[slot])) return;   // not written yet: no sample, not a guess
         uint64_t t[2];
         std::memcpy(t, map_ + uint64_t(slot) * 16, 16);
         if (!t[0] || t[1] <= t[0]) return;
@@ -393,6 +409,25 @@ void wilsjo2_abandon_at_exit() {
 struct Wilsjo2Owner {
     bool capture_layer = false;
     bool at_present = false;   // wilsjo2_owner_at_present
+    // FrameReuse on an SDR frame on the bridge (or vkd3d-proton): the flow inside the model's session through this feature
+    // (run_in_session); else the flow here (own_flow: its state is there to let go of when the other runs)
+    nr::dlssnr::Feature* session = nullptr;
+    uint32_t session_w = 0, session_h = 0;
+    bool own_flow = false, reuse_hdr_said = false;
+    // FrameReuse on the D3D12 passthrough: its stage around the flow here (nr_frame_reuse_d3d12.hpp, run_native_reuse;
+    // the Vulkan session's ReuseFields)
+    std::unique_ptr<nr::pe::d3d12_passthrough::frame_reuse12::Stage> reuse12, pair_reuse12;
+    ID3D12Resource *group_linear=nullptr,*group_pq=nullptr;
+    w2::Settings reuse_settings{};
+    std::chrono::steady_clock::time_point alloc_retry_after{};
+    std::string reuse_failed, reuse_note, reuse_ui;
+    std::set<std::string> reuse_said;
+    uint64_t reuse_frames = 0, reuse_epoch = 0;
+    nr::pe::d3d12_passthrough::frame_reuse12::Stage::Stats reuse_window{}, reuse_logged{};
+    float reuse_share = -1.f;
+    // even frames: the game's motion vectors copied for the flow (its second part runs after the game's next frame, so it
+    // must not touch the game's own resources); NON_PIXEL_SHADER_RESOURCE between uses
+    nr::Preprocess reuse_prep{};   // [Preprocess] its frame reuse last ran with (a change restarts it, as a setting's)
     w2::FlowState flow;
     std::vector<nr::dlssnr::Feature*> models;      // pass k's at [k]
     std::map<ID3D12Resource*, bool> colour;        // our surfaces: colour-family (else read as a single-channel image)
@@ -401,6 +436,10 @@ struct Wilsjo2Owner {
 
 Wilsjo2Owner* wilsjo2_owner() { return new Wilsjo2Owner(); }
 void wilsjo2_owner_at_present(Wilsjo2Owner& o) { o.at_present = true; }
+namespace {
+std::atomic<uint32_t> g_present_runs{0};   // wilsjo2_note_present_runs: the layers this Present runs
+}  // namespace
+void wilsjo2_note_present_runs(uint32_t runs) { g_present_runs.store(runs); }
 
 namespace {
 std::mutex g_spatial_lock;
@@ -439,7 +478,10 @@ namespace {
 // model through nr::dlssnr::evaluate_d3d12.
 DXGI_FORMAT dxgi_of(w2::Fmt f, DXGI_FORMAT frame) {
     switch (f) {
-        case w2::Fmt::kFrame: return frame;
+        case w2::Fmt::kFrame: {
+            const DXGI_FORMAT u = native::uav_format(frame);
+            return u != DXGI_FORMAT_UNKNOWN ? u : frame;
+        }
         case w2::Fmt::kHalf: return DXGI_FORMAT_R16G16B16A16_FLOAT;
         case w2::Fmt::kR32F: return DXGI_FORMAT_R32_FLOAT;
         case w2::Fmt::kRG32F: return DXGI_FORMAT_R32G32_FLOAT;
@@ -525,6 +567,11 @@ public:
         nr::dlssnr::with_d3d12_session([&](nr::pe::Session& s) { on = s.style_grade_active(); });
         return on;
     }
+    bool style_grade_accelerated() const override {
+        bool on = false;
+        nr::dlssnr::with_d3d12_session([&](nr::pe::Session& s) { on = s.style_grade_accelerated(); });
+        return on;
+    }
     bool stage_failed() const override { return nstage_ ? false : g_stage_retry.blocked(); }
     w2::PassReady pass(uint32_t k, const w2::PassControls& pc, uint32_t mw, uint32_t mh) override {
         if (k < o_.models.size() && o_.models[k]) return w2::PassReady::kReady;
@@ -558,12 +605,22 @@ public:
         route::HistoryRef hist;
         hist.d3d12 = c.history.h;   // (Interleaved: our resource, in UNORDERED_ACCESS)
         hist.raw = c.raw;
+        hist.external = c.external_history;
         route::CallHistory history(hist);
+        // frame reuse's even frames: the calls before the cut here, the one with it split, the rest (and all after) there
+        route::NetSplit ns;
+        std::optional<route::CallNetSplit> net_split;
+        if (nstage_ && split_tail && cmd_ != split_tail) {
+            const uint32_t lo = c.pass * split_steps;
+            if (split_cut <= lo) cmd_ = split_tail;
+            else if (split_steps && split_cut < lo + split_steps) { ns.tail = split_tail; ns.cut = split_cut - lo; net_split.emplace(&ns); }
+        }
         const int result = nr::dlssnr::evaluate_d3d12(
             cmd_, o_.models[c.pass], nullptr, static_cast<ID3D12Resource*>(c.input.h), static_cast<ID3D12Resource*>(c.depth.h),
             static_cast<ID3D12Resource*>(c.motion.h), static_cast<ID3D12Resource*>(c.output.h), c.width, c.height,
             rect(c.depth_rect), rect(c.motion_rect), c.depth_inverted ? 1 : 0, c.reset ? 1 : 0,
             controls_of(c.controls, c.noise_every_frame, c.proxy_curve, c.last), c.mv_x, c.mv_y);
+        if (net_split) cmd_ = split_tail;   // (the call's rest went there: what follows it too)
         route::end_run();
         return result == int(NVSDK_NGX_Result_Success) ? 0 : 1;
     }
@@ -572,8 +629,11 @@ public:
         style_.emplace(false);
         facts_.hdr = x.hdr; facts_.exposure = int(x.exposure); facts_.asked = x.asked; facts_.white = x.white;
         facts_.history = x.history; facts_.mode = x.mode; facts_.passes = x.passes;
+        facts_.pre_history = x.pre_history; facts_.noise_every_frame = x.noise_every_frame;
         facts_.prep_outside = x.prep_outside; facts_.prep_missing = x.prep_missing;
         facts_.fast_passes = x.fast_passes; facts_.fast_fallback = x.fast_fallback; facts_.fast_fallback_spatial = x.fast_fallback_spatial; facts_.il_missing = x.il_missing;
+        if (reuse_state) { facts_.reuse = reuse_state; facts_.reuse_note = reuse_ui; facts_.reuse_share = reuse_share; }
+        if (history >= 0.f) facts_.history = history;   // (the network's history strength: evaluate_d3d12 reads it here)
         told_.emplace(&facts_);
         // the output NR Control shows: before the upscaler the upscaler's (the frame is the render's; "No upscaling" was
         // shown), else the frame
@@ -590,6 +650,8 @@ public:
         session_->set_call_layer(nr::pe::renodx_route::call_layer());   // the run's whole time, for NR Control
         session_->outer_begin(vk);
         // F5 (nr_screenshot.hpp): the frame before this layer's NR, while a capture is armed
+        // (a Present whose screenshot pairs the frame that frame reuse shows with its input takes the pair itself)
+        if (!nr::frame_pair::Observation::current)
         o_.capture_layer = session_->capture_begin(vk, frame.image, frame.format, w_, h_, frame.layout, hdr ? 1 : 0,
                                o_.at_present ? "present" : before_ ? "nr-before-upscaler" : "nr-after-upscaler");
     }
@@ -612,15 +674,14 @@ public:
     bool made() const { return made_; }   // a pass's feature was made this run (the flow leaves that frame as it came)
 
 private:
-    // One recording of the flow's into the game's list as D3D12 compute: the list's state saved and given back (the
-    // D3D12 passthrough's way), the resources put in each dispatch's states through this route's tracking.
+    // One recording of the flow's into the game's list as D3D12 compute: the list's compute state saved and
+    // restored on nimpl_->end(), the resources put in each dispatch's states through this route's tracking.
     bool record_native(const Recorder& fn) {
         std::string why;
-        if (!nr::pe::split::prepare(cmd_, &why)) {
+        if (!nr::pe::d3d12_direct::ready(device_, cmd_, &why)) {
             log("[d3d12] wilsjo2 on D3D12: a recording could not be made: the command list's state is not known (%s)", why.c_str());
             return false;
         }
-        const auto saved = nr::pe::split::snapshot(cmd_);
         nimpl_->begin(cmd_, [this](ID3D12Resource* r, D3D12_RESOURCE_STATES want) {
             auto& st = state(r);
             transition(cmd_, r, st.now, want);
@@ -636,8 +697,7 @@ private:
             ok = false;
         }
         nimpl_->end();
-        nimpl_->end_recording();   // the replaced descriptor blocks and stale copies go (the bridge's Stage::end_recording)
-        nr::pe::split::restore(cmd_, saved);
+        nimpl_->end_recording();
         return ok;
     }
     struct State { D3D12_RESOURCE_STATES now, home; bool colour; };
@@ -666,14 +726,104 @@ private:
     nr::pe::renodx_route::Wilsjo2Facts facts_;
     std::optional<nr::pe::renodx_route::CallWilsjo2> told_;
     nr::pe::renodx_route::Frame rf_;
+public:
+    // FrameReuse in NR Control (Wilsjo2Facts): 0 off (or said elsewhere), 1 runs (reuse_share of frames with NR lately), 2
+    // cannot run (reuse_ui); the network's history strength in the layer's place (frame reuse: a history two frames old
+    // is followed half as strongly), < 0 the layer's
+    uint32_t reuse_state = 0;
+    const char* reuse_ui = "";
+    float reuse_share = -1.f;
+    float history = -1.f;
+    // Frame reuse's even frames (the D3D12 passthrough): the network calls' steps from `split_cut` on, of `split_steps` a
+    // call, go into `split_tail` (the stage's second part), and so does everything this flow records after that point
+    ID3D12GraphicsCommandList* split_tail = nullptr;
+    uint32_t split_cut = 0, split_steps = 0;
 };
+
+// FrameReuse on an SDR frame where the D3D12 passthrough does not run the layer (the bridge; vkd3d-proton): the layer's
+// flow inside the model's session, frame reuse around it (nr_pe_session.cpp record_wilsjo2; the route marker
+// renodx_route::CallW2Present), through the owner's own NR feature at the frame's extent. The flow here (its surfaces,
+// its passes' features, the bridge's Vulkan flow of run_bridged) goes first: one of them runs the layer at a time.
+bool run_in_session(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, Wilsjo2Owner& o, const Wilsjo2Frame& f,
+                    const w2::Settings& s, ID3D12Resource* target, uint32_t w, uint32_t h, bool before_upscale) {
+    namespace route = nr::pe::renodx_route;
+    if (!target || !f.motion || !device) return false;   // (as the flow here: both guides, or no run)
+    if (o.vk) { wilsjo2_vk_release(o.vk); o.vk = nullptr; }
+    o.reuse12.reset();   // (the passthrough's frame reuse: its images retire through its watermark)
+    if (o.own_flow) {   // (its sizes too: a later run of the flow here allocates afresh)
+        D3d12Io io(nullptr, nullptr, o, nullptr, nullptr, false, 0, 0);
+        w2::flow_release(io, o.flow);
+        o.flow = w2::FlowState{};
+        o.own_flow = false;
+    }
+    if (o.session && (o.session_w != w || o.session_h != h)) { nr::dlssnr::release_d3d12(o.session); o.session = nullptr; }
+    if (!o.session) {
+        int rc = 0;
+        o.session = nr::dlssnr::create_d3d12(device, cmd, nullptr, w, h, 0, 1, nr::dlssnr::Controls6{}, &rc);
+        if (!o.session) {
+            log("[nr] wilsjo2 style: the frame reuse's NR feature could not be made (0x%08X): %s", unsigned(rc),
+                nr::dlssnr::last_error());
+            return false;
+        }
+        o.session_w = w; o.session_h = h;
+    }
+    route::W2Present wp;
+    wp.settings = &s; wp.hdr = f.hdr;
+    wp.at_present = o.at_present; wp.before_upscale = before_upscale; wp.pre_exposure = f.pre_exposure;
+    route::CallW2Present present(&wp);
+    route::CallStyle style(false);
+    // what the flow here tells the route of its frame (D3d12Io::passes_begin / network)
+    route::note_pass(f.flags, 1.0f, f.depth_rect.width, f.depth_rect.height, f.out_w ? f.out_w : w, f.out_h ? f.out_h : h);
+    route::Frame rf;
+    rf.before_upscale = before_upscale;
+    rf.pre_exposure = f.pre_exposure;
+    route::begin_run(rf);
+    // the guides in the state the model reads them in (as the .asi's RenoDX layers hand them)
+    transition(cmd, f.depth, f.depth_state, kSrv);
+    if (f.motion != f.depth) transition(cmd, f.motion, f.motion_state, kSrv);
+    const auto sane = [](float v) { return std::isfinite(v) && v != 0.0f ? v : 1.0f; };   // (as the flow reads it)
+    nr::dlssnr::evaluate_d3d12(cmd, o.session, nullptr, target, f.depth, f.motion, target, w, h, f.depth_rect, f.motion_rect,
+                               (f.flags & (1u << 3)) ? 1 : 0, f.reset ? 1 : 0, nr::dlssnr::Controls6{}, sane(f.mv_x),
+                               sane(f.mv_y));
+    if (f.motion != f.depth) transition(cmd, f.motion, kSrv, f.motion_state);
+    transition(cmd, f.depth, kSrv, f.depth_state);
+    route::end_run();
+    if (wp.ran)   // peripheral compression's outlines in NR Control, as the flow here notes them (spatial_ran)
+        nr::dlssnr::with_d3d12_session([&](nr::pe::Session& session) {
+            if (session.spatial_active()) wilsjo2_note_spatial(route::call_layer(), session.spatial_layout());
+        });
+    return wp.ran;
+}
+// A frame of display codes (frame reuse's rules are in them): the Present's resolved SDR (the caller's `hdr` false), else
+// an 8 / 10-bit UNORM frame - a float frame at the upscaler is scene light (as a RenoDX layer's frame_units: mode 1)
+bool float_frame(DXGI_FORMAT f) {
+    switch (f) {
+        case DXGI_FORMAT_R16G16B16A16_FLOAT: case DXGI_FORMAT_R16G16B16A16_TYPELESS: case DXGI_FORMAT_R32G32B32A32_FLOAT:
+        case DXGI_FORMAT_R32G32B32A32_TYPELESS: case DXGI_FORMAT_R32G32B32_FLOAT: case DXGI_FORMAT_R32G32B32_TYPELESS:
+        case DXGI_FORMAT_R11G11B10_FLOAT:
+        case DXGI_FORMAT_R9G9B9E5_SHAREDEXP:
+            return true;
+        default:
+            return false;
+    }
+}
+// Tests (gates only): NR_TEST_W2_SESSION=1 runs every SDR frame's flow inside the session (where the passthrough does not
+// run the layer), frame reuse on or off - the session's flow byte-compared with the flow here
+bool test_session() {
+    static const bool on = [] { const char* e = std::getenv("NR_TEST_W2_SESSION"); return e && e[0] == '1'; }();
+    return on;
+}
 }  // namespace
 
 void wilsjo2_release(Wilsjo2Owner* o) {
     if (!o) return;
+    o->reuse12.reset();   // (its images retire through the D3D12 passthrough's watermark)
     if (o->vk) { wilsjo2_vk_release(o->vk); o->vk = nullptr; }
     D3d12Io io(nullptr, nullptr, *o, nullptr, nullptr, false, 0, 0);
     w2::flow_release(io, o->flow);
+    if (o->session) nr::dlssnr::release_d3d12(o->session);
+    if(o->group_linear)nr::pe::d3d12_passthrough::retire_resource(o->group_linear);
+    if(o->group_pq)nr::pe::d3d12_passthrough::retire_resource(o->group_pq);
     delete o;
 }
 
@@ -761,7 +911,8 @@ std::string native_refusal(ID3D12GraphicsCommandList* cmd, ID3D12Device* device,
     *waiting = false;
     if (!nr::pe::d3d12_passthrough::enabled())
         return "the D3D12 passthrough is off (dlssnr-amd.ini [D3D12Passthrough])";
-    const auto readable = [](ID3D12Resource* r, const char* what) -> std::string {
+    const auto readable = [&](ID3D12Resource* r, const char* what) -> std::string {
+        if (!r && s.frame_reuse && std::strcmp(what,"depth")==0) return "";
         if (!r) return std::string("the ") + what + " is missing";
         const D3D12_RESOURCE_DESC d = r->GetDesc();
         if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.SampleDesc.Count != 1)
@@ -784,15 +935,19 @@ std::string native_refusal(ID3D12GraphicsCommandList* cmd, ID3D12Device* device,
     // While the passthrough's pieces are made - the programs, the network - the frames pass through with no NR (the
     // bridge is neither run nor built for them); both are made at once. The bridge only where the passthrough will not run.
     std::string why;
-    *stage = native::programs(device, &why);
+    bool programs_building = false;
+    *stage = native::programs(device, &why, &programs_building);
     uint32_t mw = w, mh = h;
     w2::flow_model_extent(s, w, h, o.flow, true, &mw, &mh);
     std::string nwhy;
     bool building = false;
+    // (this layer wants the passthrough: noted before anything can refuse it - a layer waiting for another layer's second
+    // part must still keep that one from evening its frames)
+    nr::pe::d3d12_passthrough::note_layer(nr::pe::renodx_route::call_layer());
     const bool net_ready = nr::pe::d3d12_passthrough::wilsjo2_ready(device, cmd, mw, mh, &nwhy, &building);
     if (!net_ready && !building) return nwhy;   // the passthrough will not run it: the bridge (passing states set `building`)
     if (!*stage) {
-        if (!native::programs_failed()) { *waiting = true; return why; }
+        if (programs_building) { *waiting = true; return why; }
         return why;   // the programs cannot be made: the bridge
     }
     *impl = native::programs_impl();
@@ -802,24 +957,69 @@ std::string native_refusal(ID3D12GraphicsCommandList* cmd, ID3D12Device* device,
 }
 }  // namespace
 
+// What a run of the flow here tells NR Control of the layer's frame reuse, and the network's history strength in the
+// layer's place (FlowExtras::history < 0: the layer's)
+// (split_*: frame reuse's even frames - the network calls go on in `split_tail` from `split_cut` of all their steps,
+// `split_steps` a call, and everything recorded after that point there)
+struct FlowExtras {
+    uint32_t reuse_state = 0; const char* reuse_ui = ""; float reuse_share = -1.f; float history = -1.f;
+    bool group_anchor = false;   // a frame reuse group's anchor run (every member, its own frame reuse on or not)
+    ID3D12GraphicsCommandList* split_tail = nullptr; uint32_t split_cut = 0, split_steps = 0;
+};
+static bool run_flow(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, Wilsjo2Owner& o, const Wilsjo2Frame& f,
+                     const w2::Settings& s, ID3D12Resource* target, uint32_t w, uint32_t h, bool before_upscale,
+                     w2::Stage* nstage, native::Stage12* nimpl, const FlowExtras& x);
+static bool run_native_reuse(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, Wilsjo2Owner& o, const Wilsjo2Frame& f,
+                             const w2::Settings& s, ID3D12Resource* target, uint32_t w, uint32_t h, bool before_upscale,
+                             w2::Stage* nstage, native::Stage12* nimpl);
+
 bool wilsjo2_run(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, Wilsjo2Owner& o, const Wilsjo2Frame& f,
                  const w2::Settings& s, ID3D12Resource* target, uint32_t w, uint32_t h, bool before_upscale) {
     gpu_uses.touch();
     w2::Stage* nstage = nullptr;
     native::Stage12* nimpl = nullptr;
-    if (target && f.depth && f.motion && device) {
+    // The diagnostic session override applies to SDR. A selected reuse layer owns its HDR encoding.
+    const bool sdr = !f.hdr && target && (o.at_present || !float_frame(target->GetDesc().Format));
+    const bool reuse = s.frame_reuse || (nr::frame_pair::PresentAge::active && nr::frame_pair::PresentAge::active->gathering());
+    const bool in_session = (s.frame_reuse || (nr::frame_pair::PresentAge::active && nr::frame_pair::PresentAge::active->gathering()) || (test_session() && sdr));   // (where the passthrough does not run the layer)
+    if (!s.frame_reuse) {   // switched off (NR Control, live): the passthrough's stage goes, a failed one may be made again
+        o.reuse12.reset();
+        o.reuse_failed.clear(); o.reuse_note.clear(); o.reuse_said.clear(); o.reuse_ui.clear();
+    }
+    if (target && (f.depth || reuse) && f.motion && device) {
         bool bridged = false;
         nr::dlssnr::with_d3d12_session([&](nr::pe::Session& session) { bridged = session.bridged(device); });
         if (bridged) {
             o.capture_layer = false;
             bool waiting = false;
-            const std::string why = native_refusal(cmd, device, o, f, s, target, w, h, &nstage, &nimpl, &waiting);
+            // a frame reuse group runs on one route: where another member needs the Vulkan bridge, this one goes too
+            auto* age = nr::frame_pair::PresentAge::active;
+            const bool group_bridge = age && age->group_bridge();
+            const std::string why = group_bridge ? std::string("another layer of its frame reuse group runs on the Vulkan bridge")
+                                  : reuse && cmd->GetType() == D3D12_COMMAND_LIST_TYPE_COMPUTE
+                                  ? std::string("frame reuse on a compute command list (its second part cannot follow it on this route)")
+                                                 : native_refusal(cmd, device, o, f, s, target, w, h, &nstage, &nimpl, &waiting);
             if (!why.empty() && waiting) {   // the passthrough runs it once made; until then no NR, no bridge
+                if (reuse) {
+                    const std::string note = "Waiting for D3D12 Direct: " + why;
+                    nr::pe::control::layer_reuse_waiting(nr::pe::renodx_route::call_layer(), note.c_str());
+                    nr::pe::Session::note_frames_delayed(0);
+                }
                 native::say_route("waiting for the D3D12 passthrough (" + why + "): frames pass through with no NR; the bridge is not used");
                 return false;
             }
             if (!why.empty()) {
-                if (nr::pe::d3d12_passthrough::enabled()) native::say_route("the Vulkan bridge for now: " + why);
+                // frame reuse too takes the bridge where the passthrough cannot serve it (the route rule of every
+                // processing, as RenoDX's frame reuse); a group member takes its group along
+                if (reuse && age && !group_bridge) age->need_bridge();
+                if (nr::pe::d3d12_passthrough::enabled()) {
+                    native::say_route("the Vulkan bridge for now: " + why);
+                    nr::pe::d3d12_passthrough::note_bridge_fallback();
+                }
+                o.reuse12.reset();   // (the passthrough's frame reuse: not this frame's route)
+                if (in_session) return run_in_session(cmd, device, o, f, s, target, w, h, before_upscale);
+                if (o.session) { nr::dlssnr::release_d3d12(o.session); o.session = nullptr; }
+                if (o.at_present) nr::pe::Session::note_frames_delayed(0);   // (this Present's frames on time)
                 return run_bridged(cmd, device, o, f, s, target, w, h, before_upscale);
             }
             namespace pt = nr::pe::d3d12_passthrough;
@@ -828,13 +1028,58 @@ bool wilsjo2_run(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, Wilsjo2Ow
         }
     }
     o.capture_layer = false;
-    if (!target || !f.depth || !f.motion) return false;
+    if (in_session && !nstage) return run_in_session(cmd, device, o, f, s, target, w, h, before_upscale);   // (vkd3d-proton)
+    if (o.session) { nr::dlssnr::release_d3d12(o.session); o.session = nullptr; }
+    if (reuse && nstage) return run_native_reuse(cmd, device, o, f, s, target, w, h, before_upscale, nstage, nimpl);
+    if (o.reuse12) o.reuse12.reset();   // (switched off: its images retire through the watermark)
+    if (o.at_present) nr::pe::Session::note_frames_delayed(0);   // (this Present's frames on time)
+    FlowExtras x;
+    return run_flow(cmd, device, o, f, s, target, w, h, before_upscale, nstage, nimpl, x);
+}
+
+// The flow here on `target` (in place, UNORDERED_ACCESS), on the bridge's vkd3d-proton or the D3D12 passthrough (`nstage`).
+static bool run_flow(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, Wilsjo2Owner& o, const Wilsjo2Frame& f,
+                     const w2::Settings& s, ID3D12Resource* target, uint32_t w, uint32_t h, bool before_upscale,
+                     w2::Stage* nstage, native::Stage12* nimpl, const FlowExtras& x) {
+    if (!target || (!f.depth && !s.frame_reuse) || !f.motion) return false;
+    if (nstage && (x.reuse_state==1 || x.group_anchor) && f.hdr && native::srv_format(target->GetDesc().Format)==DXGI_FORMAT_R10G10B10A2_UNORM &&
+        nr::frame_pair::PresentAge::active && nr::frame_pair::PresentAge::active->gathering()) {
+        const auto ensure=[&](ID3D12Resource*& r,DXGI_FORMAT format) {
+            if (r && (r->GetDesc().Width!=w || r->GetDesc().Height!=h)) {
+                nr::pe::d3d12_passthrough::retire_resource(r); r=nullptr;
+            }
+            if (!r)r=make_surface(device,format,w,h);
+            return r!=nullptr;
+        };
+        if (!ensure(o.group_linear,DXGI_FORMAT_R16G16B16A16_FLOAT) || !ensure(o.group_pq,DXGI_FORMAT_R10G10B10A2_UNORM))
+            return false;
+        transition(cmd,target,kUav,kSrv);
+        const bool decoded=wilsjo2_convert(cmd,device,target,nullptr,o.group_linear,w,h,true,true);
+        transition(cmd,target,kSrv,kUav);
+        if (!decoded || !run_flow(cmd,device,o,f,s,o.group_linear,w,h,before_upscale,nstage,nimpl,x)) return false;
+        auto* end=x.split_tail?x.split_tail:cmd;
+        transition(end,o.group_linear,kUav,kSrv); transition(end,target,kUav,kSrv);
+        const bool encoded=wilsjo2_convert(end,device,o.group_linear,target,o.group_pq,w,h,false,true);
+        transition(end,o.group_linear,kSrv,kUav); transition(end,target,kSrv,kUav);
+        if (!encoded) return false;
+        transition(end,o.group_pq,kUav,D3D12_RESOURCE_STATE_COPY_SOURCE);
+        transition(end,target,kUav,D3D12_RESOURCE_STATE_COPY_DEST);
+        end->CopyResource(target,o.group_pq);
+        transition(end,o.group_pq,D3D12_RESOURCE_STATE_COPY_SOURCE,kUav);
+        transition(end,target,D3D12_RESOURCE_STATE_COPY_DEST,kUav);
+        return true;
+    }
     D3d12Io io(cmd, device, o, &f, target, before_upscale, w, h);
     if (nstage) io.go_native(nstage, nimpl);
+    io.reuse_state = x.reuse_state; io.reuse_ui = x.reuse_ui; io.reuse_share = x.reuse_share; io.history = x.history;
+    io.split_tail = x.split_tail; io.split_cut = x.split_cut; io.split_steps = x.split_steps;
+    o.own_flow = true;
     w2::FlowFrame ff;
     ff.target = {target};
     ff.width = w; ff.height = h;
-    const DXGI_FORMAT format = io.frame_format();
+    const DXGI_FORMAT raw_fmt = io.frame_format();
+    const DXGI_FORMAT uav_fmt = native::uav_format(raw_fmt);
+    const DXGI_FORMAT format = uav_fmt != DXGI_FORMAT_UNKNOWN ? uav_fmt : raw_fmt;
     switch (format) {
         case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8X8_UNORM:
         case DXGI_FORMAT_R10G10B10A2_UNORM: case DXGI_FORMAT_R16G16B16A16_UNORM:
@@ -847,7 +1092,7 @@ bool wilsjo2_run(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, Wilsjo2Ow
     ff.depth = {f.depth};
     ff.motion = {f.motion};
     {
-        const D3D12_RESOURCE_DESC dd = f.depth->GetDesc(), md = f.motion->GetDesc();
+        const D3D12_RESOURCE_DESC dd = f.depth ? f.depth->GetDesc() : D3D12_RESOURCE_DESC{}, md = f.motion->GetDesc();
         char g[192];
         std::snprintf(g, sizeof g, "%u:%llux%u:%u:%llux%u:%u,%u,%u,%u:%u,%u,%u,%u", unsigned(dd.Format),
                       (unsigned long long)dd.Width, dd.Height, unsigned(md.Format), (unsigned long long)md.Width, md.Height,
@@ -915,41 +1160,323 @@ bool wilsjo2_run(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, Wilsjo2Ow
     return ran;
 }
 
-bool wilsjo2_convert(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, ID3D12Resource* source,
-                     ID3D12Resource* original, ID3D12Resource* target, uint32_t w, uint32_t h, bool to_linear) {
-    if (device && source && target && (to_linear || original) && nr::pe::d3d12_passthrough::enabled()) {
-        // HDR10 at Present on the D3D12 passthrough: the conversion as D3D12 compute where its program is made (the
-        // caller has source / original readable, target writable)
-        bool bridged = false;
-        nr::dlssnr::with_d3d12_session([&](nr::pe::Session& session) { bridged = session.bridged(device); });
-        std::string why;
-        w2::Stage* st = bridged ? native::programs(device, &why) : nullptr;
-        native::Stage12* impl = st ? native::programs_impl() : nullptr;
-        const w2::Mode mode = to_linear ? w2::kFinishedToLinear : w2::kFinishedToPq;
-        if (impl && st->has(mode) && nr::pe::split::prepare(cmd, &why)) {
-            const auto saved = nr::pe::split::snapshot(cmd);
-            impl->begin(cmd, [](ID3D12Resource*, D3D12_RESOURCE_STATES) {});
-            bool ok = true;
-            try {
-                w2::Dispatch d;
-                d.t0 = native::image(source);
-                if (!to_linear) d.t2 = native::image(original);
-                d.u0 = native::image(target);
-                d.constants.mode = mode;
-                d.constants.width = w;
-                d.constants.height = h;
-                st->record(VK_NULL_HANDLE, d);
-            } catch (const std::exception& x) {
-                log("[d3d12] ERROR: wilsjo2 on D3D12: the HDR10 conversion: %s", x.what());
-                ok = false;
-            }
-            impl->end();
-            impl->end_recording();
-            nr::pe::split::restore(cmd, saved);
-            return ok;
+// FrameReuse on the D3D12 passthrough (the IRON RULE's Direct route): the flow here, natively, inside the passthrough's
+// frame reuse stage (nr_frame_reuse_d3d12.hpp) as the backend runs a RenoDX layer's (nr_d3d12_passthrough_backend.cpp
+// reuse_stage / renodx_frame): NR on every other frame, the frames between rebuilt along the game's motion vectors.
+// Two-sided with even frames under the Vulkan routes' conditions (the Present, one NR layer running, frame generation off or
+// followed, HUD FIX off): the flow's network calls split at the stage's share (the passthrough's plain call goes on in the
+// stage's second part: renodx_route::CallNetSplit), the second part handed to the passthrough, submitted at the next
+// Present (submit_pending), every frame shown two frames later. 
+// UNTESTED: the D3D12 passthrough runs on AMD's Windows driver only.
+static bool run_native_reuse(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, Wilsjo2Owner& o, const Wilsjo2Frame& f,
+                             const w2::Settings& s, ID3D12Resource* target, uint32_t w, uint32_t h, bool before_upscale,
+                             w2::Stage* nstage, native::Stage12* nimpl) {
+    namespace fr12 = nr::pe::d3d12_passthrough::frame_reuse12;
+    const D3D12_RESOURCE_DESC td = target->GetDesc(), md = f.motion->GetDesc(), dd = f.depth ? f.depth->GetDesc() : D3D12_RESOURCE_DESC{};
+    const DXGI_FORMAT view = native::srv_format(td.Format);
+    const DXGI_FORMAT mview = native::srv_format(md.Format), dview = native::srv_format(dd.Format);
+    const uint32_t mx = f.motion_rect.x, my = f.motion_rect.y;
+    const uint32_t mw = f.motion_rect.width ? f.motion_rect.width : uint32_t(md.Width);
+    const uint32_t mh = f.motion_rect.height ? f.motion_rect.height : md.Height;
+    const uint32_t dx = f.depth_rect.x, dy = f.depth_rect.y;
+    const uint32_t dw = f.depth_rect.width ? f.depth_rect.width : uint32_t(dd.Width);
+    const uint32_t dh = f.depth_rect.height ? f.depth_rect.height : dd.Height;
+    const int layer = nr::pe::renodx_route::call_layer();
+    bool alone = g_present_runs.load() <= 1u && !nr::pe::d3d12_passthrough::other_layers(layer);
+    if (alone) nr::dlssnr::with_d3d12_session([&](nr::pe::Session& session) { alone = !session.layers_running(); });
+    auto refuse = [&](const std::string& reason) {
+        o.reuse12.reset();
+        if (o.at_present) nr::pe::Session::note_frames_delayed(0);
+        if (o.reuse_note != reason) log("[nr] D3D12 wilsjo2 frame reuse: %s", reason.c_str());
+        o.reuse_note = reason;
+        nr::pe::control::layer_reuse_failed(layer, reason.c_str());
+        return false;
+    };
+    if (!o.at_present) return refuse(nr::frame_reuse::placement);
+    if ((nr::frame_pair::PresentAge::active && nr::frame_pair::PresentAge::active->interleaved_conflict) || (s.passes_mode == 1 && s.fast_method == 0)) return refuse(nr::frame_reuse::interleaved);
+    if ((nr::frame_pair::PresentAge::active ? nr::frame_pair::PresentAge::active->multiple : !alone) && !nr::frame_pair::PresentAge::terminal() && !nr::frame_pair::PresentAge::isolated()) return refuse(nr::frame_reuse::chain_busy);
+    if (const char* why = nr::pe::Session::delay_block()) return refuse(why);
+    if (!fr12::Stage::supports(view)) return refuse(nr::frame_reuse::unsupported_format);
+    if (mview == DXGI_FORMAT_UNKNOWN || (f.depth && dview == DXGI_FORMAT_UNKNOWN))
+        return refuse(nr::frame_reuse::guide_format);
+    if (!o.reuse_failed.empty()) {
+        if (std::chrono::steady_clock::now() < o.alloc_retry_after) return refuse("Cannot run: " + o.reuse_failed);
+        o.reuse_failed.clear();
+    }
+    o.reuse_note.clear();
+    fr12::Frame fr;
+    fr.colour = {target, kUav, view, w, h};
+    fr.output = fr.colour;
+    fr.motion = {f.motion, f.motion_state, mview, uint32_t(md.Width), md.Height};
+    fr.motion_x = mx; fr.motion_y = my; fr.motion_w = mw; fr.motion_h = mh;
+    // the stage reads the vectors in screen units: the game's scale (pixels of the motion region, as the flow's) over it
+    const auto sane = [](float v) { return std::isfinite(v) && v != 0.0f ? v : 1.0f; };   // (as the flow reads it)
+    fr.motion_scale_x = sane(f.mv_x) / float(std::max(mw, 1u));
+    fr.motion_scale_y = sane(f.mv_y) / float(std::max(mh, 1u));
+    fr.depth = {f.depth, f.depth_state, dview, uint32_t(dd.Width), dd.Height};
+    fr.depth_x = dx; fr.depth_y = dy; fr.depth_w = dw; fr.depth_h = dh;
+    fr.depth_inverted = (f.flags & (1u << 3)) != 0;
+    if (f.exposure) {
+        const D3D12_RESOURCE_DESC xd = f.exposure->GetDesc();
+        if (native::srv_format(xd.Format) != DXGI_FORMAT_UNKNOWN)
+            fr.exposure = {f.exposure, f.exposure_state, native::srv_format(xd.Format), uint32_t(xd.Width), xd.Height};
+    }
+    fr.reset = f.reset;
+    bool flow_ok = true;
+    using Jobs=nr::frame_pair::ChainJobs<ID3D12GraphicsCommandList*,fr12::Frame>;
+    const uint32_t steps=std::max(1u,w2::passes_requested(s))*nr::pe::d3d12_passthrough::network_steps();
+    const int chosen_model=nr::dlssnr::frame_network(), chosen_layer=nr::pe::renodx_route::call_layer();
+    auto anchor=[device,&o,f,s,w,h,before_upscale,nstage,nimpl,chosen_model,chosen_layer](ID3D12GraphicsCommandList*& list,const fr12::Frame& nf,
+                    ID3D12GraphicsCommandList* tail,uint32_t cut,uint32_t gap) -> uint32_t {
+        nr::pe::renodx_route::CallLayer row(chosen_layer);
+        nr::pe::renodx_route::CallNetwork model(chosen_model);
+        auto* a=nr::frame_pair::PresentAge::active;
+        struct Choice { nr::frame_pair::PresentAge* age; int old;
+            ~Choice(){if(age) age->net_override=old;}
+        } restore{a,a?a->net_override:-1};
+        if (a) a->net_override=chosen_model;
+        // the stage's copy of the frame (its anchor) into its answer image, the flow on that in place
+        if(nf.colour.res!=nf.output.res) {
+            transition(list,nf.colour.res,nf.colour.state,D3D12_RESOURCE_STATE_COPY_SOURCE);
+            transition(list,nf.output.res,nf.output.state,D3D12_RESOURCE_STATE_COPY_DEST);
+            list->CopyResource(nf.output.res,nf.colour.res);
+            transition(list,nf.output.res,D3D12_RESOURCE_STATE_COPY_DEST,kUav);
+            transition(list,nf.colour.res,D3D12_RESOURCE_STATE_COPY_SOURCE,nf.colour.state);
+        } else transition(list,nf.output.res,nf.output.state,kUav);
+        // a member without the game's depth (wilsjo2 needs it; frame reuse's own run does not): the anchor as it is
+        if (!nf.depth.res && !s.frame_reuse) {
+            transition(list, nf.output.res, kUav, nf.output.state);
+            if (tail) list = tail;   // (the group's cursor past the cut, as after a run)
+            return 0u;
+        }
+        Wilsjo2Frame g = f;
+        g.depth = nf.depth.res; g.depth_state = nf.depth.state;
+        g.depth_rect = {nf.depth_x, nf.depth_y, nf.depth_w, nf.depth_h};
+        g.motion = nf.motion.res; g.motion_state = nf.motion.state;
+        g.motion_rect = {nf.motion_x, nf.motion_y, nf.motion_w, nf.motion_h};
+        if (nf.motion_composed) {   // the stage's field over two frames, in screen units: the scale that reads them so
+            g.mv_x = float(std::max(nf.motion_w, 1u));
+            g.mv_y = float(std::max(nf.motion_h, 1u));
+        }
+        g.exposure = nf.exposure.res; g.exposure_state = nf.exposure.state;
+        g.reset = nf.reset;
+        FlowExtras x;
+        x.reuse_state = s.frame_reuse?1u:0u; x.reuse_share = o.reuse_share;
+        x.group_anchor = true;   // (an ordinary member converts the group's PQ anchor too)
+        if (gap>=2) x.history = 0.5f * s.history_strength;   // a history two frames old: half the layer's
+        if (tail) {
+            x.split_tail = tail;
+            x.split_steps = nr::pe::d3d12_passthrough::network_steps();
+            x.split_cut = cut;
+        }
+        const bool flow_ok = run_flow(list, device, o, g, s, nf.output.res, w, h, before_upscale, nstage, nimpl, x);
+        // (the answer's state back where the flow ended: the second part when it split)
+        transition(x.split_tail ? x.split_tail : list, nf.output.res, kUav, nf.output.state);
+        if(tail)list=tail;
+        return flow_ok ? std::max(1u, w2::passes_requested(s)) : nr::frame_pair::failed_calls;
+    };
+    Jobs* jobs=nullptr;
+    auto* age=nr::frame_pair::PresentAge::active;
+    if ((!age || !age->gathering() || !age->paired || !s.frame_reuse) && o.pair_reuse12) o.pair_reuse12.reset();
+    if (age && age->gathering()) {
+        Jobs::Pair pair;
+        if (age->paired && s.frame_reuse) {
+            fr12::Stage::Config cfg; cfg.device=device;cfg.width=w;cfg.height=h;cfg.frame_format=view;
+            cfg.motion_width=mw;cfg.motion_height=mh;cfg.depth_width=std::max(1u,dw);cfg.depth_height=std::max(1u,dh);
+            cfg.context=bool(f.depth);cfg.scrgb=f.hdr && view==DXGI_FORMAT_R16G16B16A16_FLOAT;cfg.stay_fixed=6.f;
+            std::string err;
+            if (!fr12::Stage::ensure_pair(o.pair_reuse12,cfg,[](IUnknown* r){nr::pe::d3d12_passthrough::retire_resource(r);},&err))
+                return refuse("Cannot run: "+err);
+            auto* kernel=o.pair_reuse12.get();
+            pair=[kernel](ID3D12GraphicsCommandList*& c,fr12::Frame* odd,fr12::Frame& even,const Jobs::Execute& run){
+                return kernel->render_pair(c,odd,even,run);
+            };
+        }
+        jobs=Jobs::add(device,unsigned(view),steps,uintptr_t(&o),anchor,std::move(pair));
+        if (!jobs || !jobs->ready) return true;
+    }
+    if (o.reuse12) {
+        const auto& k = o.reuse12->config();
+        if (k.width != w || k.height != h || k.frame_format != view || k.motion_width != mw || k.motion_height != mh ||
+            k.depth_width != std::max(1u,dw) || k.depth_height != std::max(1u,dh) || k.context != bool(f.depth) || k.scrgb != (f.hdr && view==DXGI_FORMAT_R16G16B16A16_FLOAT) || k.batch_only!=bool(jobs && age->paired))
+            o.reuse12.reset();
+    }
+    if (!o.reuse12) {
+        fr12::Stage::Config k;
+        k.device = device;
+        k.width = w; k.height = h; k.frame_format = view;
+        k.motion_width = mw; k.motion_height = mh; k.depth_width = std::max(1u,dw); k.depth_height = std::max(1u,dh); k.context = f.depth != nullptr;
+        k.two_sided = true;
+        k.scrgb = f.hdr && view==DXGI_FORMAT_R16G16B16A16_FLOAT; k.batch_only=jobs && age->paired;
+        k.delay = true;
+        k.stay_fixed = 6.0f;   // (a translucent HUD over a moving world may change a little in place)
+        std::string err;   // (its images count as the processing's memory: nr_frame_reuse_d3d12.cpp)
+        o.reuse12 = fr12::Stage::make(k, [](IUnknown* r) { nr::pe::d3d12_passthrough::retire_resource(r); }, &err);
+        if (!o.reuse12) {
+            o.alloc_retry_after = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+            o.reuse_failed = err.empty() ? std::string("unknown") : err;
+            return refuse("Cannot run: " + o.reuse_failed);
+        }
+        o.reuse_settings = s;
+        o.reuse_frames = 0; o.reuse_logged = {}; o.reuse_window = {}; o.reuse_share = -1.f;
+        log("[nr] frame reuse (D3D12, wilsjo2 layer %d) at %ux%u, format %d, guides %ux%u / %ux%u: NR on 1 frame of 2 (%llu MiB)%s",
+            nr::pe::renodx_route::call_layer(), w, h, int(view), mw, mh, dw, dh, (unsigned long long)(o.reuse12->image_bytes() >> 20),
+            "; even frames: the network split over two frames, each rebuilt frame made from the NR frames before and "
+                   "after it, every frame shown two frames later");
+    } else if (!w2::reuse_equal(o.reuse_settings, s)) {
+        o.reuse12->reset();
+        o.reuse_settings = s;
+    }
+    {   // [Preprocess] changed: as a setting's change, afresh
+        const nr::Preprocess b = nr::dlssnr::preprocess_settings();
+        const nr::Preprocess& a = o.reuse_prep;
+        if (a.enabled != b.enabled || a.exposure != b.exposure || a.bias_ev != b.bias_ev || a.curve != b.curve ||
+            a.contrast != b.contrast || a.saturation != b.saturation || a.inverse != b.inverse) {
+            o.reuse12->reset();
+            o.reuse_prep = b;
         }
     }
-    if (g_stage_retry.blocked()) return false;
+    nr::pe::d3d12_passthrough::note_recording(cmd);
+    if (o.reuse_epoch!=(jobs?jobs->epoch:0)) { o.reuse12->reset(); o.reuse_epoch=jobs?jobs->epoch:0; }
+    const auto paired=[&](ID3D12GraphicsCommandList*& c,fr12::Frame* odd,fr12::Frame& even,ID3D12GraphicsCommandList* tail,float share){
+        return jobs->record_pair(c,odd,even,tail,share);
+    };
+    const auto r=jobs && age->paired ? o.reuse12->record_batch(cmd,fr,paired) : o.reuse12->record(cmd,fr,[&](ID3D12GraphicsCommandList* list,const fr12::Frame& nf) {
+        const auto split=o.reuse12->split();
+        if (jobs) return jobs->record(list,nf,split.tail,split.share,o.reuse12->gap());
+        const uint32_t n=anchor(list,nf,split.tail,uint32_t(std::lround(double(split.share)*steps)),o.reuse12->gap());
+        flow_ok=n!=nr::frame_pair::failed_calls && n!=0;
+        return n;
+    });
+    if (jobs) { age->group_written=r.ok; age->group_share=o.reuse_share; }
+    // even frames: the frame's second part to the passthrough, run at the next Present before anything NR records next
+    const fr12::Stage::Pending pending = o.reuse12->take_pending();
+    if (pending.list) nr::pe::d3d12_passthrough::push_pending(pending.list, pending.ticket);
+    // (what the flow recorded there uses its surfaces: their retirement waits for that part too)
+    if (pending.ticket) gpu_uses.tickets.push_back(pending.ticket);
+    // frame generation's inputs follow a Present whose frames are shown later (nr_asi_hudcap.cpp; Session::frames_delay)
+    if (o.at_present) nr::pe::Session::note_frames_delayed(r.ok ? r.shown_late : 0,r.ok ? r.next_late : 0);
+    if ((o.reuse_frames + 1) % 60 == 0) {   // NR Control's share of frames with NR: windows of 60 frames
+        const fr12::Stage::Stats st = o.reuse12->stats();
+        if (st.frames > o.reuse_window.frames)
+            o.reuse_share = float(double(st.computed - o.reuse_window.computed) / double(st.frames - o.reuse_window.frames));
+        o.reuse_window = st;
+    }
+    if (++o.reuse_frames == 120 || o.reuse_frames % 600 == 0) {
+        const fr12::Stage::Stats st = o.reuse12->stats();
+        log("[nr] wilsjo2 layer %d: frame reuse (D3D12), last %llu frames: NR on %llu, rebuilt %llu",
+            nr::pe::renodx_route::call_layer(), (unsigned long long)(st.frames - o.reuse_logged.frames),
+            (unsigned long long)(st.computed - o.reuse_logged.computed),
+            (unsigned long long)((st.frames - o.reuse_logged.frames) - (st.computed - o.reuse_logged.computed)));
+        o.reuse_logged = st;
+    }
+    if (!r.ok) return refuse(o.flow.reuse_failure ? o.flow.reuse_failure : nr::frame_reuse::anchor_error);
+    return !r.completed || flow_ok;
+}
+
+namespace {
+struct DirectStateEntry {
+    D3D12_RESOURCE_STATES initial, now;
+};
+
+bool is_vkd3d_device(ID3D12Device* device) {
+    static const bool forced_bridge = [] {
+        char v[4] = {};
+        const DWORD n = GetEnvironmentVariableA("NR_BRIDGE", v, sizeof v);
+        return n > 0 && n < sizeof v && v[0] == '1';
+    }();
+    if (forced_bridge || !device) return false;
+    ID3D12DXVKInteropDevice* interop = nullptr;
+    if (SUCCEEDED(device->QueryInterface(__uuidof(ID3D12DXVKInteropDevice), reinterpret_cast<void**>(&interop))) &&
+        interop) {
+        interop->Release();
+        return true;
+    }
+    return false;
+}
+
+template <class Fn>
+std::optional<bool> run_direct_utility(
+    ID3D12GraphicsCommandList* cmd, ID3D12Device* device, const char* what,
+    const std::vector<w2::Mode>& required_modes,
+    std::initializer_list<std::pair<ID3D12Resource*, D3D12_RESOURCE_STATES>> initial_states, const Fn& fn) {
+    if (!device || !cmd || !nr::pe::d3d12_passthrough::enabled() || stage_fail_test()) return std::nullopt;
+    if (nr::pe::d3d12_passthrough::canary() != nr::pe::d3d12_passthrough::Canary::kHit) return std::nullopt;
+    if (is_vkd3d_device(device)) return std::nullopt;
+    std::string why;
+    if (!nr::pe::d3d12_direct::ready(device, cmd, &why)) return std::nullopt;
+    w2::Stage* st = native::programs_wait(device, &why);
+    native::Stage12* impl = st ? native::programs_impl() : nullptr;
+    if (!st || !impl) return std::nullopt;
+    for (w2::Mode m : required_modes) {
+        if (!st->has(m)) return std::nullopt;
+    }
+
+    std::map<ID3D12Resource*, DirectStateEntry> tracked;
+    for (const auto& kv : initial_states) {
+        if (kv.first && tracked.find(kv.first) == tracked.end()) tracked[kv.first] = {kv.second, kv.second};
+    }
+    bool ok = true;
+    impl->begin(cmd, [&](ID3D12Resource* r, D3D12_RESOURCE_STATES want) {
+        if (!r) return;
+        auto it = tracked.find(r);
+        if (it == tracked.end()) it = tracked.emplace(r, DirectStateEntry{kUav, kUav}).first;
+        transition(cmd, r, it->second.now, want);
+        it->second.now = want;
+    });
+    try {
+        ok = fn(*st);
+    } catch (const std::exception& x) {
+        log("[d3d12] ERROR: wilsjo2 on D3D12: %s: %s", what, x.what());
+        ok = false;
+    }
+    for (auto& kv : tracked) {
+        transition(cmd, kv.first, kv.second.now, kv.second.initial);
+        kv.second.now = kv.second.initial;
+    }
+    impl->end();
+    impl->end_recording();
+    return ok;
+}
+
+bool direct_srv_ok(ID3D12Resource* r) {
+    if (!r) return false;
+    const D3D12_RESOURCE_DESC d = r->GetDesc();
+    return d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.SampleDesc.Count == 1 &&
+           native::srv_format(d.Format) != DXGI_FORMAT_UNKNOWN;
+}
+
+bool direct_uav_ok(ID3D12Resource* r) {
+    if (!r) return false;
+    const D3D12_RESOURCE_DESC d = r->GetDesc();
+    return d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.SampleDesc.Count == 1 &&
+           (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
+           native::uav_format(d.Format) != DXGI_FORMAT_UNKNOWN;
+}
+}  // namespace
+
+bool wilsjo2_convert(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, ID3D12Resource* source,
+                     ID3D12Resource* original, ID3D12Resource* target, uint32_t w, uint32_t h, bool to_linear, bool direct_only) {
+    if (direct_srv_ok(source) && direct_uav_ok(target) && (to_linear || direct_srv_ok(original))) {
+        const w2::Mode mode = to_linear ? w2::kFinishedToLinear : w2::kFinishedToPq;
+        if (const auto r = run_direct_utility(
+                cmd, device, "HDR10 conversion", {mode},
+                {{source, kSrv}, {to_linear ? nullptr : original, kSrv}, {target, kUav}},
+                [&](w2::Stage& st) {
+                    w2::Dispatch d;
+                    d.t0 = native::image(source);
+                    if (!to_linear) d.t2 = native::image(original);
+                    d.u0 = native::image(target);
+                    d.constants.mode = mode;
+                    d.constants.width = w;
+                    d.constants.height = h;
+                    st.record(VK_NULL_HANDLE, d);
+                    return true;
+                })) {
+            return *r;
+        }
+    }
+    if (direct_only || g_stage_retry.blocked()) return false;
     bool recorded = false;
     nr::dlssnr::with_d3d12_session([&](nr::pe::Session& session) {
         recorded = session.record_raw(device, cmd, [&](VkCommandBuffer vk, const HostDevice& host,
@@ -984,6 +1511,40 @@ bool wilsjo2_convert(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, ID3D1
 
 bool hudfix_d3d12(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, const HudFixD3D12& r, uint32_t w, uint32_t h,
                   uint32_t source, bool show_mask) {
+    ID3D12Resource* alpha_res = r.alpha ? r.alpha : r.back;
+    ID3D12Resource* ref_res = r.hudless ? r.hudless : r.back;
+    if (direct_srv_ok(r.back) && direct_uav_ok(r.frame) && direct_uav_ok(r.stats) && direct_srv_ok(alpha_res) &&
+        direct_srv_ok(ref_res)) {
+        const std::vector<w2::Mode> run_modes = (source == 2 || source == 5)
+            ? std::vector<w2::Mode>{w2::kHudClear, w2::kHudCount, w2::kHudCompose}
+            : std::vector<w2::Mode>{w2::kHudClear, w2::kHudCompose};
+        if (const auto res = run_direct_utility(
+                cmd, device, "HUD FIX", run_modes,
+                {{r.back, kUav}, {r.frame, kUav}, {r.stats, kUav}, {r.alpha, kUav}, {r.hudless, kUav}},
+                [&](w2::Stage& st) {
+                    const w2::Image back = native::image(r.back), frame = native::image(r.frame),
+                                    stats = native::image(r.stats), alpha = native::image(alpha_res),
+                                    ref = native::image(ref_res);
+                    const auto run = [&](uint32_t mode, const w2::Image& t0, const w2::Image* t1, const w2::Image* t2,
+                                         const w2::Image* t3, const w2::Image& u0, uint32_t width, uint32_t height) {
+                        w2::Dispatch d;
+                        d.t0 = t0;
+                        if (t1) d.t1 = *t1;
+                        if (t2) d.t2 = *t2;
+                        if (t3) d.t3 = *t3;
+                        d.u0 = u0;
+                        d.u1 = stats;
+                        d.constants = w2::hudfix_constants(mode, width, height, source, show_mask);
+                        st.record(VK_NULL_HANDLE, d);
+                    };
+                    run(w2::kHudClear, back, nullptr, nullptr, nullptr, frame, 1, 1);
+                    if (source == 2 || source == 5) run(w2::kHudCount, back, &ref, nullptr, nullptr, frame, w, h);
+                    run(w2::kHudCompose, back, &ref, &frame, &alpha, frame, w, h);
+                    return true;
+                })) {
+            return *res;
+        }
+    }
     if (g_stage_retry.blocked()) return false;
     bool recorded = false;
     nr::dlssnr::with_d3d12_session([&](nr::pe::Session& session) {
@@ -1034,6 +1595,31 @@ bool hudfix_d3d12(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, const Hu
 
 bool hudfix_select_d3d12(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, ID3D12Resource* frame,
                          ID3D12Resource* hudless, ID3D12Resource* stats, ID3D12Resource* out, uint32_t w, uint32_t h) {
+    if (direct_srv_ok(frame) && direct_srv_ok(hudless) && direct_uav_ok(stats) && direct_uav_ok(out)) {
+        if (const auto res = run_direct_utility(
+                cmd, device, "HUD FIX select", {w2::kHudClear, w2::kHudCount, w2::kHudCompose},
+                {{frame, kUav}, {hudless, kUav}, {stats, kUav}, {out, kUav}},
+                [&](w2::Stage& st) {
+                    const w2::Image f = native::image(frame), hl = native::image(hudless),
+                                    s_img = native::image(stats), o = native::image(out);
+                    const auto run = [&](uint32_t mode, uint32_t source, const w2::Image* t1, const w2::Image& u0,
+                                         uint32_t width, uint32_t height) {
+                        w2::Dispatch d;
+                        d.t0 = f;
+                        if (t1) d.t1 = *t1;
+                        d.u0 = u0;
+                        d.u1 = s_img;
+                        d.constants = w2::hudfix_constants(mode, width, height, source, false);
+                        st.record(VK_NULL_HANDLE, d);
+                    };
+                    run(w2::kHudClear, 2, nullptr, o, 1, 1);
+                    run(w2::kHudCount, 2, &hl, o, w, h);
+                    run(w2::kHudCompose, 6, &hl, o, w, h);
+                    return true;
+                })) {
+            return *res;
+        }
+    }
     if (g_stage_retry.blocked()) return false;
     bool recorded = false;
     nr::dlssnr::with_d3d12_session([&](nr::pe::Session& session) {
@@ -1081,6 +1667,26 @@ bool hudfix_select_d3d12(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, I
 bool wilsjo2_fg_delta(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, ID3D12Resource* hudless, ID3D12Resource* before,
                       ID3D12Resource* after, ID3D12Resource* zero, ID3D12Resource* stats, ID3D12Resource* out, uint32_t w,
                       uint32_t h) {
+    if (direct_srv_ok(hudless) && direct_srv_ok(before) && direct_srv_ok(after) && direct_srv_ok(zero) &&
+        direct_uav_ok(out) && direct_uav_ok(stats)) {
+        if (const auto res = run_direct_utility(
+                cmd, device, "FG HUD-less delta", {w2::kHudCompose},
+                {{hudless, kUav}, {before, kUav}, {after, kUav}, {zero, kUav}, {out, kUav}, {stats, kUav}},
+                [&](w2::Stage& st) {
+                    w2::Dispatch d;
+                    d.t0 = native::image(hudless);
+                    d.t1 = native::image(before);
+                    d.t2 = native::image(after);
+                    d.t3 = native::image(zero);
+                    d.u0 = native::image(out);
+                    d.u1 = native::image(stats);
+                    d.constants = w2::hudfix_constants(w2::kHudCompose, w, h, 0u, false);
+                    st.record(VK_NULL_HANDLE, d);
+                    return true;
+                })) {
+            return *res;
+        }
+    }
     if (g_stage_retry.blocked()) return false;
     bool recorded = false;
     nr::dlssnr::with_d3d12_session([&](nr::pe::Session& session) {
@@ -1122,6 +1728,29 @@ bool wilsjo2_fg_delta(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, ID3D
 bool wilsjo2_inspect(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, ID3D12Resource* before, ID3D12Resource* after,
                      ID3D12Resource* target, uint32_t w, uint32_t h, uint32_t compare, float split, float zoom, bool swap,
                      bool apply_model) {
+    if (direct_srv_ok(before) && direct_srv_ok(after) && direct_uav_ok(target)) {
+        if (const auto res = run_direct_utility(
+                cmd, device, "NR comparison", {w2::kInspect},
+                {{before, kSrv}, {after, kSrv}, {target, kUav}},
+                [&](w2::Stage& st) {
+                    w2::Dispatch d;
+                    d.t0 = native::image(before);
+                    d.t1 = native::image(after);
+                    d.u0 = native::image(target);
+                    d.constants.mode = w2::kInspect;
+                    d.constants.width = w;
+                    d.constants.height = h;
+                    d.constants.compare_mode = compare;
+                    d.constants.compare_split = split;
+                    d.constants.compare_zoom = zoom;
+                    d.constants.compare_swap = swap ? 1u : 0u;
+                    d.constants.apply_model = apply_model ? 1u : 0u;
+                    st.record(VK_NULL_HANDLE, d);
+                    return true;
+                })) {
+            return *res;
+        }
+    }
     if (g_stage_retry.blocked()) return false;
     bool recorded = false;
     nr::dlssnr::with_d3d12_session([&](nr::pe::Session& session) {

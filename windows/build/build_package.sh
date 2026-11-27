@@ -1,48 +1,50 @@
 #!/usr/bin/env bash
 # Build the Windows package (64-bit games on the AMD Windows driver):
 #   dlssnr-amd/     the network: Windows shaders (windows/build/assemble_product_data.sh), and in aco/ the
-#                   same network as ACO's machine code (ACO Mode, always tried first): RX 9000's (RDNA4),
-#                   CC_SILVER_AARDWOLD_OPTIMIZED's int4 layers' in int4/, RX 7000's and the Radeon 700M / 800M / 8000S
-#                   graphics' (RDNA3) in rdna3/; the int4 layers' data in int4/, CC_SMALL_FP8_EXPERIMENTAL's SPIR-V in
-#                   experimental/, CC_SILVER_AARDWOLD_OPTIMIZED's in optimized/
+#                   same network as ACO's machine code (ACO Mode, always tried first): RDNA4's, the int4 layers' in
+#                   int4/, RDNA3's and RDNA3.5's in rdna3/; each optimized network's SPIR-V and data in a folder of its
+#                   codename and level (CC_SMALL_FP8_OPTIMIZED, CC_SMALL_FP8_OPTIMIZED-performance,
+#                   CC_SMALL_FP8_OPTIMIZED-ultra, CC_SILVER_AARDWOLD_OPTIMIZED, CC_SILVER_AARDWOLD_OPTIMIZED-balanced,
+#                   CC_SILVER_AARDWOLD_OPTIMIZED-performance, CC_SILVER_AARDWOLD_OPTIMIZED-ultra)
 #   model-tools/    dlssnr_extract_model.exe: install.ps1 makes the model from the user's nvngx_dlssnr.dll;
-#                   dlssnr-int4-weights.exe: and the int4 layers' weights from CC_SILVER_AARDWOLD_OPTIMIZED's
-#   experimental/   CC_SMALL_FP8_EXPERIMENTAL's weights as a difference from CC_SMALL_FP8's (install.ps1 applies it)
-#   optimized/      CC_SILVER_AARDWOLD_OPTIMIZED's weights as a difference from CC_SILVER_AARDWOLD's (the same)
+#                   dlssnr-int4-weights.exe: and the int4 layers' weights from the optimized networks'
+#   CC_SMALL_FP8_OPTIMIZED/        its weights as a difference from CC_SMALL_FP8's (install.ps1 applies it)
+#   CC_SILVER_AARDWOLD_OPTIMIZED/  its weights as a difference from CC_SILVER_AARDWOLD's (the same)
 #   optiscaler/     OptiScaler (the official nightly, unmodified) and our NR plugin for it
 #   reshade/        ReShade + our add-on: dxgi.dll in DX10/11/12 games, a Vulkan layer otherwise
 #   dxvk/           D3D9 -> Vulkan, for the DX9 route only
 #   vulkan/         the Khronos loader the Vulkan-layer routes put beside the game
 #   install.bat, install.ps1, README.txt
 #
-#   [NR_MODEL=CC_SILVER_AARDWOLD.bin [NR_MODEL_SMALL=CC_SMALL_FP8.bin]] [NR_INT4=0] [NR_LANG_EXTRA=<dir>] [NR_SIGN=1] bash windows/build/build_package.sh [build dir]
+#   [NR_MODEL_SILVER_AARDWOLD=CC_SILVER_AARDWOLD.bin [NR_MODEL_SMALL_FP8=CC_SMALL_FP8.bin]] [NR_INT4=0] [NR_LANG_EXTRA=<dir>] [NR_SIGN=1] bash windows/build/build_package.sh [build dir]
 #
 # The package carries no model: install.ps1 extracts it from the user's nvngx_dlssnr.dll on the first
-# install. NR_MODEL puts a CC_SILVER_AARDWOLD.bin you made yourself into the package (for your own use only), and with it
-# NR_MODEL_SMALL a CC_SMALL_FP8.bin (the new model, from the 310.9.16 DLL).
+# install. NR_MODEL_SILVER_AARDWOLD puts a CC_SILVER_AARDWOLD.bin you made yourself into the package (for your own use
+# only), and with it NR_MODEL_SMALL_FP8 a CC_SMALL_FP8.bin (from the 310.9.16 DLL).
 #
 # NR_INT4 (default 1): the programs built with CC_SILVER_AARDWOLD_OPTIMIZED's int4 layers and their data in the
-# package; install.ps1 installs all four networks (CC_SMALL_FP8, CC_SMALL_FP8_EXPERIMENTAL, CC_SILVER_AARDWOLD,
-# CC_SILVER_AARDWOLD_OPTIMIZED; the experimental and the optimized one run with ACO Mode only) and asks only which one
-# a game starts with. NR_INT4=0: no int4 layers.
+# package; install.ps1 installs all four networks (CC_SMALL_FP8, CC_SMALL_FP8_OPTIMIZED, CC_SILVER_AARDWOLD,
+# CC_SILVER_AARDWOLD_OPTIMIZED; the two optimized ones run with ACO Mode only) and asks only which one a game starts
+# with. NR_INT4=0: no int4 layers.
 #
 # D3D10/11/12 games keep the system's own D3D: the network runs on a Vulkan device of its own and the
 # frame crosses over through shared textures and a shared fence (windows/src/pe/nr_pe_bridge.hpp).
 # Only DX9 games are translated (DXVK), because D3D9 shares neither textures nor fences.
 set -euo pipefail
 model=""
-if [[ -n "${NR_MODEL:-}" ]]; then
-    [[ -f "$NR_MODEL" ]] || { echo "NR_MODEL: no such file: $NR_MODEL" >&2; exit 1; }
-    model=$(realpath -- "$NR_MODEL")
+if [[ -n "${NR_MODEL_SILVER_AARDWOLD:-}" ]]; then
+    [[ -f "$NR_MODEL_SILVER_AARDWOLD" ]] || { echo "NR_MODEL_SILVER_AARDWOLD: no such file: $NR_MODEL_SILVER_AARDWOLD" >&2; exit 1; }
+    model=$(realpath -- "$NR_MODEL_SILVER_AARDWOLD")
 fi
-small=""
-if [[ -n "$model" && -n "${NR_MODEL_SMALL:-}" ]]; then
-    [[ -f "$NR_MODEL_SMALL" ]] || { echo "NR_MODEL_SMALL: no such file: $NR_MODEL_SMALL" >&2; exit 1; }
-    small=$(realpath -- "$NR_MODEL_SMALL")
+model_small_fp8=""
+if [[ -n "$model" && -n "${NR_MODEL_SMALL_FP8:-}" ]]; then
+    [[ -f "$NR_MODEL_SMALL_FP8" ]] || { echo "NR_MODEL_SMALL_FP8: no such file: $NR_MODEL_SMALL_FP8" >&2; exit 1; }
+    model_small_fp8=$(realpath -- "$NR_MODEL_SMALL_FP8")
 fi
 cd -- "$(dirname -- "$0")/../.."
 bash windows/build/check_paths.sh   # UTF-8 paths only (a game folder with any letters)
 bash windows/build/check_imgui.sh   # ReShade's ImGui is MSVC's: no ImVec2-returning call from the add-on's code
+python3 windows/build/check_outer_aco.py > /dev/null
 out=$(realpath -m -- "${1:-artifacts/windows/package-build}")
 case "$out" in "$(pwd)"/*) ;; *) echo 'build directory must be in the project' >&2; exit 2;; esac
 mkdir -p -- "$out"
@@ -52,7 +54,7 @@ cc=x86_64-w64-mingw32-gcc
 command -v "$cxx" >/dev/null || { echo "no mingw cross compiler ($cxx)" >&2; exit 1; }
 minhook=artifacts/ref/DLSS5-Feeder/external/minhook
 reshade_inc=artifacts/ref/DLSS5-Feeder/external/reshade/include
-dxvk=${NR_DXVK:-artifacts/ref/dxvk-ge11-7}   # GE-Proton 11-7's DXVK files (fetch_deps.sh --windows)
+dxvk=${NR_DXVK:-artifacts/ref/dxvk-ge}   # DXVK from the latest GE-Proton release (fetch_deps.sh --windows)
 opti_7z=${NR_OPTI_ARCHIVE:-artifacts/ref/downloads/OptiScaler_v10.0.0-pre1_20261030.7z}
 opti_license=${NR_OPTI_LICENSE:-artifacts/ref/optiscaler-nightly-20261030/LICENSE}
 for dir in "$minhook" "$reshade_inc" artifacts/ref/reshade-shaders artifacts/ref/vort_Shaders \
@@ -63,6 +65,7 @@ for f in "$opti_7z" "$opti_license" artifacts/ref/reshade-6.8.0/ReShade64.dll; d
     [[ -f "$f" ]] || { echo "missing: $f" >&2; exit 1; }
 done
 source windows/build/arch/rdna4.sh
+source windows/build/parallel.sh
 
 # ---- the ReShade add-on -----------------------------------------------------------------------
 stamp=$(bash windows/build/version.sh)
@@ -72,45 +75,62 @@ common=(-std=c++17 -O2 -DNDEBUG -DNR_BUILD_STAMP="\"$stamp\"" -Itoolchain/Vulkan
 # (NR_RESHADE_ROUTE: these are the ReShade add-on's objects, all of them - the route's defaults, nr_fast_passes.hpp)
 common+=(-DNR_RESHADE_ROUTE=1)
 [[ "${NR_INT4:-1}" == 1 ]] && common+=(-DNR_INT4=1)
-"$cxx" "${common[@]}" "${NR_PRODUCT_DEFINES[@]}" -c windows/src/core/nr_runtime.cpp -o "$out/nr_runtime.o"
-"$cxx" "${common[@]}" -c windows/src/core/nr_native_plan.cpp -o "$out/nr_native_plan.o"
-"$cxx" "${common[@]}" -c windows/src/core/nr_renodx.cpp -o "$out/nr_renodx.o"
-"$cxx" "${common[@]}" -c windows/src/core/nr_wilsjo2.cpp -o "$out/nr_wilsjo2.o"   # its Stage: HUD FIX and the wilsjo2 layers
-"$cxx" "${common[@]}" -c windows/src/pe/nr_vram_ledger.cpp -o "$out/vram_ledger.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_pe_log.cpp -o "$out/log.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_pe_crash.cpp -o "$out/crash.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_pe_interop.cpp -o "$out/interop.o"
-"$cxx" "${common[@]}" -I"$minhook/include" -c windows/src/pe/nr_pe_vkdevice.cpp -o "$out/vkdevice.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_pe_session.cpp -o "$out/session.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_pe_bridge.cpp -o "$out/bridge.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_pe_d3d12split.cpp -o "$out/d3d12split.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_pe_config.cpp -o "$out/config.o"
-"$cxx" "${common[@]}" -c windows/src/pe/nr_screenshot.cpp -o "$out/screenshot.o"
+par "$cxx" "${common[@]}" "${NR_PRODUCT_DEFINES[@]}" -c windows/src/core/nr_runtime.cpp -o "$out/nr_runtime.o"
+par "$cxx" "${common[@]}" -c windows/src/core/nr_native_plan.cpp -o "$out/nr_native_plan.o"
+par "$cxx" "${common[@]}" -c windows/src/core/nr_renodx.cpp -o "$out/nr_renodx.o"
+par "$cxx" "${common[@]}" -c windows/src/core/nr_wilsjo2.cpp -o "$out/nr_wilsjo2.o"   # its Stage: HUD FIX and the wilsjo2 layers
+par "$cxx" "${common[@]}" -c windows/src/pe/nr_vram_ledger.cpp -o "$out/vram_ledger.o"
+par "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_log.cpp -o "$out/log.o"
+par "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_crash.cpp -o "$out/crash.o"
+par "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_interop.cpp -o "$out/interop.o"
+par "$cxx" "${common[@]}" -I"$minhook/include" -c windows/src/pe/nr_pe_vkdevice.cpp -o "$out/vkdevice.o"
+par "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_session.cpp -o "$out/session.o"
+par "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_bridge.cpp -o "$out/bridge.o"
+par "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_d3d12split.cpp -o "$out/d3d12split.o"
+par "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_config.cpp -o "$out/config.o"
+par "$cxx" "${common[@]}" -c windows/src/pe/nr_screenshot.cpp -o "$out/screenshot.o"
+par "$cxx" "${common[@]}" -c windows/src/core/nr_frame_reuse.cpp -o "$out/nr_frame_reuse.o"   # NRFrameReuse (the session's)
 # ReShade's headers include <Windows.h>; the case shim maps that onto mingw's.
-"$cxx" "${common[@]}" -Iwindows/src/pe/reshade_compat -I"$reshade_inc" -I"$minhook/include" \
+par "$cxx" "${common[@]}" -idirafter windows/src/pe/reshade_compat -I"$reshade_inc" -I"$minhook/include" \
     -Iartifacts/ref/DLSS5-Feeder/external/imgui -Iwindows/src/ui -c windows/src/pe/nr_reshade_addon.cpp -o "$out/reshade_addon.o"
 for unit in hook buffer trampoline; do
-    "$cc" -O2 -I"$minhook/include" -I"$minhook/src" -c "$minhook/src/$unit.c" -o "$out/mh_$unit.o"
+    par "$cc" -O2 -I"$minhook/include" -I"$minhook/src" -c "$minhook/src/$unit.c" -o "$out/mh_$unit.o"
 done
-"$cc" -O2 -I"$minhook/include" -I"$minhook/src" -c "$minhook/src/hde/hde64.c" -o "$out/mh_hde64.o"
+par "$cc" -O2 -I"$minhook/include" -I"$minhook/src" -c "$minhook/src/hde/hde64.c" -o "$out/mh_hde64.o"
+# the Linux network sets the ACO records belong to (linux/build/build_network.py; copied into the package below), beside
+# the compiler runs
+rm -rf -- "$out"/aco-shaders "$out"/aco-shaders-*
+par python3 linux/build/build_network.py rdna4 --out "$out/aco-shaders" > /dev/null
+for n in CC_SMALL_FP8_OPTIMIZED CC_SMALL_FP8_OPTIMIZED-performance CC_SILVER_AARDWOLD_OPTIMIZED; do
+    par python3 linux/build/build_network.py rdna4 --network "$n" --out "$out/aco-shaders-$n" > /dev/null
+done
+if [[ "${NR_INT4:-1}" == 1 ]]; then
+    for n in CC_SILVER_AARDWOLD_OPTIMIZED-balanced CC_SILVER_AARDWOLD_OPTIMIZED-performance CC_SILVER_AARDWOLD_OPTIMIZED-ultra \
+             CC_SMALL_FP8_OPTIMIZED-ultra; do
+        par python3 linux/build/build_network.py rdna4 --network "$n" --out "$out/aco-shaders-$n" > /dev/null
+    done
+fi
+par_wait
 ldflags=(-ld3d12 -ld3d11 -ldxgi -ldwmapi -lgdi32 -lole32 -static -static-libgcc -static-libstdc++)
 
 # No static import of vulkan-1.dll (it would load before the game set up its graphics): windows/build/vulkan_lazy.sh.
 objs=("$out/reshade_addon.o" "$out/session.o" "$out/bridge.o" "$out/d3d12split.o" "$out/config.o" "$out/screenshot.o" "$out/interop.o"
       "$out/vram_ledger.o" "$out/log.o" "$out/crash.o" "$out/vkdevice.o" "$out/nr_runtime.o" "$out/nr_native_plan.o"
-      "$out/nr_renodx.o" "$out/nr_wilsjo2.o" "$out"/mh_*.o)
+      "$out/nr_renodx.o" "$out/nr_frame_reuse.o" "$out/nr_wilsjo2.o" "$out"/mh_*.o)
 bash windows/build/vulkan_lazy.sh "$out" "$cxx" -shared "${objs[@]}" "${ldflags[@]}" > /dev/null
 "$cxx" -shared -o "$out/dlssnr_amd.addon64" "${objs[@]}" "$out/vulkan_lazy_s.o" "$out/vulkan_lazy_c.o" "${ldflags[@]}"
 
 # ---- the other binaries -------------------------------------------------------------------------
 NR_INT4=${NR_INT4:-1} bash windows/build/build_asi.sh artifacts/windows/asi > /dev/null
 bash windows/build/build_vulkan_loader.sh > /dev/null
+bash windows/build/x86/build32.sh "$minhook" "$out/x86" > /dev/null
+NR_ARCH=i686 bash windows/build/build_vulkan_loader.sh > /dev/null
 
 # ---- package ------------------------------------------------------------------------------------
 pkg="$out/package"
 rm -rf -- "$pkg"; mkdir -p -- "$pkg"
 if [[ -n "$model" ]]; then
-    bash windows/build/assemble_product_data.sh "$pkg" --model "$model" ${small:+--small-model "$small"}
+    bash windows/build/assemble_product_data.sh "$pkg" --silver-aardwold-model "$model" ${model_small_fp8:+--small-fp8-model "$model_small_fp8"}
 else
     bash windows/build/assemble_product_data.sh "$pkg"
 fi
@@ -126,48 +146,42 @@ fi
 # (linux/build/build_network.py; a record is found by its SPIR-V's hash) and the template aliases.
 aco="$pkg/dlssnr-amd/aco"
 mkdir -p -- "$aco/records"
-rm -rf -- "$out/aco-shaders"
-python3 linux/build/build_network.py rdna4 --out "$out/aco-shaders" > /dev/null
 cp -r -- "$out/aco-shaders" "$aco/shaders"
 cp -- windows/data/aco/records/*.nrp "$aco/records/"
+cp -- windows/data/aco/d3d12_outer.nra "$aco/"
 cp -- windows/data/aco/shell-aliases.txt "$aco/"
-# CC_SMALL_FP8_EXPERIMENTAL (ACO Mode only): the Linux network built with its changes (linux/build/build_network.py
-# --experimental); its records are with the others in aco/records (found by the SPIR-V's hash), its SPIR-V in
-# dlssnr-amd/experimental/shaders where the runtime looks for it.
-rm -rf -- "$out/aco-shaders-experimental"
-python3 linux/build/build_network.py rdna4 --experimental --out "$out/aco-shaders-experimental" > /dev/null
-mkdir -p -- "$pkg/dlssnr-amd/experimental"
-cp -r -- "$out/aco-shaders-experimental" "$pkg/dlssnr-amd/experimental/shaders"
-# CC_SILVER_AARDWOLD_OPTIMIZED (ACO Mode only) the same way: linux/build/build_network.py --optimized, its records in
-# aco/records, its SPIR-V in dlssnr-amd/optimized/shaders.
-rm -rf -- "$out/aco-shaders-optimized"
-python3 linux/build/build_network.py rdna4 --optimized --out "$out/aco-shaders-optimized" > /dev/null
-mkdir -p -- "$pkg/dlssnr-amd/optimized"
-cp -r -- "$out/aco-shaders-optimized" "$pkg/dlssnr-amd/optimized/shaders"
-# RDNA3 (RX 7000, Radeon 700M / 800M / 8000S graphics; nr_gpu_arch.hpp): its own network as ACO's machine code only
-# (windows/data/aco/rdna3/records, one record a pipeline), and in place of its SPIR-V the stand-ins the runtime takes
-# for it (rdna3/shaders, rdna3/experimental/shaders, rdna3/optimized/shaders: each pipeline's interface shell naming
-# its record, nr_pipeline_binary.hpp record_reference, with the network's marker files) and the templates (shells:
-# small shaders with the network's interfaces) the driver compiles for the containers. CC_SMALL_FP8_EXPERIMENTAL and
-# CC_SILVER_AARDWOLD_OPTIMIZED (at Quality) have their records with the default ones.
-mkdir -p -- "$aco/rdna3/records" "$aco/rdna3/experimental" "$aco/rdna3/optimized"
+# CC_SMALL_FP8_OPTIMIZED (ACO Mode only): the Linux network built with its changes (linux/build/build_network.py
+# --network CC_SMALL_FP8_OPTIMIZED: Quality; CC_SMALL_FP8_OPTIMIZED-performance: Performance); its records are with the
+# others in aco/records (found by the SPIR-V's hash), its SPIR-V in dlssnr-amd/CC_SMALL_FP8_OPTIMIZED/shaders and
+# dlssnr-amd/CC_SMALL_FP8_OPTIMIZED-performance/shaders where the runtime looks for it. CC_SILVER_AARDWOLD_OPTIMIZED
+# (ACO Mode only) the same way: --network CC_SILVER_AARDWOLD_OPTIMIZED, its records in aco/records, its SPIR-V in
+# dlssnr-amd/CC_SILVER_AARDWOLD_OPTIMIZED/shaders.
+for n in CC_SMALL_FP8_OPTIMIZED CC_SMALL_FP8_OPTIMIZED-performance CC_SILVER_AARDWOLD_OPTIMIZED; do
+    mkdir -p -- "$pkg/dlssnr-amd/$n"
+    cp -r -- "$out/aco-shaders-$n" "$pkg/dlssnr-amd/$n/shaders"
+done
+# RDNA3 and RDNA3.5 (nr_gpu_arch.hpp): their own network as ACO's machine code only (windows/data/aco/rdna3/records, one
+# record a pipeline), and in place of its SPIR-V the stand-ins the runtime takes for it (rdna3/shaders,
+# rdna3/CC_SMALL_FP8_OPTIMIZED/shaders, rdna3/CC_SILVER_AARDWOLD_OPTIMIZED/shaders: each pipeline's interface shell
+# naming its record, nr_pipeline_binary.hpp record_reference, with the network's marker files) and the templates
+# (shells: small shaders with the network's interfaces) the driver compiles for the containers. CC_SMALL_FP8_OPTIMIZED
+# and CC_SILVER_AARDWOLD_OPTIMIZED (at Quality) have their records with the default ones.
+mkdir -p -- "$aco/rdna3/records" "$aco/rdna3/CC_SMALL_FP8_OPTIMIZED" "$aco/rdna3/CC_SILVER_AARDWOLD_OPTIMIZED"
 cp -r -- windows/data/aco/rdna3/shaders "$aco/rdna3/shaders"
-cp -r -- windows/data/aco/rdna3/experimental/shaders "$aco/rdna3/experimental/shaders"
-cp -r -- windows/data/aco/rdna3/optimized/shaders "$aco/rdna3/optimized/shaders"
+cp -r -- windows/data/aco/rdna3/CC_SMALL_FP8_OPTIMIZED/shaders "$aco/rdna3/CC_SMALL_FP8_OPTIMIZED/shaders"
+cp -r -- windows/data/aco/rdna3/CC_SILVER_AARDWOLD_OPTIMIZED/shaders "$aco/rdna3/CC_SILVER_AARDWOLD_OPTIMIZED/shaders"
 cp -- windows/data/aco/rdna3/records/*.nrp "$aco/rdna3/records/"
+cp -- windows/data/aco/rdna3/d3d12_outer.nra "$aco/rdna3/"
 cp -r -- windows/data/aco/rdna3/shells "$aco/rdna3/shells"
 cp -- windows/data/aco/rdna3/shell-aliases.txt "$aco/rdna3/"
 if [[ "${NR_INT4:-1}" == 1 ]]; then
-    # CC_SILVER_AARDWOLD_OPTIMIZED with its int4 layers as ACO's machine code (windows/data/aco/int4/records: the records
-    # of its three int4 levels, Balanced, Performance and Ultra Performance - one folder, the records are named by their
-    # SPIR-V) and the Linux networks the records were made from (linux/build/build_network.py --int4 / --performance /
-    # --ultra; the OPTIMIZED builds read their SPIR-V from their own dlssnr-amd folder, --spv-dir-aco)
-    rm -rf -- "$out/aco-shaders-int4" "$out/aco-shaders-performance" "$out/aco-shaders-ultra"
-    python3 linux/build/build_network.py rdna4 --int4 --out "$out/aco-shaders-int4" > /dev/null
-    python3 linux/build/build_network.py rdna4 --performance --out "$out/aco-shaders-performance" > /dev/null
-    python3 linux/build/build_network.py rdna4 --ultra --out "$out/aco-shaders-ultra" > /dev/null
+    # The int4 layers as ACO's machine code (windows/data/aco/int4/records: the records of CC_SILVER_AARDWOLD_OPTIMIZED's
+    # three int4 levels, Balanced, Performance and Ultra Performance, and of CC_SMALL_FP8_OPTIMIZED's Ultra Performance -
+    # one folder, the records are named by their SPIR-V) and the Linux networks the records were made from
+    # (linux/build/build_network.py --network <name>; the optimized builds read their SPIR-V from their own dlssnr-amd
+    # folder, --spv-dir-aco)
     mkdir -p -- "$aco/int4/records"
-    cp -r -- "$out/aco-shaders-int4" "$aco/int4/shaders"
+    cp -r -- "$out/aco-shaders-CC_SILVER_AARDWOLD_OPTIMIZED-balanced" "$aco/int4/shaders"
     cp -- windows/data/aco/int4/records/*.nrp "$aco/int4/records/"
     cp -- windows/data/aco/int4/shell-aliases.txt "$aco/int4/"
     # INT4 adds kernels whose PAL template is one of the native default shaders.
@@ -184,24 +198,29 @@ for file in [root / 'shell-aliases.txt', root / 'int4/shell-aliases.txt']:
         aliases[name] = shell
 (root / 'shell-aliases.txt').write_text(''.join(f'{a} {b}\n' for a, b in sorted(aliases.items())))
 PY
-    # dlssnr-amd/int4/: the int4 data (one copy for both platforms, linux/data/int4/rdna4) and the SPIR-V the ACO
-    # records belong to
-    # dlssnr-amd/int4-performance/ (Balanced's tables, its network) and int4-ultra/ (Balanced's tables with
-    # linux/data/int4-ultra/rdna4 added, its settings.txt, its network); install.ps1 makes the int4 weights of all three
-    # from int4-ultra's tables
-    mkdir -p -- "$pkg/dlssnr-amd/int4" "$pkg/dlssnr-amd/int4-performance" "$pkg/dlssnr-amd/int4-ultra"
-    cp -r -- linux/data/int4/rdna4/{vit,swin,settings.txt} "$pkg/dlssnr-amd/int4/"
-    cp -r -- "$out/aco-shaders-int4" "$pkg/dlssnr-amd/int4/shaders"
-    cp -r -- linux/data/int4/rdna4/{vit,swin,settings.txt} "$pkg/dlssnr-amd/int4-performance/"
-    cp -r -- "$out/aco-shaders-performance" "$pkg/dlssnr-amd/int4-performance/shaders"
-    cp -r -- linux/data/int4/rdna4/{vit,swin,settings.txt} "$pkg/dlssnr-amd/int4-ultra/"
-    cp -r -- linux/data/int4-ultra/rdna4/. "$pkg/dlssnr-amd/int4-ultra/"
-    cp -r -- "$out/aco-shaders-ultra" "$pkg/dlssnr-amd/int4-ultra/shaders"
+    # dlssnr-amd/CC_SILVER_AARDWOLD_OPTIMIZED-balanced/: the int4 data (one copy for both platforms,
+    # linux/data/CC_SILVER_AARDWOLD_OPTIMIZED-balanced/rdna4) and the SPIR-V the ACO records belong to;
+    # CC_SILVER_AARDWOLD_OPTIMIZED-performance/ (Balanced's tables, its network) and CC_SILVER_AARDWOLD_OPTIMIZED-ultra/
+    # (Balanced's tables with linux/data/CC_SILVER_AARDWOLD_OPTIMIZED-ultra/rdna4 added, its settings.txt, its network);
+    # install.ps1 makes the int4 weights of all three from the -ultra tables
+    for n in CC_SILVER_AARDWOLD_OPTIMIZED-balanced CC_SILVER_AARDWOLD_OPTIMIZED-performance CC_SILVER_AARDWOLD_OPTIMIZED-ultra; do
+        mkdir -p -- "$pkg/dlssnr-amd/$n"
+        cp -r -- linux/data/CC_SILVER_AARDWOLD_OPTIMIZED-balanced/rdna4/{vit,swin,settings.txt} "$pkg/dlssnr-amd/$n/"
+        [[ $n == *-ultra ]] && cp -r -- linux/data/CC_SILVER_AARDWOLD_OPTIMIZED-ultra/rdna4/. "$pkg/dlssnr-amd/$n/"
+        cp -r -- "$out/aco-shaders-$n" "$pkg/dlssnr-amd/$n/shaders"
+    done
+    # CC_SMALL_FP8_OPTIMIZED at Ultra Performance (RDNA4): dlssnr-amd/CC_SMALL_FP8_OPTIMIZED-ultra - its ViT int4 tables
+    # (vit/; vit-sink/ for the 1440p-class frames), settings.txt and the Linux network its records (aco/int4/records)
+    # belong to (linux/build/build_network.py --network CC_SMALL_FP8_OPTIMIZED-ultra); install.ps1 makes its int4 weights
+    # (dlssnr-int4-weights.exe --network CC_SMALL_FP8_OPTIMIZED [--sink]) and checks them against the SHA-256 files
+    mkdir -p -- "$pkg/dlssnr-amd/CC_SMALL_FP8_OPTIMIZED-ultra"
+    cp -r -- linux/data/CC_SMALL_FP8_OPTIMIZED-ultra/rdna4/{vit,vit-sink,settings.txt} "$pkg/dlssnr-amd/CC_SMALL_FP8_OPTIMIZED-ultra/"
+    cp -r -- "$out/aco-shaders-CC_SMALL_FP8_OPTIMIZED-ultra" "$pkg/dlssnr-amd/CC_SMALL_FP8_OPTIMIZED-ultra/shaders"
     # RDNA3's int4 levels (the same tables as above): their gfx11 records (aco/rdna3/int4/records, the iu4 rewrite of
     # the NR_I4_MMA2 pairs made with them) and the stand-ins naming them, one folder a level as dlssnr-amd's
     mkdir -p -- "$aco/rdna3/int4"
     cp -r -- windows/data/aco/rdna3/int4/records "$aco/rdna3/int4/records"
-    for lv in int4 int4-performance int4-ultra; do
+    for lv in CC_SILVER_AARDWOLD_OPTIMIZED-balanced CC_SILVER_AARDWOLD_OPTIMIZED-performance CC_SILVER_AARDWOLD_OPTIMIZED-ultra; do
         mkdir -p -- "$aco/rdna3/$lv"
         cp -r -- "windows/data/aco/rdna3/$lv/shaders" "$aco/rdna3/$lv/shaders"
     done
@@ -214,7 +233,9 @@ PY
     "$cxx" -static -municode -o "$out/dlssnr-int4-weights.exe" "$out/int4_weights.o" "$out/nr_native_plan.o" "$out/int4_vkstub.o"
     mkdir -p -- "$pkg/model-tools"
     cp -- "$out/dlssnr-int4-weights.exe" "$pkg/model-tools/"
-    cp -- linux/data/int4/rdna4/dlssnr-int4.sha256 "$pkg/model-tools/dlssnr-int4.sha256"
+    cp -- linux/data/CC_SILVER_AARDWOLD_OPTIMIZED-balanced/rdna4/CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin.sha256 "$pkg/model-tools/CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin.sha256"
+    cp -- linux/data/CC_SMALL_FP8_OPTIMIZED-ultra/rdna4/CC_SMALL_FP8_OPTIMIZED_INT4.bin.sha256 "$pkg/model-tools/CC_SMALL_FP8_OPTIMIZED_INT4.bin.sha256"
+    cp -- linux/data/CC_SMALL_FP8_OPTIMIZED-ultra/rdna4/CC_SMALL_FP8_OPTIMIZED_INT4_SINK.bin.sha256 "$pkg/model-tools/CC_SMALL_FP8_OPTIMIZED_INT4_SINK.bin.sha256"
 fi
 # model-tools/: the extractor install.ps1 runs when the package has no model.
 bash windows/package/model-tools/build_extract_model.sh "$out/extract" > /dev/null
@@ -224,6 +245,8 @@ cp -- "$out/extract/dlssnr_extract_model.exe" "$pkg/model-tools/"
 # dxvk/: D3D9 (and the DXGI it was installed with) for the DX9 route, as GE-Proton ships them.
 mkdir -p -- "$pkg/dxvk"
 for f in dxgi.dll d3d9.dll; do cp -- "$dxvk/x86_64-windows/$f" "$pkg/dxvk/"; done
+mkdir -p -- "$pkg/dxvk/x86"
+for f in dxgi.dll d3d9.dll; do cp -- "$dxvk/i386-windows/$f" "$pkg/dxvk/x86/"; done
 cat "$dxvk/version" > "$pkg/dxvk/version.txt"
 cp -- artifacts/ref/dxvk/LICENSE "$pkg/dxvk/LICENSE.txt"
 
@@ -233,12 +256,17 @@ mkdir -p -- "$pkg/vulkan"
 cp -- artifacts/windows/vulkan-loader/x86_64/vulkan-1.dll "$pkg/vulkan/"
 cp -- artifacts/windows/vulkan-loader/x86_64/LICENSE.txt "$pkg/vulkan/Vulkan-Loader-LICENSE.txt"
 cp -- artifacts/windows/vulkan-loader/x86_64/PATCHES.diff "$pkg/vulkan/Vulkan-Loader-PATCHES.diff"
+mkdir -p -- "$pkg/vulkan/x86"
+cp -- artifacts/windows/vulkan-loader/i686/vulkan-1.dll "$pkg/vulkan/x86/"
+cp -- artifacts/windows/vulkan-loader/i686/LICENSE.txt "$pkg/vulkan/x86/Vulkan-Loader-LICENSE.txt"
+cp -- artifacts/windows/vulkan-loader/i686/PATCHES.diff "$pkg/vulkan/x86/Vulkan-Loader-PATCHES.diff"
 
 # reshade/: ReShade 6.8 (add-on build): installed as dxgi.dll in DX10/11/12 games, and as a Vulkan layer
 # (vk-override/, found through that loader) for DX9 and Vulkan games.
 rs="$pkg/reshade"
 mkdir -p -- "$rs/reshade-shaders/Shaders" "$rs/reshade-shaders/Textures" "$rs/vk-override/implicit_layer"
 cp -- "$out/dlssnr_amd.addon64" artifacts/ref/reshade-6.8.0/ReShade64.dll "$rs/"
+cp -- "$out/x86/dlssnr_amd.addon32" artifacts/ref/reshade-6.8.0/ReShade32.dll "$rs/"
 cp -- artifacts/ref/reshade-6.8.0/ReShade-LICENSE.md "$rs/ReShade-LICENSE.md"
 cat > "$rs/vk-override/implicit_layer/ReShade64.json" <<'JSON'
 {
@@ -259,6 +287,7 @@ cat > "$rs/vk-override/implicit_layer/ReShade64.json" <<'JSON'
   }
 }
 JSON
+sed 's/ReShade64.dll/ReShade32.dll/' "$rs/vk-override/implicit_layer/ReShade64.json" > "$rs/vk-override/implicit_layer/ReShade32.json"
 cp -- artifacts/ref/DLSS5-Feeder/shaders/DLSS5_Feed.fx "$rs/reshade-shaders/Shaders/"
 cp -- artifacts/ref/DLSS5-Feeder/LICENSE "$rs/reshade-shaders/Shaders/DLSS5_Feed-LICENSE.txt"
 cp -- artifacts/ref/reshade-shaders/Shaders/ReShade.fxh artifacts/ref/reshade-shaders/Shaders/ReShadeUI.fxh \
@@ -309,17 +338,16 @@ cp -- "${NR_IMGUI_ROOT:-toolchain/imgui-nr}/LICENSE.txt" "$op/asi/DearImGui-LICE
 cmp -s <(cd artifacts/windows/asi/shaders/wilsjo2 && sha256sum -- *.spv) <(cd "$pkg/dlssnr-amd/shaders/wilsjo2" && sha256sum -- *.spv) ||
     { echo "the plugin's wilsjo2 shaders are not dlssnr-amd/shaders/wilsjo2's" >&2; exit 1; }
 
-# experimental/: what install.ps1 makes CC_SMALL_FP8_EXPERIMENTAL's weights with - the difference of its fitted weights
-# from the small model's (linux/data/experimental: each changed entry XOR the small model's, so it holds none of NVIDIA's
-# weights) and the SHA-256 of the result.
-mkdir -p -- "$pkg/experimental"
-cp -- linux/data/experimental/dlssnr-small-experimental.delta "$pkg/experimental/"
-cp -- linux/data/experimental/dlssnr-small-experimental.sha256 "$pkg/experimental/CC_SMALL_FP8_EXPERIMENTAL.bin.sha256"
-# optimized/: the same for CC_SILVER_AARDWOLD_OPTIMIZED, from CC_SILVER_AARDWOLD's weights (linux/data/optimized); the int4
-# layers' weights are made from the result (model-tools/dlssnr-int4-weights.exe).
-mkdir -p -- "$pkg/optimized"
-cp -- linux/data/optimized/dlssnr-optimized.delta "$pkg/optimized/"
-cp -- linux/data/optimized/dlssnr-optimized.sha256 "$pkg/optimized/CC_SILVER_AARDWOLD_OPTIMIZED.bin.sha256"
+# CC_SMALL_FP8_OPTIMIZED/: what install.ps1 makes CC_SMALL_FP8_OPTIMIZED's weights with - the difference of its fitted
+# weights from CC_SMALL_FP8's (linux/data/CC_SMALL_FP8_OPTIMIZED: each changed entry XOR CC_SMALL_FP8's, so it holds none
+# of NVIDIA's weights; Performance's own entries added as "performance/<name>") and the SHA-256 of the result.
+# CC_SILVER_AARDWOLD_OPTIMIZED/: the same for CC_SILVER_AARDWOLD_OPTIMIZED, from CC_SILVER_AARDWOLD's weights
+# (linux/data/CC_SILVER_AARDWOLD_OPTIMIZED); the int4 layers' weights are made from the result
+# (model-tools/dlssnr-int4-weights.exe).
+for n in CC_SMALL_FP8_OPTIMIZED CC_SILVER_AARDWOLD_OPTIMIZED; do
+    mkdir -p -- "$pkg/$n"
+    cp -- "linux/data/$n/$n.delta" "linux/data/$n/$n.bin.sha256" "$pkg/$n/"
+done
 
 # dlssnr-amd.ini, put in place at install: the text the programs write themselves (windows/package/make_ini.py),
 # with the line ends a Windows program writes.
@@ -338,16 +366,35 @@ for f in install.ps1 README.txt; do
 done
 sed -i 's/$/\r/' "$pkg/install.bat"
 
+# Two packages, as Linux has them: x86_64 (64-bit games, every route) and i686 (32-bit games: the ReShade routes). The
+# i686 one is the same folder without OptiScaler (64-bit only) and with the 32-bit loader, DXVK, ReShade and add-on in
+# the places the 64-bit ones take; each install.ps1 knows its games ($PackageBits) and names the other package for an
+# exe of the other kind.
+pkg32="$out/package-i686"
+rm -rf -- "$pkg32"; cp -a --reflink=auto -- "$pkg" "$pkg32"
+rm -rf -- "$pkg32/optiscaler"
+for f in dxgi.dll d3d9.dll; do mv -f -- "$pkg32/dxvk/x86/$f" "$pkg32/dxvk/$f"; done
+for f in vulkan-1.dll Vulkan-Loader-LICENSE.txt Vulkan-Loader-PATCHES.diff; do mv -f -- "$pkg32/vulkan/x86/$f" "$pkg32/vulkan/$f"; done
+rmdir -- "$pkg32/dxvk/x86" "$pkg32/vulkan/x86"
+rm -f -- "$pkg32/reshade/ReShade64.dll" "$pkg32/reshade/dlssnr_amd.addon64" "$pkg32/reshade/vk-override/implicit_layer/ReShade64.json"
+sed -i 's/^\$PackageBits = 64$/$PackageBits = 32/' "$pkg32/install.ps1"
+grep -q '^\$PackageBits = 32' "$pkg32/install.ps1" || { echo "$pkg32/install.ps1: \$PackageBits not set to 32" >&2; exit 1; }
+rm -rf -- "$pkg/dxvk/x86" "$pkg/vulkan/x86"
+rm -f -- "$pkg/reshade/ReShade32.dll" "$pkg/reshade/dlssnr_amd.addon32" "$pkg/reshade/vk-override/implicit_layer/ReShade32.json"
+grep -q '^\$PackageBits = 64' "$pkg/install.ps1" || { echo "$pkg/install.ps1: \$PackageBits is not 64" >&2; exit 1; }
+
 # NR_SIGN=1: every Windows binary without a signature of its own signed with a self-signed certificate made for this
 # build (windows/build/sign_pe.py; some games load only signed DLLs and do not ask by whom)
-[[ "${NR_SIGN:-0}" == 1 ]] && python3 windows/build/sign_pe.py "$pkg"
+[[ "${NR_SIGN:-0}" == 1 ]] && python3 windows/build/sign_pe.py "$pkg" && python3 windows/build/sign_pe.py "$pkg32"
 
 # ---- archive ------------------------------------------------------------------------------------
 # A Windows-only release's version already says preview (v0.0.4-win-preview).
 preview=-preview; [[ "$stamp" == *preview* ]] && preview=
-name="DLSSNR-AMD-Vulkan-Windows-$stamp$preview-x86_64"
+for a in x86_64 i686; do
+name="DLSSNR-AMD-Vulkan-Windows-$stamp$preview-$a"
+dir=$pkg; [[ $a == i686 ]] && dir=$pkg32
 rm -f -- "$out/$name.zip"
-python3 - "$pkg" "$out/$name.zip" <<'PY'
+python3 - "$dir" "$out/$name.zip" <<'PY'
 import os, sys, zipfile
 root, dst = sys.argv[1], sys.argv[2]
 with zipfile.ZipFile(dst, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
@@ -357,5 +404,6 @@ with zipfile.ZipFile(dst, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
             z.write(full, os.path.relpath(full, root))
 PY
 mv -f -- "$out/$name.zip" "windows/package/$name.zip"
-du -sh -- "$pkg"
+du -sh -- "$dir"
 sha256sum -- "windows/package/$name.zip"
+done

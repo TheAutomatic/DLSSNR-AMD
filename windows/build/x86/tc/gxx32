@@ -1,0 +1,2 @@
+#!/bin/bash
+exec /usr/bin/i686-w64-mingw32-g++-posix -D_WIN32_WINNT=0x0A00 -DNTDDI_VERSION=0x0A000000 "$@"

@@ -203,7 +203,7 @@ def main():
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--extract", action="store_true")
     parser.add_argument("--resource", default="WEIGHTS_HT",
-                        help="weight resource: WEIGHTS_HT (310.8.0, and 310.9's preset 1) or WEIGHTS_CC_SMALL_FP8 (310.9's small model)")
+                        help="weight resource: WEIGHTS_HT (310.8.0, and 310.9's preset 1) or WEIGHTS_CC_SMALL_FP8 (310.9's CC_SMALL_FP8)")
     args = parser.parse_args()
     data = load_input(args.input)
     pe = PE(data)

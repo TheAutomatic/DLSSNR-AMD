@@ -51,6 +51,20 @@ class Session {
     // The NR-chain layer this call runs (0 outside a chain): its cost (gpu_ms, network_ms) is averaged apart from other
     // layers'.
     void set_call_layer(int layer);
+    // The Present's state for NRFrameReuse's even frames (every frame shown one frame later), set by the host's Present
+    // hooks: frame generation with the game now - 0 none, 1 the game's XeSS frame generation with its inputs given one
+    // frame later too (nr_asi_hudcap.hpp xefg_delay), 2 another (its inputs would be one frame newer than the frame: no
+    // even frames); HUD FIX on (its HUD of the newest frame over a frame one older: no even frames).
+    static void note_frame_generation(int kind, const char* reason);
+    static void note_hud_fix(bool on);
+    // The latest Present's NRFrameReuse ran even (its frame is shown one frame later): frame generation's inputs follow.
+    static bool frames_delayed();
+    static int frames_delay();   // how many frames late a Present's pictures come (0: not delayed; 1; 2 two-sided)
+    // A Present's pictures this many frames late now (0: on time) - a host's own frame reuse (the .asi's wilsjo2 flow) or
+    // its flow without it at the Present (on time).
+    static void note_frames_delayed(int frames, int next=0);
+    static void publish_delay(unsigned shown,unsigned next);
+    static int next_frames_delay();
     // A layer whose processing, placement or network changed (or that was taken out): its cost averages start anew, and
     // a timestamp still in flight from before is not counted (a measurement generation per layer).
     void reset_layer_timing(int layer);
@@ -91,6 +105,13 @@ class Session {
         bool estimate_motion{};
         // the motion vectors come from a provider that runs (a bound texture whose provider is off is not one)
         bool fast_motion = true;
+        // the .asi's layer: frame reuse may run around the flow (Settings::frame_reuse; the ReShade route never), at the
+        // .asi placement (frame reuse requires Present); DLSS's
+        // pre-exposure as given
+        bool asi{};
+        bool at_present = true, before_upscale = false;
+        uint64_t present_id = 0;
+        float pre_exposure = 1.0f;
     };
 
     struct EngineResources {
@@ -139,6 +160,8 @@ class Session {
     // grade itself); and whether the network grades now ([Network] Style Grade).
     void set_raw_call(bool raw);
     bool style_grade_active() const;
+    // and in closed form ([Network] Style Grade and Style Grade Acceleration both on)
+    bool style_grade_accelerated() const;
 
     // The post-upscale placement: the upscaler has already written its output at
     // display resolution and the network runs over that, in place. This is where
@@ -445,11 +468,20 @@ class Session {
         uint64_t resizes = 0, carried = 0;
         bool renodx_known = false;
         renodx::Stage::Facts renodx{};
+        // frame reuse on the last RenoDX run: 0 off, 1 runs (reuse_share of frames with NR lately, < 0 not yet), 2 cannot
+        // run (reuse_note)
+        uint32_t reuse = 0;
+        float reuse_share = -1.f;
+        std::string reuse_note;
         // the last wilsjo2 run of this session (the ReShade route's layers): Passes (fast) and the motion vectors
         float wilsjo2_fast_passes = 0.f;
         bool wilsjo2_fast_fallback = false, wilsjo2_motion = false;
         uint8_t wilsjo2_il_missing = 0;   // Interleaved asked for and not run (nr::wilsjo2::FlowFacts::il_missing)
         bool wilsjo2_fast_fallback_spatial = false;   // Feedback / Hybrid not run for peripheral compression
+        // ... and what its flow did (the .asi's Present layers with FrameReuse run their flow here: their engine-data panel)
+        bool wilsjo2_known = false, wilsjo2_hdr = false, wilsjo2_prep_outside = false, wilsjo2_prep_missing = false;
+        uint32_t wilsjo2_exposure = 0, wilsjo2_asked = 0, wilsjo2_mode = 0, wilsjo2_passes = 0;
+        float wilsjo2_white = 1.f, wilsjo2_history = 1.f;
         bool motion_without_depth = true;
         float prep_ev = NAN;   // the running network's Preprocess auto exposure (smoothed EV), NaN not metered
         // The last evaluation passed its frame through (not building: waiting for video memory, a size that moves...)

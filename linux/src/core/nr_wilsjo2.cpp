@@ -140,7 +140,7 @@ bool parse_key(Settings& s, const std::string& raw_key, const std::string& value
                                             "spatialworky", "spatialoffsetx", "spatialoffsety", "spatialshiftx",
                                             "spatialshifty",
                                             "preset", "style", "intensity", "localstructure", "localtone",
-                                            "skinstructure", "automask", "history", "noiseeveryframe", "transferstrength", "colourstrength", "maxratio",
+                                            "skinstructure", "automask", "noiseeveryframe", "prehistory", "posthistory", "transferstrength", "colourstrength", "maxratio",
                                             "reversiblemode", "replacedetailstrength", "transfer", "whitepointscale",
                                             "whitepointsource", "whitepointtrim", "exposuretrimanchors", "autoexposuretrim",
                                             "autoexposurehighlightprotection", "autoexposuretrimanchors", "skinprotection",
@@ -149,14 +149,15 @@ bool parse_key(Settings& s, const std::string& raw_key, const std::string& value
                                             "fastinterleavedpasses",
                                             "fastextrapolationpasses", "fastextrapolationhalolimit", "fastextrapolationfine",
                                             "fastfeedbackpasses", "fastfeedbackhalolimit", "fastfeedbackfine",
-                                            "fasthybridpasses", "fasthybridhalolimit", "fasthybridfine"};
+                                            "fasthybridpasses", "fasthybridhalolimit", "fasthybridfine", "framereuse"};
         for (const char* k : known)
             if (key == k) return true;
         return false;
     }
     if (key == "runbeforesr") return parse_bool(value, &s.run_before_sr);
+    if (key == "framereuse") return parse_bool(value, &s.frame_reuse);
     if (key == "passes") return parse_uint(value, &s.passes);
-    if (key == "history") {
+    if (key == "posthistory") {
         if (!parse_float(value, &s.history_strength)) return false;
         s.history_strength = std::clamp(s.history_strength, 0.f, 1.f);
         return true;
@@ -187,6 +188,7 @@ bool parse_key(Settings& s, const std::string& raw_key, const std::string& value
     if (key == "skinstructure") return parse_float(value, &s.skin_structure);
     if (key == "automask") return parse_bool(value, &s.auto_mask);
     if (key == "noiseeveryframe") return parse_bool(value, &s.noise_every_frame);
+    if (key == "prehistory") return parse_bool(value, &s.pre_history);
     if (key == "transferstrength") return parse_float(value, &s.transfer_strength);
     if (key == "colourstrength") return parse_float(value, &s.colour_strength);
     if (key == "maxratio") return parse_float(value, &s.max_ratio);
@@ -233,6 +235,7 @@ bool parse_key(Settings& s, const std::string& raw_key, const std::string& value
         s.fast_interleaved_passes = std::clamp(n, 2u, 8u);
         return true;
     }
+    if (key == "fastinterleaveddepthdisocclusion") return parse_bool(value, &s.fast_interleaved_depth_disocclusion);
     if (key == "fastinterleavedpreset") {   // 1 | 2
         uint32_t n = fast::kDefaultInterleavedPreset;
         if (!parse_uint(value, &n)) return false;
@@ -338,6 +341,40 @@ uint32_t passes_requested(const Settings& s) {
     // Passes (fast): one network pass; Interleaved: one a frame, each of its legacy passes with its own model and history
     if (s.passes_mode == 1) return s.fast_method == 0 ? std::clamp(s.fast_interleaved_passes, 2u, 8u) : 1;
     return std::clamp(s.passes, 1u, s.unlock_passes ? kMaxPasses : 3u);
+}
+
+// Frame reuse restarts (afresh) when what the layer's network makes changes: its passes, their controls, the composition
+// around them (as the session's reuse_settings_equal for a RenoDX layer)
+bool reuse_equal(const Settings& a, const Settings& b) {
+    // (every setting the flow reads for an SDR frame - the HDR-only ones too: a change of any restarts it)
+    const auto same2 = [](const float* x, const float* y) { return x[0] == y[0] && x[1] == y[1]; };
+    if (a.passes != b.passes || a.unlock_passes != b.unlock_passes || a.passes_mode != b.passes_mode ||
+        a.history_strength != b.history_strength || a.colour_limit != b.colour_limit || a.transfer != b.transfer ||
+        a.transfer_strength != b.transfer_strength || a.colour_strength != b.colour_strength || a.max_ratio != b.max_ratio ||
+        a.reversible_mode != b.reversible_mode || a.working_scale != b.working_scale || a.spatial != b.spatial ||
+        a.noise_every_frame != b.noise_every_frame || a.pre_history != b.pre_history ||
+        a.debug_view != b.debug_view || a.show_skin_mask != b.show_skin_mask ||
+        a.replace_detail_strength != b.replace_detail_strength || a.classic_scaler != b.classic_scaler ||
+        a.downscale != b.downscale || a.scaling_downscaler != b.scaling_downscaler ||
+        !same2(a.spatial_centre, b.spatial_centre) || !same2(a.spatial_work, b.spatial_work) ||
+        !same2(a.spatial_offset, b.spatial_offset) || !same2(a.spatial_shift, b.spatial_shift) ||
+        a.white_point_scale != b.white_point_scale || a.white_point_source != b.white_point_source ||
+        a.white_point_trim != b.white_point_trim || a.exposure_trim_anchors != b.exposure_trim_anchors ||
+        a.auto_exposure_trim != b.auto_exposure_trim ||
+        a.auto_exposure_highlight_protection != b.auto_exposure_highlight_protection ||
+        a.auto_exposure_trim_anchors != b.auto_exposure_trim_anchors || a.skin_protection != b.skin_protection ||
+        a.skin_detail != b.skin_detail || a.skin_colour != b.skin_colour || a.environment_detail != b.environment_detail ||
+        a.environment_colour != b.environment_colour)
+        return false;
+    const uint32_t n = passes_requested(a);
+    for (uint32_t k = 0; k < n; ++k) {
+        const PassControls x = pass_controls(a, k), y = pass_controls(b, k);
+        if (x.preset != y.preset || x.style != y.style || x.intensity != y.intensity ||
+            x.local_structure != y.local_structure || x.local_tone != y.local_tone || x.skin_structure != y.skin_structure ||
+            x.auto_mask != y.auto_mask)
+            return false;
+    }
+    return true;
 }
 
 // Spec 8.4.
@@ -497,11 +534,14 @@ struct Stage::Impl {
     std::array<FastProgram, nr::fast::kProgramCount> fast{};
     bool fast_loaded = false;
     // Passes (fast) Interleaved's: [0] il (preset 2; a pipeline per step, specialization constant 0), and preset 1's
-    // (0.0.8.4's method): [1] il_pp, [2] il0 with its own pipelines per step
-    std::array<FastProgram, 3> il{};
+    // (0.0.8.4's method): [1] il_pp, [2] il0 with its own pipelines per step; [3] / [4] il / il0 with the Style grade in
+    // closed form ([Network] Style Grade Acceleration), made when a frame first grades with it (il_dir: their folder)
+    std::array<FastProgram, 5> il{};
     std::array<VkPipeline, 8> il0_steps{};
     std::array<VkPipeline, 8> il_steps{};
-    bool il_loaded = false;
+    std::array<VkPipeline, 8> il_ga_steps{}, il0_ga_steps{};
+    bool il_loaded = false, il_ga_failed = false;
+    std::string il_dir;
     // The views and sets of one recording, freed once 64 later recordings have passed AND 2 s (the game's image
     // handles can name another image once the game frees one, so nothing is kept across recordings). The recordings of
     // one frame are in command lists the game submits later: a fixed ring wrapped inside one frame with many passes and
@@ -639,6 +679,8 @@ struct Stage::Impl {
     void il_clear() {
         for (VkPipeline& q : il_steps) { if (q) vkDestroyPipeline(device, q, nullptr); q = VK_NULL_HANDLE; }
         for (VkPipeline& q : il0_steps) { if (q) vkDestroyPipeline(device, q, nullptr); q = VK_NULL_HANDLE; }
+        for (VkPipeline& q : il_ga_steps) { if (q) vkDestroyPipeline(device, q, nullptr); q = VK_NULL_HANDLE; }
+        for (VkPipeline& q : il0_ga_steps) { if (q) vkDestroyPipeline(device, q, nullptr); q = VK_NULL_HANDLE; }
         for (FastProgram& p : il) {
             if (p.pipeline) vkDestroyPipeline(device, p.pipeline, nullptr);
             if (p.module) vkDestroyShaderModule(device, p.module, nullptr);
@@ -825,6 +867,7 @@ Stage::Stage(const HostDevice& host, const std::string& shaders) : impl_(std::ma
         m.load_program(m.il[0], shaders + "/wilsjo2_il.spv", 96, 0x7Bu, m.il_steps.data());
         m.load_program(m.il[1], shaders + "/wilsjo2_il_pp.spv", 28);
         m.load_program(m.il[2], shaders + "/wilsjo2_il0.spv", 96, 0x3Bu, m.il0_steps.data());
+        m.il_dir = shaders;
         m.il_loaded = m.fast_loaded;
         if (!m.il_loaded) m.il_clear();
     } catch (const std::exception&) {
@@ -962,11 +1005,21 @@ void Stage::record_fast(VkCommandBuffer cmd, uint32_t program, const FastImage* 
 }
 
 bool Stage::has_il() const { return impl_->il_loaded; }
+bool Stage::has_il_ga() const { return impl_->il_loaded && !impl_->il_ga_failed; }
 
 void Stage::record_il(VkCommandBuffer cmd, uint32_t program, uint32_t step, const FastImage* images, uint32_t count,
                       const void* push, uint32_t bytes, uint32_t gx, uint32_t gy) {
     Impl& m = *impl_;
-    if (!m.il_loaded || program > 2u) throw std::runtime_error("wilsjo2 stage: no Interleaved program");
+    if (!m.il_loaded || program > 4u) throw std::runtime_error("wilsjo2 stage: no Interleaved program");
+    if (program >= 3u && !m.il[program].pipeline) {   // (Style Grade Acceleration's, made at its first use)
+        try {
+            if (program == 3u) m.load_program(m.il[3], m.il_dir + "/wilsjo2_il_ga.spv", 96, 0x7Bu, m.il_ga_steps.data());
+            else m.load_program(m.il[4], m.il_dir + "/wilsjo2_il0_ga.spv", 96, 0x3Bu, m.il0_ga_steps.data());
+        } catch (const std::exception&) {
+            m.il_ga_failed = true;
+            throw;
+        }
+    }
     const Impl::FastProgram& pr = m.il[program];
     Impl::Slot& s = m.slot();
     if (!s.il_pool) {   // a recording's Interleaved work: up to 8 sets (il binds 21 sampled and 18 storage images)
@@ -997,7 +1050,9 @@ void Stage::record_il(VkCommandBuffer cmd, uint32_t program, uint32_t step, cons
     }
     vkUpdateDescriptorSets(m.device, uint32_t(w.size()), w.data(), 0, nullptr);
     const VkPipeline pipe = program == 0u && step < 8u && m.il_steps[step] ? m.il_steps[step]
-                          : program == 2u && step < 8u && m.il0_steps[step] ? m.il0_steps[step] : pr.pipeline;
+                          : program == 2u && step < 8u && m.il0_steps[step] ? m.il0_steps[step]
+                          : program == 3u && step < 8u && m.il_ga_steps[step] ? m.il_ga_steps[step]
+                          : program == 4u && step < 8u && m.il0_ga_steps[step] ? m.il0_ga_steps[step] : pr.pipeline;
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pr.layout, 0, 1, &set, 0, nullptr);
     vkCmdPushConstants(cmd, pr.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, std::min(bytes, pr.push_bytes), push);

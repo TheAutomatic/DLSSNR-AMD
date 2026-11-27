@@ -1,0 +1,23 @@
+#version 460
+// Frame reuse: network or rebuilt, decided on the GPU for THIS frame. One workgroup sums speed.comp's partial sums (the
+// mean of min(|vector|, 1) over the motion grid, a fraction of the screen a frame); the frame runs the network when it
+// or the frame before moved faster than `fast`. Writes the decision word the conditional blocks read, this frame's
+// speed for the next frame, and counters (and this speed) the host reads for its log.
+layout(local_size_x=256) in;
+layout(binding=0) readonly buffer Sums {float sums[];};
+layout(binding=1) buffer Decision {uint words[];};   // [0], [1]: the decision of even / odd frames; [2]: last speed (float bits)
+layout(binding=2) buffer Stats {uint frames, computed, planned; float last_speed;};
+layout(push_constant) uniform Push {uint offset, groups, slot, planned_rebuilt; float cells, fast;} pc;
+shared float part[256];
+void main() {
+    uint lane=gl_LocalInvocationIndex;float v=0;
+    for(uint i=lane;i<pc.groups;i+=256u)v+=sums[pc.offset+i];
+    part[lane]=v;barrier();
+    for(uint s=128u;s>0u;s>>=1u){if(lane<s)part[lane]+=part[lane+s];barrier();}
+    if(lane==0u) {
+        float speed=part[0]/pc.cells,before=uintBitsToFloat(words[2]);
+        uint run=pc.planned_rebuilt==0u||max(speed,before)>pc.fast?1u:0u;
+        words[pc.slot]=run;words[2]=floatBitsToUint(speed);
+        frames+=1u;computed+=run;planned+=pc.planned_rebuilt;last_speed=speed;
+    }
+}

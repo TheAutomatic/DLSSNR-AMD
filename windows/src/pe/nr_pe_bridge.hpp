@@ -55,6 +55,9 @@ struct Image {
 // otherwise. DXGI_FORMAT_UNKNOWN for what the bridge does not carry.
 DXGI_FORMAT shared_format(DXGI_FORMAT format);
 
+// Wait budget for a keyed-mutex handover on either API (matches the 2 s D3D11 fence waits and Windows TDR).
+inline constexpr uint32_t kKeyedTimeoutMs = 2000;
+
 // A recording of the network for one frame. Made with Device::begin, finished with Device::end, then
 // either submitted (run_between / submit) or discarded.
 struct Job;
@@ -77,6 +80,7 @@ class Device {
     DeviceHandles handles() const { return handles_; }
     VkQueue queue() const { return queue_; }
     uint32_t family() const { return family_; }
+    bool pipeline_robustness_enabled() const { return pipeline_robustness_; }
     // Taken around every submit on our queue (the network's weight upload included).
     void lock() { queue_mutex_.lock(); }
     void unlock() { queue_mutex_.unlock(); }
@@ -85,6 +89,7 @@ class Device {
                       std::string* why);
     bool create_d3d11(ID3D11Device* device, uint32_t width, uint32_t height, DXGI_FORMAT format, Image* out,
                       std::string* why);
+    bool d3d11_keyed_handover() const;
     // D3D10 has no fences: its shared textures carry a keyed mutex (legacy shared handle), and the
     // hand-over is the mutex - the D3D10 side releases key 1, our submit acquires 1 and releases 2,
     // the D3D10 side acquires 2. Needs VK_KHR_win32_keyed_mutex.
@@ -93,7 +98,7 @@ class Device {
                       std::string* why);
     // Submits `job` acquiring every image in `images` at `acquire_key` and releasing it at `release_key`.
     bool submit_keyed(Job* job, uint64_t generation, const std::vector<const Image*>& images, uint64_t acquire_key,
-                      uint64_t release_key);
+                      uint64_t release_key, VkResult* submitted = nullptr);
     // Frees both sides. The caller has made sure neither API is still using it.
     void destroy(Image& image);
     // Frees the Vulkan side now (no job of ours can use it) and releases the D3D side once the hand-over
@@ -204,6 +209,7 @@ class Device {
     PFN_vkGetMemoryWin32HandlePropertiesKHR get_handle_properties_{};
     PFN_vkImportSemaphoreWin32HandleKHR import_semaphore_{};
     bool keyed_mutex_{};
+    bool pipeline_robustness_{};
 
     std::mutex jobs_mutex_;
     // The command pool is externally synchronised: held from begin() to end()/abort(), across the

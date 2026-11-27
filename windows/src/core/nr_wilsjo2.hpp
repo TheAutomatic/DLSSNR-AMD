@@ -99,11 +99,15 @@ struct Settings {
     // Passes (fast) (ours, as a RenoDX layer's NRPassesMode / NRFastPasses / NRFastMethod / NRFastHaloLimit): one network
     // pass strengthened after it (nr_fast_passes.hpp), instead of Passes network passes
     uint32_t passes_mode = 0;                // PassesMode: 0 legacy, 1 fast
+    // FrameReuse (ours, as a RenoDX layer's NRFrameReuse; the .asi's Present layers): NR on every other frame, the frames
+    // between rebuilt from it along the game's motion vectors (nr_frame_reuse.hpp, around the whole flow)
+    bool frame_reuse = false;
     // FastMethod as a RenoDX layer's NRFastMethod: 0 Interleaved, 1 Extrapolation, 2 Feedback, 3 Hybrid (the route's default),
     // 4 Edit strength
     uint32_t fast_method = fast::kDefaultMethod;
     uint32_t fast_interleaved_passes = 3;    // FastInterleavedPasses 2..8 (Interleaved: the legacy passes it takes turns of)
     uint32_t fast_interleaved_preset = fast::kDefaultInterleavedPreset;   // FastInterleavedPreset: 1 = the method of 0.0.8.4, 2 = a later method
+    bool fast_interleaved_depth_disocclusion = true;   // FastInterleavedDepthDisocclusion: as a RenoDX layer's NRFastInterleavedDepthDisocclusion
     // Each method's own, [0] Extrapolation, [1] Feedback, [2] Hybrid (Fast<Method>Passes / HaloLimit / Fine)
     float fast_passes[3] = {3.0f, 3.0f, 3.0f};       // 1..8, referred to legacy pass counts
     bool fast_halo_limit[3] = {false, false, false};
@@ -117,8 +121,9 @@ struct Settings {
     float local_tone = 1.0f;                 // LocalTone
     float skin_structure = -1.0f;            // SkinStructure
     bool auto_mask = true;                   // AutoMask
-    float history_strength = 1.0f;           // History (ours): post-block previous-frame blend
-    bool noise_every_frame = true;           // NoiseEveryFrame (ours): frames without motion vectors, a new seed each
+    float history_strength = 1.0f;           // PostHistory (ours) 0..1: the post block's history blend (0 off)
+    bool noise_every_frame = true;           // NoiseEveryFrame (ours): a new seed every frame; off: the same seed always
+    bool pre_history = true;                 // PreHistory (ours): the network's pre block reads its history
     // Not keys of the layer: NR Control's [Inspect] for the layer it chose (DebugView, SkinMask) - the fork's debug
     // views of its resolve: 1 the network's input, 2 its answer, 3 its change x20 around grey; the skin weight.
     uint32_t debug_view = 0;
@@ -185,6 +190,8 @@ PassControls pass0_controls(const Settings& s);
 PassControls pass_controls(const Settings& s, uint32_t k);
 // Passes requested: Passes clamped to [1, 3], [1, 30] with UnlockPasses.
 uint32_t passes_requested(const Settings& s);
+// FrameReuse (frame_reuse): its stage starts afresh when this says the settings differ (what the network makes changes)
+bool reuse_equal(const Settings& a, const Settings& b);
 // WorkingScale sanitised (non-finite 1, clamped to [0.25, 2]) and the work extent.
 float working_scale(const Settings& s);
 void work_extent(float scale, uint32_t width, uint32_t height, uint32_t* work_width, uint32_t* work_height);
@@ -501,6 +508,8 @@ public:
         virtual void record_fast(uint32_t program, const FastImage* images, uint32_t count, const void* push,
                                  uint32_t bytes, uint32_t gx, uint32_t gy) {}
         virtual bool has_il() const { return false; }
+        // Interleaved's programs 3 / 4: 0 / 2 with the Style grade in closed form (Style Grade Acceleration)
+        virtual bool has_il_ga() const { return false; }
         virtual void record_il(uint32_t program, uint32_t step, const FastImage* images, uint32_t count, const void* push,
                                uint32_t bytes, uint32_t gx, uint32_t gy) {}
         virtual void end_recording() {}
@@ -530,6 +539,9 @@ public:
     // il (`step`: its pipeline specialised for that step, as the RenoDX-style stage's; no other program). Records one
     // dispatch with a barrier after it; throws as record() does.
     bool has_il() const;
+    // Whether programs 3 / 4 (il / il0 with the Style grade in closed form, [Network] Style Grade Acceleration) may be
+    // asked for: false once making them failed (then the flow keeps 0 / 2).
+    bool has_il_ga() const;
     void record_il(VkCommandBuffer, uint32_t program, uint32_t step, const FastImage* images, uint32_t count,
                    const void* push, uint32_t bytes, uint32_t gx, uint32_t gy);
 

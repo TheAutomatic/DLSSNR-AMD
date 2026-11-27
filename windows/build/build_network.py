@@ -7,6 +7,7 @@ Writes (default build/windows/<arch>/network):
     g_<name>.spv + the four marker files   the network, what --spv-dir points at
     runtime/                                 the passes around it (windows/shaders/passes)
     g_<name>_grade.spv                      style_grade: the post block with the Natural/Cinematic grade
+    g_<name>_grade_accel.spv                the same grade in closed form ([Network] Style Grade Acceleration)
     temporal/                                the temporal variants (+ their _grade twins) and the motion estimator
 
 LLPC leaves the large per-fragment loops of fswin_t.comp rolled and spills the arrays they
@@ -103,15 +104,17 @@ def main():
         glslang(a.arch, R / 'windows/shaders' / a.arch / base['source'], base['defines'] + v['add'],
                 out / 'temporal' / f'{name}.spv', unroll=base['source'] in UNROLLED, network=True)
     grade = table['style_grade']
-    for name in grade['pipelines']:
-        e = pipelines[name]
-        glslang(a.arch, R / 'windows/shaders' / a.arch / e['source'], e['defines'] + a.define + grade['add'],
-                out / f'g_{name}_grade.spv', unroll=e['source'] in UNROLLED, network=True)
-    for name in grade['variants']:
-        base = pipelines[table['variants'][name]['base']]
-        glslang(a.arch, R / 'windows/shaders' / a.arch / base['source'],
-                base['defines'] + table['variants'][name]['add'] + grade['add'], out / 'temporal' / f'{name}_grade.spv',
-                unroll=base['source'] in UNROLLED, network=True)
+    # _grade: the table form; _grade_accel: the same grade in closed form ([Network] Style Grade Acceleration)
+    for suffix, add in (('_grade', grade['add']), ('_grade_accel', grade['accel_add'])):
+        for name in grade['pipelines']:
+            e = pipelines[name]
+            glslang(a.arch, R / 'windows/shaders' / a.arch / e['source'], e['defines'] + a.define + add,
+                    out / f'g_{name}{suffix}.spv', unroll=e['source'] in UNROLLED, network=True)
+        for name in grade['variants']:
+            base = pipelines[table['variants'][name]['base']]
+            glslang(a.arch, R / 'windows/shaders' / a.arch / base['source'],
+                    base['defines'] + table['variants'][name]['add'] + add, out / 'temporal' / f'{name}{suffix}.spv',
+                    unroll=base['source'] in UNROLLED, network=True)
     for k in MOTION:
         glslang(a.arch, R / 'windows/shaders/passes' / f'{k}.comp', [], out / 'temporal' / f'{k}.spv')
     shutil.copy2(out / 'shader-constants.txt', out / 'temporal' / 'shader-constants.txt')

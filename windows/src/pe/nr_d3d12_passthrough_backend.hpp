@@ -11,6 +11,7 @@
 
 #include "nr_dlssnr_model.hpp"
 #include "nr_d3d12_net_plan.hpp"
+#include "nr_gpu_completion.hpp"
 
 #include <string>
 
@@ -37,6 +38,11 @@ struct PassthroughNetStatus {
     int renodx_feed = -1;
     int renodx_exposure_texture = -1;
     float renodx_divisor = 0.f;
+    // NRFrameReuse on this route (nr::control::LayerStatus::reuse: 0 off, 1 running, 2 cannot run), the share of frames
+    // NR ran on (< 0: not known yet) and NR Control's line when it cannot run
+    uint32_t reuse = 0;
+    float reuse_share = -1.f;
+    std::string reuse_note;
 };
 
 struct LinearFrame {
@@ -63,6 +69,7 @@ struct NetTemporal {
     // history as Interleaved made it), a linear buffer laid out as the feature's history images (rows of lin_pitch
     // texels, history_texel_bytes() a texel); 0 the feature's own. Read only where the history is (the gate open).
     uint64_t history_va = 0;
+    bool external_history = false;
 };
 
 // What the ACO network becomes on this side: records into the game's list. Both buffers arrive in UNORDERED_ACCESS
@@ -87,18 +94,25 @@ public:
     // [Network] History Precision (true: 16, the history images RGBA16F), live: a change starts the history afresh.
     virtual void history_f16(bool) {}
     virtual void style_grade(bool) {}   // [Network] Style Grade, live
+    virtual void style_grade_accel(bool) {}   // [Network] Style Grade Acceleration, live (the grade in closed form)
     // The frame's temporal inputs, before record.
     virtual void temporal(const NetTemporal&) {}
     // The bytes of one history texel of the network ready() settled on for the next record (8 RGBA16F, 16 RGBA32F;
     // 0 none): the layout NetTemporal::history_va must have.
     virtual uint32_t history_texel_bytes() const { return 0; }
     virtual bool record(ID3D12GraphicsCommandList* cmd, const LinearFrame& in, const LinearFrame& out, const char** why) = 0;
+    // Frame reuse's even frames: the next record goes on in `tail` (a list of the caller's, executed after `cmd`) from
+    // its dispatch `cut` (0 < cut < steps()); once. The network's dispatches per record of the network ready() settled on.
+    virtual void split(ID3D12GraphicsCommandList* /*tail*/, uint32_t /*cut*/) {}
+    virtual uint32_t steps() const { return 0; }
     // The caller destroyed this feature (model.cpp's release_feature): its history, latch and seed must go now.
     virtual void release_feature(uint64_t) {}
 };
 
-// An HLSL compute shader (cs_5_0) through d3dcompiler_47.dll; null and why when it does not compile.
-ID3DBlob* compile_cs(const char* source, size_t bytes, const char* entry, std::string* why);
+// Copies a depth-stencil or R32/R16 texture to an R32_FLOAT UAV texture without touching descriptor heaps.
+// Caller keeps `src` shader-readable and `dst` in UNORDERED_ACCESS; restores host compute state.
+bool copy_depth_r32(ID3D12Device* device, ID3D12GraphicsCommandList* cmd, ID3D12Resource* src,
+                    ID3D12Resource* dst, std::string* why);
 
 // The wilsjo2 layer on the native runtime, before anything of its frame is recorded: whether its network calls
 // will run on this backend - the passthrough enabled, its check passed, the backend made on `device`, the command list's state
@@ -112,6 +126,25 @@ bool wilsjo2_ready(ID3D12Device* device, ID3D12GraphicsCommandList* cmd, uint32_
 
 // The backend slot nr::dlssnr::evaluate_d3d12 calls (nr::dlssnr::set_d3d12_backend, from InitializeASI).
 bool evaluate_backend(const nr::dlssnr::D3d12BackendFrame& frame);
+// Frame reuse's even frames on this route: a frame's work after the network's split is a command list of the backend's
+// own that must run before anything NR records next - the next Present's list (the .asi's Present layers call this
+// first, on the swap chain's queue), or `queue` at once when NR is about to record elsewhere. Nothing waiting: nothing.
+void submit_pending(ID3D12CommandQueue* queue);
+// A resource used by NR's recordings on this route outside the backend's own frames (frame reuse around the wilsjo2
+// processing's D3D12 flow, nr_asi_wilsjo2.cpp): released once the frames recorded so far are done (the backend's watermark).
+void retire_resource(IUnknown* resource);
+// The same route's frame reuse around the wilsjo2 flow, even frames: the network's dispatches a call (the split's unit;
+// 0: none known - no split), and a frame's second part handed over (`list`: a reference, released once submitted at the
+// next Present by submit_pending; `ticket`: its recording, which the frame's retirements wait for).
+uint32_t network_steps();
+void push_pending(ID3D12GraphicsCommandList* list, const nr::gpu::Ticket& ticket);
+// ... a frame's recording on the game's list (its rebuilt frames too: no network call of the passthrough's marks it):
+// what the frame reuse stage retires waits for it
+void note_recording(ID3D12GraphicsCommandList* list);
+// The NR chain's layers that ran on this route (D3d12BackendFrame::layer, or noted by the .asi): another than `layer`
+// within the last 5 s (frame reuse's even frames need one NR layer running)
+void note_layer(int layer);
+bool other_layers(int layer);
 PassthroughNetStatus backend_net_status();
 // The process is ending (nr::dlssnr::abandon_at_exit, from DllMain): the network and the RenoDX stages are left as they
 // are, never destroyed - their destructors would run after amdxc64.dll / d3d12 were detached (loaded after us) and

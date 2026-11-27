@@ -1704,7 +1704,7 @@ template <class T> void let_go_idle(std::map<void*, Kept<T>>& m, std::chrono::st
 
 // The queue a D3D12 swap chain was made with, as the .asi saw it made (note_swapchain_queue), in a table of our own:
 // not in the swap chain's private data - set on OptiScaler's XeFG output's swap chain, that changed the frames XeFG
-// generated (1/255 on every generated frame with NR at Present, stand-in, 11-05). Each entry holds a reference to its
+// generated (1/255 on every generated frame with NR at Present). Each entry holds a reference to its
 // queue. Not let go by time: a swap chain that stops presenting (a minimised game) and presents again from a thread
 // that executed nothing would have no other way to its queue. Let go when a swap chain is made again at the same
 // address, when its queue's device is removed, and the oldest beyond kCreatedKept (a game making chain after chain).

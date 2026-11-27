@@ -1,4 +1,4 @@
-# RDNA4 (RX 9000, gfx12): FP8 e4m3 WMMA, wave32. The network in windows/shaders/rdna4/.
+# RDNA4 (gfx12): FP8 e4m3 WMMA, wave32. The network in windows/shaders/rdna4/.
 # Sourced by build_package.sh, build_optiscaler_nr.sh and assemble_product_data.sh.
 #
 # The shaders and the host must agree: nr_graph refuses a shader directory whose

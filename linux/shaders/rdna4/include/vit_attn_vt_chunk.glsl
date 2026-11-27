@@ -3,22 +3,37 @@
 // zero K and contribute no probability to P.V). NR_VT_GUARD 0: a full chunk,
 // where both tests are constant and the zero-or-load phi they created - which
 // ACO copied with four byte-inserting `v_perm_b32` a dword - does not exist.
+// NR_VT_PAD 1 (vit_attn.comp NR_VTAIL): a chunk of the padding tail - every key and value row is token M - 1's, read
+// with stride 0 from nr_krep / nr_vrep (row 15 of its tile). NR_VT_PAD 0: the macros below are the original text.
+#if NR_VT_PAD
+#define NR_VT_KS4 0u
+#define NR_VT_KS 0u
+#define NR_VT_LS 0u
+#else
+#define NR_VT_KS4 (X3 >> 2)
+#define NR_VT_KS X3
+#define NR_VT_LS 16u
+#endif
         for (uint kb = 0u; kb < uint(NR_KC); kb += 16u) {
             // K as the A operand: the same addresses its ColumnMajor B load read.
             NR_FRAG_A kfr[2];
             for (uint d = 0u; d < 2u; ++d) {
 #if NR_VKMAN && NR_VT_GUARD == 0
                 {
-                    const uint nrk = kc4 + kb * (X3 >> 2) + d * 64u;
+                    const uint nrk = kc4 + kb * NR_VT_KS4 + d * 64u;
                     const fe4m3vec4 r0 = act_x4[nrk], r1 = act_x4[nrk + 1u];
                     for (int v = 0; v < 4; ++v) { kfr[d][v] = r0[v]; kfr[d][v + 4] = r1[v]; }
                 }
 #elif NR_VADDR && NR_VT_GUARD == 0
-                NR_LOAD_A(kfr[d], act_e4m3, kcb + kb * X3 + d * 256u, 16u);
+                NR_LOAD_A(kfr[d], act_e4m3, kcb + kb * NR_VT_KS + d * 256u, NR_VT_LS);
 #else
-                if (NR_VT_GUARD == 0 || j0 + kb < pc.tokens)
+                if (NR_VT_GUARD == 0 || j0 + kb < NR_KTOK)
+#if NR_VT_PAD
+                    NR_LOAD_A(kfr[d], act_e4m3, nr_krep + d * 256u, 0u);
+#else
                     NR_LOAD_A(kfr[d], act_e4m3,
-                              nr_at16(pc.x_off, j0 + kb, kbase + d * 16u, X3), 16u);
+                              nr_at16(NR_KX, j0 + kb, kbase + d * 16u, X3), 16u);
+#endif
                 else kfr[d] = NR_FRAG_A(0.0);
 #endif
             }
@@ -29,11 +44,15 @@
             NR_FRAG_A vf[2];
             for (uint n = 0u; n < 2u; ++n)
 #if NR_VADDR && NR_VT_GUARD == 0
-                NR_LOAD_A_COL(vf[n], act_e4m3, vcb + kb * X3 + n * 256u, 16u);
+                NR_LOAD_A_COL(vf[n], act_e4m3, vcb + kb * NR_VT_KS + n * 256u, NR_VT_LS);
+#else
+#if NR_VT_PAD
+                NR_LOAD_A_COL(vf[n], act_e4m3, nr_vrep + n * 256u, 0u);
 #else
                 NR_LOAD_A_COL(vf[n], act_e4m3,
-                              nr_at16(pc.x_off, min(j0 + kb, jlast),
+                              nr_at16(NR_KX, min(j0 + kb, NR_KJLAST),
                                       vbase + n * 16u, X3), 16u);
+#endif
 #endif
             for (uint b = 0u; b < uint(NR_QB); ++b) {
                 NR_FRAG_ACC lg = NR_ACC_ZERO;
@@ -128,10 +147,10 @@
                 // killed here exactly as it was before the transpose.
 #if NR_VPB16
                 NR_FRAG_B pf = NR_FRAG_B(ph);
-                if (NR_VT_GUARD != 0 && j0 + kb >= pc.tokens) pf = NR_FRAG_B(0.0);
+                if (NR_VT_GUARD != 0 && j0 + kb >= NR_KTOK) pf = NR_FRAG_B(0.0);
 #else
                 NR_FRAG_E4M3 pe = NR_FRAG_E4M3(ph);
-                if (NR_VT_GUARD != 0 && j0 + kb >= pc.tokens) pe = NR_FRAG_E4M3(0.0);
+                if (NR_VT_GUARD != 0 && j0 + kb >= NR_KTOK) pe = NR_FRAG_E4M3(0.0);
                 NR_FRAG_B pf;
 #if NR_VKPERM && NR_VT_GUARD == 0
                 {
@@ -159,3 +178,6 @@
                 }
             }
         }
+#undef NR_VT_KS4
+#undef NR_VT_KS
+#undef NR_VT_LS

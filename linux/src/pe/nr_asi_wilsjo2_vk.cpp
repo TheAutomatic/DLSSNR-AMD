@@ -7,6 +7,7 @@
 // are read in the layouts the call hands them, and the model runs through nr::dlssnr::evaluate_vk_asi.
 #include "nr_asi_wilsjo2.hpp"
 
+#include "nr_frame_pair.hpp"
 #include "nr_pe_config.hpp"
 #include "nr_pe_log.hpp"
 #include "nr_pe_renodx_route.hpp"
@@ -18,6 +19,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
+#include <cmath>
 #include <memory>
 #include <optional>
 #include <string>
@@ -225,6 +228,11 @@ bool record(VkCommandBuffer cmd, const std::function<bool(VkCommandBuffer, nr::p
 struct Wilsjo2VkOwner {
     bool capture_layer = false;
     bool at_present = false;   // wilsjo2_vk_owner_at_present
+    // FrameReuse on an SDR frame: the flow inside the model's session through this feature (run_in_session); else the
+    // flow here (own_flow: its state is there to let go of when the other runs)
+    nr::dlssnr::Feature* session = nullptr;
+    uint32_t session_w = 0, session_h = 0;
+    bool own_flow = false, reuse_hdr_said = false;
     w2::FlowState flow;
     std::vector<nr::dlssnr::Feature*> models;   // pass k's at [k]
 };
@@ -309,6 +317,11 @@ public:
         nr::dlssnr::with_vk_session([&](nr::pe::Session& s) { on = s.style_grade_active(); });
         return on;
     }
+    bool style_grade_accelerated() const override {
+        bool on = false;
+        nr::dlssnr::with_vk_session([&](nr::pe::Session& s) { on = s.style_grade_accelerated(); });
+        return on;
+    }
     bool stage_failed() const override { return g_stage_retry.blocked(); }
     w2::PassReady pass(uint32_t k, const w2::PassControls&, uint32_t mw, uint32_t mh) override {
         if (k < o_.models.size() && o_.models[k]) return w2::PassReady::kReady;
@@ -351,6 +364,7 @@ public:
         style_.emplace(false);
         facts_.hdr = x.hdr; facts_.exposure = int(x.exposure); facts_.asked = x.asked; facts_.white = x.white;
         facts_.history = x.history; facts_.mode = x.mode; facts_.passes = x.passes;
+        facts_.pre_history = x.pre_history; facts_.noise_every_frame = x.noise_every_frame;
         facts_.prep_outside = x.prep_outside; facts_.prep_missing = x.prep_missing;
         facts_.fast_passes = x.fast_passes; facts_.fast_fallback = x.fast_fallback; facts_.fast_fallback_spatial = x.fast_fallback_spatial; facts_.il_missing = x.il_missing;
         told_.emplace(&facts_);
@@ -370,6 +384,8 @@ public:
         session_->set_call_layer(nr::pe::renodx_route::call_layer());
         session_->outer_begin(vk);
         // F5 (nr_screenshot.hpp): the frame before this layer's NR, while a capture is armed
+        // (a Present whose screenshot pairs the frame that frame reuse shows with its input takes the pair itself)
+        if (!nr::frame_pair::Observation::current)
         o_.capture_layer = session_->capture_begin(vk, frame.image, frame.format, w_, h_, frame.layout, hdr ? 1 : 0,
                                o_.at_present ? "present" : before_ ? "nr-before-upscaler" : "nr-after-upscaler");
     }
@@ -413,13 +429,75 @@ private:
     nr::pe::renodx_route::Wilsjo2Facts facts_;
     std::optional<nr::pe::renodx_route::CallWilsjo2> told_;
     nr::pe::renodx_route::Frame rf_;
+public:
 };
+
+// As nr_asi_wilsjo2.cpp's run_in_session: FrameReuse on an SDR frame runs the layer's flow inside the model's session with
+// frame reuse around it, through the owner's own NR feature at the frame's extent; the flow here lets go of its state.
+bool run_in_session(VkCommandBuffer cmd, Wilsjo2VkOwner& o, const Wilsjo2VkFrame& f, const w2::Settings& s,
+                    const Wilsjo2VkImage& target, uint32_t w, uint32_t h, bool before_upscale) {
+    namespace route = nr::pe::renodx_route;
+    if (!target.image || !f.motion.image) return false;   // (as the flow here)
+    if (o.own_flow) {   // (its sizes too: a later run of the flow here allocates afresh)
+        VkIo io(VK_NULL_HANDLE, o, nullptr, nullptr, false, 0, 0);
+        w2::flow_release(io, o.flow);
+        o.flow = w2::FlowState{};
+        o.own_flow = false;
+    }
+    if (o.session && (o.session_w != w || o.session_h != h)) { nr::dlssnr::release_vk(o.session); o.session = nullptr; }
+    if (!o.session) {
+        int rc = 0;
+        o.session = nr::dlssnr::create_vk_asi(w, h, &rc);
+        if (!o.session) {
+            log("[nr] wilsjo2 style (Vulkan): the frame reuse's NR feature could not be made (0x%08X)", unsigned(rc));
+            return false;
+        }
+        o.session_w = w; o.session_h = h;
+    }
+    route::W2Present wp;
+    wp.settings = &s; wp.hdr = before_upscale ? f.hdr_before : f.hdr;
+    wp.at_present = o.at_present; wp.before_upscale = before_upscale; wp.pre_exposure = f.pre_exposure;
+    route::CallW2Present present(&wp);
+    route::CallStyle style(false);
+    route::note_pass(f.flags, 1.0f, f.depth_rect.width, f.depth_rect.height, f.out_w ? f.out_w : w, f.out_h ? f.out_h : h);
+    route::Frame rf;
+    rf.before_upscale = before_upscale;
+    rf.pre_exposure = f.pre_exposure;
+    route::begin_run(rf);
+    const nr::dlssnr::VkImageRef t = ref_of(target);
+    const auto sane = [](float v) { return std::isfinite(v) && v != 0.0f ? v : 1.0f; };   // (as the flow reads it)
+    nr::dlssnr::evaluate_vk_asi(cmd, o.session, t, t, ref_of(f.depth), ref_of(f.motion), w, h, f.depth_rect, f.motion_rect,
+                                (f.flags & (1u << 3)) ? 1 : 0, f.reset ? 1 : 0, nr::dlssnr::Controls6{}, sane(f.mv_x),
+                                sane(f.mv_y));
+    route::end_run();
+    if (wp.ran)   // peripheral compression's outlines in NR Control, as the flow here notes them
+        nr::dlssnr::with_vk_session([&](nr::pe::Session& session) {
+            if (session.spatial_active()) wilsjo2_note_spatial(route::call_layer(), session.spatial_layout());
+        });
+    return wp.ran;
+}
+// As nr_asi_wilsjo2.cpp's: a float frame at the upscaler is scene light, not display codes (frame reuse needs those)
+bool float_frame(VkFormat f) {
+    switch (f) {
+        case VK_FORMAT_R16G16B16A16_SFLOAT: case VK_FORMAT_R16G16B16_SFLOAT: case VK_FORMAT_R32G32B32A32_SFLOAT:
+        case VK_FORMAT_R32G32B32_SFLOAT:
+        case VK_FORMAT_B10G11R11_UFLOAT_PACK32: case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32:
+            return true;
+        default:
+            return false;
+    }
+}
+bool test_session() {   // (as nr_asi_wilsjo2.cpp's: NR_TEST_W2_SESSION=1, gates only)
+    static const bool on = [] { const char* e = std::getenv("NR_TEST_W2_SESSION"); return e && e[0] == '1'; }();
+    return on;
+}
 }  // namespace
 
 void wilsjo2_vk_release(Wilsjo2VkOwner* o) {
     if (!o) return;
     VkIo io(VK_NULL_HANDLE, *o, nullptr, nullptr, false, 0, 0);
     w2::flow_release(io, o->flow);
+    if (o->session) nr::dlssnr::release_vk(o->session);
     delete o;
 }
 
@@ -427,8 +505,16 @@ bool wilsjo2_run_vk(VkCommandBuffer cmd, Wilsjo2VkOwner& o, const Wilsjo2VkFrame
                     const Wilsjo2VkImage& target, uint32_t w, uint32_t h, bool before_upscale) {
     gpu_uses.touch();
     o.capture_layer = false;
+    const bool hdr = before_upscale ? f.hdr_before : f.hdr;   // the image processed decides (as ff.hdr below)
+    // (IsHDR on a non-float frame is not HDR: the project's rule, wilsjo2_frame / RenoDX's encode)
+    const bool sdr = !hdr && (o.at_present || !float_frame(target.format));
+    if ((s.frame_reuse || (nr::frame_pair::PresentAge::active && nr::frame_pair::PresentAge::active->gathering()) || (test_session() && sdr))) return run_in_session(cmd, o, f, s, target, w, h, before_upscale);
+    if (o.session) { nr::dlssnr::release_vk(o.session); o.session = nullptr; }
+    // this Present's frames on time (a frame reuse of this layer's that delayed them is not running now)
+    if (o.at_present) nr::pe::Session::note_frames_delayed(0);
     if (!target.image || !f.depth.image || !f.motion.image || !g_device) return false;
     VkIo io(cmd, o, &f, &target, before_upscale, w, h);
+    o.own_flow = true;
     w2::FlowFrame ff;
     ff.target = io.game(target);
     ff.width = w; ff.height = h;

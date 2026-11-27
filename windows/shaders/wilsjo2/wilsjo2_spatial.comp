@@ -97,7 +97,7 @@ void main() {
                            ivec2(sp.DepthRect.zw + sp.DepthRect.xy) - 1);
     const ivec2 mp = clamp(ivec2(sp.MotionRect.zw * nuv + sp.MotionRect.xy), ivec2(sp.MotionRect.xy),
                            ivec2(sp.MotionRect.zw + sp.MotionRect.xy) - 1);
-    const float depth = texelFetch(t1, dp, 0).x;
+    const float depth = sp.DepthRect.z > 0.0 && sp.DepthRect.w > 0.0 ? texelFetch(t1, dp, 0).x : 0.0;
     const vec2 mv = texelFetch(t2, mp, 0).xy * sp.MotionScale;
     imageStore(u0, ivec2(p), vec4(depth));
     const vec2 packed = pack_offset(off + mv) - pack_offset(off);

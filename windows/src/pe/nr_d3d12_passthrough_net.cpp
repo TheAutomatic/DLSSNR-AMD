@@ -22,7 +22,7 @@
 #include "tinlayout.hpp"
 #include "nr_ini_network.hpp"
 #include "nr_pe_log.hpp"
-#include "nr_pe_d3d12split.hpp"
+#include "nr_d3d12_direct_state.hpp"
 #include "nr_vram_ledger.hpp"
 
 #include <windows.h>
@@ -50,13 +50,13 @@ template <class T> void release(T*& p) { if (p) { p->Release(); p = nullptr; } }
 void touch_recording(nr::gpu::Uses& uses, const nr::gpu::Ticket& rec) {
     auto& tickets = uses.tickets;
     tickets.erase(std::remove_if(tickets.begin(), tickets.end(), [](const auto& t) {
-        return split::completed(t);
+        return d3d12_direct::completed(t);
     }), tickets.end());
     if (rec && std::find(tickets.begin(), tickets.end(), rec) == tickets.end()) tickets.push_back(rec);
 }
 bool recordings_done(const nr::gpu::Uses& uses) {
     return std::all_of(uses.tickets.begin(), uses.tickets.end(), [](const auto& t) {
-        return split::completed(t);
+        return d3d12_direct::completed(t);
     });
 }
 
@@ -128,16 +128,18 @@ void rdna3_bindings(const std::vector<uint8_t>& spv, std::set<uint32_t>* e4m3, s
 
 // ---- the binding table of a kernel: nr_graph.cpp's kernel creation ------------------------------------------------
 // NOISE: the seed-0 noise table (binding 5 of the pre kernels, image_input.glsl; g_noisefield writes it).
-enum Res { ACT, WGT, NOISE, PARAMS };
+// PRE_PARAMS: the temporal pre's own copy of PARAMS (nr_runtime.cpp Temporal::pre_params): its gate is Pre history's.
+enum Res { ACT, WGT, NOISE, PARAMS, PRE_PARAMS };
 // TEX_IN, FLOW, HIST, DEPTH: combined image + sampler (48 bytes); SURF0, SURF1, HIST_STORE: storage images (32).
 enum Img { TEX_IN, SURF0, SURF1, FLOW, HIST, HIST_STORE, DEPTH };
 struct Family { std::vector<Res> buffers; std::vector<Img> images; };
 bool family_of(std::string k, Family* f) {
+    if (k.size() > 12 && k.compare(k.size() - 12, 12, "_grade_accel") == 0) k.resize(k.size() - 12);
     if (k.size() > 6 && k.compare(k.size() - 6, 6, "_grade") == 0) k.resize(k.size() - 6);
     auto w = [&](std::initializer_list<Res> b) { f->buffers.assign(b); };
     // nr_runtime.cpp's temporal pre / post: {act, act, wgt, wgt, wgt, noise_buf, params} {tex_in, flow0_sampled,
     // hist(c), depth}; {act, act, wgt, wgt, wgt, params} {surf0, hist_store[c ^ 1], tex_in, flow0_sampled, hist(c)}.
-    if (k.rfind("temporal_pre", 0) == 0) { w({ACT, ACT, WGT, WGT, WGT, NOISE, PARAMS}); f->images = {TEX_IN, FLOW, HIST, DEPTH}; }
+    if (k.rfind("temporal_pre", 0) == 0) { w({ACT, ACT, WGT, WGT, WGT, NOISE, PRE_PARAMS}); f->images = {TEX_IN, FLOW, HIST, DEPTH}; }
     else if (k.rfind("temporal_post", 0) == 0) { w({ACT, ACT, WGT, WGT, WGT, PARAMS}); f->images = {SURF0, HIST_STORE, TEX_IN, FLOW, HIST}; }
     else if (k.rfind("fswindsp", 0) == 0) w({ACT, ACT, WGT, WGT, WGT, ACT});
     else if (k == "fswinimagepreds32" || k == "fswinimagepreds32nh") { w({ACT, ACT, WGT, WGT, WGT, NOISE}); f->images = {TEX_IN}; }
@@ -162,6 +164,7 @@ constexpr uint32_t kTableBytes = 4096, kTablePushOff = 512, kTableGridOff = 640;
 constexpr uint32_t kRing = 16;        // upload slots a buffer; more buffers are added while every slot is held
 constexpr uint32_t kDoneSlots = 128;  // frame numbers the GPU lands in the readback buffer, a ring of these
 constexpr uint32_t kParamsBytes = 256;   // the temporal params (12 floats), after the frame's tables
+constexpr uint32_t kPreParamsAt = 64;    // the pre block's copy of them (its gate Pre history's) in the same 256 bytes
 constexpr uint32_t kMaxFeatures = 64, kHardMaxFeatures = 128, kMaxExtents = 4;
 
 using elf::put_buf;
@@ -260,12 +263,16 @@ struct Built {
     std::map<std::string, Kern> kern;
     Kern t_pre, t_post, t_grade;                  // the temporal pre / post (t_grade.pso null: no Style grade)
     Kern t_post16, t_grade16;                     // the RGBA16F history's post (t_post16.pso null: none)
+    // the grade posts' closed-form twins ([Network] Style Grade Acceleration; t_grade_a.pso null: the table form only)
+    Kern t_grade_a, t_grade16_a;
     // stand: 256 bytes, the 1x1 surf1 and the missing depth (as the runtime's 1x1 images). noise: the seed-0 noise table,
-    // the stand-in until noise_real (made once frames keep seed 0, make_noise).
-    ID3D12Resource *act = nullptr, *wgt = nullptr, *wgt_upload = nullptr, *stand = nullptr, *noise = nullptr;
+    // the stand-in until noise_real (made once frames keep seed 0, make_noise). sink: 256 bytes, the 1x1 history store of
+    // a pass whose history Interleaved supplies (written there and never read: never the stand, which is read)
+    ID3D12Resource *act = nullptr, *wgt = nullptr, *wgt_upload = nullptr, *stand = nullptr, *noise = nullptr, *sink = nullptr;
     // RDNA3 (the Vulkan runtime's fp16_twin): the arena's FP16 twin (twice its bytes, zero) and the weights' (each e4m3
     // byte as an f16), what its e4m3 views read
     bool rdna3 = false;
+    bool wgt_uploaded = false;
     ID3D12Resource *act_e = nullptr, *wgt_e = nullptr, *wgt_e_upload = nullptr;
     bool noise_real = false, want_noise = false;
     uint32_t seed0_run = 0;                       // consecutive recordings whose pre block ran seed 0
@@ -325,6 +332,7 @@ struct Built {
     ~Built() {
         for (auto& [n, k] : kern) release(k.pso);
         release(t_pre.pso); release(t_post.pso); release(t_grade.pso); release(t_post16.pso); release(t_grade16.pso);
+        release(t_grade_a.pso); release(t_grade16_a.pso);
         for (auto& u : upload) {
             if (u.map) u.buf->Unmap(0, nullptr);
             release(u.buf);
@@ -333,7 +341,7 @@ struct Built {
         release(exec_token);
         if (copy_map) done->Unmap(0, nullptr);
         release(done);
-        release(act); release(wgt); release(wgt_upload); release(stand); release(noise); release(table);
+        release(act); release(wgt); release(wgt_upload); release(stand); release(noise); release(sink); release(table);
         release(act_e); release(wgt_e); release(wgt_e_upload);
     }
 };
@@ -348,6 +356,91 @@ struct Shared {
     std::shared_ptr<Built> done;                  // built, not yet taken by ready()
     std::map<std::tuple<uint32_t, uint32_t, int>, std::string> failed;   // extents & models that cannot run (not built again)
 };
+
+// Upload weights via a temporary COPY (or DIRECT) queue using one reusable 16 MB staging buffer so neither
+// the game's first frame nor Process Committed sees a full-weights UPLOAD allocation spike.
+bool upload_weights_chunked(ID3D12Device* device, ID3D12Resource* wgt, ID3D12Resource* wgt_e,
+                            const std::vector<uint8_t>& weights, bool rdna3) {
+    if (weights.empty()) return true;
+    struct Hold {
+        ID3D12Resource* staging = nullptr;
+        void* mapped = nullptr;
+        HANDLE ev = nullptr;
+        ID3D12Fence* fence = nullptr;
+        ID3D12GraphicsCommandList* cmd = nullptr;
+        ID3D12CommandAllocator* alloc = nullptr;
+        ID3D12CommandQueue* queue = nullptr;
+        ~Hold() {
+            if (mapped && staging) staging->Unmap(0, nullptr);
+            release(staging);
+            if (ev) CloseHandle(ev);
+            release(fence);
+            release(cmd);
+            release(alloc);
+            release(queue);
+        }
+    } h;
+
+    D3D12_COMMAND_LIST_TYPE q_type = D3D12_COMMAND_LIST_TYPE_COPY;
+    D3D12_COMMAND_QUEUE_DESC qd{};
+    qd.Type = q_type;
+    if (FAILED(device->CreateCommandQueue(&qd, IID_PPV_ARGS(&h.queue))) || !h.queue) {
+        q_type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        qd.Type = q_type;
+        if (FAILED(device->CreateCommandQueue(&qd, IID_PPV_ARGS(&h.queue))) || !h.queue) return false;
+    }
+    if (FAILED(device->CreateCommandAllocator(q_type, IID_PPV_ARGS(&h.alloc))) || !h.alloc ||
+        FAILED(device->CreateCommandList(0, q_type, h.alloc, nullptr, IID_PPV_ARGS(&h.cmd))) || !h.cmd ||
+        FAILED(h.cmd->Close()) ||
+        FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&h.fence))) || !h.fence) {
+        return false;
+    }
+    h.ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!h.ev) return false;
+
+    const uint64_t wbytes = weights.size();
+    const uint64_t raw_chunk = std::min<uint64_t>(16ull << 20, rdna3 ? wbytes * 2 : wbytes);
+    const uint64_t chunk_bytes = std::max<uint64_t>(256ull, (raw_chunk + 255ull) & ~255ull);
+    h.staging = buffer(device, D3D12_HEAP_TYPE_UPLOAD, chunk_bytes, D3D12_RESOURCE_STATE_GENERIC_READ, false);
+    if (!h.staging || FAILED(h.staging->Map(0, nullptr, &h.mapped)) || !h.mapped) return false;
+
+    uint64_t fv = 0;
+    auto submit_chunk = [&](ID3D12Resource* dst, uint64_t dst_off, uint64_t len) -> bool {
+        if (FAILED(h.alloc->Reset()) || FAILED(h.cmd->Reset(h.alloc, nullptr))) return false;
+        h.cmd->CopyBufferRegion(dst, dst_off, h.staging, 0, len);
+        if (FAILED(h.cmd->Close())) return false;
+        ID3D12CommandList* lists[] = {h.cmd};
+        h.queue->ExecuteCommandLists(1, lists);
+        if (FAILED(h.queue->Signal(h.fence, ++fv))) return false;
+        if (h.fence->GetCompletedValue() < fv) {
+            ResetEvent(h.ev);
+            if (FAILED(h.fence->SetEventOnCompletion(fv, h.ev))) return false;
+            if (WaitForSingleObject(h.ev, 10000) != WAIT_OBJECT_0) return false;
+        }
+        return true;
+    };
+
+    for (uint64_t off = 0; off < wbytes;) {
+        const uint64_t len = std::min<uint64_t>(chunk_bytes, wbytes - off);
+        std::memcpy(h.mapped, weights.data() + off, size_t(len));
+        if (!submit_chunk(wgt, off, len)) return false;
+        off += len;
+    }
+    if (rdna3 && wgt_e) {
+        uint16_t to_f16[256];
+        for (int i = 0; i < 256; ++i) to_f16[i] = tin::f_to_f16(tin::e4m3_to_f(uint8_t(i)));
+        const uint64_t max_e = chunk_bytes / 2;
+        auto* out = static_cast<uint16_t*>(h.mapped);
+        for (uint64_t off = 0; off < wbytes;) {
+            const uint64_t len = std::min<uint64_t>(max_e, wbytes - off);
+            const uint8_t* src = weights.data() + off;
+            for (uint64_t i = 0; i < len; ++i) out[i] = to_f16[src[i]];
+            if (!submit_chunk(wgt_e, off * 2, len * 2)) return false;
+            off += len;
+        }
+    }
+    return true;
+}
 
 // build: the lowering and everything of the device's it needs. On the build thread.
 std::shared_ptr<Built> build(ID3D12Device* device, ID3D12RootSignature* rs, uint32_t w,
@@ -394,15 +487,17 @@ std::shared_ptr<Built> build(ID3D12Device* device, ID3D12RootSignature* rs, uint
     };
     std::map<std::string, const KernElf*> found;
     const KernElf *c_pre = nullptr, *c_post = nullptr, *c_grade = nullptr, *c_post16 = nullptr, *c_grade16 = nullptr;
+    const KernElf *c_grade_a = nullptr, *c_grade16_a = nullptr;
     std::string missing;
     for (int attempt = 0; attempt < 2; ++attempt) {
-        // CC_SMALL_FP8_EXPERIMENTAL first, as the runtime picks it; a kernel without a record: CC_SMALL_FP8 (the
-        // runtime's own "anything missing: the small model").
-        const bool try_experimental = (want_net == nr::kSmallFp8Experimental && attempt == 0);
-        const int plan_model = (want_net == nr::kSmallFp8Experimental && attempt == 1) ? nr::kSmallFp8 : want_net;
-        if (!planner(w, h, plan_model, try_experimental, &b->plan, why)) return nullptr;
+        // CC_SMALL_FP8_OPTIMIZED (its level as asked) first, as the runtime picks it; a kernel without a record:
+        // CC_SMALL_FP8 (the runtime's own "anything missing: CC_SMALL_FP8").
+        const bool try_small_fp8_optimized = (nr::network_small_fp8_optimized(want_net) && attempt == 0);
+        const int plan_model = (nr::network_small_fp8_optimized(want_net) && attempt == 1) ? nr::kSmallFp8 : want_net;
+        if (!planner(w, h, plan_model, try_small_fp8_optimized, &b->plan, why)) return nullptr;
         found.clear(); missing.clear();
         c_pre = c_post = c_grade = c_post16 = c_grade16 = nullptr;
+        c_grade_a = c_grade16_a = nullptr;
         const auto& t = b->plan.temporal;
         for (size_t i = 0; i < b->plan.disp.size(); ++i) {
             const auto& d = b->plan.disp[i];
@@ -423,8 +518,15 @@ std::shared_ptr<Built> build(ID3D12Device* device, ID3D12RootSignature* rs, uint
         if (missing.empty() && !t.post16_spv.empty() && resolve_file(t.post16_spv, &c_post16) &&
             !t.post16_grade_spv.empty() && !resolve_file(t.post16_grade_spv, &c_grade16))
             c_post16 = nullptr;
+        // The grade posts' closed-form twins: every one the table form has, or none (the table form, as the runtime's
+        // style_grade_accel); never a missing kernel
+        if (missing.empty() && c_grade && !t.post_grade_accel_spv.empty() && resolve_file(t.post_grade_accel_spv, &c_grade_a)) {
+            if (c_post16 && c_grade16 &&
+                (t.post16_grade_accel_spv.empty() || !resolve_file(t.post16_grade_accel_spv, &c_grade16_a)))
+                c_grade_a = c_grade16_a = nullptr;
+        }
         if (missing.empty()) break;
-        if (b->plan.model.rfind("CC_SMALL_FP8_EXPERIMENTAL", 0) != 0) break;
+        if (b->plan.model.rfind("CC_SMALL_FP8_OPTIMIZED", 0) != 0) break;
         nr::pe::log("[d3d12] the %s network: kernel %s has no ACO record; CC_SMALL_FP8 instead", b->plan.model.c_str(),
                     missing.c_str());
     }
@@ -436,11 +538,15 @@ std::shared_ptr<Built> build(ID3D12Device* device, ID3D12RootSignature* rs, uint
     }
     b->net = nr::network_choice(b->plan.model.substr(0, b->plan.model.find(' ')));
     if (b->net < 0) b->net = want_net >= 0 ? want_net : nr::kSmallFp8;
-    else if (nr::network_optimized(b->net)) {
+    else if (nr::network_silver_aardwold_optimized(b->net)) {
         if (b->plan.model.find("(layers: quality)") != std::string::npos) b->net = nr::kSilverAardwoldOptimizedFp8;
         else if (b->plan.model.find("(layers: performance)") != std::string::npos) b->net = nr::kSilverAardwoldOptimizedPerformance;
         else if (b->plan.model.find("(layers: ultra performance)") != std::string::npos) b->net = nr::kSilverAardwoldOptimizedUltra;
-        else if (nr::network_optimized(want_net)) b->net = want_net;
+        else if (nr::network_silver_aardwold_optimized(want_net)) b->net = want_net;
+    } else if (nr::network_small_fp8_optimized(b->net)) {
+        if (b->plan.model.find("(layers: performance)") != std::string::npos) b->net = nr::kSmallFp8OptimizedPerformance;
+        else if (b->plan.model.find("(layers: ultra performance)") != std::string::npos) b->net = nr::kSmallFp8OptimizedUltra;
+        else b->net = nr::kSmallFp8Optimized;
     }
     auto make = [&](const std::string& kern, const KernElf& c, Built::Kern* k) {
         if (!family_of(kern, &k->fam)) { *why = "no binding table for kernel " + kern; return false; }
@@ -465,6 +571,16 @@ std::shared_ptr<Built> build(ID3D12Device* device, ID3D12RootSignature* rs, uint
         (c_post16 && !make(stem_of(b->plan.temporal.post16_spv), *c_post16, &b->t_post16)) ||
         (c_grade16 && !make(stem_of(b->plan.temporal.post16_grade_spv), *c_grade16, &b->t_grade16)))
         return nullptr;
+    if (c_grade_a && (!make(stem_of(b->plan.temporal.post_grade_accel_spv), *c_grade_a, &b->t_grade_a) ||
+                      (c_grade16_a && !make(stem_of(b->plan.temporal.post16_grade_accel_spv), *c_grade16_a, &b->t_grade16_a)))) {
+        nr::pe::log("[d3d12] Style grade acceleration: %s; Natural and Cinematic are graded step by step", why->c_str());
+        release(b->t_grade_a.pso); release(b->t_grade16_a.pso);
+        b->t_grade_a = {}; b->t_grade16_a = {};
+        why->clear();
+    }
+    if (b->t_grade.pso && !b->t_grade_a.pso)
+        nr::pe::log("[d3d12] Style grade acceleration: no closed-form grade kernels for this network; Natural and Cinematic are "
+                    "graded step by step");
     // The network memory (retarget): the arena zero (a new committed resource), the weights to upload once.
     const uint64_t wbytes = b->plan.weights.size();
     {
@@ -474,10 +590,9 @@ std::shared_ptr<Built> build(ID3D12Device* device, ID3D12RootSignature* rs, uint
     }
     {
         nr::vram::Scope s_wgt(nr::vram::kWeights, b->net);
-        b->wgt = buffer(device, D3D12_HEAP_TYPE_DEFAULT, wbytes, D3D12_RESOURCE_STATE_COPY_DEST, true);
+        b->wgt = buffer(device, D3D12_HEAP_TYPE_DEFAULT, wbytes, D3D12_RESOURCE_STATE_COMMON, true);
         nr::vram::track_d3d12(device, b->wgt, nr::vram::kWeights);
     }
-    b->wgt_upload = buffer(device, D3D12_HEAP_TYPE_UPLOAD, wbytes, D3D12_RESOURCE_STATE_GENERIC_READ, false);
     if (b->rdna3) {   // the FP16 twins (nr_graph.cpp / reload_network on RDNA3): the arena's zero, the weights' converted
         {
             nr::vram::Scope s_act(nr::vram::kActivations, b->net);
@@ -486,21 +601,14 @@ std::shared_ptr<Built> build(ID3D12Device* device, ID3D12RootSignature* rs, uint
         }
         {
             nr::vram::Scope s_wgt(nr::vram::kWeights, b->net);
-            b->wgt_e = buffer(device, D3D12_HEAP_TYPE_DEFAULT, wbytes * 2, D3D12_RESOURCE_STATE_COPY_DEST, true);
+            b->wgt_e = buffer(device, D3D12_HEAP_TYPE_DEFAULT, wbytes * 2, D3D12_RESOURCE_STATE_COMMON, true);
             nr::vram::track_d3d12(device, b->wgt_e, nr::vram::kWeights);
         }
-        b->wgt_e_upload = buffer(device, D3D12_HEAP_TYPE_UPLOAD, wbytes * 2, D3D12_RESOURCE_STATE_GENERIC_READ, false);
-        if (!b->act_e || !b->wgt_e || !b->wgt_e_upload) { *why = "the RDNA3 FP16 twins could not be made"; return nullptr; }
-        void* em = nullptr;
-        if (FAILED(b->wgt_e_upload->Map(0, nullptr, &em)) || !em) { *why = "the FP16 weights upload could not be mapped"; return nullptr; }
-        uint16_t to_f16[256];
-        for (int i = 0; i < 256; ++i) to_f16[i] = tin::f_to_f16(tin::e4m3_to_f(uint8_t(i)));
-        auto* o = static_cast<uint16_t*>(em);
-        for (uint64_t i = 0; i < wbytes; ++i) o[i] = to_f16[b->plan.weights[size_t(i)]];
-        b->wgt_e_upload->Unmap(0, nullptr);
+        if (!b->act_e || !b->wgt_e) { *why = "the RDNA3 FP16 twins could not be made"; return nullptr; }
     }
     b->stand = buffer(device, D3D12_HEAP_TYPE_DEFAULT, 256, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
     b->noise = buffer(device, D3D12_HEAP_TYPE_DEFAULT, 256, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
+    b->sink = buffer(device, D3D12_HEAP_TYPE_DEFAULT, 256, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
     b->tables = uint32_t(b->plan.noise.size() + b->plan.disp.size());
     b->slot_bytes = uint64_t(b->tables) * kTableBytes + kParamsBytes;
     {
@@ -508,16 +616,33 @@ std::shared_ptr<Built> build(ID3D12Device* device, ID3D12RootSignature* rs, uint
         b->table = buffer(device, D3D12_HEAP_TYPE_DEFAULT, b->slot_bytes, D3D12_RESOURCE_STATE_COPY_DEST, true);
         nr::vram::track_d3d12(device, b->table, nr::vram::kUnset);
     }
-    if (!b->act || !b->wgt || !b->wgt_upload || !b->stand || !b->noise || !b->table) {
+    if (!b->act || !b->wgt || !b->stand || !b->noise || !b->sink || !b->table) {
         *why = "the network memory could not be made"; return nullptr;
     }
-    for (ID3D12Resource* r : {b->act, b->wgt, b->stand, b->noise, b->table})
+    for (ID3D12Resource* r : {b->act, b->wgt, b->stand, b->noise, b->sink, b->table})
         if ((r->GetGPUVirtualAddress() >> 48) != 0) { *why = "a buffer address above 48 bits"; return nullptr; }
-    {
+    if (b->wgt_e && ((b->wgt_e->GetGPUVirtualAddress() >> 48) != 0 || (b->act_e->GetGPUVirtualAddress() >> 48) != 0)) {
+        *why = "a buffer address above 48 bits"; return nullptr;
+    }
+    b->wgt_uploaded = upload_weights_chunked(device, b->wgt, b->wgt_e, b->plan.weights, b->rdna3);
+    if (!b->wgt_uploaded) {
+        b->wgt_upload = buffer(device, D3D12_HEAP_TYPE_UPLOAD, wbytes, D3D12_RESOURCE_STATE_GENERIC_READ, false);
+        if (!b->wgt_upload) { *why = "the weights upload could not be made"; return nullptr; }
         void* wm = nullptr;
         if (FAILED(b->wgt_upload->Map(0, nullptr, &wm)) || !wm) { *why = "the weights upload could not be mapped"; return nullptr; }
         if (wbytes) std::memcpy(wm, b->plan.weights.data(), wbytes);
         b->wgt_upload->Unmap(0, nullptr);
+        if (b->rdna3) {
+            b->wgt_e_upload = buffer(device, D3D12_HEAP_TYPE_UPLOAD, wbytes * 2, D3D12_RESOURCE_STATE_GENERIC_READ, false);
+            if (!b->wgt_e_upload) { *why = "the RDNA3 FP16 twins could not be made"; return nullptr; }
+            void* em = nullptr;
+            if (FAILED(b->wgt_e_upload->Map(0, nullptr, &em)) || !em) { *why = "the FP16 weights upload could not be mapped"; return nullptr; }
+            uint16_t to_f16[256];
+            for (int i = 0; i < 256; ++i) to_f16[i] = tin::f_to_f16(tin::e4m3_to_f(uint8_t(i)));
+            auto* o = static_cast<uint16_t*>(em);
+            for (uint64_t i = 0; i < wbytes; ++i) o[i] = to_f16[b->plan.weights[size_t(i)]];
+            b->wgt_e_upload->Unmap(0, nullptr);
+        }
     }
     std::vector<uint8_t>().swap(b->plan.weights);
     {
@@ -603,9 +728,9 @@ public:
         // tick rate from a queue of our own (the device's timestamp frequency; nothing is submitted to it).
         D3D12_QUERY_HEAP_DESC qh{};
         qh.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-        qh.Count = 2 * kRing;
+        qh.Count = 4 * kRing;   // a record's start / end, and its second list's start / end (frame reuse's split)
         if (SUCCEEDED(device->CreateQueryHeap(&qh, IID_PPV_ARGS(&queries_)))) {
-            stamps_ = buffer(device, D3D12_HEAP_TYPE_READBACK, 16 * kRing, D3D12_RESOURCE_STATE_COPY_DEST, false);
+            stamps_ = buffer(device, D3D12_HEAP_TYPE_READBACK, 32 * kRing, D3D12_RESOURCE_STATE_COPY_DEST, false);
             ID3D12CommandQueue* q = nullptr;
             D3D12_COMMAND_QUEUE_DESC qd{};
             qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
@@ -677,7 +802,7 @@ public:
         std::lock_guard<std::mutex> lock(shared_->m);
         if (shared_->done) {
             auto done = std::move(shared_->done);
-            // The build may have fallen back (CC_SMALL_FP8_EXPERIMENTAL -> CC_SMALL_FP8 when a kernel has no
+            // The build may have fallen back (CC_SMALL_FP8_OPTIMIZED -> CC_SMALL_FP8 when a kernel has no
             // ACO record). The result is registered under what it IS and under what was ASKED (shared_->bw/bh/
             // bnet, still the request this build answered), so the next ask of either finds it instead of
             // starting the same build again every frame.
@@ -763,6 +888,9 @@ public:
         f16_set_ = true; f16_want_ = on;
     }
     void style_grade(bool on) override { grade_set_ = true; grade_want_ = on; }
+    void style_grade_accel(bool on) override { accel_set_ = true; accel_want_ = on; }
+    void split(ID3D12GraphicsCommandList* tail, uint32_t cut) override { split_tail_ = tail; split_cut_ = cut; }
+    uint32_t steps() const override { return current_ ? uint32_t(current_->plan.disp.size()) : 0u; }
     void temporal(const NetTemporal& t) override { temporal_ = t; }
     uint32_t history_texel_bytes() const override {   // (record's own rule for the precision below)
         const Built* b = current_;
@@ -782,6 +910,10 @@ public:
         b->last = c0;
         if ((in.va & 255) || (out.va & 255) || (temporal_.motion_va & 255) || (temporal_.depth_va & 255) || (temporal_.history_va & 255)) { *why = "a linear buffer is not 256-byte aligned"; return false; }
         const auto& tp = b->plan.temporal;
+        // Frame reuse's even frames (split): from dispatch `cut` on in `tail` (taken once; none otherwise)
+        ID3D12GraphicsCommandList* const tail = split_cut_ > 0 && split_cut_ < b->plan.disp.size() ? split_tail_ : nullptr;
+        const uint32_t cut = split_cut_;
+        split_tail_ = nullptr; split_cut_ = 0;
         // [Network] History Precision as the caller last said (history_f16), the plan's ini value before that; RGBA16F
         // only when the folder has its posts (the runtime's h16_ok).
         const bool f16 = (f16_set_ ? f16_want_ : tp.history_f16) && b->t_post16.pso;
@@ -801,11 +933,45 @@ public:
                         f16 ? "RGBA16F" : "RGBA32F", f16 ? "16" : "32");
         }
         b->hist_f16 = int(f16);
+        const bool ext_hist = temporal_.external_history && (temporal_.reset || temporal_.history_va != 0);
+        const auto alloc_hist = [&](FeatureState& st) -> bool {
+            nr::vram::Scope s_hist(nr::vram::kUnset, b->net);
+            for (auto& hh : st.hist) {
+                if (!hh) {
+                    hh = buffer(device_, D3D12_HEAP_TYPE_DEFAULT,
+                                uint64_t(lin_pitch(b->w, f16 ? 8 : 16)) * b->h * (f16 ? 8 : 16),   // (rows of lin_pitch texels)
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
+                    nr::vram::track_d3d12(device_, hh, nr::vram::kUnset);
+                }
+            }
+            if (!st.hist[0] || !st.hist[1]) {
+                release(st.hist[0]);
+                release(st.hist[1]);
+                return false;
+            }
+            return true;
+        };
         // This frame's feature (Runtime::record_all): its state, made on its first frame. A feature whose history is
         // in the other format starts afresh (Runtime::Impl::switch_history: a switch is a cut, as a network switch is).
         FeatureState* fs = nullptr;
         if (auto it = b->features.find(temporal_.feature); it != b->features.end() && it->second && it->second->f16 == f16) {
             fs = it->second.get();
+            if (ext_hist && (fs->hist[0] || fs->hist[1])) {
+                auto drop_holder = std::make_shared<FeatureState>();
+                drop_holder->hist[0] = fs->hist[0];
+                drop_holder->hist[1] = fs->hist[1];
+                fs->hist[0] = fs->hist[1] = nullptr;
+                RetiredUse r;
+                r.net = current_shared_;
+                r.frame = fs->last_frame;
+                r.uses = fs->gpu;
+                r.hold = std::move(drop_holder);
+                retired_features_.push_back(std::move(r));
+            } else if (!ext_hist && (!fs->hist[0] || !fs->hist[1])) {
+                if (!alloc_hist(*fs)) { *why = "the history images could not be made"; return false; }
+                fs->latch = false;
+                fs->hcur = 0;
+            }
         } else {
             if (it != b->features.end()) {
                 RetiredUse r;
@@ -822,16 +988,7 @@ public:
             // history of a feature that still exists.
             auto fresh = std::make_shared<FeatureState>();
             fresh->f16 = f16;
-            {
-                nr::vram::Scope s_hist(nr::vram::kUnset, b->net);
-                for (auto& hh : fresh->hist) {
-                    hh = buffer(device_, D3D12_HEAP_TYPE_DEFAULT,
-                                uint64_t(lin_pitch(b->w, f16 ? 8 : 16)) * b->h * (f16 ? 8 : 16),   // (rows of lin_pitch texels)
-                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
-                    nr::vram::track_d3d12(device_, hh, nr::vram::kUnset);
-                }
-            }
-            if (!fresh->hist[0] || !fresh->hist[1]) { *why = "the history images could not be made"; return false; }
+            if (!ext_hist && !alloc_hist(*fresh)) { *why = "the history images could not be made"; return false; }
             fs = fresh.get();
             b->features[temporal_.feature] = std::move(fresh);
         }
@@ -843,17 +1000,21 @@ public:
         // Controls::noise_every_frame, then a separate per-feature counter across no-MV frames.
         bool gate = false;
         uint32_t pre_seed = 0;
+        static const bool diag_seed0 = [] {
+            const char* e = std::getenv("NR_DIAG_SEED0");
+            return e && e[0] && e[0] != '0';
+        }();
         if (temporal_.have_motion) {
             const bool domain_changed = fs->latch && fs->domain != controls_.reversible;
             gate = fs->latch && !temporal_.reset && !domain_changed;
             if (!fs->latch || temporal_.reset || domain_changed) fs->seed = 0;
             fs->domain = controls_.reversible;
             pre_seed = fs->seed++;
-            if (controls_.seed_fixed) pre_seed = 0;
+            if (controls_.seed_fixed || diag_seed0) pre_seed = 0;
         } else {
             uint32_t& seed = temporal_.feature ? plain_seeds_[temporal_.feature] : plain_seed_;
             if (temporal_.reset) seed = 0;
-            if (controls_.noise_every_frame && !controls_.seed_fixed) pre_seed = seed++;
+            if (controls_.noise_every_frame && !controls_.seed_fixed && !diag_seed0) pre_seed = seed++;
             else seed = 0;
         }
 
@@ -862,17 +1023,26 @@ public:
         const uint64_t act_e_va = b->act_e ? b->act_e->GetGPUVirtualAddress() : 0;
         const uint64_t wgt_e_va = b->wgt_e ? b->wgt_e->GetGPUVirtualAddress() : 0;
         const uint64_t stand_va = b->stand->GetGPUVirtualAddress();
+        const uint64_t sink_va = b->sink->GetGPUVirtualAddress();
         const uint64_t table_va = b->table->GetGPUVirtualAddress();
         const uint64_t params_va = table_va + uint64_t(b->tables) * kTableBytes;
-        // (Passes (fast) Interleaved: the pass's history as it made it, read in place of the feature's; the post block still
-        // stores into the feature's other image, the next frame's history)
-        const uint64_t hist_va = temporal_.history_va ? temporal_.history_va : fs->hist[fs->hcur]->GetGPUVirtualAddress();
-        const uint64_t store_va = fs->hist[fs->hcur ^ 1u]->GetGPUVirtualAddress();
+        // (Passes (fast) Interleaved: the pass's history as it made it, read in place of the feature's; with external
+        // history, HIST_STORE binds the 1x1 sink: the post block's stores outside it are dropped, its pixel (0, 0) lands
+        // there - never in the stand, whose 1x1 is the missing depth read through a clamping sampler by every pixel)
+        const uint64_t hist_va = temporal_.history_va ? temporal_.history_va
+                               : (ext_hist || !fs->hist[fs->hcur] ? stand_va : fs->hist[fs->hcur]->GetGPUVirtualAddress());
+        const uint64_t store_va = (ext_hist || !fs->hist[fs->hcur ^ 1u]) ? sink_va : fs->hist[fs->hcur ^ 1u]->GetGPUVirtualAddress();
         NetControlsPatch patch = g_patch.load();
         // [Network] Style Grade as the caller last said (style_grade), the plan's ini value before that (the Vulkan
         // runtime's style_grade && style_grade_on)
         const bool grade = b->t_grade.pso && controls_.style != 0 && !controls_.no_grade &&
                            (grade_set_ ? grade_want_ : b->plan.style_grade);
+        // [Network] Style Grade Acceleration (the caller's, the plan's ini value before that): the closed-form twin
+        const bool grade_closed = grade && b->t_grade_a.pso && (accel_set_ ? accel_want_ : b->plan.style_grade_accel);
+        if (grade && grade_form_said_ != (grade_closed ? 2 : 1)) {
+            grade_form_said_ = grade_closed ? 2 : 1;
+            nr::pe::log("[d3d12] Style grade: %s", grade_closed ? "in closed form (Style Grade Acceleration)" : "step by step");
+        }
 
         // retarget: the weights with their tail once. Recorded only after this record has a slot: a record that
         // declines below must not leave the weight copy in the list, or the next one would transition b->wgt from
@@ -922,10 +1092,12 @@ public:
         }
         Built::Upload* slot_buf = nullptr;
         uint32_t slot_i = 0;
-        const nr::gpu::Ticket record_ticket = split::book(cmd);
+        const nr::gpu::Ticket record_ticket = d3d12_direct::book(cmd);
+        // (split: what this record touches is in use until its second list has run too)
+        const nr::gpu::Ticket tail_ticket = tail ? d3d12_direct::book(tail) : nr::gpu::Ticket{};
         for (auto& u : b->upload) {
             for (uint32_t i = 0; i < kRing; ++i) {
-                const bool free = u.uses[i] ? split::completed(u.uses[i])
+                const bool free = u.uses[i] ? d3d12_direct::completed(u.uses[i])
                                                   : (u.owner[i] == ~uint64_t(0) ||
                                                      (b->copied >= 0 && u.owner[i] <= uint64_t(b->copied)));
                 if (free) { slot_buf = &u; slot_i = i; break; }
@@ -964,17 +1136,26 @@ public:
         b->last_frame = int64_t(frame);
         if (first) b->initialization = record_ticket;
         touch_recording(b->gpu, record_ticket);
+        if (tail_ticket) touch_recording(b->gpu, tail_ticket);
         if (fs) {
             fs->last_frame = int64_t(frame);
             touch_recording(fs->gpu, record_ticket);
+            if (tail_ticket) touch_recording(fs->gpu, tail_ticket);
         }
         slot_buf->owner[slot_i] = frame;
         if (first) {
-            cmd->CopyBufferRegion(b->wgt, 0, b->wgt_upload, 0, b->wgt->GetDesc().Width);
-            transition(cmd, b->wgt, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            if (b->wgt_e) {
-                cmd->CopyBufferRegion(b->wgt_e, 0, b->wgt_e_upload, 0, b->wgt_e->GetDesc().Width);
-                transition(cmd, b->wgt_e, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            if (b->wgt_uploaded) {
+                transition(cmd, b->wgt, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                if (b->wgt_e) transition(cmd, b->wgt_e, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            } else {
+                transition(cmd, b->wgt, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+                cmd->CopyBufferRegion(b->wgt, 0, b->wgt_upload, 0, b->wgt->GetDesc().Width);
+                transition(cmd, b->wgt, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                if (b->wgt_e) {
+                    transition(cmd, b->wgt_e, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+                    cmd->CopyBufferRegion(b->wgt_e, 0, b->wgt_e_upload, 0, b->wgt_e->GetDesc().Width);
+                    transition(cmd, b->wgt_e, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                }
             }
         }
         if (noise_made) {   // the stand-in goes behind every recording that bound it (this one included)
@@ -1005,6 +1186,7 @@ public:
             size_t at = 0;
             const auto put_res = [&](uint32_t* d, Res r, bool twin) {   // twin: RDNA3's e4m3 view (the arena's / weights' twin)
                 if (r == PARAMS) put_buf(d, params_va, 48);
+                else if (r == PRE_PARAMS) put_buf(d, params_va + kPreParamsAt, 48);
                 else if (r == NOISE) put_buf(d, noise_va, noise_size);
                 else if (twin && r == ACT) put_buf(d, act_e_va, b->plan.act_total * 2);
                 else if (twin && r == WGT) put_buf(d, wgt_e_va, b->wgt_e->GetDesc().Width);
@@ -1027,9 +1209,18 @@ public:
                 case TEX_IN: put_img(d, in.va, b->w, b->h, in_format); break;
                 case SURF0: put_img(d, out.va, b->w, b->h, out_format); break;
                 case SURF1: put_img(d, stand_va, 1, 1, kFormatRgba32f); break;
-                case FLOW: put_img(d, temporal_.motion_va, b->w, b->h, mv_format); break;
-                case HIST: put_img(d, hist_va, b->w, b->h, hist_format); break;
-                case HIST_STORE: put_img(d, store_va, b->w, b->h, hist_format); break;
+                case FLOW:
+                    if (temporal_.motion_va) put_img(d, temporal_.motion_va, b->w, b->h, mv_format);
+                    else put_img(d, stand_va, 1, 1, mv_format);
+                    break;
+                case HIST:
+                    if (ext_hist && !gate) put_img(d, stand_va, 1, 1, hist_format);
+                    else put_img(d, hist_va, b->w, b->h, hist_format);
+                    break;
+                case HIST_STORE:
+                    if (ext_hist) put_img(d, sink_va, 1, 1, hist_format);
+                    else put_img(d, store_va, b->w, b->h, hist_format);
+                    break;
                 case DEPTH:
                     if (temporal_.depth_va) put_img(d, temporal_.depth_va, b->w, b->h, kFormatRgba32f);
                     else put_img(d, stand_va, 1, 1, kFormatRgba32f);
@@ -1076,7 +1267,8 @@ public:
                 }
                 pre_seed0 = !pre_seed && !b->noise_real && !b->plan.noise.empty();
             } else if (int(i) == tp.post) {
-                k = f16 ? (grade ? &b->t_grade16 : &b->t_post16) : (grade ? &b->t_grade : &b->t_post);
+                k = f16 ? (grade_closed ? &b->t_grade16_a : grade ? &b->t_grade16 : &b->t_post16)
+                        : (grade_closed ? &b->t_grade_a : grade ? &b->t_grade : &b->t_post);
             } else {
                 k = &b->kern.at(d.kern);
             }
@@ -1091,13 +1283,17 @@ public:
             // motion field covering the frame (the backend resampled the guide's region onto it).
             const float hs = controls_.history_strength >= 0.f ? std::min(std::max(controls_.history_strength, 0.f), 1.f) : 1.0f;
             const bool have_depth = temporal_.have_depth && !b->plan.temporal.motion_without_depth;
-            const float params[12] = {gate ? 1.0f : 0.0f, temporal_.motion_scale_x, temporal_.motion_scale_y,
+            // [0] the gate: the post's closed at strength 0 (Post history), the pre's copy (kPreParamsAt) with Pre history
+            // (Runtime::record_all)
+            float params[12] = {gate && hs > 0.f ? 1.0f : 0.0f, temporal_.motion_scale_x, temporal_.motion_scale_y,
                                       hs * tp.blend_scale, float(b->w), float(b->h),
                                       have_depth ? 1.0f : 0.0f,
                                       have_depth && temporal_.depth_inverted ? 1.0f : 0.0f,
                                       1.0f, 1.0f, 0.0f, 0.0f};
             std::memset(ring + uint64_t(b->tables) * kTableBytes, 0, kParamsBytes);
             std::memcpy(ring + uint64_t(b->tables) * kTableBytes, params, sizeof params);
+            params[0] = gate && controls_.pre_history ? 1.0f : 0.0f;
+            std::memcpy(ring + uint64_t(b->tables) * kTableBytes + kPreParamsAt, params, sizeof params);
         }
         const uint32_t lo = n_noise ? 0 : base;
         if (b->table_uav) transition(cmd, b->table, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -1113,27 +1309,42 @@ public:
         uint32_t ts = kRing;
         if (stamps_map_) {
             for (uint32_t i = 0; i < kRing; ++i) {
-                if (stamp_uses_[i] && split::completed(stamp_uses_[i])) {
-                    uint64_t t2[2];
-                    std::memcpy(t2, stamps_map_ + i * 16, 16);
-                    if (t2[1] > t2[0]) note_gpu(double(t2[1] - t2[0]) * 1000.0 / hz_);
+                if (stamp_uses_[i] && d3d12_direct::completed(stamp_uses_[i])) {
+                    uint64_t t4[4];   // start / end, and a split record's second list's start / end
+                    std::memcpy(t4, stamps_map_ + i * 32, 32);
+                    if (t4[1] > t4[0]) {
+                        double ticks = double(t4[1] - t4[0]);
+                        if (t4[2] && t4[3] > t4[2]) ticks += double(t4[3] - t4[2]);
+                        note_gpu(ticks * 1000.0 / hz_);
+                    }
                     stamp_uses_[i].reset();
                 }
                 if (!stamp_uses_[i] && ts == kRing) ts = i;
             }
         }
-        const auto recording = ts < kRing ? split::book(cmd) : nr::gpu::Ticket{};
+        const auto recording = ts < kRing ? d3d12_direct::book(cmd) : nr::gpu::Ticket{};
         const bool timed = bool(recording);
         if (timed) {
-            stamp_uses_[ts] = recording;
+            stamp_uses_[ts] = tail ? tail_ticket : recording;   // (split: read once the second list has run)
             // A recording reset without execution has no timestamp result. Do not count a previous use's pair.
-            std::memset(stamps_map_ + ts * 16, 0, 16);
-            cmd->EndQuery(queries_, D3D12_QUERY_TYPE_TIMESTAMP, ts * 2);
+            std::memset(stamps_map_ + ts * 32, 0, 32);
+            cmd->EndQuery(queries_, D3D12_QUERY_TYPE_TIMESTAMP, ts * 4);
         }
 
         // record: the noise table's jobs (when made now), then every dispatch in plan order, a barrier after each.
         cmd->SetComputeRootSignature(rs_);
         for (uint32_t i = lo; i < b->tables; ++i) {
+            if (tail && i == base + cut) {   // the rest in the second list (it runs after this one: the tables are there)
+                uav_barrier(cmd);
+                if (timed) {
+                    cmd->EndQuery(queries_, D3D12_QUERY_TYPE_TIMESTAMP, ts * 4 + 1);
+                    cmd->ResolveQueryData(queries_, D3D12_QUERY_TYPE_TIMESTAMP, ts * 4, 2, stamps_, uint64_t(ts) * 32);
+                }
+                cmd = tail;
+                uav_barrier(cmd);
+                cmd->SetComputeRootSignature(rs_);
+                if (timed) cmd->EndQuery(queries_, D3D12_QUERY_TYPE_TIMESTAMP, ts * 4 + 2);
+            }
             const Built::Kern& k = *kern[i];
             const uint8_t* t = ring + uint64_t(i) * kTableBytes;
             uint32_t grid[3];
@@ -1144,17 +1355,19 @@ public:
             cmd->SetComputeRootUnorderedAccessView(1, table_va + uint64_t(i) * kTableBytes);
             cmd->Dispatch(grid[0], grid[1], grid[2]);
             const bool nobar = i >= base && (i - base) < b->plan.disp.size() && b->plan.disp[i - base].no_barrier_after;
-            if (!nobar) uav_barrier(cmd);
+            if (!nobar || i + 1u == b->tables) uav_barrier(cmd);
         }
         if (first) {
             b->retargeted = true;
-            RetiredUse r;
-            r.net = current_shared_;
-            r.upload = b->wgt_upload;
-            r.uses = b->gpu;
-            r.frame = int64_t(frame);
-            retire_upload_.push_back(std::move(r));
-            b->wgt_upload = nullptr;
+            if (b->wgt_upload) {
+                RetiredUse r;
+                r.net = current_shared_;
+                r.upload = b->wgt_upload;
+                r.uses = b->gpu;
+                r.frame = int64_t(frame);
+                retire_upload_.push_back(std::move(r));
+                b->wgt_upload = nullptr;
+            }
             if (b->wgt_e_upload) {
                 RetiredUse e;
                 e.net = current_shared_;
@@ -1165,15 +1378,18 @@ public:
                 b->wgt_e_upload = nullptr;
             }
         }
-        if (timed) {
-            cmd->EndQuery(queries_, D3D12_QUERY_TYPE_TIMESTAMP, ts * 2 + 1);
-            cmd->ResolveQueryData(queries_, D3D12_QUERY_TYPE_TIMESTAMP, ts * 2, 2, stamps_, uint64_t(ts) * 16);
+        if (timed && tail) {
+            cmd->EndQuery(queries_, D3D12_QUERY_TYPE_TIMESTAMP, ts * 4 + 3);
+            cmd->ResolveQueryData(queries_, D3D12_QUERY_TYPE_TIMESTAMP, ts * 4 + 2, 2, stamps_, uint64_t(ts) * 32 + 16);
+        } else if (timed) {
+            cmd->EndQuery(queries_, D3D12_QUERY_TYPE_TIMESTAMP, ts * 4 + 1);
+            cmd->ResolveQueryData(queries_, D3D12_QUERY_TYPE_TIMESTAMP, ts * 4, 2, stamps_, uint64_t(ts) * 32);
         }
         cmd->CopyBufferRegion(b->done, (kDoneSlots + uint64_t(frame % kDoneSlots)) * 8,
                               b->exec_token, token_off, 8);
         if (temporal_.have_motion) {
             fs->latch = true;
-            fs->hcur ^= 1u;
+            if (!ext_hist) fs->hcur ^= 1u;
         }
         ++frames_;
         if (temporal_.reset) ++resets_;
@@ -1261,6 +1477,10 @@ private:
     nr::D3d12NetControls controls_;
     bool f16_set_ = false, f16_want_ = true;   // [Network] History Precision from the caller (history_f16)
     bool grade_set_ = false, grade_want_ = true;   // [Network] Style Grade from the caller (style_grade)
+    bool accel_set_ = false, accel_want_ = true;   // [Network] Style Grade Acceleration from the caller (style_grade_accel)
+    ID3D12GraphicsCommandList* split_tail_ = nullptr;   // the next record's second list (split), from its dispatch split_cut_
+    uint32_t split_cut_ = 0;
+    int grade_form_said_ = 0;                      // the grade's form last said in the log (1 step by step, 2 closed form)
     NetTemporal temporal_;
     uint32_t plain_seed_ = 0;
     std::map<uint64_t, uint32_t> plain_seeds_;

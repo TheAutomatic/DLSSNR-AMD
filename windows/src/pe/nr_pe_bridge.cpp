@@ -16,6 +16,7 @@
 #include <iterator>
 
 extern "C" void nr_vk_load(void);
+extern "C" const char* nr_vk_source;
 
 namespace nr::pe::bridge {
 
@@ -186,6 +187,10 @@ Device* Device::get(const LUID& luid, std::string* why) {
 bool Device::create(const LUID& luid, std::string* why) {
     luid_ = luid;
     nr_vk_load();
+    if (std::strcmp(nr_vk_source, "none") == 0) {
+        *why = "the Vulkan loader is unavailable";
+        return false;
+    }
     nr::vram::install_vulkan();   // our allocations counted for NR Control's VRAM breakdown (as on the interop path)
     uint32_t api = 0;
     if (vkEnumerateInstanceVersion(&api) != VK_SUCCESS || api < VK_API_VERSION_1_3) {
@@ -197,6 +202,30 @@ bool Device::create(const LUID& luid, std::string* why) {
     app.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
+    // OptiScaler's FSR FG device hook queries Win32 presentation support even on
+    // our compute-only device. The query belongs to the instance extension.
+    const char* const surface_extensions[] = {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME};
+    uint32_t extension_count = 0;
+    std::vector<VkExtensionProperties> available;
+    VkResult enumerated;
+    do {
+        enumerated = vkEnumerateInstanceExtensionProperties(nullptr, &extension_count, nullptr);
+        if (enumerated != VK_SUCCESS || !extension_count) break;
+        available.resize(extension_count);
+        enumerated = vkEnumerateInstanceExtensionProperties(nullptr, &extension_count, available.data());
+    } while (enumerated == VK_INCOMPLETE);
+    if (enumerated == VK_SUCCESS) {
+        available.resize(extension_count);
+        const auto supported = [&](const char* name) {
+            return std::any_of(available.begin(), available.end(), [&](const VkExtensionProperties& e) {
+                return std::strcmp(e.extensionName, name) == 0;
+            });
+        };
+        if (std::all_of(std::begin(surface_extensions), std::end(surface_extensions), supported)) {
+            ici.enabledExtensionCount = uint32_t(std::size(surface_extensions));
+            ici.ppEnabledExtensionNames = surface_extensions;
+        }
+    }
     if (vkCreateInstance(&ici, nullptr, &instance_) != VK_SUCCESS) {
         *why = "could not create a Vulkan instance";
         return false;
@@ -329,7 +358,6 @@ bool Device::create(const LUID& luid, std::string* why) {
         wml.pNext = &prf;
         extensions.push_back(VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME);
     }
-
     uint32_t qcount = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(physical_, &qcount, nullptr);
     std::vector<VkQueueFamilyProperties> families(qcount);
@@ -376,6 +404,7 @@ bool Device::create(const LUID& luid, std::string* why) {
     handles_.instance = instance_;
     handles_.physical = physical_;
     handles_.device = device_;
+    pipeline_robustness_ = robustness;
     log("[nr] bridge: own Vulkan device on %s (queue family %u%s), the game's D3D runtime is native",
         chosen.deviceName, family_, keyed_mutex_ ? ", keyed mutexes" : "");
     return true;
@@ -586,6 +615,30 @@ bool Device::create_d3d12(ID3D12Device* device, uint32_t width, uint32_t height,
     return true;
 }
 
+bool Device::d3d11_keyed_handover() const {
+    // Default on when the driver exposes VK_KHR_win32_keyed_mutex: on AMD's Windows D3D11 driver a shared
+    // ID3D11Fence alone occasionally lets Vulkan read the shared twin before D3D11's CopyResource is visible,
+    // feeding the previous frame's NR output back in (periodic bright/dark flashes). NR_D11_VK_KEYED_MUTEX=0
+    // restores the shared-fence hand-over.
+    static const bool enabled = [] {
+        char value[2]{};
+        const DWORD n = GetEnvironmentVariableA("NR_D11_VK_KEYED_MUTEX", value, sizeof value);
+        return !(n == 1 && value[0] == '0');
+    }();
+    if (!enabled) {
+        static std::once_flag noted;
+        std::call_once(noted, [] {
+            log("[nr] bridge: NR_D11_VK_KEYED_MUTEX=0: using the shared fence for D3D11 hand-overs");
+        });
+    } else if (!keyed_mutex_) {
+        static std::once_flag warned;
+        std::call_once(warned, [] {
+            log("[nr] bridge: VK_KHR_win32_keyed_mutex unavailable; falling back to the shared fence for D3D11 hand-overs");
+        });
+    }
+    return enabled && keyed_mutex_;
+}
+
 bool Device::create_d3d11(ID3D11Device* device, uint32_t width, uint32_t height, DXGI_FORMAT format, Image* out,
                           std::string* why) {
     destroy(*out);
@@ -614,7 +667,8 @@ bool Device::create_d3d11(ID3D11Device* device, uint32_t width, uint32_t height,
     desc.Format = format; desc.SampleDesc.Count = 1;
     desc.Usage = D3D11_USAGE_DEFAULT;
     desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | (storage ? D3D11_BIND_UNORDERED_ACCESS : 0);
-    desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+    desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE |
+                     (d3d11_keyed_handover() ? D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX : D3D11_RESOURCE_MISC_SHARED);
     ID3D11Texture2D* texture = nullptr;
     HRESULT hr = device->CreateTexture2D(&desc, nullptr, &texture);
     if (FAILED(hr)) {
@@ -696,18 +750,21 @@ bool Device::create_d3d10(ID3D10Device* device, uint32_t width, uint32_t height,
 }
 
 bool Device::submit_keyed(Job* job, uint64_t generation, const std::vector<const Image*>& images,
-                          uint64_t acquire_key, uint64_t release_key) {
+                          uint64_t acquire_key, uint64_t release_key, VkResult* submitted) {
+    if (submitted) *submitted = VK_NOT_READY;
     std::vector<std::function<void()>> calls;
+    bool rejected = false;
     {
         std::lock_guard<std::mutex> guard(jobs_mutex_);
         if (job->gen != generation || job->state != Job::Ready) return false;
-        if (lost_) { drop_locked(job, calls); }
+        rejected = lost_;
+        if (rejected) drop_locked(job, calls);
     }
-    if (!calls.empty()) { for (auto& c : calls) c(); return false; }
+    if (rejected) { if (submitted) *submitted = VK_ERROR_DEVICE_LOST; for (auto& c : calls) c(); return false; }
     std::vector<VkDeviceMemory> memories;
     for (const Image* i : images) if (i && i->memory) memories.push_back(i->memory);
     std::vector<uint64_t> acquire(memories.size(), acquire_key), release(memories.size(), release_key);
-    std::vector<uint32_t> timeouts(memories.size(), 1000);
+    std::vector<uint32_t> timeouts(memories.size(), kKeyedTimeoutMs);
     VkWin32KeyedMutexAcquireReleaseInfoKHR km{VK_STRUCTURE_TYPE_WIN32_KEYED_MUTEX_ACQUIRE_RELEASE_INFO_KHR};
     km.acquireCount = uint32_t(memories.size());
     km.pAcquireSyncs = memories.data();
@@ -730,12 +787,14 @@ bool Device::submit_keyed(Job* job, uint64_t generation, const std::vector<const
             drop_locked(job, calls);
             static bool said = false;
             if (!said) { said = true; log("[nr] bridge: keyed-mutex vkQueueSubmit failed (%d)", int(r)); }
+            if (r == VK_ERROR_DEVICE_LOST && !lost_) { lost_ = true; log("[nr] bridge: our Vulkan device was lost"); }
         } else {
             job->state = Job::Submitted;
             job->submitted = ++g_submits;
         }
     }
     for (auto& c : calls) c();
+    if (submitted) *submitted = r;
     return r == VK_SUCCESS;
 }
 

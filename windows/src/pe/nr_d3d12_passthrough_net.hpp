@@ -21,7 +21,7 @@ namespace nr::pe::d3d12_passthrough {
 
 // Who lowers the network: the .asi sets nr::plan_d3d12_network for its installation (nr_asi_main.cpp); a test sets
 // one of its own. None set: the backend keeps the placeholder copy network.
-using NetPlanner = bool (*)(uint32_t width, uint32_t height, int model, bool experimental, nr::D3d12NetPlan* out, std::string* why);
+using NetPlanner = bool (*)(uint32_t width, uint32_t height, int model, bool small_fp8_optimized, nr::D3d12NetPlan* out, std::string* why);
 using NetControlsPatch = void (*)(nr::D3d12NetPlan::Dispatch& d, const nr::D3d12NetControls& c, bool grade);
 using NetModelQuery = int (*)();
 void set_net_planner(NetPlanner planner, NetControlsPatch patch = nullptr, NetModelQuery model_query = nullptr);

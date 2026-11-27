@@ -14,6 +14,8 @@ dlssnr-amd.pipelinecache
 *.bin
 # except the int4 tables (CC_SILVER_AARDWOLD_OPTIMIZED's int4 layers): per-matrix corrections and calibration means, no
 # weight values
-!/linux/data/int4/**/*.bin
-!/linux/data/int4-ultra/**/*.bin
+!/linux/data/CC_SILVER_AARDWOLD_OPTIMIZED-balanced/**/*.bin
+!/linux/data/CC_SILVER_AARDWOLD_OPTIMIZED-ultra/**/*.bin
+# ... and CC_SMALL_FP8_OPTIMIZED Ultra Performance's int4 tables (the same kinds)
+!/linux/data/CC_SMALL_FP8_OPTIMIZED-ultra/**/*.bin
 nvngx*

@@ -41,7 +41,7 @@ list with `GetModuleHandleW` (never `LoadLibrary`) and routes through its export
 | **`nvngx.dll_dlssnr.dll`** | **the forwarder, for the older lineage** | same |
 | **`nvngx_dlssnr.dll`** | **a byte copy of the forwarder** | same |
 | `vulkan-1.dll` | exports forwarded to `winevulkan.dll`, as Proton's own `vulkan-1.dll`; keeps OptiScaler's menu working when Proton loads a native Vulkan loader (not installed when the game brings its own) | `linux/vulkan-loader/vulkan1_forwarder.c`, built by `linux/build/build_package.sh` |
-| `dlssnr-amd/` | the models, the network's SPIR-V, the pipeline cache, int4 mixed's network and Vulkan layer, NR Control's Vulkan layer | `linux/build/build_package.sh`'s package |
+| `dlssnr-amd/` | the models, the network's SPIR-V, the pipeline cache, the int4 levels' networks and Vulkan layer, NR Control's Vulkan layer | `linux/build/build_package.sh`'s package |
 | `dlssnr-amd.ini` | our own settings: `[Network]`, `[Preprocess]`, `[RenoDX]`, `[Log]` | written at install |
 
 The package's `install.sh <game-dir> optiscaler` does all of it. (`install_optiscaler_nr.sh` in this

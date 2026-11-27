@@ -28,7 +28,7 @@ D3D12 and DXVK translates D3D10/11. Both expose interop interfaces that hand ove
 `VkDevice`, queue, command buffers and images. The network's shaders are recorded straight into the
 game's own command buffer, at the point where the frame is processed.
 
-**`optiscaler` route (Linux, since 0.0.8).** The original [OptiScaler](https://github.com/optiscaler/OptiScaler)
+**`optiscaler` route (Linux since 0.0.8, Windows since 0.0.8.1).** The original [OptiScaler](https://github.com/optiscaler/OptiScaler)
 (shipped unchanged) hooks the game's DLSS/FSR/XeSS upscaler and does the upscaling and frame
 generation. Our NR is an OptiScaler plugin, `dlssnr-amd.asi` (`linux/src/pe/nr_asi_main.cpp`), which OptiScaler
 loads from `OptiScaler/plugins/` (`[Plugins] LoadAsiPlugins = true`). Every upscaler input of OptiScaler ends in its
@@ -41,14 +41,9 @@ DXVK's work, Vulkan games into the game's own command buffer. The wilsjo2 style
 (`linux/src/core/nr_wilsjo2.cpp`, `linux/shaders/wilsjo2/`) and HUD FIX (`linux/src/pe/nr_asi_hudcap.cpp`) are part
 of the plugin; NR Control is drawn by it too (`linux/src/pe/nr_pe_menu.cpp`).
 
-**`optiscaler` route (Windows).** [OptiScaler-NR](https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass)
-hooks the game's DLSS/FSR/XeSS upscaler, gathers colour, depth and the engine's own motion vectors,
-and calls NVIDIA's NGX API for feature 18 (DLSS-NR). This project provides that API: an NGX core
-(`dlssnr_core.dll`, which OptiScaler loads through `[Libraries] NvngxPath`) implements the NGX entry
-points and runs our network instead of NVIDIA's. It is deliberately not named `_nvngx.dll`: Streamline
-games would take a loaded module of that name for NVIDIA's own core and lose their DLSS option.
-OptiScaler's file is not modified; a few defects of the bundled release are corrected in memory when
-it loads the core (`windows/src/pe/nr_pe_optifix.cpp`, listed in `linux/package/optiscaler/README.md`).
+**`optiscaler` route (Windows).** The same plugin (`windows/src/pe/nr_asi_main.cpp`) in the original OptiScaler.
+The game's D3D is not translated there, so NR runs either on the game's own D3D12 device (the D3D12 passthrough,
+below) or on a Vulkan device of its own with the frames handed across (the Vulkan bridge, under Windows below).
 The motion vectors and depth are the engine's own, not estimated as in the ReShade routes.
 
 **`reshade-feeder` route.** For games without an upscaler to hook, a ReShade add-on (the design follows
@@ -81,14 +76,25 @@ Native Vulkan games use the same route: ReShade as a layer under the game's own 
 with the ReShade Add-ons page) over the game's DXGI swap chain (D3D11 / D3D12 games) or its Vulkan swap chain, in
 the swap chain's encoding. `nr_present_probe.exe` finds DXGI's methods in a process of its own (no D3D device or swap
 chain is made inside the game's). Settings go through `dlssnr-amd.ini`, status through
-`dlssnr-amd/control.bin` (`linux/src/core/nr_control_shared.hpp`). The Windows version draws the same menu from the
-NGX core itself; see Windows below.
+`dlssnr-amd/control.bin` (`linux/src/core/nr_control_shared.hpp`). The Windows plugin draws the same menu; see Windows
+below.
 
 **RenoDX style.** A layer with the RenoDX processing wraps the network in RenoDX's DLSS5 processing on every
 route (`linux/src/core/nr_renodx.cpp`): RenoDX's encode, look and resolve shaders (`linux/shaders/renodx`,
 compiled by Slang as RenoDX builds its Vulkan path), with the network as the model in between. Passes (fast)
 (`linux/shaders/renodx-fast`, `linux/src/core/nr_fast_passes.hpp`) and Preprocess (`linux/shaders/renodx-prep`)
 run inside it.
+
+**Frame reuse.** With it on, a layer at the Present runs the network on every other frame
+(`linux/src/core/nr_frame_reuse.cpp`, shaders in `linux/shaders/frame-reuse/`). The network's passes of an NR frame
+are split: the first part is recorded into that frame's command stream, the rest into a secondary command buffer
+that the next frame's recording runs first, so every frame carries about half of the network. The frame in between
+is rebuilt from the NR frames before and after it: their edits (answer minus input) are carried along the game's
+motion vectors from both sides (`compose.comp`), merged, and the uncovered places filled from trusted neighbours;
+a temporal filter (`display.comp`) steadies the shown edit. Every frame is therefore shown two frames later; the
+frame generation the plugin follows gets its inputs delayed to match (`linux/src/pe/nr_asi_main.cpp`,
+`nr_asi_hudcap.cpp`). On Windows the D3D12 passthrough has its own host for it
+(`windows/src/pe/nr_frame_reuse_d3d12.cpp`), running the same shaders as ACO machine code.
 
 **Windows.** A native D3D game on Windows has no Vulkan device underneath it. DirectX 10/11/12 games
 keep the system's D3D, and the network runs on a Vulkan device of its own, created on the adapter the
@@ -113,7 +119,7 @@ shared D3D fence imported as a Vulkan timeline semaphore:
 D3D9 shares neither textures nor fences, so DX9 games run on DXVK with ReShade as a Vulkan layer
 underneath it, as on Linux.
 
-NR Control on Windows has no Vulkan swap chain to sit on: the NGX core hooks DXGI's `Present`, `Present1`
+NR Control on Windows has no Vulkan swap chain to sit on in D3D games: the plugin hooks DXGI's `Present`, `Present1`
 and `SetColorSpace1` in the system's `dxgi.dll` (`windows/src/pe/nr_pe_menu.cpp`), below OptiScaler's own
 swap chain wrapper, so the menu lands on the frame after OptiScaler's menu and frame generation. The
 addresses come from `dlssnr-amd\nr_present_probe.exe`, which makes D3D12 and D3D11 swap chains in a
@@ -121,13 +127,22 @@ process of its own and writes each method as a module path and offset: a swap ch
 would be seen, and kept, by the hooks OptiScaler has there. While open (and, closed, while the OSD of the
 running network is due), the menu is drawn with Dear ImGui (D3D11 or D3D12 backend, on the swap chain's
 device) into an 8-bit image of its own and laid over the back buffer in the swap chain's encoding (SDR,
-scRGB or HDR10, from `SetColorSpace1` and the format). Its contents are Linux's (`windows/src/ui/nr_control_ui.hpp`); status comes from the core in the
-same process, settings go through `dlssnr-amd.ini`, and keyboard and mouse come from the game window.
+scRGB or HDR10, from `SetColorSpace1` and the format). Its contents are Linux's (`windows/src/ui/nr_control_ui.hpp`); status comes from the plugin in
+the same process, settings go through `dlssnr-amd.ini`, and keyboard and mouse come from the game window.
+
+**D3D12 passthrough.** In D3D12 games the network can run on the game's own D3D12 device: the same ACO machine
+code as on the Vulkan bridge, made into pipelines by AMD's driver through its D3D12 extension
+(`windows/src/pe/nr_d3d12_passthrough*.cpp`, the RenoDX stage in `nr_renodx_d3d12.cpp`, the kernels around the
+network in `windows/data/aco/d3d12_outer.nra` and `rdna3/`, made by `windows/build/build_d3d12_outer_aco.py`). NR's
+work never changes the game's descriptor heap bindings; what the passthrough cannot serve (a game-folder
+`d3d12.dll`, wrapped or compute command lists) goes through the Vulkan bridge.
+
+**32-bit games (Windows).** The ReShade routes have a 32-bit add-on (`dlssnr_amd.addon32`, built by
+`windows/build/x86/build32.sh`) with the same networks and ACO machine code, in a package of its own.
 
 The Windows version runs the same network through AMD's Windows shader compiler, which produces slower
-code for the largest kernels than Mesa's ACO does on Linux. With `[Network] ACO Mode = 1` (the default) it imports
-machine code made by ACO for the Linux shaders instead (`windows/data/aco/records`; int4 mixed's in
-`windows/data/aco/int4`), through
+code for the largest kernels than Mesa's ACO does on Linux. It imports machine code made by ACO for the Linux
+shaders instead, always first (`windows/data/aco/records`; the int4 levels' in `windows/data/aco/int4`), through
 `VK_KHR_pipeline_binary`: the driver compiles a shader with the same interface to get its pipeline
 container, ACO's code is put into that container (`windows/src/core/nr_pal_binary.hpp`,
 `nr_pipeline_binary.hpp`), and the imported binaries are kept in `dlssnr-amd\aco-cache`. Whether AMD's
@@ -135,25 +150,24 @@ driver runs the GPU is asked of AMD's driver itself, by the adapter's LUID
 (`windows/src/core/nr_driver_identity.hpp`), not of the Vulkan loader: OptiScaler's GPU spoofing changes
 what the loader reports.
 
-## Why Vulkan and not HIP/ROCm
+## Why Vulkan
 
-HIP could run this network as well - ROCm supports RDNA4 and its WMMA instructions. Vulkan was chosen
-because it fits the job better:
-
-- **The code runs inside the game.** OptiScaler, ReShade and every add-on are Windows DLLs loaded into
-  the game's process; on Linux that process is a Wine/Proton process. Vulkan is there already, because
-  DXVK and vkd3d-proton are how the game draws. HIP would need ROCm installed and a bridge from the
-  Wine process to the Linux runtime.
-- **Same device, no copies.** With Vulkan the network records into the game's own command buffers on
-  the game's own device. HIP would need its own context next to the game's Vulkan device, the frame's
-  images imported or copied into it, and synchronisation between the two APIs every frame.
-- **One code base for Linux and Windows.** The AMD Windows driver exposes the same Vulkan extensions
-  (`VK_KHR_cooperative_matrix`, `VK_EXT_shader_float8`), so the Windows version is the same shaders and
-  host code, compiled by a different driver.
-- **The hardware is reachable.** Cooperative matrices with FP8 operands compile to the RDNA4 WMMA
-  instructions, which is where the network's time goes. The network is one sequential chain of about
-  150 layers (only one adjacent pair is independent), so HIP streams or graphs would have nothing to
-  run in parallel.
+- Through Vulkan the shaders are compiled by ACO, the compiler of Mesa's Vulkan driver, which makes faster machine code
+  for this network than the AMD Windows driver's compiler; this is the main reason, and why the Windows version runs
+  ACO's machine code as well.
+- OptiScaler, ReShade and every add-on are Windows DLLs loaded into the game's process; on Linux that process is a
+  Wine/Proton process. Vulkan is there already, because DXVK and vkd3d-proton are how the game draws. HIP would need
+  ROCm installed and a bridge from the Wine process to the Linux runtime.
+- With Vulkan the network records into the game's own command buffers on the game's own device, and in D3D12 games on
+  Windows ACO's machine code can run on the game's own D3D12 device (the D3D12 passthrough). HIP would need its own
+  context next to the game's device, the frame's images imported or copied into it, and synchronisation between the
+  two APIs every frame.
+- The AMD Windows driver exposes the same Vulkan extensions (`VK_KHR_cooperative_matrix`, `VK_EXT_shader_float8`), so
+  the Windows version runs the same shaders, as the machine code ACO makes for Linux, loaded through
+  `VK_KHR_pipeline_binary`.
+- Cooperative matrices with FP8 operands compile to the RDNA4 WMMA instructions, which is where the network's time goes.
+  The network is one sequential chain of about 150 layers (only one adjacent pair is independent), so HIP streams or
+  graphs would have nothing to run in parallel.
 
 ## Layout
 
@@ -162,19 +176,22 @@ because it fits the job better:
 linux/                 the Linux version (the reference implementation)
   src/core/              network runtime: graph, Vulkan helpers, planner
   src/pe/                the Windows DLLs as run under Proton: the OptiScaler plugin with NR Control, ReShade add-on
-  src/layer/             int4 mixed's Vulkan layer (ReShade routes)
+  src/layer/             the int4 levels' Vulkan layer (ReShade routes)
   src/ui/                menu contents shared by NR Control and the ReShade add-on
   shaders/rdna4/         the network (pipelines.json lists every pipeline and its defines)
   shaders/passes/        the passes around it (motion estimation, depth, alpha)
   shaders/renodx/        RenoDX's shaders for the RenoDX style (MIT, with its licence)
   shaders/renodx-fast/   Passes (fast); shaders/renodx-prep/: Preprocess
+  shaders/frame-reuse/   frame reuse
   shaders/wilsjo2/       the wilsjo2 style and HUD FIX
   build/                 build_network.py, build_package.sh, build_asi.sh, ...
   package/               installer, README and model-tools/ (model extraction)
   vulkan-loader/         patches for the Khronos loader used by the reshade-feeder-vulkan/-dx9 routes
 windows/               a separate copy for the AMD Windows driver, changed on its own
   src/pe/nr_pe_menu.cpp  NR Control on Windows (DXGI Present hook, D3D11/D3D12 drawing)
-  data/aco/              ACO machine code of the Linux network, for [Network] ACO Mode = 1 (int4/: int4 mixed)
+  data/aco/              ACO machine code of the Linux network (records/, int4/: the int4 levels' records), and the D3D12
+                         passthrough's kernels (d3d12_outer.nra, rdna3/)
+  build/x86/             the 32-bit ReShade add-on
 fetch_deps.sh          pinned third-party downloads
 ```
 

@@ -34,13 +34,15 @@ namespace nr::control_ui {
 
 // A network's name as the menus show it: its codename (nr::network_label) through the language file, so a language can
 // name the networks its own way (the ini file, the log and the bug report keep the codenames).
-inline const char* const kNetworkNames[] = {NR_N("CC_SMALL_FP8"), NR_N("CC_SMALL_FP8_EXPERIMENTAL"),
+inline const char* const kNetworkNames[] = {NR_N("CC_SMALL_FP8"), NR_N("CC_SMALL_FP8_OPTIMIZED"),
+    NR_N("CC_SMALL_FP8_OPTIMIZED (layers: quality)"), NR_N("CC_SMALL_FP8_OPTIMIZED (layers: performance)"),
+    NR_N("CC_SMALL_FP8_OPTIMIZED (layers: ultra performance)"),
     NR_N("CC_SILVER_AARDWOLD"), NR_N("CC_SILVER_AARDWOLD_OPTIMIZED"), NR_N("CC_SILVER_AARDWOLD_OPTIMIZED (layers: quality)"),
     NR_N("CC_SILVER_AARDWOLD_OPTIMIZED (layers: balanced)"), NR_N("CC_SILVER_AARDWOLD_OPTIMIZED (layers: performance)"),
     NR_N("CC_SILVER_AARDWOLD_OPTIMIZED (layers: ultra performance)")};
 inline const char* net_name(int n) { return tr(nr::network_label(n)); }
-// A network as the lists offer it (a choice, not what runs): CC_SILVER_AARDWOLD_OPTIMIZED without its level - that is
-// the Optimized layers combo's, not the list's.
+// A network as the lists offer it (a choice, not what runs): an optimized network without its level - that is the
+// Optimized layers combo's, not the list's.
 inline const char* net_choice_name(int n) { return tr(nr::network_codename(n)); }
 
 // A text's size, the room left on the line, the cursor on the screen. ReShade's ImGui (the add-on's page) is a function
@@ -623,11 +625,12 @@ inline FootRow aco_row(const nr::control::Shared* s) {
 }
 // The device the network runs on (Shared::device_path): "Bridge" (a Vulkan device of NR's own beside the game's D3D),
 // "Vulkan" (the game's own Vulkan device), "Passthrough" (the D3D12 passthrough: the game's D3D12 device itself, the
-// bridge's opposite), "-" until NR first runs
+// bridge's opposite), "Bridge (fallback)" (the passthrough is on, but frames went through the bridge), "-" until NR
+// first runs
 inline FootRow path_row(const nr::control::Shared* s) {
-    static const char* const kPath[] = {"-", NR_N("Bridge"), NR_N("Vulkan"), NR_N("Passthrough")};
+    static const char* const kPath[] = {"-", NR_N("Bridge"), NR_N("Vulkan"), NR_N("Passthrough"), NR_N("Bridge (fallback)")};
     const uint32_t p = s ? s->device_path : 0;
-    return {NR_N("Path"), tr(kPath[p < 4 ? p : 0]), p == 3};   // the D3D12 passthrough lit (green), as ACO's "On"
+    return {NR_N("Path"), tr(kPath[p < 5 ? p : 0]), p == 3};   // the D3D12 passthrough lit (green), as ACO's "On"
 }
 // The same in words (the Network page, the report): what the network runs on and how the frame gets there
 inline const char* path_text(uint32_t path) {
@@ -636,6 +639,8 @@ inline const char* path_text(uint32_t path) {
                             "frame crosses over through shared textures and fences");
         case 2: return NR_N("Path: the game's own Vulkan device (a Vulkan game, or D3D9 through DXVK)");
         case 3: return NR_N("Path: the game's own D3D12 device");
+        case 4: return NR_N("Path: the bridge as a fallback - the D3D12 passthrough is on, but frames could not run on it "
+                            "(dlssnr-amd.log says why); the network runs on a Vulkan device of NR's own beside the game's D3D");
         default: return NR_N("Path: not known until NR first runs");
     }
 }
@@ -1203,15 +1208,58 @@ inline void draw_layers_switch(nr::ini_edit::Ini& ini) {
     ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.3f, 1.0f), "%s", tr("For ordinary stacking use Passes."));
 }
 
+// An optimized network's level: Layers in the section of its codename, [CC_SILVER_AARDWOLD_OPTIMIZED] or
+// [CC_SMALL_FP8_OPTIMIZED] (Quality, Performance and Ultra Performance - Balanced runs its Quality - and lists only those
+// three). `net`: a listed network (nr::network_listed); opt false when it is not an optimized one.
+struct OptimizedLevel { bool opt, small_fp8; int base, level, shown_level; const char* section; };
+inline OptimizedLevel optimized_level(nr::ini_edit::Ini& ini, int net) {
+    OptimizedLevel v{};
+    v.opt = nr::network_levelled(net);
+    v.small_fp8 = nr::network_small_fp8_optimized(net);
+    v.base = v.small_fp8 ? int(nr::kSmallFp8Optimized) : int(nr::kSilverAardwoldOptimized);
+    v.section = v.small_fp8 ? "CC_SMALL_FP8_OPTIMIZED" : "CC_SILVER_AARDWOLD_OPTIMIZED";
+    v.level = nr::layers_value(ini.get(v.section, "Layers", v.small_fp8 ? "0" : "3"));
+    if (v.level < 0) v.level = v.small_fp8 ? nr::kSmallFp8LayersDefault : nr::kLayersDefault;
+    v.shown_level = v.small_fp8 ? nr::network_layers(nr::network_with_layers(v.base, v.level)) : v.level;
+    return v;
+}
+// The Optimized layers box of network `net` (greyed when it is not an optimized network): the Network page's, and NR
+// settings' beside a layer's network - one setting, the network's Layers key, whichever page changes it.
+inline void draw_optimized_layers_combo(nr::ini_edit::Ini& ini, const nr::control::Shared* s, int net, const char* label) {
+    static const char* const levels[] = {NR_N("Quality"), NR_N("Balanced"), NR_N("Performance"), NR_N("Ultra Performance")};
+    const OptimizedLevel v = optimized_level(ini, net);
+    ImGui::BeginDisabled(!v.opt);
+    if (ImGui::BeginCombo(label, tr(levels[v.shown_level]))) {
+        for (int l = 0; l < nr::kLayersCount; ++l) {
+            if (v.small_fp8 && l == nr::kLayersBalanced) continue;
+            // a level that cannot run here: greyed, its reason under it (Quality's is the network's)
+            const char* why = l && s && s->net_known ? tr_text(s->net_why[nr::network_with_layers(v.base, l)]) : "";
+            // CC_SMALL_FP8_OPTIMIZED: the key keeps a value that already picks the level (Ultra Performance stays)
+            if (ImGui::Selectable(tr(levels[l]), l == v.shown_level, why[0] ? ImGuiSelectableFlags_Disabled : 0) &&
+                (!v.small_fp8 || nr::network_with_layers(v.base, v.level) != nr::network_with_layers(v.base, l)))
+                ini.set(v.section, "Layers", std::to_string(l));
+            if (why[0]) {
+                ImGui::Indent();
+                ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 26.f * ImGui::GetFontSize());
+                ImGui::TextDisabled("%s", why);
+                ImGui::PopTextWrapPos();
+                ImGui::Unindent();
+            }
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::EndDisabled();
+}
+
 inline void draw_network_options(nr::ini_edit::Ini& ini, const nr::control::Shared* s, const NetworkOptions& o) {
     if (const char* e = std::getenv("NR_CONTROL_GLOBAL_OPEN")) ImGui::SetNextItemOpen(e[0] != '0');   // tests
     if (!section("Network model and options", ImGuiTreeNodeFlags_DefaultOpen)) return;
     const int file_model = std::max(0, nr::network_choice(ini.get("Network", "Model", "CC_SMALL_FP8")));
-    // the list has CC_SILVER_AARDWOLD_OPTIMIZED once (kSilverAardwoldOptimized); whether it can run at all is its
-    // Quality level's (the other levels have reasons of their own, under the Optimized layers combo)
-    auto listed = [](int n) { return nr::network_optimized(n) ? int(nr::kSilverAardwoldOptimized) : n; };
+    // the list has each optimized network once (kSilverAardwoldOptimized, kSmallFp8Optimized); whether it can run at all
+    // is its Quality level's (the other levels have reasons of their own, under the Optimized layers combo)
+    auto listed = [](int n) { return nr::network_listed(n); };
     auto why_of = [&](int n) {
-        return s && s->net_known ? tr_text(s->net_why[nr::network_optimized(n) ? nr::kSilverAardwoldOptimizedFp8 : n]) : "";
+        return s && s->net_known ? tr_text(s->net_why[nr::network_levelled(n) ? nr::network_with_layers(n, nr::kLayersQuality) : n]) : "";
     };
     // The box is [Network] Model, the setting; the networks running are named beside it. A layer with a network of its
     // own ([LayerN] Network) is not reached by [Network] Model: the box showed the network running, the layer's, and
@@ -1243,43 +1291,29 @@ inline void draw_network_options(nr::ini_edit::Ini& ini, const nr::control::Shar
         }
         ImGui::EndCombo();
     }
-    help("[Network] Model. CC_SMALL_FP8: 310.9.16's default network. CC_SMALL_FP8_EXPERIMENTAL: ours, "
+    help("[Network] Model. CC_SMALL_FP8: 310.9.16's default network. CC_SMALL_FP8_OPTIMIZED: ours, "
          "CC_SMALL_FP8 made faster. CC_SILVER_AARDWOLD: "
          "310.8.0's network (310.9.16's preset 1). CC_SILVER_AARDWOLD_OPTIMIZED: ours, CC_SILVER_AARDWOLD made "
          "faster, its picture very close to it. Switching builds the new network in the background; the running one "
          "serves until it is ready.");
     for (int n : nr::kNetworkList)
         if (why_of(n)[0]) text_dim_wrapped("%s: %s", net_choice_name(n), why_of(n));
-    {   // [Network] OptimizedLayers: CC_SILVER_AARDWOLD_OPTIMIZED's only
-        static const char* const levels[] = {NR_N("Quality"), NR_N("Balanced"), NR_N("Performance"), NR_N("Ultra Performance")};
-        const bool opt = shown == nr::kSilverAardwoldOptimized;
-        int level = nr::optimized_layers_value(ini.get("Network", "OptimizedLayers", "3"));
-        if (level < 0) level = nr::kLayersDefault;
-        ImGui::BeginDisabled(!opt);
-        if (ImGui::BeginCombo(tr("Optimized layers"), tr(levels[level]))) {
-            for (int l = 0; l < nr::kLayersCount; ++l) {
-                // a level that cannot run here: greyed, its reason under it (Quality's is the network's, above)
-                const char* why = l && s && s->net_known ? tr_text(s->net_why[nr::network_with_layers(nr::kSilverAardwoldOptimized, l)]) : "";
-                if (ImGui::Selectable(tr(levels[l]), l == level, why[0] ? ImGuiSelectableFlags_Disabled : 0))
-                    ini.set("Network", "OptimizedLayers", std::to_string(l));
-                if (why[0]) {
-                    ImGui::Indent();
-                    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 26.f * ImGui::GetFontSize());
-                    ImGui::TextDisabled("%s", why);
-                    ImGui::PopTextWrapPos();
-                    ImGui::Unindent();
-                }
-            }
-            ImGui::EndCombo();
-        }
-        ImGui::EndDisabled();
-        help("[Network] OptimizedLayers, CC_SILVER_AARDWOLD_OPTIMIZED only: how many of its layers run in a faster "
-             "form. It changes only how the network computes, not the resolution; every level's picture stays very close "
-             "to CC_SILVER_AARDWOLD's. Quality: none of them in int4. Balanced: some of them in int4. Performance: also fixed "
-             "attention on the first full-resolution layers. Ultra Performance (default): also more int4 layers, the "
-             "fastest. Switching builds the network again in the background.");
-        const char* why = level && s && s->net_known ? tr_text(s->net_why[nr::network_with_layers(nr::kSilverAardwoldOptimized, level)]) : "";
-        if (opt && why[0] && !why_of(nr::kSilverAardwoldOptimized)[0]) text_dim_wrapped("%s", why);
+    {   // Layers in the section of the shown optimized network's codename: its own level
+        const OptimizedLevel lv = optimized_level(ini, shown);
+        const bool opt = lv.opt;
+        const int base = lv.base, level = lv.level, shown_level = lv.shown_level;
+        draw_optimized_layers_combo(ini, s, shown, tr("Optimized layers"));
+        help("Layers in [CC_SILVER_AARDWOLD_OPTIMIZED] / [CC_SMALL_FP8_OPTIMIZED] (each optimized network keeps its own): how many of an "
+             "optimized network's layers run in a faster form. It changes only how the network computes, not the "
+             "resolution. CC_SILVER_AARDWOLD_OPTIMIZED, every level's picture very close to CC_SILVER_AARDWOLD's: Quality: "
+             "none of them in int4. Balanced: some of them in int4. Performance: also fixed attention on the first "
+             "full-resolution layers. Ultra Performance (default): also more int4 layers, the fastest. "
+             "CC_SMALL_FP8_OPTIMIZED has three levels: Quality (default; also for Balanced). Performance: fixed attention "
+             "on the first full-resolution layer and, at 4K-class resolutions, fewer keys in some attention heads. Ultra "
+             "Performance: also int4 layers in the middle of the network, the fastest. Switching builds the network again "
+             "in the background.");
+        const char* why = shown_level && s && s->net_known ? tr_text(s->net_why[nr::network_with_layers(base, level)]) : "";
+        if (opt && why[0] && !why_of(base)[0]) text_dim_wrapped("%s", why);
     }
     // What runs now (the layers' last runs, else the network asked for), on a line of its own under the two boxes (the
     // settings): beside the Network box it ran off the window's edge (a long name, ReShade's narrower page) and split
@@ -1295,35 +1329,15 @@ inline void draw_network_options(nr::ini_edit::Ini& ini, const nr::control::Shar
         else text_dim_wrapped(tr("Layer %d runs a network of its own (%s); the model here is for the layers set to "
                                  "[Global]."), o.first, net_choice_name(o.second));
     }
-    // ACO Mode (not a setting): whether this run's network is ACO's machine code, and why not
-    if (s) {
-        switch (s->aco_state) {
-            case 1:
-                ImGui::TextWrapped(tr("ACO Mode: on in this run (machine code for %s)"),
-                                   s->aco_rdna3 ? tr("RDNA3: RX 7000, Radeon 700M / 800M / 8000S") : tr("RDNA4: RX 9000"));
-                break;
-            case 2: case 3: case 4:
-                ImGui::TextWrapped(tr("ACO Mode: off in this run%s%s - an RX 9000 runs the network compiled by the AMD driver; "
-                                      "RX 7000 and Radeon 700M / 800M / 8000S graphics have no NR"),
-                                   s->aco_why[0] ? ": " : "", tr_text(s->aco_why));
-                break;
-            default: ImGui::TextDisabled("%s", tr("ACO Mode: not known until NR first runs")); break;
-        }
-        help("ACO Mode: the network runs as machine code made in advance by the ACO compiler (the one the Linux version "
-             "uses), loaded by the AMD driver. It is not a setting; when the driver cannot take it, the line above and "
-             "dlssnr-amd.log say why.");
-        if (s->device_path == 3) {   // the D3D12 passthrough: green, as the footer's Path
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.45f, 0.85f, 0.45f, 1.f));
-            ImGui::TextWrapped("%s", tr(path_text(s->device_path)));
-            ImGui::PopStyleColor();
-        } else {
-            text_dim_wrapped("%s", tr(path_text(s->device_path)));
-        }
-    }
+    // ACO Mode (not a setting): said here only when it is off and why (the footer's ACO and Path rows say the rest)
+    if (s && s->aco_state >= 2 && s->aco_state <= 4)
+        ImGui::TextWrapped(tr("ACO Mode: off in this run%s%s - RDNA4 runs the network compiled by the AMD driver; "
+                              "RDNA3 and RDNA3.5 have no NR"),
+                           s->aco_why[0] ? ": " : "", tr_text(s->aco_why));
     {   // [GPU] Architecture: auto, or set by hand where NR cannot tell the GPU (nr_gpu_arch.hpp with_manual)
         static const char* const keys[] = {"auto", "rdna4", "rdna3"};
-        static const char* const names[] = {NR_N("Auto (AMD's driver tells)"), NR_N("RDNA4: RX 9000"),
-                                            NR_N("RDNA3: RX 7000, Radeon 700M / 800M / 8000S")};
+        static const char* const names[] = {NR_N("Auto (AMD's driver tells)"), NR_N("RDNA4"),
+                                            NR_N("RDNA3 / RDNA3.5")};
         std::string v = ini.get("GPU", "Architecture", "auto");
         for (char& c : v) c = char(std::tolower(static_cast<unsigned char>(c)));
         int cur = 0;
@@ -1345,7 +1359,7 @@ inline void draw_network_options(nr::ini_edit::Ini& ini, const nr::control::Shar
     }
     ini_flag(ini, "Sound##net", "Network", "Sound", "1",
              "[Network] Sound. A cue on every switch: one note CC_SMALL_FP8, a higher one "
-             "CC_SMALL_FP8_EXPERIMENTAL, two going down CC_SILVER_AARDWOLD, two going up "
+             "CC_SMALL_FP8_OPTIMIZED, two going down CC_SILVER_AARDWOLD, two going up "
              "CC_SILVER_AARDWOLD_OPTIMIZED.");
     static const char* const residencies[] = {NR_N("auto"), NR_N("resident"), NR_N("offload"), NR_N("minimal")};
     const std::string r = ini.get("Network", "Residency", "auto");
@@ -1388,6 +1402,16 @@ inline void draw_network_options(nr::ini_edit::Ini& ini, const nr::control::Shar
              "[Network] Style Grade. On (default): Natural and Cinematic are graded after the network as NVIDIA's DLL "
              "does. Off: the picture these styles had up to 0.0.6, without that grade. Standard is not affected. "
              "Takes effect at once.");
+    {   // RDNA4 only (user 11-25): greyed on RDNA3 / RDNA3.5, where the grade is computed step by step whatever it says
+        const bool rdna3 = s && s->aco_state == 1 && s->aco_rdna3;
+        ImGui::BeginDisabled(rdna3);
+        ini_flag(ini, "Style grade acceleration", "Network", "Style Grade Acceleration", "1",
+                 "[Network] Style Grade Acceleration. On (default): Natural and Cinematic are graded with an equivalent "
+                 "formula that takes less GPU time. Off: the "
+                 "grade computed step by step. Only while Style grade is on. Takes effect at once.");
+        ImGui::EndDisabled();
+        if (rdna3) ImGui::TextDisabled("%s", tr("Style grade acceleration: RDNA4 only"));
+    }
     ini_flag(ini, "Motion without depth", "Network", "Motion Without Depth", "1",
              "[Network] Motion Without Depth. Where the network's previous-frame lookup reads its motion vector.\n"
              "On (default): the pixel's own vector, depth not used, as NVIDIA's DLL does.\n"
@@ -1764,6 +1788,39 @@ struct ChainRoute {
     std::function<Route(const std::string& placement)> renodx_route;
 };
 
+// A layer's Frame reuse switch (a RenoDX layer's NRFrameReuse, a wilsjo2 layer's FrameReuse: `name` in `table`) and,
+// while it is on, the layer's last word on it: the share of frames NR ran on lately, or why it cannot run (the session's
+// line, nr_pe_session.cpp reuse_stage_for). True: changed. Nothing when the table has no such key (the ReShade route's
+// wilsjo2 table). `greyed`: the ReShade route (user 11-25: not offered there - the add-on never runs it; the file's value
+// is kept).
+template <class A>
+bool draw_frame_reuse_in(const renodx_keys::Key* table, int count, const char* name, A& a,
+                         const nr::control::LayerStatus* status, bool greyed = false) {
+    int i = -1;
+    for (int k = 0; table && k < count && i < 0; ++k)
+        if (std::strcmp(table[k].name, name) == 0) i = k;
+    if (i < 0) return false;
+    ImGui::BeginDisabled(greyed);
+    const bool changed = draw_key_in(table, i, a);
+    ImGui::EndDisabled();
+    if (greyed && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("%s",tr(reshade_reuse_reason()));
+    if (greyed || !a.b(i) || !status) return changed;
+    const uint32_t now = uint32_t(GetTickCount64());
+    if (!status->updated || now - status->updated >= 1500u) return changed;   // not running now: nothing to say
+    ImGui::Indent();
+    if (status->reuse == 1u && status->reuse_share >= 0.f)
+        ImGui::TextDisabled(tr("NR on %.0f %% of frames"), double(status->reuse_share) * 100.0);
+    else if (status->reuse == 2u && status->reuse_note[0])
+        ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.3f, 1.0f), "%s", tr_text(status->reuse_note));
+    ImGui::Unindent();
+    return changed;
+}
+template <class A>
+bool draw_frame_reuse(A& a, const nr::control::LayerStatus* status, bool greyed = false) {
+    return draw_frame_reuse_in(renodx_keys::kKeys, renodx_keys::kCount, "NRFrameReuse", a, status, greyed);
+}
+
 struct ChainEditor {
     nr::ini_edit::Ini& ini;
     const ChainRoute& route;
@@ -1843,6 +1900,17 @@ struct ChainEditor {
             }
         return -1;
     }
+    // The Optimized layers box of the layer's network (its own, else [Network] Model's) when that is an optimized network
+    // (user 11-22): the Network page's setting - one level per optimized network, followed by every NR using it
+    void draw_levels(const ChainRow& row, const nr::control::Shared* s, float field) {
+        const int own = row.network.empty() ? -1 : nr::network_choice(row.network);
+        const int net = nr::network_listed(own >= 0 ? own : std::max(0, nr::network_choice(ini.get("Network", "Model", "CC_SMALL_FP8"))));
+        if (!nr::network_levelled(net)) return;
+        ImGui::SetNextItemWidth(field);
+        draw_optimized_layers_combo(ini, s, net, (std::string(tr("Optimized layers")) + "##levels").c_str());
+        help("Optimized layers. The same choice as on the Network page: one level per optimized network, shared by every "
+             "NR that uses it.");
+    }
     // A layer's processing, network and place: a table row's cells (the NR chain), or labelled lines (the one layer's
     // page with Layers off)
     void draw_choices(const ChainRow& row, const nr::control::Shared* s, bool cells) {
@@ -1873,6 +1941,7 @@ struct ChainEditor {
         }
         if (!cells) help("Network. [Global]: the Network page's model ([Network] Model, also switched by its hotkey); or "
                          "one network for this NR alone.");
+        if (!cells) draw_levels(row, s, field);
         int pl = row.placement == "before" ? 1 : row.placement == "present" ? 2 : 0;
         // Where it ran (the layer's status, fresh): another place than set - a frame may not allow before, a
         // Present layer may wait for its Present - is
@@ -1917,6 +1986,21 @@ struct ChainEditor {
                                             : "Place. Before or after the upscaler, or at Present (the finished picture).");
     }
 
+    // The layer page's values into the file (the old file's: [Layer1] made first)
+    void store_layer(bool old_file) {
+        if (old_file) {
+            materialize();
+            layer_values.section = section_of(1);
+            layer_key.clear();
+        }
+        layer_values.store(ini);
+    }
+    static const nr::control::LayerStatus* status_of(const nr::control::Shared* s, int number) {
+        if (s)
+            for (const auto& r : s->layers)
+                if (r.number == uint32_t(number)) return &r;
+        return nullptr;
+    }
     // `s`: where each layer actually ran (its status row); a layer running elsewhere than set shows that place
     void draw_chain(const nr::control::Shared* s = nullptr) {
         ImGui::SeparatorText(tr("NR chain"));
@@ -2077,7 +2161,9 @@ struct ChainEditor {
                 ImGui::TextDisabled(tr("Interleaved / Feedback / Hybrid cannot run with peripheral compression (one network pass)."));
             // the chosen method's own settings (Fast<Method>Passes / HaloLimit / Fine; Edit strength, Interleaved their own)
             if (method == 0u) {
-                const int pr = std::clamp(int(num("FastInterleavedPreset", float(nr::fast::kDefaultInterleavedPreset))), 1, 2);
+                // (a value the file holds outside 1..2 runs the default preset - shown as that, as the layer parses it)
+                const int raw = int(num("FastInterleavedPreset", float(nr::fast::kDefaultInterleavedPreset)));
+                const int pr = raw == 1 || raw == 2 ? raw : int(nr::fast::kDefaultInterleavedPreset);
                 const char* presets[] = {NR_N("Preset 1"), NR_N("Preset 2")};
                 ImGui::SetNextItemWidth(230 * u);
                 if (ImGui::BeginCombo(tr("Interleaved preset##w2filp"), tr(presets[pr - 1]))) {
@@ -2091,6 +2177,10 @@ struct ChainEditor {
                 if (ImGui::SliderInt(tr("Passes (fast)##w2fil"), &n, 2, 8)) put("FastInterleavedPasses", std::to_string(n));
                 reset("w2f-il", "FastInterleavedPasses", "3");
                 help("FastInterleavedPasses. Interleaved: how many legacy passes (2 to 8) take turns, one each frame. Each pass more needs more video memory.");
+                bool depth_docc = flag_of("FastInterleavedDepthDisocclusion", true);
+                if (ImGui::Checkbox(tr("Depth disocclusion check##w2fild"), &depth_docc)) put("FastInterleavedDepthDisocclusion", depth_docc ? "true" : "false");
+                help("FastInterleavedDepthDisocclusion. Interleaved also uses the game's depth to find surfaces that just came into view (on by default; off: only the motion vectors and colours find them).");
+                ImGui::TextDisabled("%s", tr("If a grid of light squares appears (with strong upscaling, e.g. Ray Reconstruction), turn Depth disocclusion check off."));
             } else if (method == 4u) {
                 float e = std::clamp(num("FastEditStrength", 2.f), 0.f, 4.f);
                 ImGui::SetNextItemWidth(250 * u);
@@ -2187,6 +2277,12 @@ struct ChainEditor {
 
     // The selected layer's page: its processing's settings, then what the game hands it (`s`'s row for it). `loaded`
     // changes when the file was read again (the page reloads its values then); `accent`: the layer's title colour.
+    // The layer's Frame reuse switch and line (RenoDX: NRFrameReuse; wilsjo2: FrameReuse, in its own table). True: changed.
+    bool draw_layer_reuse(const ChainRow& row, bool wilsjo2, const nr::control::Shared* s) {
+        if (!wilsjo2) return draw_frame_reuse(layer_values, status_of(s, row.number), route.present_only);
+        return draw_frame_reuse_in(route.wilsjo2_table, route.wilsjo2_count, "FrameReuse", layer_values,
+                                   status_of(s, row.number), route.present_only);
+    }
     void draw_layer_page(const nr::control::Shared* s, int64_t loaded, const ImVec4& accent) {
         const bool old_file = legacy();
         const std::vector<ChainRow> rows = old_file ? std::vector<ChainRow>{legacy_row()} : layers();
@@ -2226,6 +2322,7 @@ struct ChainEditor {
             help("Enabled. Off: NR does not run (kept in the file). The switch at the top of the menu turns NR off or on "
                  "for this run only.");
             draw_choices(row, s, false);
+            if (draw_layer_reuse(row, wilsjo2, s)) store_layer(old_file);
             ImGui::Spacing();
         }
         ImGui::BeginChild("layerpage", ImVec2(0, 0), ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY);
@@ -2249,6 +2346,9 @@ struct ChainEditor {
         }
         if (!open) return;
         ImGui::Separator();
+        // Layers on (the layer's network is a cell of the NR chain): its Optimized layers box heads its own page
+        if (!one) draw_levels(row, s, std::max(ImGui::GetFontSize() * 18.f, room_x() * 0.6f));
+        if (!one && draw_layer_reuse(row, wilsjo2, s)) store_layer(old_file);
         // each layer and processing keeps its own groups' open state (the groups share names: Network, Composition,
         // Resolution) - switching RenoDX -> wilsjo2 -> RenoDX finds the groups as they were
         // (an int: ReShade's ImGui table takes no PushID(const char*))
@@ -2273,14 +2373,7 @@ struct ChainEditor {
             changed = draw_renodx(layer_values, route.renodx_route(row.placement), true, {},
                                   [](const char* name) { return !nr::ini_edit::chain_global(name); }, layer_motion);
         }
-        if (changed) {
-            if (old_file) {
-                materialize();
-                layer_values.section = section_of(1);
-                layer_key.clear();
-            }
-            layer_values.store(ini);
-        }
+        if (changed) store_layer(old_file);
         // What the game hands this layer, and who covers what it does not (its runs' engine-data lines)
         const nr::control::LayerStatus* status = nullptr;
         if (s)

@@ -4,21 +4,23 @@ DLSSNR-AMD-Vulkan (Windows)
 Runs the neural rendering (NR) model of DLSS 5 in games on AMD graphics cards. The network is
 reimplemented in Vulkan; NVIDIA's runtime is neither needed nor called.
 
-It is slower than the Linux version and updated less often, and some releases may be Linux
-only. If something breaks, uninstall with option 5 of install.bat.
+Some releases may be Linux only. If something breaks, uninstall with option 5 of install.bat.
 
-DX10/11/12 games keep the system's own D3D; nothing is translated. NR runs on a Vulkan device
-of its own on the same graphics card, and the frame is handed between the two through shared
-textures and a shared fence, all on the GPU. Only DX9 games are moved to Vulkan with DXVK
-(D3D9 cannot share a frame with another API). Vulkan games: NR runs on the game's own device.
+In 64-bit DX12 games NR can run on the game's own device (D3D12 passthrough, below); otherwise DX10/11/12
+games run it on a Vulkan device of its own on the same graphics card, and the frame is handed between
+the two through shared textures and a shared fence, all on the GPU. Only DX9 games are moved to Vulkan
+with DXVK (D3D9 cannot share a frame with another API). Vulkan games: NR runs on the game's own device.
 
 Requirements
 ------------
-- RX 9000 series (RDNA4): every network
-- RX 7000 series, Radeon 700M / 800M / 8000S graphics (RDNA3 / RDNA3.5): every network as well,
-  experimental (see "ACO Mode")
-- AMD Software 26.9 or newer
-- 64-bit games
+- RDNA4: every network
+- RDNA3 and RDNA3.5: every network as well (CC_SMALL_FP8_OPTIMIZED at Quality), experimental (see
+  "ACO Mode")
+- A recent AMD Software
+- Two packages: ...-x86_64.zip for 64-bit games (every route) and ...-i686.zip for 32-bit games
+  (the ReShade routes: Vulkan, DX9 through DXVK, and native DX10/11; D3D12 requires an existing
+  vkd3d-proton setup, native 32-bit D3D12 is not supported). The installer says so when the game's
+  exe is the other kind.
 - Do not use it in online games with anti-cheat; start games with EasyAntiCheat with EAC off
 
 Install
@@ -26,11 +28,11 @@ Install
 Double-click install.bat, pick the game's exe (the one that actually runs - for Unreal Engine
 games it is under Binaries\Win64, not the launcher outside), then pick a route:
 
-  1) optiscaler             the game has a DLSS, FSR or XeSS option (DX11 / DX12 / Vulkan). OptiScaler
+  1) optiscaler             64-bit games with a DLSS, FSR or XeSS option (DX11 / DX12 / Vulkan). OptiScaler
                             does the upscaling and frame generation (the original OptiScaler, its files
                             unchanged); this project's NR runs as an OptiScaler plugin.
-  2) reshade-feeder         other DX10/11/12 games (ReShade + VORT, or the optional LumeniteFX, provide the
-                            motion vectors)
+  2) reshade-feeder         DX10/11 games, also native DX12 in 64-bit games (ReShade + VORT, or the optional
+                            LumeniteFX, provide the motion vectors)
   3) reshade-feeder-dx9     old DX9 games (ReShade)
   4) reshade-feeder-vulkan  Vulkan games (ReShade)
   5) Uninstall
@@ -39,9 +41,7 @@ games it is under Binaries\Win64, not the launcher outside), then pick a route:
 
 You can also drag the game's exe onto install.bat. Games under Program Files ask for
 administrator rights. On the command line: install.bat <game exe or folder> <route> [-Dll <path>]
-[-Model <network>] [-RenoDX on|off] [-Lumenite on|off]. The old route names reshade,
-dx9 and vulkan are now reshade-feeder, reshade-feeder-dx9 and reshade-feeder-vulkan; optiscaler-renodx
-is the same as optiscaler.
+[-Model <network>] [-RenoDX on|off] [-Lumenite on|off].
 
 Then the installer asks two questions:
 
@@ -50,31 +50,37 @@ The processing before and after NR (the NR network itself is the same; -RenoDX o
   2) wilsjo2 style           the processing of OptiScaler-NR (wilsjo2), ported (see "wilsjo2 style")
 In game NR Control (End) or ReShade's Add-ons page switches it at any time.
 
-Networks: all four are installed, named as in NVIDIA's DLL (CC_SMALL_FP8_EXPERIMENTAL and
+Networks: all four are installed, named as in NVIDIA's DLL (CC_SMALL_FP8_OPTIMIZED and
 CC_SILVER_AARDWOLD_OPTIMIZED are this project's). The installer asks which one a game starts with
 (Enter = CC_SMALL_FP8; -Model <name>):
 
     CC_SMALL_FP8                   the default network of 310.9.16 (default)
-    CC_SMALL_FP8_EXPERIMENTAL      experimental: CC_SMALL_FP8 made faster; its picture differs
-                                   somewhat. RX 9000 and RX 7000 / 700M - 8000S, with ACO Mode
+    CC_SMALL_FP8_OPTIMIZED         CC_SMALL_FP8 made faster, at three levels. RDNA4 (every level)
+                                   and RDNA3 / RDNA3.5 (Quality), with ACO Mode
     CC_SILVER_AARDWOLD             the network of 310.8.0 (also preset 1 of 310.9.16)
     CC_SILVER_AARDWOLD_OPTIMIZED   CC_SILVER_AARDWOLD made faster, its picture very close to it.
-                                   RX 9000 and RX 7000 / 700M - 8000S, with ACO Mode
+                                   RDNA4 and RDNA3 / RDNA3.5, with ACO Mode
 
 This only sets [Network] Model in dlssnr-amd.ini; the network can be switched in game at any time:
 the drop-down in NR Control (End) or on ReShade's Add-ons page, or Ctrl+F11 to cycle. The new network
 is prepared in the background, and the current one keeps running until it is ready. A network that
 cannot run is greyed out in the drop-down with the reason (without ACO Mode, for example,
-CC_SMALL_FP8_EXPERIMENTAL and CC_SILVER_AARDWOLD_OPTIMIZED). The weights of CC_SMALL_FP8_EXPERIMENTAL and
+CC_SMALL_FP8_OPTIMIZED and CC_SILVER_AARDWOLD_OPTIMIZED). The weights of CC_SMALL_FP8_OPTIMIZED and
 CC_SILVER_AARDWOLD_OPTIMIZED are made at install from your models; if that fails the other networks
 are installed and the one that failed is greyed out.
-CC_SILVER_AARDWOLD_OPTIMIZED replaces CC_SILVER_AARDWOLD_INT4_MIXED of earlier versions (a
-dlssnr-amd.ini that names that one gets CC_SILVER_AARDWOLD_OPTIMIZED). Optimized layers (in NR
-Control under the network, [Network] OptimizedLayers) sets how many of its layers run in a faster form;
+CC_SILVER_AARDWOLD_OPTIMIZED replaces CC_SILVER_AARDWOLD_INT4_MIXED of earlier versions. Optimized
+layers (in NR Control under the network, [CC_SILVER_AARDWOLD_OPTIMIZED] Layers) sets how many of its layers run in a faster form;
 it changes only how the network computes, not the resolution, and every level's picture stays very
 close to CC_SILVER_AARDWOLD's. Quality: none of them in int4, a little slower. Balanced: some of them
 in int4. Performance: also fixed attention on the first full-resolution layers. Ultra Performance
 (default): also more int4 layers, the fastest.
+CC_SMALL_FP8_OPTIMIZED replaces CC_SMALL_FP8_EXPERIMENTAL of earlier versions. Its Optimized layers
+(in NR Control under the network, [CC_SMALL_FP8_OPTIMIZED] Layers) has three levels: Quality (default; also for Balanced); Performance:
+fixed attention on the first full-resolution layer and, at 4K-class resolutions, fewer keys in some
+attention heads; Ultra Performance: also int4 layers in the middle of the network. Performance and
+Ultra Performance run on
+RDNA4 (on RDNA3 and RDNA3.5 they are greyed out: "not on RDNA3 / RDNA3.5 yet"). Its weights are made at
+install too (from CC_SMALL_FP8's model), so it also needs the 310.9.16 nvngx_dlssnr.dll.
 
 LumeniteFX (optional, reshade-feeder routes only): motion vectors from LumeniteFX Kernel (by Afzaal
 (Kaidō), https://github.com/umar-afzaal/LumeniteFX, AGNYA licence). It is not part of this project and
@@ -95,13 +101,13 @@ The package does not contain NVIDIA's model. The first install asks for nvngx_dl
 310.9.16 or 310.8.0, or a zip that contains it (on the command line: -Dll):
 
     dlssnr-amd\CC_SMALL_FP8.bin        CC_SMALL_FP8 (the default network of 310.9.16), also the source
-                                       of CC_SMALL_FP8_EXPERIMENTAL
+                                       of CC_SMALL_FP8_OPTIMIZED
     dlssnr-amd\CC_SILVER_AARDWOLD.bin  CC_SILVER_AARDWOLD (the network of 310.8.0; 310.9.16 has it too),
                                        also the source of CC_SILVER_AARDWOLD_OPTIMIZED
 
 Use 310.9.16 when you can: it already contains the 310.8.0 network, so with it both models are
 extracted and installed; 310.8.0 gives CC_SILVER_AARDWOLD and CC_SILVER_AARDWOLD_OPTIMIZED only
-(CC_SMALL_FP8 and CC_SMALL_FP8_EXPERIMENTAL are then greyed out in the menus). The installer
+(CC_SMALL_FP8 and CC_SMALL_FP8_OPTIMIZED are then greyed out in the menus). The installer
 extracts the models with model-tools\dlssnr_extract_model.exe (it only reads the weight data; the
 DLL is never loaded or run), checks every entry against known hashes and writes a model file only if
 all of them match. The models stay in this package, so later installs from it (into other games too)
@@ -116,9 +122,9 @@ package and loaded by the AMD driver as it is, instead of the driver compiling t
 faster than the driver's own compile. This is not a setting: it is always tried first. When the driver
 cannot take it (a driver without pipeline binaries, for example), the reason is shown under "Network model
 and options" in NR Control and on the Add-ons page and written to dlssnr-amd.log, and:
-  - an RX 9000 runs the network compiled by the AMD driver instead (CC_SMALL_FP8_EXPERIMENTAL and
+  - an RDNA4 card runs the network compiled by the AMD driver instead (CC_SMALL_FP8_OPTIMIZED and
     CC_SILVER_AARDWOLD_OPTIMIZED are greyed out then);
-  - an RX 7000 / Radeon 700M - 8000S has no NR (their network exists as ACO's machine code only).
+  - RDNA3 and RDNA3.5 have no NR (their network exists as ACO's machine code only).
 The same place shows "ACO Mode: on in this run" and for which graphics while it is in use. A failure that
 is not ACO's own (video memory running short, for example) does not turn it off. The RDNA3 machine code builds on
 mauri870's DLSSNR-RDNA3 (https://github.com/mauri870/DLSSNR-RDNA3), its int4 included, and on TheAutomatic's
@@ -126,11 +132,11 @@ mauri870's DLSSNR-RDNA3 (https://github.com/mauri870/DLSSNR-RDNA3), its int4 inc
 
 D3D12 passthrough (experimental)
 --------------------------------
-On the optiscaler route in D3D12 games on an RX 9000 or RX 7000, the network runs on the game's own D3D12 device
+On the optiscaler route in D3D12 games on RDNA4, RDNA3 or RDNA3.5, the network runs on the game's own D3D12 device
 as the same ACO machine code, made into pipelines by AMD's driver (its D3D12 extension), instead of on a Vulkan
 device of NR's own with the frame handed across: no hand-over between the two devices. First implemented by
 TheAutomatic. It is on by default in this version: [D3D12Passthrough] Enabled in dlssnr-amd.ini (1 on, 0 off),
-or the checkbox on NR Control's Network page; either takes effect at the next game start. On an RX 9000 a small
+or the checkbox on NR Control's Network page; either takes effect at the next game start. On RDNA4 a small
 check runs on the game's device at the first frame; a game or GPU it cannot serve (another GPU, a driver without
 the extension, the check failing) runs through the Vulkan device as before. The Network page shows the check's
 result and how many frames ran each way, Diagnostics more; dlssnr-amd.log has the details ([d3d12] lines).
@@ -210,13 +216,30 @@ reshade-feeder routes: Home opens ReShade; the NR settings are on the Add-ons pa
             resolution goes up to 200% (supersampling). Passes 1..3, up to 30 with Unlock passes.
             HDR: scRGB (linear) and HDR10 (PQ) are supported; HLG pictures are not handled on these
             routes, set the game to SDR, scRGB or HDR10.
-New noise every frame: the network's noise seed changes every frame, as in NVIDIA's original. RenoDX
-layers (NRNoiseEveryFrame): on by default. wilsjo2 layers (NoiseEveryFrame): only on frames without
-motion vectors; on by default on the OptiScaler route, off on the ReShade routes. Without motion
-vectors there is no previous result to average the noise, so with it on a still picture shimmers
-slightly.
+New noise every frame: the network's noise seed changes every frame, as in NVIDIA's original (RenoDX
+layers NRNoiseEveryFrame, wilsjo2 layers NoiseEveryFrame): on by default; off uses the same seed every
+frame. Without motion vectors there is no previous result to average the noise, so with it on a still
+picture shimmers slightly.
+Pre history and Post history (diagnostic; RenoDX layers NRPreHistory / NRPostHistory, wilsjo2 layers
+PreHistory / PostHistory): the network's own use of its previous frame - Pre, its input also reads the
+previous answer; Post (0..1, 0 = off), the previous answer is blended into the new one. Both default to
+NVIDIA's behaviour (on / 1).
 
-Networks and other settings ([Network] in dlssnr-amd.ini; in NR Control and on the Add-ons page under
+Frame reuse (optional, off by default; optiscaler route, NR settings under the network, NRFrameReuse
+for RenoDX layers, FrameReuse for wilsjo2 layers, switchable in game): NR's network runs on every other
+frame and the frame in between is rebuilt from the NR frames before and after it along the game's
+motion vectors. The network's work is split over the two frames so every frame takes about the same
+GPU time, and every frame is shown two frames later, which adds latency. It runs at Present only and
+needs the game's motion vectors (depth is used when the game gives it); it does not run with
+Interleaved. Where it cannot run, the line under the switch says why and the layer's frame is left as
+it is. Not offered on the reshade-feeder routes.
+
+Interleaved (Passes (fast)): Depth disocclusion check (NRFastInterleavedDepthDisocclusion /
+FastInterleavedDepthDisocclusion, on by default) finds surfaces that have just come into view from the
+game's depth; if a grid of light squares appears (strong upscaling, for example Ray Reconstruction),
+turn it off and they are found from the motion vectors and colours only.
+
+Networks and other settings ([Network], [CC_SILVER_AARDWOLD_OPTIMIZED] and [CC_SMALL_FP8_OPTIMIZED] in dlssnr-amd.ini; in NR Control and on the Add-ons page under
 Network model and options):
   - Residency: what is kept of a network that is no longer running. The networks share one activation
     memory, so what is kept is mainly the weights.
@@ -239,11 +262,16 @@ Network model and options):
   - Style Grade (default 1): the grade of the Natural and Cinematic styles. 1 = as NVIDIA's DLL, the
     picture is graded for the style after the network; 0 = the picture of 0.0.6 and earlier (without
     that step). Standard is not affected; applied at once.
+  - Style Grade Acceleration (default 1): 1 = the Natural / Cinematic grade with an equivalent formula
+    that takes less GPU time; 0 = computed
+    step by step. Only with Style Grade 1; RDNA4 only (greyed out on RDNA3 and RDNA3.5); applied at once.
   - Motion Without Depth (default 1): 1 = the network fetches the previous frame with the pixel's own
     motion vector, depth not used, as NVIDIA's DLL does; 0 = with depth, the motion vector of whichever
     of the pixel and its four diagonal neighbours is nearest the camera. Applied after a game restart.
-  - OptimizedLayers (default 3): CC_SILVER_AARDWOLD_OPTIMIZED's level, 0 = Quality, 1 = Balanced,
+  - [CC_SILVER_AARDWOLD_OPTIMIZED] Layers (default 3): its level, 0 = Quality, 1 = Balanced,
     2 = Performance, 3 = Ultra Performance (see the networks above).
+  - [CC_SMALL_FP8_OPTIMIZED] Layers (default 0): its level, 0 and 1 = Quality, 2 = Performance,
+    3 = Ultra Performance (see the networks above).
   - History Precision (default 16): the images NR keeps its previous result in. 16 = 16-bit, as
     NVIDIA's DLL keeps it, half the memory; 32 = 32-bit, as up to 0.0.8.1. With several passes the two
     can differ in fine detail. Applied at once (the previous result starts afresh).
@@ -319,8 +347,8 @@ Files put into the game folder
     optiscaler route:            dxgi.dll (that is OptiScaler.dll), OptiScaler.ini and OptiScaler\ (the NR
                                  plugin is OptiScaler\plugins\dlssnr-amd.asi, OptiScaler's licences are in
                                  OptiScaler\Licenses\)
-    reshade-feeder (DX10/11/12): dxgi.dll (ReShade), dlssnr_amd.addon64, ReShade's settings and
-                                 shaders
+    reshade-feeder (DX10/11/12): dxgi.dll (ReShade), dlssnr_amd.addon64 (dlssnr_amd.addon32 from the
+                                 i686 package), ReShade's settings and shaders
     reshade-feeder-dx9:          d3d9.dll dxgi.dll (DXVK), vulkan-1.dll (Vulkan loader; never calls
                                  DXGI and loads the ReShade layer from the game folder), ReShade's files
     reshade-feeder-vulkan:       vulkan-1.dll and ReShade's files
@@ -346,7 +374,6 @@ Known limits
 - 007 First Light (optiscaler route, NR before or after the upscaler): the picture turns green and
   grainy, since the game hands the upscaler a picture that is not yet tone mapped and no exposure.
   Turn on Preprocess with Exposure = auto.
-- 64-bit package only.
 
 Third-party components
 ----------------------

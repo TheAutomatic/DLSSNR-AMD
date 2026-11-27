@@ -33,6 +33,11 @@ for k in st_fb_in st_prep st_box st_apply il il0 il_pp; do
     "$glslang" -V --target-env vulkan1.3 -Ilinux/shaders/renodx-fast linux/shaders/renodx-fast/$k.comp -o "$out/wilsjo2_$k.spv" > "$log" ||
         { cat "$log" >&2; exit 1; }
 done
+# Interleaved with the Style grade in closed form ([Network] Style Grade Acceleration)
+for k in il il0; do
+    "$glslang" -V --target-env vulkan1.3 -DNR_STYLE_GRADE_CLOSED -Ilinux/shaders/renodx-fast linux/shaders/renodx-fast/$k.comp \
+        -o "$out/wilsjo2_${k}_ga.spv" > "$log" || { cat "$log" >&2; exit 1; }
+done
 "$glslang" -V --target-env vulkan1.3 -I"$src" "$src/wilsjo2_half_copy.comp" -o "$out/wilsjo2_half_copy.spv" > "$log" ||
     { cat "$log" >&2; exit 1; }
 # the .asi's Vulkan copies a transfer cannot make: one file, two programs (the source sampled / read as storage)

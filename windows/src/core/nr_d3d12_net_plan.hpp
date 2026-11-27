@@ -36,6 +36,9 @@ struct D3d12NetPlan {
     std::string note;              // why the model is not the one asked for (empty: it is)
     uint32_t width = 0, height = 0, work_w = 0, work_h = 0;
     bool style_grade = true;       // [Network] Style Grade (false too when the temporal post has no grade twin)
+    // [Network] Style Grade Acceleration as the ini says it (default on; the grade in closed form where the folder has
+    // the temporal posts' *_grade_accel twins)
+    bool style_grade_accel = true;
     // The temporal path (Runtime::Runtime's temporal_config.enable): the graph's pre and post block are replaced by the
     // temporal pre / post kernels at their steps, with the same push blocks.
     struct Temporal {
@@ -45,6 +48,8 @@ struct D3d12NetPlan {
         // The RGBA16F history's post and its grade twin ([Network] History Precision 16; empty: the folder has none,
         // or not the grade twin where the RGBA32F post has one - then the history stays RGBA32F, as the runtime's h16_ok)
         std::string post16_spv, post16_grade_spv;
+        // Their closed-form twins ([Network] Style Grade Acceleration; empty: the folder has none - the table form)
+        std::string post_grade_accel_spv, post16_grade_accel_spv;
         bool history_f16 = true;                   // [Network] History Precision (16, the default) as the ini says it
         uint32_t pre_push_bytes = 0;               // kPrePushBytes: the pre block's push, PushFSwin + PushPreImage
         uint32_t seed_at = 0, noise_field_at = 0;  // kPreSeedAt / kPreNoiseFieldAt in it
@@ -61,6 +66,7 @@ struct D3d12NetControls {
     bool round_u8 = false;         // the output is 8-bit: the alpha pass rounds as the post block would
     uint32_t reversible = 0;       // reversible_of(Controls): part of the input domain a history was made under
     float history_strength = -1.0f;   // Controls::history_strength (< 0: the session's, 1)
+    bool pre_history = true;   // Controls::pre_history (a layer's Pre history; Post history is history_strength)
     bool noise_every_frame = false;
     bool seed_fixed = false;       // Controls::seed_fixed, including temporal frames
     bool no_grade = false;         // this call without the Style grade (Passes (fast) Interleaved's plain pass)
@@ -68,11 +74,11 @@ struct D3d12NetControls {
 
 // nr_runtime.cpp. The network for a `width` x `height` frame of the installation at `root` (the folder with
 // dlssnr-amd\ in it), the model as the Vulkan runtime picks it (DLSSNR_MODEL over dlssnr-amd.ini [Network] Model) unless
-// `model` (nr::kOriginal ...) is given; `experimental` false: CC_SMALL_FP8_EXPERIMENTAL is planned as CC_SMALL_FP8.
+// `model` (nr::kSmallFp8 ...) is given; `small_fp8_optimized` false: CC_SMALL_FP8_OPTIMIZED is planned as CC_SMALL_FP8.
 // False, and `why`: no network.
 // `arch`: the GPU's architecture (nr_gpu_arch.hpp), whose network is planned: RDNA4 the bundle's own, RDNA3 the
 // bundle's dlssnr-amd\aco\rdna3 stand-ins and records with RDNA3's lowering; any other is refused.
-bool plan_d3d12_network(const std::string& root, uint32_t width, uint32_t height, bool experimental, D3d12NetPlan* out,
+bool plan_d3d12_network(const std::string& root, uint32_t width, uint32_t height, bool small_fp8_optimized, D3d12NetPlan* out,
                         std::string* why, int model, nr::arch::GpuArch arch);
 // The frame's controls into one dispatch's push block (Runtime::Impl::patch_push, the same code).
 void d3d12_net_controls(D3d12NetPlan::Dispatch& d, const D3d12NetControls& c, bool grade);

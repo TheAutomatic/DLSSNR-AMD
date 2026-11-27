@@ -1,0 +1,63 @@
+#version 460
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// Frame reuse, two-sided rebuild: the outline context of a depth image (this frame's - the kept rebuilt frame's - or an
+// anchor's), at its own size. Class = the first ring (2, 4, 8, 16 px at 720p; 8 directions, the nearest texel) that
+// reaches a surface nearer by more than 5 % (0..3; 4: none) - compose.comp's mode 2 weighs each side of the merge by the
+// classes at the pixel now and at its source.
+//   mode 0  the nearest depth of each 16 x 16 texels into TileOut
+//   mode 1  the classes; a tile where nothing within the rings' reach is more than 5 % nearer than its farthest texel takes
+//           class 4 without the taps (exact: the test rises with the tap's nearness and falls with the centre's)
+// `which`: 0 Depth -> OutNow, 1 / 2 AnchorDepth0 / 1 -> Out0 / Out1.
+layout(local_size_x=16,local_size_y=16) in;
+layout(binding=0) uniform sampler2D Depth;
+layout(binding=1) uniform sampler2D AnchorDepth0;
+layout(binding=2) uniform sampler2D AnchorDepth1;
+layout(binding=3,r8) uniform writeonly image2D OutNow;
+layout(binding=4,r8) uniform writeonly image2D Out0;
+layout(binding=5,r8) uniform writeonly image2D Out1;
+layout(binding=6,r32f) uniform writeonly image2D TileOut;
+layout(binding=7) uniform sampler2D Tile;
+layout(push_constant) uniform Push {uvec2 size; uint mode, which, inverted;} pc;   // size: the frame's (output) size
+float near_depth(float z) {return pc.inverted!=0u?z:1.0-z;}
+float rel_depth(float a,float b) {return (a-b)/max(max(abs(a),abs(b)),1e-7);}
+float depth(ivec2 t) {
+    return near_depth((pc.which==0u?texelFetch(Depth,t,0):pc.which==1u?texelFetch(AnchorDepth0,t,0):texelFetch(AnchorDepth1,t,0)).r);
+}
+ivec2 extent() {return pc.which==0u?textureSize(Depth,0):pc.which==1u?textureSize(AnchorDepth0,0):textureSize(AnchorDepth1,0);}
+vec2 unit(ivec2 n) {return vec2(n)/vec2(pc.size)*(float(pc.size.y)/720.0);}   // one 720p pixel in texels
+float context_class(ivec2 t,ivec2 n,float z) {
+    vec2 u=unit(n);
+    for(int k=0;k<4;++k){float r=float(2<<k);
+        for(int d=0;d<8;++d){vec2 o=vec2(d==0||d==1||d==7?1:d==3||d==4||d==5?-1:0,d==1||d==2||d==3?1:d==5||d==6||d==7?-1:0);
+            if(o.x!=0&&o.y!=0)o*=.7071;
+            if(rel_depth(depth(ivec2(floor(clamp(vec2(t)+o*r*u,vec2(0),vec2(n-1))+.5))),z)>.05)return float(k);}}
+    return 4.0;
+}
+shared uint nearest,farthest;   // float bits (depths >= 0)
+void main() {
+    ivec2 p=ivec2(gl_GlobalInvocationID.xy),n=extent();
+    float z=depth(min(p,n-1));
+    if(gl_LocalInvocationIndex==0u){nearest=0u;farthest=0xffffffffu;}
+    barrier();
+    if(pc.mode==0u) {
+        float m=subgroupMax(z);
+        if(subgroupElect())atomicMax(nearest,floatBitsToUint(m));
+        barrier();
+        if(gl_LocalInvocationIndex==0u)imageStore(TileOut,ivec2(gl_WorkGroupID.xy),vec4(uintBitsToFloat(nearest)));
+        return;
+    }
+    vec2 reach=16.0*unit(n)+.5;   // the farthest tap, rounded to its texel
+    ivec2 tiles=textureSize(Tile,0),t0=ivec2(gl_WorkGroupID.xy)*16;
+    ivec2 c0=clamp(ivec2(floor((vec2(t0)-reach)/16.0)),ivec2(0),tiles-1),c1=clamp(ivec2(floor((vec2(t0+15)+reach)/16.0)),ivec2(0),tiles-1);
+    ivec2 cn=c1-c0+1;bool skip=cn.x*cn.y<=256;
+    if(skip && int(gl_LocalInvocationIndex)<cn.x*cn.y)
+        atomicMax(nearest,floatBitsToUint(texelFetch(Tile,c0+ivec2(int(gl_LocalInvocationIndex)%cn.x,int(gl_LocalInvocationIndex)/cn.x),0).r));
+    float f=subgroupMin(z);
+    if(subgroupElect())atomicMin(farthest,floatBitsToUint(f));
+    barrier();
+    skip=skip && rel_depth(uintBitsToFloat(nearest),uintBitsToFloat(farthest))<=.05;
+    if(any(greaterThanEqual(p,n)))return;
+    vec4 v=vec4((skip?4.0:context_class(p,n,z))*.25);
+    if(pc.which==0u)imageStore(OutNow,p,v);else if(pc.which==1u)imageStore(Out0,p,v);else imageStore(Out1,p,v);
+}

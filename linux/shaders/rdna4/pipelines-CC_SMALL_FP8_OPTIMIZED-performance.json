@@ -1,0 +1,204 @@
+{
+ "about": [
+  "CC_SMALL_FP8_OPTIMIZED at Optimized layers Performance (build_network.py <arch> --network CC_SMALL_FP8_OPTIMIZED-performance; the weights of",
+  "CC_SMALL_FP8_OPTIMIZED.bin with its \"performance/\" entries): the Quality network (pipelines-CC_SMALL_FP8_OPTIMIZED.json, copied",
+  "here in full) plus: the pre block (fswinimagepreds32nh) with fixed attention (NR_FIXP) and the hard-swish MLP",
+  "(NR_ACT_HS=2); the ViT attention reading pooled keys and values (NR_VKPOOL=1) for the heads vit-kv-pool.txt names, at",
+  "frames whose ViT has at least min_tokens tokens (4K class): vit_kvpool.comp (pipeline poolvkv, one dispatch a ViT layer",
+  "between QKV and the attention) averages each such head's keys (back to unit length) and values over 1x2, 2x2, 2x4 or",
+  "4x4 neighbours of the token raster (a digit d: 1 / 2^d of the keys; 0: all of them). Smaller frames, and frames",
+  "whose ViT padding is all the image's edge (5120x1440: the pooling tips the ViT's padding sink there), run the",
+  "network without pooling.",
+  "The ViT attention skips the identical padding rows of a 4K-class token raster as at Quality (NR_VTAIL)."
+ ],
+ "change": {
+  "fswin128": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswin256": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswin32": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswin32nh": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswin64": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinds128": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinds256": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinds32": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinds64": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswindsp128": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswindsp256": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswindsp32": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswindsp32nh": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswindsp64": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinfusedup128": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinfusedup32": {
+   "add": [
+    "NR_SACT=1",
+    "NR_FIXP=1",
+    "NR_VOMERGE=1"
+   ]
+  },
+  "fswinfusedup32nh": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinfusedup64": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinimagepost32": {
+   "add": [
+    "NR_SACT=1",
+    "NR_FIXP=1",
+    "NR_VOMERGE=1"
+   ]
+  },
+  "fswinimagepreds32": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinp128": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinp256": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinp64": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinpds128": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinpds256": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinpds64": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinpup128": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinpup64": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinimagepreds32nh": {
+   "add": [
+    "NR_FIXP=1",
+    "NR_ACT_HS=2"
+   ]
+  },
+  "vitattn": {
+   "add": [
+    "NR_VKPOOL=1",
+    "NR_VTAIL=1"
+   ]
+  }
+ },
+ "new": {
+  "fswin32nhd": {
+   "base": "fswin32nh",
+   "add": [
+    "NR_SACT=1",
+    "NR_FIXP=1",
+    "NR_VOMERGE=1"
+   ]
+  },
+  "poolvkv": {
+   "source": "vit_kvpool.comp",
+   "defines": [
+    "NR_COHERENT_ACT=0"
+   ]
+  }
+ },
+ "markers": {
+  "vit-kv-pool.txt": [
+   "min_tokens 1500",
+   "11 01113331112110101323102111233201",
+   "12 22213212310122131212302111120221",
+   "13 11211222312102111012111201022111",
+   "14 01111121121210120211211111111210",
+   "15 11212110112202112210211111111311",
+   "16 21011121110112212012212212202221",
+   "17 12212221012231121221221111221220",
+   "18 11132130012222111121222022113201"
+  ],
+  "vit-tail.txt": [
+   "on"
+  ]
+ }
+}

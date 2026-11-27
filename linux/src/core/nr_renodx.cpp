@@ -563,6 +563,7 @@ struct Stage::Impl {
              kPrepFused,   // Preprocess with RenoDX's SDR encode (mode 3) and decode (mode 4) folded in
              kIl, kIlMv,   // Passes (fast) Interleaved: the slots' increments, the vectors for a slot's older history
              kIl0, kIlPp,   // Interleaved preset 1 (0.0.8.4's method): its own program, its fill's pyramid
+             kIlGa, kIl0Ga,   // kIl / kIl0 with the Style grade in closed form ([Network] Style Grade Acceleration)
              kCount };
     Program programs[kCount];
 
@@ -626,6 +627,7 @@ struct Stage::Impl {
     Image il_depth[2];   // the game's nearness at the network's size, this frame's and last frame's
     uint32_t il_dcur = 0;
     bool il_graded_last = false;
+    int il_grade_form = 0;   // the Style grade's form last said in the log (1 step by step, 2 closed form)
     Image il_tdbg;   // (research NR_IL_DEBUG=2: each test's own answer; 1 x 1 unless that view is on)
     Image il_base, il_base2, il_trust, il_inc[2][kIlSlots], il_ring[3], il_comp, il_hist;
     uint32_t il_cur = 0, il_frame = 0, il_ring_cur = 0, il_last[kIlSlots] = {}, il_slots = 0, il_bcur = 0;
@@ -667,6 +669,13 @@ struct Stage::Impl {
             il_slots = slots; il_valid = false;
         }
         init_fresh(cmd);
+    }
+    // Interleaved's program with the Style grade in closed form (renodx_il_ga.spv / renodx_il0_ga.spv), made when a frame
+    // first grades with Style Grade Acceleration on
+    void ensure_il_ga(P program) {
+        if (programs[program].pipeline) return;
+        if (program == kIlGa) load(programs[kIlGa], "il_ga", 96, 0x7Bu);
+        else load(programs[kIl0Ga], "il0_ga", 96, 0x3Bu);
     }
     void retire_il() {
         retire(il_base); retire(il_base2); retire(il_trust); retire(il_tdbg); retire(il_comp); retire(il_hist);
@@ -886,6 +895,7 @@ struct Stage::Impl {
     // flight are past them, as the retired images are.
     struct Borrow { nr::gpu::Ticket gpu; VkImageView in{}, out{}, motion{}, depth{}; VkDescriptorPool pool{}; };
     std::vector<Borrow> borrows;
+    uint32_t il_depth_mode_said = ~0u;   // the Interleaved depth mode last said in the log
     bool in_place_logged = false, motion_logged = false, il_depth_logged = false, il_nodepth_logged = false, il_missing_logged = false, fb_missing_logged = false;
     Borrow& borrow_slot() {
         if (borrows.empty()) borrows.resize(66);   // retire()'s 64 recordings, and two
@@ -1449,6 +1459,26 @@ void working_resolution(const Settings& s, uint32_t rw, uint32_t rh, uint32_t gw
 }
 
 uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network& network) {
+    return record_impl(cmd, fr, network, {});
+}
+
+uint32_t Stage::record_split(VkCommandBuffer cmd, const StageFrame& fr, const Network& network,
+                             const Continuation& continuation) {
+    return record_impl(cmd, fr, network, continuation);
+}
+
+void Stage::touch_submission() { impl_->gpu_uses.touch(); }
+
+uint32_t Stage::record_impl(VkCommandBuffer cmd, const StageFrame& fr, const Network& network,
+                            const Continuation& continuation) {
+    const auto invoke_network = [&](uint32_t pass, const ColourFrame& proxy, const ColourFrame& neural, bool reset) {
+        network(pass, proxy, neural, reset);
+        if (continuation) {
+            const VkCommandBuffer next = continuation(cmd);
+            if (!next) throw std::invalid_argument("split NR stage has no continuation command buffer");
+            cmd = next;
+        }
+    };
     Impl& m = *impl_;
     m.gpu_uses.touch();
     ++m.recordings;
@@ -2040,7 +2070,7 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
             // frame + the earlier slots' moved increments, the answer the frame + every increment.
             m.ensure_il(cmd, NW, NH, il_n, il_preset);
             const bool stable = il_preset == 2u;
-            const auto il_program = stable ? Impl::kIl : Impl::kIl0;
+            auto il_program = stable ? Impl::kIl : Impl::kIl0;
             // each slot's network reads a history one frame old, made from last frame's increments (NR_IL_HIST=0, research:
             // its own history, several frames old, moved by the composed vectors)
             static const bool il_fresh_history = [] { const char* e = std::getenv("NR_IL_HIST"); return !(e && e[0] == '0'); }();
@@ -2060,8 +2090,16 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
                     return std::make_pair(false, std::make_pair(a, b));
                 }
                 std::sscanf(e, "%f,%f", &a, &b); return std::make_pair(true, std::make_pair(a, b)); }();
-            // NR_IL_DEPTH (research): the game's depth for a disocclusion test (1, 2) and vector dilation (1, 3)
-            static const uint32_t il_depth_mode = [] { const char* e = std::getenv("NR_IL_DEPTH"); return e && e[0] ? uint32_t(std::atoi(e)) : il_ag ? 1u : 0u; }();
+            // The game's depth for the disocclusion check (1, 2) and vector dilation (1, 3): NRFastInterleavedDepthDisocclusion picks
+            // 1 (on, 0.0.9's) or 3 (off); NR_IL_DEPTH (research) overrides it
+            static const int il_depth_env = [] { const char* e = std::getenv("NR_IL_DEPTH"); return e && e[0] ? std::atoi(e) : -1; }();
+            const uint32_t il_depth_mode = il_depth_env >= 0 ? uint32_t(il_depth_env) : !il_ag ? 0u : s.fast_interleaved_depth_disocclusion ? 1u : 3u;
+            if (il_depth_mode != m.il_depth_mode_said) {   // (the switch, live: said once each time it changes)
+                m.il_depth_mode_said = il_depth_mode;
+                nr::logf("[nr] RenoDX stage: Interleaved depth disocclusion check %s (depth mode %u%s)",
+                         il_depth_mode == 1u || il_depth_mode == 2u ? "on" : "off", unsigned(il_depth_mode),
+                         il_depth_env >= 0 ? ", NR_IL_DEPTH" : "");
+            }
             VkImageView depth_view = VK_NULL_HANDLE;
             const VkImageAspectFlags depth_aspects =
                 fr.depth.format == VK_FORMAT_D32_SFLOAT || fr.depth.format == VK_FORMAT_D16_UNORM || fr.depth.format == VK_FORMAT_X8_D24_UNORM_PACK32
@@ -2096,13 +2134,25 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
             // "Same as pass 1" is off; the Intensity always the pass's own). Not plain (a Style, an Intensity other than 1):
             // the slots' networks run plain and the stage composes - the slots' histories must be the network's own
             // output, not the graded answer, or the grade comes round again every frame (Natural: grey, then noise).
-            bool il_graded = false;
+            bool il_graded = false, il_styled = false;
             for (uint32_t k = 0; k < 4; ++k) {
                 const bool own = k > 0 && !s.pass_follow[k - 1];
                 const uint32_t st = fr.style_grade ? std::min(own ? s.pass_style[k - 1] : s.style, 2u) : 0u;
                 const float in = k == 0 ? s.intensity : s.pass_intensity[k - 1];
                 ip.styles |= st << (2 * k); ip.inten[k] = in;
                 if (k < il_n && (st != 0 || in != 1.0f)) il_graded = true;
+                if (k < il_n && st != 0) il_styled = true;
+            }
+            // [Network] Style Grade Acceleration: a pass with a Style is graded by the program with the grade in closed
+            // form (the same grade; a frame without a Style keeps the plain program)
+            if (il_styled && fr.style_grade_accel) {
+                il_program = stable ? Impl::kIlGa : Impl::kIl0Ga;
+                m.ensure_il_ga(il_program);
+            }
+            if (il_styled && m.il_grade_form != (fr.style_grade_accel ? 2 : 1)) {
+                m.il_grade_form = fr.style_grade_accel ? 2 : 1;
+                nr::logf("[nr] RenoDX stage: Interleaved's Style grade %s",
+                         fr.style_grade_accel ? "in closed form (Style Grade Acceleration)" : "step by step");
             }
             // (the increments mean the network's own output or the graded answer: a change between them starts over)
             if (il_graded != m.il_graded_last) { m.il_valid = false; m.il_graded_last = il_graded; }
@@ -2200,7 +2250,7 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
                 if (depth_view) depth_layout(false);   // (the game's depth back before the network reads it)
                 m.network_motion = Stage::NetworkMotion{false, {}, {}, il_graded};
                 for (uint32_t j = 0; j < il_n; ++j) {
-                    il(3u, j, false); il(0u, j, false); network(j, il_input(), n, true); after_network(); il(1u, j, false);
+                    il(3u, j, false); il(0u, j, false); invoke_network(j, il_input(), n, true); after_network(); il(1u, j, false);
                     if (j + 1 < il_n) ++ran;
                     m.il_last[j] = 0;
                 }
@@ -2234,7 +2284,7 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
                 ColourFrame hist = comp;
                 hist.image = m.il_hist.handle; hist.format = VK_FORMAT_R16G16B16A16_SFLOAT;
                 m.network_motion = il_fresh_history ? Stage::NetworkMotion{false, {}, hist, il_graded} : Stage::NetworkMotion{true, comp, {}, il_graded};
-                network(slot, il_input(), n, false);
+                invoke_network(slot, il_input(), n, false);
                 m.mark(cmd, "network-il");   // (NR_RENODX_PROF: the network apart from the slots' steps around it)
                 m.network_motion = {};
                 after_network();
@@ -2244,7 +2294,7 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
             }
             m.il_ring_cur = (m.il_ring_cur + 1u) % 3u;
         } else {
-            network(k, p, n, reset);
+            invoke_network(k, p, n, reset);
         }
         m.mark(cmd, "network");
         ++ran;

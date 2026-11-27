@@ -18,14 +18,9 @@ void draw_network() {
     if (!nr::control_ui::section("D3D12 passthrough (experimental)")) return;
     bool on = g_written >= 0 ? g_written == 1 : s.enabled;
     if (ImGui::Checkbox(tr("D3D12 passthrough (next launch)"), &on)) { set_enabled(on); g_written = on ? 1 : 0; }
-    nr::control_ui::help("On the OptiScaler route in D3D12 games on an RX 9000 or RX 7000: NR's network runs on the game's "
+    nr::control_ui::help("On the OptiScaler route in D3D12 games on RDNA4, RDNA3 or RDNA3.5: NR's network runs on the game's "
                          "own D3D12 device instead of through the Vulkan bridge. A game it cannot serve uses the bridge.");
-    nr::control_ui::text_dim_wrapped("%s at launch (dlssnr-amd.ini [D3D12Passthrough] Enabled)", s.enabled ? tr("On") : tr("Off"));
-    if (s.enabled) {
-        nr::control_ui::text_dim_wrapped("Check: %s", s.canary.c_str());
-        nr::control_ui::text_dim_wrapped("Frames: %llu on the game's D3D12 device, %llu through the Vulkan bridge, %llu waiting (no NR)",
-                                         (unsigned long long)s.runs, (unsigned long long)s.fallbacks, (unsigned long long)s.waits);
-    }
+    // (its state - the check, the frames on the device or through the bridge - is on the Diagnostics page)
 }
 
 void draw_panel() {

@@ -30,6 +30,18 @@ CallWilsjo2::CallWilsjo2(const Wilsjo2Facts* facts) : previous(t_call_wilsjo2) {
 CallWilsjo2::~CallWilsjo2() { t_call_wilsjo2 = previous; }
 const Wilsjo2Facts* call_wilsjo2() { return t_call_wilsjo2; }
 namespace {
+thread_local const W2Present* t_call_w2_present = nullptr;
+}  // namespace
+CallW2Present::CallW2Present(const W2Present* present) : previous(t_call_w2_present) { t_call_w2_present = present; }
+CallW2Present::~CallW2Present() { t_call_w2_present = previous; }
+const W2Present* call_w2_present() { return t_call_w2_present; }
+namespace {
+thread_local const NetSplit* t_call_net_split = nullptr;
+}  // namespace
+CallNetSplit::CallNetSplit(const NetSplit* split) : previous(t_call_net_split) { t_call_net_split = split; }
+CallNetSplit::~CallNetSplit() { t_call_net_split = previous; }
+const NetSplit* call_net_split() { return t_call_net_split; }
+namespace {
 thread_local int t_call_network = -1;
 }  // namespace
 CallNetwork::CallNetwork(int network) : previous(t_call_network) { t_call_network = network; }

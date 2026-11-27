@@ -119,6 +119,7 @@ struct D3d12BackendFrame {
     int noise_every_frame;
     int history_f16;       // [Network] History Precision 16 (else 32), as the session reads dlssnr-amd.ini
     int style_grade;       // [Network] Style Grade (live, as the Vulkan runtime's set_style_grade)
+    int style_grade_accel; // [Network] Style Grade Acceleration with it (the grade in closed form; live)
     // The temporal inputs, as the session's EngineResources takes them (evaluate_d3d12): the motion guide in
     // NON_PIXEL_SHADER_RESOURCE, its subrect (0 extent: the whole texture), MVecScale over the region's extent
     // (normalized_mv_scale), DLSSNR.Reset, the feature (its history).
@@ -131,6 +132,9 @@ struct D3d12BackendFrame {
     int reset;
     unsigned long long feature;
     float history_strength;   // < 0: the session's
+    // a wilsjo2 layer's PreHistory off (nr::Controls::pre_history; zero = on, the default) and NoiseEveryFrame off
+    // (nr::Controls::seed_fixed: the same seed on every frame)
+    int pre_history_off, seed_fixed;
     // The RenoDX route installed (OptiScaler's encode / resolve skipped: nr_pe_optifix.cpp).
     int renodx_route;
     // The RenoDX route's own frame, as evaluate_d3d12 builds it for the bridge (nr_pe_session.hpp RenoDXFrame)
@@ -162,6 +166,14 @@ struct D3d12BackendFrame {
     // (Intensity 1 already in `intensity`, no Style grade)
     ID3D12Resource* history;
     int no_grade;
+    int external_history;
+    // The wilsjo2 flow's network call split for frame reuse's even frames (renodx_route::CallNetSplit): the network goes on
+    // in `split_tail` (ID3D12GraphicsCommandList*) after `split_cut` of its dispatches, the call's writeback there too.
+    void* split_tail;
+    unsigned int split_cut;
+    // The NR chain's layer this call runs (renodx_route::call_layer; 0 outside one): the passthrough notes which layers
+    // run on it (frame reuse's even frames need one)
+    int layer;
     // (out, may be null): set to 1 by a backend that returns false only because its network for this extent is still
     // being made - it will take such frames; evaluate_d3d12 then passes the frame through (output := colour) with no NR
     // and does not start the Vulkan bridge's network for them.

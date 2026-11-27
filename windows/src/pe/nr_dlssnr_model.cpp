@@ -1,3 +1,4 @@
+#include "nr_frame_pair.hpp"
 // The DLSS-NR model behind both doors; see nr_dlssnr_model.hpp for which two and why.
 //
 // Everything here was windows/src/pe/nr_dlssnr_forwarder.cpp's anonymous namespace and the bodies of its
@@ -48,6 +49,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <string>
 #include <utility>
@@ -84,7 +86,9 @@ struct Feature {
 
 namespace {
 
-std::mutex g_lock;
+// A grouped Direct renderer may run a wilsjo2 member's model call while
+// recording a RenoDX member's outer evaluation on the same thread.
+std::recursive_mutex g_lock;
 std::atomic<D3d12Backend> g_d3d12_backend{nullptr};   // set_d3d12_backend
 thread_local bool t_native_call = false;                 // set_d3d12_native_call
 std::atomic<int> g_d3d12_network{-1};
@@ -145,6 +149,13 @@ void count_passthrough(int what) {   // 0 ran, 1 copy-through, 2 waiting for its
 // forwarder module is already there.
 std::unique_ptr<nr::pe::Session> g_d3d12_session;
 std::unique_ptr<nr::pe::Session> g_vk_session;
+// A nonterminal delayed network keeps its intermediate activations until the
+// next Present. Its session owns that scratch while the ordinary layers run.
+std::unique_ptr<nr::pe::Session> g_split_d3d12, g_split_vk;
+nr::pe::DeviceHandles g_split_handles;
+VkQueue g_split_queue{};
+uint32_t g_split_family{};
+std::function<void()> g_split_lock,g_split_unlock;
 bool g_keep_caller_state = false;   // keep_caller_state()
 
 // The processing around the model (the RenoDX-style stage, the wilsjo2 flow) runs its own resolve, as OptiScaler does
@@ -157,9 +168,11 @@ void start_idle_clock() {
         std::thread([] {
             for (;;) {
                 Sleep(1000);
-                std::lock_guard<std::mutex> guard(g_lock);
+                std::lock_guard<std::recursive_mutex> guard(g_lock);
                 if (g_d3d12_session) g_d3d12_session->idle();
                 if (g_vk_session) g_vk_session->idle();
+                if (g_split_d3d12) g_split_d3d12->idle();
+                if (g_split_vk) g_split_vk->idle();
             }
         }).detach();
     });
@@ -189,6 +202,21 @@ nr::pe::Session& vk_session() {
         g_vk_session->set_motion_point(motion_point());
     }
     return *g_vk_session;
+}
+
+nr::pe::Session& recording_session(bool vulkan) {
+    if (!nr::frame_pair::PresentAge::isolated()) return vulkan?vk_session():d3d12_session();
+    auto& private_session=vulkan?g_split_vk:g_split_d3d12;
+    if (!private_session) {
+        private_session=std::make_unique<nr::pe::Session>(std::string());
+        private_session->set_motion_point(motion_point());
+        if (vulkan) {
+            private_session->set_vulkan_queue(g_split_queue,g_split_family);
+            private_session->set_vulkan_handles(g_split_handles);
+            private_session->set_queue_lock(g_split_lock,g_split_unlock);
+        } else private_session->set_keep_caller_state(g_keep_caller_state);
+    }
+    return *private_session;
 }
 
 // [Preprocess] in dlssnr-amd.ini beside this module: the file re-read at most once a second, the
@@ -344,6 +372,10 @@ void report_control(nr::pe::Session& session, const Feature* f, uint32_t route, 
     st.passes = rs ? nr::renodx::stack_passes(*rs) : uint32_t(std::max<size_t>(live, 1));
     const auto ss = session.state();
     st.motion = guides.motion;
+    // frame reuse: a RenoDX layer's, or a wilsjo2 Present layer's run inside the session (renodx_route::call_w2_present)
+    if (rs ? ss.renodx_known : nr::pe::renodx_route::call_w2_present() != nullptr) {
+        st.reuse = ss.reuse; st.reuse_share = ss.reuse_share; st.reuse_note = ss.reuse_note;
+    }
     if (rs && ss.renodx_known && ran) {
         st.fast_passes = ss.renodx.fast_passes;
         st.fast_fallback = ss.renodx.fast_fallback;
@@ -416,6 +448,7 @@ void report_control(nr::pe::Session& session, const Feature* f, uint32_t route, 
         if (const auto* w = nr::pe::renodx_route::call_wilsjo2()) {
             // its passes on one runtime: the network's time is one pass's average times the passes
             st.passes = w->passes;
+            if (w->reuse) { st.reuse = w->reuse; st.reuse_share = w->reuse_share; st.reuse_note = w->reuse_note ? w->reuse_note : ""; }
             if (ran && w->fast_passes > 0.f) { st.fast_passes = w->fast_passes; st.fast_fallback = w->fast_fallback; st.fast_fallback_spatial = w->fast_fallback_spatial; }
             if (ran) st.il_missing = w->il_missing;
             // the layer's whole run, timed around all its passes (Session::outer_begin); until that reading is there,
@@ -444,8 +477,10 @@ void report_control(nr::pe::Session& session, const Feature* f, uint32_t route, 
     for (int n = 0; n < nr::kNetworkChoices; ++n) st.net_why[n] = ss.unavailable[n];
     st.aco = ss.aco; st.aco_why = ss.aco_why; st.aco_rdna3 = ss.aco_rdna3;
     st.device_path = ss.device_path;
-    // the bridge's session reporting while the passthrough serves this process's D3D12 frames (within 2 s): D3D12
-    if (!passthrough_frame && st.device_path == 1 && g_pt_last.load() && GetTickCount64() - g_pt_last.load() < 2000)
+    // the bridge's session reporting while the passthrough serves this process's D3D12 frames (within 2 s): D3D12 -
+    // unless frames fell back to the bridge in that time (nr_pe_control's report says "Bridge (fallback)" then)
+    if (!passthrough_frame && st.device_path == 1 && !nr::pe::d3d12_passthrough::fell_back_recently() &&
+        g_pt_last.load() && GetTickCount64() - g_pt_last.load() < 2000)
         st.device_path = 3;
     if (ss.building) {
         char phase[128];
@@ -459,6 +494,8 @@ void report_control(nr::pe::Session& session, const Feature* f, uint32_t route, 
         const auto as = nr::pe::d3d12_passthrough::backend_net_status();
         st.ran = ran;
         st.waiting = !ran;
+        // NRFrameReuse ran (or could not) on this route: the Vulkan session's state is an older bridge frame's
+        if (rs) { st.reuse = as.reuse; st.reuse_share = as.reuse_share; st.reuse_note = as.reuse_note; }
         if (st.waiting) st.waiting_why = "building the network in the background; frames pass through until it is ready";
         else st.waiting_why.clear();
         st.building = as.building;
@@ -545,6 +582,23 @@ void log_evaluate(Feature* f, const char* api, unsigned int w, unsigned int h, c
 //   - `colour`  : OptiScaler applies its own ColourStrength in its resolve shader, after us.
 //   - `passes`  : OptiScaler runs its own passes as separate features; see the multipass note.
 //   - `apply_model`: there is no "run but discard" in the NGX surface.
+// A wilsjo2 Present layer's run inside the session: what its flow did, as the .asi's own route tells report_control
+// (nr_asi_wilsjo2*.cpp passes_begin); and [Preprocess] taken out of the network when the flow ran it.
+nr::pe::renodx_route::Wilsjo2Facts w2_present_facts(const nr::pe::Session& session, Feature* f) {
+    nr::pe::renodx_route::Wilsjo2Facts x;
+    const auto ss = session.state();
+    if (ss.wilsjo2_known) {
+        x.hdr = ss.wilsjo2_hdr; x.exposure = int(ss.wilsjo2_exposure); x.asked = ss.wilsjo2_asked; x.white = ss.wilsjo2_white;
+        x.history = ss.wilsjo2_history; x.mode = ss.wilsjo2_mode; x.passes = std::max(1u, ss.wilsjo2_passes);
+        x.prep_outside = ss.wilsjo2_prep_outside; x.prep_missing = ss.wilsjo2_prep_missing;
+        x.fast_passes = ss.wilsjo2_fast_passes; x.fast_fallback = ss.wilsjo2_fast_fallback;
+        x.fast_fallback_spatial = ss.wilsjo2_fast_fallback_spatial; x.il_missing = ss.wilsjo2_il_missing;
+    }
+    f->prep_by_layer = x.prep_outside && f->controls.preprocess.active() && !x.prep_missing;
+    if (x.prep_outside) f->controls.preprocess = nr::Preprocess{};
+    return x;
+}
+
 nr::Controls controls_from(const Controls6& in) {
     nr::Controls c;
     c.enabled = true;
@@ -1275,7 +1329,7 @@ void write_evaluate_keys(void* params, const Controls6& c, bool reset, int depth
 Feature* create_d3d12(ID3D12Device* device, ID3D12GraphicsCommandList* cmd, void* params,
                       unsigned int width, unsigned int height, int preset, int ui_correction,
                       const Controls6& controls, int* out_result) {
-    std::lock_guard<std::mutex> guard(g_lock);
+    std::lock_guard<std::recursive_mutex> guard(g_lock);
     g_last_error.clear();
     auto fail = [&](int code) -> Feature* {
         if (out_result) *out_result = code;
@@ -1338,7 +1392,7 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
                    unsigned int width, unsigned int height, const Rect& depth_rect,
                    const Rect& motion_rect, int depth_inverted, int reset, const Controls6& controls,
                    float mv_scale_x, float mv_scale_y) {
-    std::lock_guard<std::mutex> guard(g_lock);
+    std::lock_guard<std::recursive_mutex> guard(g_lock);
     g_last_error.clear();
 
     if (!f || !cmd || !color || !output) {
@@ -1423,6 +1477,7 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
         }
         frame.history_f16 = d3d12_session().history_f16() ? 1 : 0;
         frame.style_grade = d3d12_session().style_grade() ? 1 : 0;
+        frame.style_grade_accel = d3d12_session().style_grade_accelerated() ? 1 : 0;
         // The temporal inputs, as the session's resources below take them.
         frame.motion = motion;
         frame.motion_x = motion_rect.x; frame.motion_y = motion_rect.y;
@@ -1445,10 +1500,17 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
             const auto ch = nr::pe::renodx_route::call_history();
             frame.history = static_cast<ID3D12Resource*>(ch.d3d12);
             frame.no_grade = ch.raw ? 1 : 0;
+            frame.external_history = ch.external ? 1 : 0;
             if (ch.raw) frame.intensity = 1.0f;
         }
         const auto* w2 = nr::pe::renodx_route::call_wilsjo2();
         if (w2) frame.history_strength = w2->history;
+        if (w2) { frame.pre_history_off = w2->pre_history ? 0 : 1; frame.seed_fixed = w2->noise_every_frame ? 0 : 1; }
+        frame.layer = nr::pe::renodx_route::call_layer();
+        if (const auto* sp = nr::pe::renodx_route::call_net_split()) {   // frame reuse's even frames (the wilsjo2 flow's)
+            frame.split_tail = sp->tail;
+            frame.split_cut = sp->cut;
+        }
         const bool prep_outside = w2 && w2->prep_outside;
         const nr::Preprocess pp = prep_outside ? nr::Preprocess{} : preprocess_now();
         frame.renodx_route = nr::pe::renodx_route::installed() ? 1 : 0;
@@ -1571,7 +1633,11 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
     }
 
     f->controls = controls_from(controls);
-    if (const auto* w2 = nr::pe::renodx_route::call_wilsjo2()) f->controls.history_strength = w2->history;
+    if (const auto* w2 = nr::pe::renodx_route::call_wilsjo2()) {
+        f->controls.history_strength = w2->history;
+        f->controls.pre_history = w2->pre_history;
+        f->controls.seed_fixed = !w2->noise_every_frame;   // (a wilsjo2 layer's NoiseEveryFrame off: the same seed always)
+    }
     f->controls.preprocess = preprocess_now();
     // a wilsjo2 layer that runs [Preprocess] itself (nr_asi_wilsjo2*.cpp, from the frame's light): not again here
     f->prep_by_layer = false;
@@ -1628,7 +1694,7 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
 
     write_evaluate_keys(params, controls, resources.reset, depth_inverted);
 
-    auto& session = d3d12_session();
+    auto& session = recording_session(false);
     session.set_call_network(nr::pe::renodx_route::call_network());   // an NR-chain layer's own network, else -1
     // a wilsjo2 layer's Interleaved pass with a Style or an Intensity: the network plain (Intensity 1, no Style grade);
     // the layer composes them (the pass's history must be the network's own output, or the grade comes round again)
@@ -1646,6 +1712,36 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
     // as before. NR_SEED_COPY=1 keeps the old order for comparisons.
     static const bool seed_always = [] { const char* e = std::getenv("NR_SEED_COPY"); return e && std::atoi(e); }();
     bool ran = false;
+    // The .asi's wilsjo2 Present layer with FrameReuse: the layer's whole flow inside the session, frame reuse around it
+    // (nr_pe_session.cpp record_wilsjo2), in place on the output (the Present's own copy of the frame). Not run: the
+    // frame stays as it came.
+    if (const auto* wp = nr::pe::renodx_route::call_w2_present()) {
+        nr::pe::Session::Wilsjo2Frame wf;
+        wf.settings = wp->settings;
+        wf.hdr = wp->hdr;
+        wf.preprocess = f->controls.preprocess;
+        wf.asi = true;
+        wf.at_present = wp->at_present; wf.before_upscale = wp->before_upscale; wf.pre_exposure = wp->pre_exposure;
+        resources.wilsjo2 = &wf;
+        D3D12_RESOURCE_BARRIER uav{};   // (as run_after's other callers below: vkd3d-proton's batched transfers first)
+        uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        uav.UAV.pResource = nullptr;
+        cmd->ResourceBarrier(1, &uav);
+        if (!skipped) ran = session.run_after(device, cmd, output, kOutputState, resources, f->controls);
+        wp->ran = ran;
+        const nr::pe::renodx_route::Wilsjo2Facts facts = w2_present_facts(session, f);
+        log_evaluate(f, "D3D12", width, height, static_cast<const void*>(color), static_cast<const void*>(output),
+                     resources.reset, ran, ran ? nullptr : skipped ? "skipped(NR_DEBUG_SKIP_PASS)" : session.failed() ? "failed"
+                     : session.building() ? "building" : "declined", session.gpu_ms(), session.network_ms());
+        {
+            nr::pe::renodx_route::CallWilsjo2 told(&facts);
+            report_control(session, f, 1, width, height, nullptr, g_live_d3d12.size(), render_w, render_h,
+                           panel_guides_d3d12(color, motion, depth, motion_rect, resources.reset, mv_scale_x, mv_scale_y), ran);
+        }
+        device->Release();
+        if (!ran && session.failed()) return static_cast<int>(NVSDK_NGX_Result_FAIL_UnableToInitializeFeature);
+        return static_cast<int>(NVSDK_NGX_Result_Success);
+    }
     // The RenoDX-style option: OptiScaler has handed the frame over as it is (its hook), so the model runs
     // RenoDX's processing around the network, or - while it cannot - copies the frame over, which OptiScaler
     // then outputs unchanged. It never runs the network on the raw frame.
@@ -1741,18 +1837,18 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
 }
 
 void keep_caller_state() {
-    std::lock_guard<std::mutex> guard(g_lock);
+    std::lock_guard<std::recursive_mutex> guard(g_lock);
     g_keep_caller_state = true;
     if (g_d3d12_session) g_d3d12_session->set_keep_caller_state(true);
 }
 
 void with_d3d12_session(const std::function<void(nr::pe::Session&)>& fn) {
-    std::lock_guard<std::mutex> guard(g_lock);
-    fn(d3d12_session());
+    std::lock_guard<std::recursive_mutex> guard(g_lock);
+    fn(recording_session(false));
 }
 
 void release_d3d12(Feature* f) {
-    std::lock_guard<std::mutex> guard(g_lock);
+    std::lock_guard<std::recursive_mutex> guard(g_lock);
     // **No wait.** This runs on the render thread, and it used to call Session::wait_idle() before
     // freeing anything the GPU might still be reading. That was the wrong tool twice over: on the
     // D3D12 path nothing of ours is ever submitted by us, so there is no fence of ours to wait on,
@@ -1761,6 +1857,7 @@ void release_d3d12(Feature* f) {
     // (DlssNr_Dx12.cpp ParkNrFeature) before releasing it, and the runtime retires the feature's
     // images for a further 64 recordings before destroying them.
     if (f && g_d3d12_session) g_d3d12_session->release_feature(f->id);
+    if (f && g_split_d3d12) g_split_d3d12->release_feature(f->id);
     // The D3D12 passthrough keeps its own stage and per-feature history: without this it learns of the feature's
     // death only from an LRU budget guess.
     if (f) nr::pe::d3d12_passthrough::release_renodx_feature(f->id);
@@ -1782,7 +1879,7 @@ void release_d3d12(Feature* f) {
 // ---------------------------------------------------------------------------------------------
 
 int vk_init(void* instance, void* physical_device, void* device) {
-    std::lock_guard<std::mutex> guard(g_lock);
+    std::lock_guard<std::recursive_mutex> guard(g_lock);
 
     if (!instance || !physical_device || !device) {
         return static_cast<int>(NVSDK_NGX_Result_FAIL_InvalidParameter);
@@ -1816,6 +1913,8 @@ int vk_init(void* instance, void* physical_device, void* device) {
         return static_cast<int>(NVSDK_NGX_Result_FAIL_UnableToInitializeFeature);
     }
 
+    g_split_handles=g_vk_handles; g_split_queue=queue; g_split_family=family;
+    if (g_split_vk) { g_split_vk->set_vulkan_queue(queue,family); g_split_vk->set_vulkan_handles(g_split_handles); }
     vk_session().set_vulkan_queue(queue, family);
     vk_session().set_vulkan_handles(g_vk_handles);
     log("[nr] Vulkan model init: device %p, queue family %u", device, family);
@@ -1823,36 +1922,40 @@ int vk_init(void* instance, void* physical_device, void* device) {
 }
 
 void vk_queue_lock(const std::function<void()>& lock, const std::function<void()>& unlock) {
-    std::lock_guard<std::mutex> guard(g_lock);
+    std::lock_guard<std::recursive_mutex> guard(g_lock);
+    g_split_lock=lock; g_split_unlock=unlock;
+    if (g_split_vk) g_split_vk->set_queue_lock(lock,unlock);
     vk_session().set_queue_lock(lock, unlock);
 }
 
 void abandon_at_exit() {
-    for (std::unique_ptr<nr::pe::Session>* s : {&g_d3d12_session, &g_vk_session})
+    for (std::unique_ptr<nr::pe::Session>* s : {&g_d3d12_session, &g_vk_session, &g_split_d3d12, &g_split_vk})
         if (*s) {
             (*s)->log_totals();
             (void)s->release();
         }
 }
 
-void vk_device_destroyed() {    std::lock_guard<std::mutex> guard(g_lock);
+void vk_device_destroyed() {    std::lock_guard<std::recursive_mutex> guard(g_lock);
     if (g_vk_session) {
         g_vk_session->wait_idle();
         g_vk_session.reset();
     }
+    if (g_split_vk) { g_split_vk->wait_idle(); g_split_vk.reset(); }
+    g_split_handles={}; g_split_queue={}; g_split_lock={}; g_split_unlock={};
     g_vk_handles = nr::pe::DeviceHandles{};
     g_vk_queue_known = false;
     log("[nr] Vulkan model: the game destroys its device; the session made on it is gone");
 }
 
 bool vk_ready() {
-    std::lock_guard<std::mutex> guard(g_lock);
+    std::lock_guard<std::recursive_mutex> guard(g_lock);
     return g_vk_handles.valid() && g_vk_queue_known;
 }
 
 Feature* create_vk(void* cmd_buffer, void* params, unsigned int width, unsigned int height,
                    int preset, int ui_correction, const Controls6& controls, int* out_result) {
-    std::lock_guard<std::mutex> guard(g_lock);
+    std::lock_guard<std::recursive_mutex> guard(g_lock);
 
     if (!cmd_buffer || !g_vk_handles.valid() || !g_vk_queue_known) {
         if (out_result) *out_result = static_cast<int>(NVSDK_NGX_Result_FAIL_NotInitialized);
@@ -1883,7 +1986,7 @@ int evaluate_vk(void* cmd_buffer, Feature* f, void* params, const void* color, c
                 const void* motion, const void* output, unsigned int width, unsigned int height,
                 const Rect& depth_rect, const Rect& motion_rect, int depth_inverted, int reset,
                 const Controls6& controls, float mv_scale_x, float mv_scale_y) {
-    std::lock_guard<std::mutex> guard(g_lock);
+    std::lock_guard<std::recursive_mutex> guard(g_lock);
 
     if (!f || !cmd_buffer || !color || !output || !g_vk_handles.valid()) return -1;
 
@@ -1955,7 +2058,11 @@ int evaluate_vk(void* cmd_buffer, Feature* f, void* params, const void* color, c
         mv_scale_y, motion_rect.height ? motion_rect.height : frame.motion_height ? frame.motion_height : frame.height);
 
     f->controls = controls_from(controls);
-    if (const auto* w2 = nr::pe::renodx_route::call_wilsjo2()) f->controls.history_strength = w2->history;
+    if (const auto* w2 = nr::pe::renodx_route::call_wilsjo2()) {
+        f->controls.history_strength = w2->history;
+        f->controls.pre_history = w2->pre_history;
+        f->controls.seed_fixed = !w2->noise_every_frame;   // (a wilsjo2 layer's NoiseEveryFrame off: the same seed always)
+    }
     f->controls.preprocess = preprocess_now();
     // a wilsjo2 layer that runs [Preprocess] itself (nr_asi_wilsjo2*.cpp, from the frame's light): not again here
     f->prep_by_layer = false;
@@ -1965,7 +2072,7 @@ int evaluate_vk(void* cmd_buffer, Feature* f, void* params, const void* color, c
     }
     write_evaluate_keys(params, controls, frame.reset, depth_inverted);
 
-    auto& session = vk_session();
+    auto& session = recording_session(true);
     // The RenoDX-style option (nr_pe_renodx_route.hpp): OptiScaler hands the frame over as it is; RenoDX's
     // processing runs around the network, or the frame is copied over unchanged. The network never runs raw.
     nr::pe::Session::RenoDXFrame rf;
@@ -2042,15 +2149,16 @@ int evaluate_vk(void* cmd_buffer, Feature* f, void* params, const void* color, c
 }
 
 void release_vk(Feature* f) {
-    std::lock_guard<std::mutex> guard(g_lock);
+    std::lock_guard<std::recursive_mutex> guard(g_lock);
     if (f && g_vk_session) g_vk_session->release_feature(f->id);
+    if (f && g_split_vk) g_split_vk->release_feature(f->id);
     g_live_vk.erase(std::remove(g_live_vk.begin(), g_live_vk.end(), f), g_live_vk.end());
     delete f;
     // The session outlives the feature on purpose; see the comment on g_vk_session.
 }
 
 Feature* create_vk_asi(unsigned int width, unsigned int height, int* out_result) {
-    std::lock_guard<std::mutex> guard(g_lock);
+    std::lock_guard<std::recursive_mutex> guard(g_lock);
     if (!g_vk_handles.valid() || !g_vk_queue_known) {
         if (out_result) *out_result = static_cast<int>(NVSDK_NGX_Result_FAIL_NotInitialized);
         return nullptr;
@@ -2127,7 +2235,11 @@ int evaluate_vk_on(nr::pe::Session& session, const nr::pe::DeviceHandles& handle
     frame.motion_scale_y = normalized_mv_scale(
         mv_scale_y, motion_rect.height ? motion_rect.height : frame.motion_height ? frame.motion_height : frame.height);
     f->controls = controls_from(controls);
-    if (const auto* w2 = nr::pe::renodx_route::call_wilsjo2()) f->controls.history_strength = w2->history;
+    if (const auto* w2 = nr::pe::renodx_route::call_wilsjo2()) {
+        f->controls.history_strength = w2->history;
+        f->controls.pre_history = w2->pre_history;
+        f->controls.seed_fixed = !w2->noise_every_frame;   // (a wilsjo2 layer's NoiseEveryFrame off: the same seed always)
+    }
     f->controls.preprocess = preprocess_now();
     // a wilsjo2 layer that runs [Preprocess] itself (nr_asi_wilsjo2*.cpp, from the frame's light): not again here
     f->prep_by_layer = false;
@@ -2146,7 +2258,18 @@ int evaluate_vk_on(nr::pe::Session& session, const nr::pe::DeviceHandles& handle
     session.set_call_layer(nr::pe::renodx_route::call_layer());
     // The RenoDX style, as the D3D12 route's direct path runs it: what the .asi told renodx_route of the frame.
     nr::pe::Session::RenoDXFrame rf;
-    const bool renodx = nr::pe::renodx_route::installed();
+    // the .asi's wilsjo2 Present layer with FrameReuse: its whole flow inside the session, frame reuse around it, in place
+    const auto* wp = nr::pe::renodx_route::call_w2_present();
+    nr::pe::Session::Wilsjo2Frame w2f;
+    if (wp) {
+        w2f.settings = wp->settings;
+        w2f.hdr = wp->hdr;
+        w2f.preprocess = f->controls.preprocess;
+        w2f.asi = true;
+        w2f.at_present = wp->at_present; w2f.before_upscale = wp->before_upscale; w2f.pre_exposure = wp->pre_exposure;
+        frame.wilsjo2 = &w2f;
+    }
+    const bool renodx = !wp && nr::pe::renodx_route::installed();
     if (renodx) {
         const auto encode = nr::pe::renodx_route::last_encode();
         note_renodx_extent(encode, frame.width, frame.height);
@@ -2179,6 +2302,7 @@ int evaluate_vk_on(nr::pe::Session& session, const nr::pe::DeviceHandles& handle
     const VkImage answer = session.run_vulkan(handles, cmd, frame, f->controls);
     const bool ran = answer != VK_NULL_HANDLE;
     if (ran_out) *ran_out = ran;
+    if (wp) wp->ran = ran;
     if (ran && answer != output_image && !in_place)
         copy_into_output(cmd, answer, answer == frame.colour ? frame.colour_layout : VK_IMAGE_LAYOUT_GENERAL, output_image,
                          frame.width, frame.height);
@@ -2197,6 +2321,9 @@ int evaluate_vk_on(nr::pe::Session& session, const nr::pe::DeviceHandles& handle
         g.depth = frame.depth != VK_NULL_HANDLE;
         g.mv_scale_x = mv_scale_x; g.mv_scale_y = mv_scale_y;
         g.reset = frame.reset;
+        nr::pe::renodx_route::Wilsjo2Facts facts;
+        std::optional<nr::pe::renodx_route::CallWilsjo2> told;
+        if (wp) { facts = w2_present_facts(session, f); told.emplace(&facts); }
         report_control(session, f, api, frame.width, frame.height, renodx ? &rf.settings : nullptr, live,
                        frame.depth_subrect.width ? frame.depth_subrect.width : frame.depth_width,
                        frame.depth_subrect.height ? frame.depth_subrect.height : frame.depth_height, g, ran);
@@ -2218,14 +2345,14 @@ int evaluate_vk_asi(void* cmd_buffer, Feature* f, const VkImageRef& colour, cons
                     const VkImageRef& depth, const VkImageRef& motion, unsigned int width, unsigned int height,
                     const Rect& depth_rect, const Rect& motion_rect, int depth_inverted, int reset,
                     const Controls6& controls, float mv_scale_x, float mv_scale_y, bool* ran_out) {
-    std::lock_guard<std::mutex> guard(g_lock);
+    std::lock_guard<std::recursive_mutex> guard(g_lock);
     return evaluate_vk_on(vk_session(), g_vk_handles, 2, g_live_vk.size(), "Vulkan", cmd_buffer, f, colour, output, depth,
                           motion, width, height, depth_rect, motion_rect, depth_inverted, reset, controls, mv_scale_x,
                           mv_scale_y, ran_out);
 }
 
 Feature* create_bridge12(unsigned int width, unsigned int height, int* out_result) {
-    std::lock_guard<std::mutex> guard(g_lock);
+    std::lock_guard<std::recursive_mutex> guard(g_lock);
     if (!d3d12_session().vulkan_handles().valid()) {
         if (out_result) *out_result = static_cast<int>(NVSDK_NGX_Result_FAIL_NotInitialized);
         return nullptr;
@@ -2244,7 +2371,7 @@ int evaluate_bridge12(void* cmd_buffer, Feature* f, const VkImageRef& colour, co
                       const VkImageRef& depth, const VkImageRef& motion, unsigned int width, unsigned int height,
                       const Rect& depth_rect, const Rect& motion_rect, int depth_inverted, int reset,
                       const Controls6& controls, float mv_scale_x, float mv_scale_y) {
-    std::lock_guard<std::mutex> guard(g_lock);
+    std::lock_guard<std::recursive_mutex> guard(g_lock);
     nr::pe::Session& session = d3d12_session();
     return evaluate_vk_on(session, session.vulkan_handles(), 1, g_live_d3d12.size(), "D3D12 bridge", cmd_buffer, f,
                           colour, output, depth, motion, width, height, depth_rect, motion_rect, depth_inverted, reset,
@@ -2252,8 +2379,9 @@ int evaluate_bridge12(void* cmd_buffer, Feature* f, const VkImageRef& colour, co
 }
 
 void release_bridge12(Feature* f) {
-    std::lock_guard<std::mutex> guard(g_lock);
+    std::lock_guard<std::recursive_mutex> guard(g_lock);
     if (f && g_d3d12_session) g_d3d12_session->release_feature(f->id);
+    if (f && g_split_d3d12) g_split_d3d12->release_feature(f->id);
     // The D3D12 passthrough keeps its own stage and per-feature history: without this it learns of the feature's
     // death only from an LRU budget guess.
     if (f) nr::pe::d3d12_passthrough::release_renodx_feature(f->id);
@@ -2262,17 +2390,17 @@ void release_bridge12(Feature* f) {
 }
 
 void with_vk_session(const std::function<void(nr::pe::Session&)>& fn) {
-    std::lock_guard<std::mutex> guard(g_lock);
-    fn(vk_session());
+    std::lock_guard<std::recursive_mutex> guard(g_lock);
+    fn(recording_session(true));
 }
 
 void discard_vk_timing() {
-    std::lock_guard<std::mutex> guard(g_lock);
+    std::lock_guard<std::recursive_mutex> guard(g_lock);
     if (g_vk_session) g_vk_session->discard_timing();
 }
 
 void layer_changed(int layer) {
-    std::lock_guard<std::mutex> guard(g_lock);
+    std::lock_guard<std::recursive_mutex> guard(g_lock);
     if (g_d3d12_session) g_d3d12_session->reset_layer_timing(layer);
     if (g_vk_session) g_vk_session->reset_layer_timing(layer);
 }
@@ -2280,6 +2408,7 @@ void layer_changed(int layer) {
 void set_d3d12_backend(D3d12Backend backend) { g_d3d12_backend = backend; }
 void set_d3d12_native_call(bool on) { t_native_call = on; }
 int frame_network() {
+    if (auto* a=nr::frame_pair::PresentAge::active; a && a->net_override>=0) return a->net_override;
     return g_d3d12_network.load();
 }
 

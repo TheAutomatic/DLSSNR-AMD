@@ -154,6 +154,10 @@ struct Controls {
     std::function<void(VkCommandBuffer, bool)> network_timestamp;
     uint64_t feature = 0; // identity for non-temporal seed and Preprocess state
     float history_strength = -1.f; // negative: the session default; otherwise this layer's post blend
+    // A layer's Pre history (default on = NVIDIA's DLL): the pre block reads its previous output, moved by the motion
+    // vectors, as input features. Off: it runs as with no history (its gate closed; the history image is still written
+    // for the post block). The post block's blend is history_strength's: 0 closes its gate.
+    bool pre_history = true;
     bool model_capture_allowed = true; // an outer multipass host arms only its final pass
     // Optional readback of the last pass before and after its network, before composition.
     std::function<void(VkCommandBuffer, const ColourFrame&, const ColourFrame&, bool)> model_capture;
@@ -197,24 +201,23 @@ struct RuntimeConfig {
     std::string adapter_shaders;  // empty: ROOT/build/runtime
     uint32_t width{}, height{};
     VkFormat colour_format = VK_FORMAT_R32G32B32A32_SFLOAT;
-    // The network: the 310.8 model (CC_SILVER_AARDWOLD.bin) or the 310.9 small model
-    // (CC_SMALL_FP8.bin). Same shaders; the plan and the weights differ.
-    // -1 = as DLSSNR_MODEL / dlssnr-amd.ini [Network] Model say (small or original;
-    // neither: small), 0 = the original model, 1 = the small model, 2 = the small
-    // model's faster variant CC_SMALL_FP8_EXPERIMENTAL (its own weights and shaders,
-    // CC_SMALL_FP8_EXPERIMENTAL.bin and experimental/; without them, the small model),
-    // 3 = the original model's CC_SILVER_AARDWOLD_OPTIMIZED (CC_SILVER_AARDWOLD_OPTIMIZED.bin and
-    // optimized/; without them, the original model).
-    // The small model needs an installed tree with CC_SMALL_FP8.bin; without it, the
-    // original model.
+    // The network: CC_SILVER_AARDWOLD (310.8, CC_SILVER_AARDWOLD.bin) or CC_SMALL_FP8 (310.9, CC_SMALL_FP8.bin).
+    // Same shaders; the plan and the weights differ.
+    // -1 = as DLSSNR_MODEL / dlssnr-amd.ini [Network] Model say (neither: CC_SMALL_FP8), 0 = CC_SILVER_AARDWOLD,
+    // 1 = CC_SMALL_FP8, 2 = CC_SMALL_FP8_OPTIMIZED (its own weights and shaders, CC_SMALL_FP8_OPTIMIZED.bin and
+    // CC_SMALL_FP8_OPTIMIZED/, CC_SMALL_FP8_OPTIMIZED-performance/ or CC_SMALL_FP8_OPTIMIZED-ultra/; without them,
+    // CC_SMALL_FP8), 3 = CC_SILVER_AARDWOLD_OPTIMIZED (CC_SILVER_AARDWOLD_OPTIMIZED.bin and CC_SILVER_AARDWOLD_OPTIMIZED/;
+    // without them, CC_SILVER_AARDWOLD).
+    // CC_SMALL_FP8 needs an installed tree with CC_SMALL_FP8.bin; without it, CC_SILVER_AARDWOLD.
     int network = -1;
-#if NR_INT4
-    // CC_SILVER_AARDWOLD_OPTIMIZED's level of optimized layers (network 3 only, nr_ini_network.hpp): -1 = as
-    // DLSSNR_INT4 / dlssnr-amd.ini [Network] OptimizedLayers say (neither: Ultra Performance), 0 = Quality (no int4 layers),
-    // 1 = Balanced (int4/), 2 = Performance (int4-performance/); 1 and 2 when installed and the device has
-    // VK_KHR_pipeline_binary.
+    // The optimized networks' level of optimized layers (networks 2 and 3, nr_ini_network.hpp): -1 = as dlssnr-amd.ini's
+    // Layers in the section of the network's codename says (network 3: also DLSSNR_INT4; neither: Ultra Performance).
+    // Network 3 (builds with the int4 layers only): 0 = Quality (no int4 layers), 1 = Balanced
+    // (CC_SILVER_AARDWOLD_OPTIMIZED-balanced/), 2 = Performance (CC_SILVER_AARDWOLD_OPTIMIZED-performance/), 3 = Ultra
+    // Performance (CC_SILVER_AARDWOLD_OPTIMIZED-ultra/); 1-3 when installed and the device has VK_KHR_pipeline_binary.
+    // Network 2: 0 / 1 = Quality, 2 = Performance (CC_SMALL_FP8_OPTIMIZED-performance/), 3 = Ultra Performance
+    // (CC_SMALL_FP8_OPTIMIZED-ultra/: int4 layers, the same needs as network 3's; without them Performance).
     int layers = -1;
-#endif
     // The game's motion vectors read with point sampling at the colour's coordinate, as NVIDIA's DLL binds them
     // (MIN_MAG_MIP_POINT, the colour's own sampler; launch capture 2026-10-18). Bilinear blends two surfaces'
     // vectors at every silhouette when the vectors are at a lower resolution than the colour (after-SR edge band
@@ -403,6 +406,17 @@ struct EngineResult {
     const char* motion_provider = "engine";
 };
 
+// A network recorded in two parts (NRFrameReuse's even frames, nr_frame_reuse.hpp): the steps before `before_step` (moved
+// to a safe barrier: never inside a tile-counter chain) into the first recording, the rest into `second`. Both are
+// recorded together and executed in that order on the same queue; the runtime's whole scratch arena stays this
+// evaluation's until `second` has run (nothing else may record this runtime in between), and every image either part
+// reads is the caller's own (no game resource borrowed across the two).
+struct NetworkSplit {
+    VkCommandBuffer second = VK_NULL_HANDLE;
+    uint32_t before_step = 0;
+    uint32_t actual_before_step = 0;
+};
+
 // Diagnostics, off by default: every ~600 recordings of an engine frame, read back what the
 // network is handed (colour, the game's motion vectors, depth) and what it hands back, score it
 // on a background thread and log the result; the first `pictures` captures also as PNGs in
@@ -447,6 +461,13 @@ public:
     // Requires a runtime built with TemporalConfig::enable, whose extent matches
     // the render resolution rather than the display one.
     EngineResult record_engine(VkCommandBuffer, const EngineFrame&, const Controls&);
+    // record_engine in two recordings (NetworkSplit). Controls::network_timestamp: its end in the first recording at the
+    // split and its begin in the second there too (two pairs: the first part's and the second part's).
+    EngineResult record_engine_split(VkCommandBuffer, const EngineFrame&, const Controls&, NetworkSplit&);
+    uint32_t network_steps() const;
+    // What this runtime's recording uses lives (gpu::Uses) with the recording made now as well (a second part recorded
+    // under another one's ticket).
+    void touch_submission();
     // whether record_engine can take EngineFrame::target with these controls
     // (the model applied, one pass). A host asks before it skips its own seed copy.
     bool takes_target(const Controls&) const;
@@ -477,10 +498,10 @@ public:
     uint32_t model_height() const;
     // The model this runtime runs (RuntimeConfig::network resolved).
     NetworkModel network() const;
-    // Whether it runs CC_SMALL_FP8_EXPERIMENTAL (network() is then NetworkModel::Small).
-    bool experimental() const;
-    // Whether it runs CC_SILVER_AARDWOLD_OPTIMIZED (network() is then NetworkModel::Original; int4() says how).
-    bool optimized() const;
+    // Whether it runs CC_SMALL_FP8_OPTIMIZED (network() is then NetworkModel::SmallFp8; layers() its level).
+    bool small_fp8_optimized() const;
+    // Whether it runs CC_SILVER_AARDWOLD_OPTIMIZED (network() is then NetworkModel::SilverAardwold; int4() says how).
+    bool silver_aardwold_optimized() const;
     // What a runtime at width x height (the frame's extent, as RuntimeConfig::width/height) with this one's
     // configuration otherwise can take over from this one (RuntimeConfig::share): null when its working extent
     // differs, or the frame is taller than this one's network was built for.
@@ -490,8 +511,8 @@ public:
     // Its activation arena (shared with other networks when built with RuntimeConfig::act_arena), and its identity.
     std::shared_ptr<ActArenaRef> act_arena() const;
     const void* act_id() const;
-    // Why it runs another model or network than RuntimeConfig asked for (the small model's file missing, int4 mixed
-    // without what it needs); empty when it runs what was asked.
+    // Why it runs another model or network than RuntimeConfig asked for (CC_SMALL_FP8's file missing, an optimized
+    // level without what it needs); empty when it runs what was asked.
     const std::string& network_note() const;
     // [Network] Motion Without Depth as this runtime read it at construction (true: the depth is not read).
     bool motion_without_depth() const;
@@ -511,6 +532,13 @@ public:
     // goes on too. Recorded into `cmd` before that recording. False, nothing recorded: one model pass only, and
     // `from` must hold a history for the feature.
     bool carry_history(VkCommandBuffer cmd, const Runtime& from, uint64_t feature);
+    // Frame reuse: the network history images `feature`'s last recording read and wrote (rotation; false: none). A
+    // caller that lets the GPU skip that recording's network copies the one read into the one written.
+    bool history_slots(uint64_t feature, ColourFrame* read, ColourFrame* write) const;
+    // Frame reuse: called in every recording right after the post block's parameters are written, with their buffer,
+    // the byte offset of the history weight and the weight written there; the caller may replace it on the GPU.
+    using HistoryWeightHook = std::function<void(VkCommandBuffer, VkBuffer, uint32_t, float)>;
+    void set_history_weight_hook(HistoryWeightHook);
     // A runtime built with RuntimeConfig::plan_only: its lowering, for another runtime's network memory
     // (with_slot_of). Any runtime: its own lowering.
     std::shared_ptr<const RuntimeCore> plan() const;
@@ -521,10 +549,12 @@ public:
 
 #if NR_INT4
     // Whether this runtime runs CC_SILVER_AARDWOLD_OPTIMIZED with int4 layers (asked for and everything they need
-    // present), and its level (0 Quality - also when the int4 layers could not run -, 1 Balanced, 2 Performance).
+    // present).
     bool int4() const;
-    int layers() const;
 #endif
+    // The level an optimized network runs at (nr::kLayers*): CC_SILVER_AARDWOLD_OPTIMIZED's (Quality - also when its
+    // int4 layers could not run - in builds without them), CC_SMALL_FP8_OPTIMIZED's (Quality or Performance); 0 others.
+    int layers() const;
     // Change the post block's history strength (TemporalConfig::history_strength)
     // between frames. Takes effect on the next recording; no-op without a
     // temporal path.
@@ -534,6 +564,12 @@ public:
     void set_style_grade(bool);
     // Whether Natural / Cinematic are graded now (the switch on and the grade's pipelines in the shader folder).
     bool style_grade_active() const;
+    // [Network] Style Grade Acceleration: the grade in closed form (the *_grade_accel pipelines; true, the default) or
+    // step by step in the table form (false, as before). The same grade; the results differ only by the table form's
+    // float rounding. Per frame; nothing is rebuilt.
+    void set_style_grade_acceleration(bool);
+    // Whether Natural / Cinematic are graded in closed form now (graded, the switch on, its pipelines in the folder).
+    bool style_grade_accelerated() const;
     // [Network] History Precision, live: true = the history images in RGBA16F (the default), false = RGBA32F. Applied
     // at the next recording; the history starts afresh then. NR_HIST16 in the environment wins (comparisons).
     void set_history_f16(bool);
@@ -567,6 +603,6 @@ private:
     // cannot drift apart in barriers or ordering.
     ControlMaskResult record_all(VkCommandBuffer, const ColourFrame&, const Controls&,
                                  const ControlMaskFrame*, const TemporalFrame*, bool*,
-                                 const EngineFrame*);
+                                 const EngineFrame*, NetworkSplit* = nullptr);
 };
 }  // namespace nr

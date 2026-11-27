@@ -36,6 +36,9 @@ struct Status {
     bool motion = false, fast_fallback = false;
     uint8_t il_missing = 0;                // Passes (fast) Interleaved chosen and not run: why (nr::control::il_missing_note)
     bool fast_fallback_spatial = false;    // Feedback / Hybrid not run because of peripheral compression
+    uint32_t reuse = 0;                    // frame reuse: as nr::control::LayerStatus::reuse
+    float reuse_share = -1.f;
+    std::string reuse_note;
     bool waiting = false;                  // the run passed its frame through, not building (`waiting_why`)
     bool ran = false;                      // this run's network ran (a switch builds behind the network before)
     std::string waiting_why;
@@ -62,6 +65,9 @@ void chain_layers(const std::vector<int>& numbers);
 void layer_ran(int number, uint32_t processing, uint32_t placement, uint32_t state, const char* note);
 // A layer's setup changed (processing, placement, network): its row's readings (sizes, passes, network, costs, engine
 // data) go until it runs as it is now.
+void layer_reuse_group(int number,bool ready,float share,const char* reason);
+void layer_reuse_waiting(int number, const char* reason);
+void layer_reuse_failed(int number, const char* reason);
 void layer_changed(int number);
 void present_layers(); // clear running rows with no recording since the preceding presentation
 // The .asi's build and its frame-generation line, for NR Control (and its report).

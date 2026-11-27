@@ -52,6 +52,10 @@ struct Settings {
     uint32_t fast_interleaved_passes = 3;   // NRFastInterleavedPasses 2..8
     // NRFastInterleavedPreset: Interleaved's variant - 1 = the method of 0.0.8.4 , 2 = a later method (the default: nr_fast_passes.hpp)
     uint32_t fast_interleaved_preset = fast::kDefaultInterleavedPreset;
+    // NRFastInterleavedDepthDisocclusion: Interleaved's depth disocclusion check (with the game's depth; on, as 0.0.9). Off: only
+    // the vector dilation reads depth - for games where the test turns into a grid of light squares (upscaling with
+    // sub-pixel jitter, e.g. Ray Reconstruction): the render-size depth taken nearest at work size false-triggers in blocks.
+    bool fast_interleaved_depth_disocclusion = true;
     bool unlock_passes = false;         // NRUnlockPasses: ours, as OptiScaler's UnlockPasses (passes 5.. take pass 4's)
     float pass_intensity[3] = {1.0f, 1.0f, 1.0f};
     bool pass_follow[3] = {true, true, true};
@@ -126,6 +130,8 @@ struct Settings {
     bool chained_history = true;        // NRChainedHistory: passes 2+ keep their history (off: they restart every frame)
     bool noise_every_frame = true;      // NRNoiseEveryFrame (ours): the network's noise seed moves every frame, as the
                                         // DLL's; off: seed 0 every frame (Controls::seed_fixed)
+    bool pre_history = true;            // NRPreHistory (ours): the network's pre block reads its history (Controls::pre_history)
+    float post_history = 1.0f;          // NRPostHistory (ours) 0..1: the post block's history blend (Controls::history_strength)
     uint32_t debug_view = 0;            // not a key: NR Control's [Inspect] DebugView for the layer it chose
                                         // (renodx_debug.comp: 1 the network's input, 2 its answer, 3 its change x20)
     // NRSkinIndependent: with the Character mask on, Structure is sent at most 1 and a "stock" Skin as 1, so a
@@ -135,6 +141,10 @@ struct Settings {
     uint32_t present_encoding = 0;      // NRPresentEncoding: 0 the swapchain's colour space, 1 SDR, 2 HDR10, 3 scRGB
     float present_white_nits = 0.0f;    // NRPresentWhiteNits: 0 automatic
     uint32_t present_white_source = 0;  // NRPresentWhiteSource: 0 auto (a RenoDX mod's, else Windows'), 1 Windows'
+    // NRFrameReuse (prototype, Passes (legacy), 8-bit frames with the game's motion vectors and depth): the complete NR
+    // runs on every other frame (and on every frame in fast motion); the frames between are rebuilt from its last
+    // answer along the game's vectors (nr_frame_reuse.hpp). Not a history setting: the stage keeps its histories.
+    bool frame_reuse = false;
 };
 inline uint32_t stack_passes(const Settings& s) {
     if (s.passes_mode == 1u) return 1u;
@@ -186,6 +196,8 @@ struct StageFrame {
     // The runtime grades Natural / Cinematic after its post block (Runtime::style_grade_active): Interleaved then grades
     // its own composition the same way.
     bool style_grade = false;
+    // and in closed form (Runtime::style_grade_accelerated, [Network] Style Grade Acceleration)
+    bool style_grade_accel = false;
     // The game's exposure as DLSS was given it (RenoDX's feed v2): the exposure texture (texel 0,0 is read),
     // DLSS.Pre.Exposure and DLSS.Exposure.Scale, and whether the game created its DLSS with AutoExposure
     // (then the texture is not used). No image: there is none.
@@ -223,6 +235,12 @@ public:
     // The frame through every pass of the stack (Settings::passes) into StageFrame::output. Returns how many passes
     // ran the network (0: NR off, or every pass at zero strength - the frame copied through as it is).
     uint32_t record(VkCommandBuffer, const StageFrame&, const Network&);
+    // record() with the stage going on in another recording after a network call: the callback is handed the recording
+    // in use and returns the one to go on in (NRFrameReuse's even frames: the network split over two recordings).
+    using Continuation = std::function<VkCommandBuffer(VkCommandBuffer)>;
+    uint32_t record_split(VkCommandBuffer, const StageFrame&, const Network&, const Continuation&);
+    // What this stage's recording uses lives (gpu::Uses) with the recording made now as well.
+    void touch_submission();
     // Inside a Network call: the motion vectors that pass's history needs, when they are not the frame's own
     // (Interleaved: a slot's history is several frames old) - `use` false: the frame's own. Normalised backward
     // vectors at the network's size, scale 1, region at the origin.
@@ -253,6 +271,7 @@ public:
 
 private:
     struct Impl;
+    uint32_t record_impl(VkCommandBuffer, const StageFrame&, const Network&, const Continuation&);
     std::unique_ptr<Impl> impl_;
 };
 

@@ -1,0 +1,61 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "coopmm.glsl"
+// CC_SMALL_FP8_OPTIMIZED Performance: the pooled keys and values of a ViT layer's pooled heads (vit_attn.comp
+// NR_VKPOOL reads them), one dispatch between the QKV GEMM and the attention. Workgroup y is the pooling shape
+// (0..3: 1x2, 2x2, 2x4, 4x4 tokens of the ViT raster, f = 2, 4, 8, 16), x the pooled token; an invocation is one
+// (pooled token, head, K or V) and only the heads whose own shape is y do work. A pooled key is the sum of its f keys
+// scaled back to unit length (the QKV epilogue leaves every key a unit vector per head), a pooled value their mean.
+// The sums are of e4m3 values, exact in f32. Each head's region in the QKV slot starts after token align(T,32), the
+// regions of f = 2, 4, 8, 16 in that order, align(T/f,32) tokens each - the attention computes the same offsets.
+// push: x_off, raster width (s.H, as repack_tokens.comp lays the tokens out), raster rows (s.W), the pooled heads (bit
+// a head), flags (bits 0-7: renormalise the keys, bits 8-11: shapes in use), the 2-bit shapes of heads 0-15 / 16-31.
+layout(local_size_x = 64) in;
+// binding 0 = the activation arena, read and written sixteen bytes at a time (a token's 16 channels of a tile)
+layout(set = 0, binding = 0, std430) NR_COH buffer ActE4M3x4 { fe4m3vec4 act_x4[]; };
+layout(push_constant) uniform Push { uint x_off, rw, rh, hmask, flags, code0, code1; } pc;
+uint nr_at4(uint token, uint ch) {   // ch a multiple of 4: the fe4m3vec4 holding channels ch..ch+3
+    return (pc.x_off + ((token / 16u) * 192u + ch / 16u) * 256u + (token % 16u) * 16u + ch % 16u) >> 2;
+}
+void main() {
+    const uint i = gl_GlobalInvocationID.x, sh = gl_WorkGroupID.y;
+    if ((pc.flags & (256u << sh)) == 0u) return;
+    const uint f = 2u << sh, T = pc.rw * pc.rh;
+    const uint fy = f == 2u ? 1u : f == 16u ? 4u : 2u, fx = f / fy;
+    uint t0 = (T + 31u) & ~31u;
+    for (uint g = 2u; g < f; g *= 2u) t0 += (T / g + 31u) & ~31u;
+    const uint pw = pc.rw / fx, ph = pc.rh / fy, np = pw * ph;
+    // The region holds align(np, 32) tokens and its padding is written zero too: the attention reads its last pooled
+    // key tile whole and counts each padding key as exp(0) with a zero value, as it does past the full keys. Unwritten,
+    // that padding held whatever the shared arena last put there (arena reuse) - garbage keys in the softmax.
+    if (i >= ((np + 31u) & ~31u) * 64u) return;
+    const uint part = i & 1u, head = (i >> 1u) & 31u, tp = i >> 6u;
+    if ((pc.hmask & (1u << head)) == 0u || (((head < 16u ? pc.code0 : pc.code1) >> (2u * (head & 15u))) & 3u) != sh) return;
+    const uint cb = (part == 0u ? 1024u : 2048u) + head * 32u;
+    if (tp >= np) {
+        const fe4m3vec4 z = fe4m3vec4(nr_quant_e4m3(NR_F16(0.0)), nr_quant_e4m3(NR_F16(0.0)), nr_quant_e4m3(NR_F16(0.0)),
+                                      nr_quant_e4m3(NR_F16(0.0)));
+        for (uint q = 0u; q < 8u; ++q) act_x4[nr_at4(t0 + tp, cb + 4u * q)] = z;
+        return;
+    }
+    const uint px = tp % pw, py = tp / pw;
+    const uint t00 = fy * py * pc.rw + fx * px;
+    vec4 v[8];
+    for (uint q = 0u; q < 8u; ++q) v[q] = vec4(0.0);
+    for (uint y = 0u; y < fy; ++y)
+        for (uint x = 0u; x < fx; ++x) {
+            uint t = t00 + y * pc.rw + x;
+            // flags bits 16..31 (vit_attn.comp NR_VTAIL): M / 16 - tokens from M on were not computed; they equal
+            // token M - 1 (identical padding), so it stands in for them
+            if ((pc.flags >> 16u) != 0u && t >= (pc.flags >> 16u) * 16u) t = (pc.flags >> 16u) * 16u - 1u;
+            for (uint q = 0u; q < 8u; ++q) v[q] += vec4(act_x4[nr_at4(t, cb + 4u * q)]);
+        }
+    float n2 = 0.0;
+    for (uint q = 0u; q < 8u; ++q) { n2 += v[q].x * v[q].x; n2 += v[q].y * v[q].y; n2 += v[q].z * v[q].z; n2 += v[q].w * v[q].w; }
+    const float s = (part == 0u && (pc.flags & 255u) != 0u) ? (n2 > 0.0 ? inversesqrt(n2) : 0.0) : 1.0 / float(fy * fx);
+    for (uint q = 0u; q < 8u; ++q) {
+        const vec4 o = v[q] * s;
+        act_x4[nr_at4(t0 + tp, cb + 4u * q)] = fe4m3vec4(nr_quant_e4m3(NR_F16(o.x)), nr_quant_e4m3(NR_F16(o.y)),
+                                                          nr_quant_e4m3(NR_F16(o.z)), nr_quant_e4m3(NR_F16(o.w)));
+    }
+}

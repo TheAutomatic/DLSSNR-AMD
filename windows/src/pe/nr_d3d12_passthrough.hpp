@@ -75,6 +75,11 @@ Status status();
 // The backend's last state, in words, and the frame counted: ran on the game's device, passed through while the
 // passthrough waits (its network building, the check running: no NR, no bridge), else through the bridge
 void note_backend(const char* line, bool ran, bool waiting = false);
+// A frame the passthrough was asked to carry went through the Vulkan bridge instead (note_backend's fallback, or a
+// caller that took the bridge itself, the wilsjo2 flow): NR Control's Path says "Bridge (fallback)" for the next 2 s,
+// never "Passthrough" while frames fall back.
+void note_bridge_fallback();
+bool fell_back_recently();
 // Whether the last frame the backend recorded actually carried NR (a copy-through frame carries none and is still a
 // success: the caller reports that as its own result instead of claiming the network ran).
 void note_backend_produced(bool produced);

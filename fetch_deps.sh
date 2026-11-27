@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Download the third-party pieces the build uses, each pinned to the exact version the
-# packages were built and tested with, into toolchain/ and artifacts/ref/ (neither is in git).
+# Download the third-party pieces the build uses into toolchain/ and artifacts/ref/ (neither is in git), each pinned to
+# the exact version the packages were built and tested with - except the Windows packages' DXVK, taken from the latest
+# GE-Proton release (NR_GE_PROTON=<tag> pins one).
 #
 #   bash fetch_deps.sh             what the Linux package needs
-#   bash fetch_deps.sh --windows   plus what the Windows package needs (GE-Proton 11-7 for DXVK,
-#                                  and its licence)
+#   bash fetch_deps.sh --windows   plus what the Windows package needs (that DXVK and its licence)
 #
 # Already present entries are kept. Needs git, curl, tar and python3.
 #
@@ -157,58 +157,57 @@ EOF
 
 # ---- Windows package only ---------------------------------------------------------------------
 if [[ $windows == 1 ]]; then
-    # DXVK as GE-Proton 11-7 ships it (PE build, it runs on Windows): the DX9 route's d3d9.dll and dxgi.dll, with
-    # GE-Proton's dxvk version file, into artifacts/ref/dxvk-ge11-7 - only these three files: taken from an unpacked
-    # toolchain/GE-Proton11-7-x86_64 when there is one, else out of GE-Proton's release tarball (deleted after,
-    # unless it was there already).
-    ge=GE-Proton11-7-x86_64
-    dx=artifacts/ref/dxvk-ge11-7
-    dxvk_ok() {
-        (cd "$dx" 2>/dev/null && sha256sum -c --quiet - 2>/dev/null) <<EOF
-2502fbd3ebec2fbaa8451251c62d1f47e18b03ad72e32d734f6d69ee7d22c3b7  x86_64-windows/d3d9.dll
-a32191d1292ee388d7e0c3b8e43716f944971c7b49ce77f213be2cf4f6432756  x86_64-windows/dxgi.dll
-c7df6b81518bf073cc5d558fb8670676d30a61492e882b7a2f3a088e7df28d62  version
-EOF
-    }
-    if dxvk_ok; then
-        echo "have $dx"
+    # DXVK as the latest GE-Proton release ships it (PE build, it runs on Windows): the DX9 route's d3d9.dll and
+    # dxgi.dll, 64-bit and 32-bit, with GE-Proton's dxvk version file, into artifacts/ref/dxvk-ge (ge-proton: the
+    # release they came from). NR_GE_PROTON=<tag> (for example GE-Proton11-14) takes that release instead. The release
+    # tarball is checked against the .sha512sum GE-Proton publishes beside it (and deleted after, unless it was there
+    # already); an unpacked toolchain/<tag>-x86_64 is used as it is.
+    ge=${NR_GE_PROTON:-}
+    if [[ -z "$ge" ]]; then
+        ge=$(curl -fsSL --retry 3 https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest |
+             python3 -c 'import json, sys; print(json.load(sys.stdin)["tag_name"])') ||
+            { echo "cannot tell the latest GE-Proton release (set NR_GE_PROTON=<tag>)" >&2; exit 1; }
+    fi
+    [[ "$ge" =~ ^GE-Proton[0-9]+-[0-9]+$ ]] || { echo "not a GE-Proton release: $ge" >&2; exit 1; }
+    dx=artifacts/ref/dxvk-ge
+    from=lib/wine/dxvk
+    files=(x86_64-windows/d3d9.dll x86_64-windows/dxgi.dll i386-windows/d3d9.dll i386-windows/dxgi.dll version)
+    have=1
+    [[ "$(cat "$dx/ge-proton" 2>/dev/null)" == "$ge" ]] || have=0
+    for f in "${files[@]}"; do [[ -f "$dx/$f" ]] || have=0; done
+    if [[ $have == 1 ]]; then
+        echo "have $dx ($ge)"
     else
-        echo "fetch $dx"
-        rm -rf -- "$dx"; mkdir -p -- "$dx/x86_64-windows"
-        from=lib/wine/dxvk
-        if [[ -d "toolchain/$ge/files/$from" ]]; then
-            cp -- "toolchain/$ge/files/$from/x86_64-windows/d3d9.dll" "toolchain/$ge/files/$from/x86_64-windows/dxgi.dll" \
-                "$dx/x86_64-windows/"
-            cp -- "toolchain/$ge/files/$from/version" "$dx/"
+        echo "fetch $dx ($ge)"
+        rm -rf -- "$dx"; mkdir -p -- "$dx/x86_64-windows" "$dx/i386-windows"
+        if [[ -d "toolchain/$ge-x86_64/files/$from" ]]; then
+            for f in "${files[@]}"; do cp -- "toolchain/$ge-x86_64/files/$from/$f" "$dx/$f"; done
         else
-            tgz=artifacts/ref/downloads/$ge.tar.gz keep=1
+            url=https://github.com/GloriousEggroll/proton-ge-custom/releases/download/$ge
+            tgz=artifacts/ref/downloads/$ge-x86_64.tar.gz keep=1
             if [[ ! -f "$tgz" ]]; then
                 keep=0
-                curl -fsSL --retry 3 -o "$tgz.part" \
-                    "https://github.com/GloriousEggroll/proton-ge-custom/releases/download/GE-Proton11-7/$ge.tar.gz"
+                curl -fsSL --retry 3 -o "$tgz.part" "$url/$ge-x86_64.tar.gz"
                 mv -- "$tgz.part" "$tgz"
             fi
-            echo "7db87e9787e20c35cbdac26018431d5794626b626e4067b050684e45a88cc2ca229d7d263519eafb2e168cde5bef57611065d159d3685aaec152ccb9abe3073f  $tgz" |
-                sha512sum -c --quiet - || { echo "checksum mismatch: $tgz" >&2; exit 1; }
-            tar -C "$dx" --strip-components=5 -xzf "$tgz" "$ge/files/$from/x86_64-windows/d3d9.dll" \
-                "$ge/files/$from/x86_64-windows/dxgi.dll" "$ge/files/$from/version"
+            sum=$(curl -fsSL --retry 3 "$url/$ge-x86_64.sha512sum" | awk '{print $1}')
+            [[ "$sum" =~ ^[0-9a-f]{128}$ ]] || { echo "no checksum published for $ge" >&2; exit 1; }
+            echo "$sum  $tgz" | sha512sum -c --quiet - || { echo "checksum mismatch: $tgz" >&2; exit 1; }
+            tar -C "$dx" --strip-components=5 -xzf "$tgz" "${files[@]/#/$ge-x86_64/files/$from/}"
             [[ $keep == 1 ]] || rm -f -- "$tgz"
         fi
-        dxvk_ok || { echo "checksum mismatch: $dx" >&2; exit 1; }
+        echo "$ge" > "$dx/ge-proton"
     fi
+    # DXVK's licence, from the commit its version file names
+    commit=$(awk '{print $1; exit}' "$dx/version")
+    [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || { echo "no DXVK commit in $dx/version" >&2; exit 1; }
     mkdir -p artifacts/ref/dxvk
-    get artifacts/ref/dxvk/LICENSE \
-        https://raw.githubusercontent.com/doitsujin/dxvk/601930949d111edbbcf9dd463948426d9f8f6ddd/LICENSE \
-        a5cb1a6ded7d2d7e92d550ba28edd21be2d1d4044662b399887351023e30ce64
-    # SPIRV-Cross: the D3D12 route's own programs (NR's Preprocess, Passes (fast), debug views and the wilsjo2 style)
-    # are this package's SPIR-V turned into HLSL (windows/build/build_d3d12_hlsl.sh), which the plugin compiles in the
-    # game - one source for both routes.
-    repo toolchain/SPIRV-Cross https://github.com/KhronosGroup/SPIRV-Cross.git \
-         6c09849fe88c48eaed08413aa022aaa136a3a057                                  # vulkan-sdk-1.4.357.0
-    if [[ ! -x toolchain/SPIRV-Cross/build/spirv-cross ]]; then
-        cmake -S toolchain/SPIRV-Cross -B toolchain/SPIRV-Cross/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DSPIRV_CROSS_SHARED=OFF -DSPIRV_CROSS_STATIC=ON -DSPIRV_CROSS_CLI=ON -DSPIRV_CROSS_ENABLE_TESTS=OFF > /dev/null
-        cmake --build toolchain/SPIRV-Cross/build --target spirv-cross > /dev/null
+    if [[ "$(cat artifacts/ref/dxvk/commit 2>/dev/null)" != "$commit" ]]; then
+        curl -fsSL --retry 3 -o artifacts/ref/dxvk/LICENSE.part "https://raw.githubusercontent.com/doitsujin/dxvk/$commit/LICENSE"
+        grep -q "This software is provided 'as-is'" artifacts/ref/dxvk/LICENSE.part ||
+            { echo "DXVK $commit: not the zlib licence" >&2; exit 1; }
+        mv -- artifacts/ref/dxvk/LICENSE.part artifacts/ref/dxvk/LICENSE
+        echo "$commit" > artifacts/ref/dxvk/commit
     fi
 fi
 echo "dependencies ready"

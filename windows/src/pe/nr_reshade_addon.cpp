@@ -92,6 +92,9 @@ extern "C" __declspec(dllexport) const char* DESCRIPTION =
 // The generated thunks' loader (windows/build/build_package.sh): nothing pulls
 // Vulkan in until a game has its own graphics stack up.
 extern "C" void nr_vk_load(void);
+extern "C" const char* nr_vk_source;
+extern "C" int nr_vk_missing;
+extern "C" const char* nr_vk_first_missing;
 extern "C" void nr_vk_use_loader(int);
 extern "C" void* nr_vk_p_vkGetDeviceQueue;
 extern "C" void* nr_vk_p_vkGetPhysicalDeviceQueueFamilyProperties;
@@ -207,6 +210,7 @@ nr::pe::Config config{};
 std::string config_path;
 nr::pe::PreprocessSwitch prep_switch;   // [Preprocess] Enabled and its hotkey
 bool vk_loaded = false;
+std::string startup_why;
 
 // [RenoDX] Enabled as it was when the add-on loaded: the option is switched by restarting the game (its other
 // keys follow the file while the game runs).
@@ -2475,6 +2479,34 @@ void on_destroy_effect_runtime(effect_runtime* rt) {
     technique = {}; mv_var = {}; depth_var = {};
 }
 
+bool load_vulkan(device_api api, ID3D12Device* d12 = nullptr) {
+    static bool attempted = false;
+    if (attempted) return vk_loaded;
+    attempted = true;
+#if defined(__i386__)
+    if (api == device_api::d3d12 && !nr::pe::device_handles(d12).valid()) {
+        startup_why = NR_N("Native D3D12 is not supported by the 32-bit add-on");
+        log("[nr] %s", startup_why.c_str());
+        return false;
+    }
+#endif
+    nr_vk_use_loader(api == device_api::vulkan);
+    nr_vk_load();
+    if (std::strcmp(nr_vk_source, "none") == 0)
+        startup_why = NR_N("The Vulkan loader is unavailable");
+    if (!startup_why.empty()) {
+        log("[nr] %s", startup_why.c_str());
+        return false;
+    }
+    if (nr_vk_missing)
+        log("[nr] Vulkan entry points from %s: %d not exported (%s, ...)", nr_vk_source, nr_vk_missing,
+            nr_vk_first_missing);
+    nr::vram::install_vulkan();
+    vk_loaded = true;
+    log("[nr] feed: Vulkan entry points resolved");
+    return true;
+}
+
 // The Vulkan self-test: with no display to present on (a headless box), the
 // effect runtime never renders a technique, so NR_RESHADE_SELFTEST=1 runs the
 // whole Vulkan path once on a scratch image at device creation and logs the
@@ -2486,7 +2518,7 @@ void vulkan_selftest(VkDevice rs_device) {
     if (!GetEnvironmentVariableA("NR_RESHADE_SELFTEST", flag, sizeof flag) || flag[0] != '1') return;
     std::lock_guard<std::mutex> guard(lock);
     log("[nr] selftest: begin");
-    if (!vk_loaded) { nr_vk_use_loader(1); nr_vk_load(); nr::vram::install_vulkan(); vk_loaded = true; }
+    if (!vk_loaded && !load_vulkan(device_api::vulkan)) return;
     auto h = nr::pe::vkdevice::handles();
     h.device = rs_device;
     log("[nr] selftest: handles instance %p physical %p device %p", static_cast<void*>(h.instance),
@@ -2797,6 +2829,7 @@ nr::wilsjo2::Settings w2_settings(const nr::Controls& c, const nr::pe::Config& c
     s.auto_mask = c.automatic_mask;
     s.history_strength = cfg.history;
     s.noise_every_frame = c.noise_every_frame;
+    s.pre_history = c.pre_history;
     s.debug_view = c.debug_view;
     s.show_skin_mask = c.show_skin_mask;
     s.transfer_strength = c.detail_strength;
@@ -2812,6 +2845,7 @@ nr::wilsjo2::Settings w2_settings(const nr::Controls& c, const nr::pe::Config& c
     s.fast_method = std::min(cfg.fast_method, 4u);   // (both RenoDX's numbering: 0 Interleaved .. 4 Edit strength)
     s.fast_interleaved_passes = std::clamp(cfg.fast_interleaved_passes, 2u, 8u);
     s.fast_interleaved_preset = cfg.fast_interleaved_preset == 1u ? 1u : cfg.fast_interleaved_preset == 2u ? 2u : nr::fast::kDefaultInterleavedPreset;
+    s.fast_interleaved_depth_disocclusion = cfg.fast_interleaved_depth_disocclusion;
     for (int m = 0; m < 3; ++m) {   // each method's own
         s.fast_passes[m] = cfg.fast_passes[m]; s.fast_halo_limit[m] = cfg.fast_halo_limit[m]; s.fast_fine[m] = cfg.fast_fine[m];
     }
@@ -2828,6 +2862,20 @@ nr::wilsjo2::Settings w2_settings(const nr::Controls& c, const nr::pe::Config& c
     s.skin_detail = c.skin_detail; s.skin_colour = c.skin_colour;
     s.environment_detail = c.environment_detail; s.environment_colour = c.environment_colour;
     return s;
+}
+
+// Frame reuse is not run on this route (user 11-25): a layer with it on is left out and says why (never NR on every
+// frame in its place - no fallback)
+bool layer_refused(const AddonLayer& layer) { return layer.renodx ? layer.rdx.values.frame_reuse : layer.cfg.frame_reuse; }
+
+void skip_reshade_reuse(int number, bool renodx, unsigned w, unsigned h, float white_point) {
+    const char* reason = nr::control_ui::reshade_reuse_reason();
+    const auto* last = view_row(number, false);
+    if (!last || last->state != 3u || std::strcmp(last->note, reason) != 0) {
+        log("[nr] Layer %d is off: %s", number, reason);
+        if (session) session->release_feature(uint64_t(number) * 2u + (renodx ? 1u : 0u));
+    }
+    note_layer(number, !renodx, 3u, reason, w, h, 0, white_point);
 }
 
 template <class RunOne, class Around, class RunPq>
@@ -2851,6 +2899,10 @@ bool run_layers(effect_runtime* rt, nr::pe::Session& s, const nr::pe::Session::R
                                           [](const AddonLayer& a) { return a.number == chain.inspect.layer; })
                           ? chain.inspect.layer : 0;
     for (const AddonLayer& l : layers_now) {
+        if (layer_refused(l)) {
+            skip_reshade_reuse(l.number, l.renodx, w, h, l.renodx ? 1.f : l.cfg.white_point);
+            continue;
+        }
         if (shown && l.number > shown) {
             note_layer(l.number, !l.renodx, 3, ("not run while Layer " + std::to_string(shown) + "'s debug view is shown").c_str(),
                        w, h, 0, l.renodx ? 1.f : l.cfg.white_point);
@@ -2862,6 +2914,7 @@ bool run_layers(effect_runtime* rt, nr::pe::Session& s, const nr::pe::Session::R
         if (l.renodx) {
             nr::pe::Session::RenoDXFrame f = base;
             f.settings = l.rdx.values;
+            f.settings.frame_reuse = false;   // (not on the ReShade route: user 11-25; NR Control greys it)
             f.settings.nr_enabled = true;
             f.present = present_encoding(f.settings, format);
             if (!f.present) {
@@ -2915,6 +2968,8 @@ bool run_layers(effect_runtime* rt, nr::pe::Session& s, const nr::pe::Session::R
 
 void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
     device* dev = rt->get_device();
+    if (!vk_loaded && !load_vulkan(dev->get_api(), dev->get_api() == device_api::d3d12
+                                 ? reinterpret_cast<ID3D12Device*>(dev->get_native()) : nullptr)) return;
     resource_view mv_srv{}, mv_srgb{}, d_srv{}, d_srgb{};
     if (mv_var.handle) rt->get_texture_binding(mv_var, &mv_srv, &mv_srgb);
     if (depth_var.handle) rt->get_texture_binding(depth_var, &d_srv, &d_srgb);
@@ -2967,14 +3022,28 @@ void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
         pf.preprocess_exposure = config.controls.preprocess.active() ? config.controls.preprocess.exposure : 0;
         pf.white_point = renodx_on ? 0.f : config.white_point;
     }
-    // the VRAM ledger wraps our allocation entry points (nr_vram_ledger.hpp) - after every load, or NR Control's VRAM
-    // breakdown shows none of the network's memory (the .asi does it in nr_pe_interop.cpp)
-    if (!vk_loaded) { nr_vk_use_loader(dev->get_api() == device_api::vulkan); nr_vk_load(); nr::vram::install_vulkan(); vk_loaded = true; log("[nr] feed: Vulkan entry points resolved"); }
     // An HDR10 back buffer is PQ (or HLG) over BT.2020, and nothing in this
     // pass decodes either. Running on it anyway would hand the model a picture
     // in a transfer function it has never seen and hand back a worse one, which
     // is a failure worth naming rather than a picture worth shipping.
     if (!layered) view_layers({1});   // the route without [LayerN]: its one layer
+    static nr::pe::NrToggle toggle;
+    const bool nr_on = toggle.frame(config.renodx);
+    nr::pe::layer_keys_frame();
+    view.nr_on = nr_on ? 1u : 0u;
+    // Refuse the layer before HDR conversion, HUD composition, Inspect, or any network work.
+    // A mixed chain handles each blocked layer in run_layers and runs the others normally.
+    if (!layered && (renodx_on ? config.renodx.values.frame_reuse : config.frame_reuse)) {
+        skip_reshade_reuse(1, renodx_on, w, h_, renodx_on ? 1.f : config.white_point);
+        ++frames_declined;
+        return;
+    }
+    if (layered && !layers_now.empty() && std::all_of(layers_now.begin(), layers_now.end(), layer_refused)) {
+        for (const AddonLayer& l : layers_now)
+            skip_reshade_reuse(l.number, l.renodx, w, h_, l.renodx ? 1.f : l.cfg.white_point);
+        ++frames_declined;
+        return;
+    }
     // HDR10 (PQ) is decoded for the wilsjo2 processing around its run (run_pq); HLG is not.
     if (!layered && !renodx_on && back_buffer_space == color_space::hdr10_hlg) {
         report("the swapchain is HLG; this pass has no decode for it, so the frame is left alone - switch the game to "
@@ -3009,12 +3078,9 @@ void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
         ? provider_technique.handle && rt->get_technique_state(provider_technique) : provider != 0);
     renodx_frame.after_upscale = true;
     renodx_frame.settings = config.renodx.values;
+    renodx_frame.settings.frame_reuse = false;   // (not on the ReShade route: user 11-25; NR Control greys it)
     if (!layered && chain.inspect.layer == 1) renodx_frame.settings.debug_view = chain.inspect.debug_view;
-    {   // NeuralUplift as NRToggleKey left it
-        static nr::pe::NrToggle toggle;
-        renodx_frame.settings.nr_enabled = toggle.frame(config.renodx);
-        nr::pe::layer_keys_frame();   // [LayerN] ToggleKey
-    }
+    renodx_frame.settings.nr_enabled = nr_on;
     {   // RenoDX's NR screenshot (nr_screenshot.hpp), taken by a RenoDX layer: this route's final picture is the presented frame
         static nr::pe::KeyPress screenshot_key;
         const auto& r = config.renodx;
@@ -3045,7 +3111,6 @@ void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
         return;
     }
     // NR on / off (NeuralUplift as NRToggleKey left it) is every layer's, this route's one without [LayerN] too
-    view.nr_on = renodx_frame.settings.nr_enabled ? 1u : 0u;
     if (!layered && !renodx && !renodx_frame.settings.nr_enabled) {
         note_layer(1, true, 3, "NR is off (toggle key)", w, h_, 0, config.white_point);
         return;
@@ -3110,7 +3175,7 @@ void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
         }
         // a wilsjo2 layer: its flow, on linear light when the target is (scRGB, a decoded HDR10 frame)
         nr::pe::Session::Wilsjo2Frame w2frame;
-        if (w2f) { w2frame = *w2f; w2frame.hdr = tgt.linear; w2frame.fast_motion = renodx_frame.fast_motion_available; }
+        if (w2f) { w2frame = *w2f; w2frame.present_id = presents; w2frame.hdr = tgt.linear; w2frame.fast_motion = renodx_frame.fast_motion_available; }
         const nr::pe::Session::Wilsjo2Frame* const w2run = w2f ? &w2frame : nullptr;
         bool ran = false;
         // DXVK builds D3D10 on its D3D11: an ID3D10Device or ID3D10Texture2D answers QueryInterface with the
@@ -3463,12 +3528,14 @@ void dlssnr_as_layer(nr::ini_edit::Ini& ini, const std::string& sec) {
     num("WhitePointScale", config.white_point);
     flag("SkinProtection", c.skin_protection); num("SkinDetail", c.skin_detail); num("SkinColour", c.skin_colour);
     num("EnvironmentDetail", c.environment_detail); num("EnvironmentColour", c.environment_colour);
-    num("History", config.history); flag("NoiseEveryFrame", c.noise_every_frame); flag("ApplyModel", c.apply_model);
+    num("PostHistory", config.history); flag("NoiseEveryFrame", c.noise_every_frame); flag("ApplyModel", c.apply_model);
+    flag("PreHistory", c.pre_history);
     num("Passes", float(c.passes)); flag("UnlockPasses", config.unlock_passes); flag("ColourLimit", config.colour_limit);
     ini.set(sec, "PassesMode", config.passes_mode == 1 ? "fast" : "legacy");
     num("FastMethod", float(config.fast_method));
     num("FastInterleavedPasses", float(config.fast_interleaved_passes));
     num("FastInterleavedPreset", float(config.fast_interleaved_preset));
+    flag("FastInterleavedDepthDisocclusion", config.fast_interleaved_depth_disocclusion);
     for (int m = 0; m < 3; ++m) {   // each method's own (Fast<Method>Passes / HaloLimit / Fine)
         static const char* const names[] = {"FastExtrapolation", "FastFeedback", "FastHybrid"};
         const std::string n = names[m];
@@ -3742,6 +3809,7 @@ void draw_page() {
     static const int skip = [] { char v[8] = {}; return GetEnvironmentVariableA("NR_ADDON_PAGE_SKIP", v, 8) ? std::atoi(v) : 0; }();
     switch (addon_page) {
         case kPgStatus:   // what runs: the frame, the layers as they last ran and what they cost, a build, the video memory
+            if (!startup_why.empty()) nr::control_ui::text_dim_wrapped("%s", tr_text(startup_why.c_str()));
             if (view.width)
                 ImGui::Text(tr("Frame: %ux%u, %s, %s"), view.width, view.height, panel_facts.format.c_str(), space_name(back_buffer_space));
             if (!(skip & 1)) {
@@ -3752,6 +3820,8 @@ void draw_page() {
             page_trace("layer status");
             if (session) {
                 const nr::pe::Session::State st = session->state();
+                if (st.bda_probe_failed)
+                    nr::control_ui::text_dim_wrapped("Storage-buffer shaders: the Vulkan device NR is using has no vkGetBufferDeviceAddress");
                 if (st.building) {
                     char phase[128];
                     const float f = build_fraction(st, phase, sizeof phase);
@@ -4151,7 +4221,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         chain.hud.mode = 0;
         if (!reshade::register_addon(module)) return FALSE;
         previous_filter = SetUnhandledExceptionFilter(&crash_filter);
-        nr::pe::install_crash_watch();
+        nr::pe::install_crash_watch(reshade::internal::get_reshade_module_handle());
         log("[nr] ---------------------------------------------------------------");
         log("[nr] ReShade add-on loaded from %s (build %s)", nr::pe::module_folder(), NR_BUILD_STAMP);
         nr::pe::watchdog::start();

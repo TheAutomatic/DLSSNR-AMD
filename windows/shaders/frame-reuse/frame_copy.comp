@@ -1,0 +1,13 @@
+#version 460
+// Frame reuse: the rebuilt answer (RGBA16F) into the 8-bit frame the display filter reads (frame_copy10.spv, TEN_BIT: the
+// 10-bit one)
+layout(local_size_x=16,local_size_y=16) in;
+layout(binding=0) uniform sampler2D Src;
+#ifdef TEN_BIT
+layout(binding=1,rgb10_a2) uniform writeonly image2D Dst;
+#elif defined(FLOAT_OUTPUT)
+layout(binding=1,FLOAT_OUTPUT) uniform writeonly image2D Dst;
+#else
+layout(binding=1,rgba8) uniform writeonly image2D Dst;
+#endif
+void main(){ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(p,imageSize(Dst))))return;imageStore(Dst,p,texelFetch(Src,p,0));}

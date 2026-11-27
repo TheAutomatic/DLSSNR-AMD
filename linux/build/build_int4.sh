@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
 # CC_SILVER_AARDWOLD_OPTIMIZED's int4 layers: the Linux-side parts, from the same tree as everything else:
-#   <out>/network/             the network with them (build_network.py <arch> --int4)
-#   <out>/layer/               the Vulkan layer that gives the game's device VK_KHR_pipeline_binary (src/layer)
+#   <out>/network-<name>/      the networks with them (build_network.py <arch> --network <name>)
+#   <out>/layer/               the Vulkan layer that gives the game's device VK_KHR_pipeline_binary (src/layer); what
+#                              install.sh copies into dlssnr-amd/int4/layer
 #   <out>/dlssnr-int4-weights  the install-time weights generator (src/tools/nr_int4_weights.cpp), fully static
-#   <out>/data/                the int4 data: the network, linux/data/int4/<arch>/ (quantisers, recovery tables,
-#                              settings.txt), the layer; what install.sh copies into dlssnr-amd/int4/ (Optimized layers:
-#                              Balanced)
-#   <out>/data-performance/    Performance: its network (--performance) and Balanced's tables -> dlssnr-amd/int4-performance/
-#   <out>/data-ultra/          Ultra Performance: its network (--ultra), Balanced's tables with linux/data/int4-ultra/<arch>/
-#                              added (and its settings.txt) -> dlssnr-amd/int4-ultra/; the install-time generator makes
-#                              the int4 weights of all three from these tables (theirs cover the others')
+#   <out>/CC_SILVER_AARDWOLD_OPTIMIZED-balanced/     Optimized layers Balanced: the network,
+#                              linux/data/CC_SILVER_AARDWOLD_OPTIMIZED-balanced/<arch>/ (quantisers, recovery tables,
+#                              settings.txt); what install.sh copies into dlssnr-amd/ under the same name, as the others
+#   <out>/CC_SILVER_AARDWOLD_OPTIMIZED-performance/  Performance: its network and Balanced's tables
+#   <out>/CC_SILVER_AARDWOLD_OPTIMIZED-ultra/        Ultra Performance: its network, Balanced's tables with
+#                              linux/data/CC_SILVER_AARDWOLD_OPTIMIZED-ultra/<arch>/ added (and its settings.txt); the
+#                              install-time generator makes the int4 weights of all three from these tables (theirs
+#                              cover the others')
+#   <out>/CC_SMALL_FP8_OPTIMIZED-ultra/              CC_SMALL_FP8_OPTIMIZED at Ultra Performance: its network and its
+#                              own tables (linux/data/CC_SMALL_FP8_OPTIMIZED-ultra/<arch>/); the generator makes its int4
+#                              weights (CC_SMALL_FP8_OPTIMIZED_INT4.bin) from them
 #
 #   build_int4.sh <out dir>
 set -euo pipefail
@@ -17,13 +22,14 @@ cd -- "$(dirname -- "$0")/../.."
 out=$(realpath -m -- "${1:?usage: build_int4.sh <out dir>}")
 case "$out" in "$(pwd)"/*) ;; *) echo 'build directory must be in the project' >&2; exit 2;; esac
 source linux/build/arch/rdna4.sh
-src=linux/data/int4/$NR_GPU_ARCH
+src=linux/data/CC_SILVER_AARDWOLD_OPTIMIZED-balanced/$NR_GPU_ARCH
 [[ -f "$src/settings.txt" ]] || { echo "missing $src" >&2; exit 1; }
 rm -rf -- "$out"; mkdir -p -- "$out/layer" "$out/gen"
 
-python3 linux/build/build_network.py "$NR_GPU_ARCH" --int4 --out "$out/network" > /dev/null
-python3 linux/build/build_network.py "$NR_GPU_ARCH" --performance --out "$out/network-performance" > /dev/null
-python3 linux/build/build_network.py "$NR_GPU_ARCH" --ultra --out "$out/network-ultra" > /dev/null
+for n in CC_SILVER_AARDWOLD_OPTIMIZED-balanced CC_SILVER_AARDWOLD_OPTIMIZED-performance CC_SILVER_AARDWOLD_OPTIMIZED-ultra \
+         CC_SMALL_FP8_OPTIMIZED-ultra; do
+    python3 linux/build/build_network.py "$NR_GPU_ARCH" --network "$n" --out "$out/network-$n" > /dev/null
+done
 
 python3 linux/build/generate_device_chain.py toolchain/Vulkan-Headers "$out/gen/nr_device_chain_sizes.hpp" > /dev/null
 g++ -std=c++17 -O2 -fPIC -shared -Wl,-Bsymbolic -Wl,-z,defs -static-libstdc++ -static-libgcc \
@@ -62,20 +68,19 @@ gcc -O2 -c "$out/gen/vkstub.c" -o "$out/gen/vkstub.o"
 g++ -static -O2 "$out/gen/gen.o" "$out/gen/plan.o" "$out/gen/vkstub.o" -lpthread -o "$out/dlssnr-int4-weights"
 strip "$out/dlssnr-int4-weights"
 
-d="$out/data"
-mkdir -p -- "$d/shaders"
-cp -- "$out/network"/g_* "$out/network"/*.txt "$d/shaders/"   # the SPVs and the host markers (.iu4, hs-pipelines.txt)
-cp -r -- "$out/network/temporal" "$d/shaders/temporal"
-cp -r -- "$src"/. "$d/"
-rm -f -- "$d/dlssnr-int4.sha256"
-cp -r -- "$out/layer" "$d/layer"
-for lv in performance ultra; do
-    e="$out/data-$lv"
+for n in CC_SILVER_AARDWOLD_OPTIMIZED-balanced CC_SILVER_AARDWOLD_OPTIMIZED-performance CC_SILVER_AARDWOLD_OPTIMIZED-ultra; do
+    e="$out/$n"
     mkdir -p -- "$e/shaders"
-    cp -- "$out/network-$lv"/g_* "$out/network-$lv"/*.txt "$e/shaders/"
-    cp -r -- "$out/network-$lv/temporal" "$e/shaders/temporal"
+    cp -- "$out/network-$n"/g_* "$out/network-$n"/*.txt "$e/shaders/"   # the SPVs and the host markers (.iu4, hs-pipelines.txt)
+    cp -r -- "$out/network-$n/temporal" "$e/shaders/temporal"
     cp -r -- "$src"/. "$e/"
-    rm -f -- "$e/dlssnr-int4.sha256"
-    [[ $lv == ultra ]] && cp -r -- "linux/data/int4-ultra/$NR_GPU_ARCH"/. "$e/"   # its tables and settings.txt
+    rm -f -- "$e/CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin.sha256"
+    [[ $n == *-ultra ]] && cp -r -- "linux/data/CC_SILVER_AARDWOLD_OPTIMIZED-ultra/$NR_GPU_ARCH"/. "$e/"   # its tables and settings.txt
 done
-echo "$out: int4 networks $(ls "$d/shaders"/g_*.spv | wc -l) / $(ls "$out/data-performance/shaders"/g_*.spv | wc -l) / $(ls "$out/data-ultra/shaders"/g_*.spv | wc -l) pipelines"
+e="$out/CC_SMALL_FP8_OPTIMIZED-ultra"
+mkdir -p -- "$e/shaders"
+cp -- "$out/network-CC_SMALL_FP8_OPTIMIZED-ultra"/g_* "$out/network-CC_SMALL_FP8_OPTIMIZED-ultra"/*.txt "$e/shaders/"
+cp -r -- "$out/network-CC_SMALL_FP8_OPTIMIZED-ultra/temporal" "$e/shaders/temporal"
+cp -r -- "linux/data/CC_SMALL_FP8_OPTIMIZED-ultra/$NR_GPU_ARCH"/. "$e/"
+rm -f -- "$e/CC_SMALL_FP8_OPTIMIZED_INT4.bin.sha256" "$e/CC_SMALL_FP8_OPTIMIZED_INT4_SINK.bin.sha256"
+echo "$out: int4 networks$(for n in CC_SILVER_AARDWOLD_OPTIMIZED-balanced CC_SILVER_AARDWOLD_OPTIMIZED-performance CC_SILVER_AARDWOLD_OPTIMIZED-ultra CC_SMALL_FP8_OPTIMIZED-ultra; do echo -n " $n $(ls "$out/$n/shaders"/g_*.spv | wc -l)"; done) pipelines"

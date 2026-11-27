@@ -55,6 +55,8 @@ struct Fg {
     uint32_t ui_frame = 0;
     std::shared_ptr<void> ui_keep;
     bool copied = false;           // already copied into `copy` (on the game's list, when it was handed over)
+    ID3D12Resource* destination = nullptr; // shown frame handed to the provider
+    D3D12_RESOURCE_STATES destination_state = D3D12_RESOURCE_STATE_COMMON;
     ID3D12Resource* game = nullptr;   // the game's resource, valid until the present
     D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
     bool substitute = false;       // NR's answer may be written back into `game` (frame generation reads it at the present)
@@ -108,7 +110,52 @@ void d3d12_executed(unsigned count, ID3D12CommandList* const* lists, ID3D12Comma
 // NGX's DLSS-G evaluate (the .asi's NVSDK_NGX_D3D12_EvaluateFeature hook): its DLSSG.HUDLess (COPY_DEST there, as
 // OptiScaler takes it), copied on its command list. `layers_here`: the Present layers run in this evaluate (d3d12_present
 // is called from it next, `sc` null): the frame is this present's, NR's change may be put into it.
-void fg_note_dlssg(ID3D12GraphicsCommandList* list, ID3D12Resource* hudless, bool layers_here = false);
+void fg_note_dlssg(ID3D12GraphicsCommandList* list, ID3D12Resource* hudless, bool layers_here = false, ID3D12Resource* destination = nullptr);
+// NRFrameReuse's even frames (every frame shown `frames` frames later: 1, or 2 with the two-sided rebuild) with frame
+// generation: `frames` > 0 from the Present that ran them - frame generation is then handed each frame's inputs as many
+// frames later too (copies of ours): XeSS frame generation its HUD-less frame, depth, motion vectors, UI (its tags) and
+// constants; FSR frame generation (FidelityFX API) its depth, motion vectors and numbers (the prepare dispatch), HUD-less
+// frame (its configure) and UI (the swap chain's). The calls followed are those of whoever drives frame generation:
+// OptiScaler's own frame generation while it calls a library, else the game (set_opti_caller, set_game_caller).
+// followed(): frame generation's inputs come through calls followed here (the driver's in the last frames, nothing seen
+// that cannot be followed); `xefg_proxy`: the game's own XeSS frame generation's swap chain is followed (its calls are,
+// whether it makes any now or not). present(): at the Present layers' recording, before the layers - this frame's copies
+// of resources valid until the present. forget(): an XeSS frame generation context destroyed.
+void fg_delay(int frames, bool capture);
+bool fg_followed(bool xefg_proxy, const char** reason);
+// Frame generation whose calls are hooked here (FidelityFX / XeSS FG) but which has made none yet - nothing it would
+// generate exists yet, so it is no frame generation that cannot be followed (the frames' start, before its first call)
+bool fg_not_started();
+// DLSS-G through NGX (nr_asi_main.cpp hk_evaluate, with the Present layers at its evaluate) while the even frames run: a
+// provider that calls no frame-generation library is handed the inputs of the frame shown at its evaluate.
+// dlssg_delay_here(): no call into a frame-generation library carried the inputs in the last second (those are delayed
+// there: OptiScaler's own replacement); dlssg_seen(): an evaluate delayed here (fg_followed's evidence); dlssg_input():
+// frame `id`'s input `type` (in COPY_DEST, as Streamline hands it) copied on `list` (ring copies retired, not released, when
+// unused), the copy of frame `id - lag` returned (null: none - as given); `copied`: this frame's copy was made. dlssg_reset_ring(): another
+// feature (the ring's frames are not its). DlssgHanded: around an evaluate handed the shown frame's inputs here - a
+// FidelityFX call inside it (a provider calling the library after all) is not delayed again.
+enum DlssgInput : uint32_t { kDlssgDepth, kDlssgMotion, kDlssgHudless, kDlssgDistortion, kDlssgInputs };
+bool dlssg_delay_here();
+void dlssg_seen();
+void dlssg_unfollowed(const char* why);
+uint32_t fg_lag();
+void dlssg_reset_ring();
+ID3D12Resource* dlssg_input(uint32_t type, uint64_t id, uint32_t lag, ID3D12Resource* game, ID3D12GraphicsCommandList* list,
+                            bool* copied);
+struct DlssgHanded {
+    explicit DlssgHanded(bool handed);
+    ~DlssgHanded();
+    DlssgHanded(const DlssgHanded&) = delete;
+    DlssgHanded& operator=(const DlssgHanded&) = delete;
+    bool on;
+};
+void fg_delay_present(ID3D12GraphicsCommandList* list);
+void set_opti_caller(bool (*opti)(void* caller));
+void xefg_delay_forget(void* context);
+void xefg_proxy_observed(void* context,bool observed);
+bool xefg_any_pending();
+bool xefg_pending(void* context);
+void xefg_flush_proxy(void* context,ID3D12GraphicsCommandList*);
 // The game's Present call runs (the .asi's Present detours, around the original): frame generation's hand-overs then
 // are OptiScaler's own (a frame late), not taken.
 struct PresentCall {

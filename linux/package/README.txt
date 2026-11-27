@@ -7,7 +7,7 @@ runtime is neither needed nor called.
 
 Requirements
 ------------
-- RX 9000 series (RDNA4) graphics card
+- RDNA4 graphics card
 - Mesa 26.2 or newer (RADV driver)
 - Proton: tested on GE-Proton 11-11
 - python3 (the installer and the model extraction use it)
@@ -24,7 +24,6 @@ the routes; you can also name one after the folder:
                            frame generation (the original OptiScaler, its files unchanged); this project's
                            NR runs as an OptiScaler plugin, on D3D12, D3D11 and Vulkan games. 64-bit package
                            only.
-    optiscaler-renodx      the earlier name, now the same as optiscaler (the RenoDX style is the default).
     reshade-feeder         for D3D10/11/12 games without a usable upscaler. ReShade + VORT (or the
                            optional LumeniteFX) provide the motion vectors.
     reshade-feeder-vulkan  Vulkan games, or D3D9 games (under Proton, DXVK turns D3D9 into Vulkan).
@@ -46,21 +45,19 @@ Control itself).
 
 Use the i686 package for 32-bit games and the x86_64 package for 64-bit games.
 
-Networks: all four are installed, named as in NVIDIA's DLL (CC_SMALL_FP8_EXPERIMENTAL and
+Networks: all four are installed, named as in NVIDIA's DLL (CC_SMALL_FP8_OPTIMIZED and
 CC_SILVER_AARDWOLD_OPTIMIZED are this project's):
     CC_SMALL_FP8                   the default network of 310.9.16 (default)
-    CC_SMALL_FP8_EXPERIMENTAL      experimental: CC_SMALL_FP8 made faster
+    CC_SMALL_FP8_OPTIMIZED         CC_SMALL_FP8 made faster
     CC_SILVER_AARDWOLD             the network of 310.8.0 (also preset 1 of 310.9.16)
-    CC_SILVER_AARDWOLD_OPTIMIZED   CC_SILVER_AARDWOLD made faster (RX 9000), its picture very close to it
+    CC_SILVER_AARDWOLD_OPTIMIZED   CC_SILVER_AARDWOLD made faster, its picture very close to it
 The installer asks once which one a game starts with (Enter = CC_SMALL_FP8; not asked when not run in
-a terminal), or give --model <name> (the earlier --new-model, --old-model and --int4 still work;
---no-int4 is no longer needed). This only sets [Network] Model in dlssnr-amd.ini; the network can be
+a terminal), or give --model <name>. This only sets [Network] Model in dlssnr-amd.ini; the network can be
 switched in game at any time: the drop-down in NR Control (End) or on the Add-ons page, or Ctrl+F11 to
 cycle. The new network is prepared in the background, and the current one keeps running until it is
 ready. A network that cannot run is greyed out in the drop-down with the reason.
-CC_SILVER_AARDWOLD_OPTIMIZED replaces CC_SILVER_AARDWOLD_INT4_MIXED of earlier versions (a
-dlssnr-amd.ini that names that one gets CC_SILVER_AARDWOLD_OPTIMIZED). Optimized layers (in NR
-Control under the network, [Network] OptimizedLayers) sets how many of its layers run in a faster form;
+CC_SILVER_AARDWOLD_OPTIMIZED replaces CC_SILVER_AARDWOLD_INT4_MIXED of earlier versions. Optimized
+layers (in NR Control under the network, [CC_SILVER_AARDWOLD_OPTIMIZED] Layers) sets how many of its layers run in a faster form;
 it changes only how the network computes, not the resolution, and every level's picture stays very
 close to CC_SILVER_AARDWOLD's. Quality: none of them in int4, a little slower. Balanced: some of them
 in int4. Performance: also fixed attention on the first full-resolution layers. Ultra Performance
@@ -74,8 +71,14 @@ When games start with CC_SILVER_AARDWOLD_OPTIMIZED, the main line is that one. W
 runs at Quality. The optiscaler route needs no layer (the NR plugin adds the device extensions they
 need). The first time a level is used the network takes longer to build, and until then the picture
 goes without NR.
-CC_SMALL_FP8_EXPERIMENTAL's weights are made at install too (from CC_SMALL_FP8's model), so it also
-needs the 310.9.16 nvngx_dlssnr.dll; without it, it is greyed out in the menus.
+CC_SMALL_FP8_OPTIMIZED replaces CC_SMALL_FP8_EXPERIMENTAL of earlier versions. Its Optimized layers
+(in NR Control under the network, [CC_SMALL_FP8_OPTIMIZED] Layers) has three levels: Quality (default; also for Balanced); Performance:
+fixed attention on the first full-resolution layer and, at 4K-class resolutions, fewer keys in some
+attention heads; Ultra Performance: also int4 layers in the middle of the network. Its weights are
+made at install too (from
+CC_SMALL_FP8's model), so it also needs the 310.9.16 nvngx_dlssnr.dll; without it, it is greyed out
+in the menus. Ultra Performance needs the same Vulkan layer line as CC_SILVER_AARDWOLD_OPTIMIZED's
+int4 levels.
 
 LumeniteFX (optional, reshade-feeder routes only): motion vectors from LumeniteFX Kernel (by Afzaal
 (Kaidō), https://github.com/umar-afzaal/LumeniteFX, AGNYA licence). It is not part of this project and
@@ -97,13 +100,13 @@ The weights are NVIDIA's and are not distributed with this project. They are ext
 own copy of nvngx_dlssnr.dll, version 310.9.16 or 310.8.0:
 
     dlssnr-amd/CC_SMALL_FP8.bin        CC_SMALL_FP8 (the default network of 310.9.16), also the source
-                                       of CC_SMALL_FP8_EXPERIMENTAL
+                                       of CC_SMALL_FP8_OPTIMIZED
     dlssnr-amd/CC_SILVER_AARDWOLD.bin  CC_SILVER_AARDWOLD (the network of 310.8.0; 310.9.16 has it too),
                                        also the source of CC_SILVER_AARDWOLD_OPTIMIZED
 
 - use 310.9.16 when you can: it already contains the 310.8.0 network, so with it both models are
   extracted and installed; 310.8.0 gives CC_SILVER_AARDWOLD only (CC_SMALL_FP8 and
-  CC_SMALL_FP8_EXPERIMENTAL are then greyed out in the menus);
+  CC_SMALL_FP8_OPTIMIZED are then greyed out in the menus);
 - give --dll either the DLL itself or a zip that contains exactly one nvngx_dlssnr.dll
   (it may sit in a subfolder of the zip);
 - a DLL of any other version is refused before anything is installed;
@@ -215,14 +218,15 @@ reshade-feeder routes: Home opens ReShade; the NR settings are on the Add-ons pa
             more also rebuilds in the background; until it is done NR keeps running with the previous
             number of passes.
             New noise every frame: the network's noise seed changes every frame, as in NVIDIA's original.
-            Every layer on both routes has it. RenoDX layers (NRNoiseEveryFrame): on by default; off
-            uses the same seed every frame. wilsjo2 layers (NoiseEveryFrame): only on frames without
-            motion vectors (for example on the ReShade route while DLSS5_MV is not bound); on frames with
-            motion vectors the seed always changes every frame; on by default on the OptiScaler route,
-            off on the ReShade routes (as these routes always had it).
+            Every layer on both routes has it (RenoDX layers NRNoiseEveryFrame, wilsjo2 layers
+            NoiseEveryFrame): on by default; off uses the same seed every frame.
             Without motion vectors there is no previous result to average the noise, so with it on a
             still picture shimmers slightly. With Apply model off the network runs as usual (same cost)
             but its result is not shown, to compare.
+            Pre history and Post history (diagnostic; RenoDX layers NRPreHistory / NRPostHistory,
+            wilsjo2 layers PreHistory / PostHistory): the network's own use of its previous frame - Pre,
+            its input also reads the previous answer; Post (0..1, 0 = off), the previous answer is
+            blended into the new one. Both default to NVIDIA's behaviour (on / 1).
             Below 100% Model resolution, Enlargement (Transfer) chooses how the model's result is
             enlarged back to full resolution: Matched residual (default) and Edge-aware lighting +
             colour enlarge the model's change and apply it to the full-resolution picture; Classic
@@ -239,7 +243,7 @@ reshade-feeder routes: Home opens ReShade; the NR settings are on the Add-ons pa
             HDR: scRGB (linear) and HDR10 (PQ) are supported; HLG pictures are not handled on these
             routes, set the game to SDR, scRGB or HDR10.
 
-Networks and other settings ([Network] in dlssnr-amd.ini; in NR Control and on the Add-ons page under
+Networks and other settings ([Network], [CC_SILVER_AARDWOLD_OPTIMIZED] and [CC_SMALL_FP8_OPTIMIZED] in dlssnr-amd.ini; in NR Control and on the Add-ons page under
 Network model and options):
   - Residency: what is kept of a network that is no longer running. The networks share one activation
     memory, so what is kept is mainly the weights.
@@ -265,12 +269,17 @@ Network model and options):
   - Style Grade (default 1): the grade of the Natural and Cinematic styles. 1 = as NVIDIA's DLL, the
     picture is graded for the style after the network; 0 = the picture of 0.0.6 and earlier (without
     that step), for those who prefer it. Standard is not affected; applied at once.
+  - Style Grade Acceleration (default 1): 1 = the Natural / Cinematic grade with an equivalent formula
+    that takes less GPU time; 0 = computed
+    step by step. Only with Style Grade 1; applied at once.
   - Motion Without Depth (default 1): 1 = the network fetches the previous frame with the pixel's own
     motion vector, depth not used, as NVIDIA's DLL does; 0 = with depth, the motion vector of whichever
     of the pixel and its four diagonal neighbours is nearest the camera. Only the edges of moving
     objects change; applied after a game restart.
-  - OptimizedLayers (default 3): CC_SILVER_AARDWOLD_OPTIMIZED's level, 0 = Quality, 1 = Balanced,
+  - [CC_SILVER_AARDWOLD_OPTIMIZED] Layers (default 3): its level, 0 = Quality, 1 = Balanced,
     2 = Performance, 3 = Ultra Performance (see the networks above).
+  - [CC_SMALL_FP8_OPTIMIZED] Layers (default 0): its level, 0 and 1 = Quality, 2 = Performance,
+    3 = Ultra Performance (see the networks above).
   - History Precision (default 16): the images NR keeps its previous result in. 16 = 16-bit, as
     NVIDIA's DLL keeps it, half the memory; 32 = 32-bit, as up to 0.0.8.1. With several passes the two
     can differ in fine detail. Applied at once (the previous result starts afresh).
@@ -293,6 +302,20 @@ exposure from anywhere, a hint says to try Preprocess with Exposure = auto if th
 Depth is shown only with Motion Without Depth = 0 (NVIDIA's DLL does not use depth). The name at the
 start of each line has a colour: green = from the game, yellow = not from the game but filled in (what
 fills it in is on the line), orange = not from the game and nothing fills it in.
+
+Frame reuse (optional, off by default; optiscaler route, NR settings under the network, NRFrameReuse
+for RenoDX layers, FrameReuse for wilsjo2 layers, switchable in game): NR's network runs on every other
+frame and the frame in between is rebuilt from the NR frames before and after it along the game's
+motion vectors. The network's work is split over the two frames so every frame takes about the same
+GPU time, and every frame is shown two frames later, which adds latency. It runs at Present only and
+needs the game's motion vectors (depth is used when the game gives it); it does not run with
+Interleaved. Where it cannot run, the line under the switch says why and the layer's frame is left as
+it is. Not offered on the reshade-feeder routes.
+
+Interleaved (Passes (fast)): Depth disocclusion check (NRFastInterleavedDepthDisocclusion /
+FastInterleavedDepthDisocclusion, on by default) finds surfaces that have just come into view from the
+game's depth; if a grid of light squares appears (strong upscaling, for example Ray Reconstruction),
+turn it off and they are found from the motion vectors and colours only.
 
 Preprocess (optional, off by default): [Preprocess] in dlssnr-amd.ini in the game folder (written
 at install; the ReShade routes also show it on the Add-ons page). It changes the picture the

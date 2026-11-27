@@ -13,14 +13,15 @@ using renodx_keys::kFloat;
 using renodx_keys::kText;
 using renodx_keys::kUint;
 inline constexpr Key kKeys[] = {
-    wilsjo2_keys::kHistory,
     {"Style", kUint, 0, 0.0f, 2.0f, 0.0f, "Network", "Style", "Style.", "Standard\0Natural\0Cinematic\0"},
     {"Intensity", kFloat, 2, 0.0f, 2.0f, 1.0f, "Network", "Intensity", "Intensity. Enhancement strength.", nullptr},
     {"LocalStructure", kFloat, 2, 0.0f, 2.0f, 1.0f, "Network", "Local structure", "LocalStructure.", nullptr},
     {"LocalTone", kFloat, 2, 0.0f, 2.0f, 1.0f, "Network", "Local tone", "LocalTone.", nullptr},
     {"SkinStructure", kFloat, 2, -1.0f, 2.0f, -1.0f, "Network", "Skin structure", "SkinStructure. -1: follows Local structure.", nullptr},
     {"AutoMask", kBool, 0, 0.0f, 0.0f, 1.0f, "Network", "Character mask", "AutoMask.", nullptr},
-    {"NoiseEveryFrame", kBool, 0, 0.0f, 0.0f, 1.0f, "Network", "New noise without motion vectors", "NoiseEveryFrame (ours). Frames without motion vectors: a new noise seed every frame, as NVIDIA's DLL does (default). Off: the seed stays. Frames with motion vectors always get a new one.", nullptr},
+    {"NoiseEveryFrame", kBool, 0, 0.0f, 0.0f, 1.0f, "Network", "New noise every frame", "NoiseEveryFrame (ours). A new noise seed for the network every frame, as NVIDIA's DLL does (default). Off: the same seed every frame.", nullptr},
+    {"PreHistory", kBool, 0, 0.0f, 0.0f, 1.0f, "Network", "Pre history", "PreHistory (ours). The network's input block also reads its previous answer, moved along the motion vectors, as NVIDIA's DLL does (default). Off: it sees this frame only. Without motion vectors there is no history either way (diagnostic).", nullptr},
+    wilsjo2_keys::kPostHistory,
     {"TransferStrength", kFloat, 2, 0.0f, 2.0f, 1.0f, "Composition", "Detail strength", "TransferStrength. How much of the network's detail change is kept.", nullptr},
     {"ColourStrength", kFloat, 2, 0.0f, 2.0f, 1.0f, "Composition", "Colour strength", "ColourStrength. How much of the network's colour change is kept.", nullptr},
     {"MaxRatio", kFloat, 2, 1.0f, 8.0f, 2.0f, "Composition", "Highlight guard", "MaxRatio. The most a pixel's brightness may change, either way.", nullptr},
@@ -52,6 +53,8 @@ inline constexpr Key kKeys[] = {
     {"SkinColour", kFloat, 2, 0.0f, 1.0f, 1.0f, "Skin and environment", "Skin colour", "SkinColour.", nullptr},
     {"EnvironmentDetail", kFloat, 2, 0.0f, 1.0f, 1.0f, "Skin and environment", "Environment detail", "EnvironmentDetail.", nullptr},
     {"EnvironmentColour", kFloat, 2, 0.0f, 1.0f, 1.0f, "Skin and environment", "Environment colour", "EnvironmentColour.", nullptr},
+    // drawn at the top of the layer page (draw_frame_reuse_in), not in its group; appended here: the indices stay
+    {"FrameReuse", kBool, 0, 0.0f, 0.0f, 0.0f, "Network", "Frame reuse", "FrameReuse. At Present, NR runs on alternate frames. Each intermediate frame uses both neighbouring NR results and the game's motion vectors. The network work is split across the pair. Each picture is shown two frames late after startup. Frame reuse and Interleaved cannot be combined.", nullptr},
 };
 inline constexpr int kCount = int(sizeof kKeys / sizeof kKeys[0]);
 }  // namespace nr::wilsjo2_keys

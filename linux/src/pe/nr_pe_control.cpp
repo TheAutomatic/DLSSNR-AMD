@@ -208,9 +208,24 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return CallWindowProcW(g_previous, hwnd, msg, wp, lp);
 }
 
-// The game's window: the largest visible top-level window of this process.
+bool is_overlay_helper_window(HWND h) {
+    const LONG_PTR ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
+    return (ex & (WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW)) != 0 || !IsWindowEnabled(h);
+}
+
+// The game's window: the largest visible activatable top-level window of this process (falling back to any visible
+// window if all visible windows look like overlay helpers, e.g. RemixGuiInputSink).
 HWND game_window() {
-    struct Find { HWND best = nullptr; long area = 0; } f;
+    struct Find {
+        HWND best = nullptr;
+        long area = 0;
+        bool best_fg = false;
+        bool best_unowned = false;
+        HWND fallback = nullptr;
+        long fallback_area = 0;
+        HWND fg = nullptr;
+    } f;
+    f.fg = GetForegroundWindow();
     EnumWindows([](HWND h, LPARAM p) -> BOOL {
         auto& f = *reinterpret_cast<Find*>(p);
         DWORD pid = 0;
@@ -218,11 +233,22 @@ HWND game_window() {
         RECT r{};
         if (pid == GetCurrentProcessId() && IsWindowVisible(h) && GetClientRect(h, &r)) {
             const long area = long(r.right - r.left) * long(r.bottom - r.top);
-            if (area > f.area) { f.area = area; f.best = h; }
+            if (area <= 0) return TRUE;
+            if (area > f.fallback_area) { f.fallback_area = area; f.fallback = h; }
+            if (is_overlay_helper_window(h)) return TRUE;
+            const bool is_fg = (h == f.fg);
+            const bool unowned = (GetWindow(h, GW_OWNER) == nullptr);
+            if (area > f.area ||
+                (area == f.area && ((is_fg && !f.best_fg) || (is_fg == f.best_fg && unowned && !f.best_unowned)))) {
+                f.area = area;
+                f.best = h;
+                f.best_fg = is_fg;
+                f.best_unowned = unowned;
+            }
         }
         return TRUE;
     }, reinterpret_cast<LPARAM>(&f));
-    return f.best;
+    return f.best ? f.best : f.fallback;
 }
 
 void read_pass_key() {   // [NRControl] PassOptiScalerKey and OptiScaler's [Menu] ShortcutKey, once a second
@@ -280,7 +306,10 @@ void watch() {
                 ci.cbSize = sizeof ci;
                 s->cursor_shown = GetCursorInfo(&ci) && (ci.flags & CURSOR_SHOWING) && ci.hCursor ? 1u : 0u;
                 uint32_t keys[8] = {};
-                const bool focused = GetForegroundWindow() == g_window;
+                // (the swap chain's window can be a child of the one in front)
+                const HWND front = GetForegroundWindow();
+                const bool focused = front && (front == g_window || front == GetAncestor(g_window, GA_ROOT) ||
+                                               front == GetAncestor(g_window, GA_ROOTOWNER));
                 for (int vk = 1; vk < 256; ++vk)
                     if (focused && (GetAsyncKeyState(vk) & 0x8000)) keys[vk / 32] |= 1u << (vk % 32);
                 // the presses first (nr_control_shared.hpp `pressed`), then the keys: a key seen down has its press
@@ -357,6 +386,34 @@ void chain_layers(const std::vector<int>& numbers) {
         s->building_net = nr::control::kNoNet;
         s->panel_lines = 0;
         ++s->status_seq;
+    }
+}
+
+void layer_reuse_group(int number,bool ready,float share,const char* reason) {
+    auto* page=shared();
+    if (auto* row=row_of(page,number,false)) {
+        if (!ready && (!reason || !*reason) && row->reuse==2 && row->reuse_note[0]) return;
+        row->state=ready?1u:3u; row->reuse=ready?1u:2u; row->reuse_share=ready?share:-1.f;
+        std::snprintf(row->reuse_note,sizeof row->reuse_note,"%s",ready?"":reason && *reason?reason:NR_N("Waiting for the other frame reuse layers"));
+        std::snprintf(row->note,sizeof row->note,"%s",row->reuse_note);
+        row->updated=uint32_t(GetTickCount64());
+    }
+}
+
+void layer_reuse_failed(int number, const char* reason) {
+    nr::control::Shared* s = shared();
+    if (!s) s = page();
+    if (auto* r = row_of(s, number, false)) {
+        const bool changed=r->reuse!=2 || std::strcmp(r->reuse_note,reason)!=0;
+        r->state = 3;
+        r->reuse = 2; r->reuse_share = -1.f;
+        r->passes = 0; r->network_ms = r->gpu_ms = 0.f;
+        std::snprintf(r->reuse_note, sizeof r->reuse_note, "%s", reason);
+        std::snprintf(r->note, sizeof r->note, "%s", reason);
+        r->updated = uint32_t(GetTickCount64());
+        if (changed) log("[nr] NR Control frame reuse: layer=%u state=%u reuse=%u passes=%u reason=%s",
+                         r->number,r->state,r->reuse,r->passes,r->reuse_note);
+        nr::pe::events::layer_state(number, 3u, reason);
     }
 }
 
@@ -462,6 +519,14 @@ void report(const Status& st) {
         else if (r->state == 1u && st.fast_fallback)
             std::snprintf(r->note, sizeof r->note, "%s", nr::control::fast_fallback_note(st.fast_fallback_spatial));
         r->gpu_ms = st.gpu_ms; r->network_ms = st.network_ms;
+        if (st.reuse == 2u) {
+            r->state = 3u;
+            r->passes = 0;
+            r->network_ms = 0.f;
+            std::snprintf(r->note, sizeof r->note, "%s", st.reuse_note.c_str());
+        }
+        r->reuse = st.reuse; r->reuse_share = st.reuse_share;
+        std::snprintf(r->reuse_note, sizeof r->reuse_note, "%s", st.reuse_note.c_str());
         r->updated = uint32_t(now);
         nr::pe::events::layer_state(st.layer, r->state, r->note);
         if (uint32_t(now) - r->panel_at >= 250u) {   // its engine data, four times a second
