@@ -77,6 +77,9 @@ common=(-std=c++17 -O2 -DNDEBUG -DNR_BUILD_STAMP="\"$stamp\"" -Itoolchain/Vulkan
 common+=(-DNR_RESHADE_ROUTE=1)
 [[ "${NR_INT4:-1}" == 1 ]] && common+=(-DNR_INT4=1)
 par "$cxx" "${common[@]}" "${NR_PRODUCT_DEFINES[@]}" -c windows/src/core/nr_runtime.cpp -o "$out/nr_runtime.o"
+# ReShade's headers include <Windows.h>; the case shim maps that onto mingw's.
+par "$cxx" "${common[@]}" -idirafter windows/src/pe/reshade_compat -I"$reshade_inc" -I"$minhook/include" \
+    -Iartifacts/ref/DLSS5-Feeder/external/imgui -Iwindows/src/ui -c windows/src/pe/nr_reshade_addon.cpp -o "$out/reshade_addon.o"
 par "$cxx" "${common[@]}" -c windows/src/core/nr_native_plan.cpp -o "$out/nr_native_plan.o"
 par "$cxx" "${common[@]}" -c windows/src/core/nr_renodx.cpp -o "$out/nr_renodx.o"
 par "$cxx" "${common[@]}" -c windows/src/core/nr_wilsjo2.cpp -o "$out/nr_wilsjo2.o"   # its Stage: HUD FIX and the wilsjo2 layers
@@ -91,9 +94,6 @@ par "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_d3d12split.cpp -o "$out/d3d12s
 par "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_config.cpp -o "$out/config.o"
 par "$cxx" "${common[@]}" -c windows/src/pe/nr_screenshot.cpp -o "$out/screenshot.o"
 par "$cxx" "${common[@]}" -c windows/src/core/nr_frame_reuse.cpp -o "$out/nr_frame_reuse.o"   # NRFrameReuse (the session's)
-# ReShade's headers include <Windows.h>; the case shim maps that onto mingw's.
-par "$cxx" "${common[@]}" -idirafter windows/src/pe/reshade_compat -I"$reshade_inc" -I"$minhook/include" \
-    -Iartifacts/ref/DLSS5-Feeder/external/imgui -Iwindows/src/ui -c windows/src/pe/nr_reshade_addon.cpp -o "$out/reshade_addon.o"
 for unit in hook buffer trampoline; do
     par "$cc" -O2 -I"$minhook/include" -I"$minhook/src" -c "$minhook/src/$unit.c" -o "$out/mh_$unit.o"
 done

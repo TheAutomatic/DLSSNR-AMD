@@ -43,16 +43,18 @@ mkdir -p "$OUT/shim"; printf '#include <windows.h>\n' > "$OUT/shim/Windows.h"   
 
 cd "$OUT"
 objs=()
+par "$GXX" "${DEF[@]}" "${INC[@]}" "${NR_PRODUCT_DEFINES[@]}" -c "$SRC/windows/src/core/nr_runtime.cpp" -o nr_runtime.o
+par "$GXX" "${DEF[@]}" -I. "${INC[@]}" "${INC_ADDON[@]}" -idirafter "$OUT/shim" "${NR_PRODUCT_DEFINES[@]}" \
+       -c "$SRC/windows/src/pe/nr_reshade_addon.cpp" -o reshade_addon.o
+objs+=(nr_runtime.o reshade_addon.o)
 for f in nr_native_plan nr_pe_bridge nr_pe_config nr_pe_crash nr_pe_d3d12split \
-         nr_pe_interop nr_pe_log nr_pe_session nr_pe_vkdevice nr_renodx nr_runtime nr_screenshot \
+         nr_pe_interop nr_pe_log nr_pe_session nr_pe_vkdevice nr_renodx nr_screenshot \
          nr_vram_ledger nr_wilsjo2 nr_frame_reuse; do
     p=$(find "$SRC/windows/src" -name "$f.cpp" | head -1)
     par "$GXX" "${DEF[@]}" "${INC[@]}" "${NR_PRODUCT_DEFINES[@]}" -c "$p" -o "$f.o"
     objs+=("$f.o")
 done
-par "$GXX" "${DEF[@]}" -I. "${INC[@]}" "${INC_ADDON[@]}" -idirafter "$OUT/shim" "${NR_PRODUCT_DEFINES[@]}" \
-       -c "$SRC/windows/src/pe/nr_reshade_addon.cpp" -o reshade_addon.o
-objs+=(reshade_addon.o mh_hook.o mh_buffer.o mh_trampoline.o mh_hde32.o)
+objs+=(mh_hook.o mh_buffer.o mh_trampoline.o mh_hde32.o)
 
 # MinHook, 32-bit (hde32 only)
 par "$GCC" -O2 -I"$MINHOOK/include" -I"$MINHOOK/src" -c "$MINHOOK/src/hook.c"       -o mh_hook.o

@@ -109,7 +109,7 @@ jobs:
         run: bash fetch_deps.sh --windows
 
       - name: Build package   # builds the Vulkan loader and the OptiScaler DLLs too
-        run: NR_SIGN=1 bash windows/build/build_package.sh
+        run: NR_JOBS=$(nproc) NR_SIGN=1 bash windows/build/build_package.sh
 
       - name: Check that no model was packaged
         run: |
