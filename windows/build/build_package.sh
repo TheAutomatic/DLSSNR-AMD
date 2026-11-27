@@ -394,15 +394,19 @@ for a in x86_64 i686; do
 name="DLSSNR-AMD-Vulkan-Windows-$stamp$preview-$a"
 dir=$pkg; [[ $a == i686 ]] && dir=$pkg32
 rm -f -- "$out/$name.zip"
-python3 - "$dir" "$out/$name.zip" <<'PY'
+if command -v 7z >/dev/null; then
+    ( cd "$dir" && 7z a -tzip -mm=Deflate -mx=6 -mmt="$NR_JOBS" -bd "$out/$name.zip" . > /dev/null )
+else
+    python3 - "$dir" "$out/$name.zip" <<'PY'
 import os, sys, zipfile
 root, dst = sys.argv[1], sys.argv[2]
-with zipfile.ZipFile(dst, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+with zipfile.ZipFile(dst, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as z:
     for d, _, files in sorted(os.walk(root)):
         for f in sorted(files):
             full = os.path.join(d, f)
             z.write(full, os.path.relpath(full, root))
 PY
+fi
 mv -f -- "$out/$name.zip" "windows/package/$name.zip"
 du -sh -- "$dir"
 sha256sum -- "windows/package/$name.zip"

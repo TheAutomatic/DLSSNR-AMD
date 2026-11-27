@@ -14,6 +14,7 @@ signature against the run's certificate; otherwise the package build stops.
 
   sign_pe.py <folder>      (needs openssl and osslsigncode)
 """
+import concurrent.futures
 import os
 import shutil
 import struct
@@ -69,17 +70,19 @@ def main():
                         '-subj', SUBJECT, '-addext', 'keyUsage=critical,digitalSignature',
                         '-addext', 'extendedKeyUsage=codeSigning', '-keyout', key, '-out', cert],
                        check=True, capture_output=True)
-        signed = kept = 0
-        for path in files:
+        env_jobs = os.environ.get('NR_JOBS', '').strip()
+        workers = int(env_jobs) if env_jobs.isdigit() and int(env_jobs) > 0 else (os.cpu_count() or 4)
+
+        def sign_one(item):
+            idx, path = item
             data = open(path, 'rb').read()
             fields = pe_fields(data)
             if not fields:
-                continue
+                return 'skip', ''
+            rel = os.path.relpath(path, root)
             if struct.unpack_from('<Q', data, fields[1])[0]:   # a signature of its own: left as it is
-                kept += 1
-                print(f'kept (signed already): {os.path.relpath(path, root)}')
-                continue
-            out = os.path.join(tmp, 'signed')
+                return 'kept', f'kept (signed already): {rel}'
+            out = os.path.join(tmp, f'signed-{idx}')
             if os.path.exists(out):
                 os.remove(out)   # (osslsigncode does not write over a file)
             r = subprocess.run(['osslsigncode', 'sign', '-certs', cert, '-key', key, '-h', 'sha256', '-n', 'DLSSNR-AMD',
@@ -96,8 +99,17 @@ def main():
                 os.chmod(path, mode | 0o200)
             with open(path, 'wb') as f:   # in place (the file keeps its mode)
                 f.write(after)
-            signed += 1
-            print(f'signed: {os.path.relpath(path, root)}')
+            return 'signed', f'signed: {rel}'
+
+        signed = kept = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            for status, line in pool.map(sign_one, enumerate(files)):
+                if status == 'kept':
+                    kept += 1
+                    print(line)
+                elif status == 'signed':
+                    signed += 1
+                    print(line)
         print(f'sign_pe.py: {signed} signed, {kept} kept with their own signature')
 
 
