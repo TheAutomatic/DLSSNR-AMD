@@ -34,6 +34,8 @@ default:
 
 .version: &version
   - if [[ -n "${CI_COMMIT_TAG:-}" ]]; then export NR_VERSION=${CI_COMMIT_TAG#v}; fi
+  # every vCPU for the parallel build steps (*/build/parallel.sh's default is half of them: one on a 2-vCPU runner)
+  - export NR_JOBS=$(nproc)
 
 linux:
   stage: build

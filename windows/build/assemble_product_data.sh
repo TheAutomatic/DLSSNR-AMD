@@ -23,7 +23,7 @@ rm -rf -- "$dst"; mkdir -p -- "$dst/shaders/runtime" "$dst/shaders/temporal"
 
 # Every network set and the outer shaders at once (windows/build/parallel.sh), then their files copied into place.
 source windows/build/parallel.sh
-par python3 windows/build/build_network.py "$NR_GPU_ARCH" --out "$NR_PRODUCT_SPV" > /dev/null
+par env NR_SHADER_JOBS="${NR_JOBS:-}" python3 windows/build/build_network.py "$NR_GPU_ARCH" --out "$NR_PRODUCT_SPV" > /dev/null
 par bash windows/build/build_renodx.sh "$dst/shaders/renodx" > /dev/null
 par bash windows/build/build_frame_reuse.sh "$dst/shaders/frame-reuse" > /dev/null
 par bash windows/build/build_wilsjo2.sh "$dst/shaders/wilsjo2" > /dev/null

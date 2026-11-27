@@ -22,12 +22,12 @@ The host must be compiled with the same constants: windows/build/arch/<arch>.sh.
 lists the differences (exit 1 if any).
 """
 import argparse
-import concurrent.futures
 import json
 import os
 import shutil
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 R = Path(__file__).resolve().parents[2]
@@ -43,8 +43,31 @@ QUAD = True   # --no-quad: the pair loops as written (A/B)
 # loop variable.
 UNROLLED = {'fswin_t.comp', 'ffwd3_t.comp', 'attn.comp', 'vit_attn.comp'}
 
+# Every glslang run of this build is queued (glslang) and run at the end (run_queued), NR_SHADER_JOBS at a time - by
+# default the CPUs shared with the steps windows/build/parallel.sh runs beside this one (CPUs / its NR_JOBS); each run
+# writes a file of its own, so the outputs do not depend on the order. A failure stops the build with that compiler's
+# messages (the first failure in queue order).
+_queue = []
 
-def glslang(arch, src, defines, out, unroll=False, network=False):
+
+def _jobs():
+    if os.environ.get('NR_SHADER_JOBS'):
+        return max(1, int(os.environ['NR_SHADER_JOBS']))
+    return max(1, (os.cpu_count() or 1) // max(1, int(os.environ.get('NR_JOBS') or 1)))
+
+
+def run_queued():
+    work, _queue[:] = list(_queue), []
+    with ThreadPoolExecutor(_jobs()) as pool:
+        for f in [pool.submit(_compile, *a, **k) for a, k in work]:
+            f.result()
+
+
+def glslang(*a, **k):
+    _queue.append((a, k))
+
+
+def _compile(arch, src, defines, out, unroll=False, network=False):
     if unroll or (network and QUAD):
         pre = out.with_suffix('.pre.comp')
         r = subprocess.run([str(R / 'toolchain/glslang/bin/glslang'), '-E', '-I' + str(R / 'windows/shaders' / arch / 'include'),
@@ -94,44 +117,35 @@ def main():
     consts = dict(r.split() for r in table['markers']['shader-constants.txt'][1:])
     if consts.get('post_no_out1') == '1' and 'NR_POST_NO_OUT1=1' not in pipelines['fswinimagepost32']['defines']:
         sys.exit('pipelines.json: post_no_out1 1, but fswinimagepost32 is built without NR_POST_NO_OUT1=1')
+    for name, e in pipelines.items():
+        glslang(a.arch, R / 'windows/shaders' / a.arch / e['source'], e['defines'] + a.define, out / f'g_{name}.spv',
+                unroll=e['source'] in UNROLLED, network=True)
     for name, text in table['markers'].items():
         (out / name).write_text('\n'.join(text) + '\n' if isinstance(text, list) else text + '\n')
     (out / 'runtime').mkdir()
     (out / 'temporal').mkdir()
-    shutil.copy2(out / 'shader-constants.txt', out / 'temporal' / 'shader-constants.txt')
-
-    tasks = []
-    for name, e in pipelines.items():
-        tasks.append((R / 'windows/shaders' / a.arch / e['source'], e['defines'] + a.define, out / f'g_{name}.spv',
-                      e['source'] in UNROLLED, True))
     for name, v in table['variants'].items():
         base = pipelines[v['base']]
-        tasks.append((R / 'windows/shaders' / a.arch / base['source'], base['defines'] + v['add'],
-                      out / 'temporal' / f'{name}.spv', base['source'] in UNROLLED, True))
+        glslang(a.arch, R / 'windows/shaders' / a.arch / base['source'], base['defines'] + v['add'],
+                out / 'temporal' / f'{name}.spv', unroll=base['source'] in UNROLLED, network=True)
     grade = table['style_grade']
     # _grade: the table form; _grade_accel: the same grade in closed form ([Network] Style Grade Acceleration)
     for suffix, add in (('_grade', grade['add']), ('_grade_accel', grade['accel_add'])):
         for name in grade['pipelines']:
             e = pipelines[name]
-            tasks.append((R / 'windows/shaders' / a.arch / e['source'], e['defines'] + a.define + add,
-                          out / f'g_{name}{suffix}.spv', e['source'] in UNROLLED, True))
+            glslang(a.arch, R / 'windows/shaders' / a.arch / e['source'], e['defines'] + a.define + add,
+                    out / f'g_{name}{suffix}.spv', unroll=e['source'] in UNROLLED, network=True)
         for name in grade['variants']:
             base = pipelines[table['variants'][name]['base']]
-            tasks.append((R / 'windows/shaders' / a.arch / base['source'],
-                          base['defines'] + table['variants'][name]['add'] + add,
-                          out / 'temporal' / f'{name}{suffix}.spv', base['source'] in UNROLLED, True))
+            glslang(a.arch, R / 'windows/shaders' / a.arch / base['source'],
+                    base['defines'] + table['variants'][name]['add'] + add, out / 'temporal' / f'{name}{suffix}.spv',
+                    unroll=base['source'] in UNROLLED, network=True)
     for k in MOTION:
-        tasks.append((R / 'windows/shaders/passes' / f'{k}.comp', [], out / 'temporal' / f'{k}.spv', False, False))
+        glslang(a.arch, R / 'windows/shaders/passes' / f'{k}.comp', [], out / 'temporal' / f'{k}.spv')
+    shutil.copy2(out / 'shader-constants.txt', out / 'temporal' / 'shader-constants.txt')
     for k in RUNTIME:
-        tasks.append((R / 'windows/shaders/passes' / f'{k}.comp', [], out / 'runtime' / f'{k}.spv', False, False))
-
-    env_jobs = os.environ.get('NR_JOBS', '').strip()
-    workers = int(env_jobs) if env_jobs.isdigit() and int(env_jobs) > 0 else (os.cpu_count() or 4)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        futs = [pool.submit(glslang, a.arch, src, defs, dst, unroll=unroll, network=network)
-                for src, defs, dst, unroll, network in tasks]
-        for fut in futs:
-            fut.result()
+        glslang(a.arch, R / 'windows/shaders/passes' / f'{k}.comp', [], out / 'runtime' / f'{k}.spv')
+    run_queued()
     print(f'{out}: {len(pipelines) + len(grade["pipelines"])} network pipelines, '
           f'{len(table["variants"]) + len(grade["variants"]) + len(MOTION)} temporal, '
           f'{len(RUNTIME)} runtime')
