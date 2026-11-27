@@ -21,7 +21,9 @@ g_gemmvqkvnorm4.spv g_gemmvqkvnorm.spv
 g_gemmvqkvnorms4.spv g_gemmvqkvnorms.spv
 temporal_post_fp32h16.spv temporal_post_fp32.spv
 temporal_post_fp32h16_grade.spv temporal_post_fp32_grade.spv
+temporal_post_fp32h16_grade_accel.spv temporal_post_fp32_grade_accel.spv
 temporal_post_fp32hp.spv temporal_post_fp32.spv
 temporal_post_fp32hp_grade.spv temporal_post_fp32_grade.spv
+temporal_post_fp32hp_grade_accel.spv temporal_post_fp32_grade_accel.spv
 temporal_pre_fp32nh.spv temporal_pre_fp32.spv
 temporal_pre_fp32nhhp.spv temporal_pre_fp32.spv

@@ -208,14 +208,20 @@ void judge_executable() {
 void read_ini_barriers() {
     char ini[MAX_PATH * 4 + 32];
     std::snprintf(ini, sizeof ini, "%s\\OptiScaler.ini", nr::pe::module_folder());
-    auto get = [&](const char* key) {
-        char v[32] = {};
-        nr::u8::profile("Hotfix", key, "", v, sizeof v, ini);
-        return v[0] >= '0' && v[0] <= '9' ? std::atoi(v) : -1;
+    auto get = [&](const char* key) {   // as OptiScaler's Config::readInt: "0x" hexadecimal, else decimal, the whole value
+        char v[64] = {};
+        if (nr::u8::profile("Hotfix", key, "", v, sizeof v, ini) >= sizeof v - 1) return -1;   // (cut off: not a value)
+        const char* s = v[0] == '+' ? v + 1 : v;
+        const bool hex = s == v && s[0] == '0' && (s[1] == 'x' || s[1] == 'X') && s[2];   // ("+0x..": no value, as there)
+        const char* digits = hex ? s + 2 : s;
+        if (!(*digits >= '0' && *digits <= '9') && !(hex && std::isxdigit(static_cast<unsigned char>(*digits)))) return -1;
+        char* end = nullptr;
+        const unsigned long n = std::strtoul(digits, &end, hex ? 16 : 10);
+        return end && *end == 0 && n <= 0x7fffffffUL ? int(n) : -1;
     };
     g_ini.color = get("ColorResourceBarrier");
     g_ini.depth = get("DepthResourceBarrier");
-    g_ini.motion = get("MVResourceBarrier");
+    g_ini.motion = get("MotionVectorResourceBarrier");   // (OptiScaler's name: its Config.cpp; "MVResourceBarrier" was never one)
     g_ini.exposure = get("ExposureResourceBarrier");
     g_ini.output = get("OutputResourceBarrier");
 }
@@ -360,7 +366,10 @@ bool hold_released(int row) { return g_hold_released.erase(row) != 0; }
 // The sizes of a feature's create block (upstream RenoDX dlssnr.hpp, KCD2: an evaluate may carry the render size as
 // OutWidth while the create block and the output resource say the display size; the SDK's evaluate helper never
 // writes OutWidth): Width / Height and OutWidth / OutHeight, 0 not given.
-struct CreateSizes { uint32_t in_w = 0, in_h = 0, out_w = 0, out_h = 0; };
+// extended: OptiScaler.ini [Menu] ExtendedLimits at the create (as_optiscaler_reads; the evaluates read with it).
+// out_subrects: DLSS.Enable.Output.Subrects at the create - OptiScaler places the output at DLSS.Output.Subrect.Base only
+// when it is on (upscalers/IFeature.cpp); -1 the create not seen (the base taken as given).
+struct CreateSizes { uint32_t in_w = 0, in_h = 0, out_w = 0, out_h = 0; bool extended = false; int out_subrects = -1; };
 CreateSizes create_sizes(const NVSDK_NGX_Parameter* p) {
     CreateSizes c;
     if (!p) return c;
@@ -369,7 +378,98 @@ CreateSizes create_sizes(const NVSDK_NGX_Parameter* p) {
     if (p->Get("Height", &v) == NVSDK_NGX_Result_Success) c.in_h = v;
     if (p->Get("OutWidth", &v) == NVSDK_NGX_Result_Success) c.out_w = v;
     if (p->Get("OutHeight", &v) == NVSDK_NGX_Result_Success) c.out_h = v;
+    int e = 0;
+    c.out_subrects = p->Get("DLSS.Enable.Output.Subrects", &e) == NVSDK_NGX_Result_Success && e != 0 ? 1 : 0;
     return c;
+}
+// OpenRR (openrr-amd.asi: DLSS Ray Reconstruction on AMD, an OptiScaler plugin as this one, often installed beside it)
+// loaded in this process. What NR does for it below changes nothing while it is not.
+bool openrr_loaded() {
+    return GetModuleHandleW(L"openrr-amd.asi") != nullptr || GetModuleHandleW(L"openrr-amd-loadlate.asi") != nullptr;
+}
+// A feature's create block: its sizes and DLSS.Feature.Create.Flags. With OpenRR loaded it is read before the create
+// call (a create OpenRR answers may rewrite the block) and what it lacks then is taken from after the call; without
+// OpenRR it is read after the call, as always.
+struct CreateBlock { CreateSizes sizes; bool flags_known = false; uint32_t flags = 0; };
+CreateBlock read_create_block(const NVSDK_NGX_Parameter* p) {
+    CreateBlock b;
+    if (!p) return b;
+    b.sizes = create_sizes(p);
+    int flags = 0;
+    if (p->Get("DLSS.Feature.Create.Flags", &flags) == NVSDK_NGX_Result_Success) {
+        b.flags = uint32_t(flags);
+        b.flags_known = true;
+    }
+    return b;
+}
+CreateBlock create_block_before(const NVSDK_NGX_Parameter* p) { return openrr_loaded() ? read_create_block(p) : CreateBlock{}; }
+// OptiScaler.ini [Menu] ExtendedLimits = true: OptiScaler takes a create block's sizes as given (read every 5 s)
+bool optiscaler_extended_limits() {   // (at a feature's create only: a lock, the file read again after 5 s)
+    static std::mutex lock;
+    static bool on = false;
+    static ULONGLONG read = 0;
+    std::lock_guard<std::mutex> guard(lock);
+    const ULONGLONG now = GetTickCount64();
+    if (!read || now - read >= 5000) {
+        char path[MAX_PATH * 4 + 32];
+        std::snprintf(path, sizeof path, "%s\\OptiScaler.ini", nr::pe::module_folder());
+        char v[16] = {};
+        nr::u8::profile("Menu", "ExtendedLimits", "", v, sizeof v, path);
+        on = _stricmp(v, "true") == 0;
+        read = now;
+    }
+    return on;
+}
+// A feature's create sizes as OptiScaler reads them (upscalers/IFeature.cpp SetInitParameters, nightly-20261127), so
+// that NR's sizes are those of the feature OptiScaler made: with an output size given, a value outside 20..16384 is not
+// given, and - unless OptiScaler.ini [Menu] ExtendedLimits = true - each axis's larger value is the output's and the
+// smaller one the render size. (A game that hands CreateFeature the block GetOptimalSettings filled gives Width / Height
+// the display's and OutWidth / OutHeight the render's.) Said in the log when they came the other way round.
+void as_optiscaler_reads(CreateSizes& c) {
+    c.extended = optiscaler_extended_limits();
+    if (!c.out_w || !c.out_h) return;
+    const auto range = [](uint32_t& v) { if (v > 16384 || v < 20) v = 0; };
+    range(c.in_w); range(c.in_h); range(c.out_w); range(c.out_h);
+    if (c.extended) return;
+    const CreateSizes given = c;
+    c.in_w = std::min(given.in_w, given.out_w); c.out_w = std::max(given.in_w, given.out_w);
+    c.in_h = std::min(given.in_h, given.out_h); c.out_h = std::max(given.in_h, given.out_h);
+    static std::atomic<int> said{0};
+    if ((given.in_w > given.out_w || given.in_h > given.out_h) && said.fetch_add(1, std::memory_order_relaxed) < 8)
+        log("[nr] a feature's create block gives Width x Height %ux%u and OutWidth x OutHeight %ux%u: read as OptiScaler "
+            "reads it, render %ux%u, output %ux%u", given.in_w, given.in_h, given.out_w, given.out_h, c.in_w, c.in_h,
+            c.out_w, c.out_h);
+}
+void create_block_after(CreateBlock& b, const NVSDK_NGX_Parameter* p) {
+    const CreateBlock a = read_create_block(p);
+    if (!b.sizes.in_w) b.sizes.in_w = a.sizes.in_w;
+    if (!b.sizes.in_h) b.sizes.in_h = a.sizes.in_h;
+    if (!b.sizes.out_w) b.sizes.out_w = a.sizes.out_w;
+    if (!b.sizes.out_h) b.sizes.out_h = a.sizes.out_h;
+    if (!b.flags_known) { b.flags = a.flags; b.flags_known = a.flags_known; }
+    if (b.sizes.out_subrects <= 0) b.sizes.out_subrects = a.sizes.out_subrects;
+    as_optiscaler_reads(b.sizes);
+}
+// An evaluate's render size without DLSS.Render.Subrect.Dimensions, as OptiScaler takes it (upscalers/IFeature.cpp
+// GetRenderResolution): its Width x Height when its Width is below its OutWidth (no OutWidth given: below the create's
+// render width), else the create's render size; the create's not known: its Width x Height, else the colour's.
+void evaluate_render_size(const NVSDK_NGX_Parameter* p, const CreateSizes& c, uint32_t colour_w, uint32_t colour_h,
+                          uint32_t* w, uint32_t* h) {
+    unsigned int ew = 0, eh = 0, ow = 0, oh = 0;
+    const bool in = p->Get("Width", &ew) == NVSDK_NGX_Result_Success && p->Get("Height", &eh) == NVSDK_NGX_Result_Success &&
+                    ew && eh;
+    const bool out = p->Get("OutWidth", &ow) == NVSDK_NGX_Result_Success && p->Get("OutHeight", &oh) == NVSDK_NGX_Result_Success &&
+                     ow && oh;
+    if (c.in_w && c.in_h) {
+        const bool own = in && (out ? ew < ow : ew < c.in_w);
+        *w = own ? ew : c.in_w;
+        *h = own ? eh : c.in_h;
+        return;
+    }
+    // (the create not seen: its pair read as a create's, the smaller one the render size)
+    if (in && out && !c.extended && (ew > ow || eh > oh)) { *w = std::min(ew, ow); *h = std::min(eh, oh); return; }
+    *w = in ? ew : colour_w;
+    *h = in ? eh : colour_h;
 }
 // NROutputRect: Auto uses create, then evaluate, then resource size. Declared uses evaluate then resource;
 // Resource uses the allocation. Auto logs a disagreement between the create and evaluate sizes.
@@ -381,7 +481,27 @@ void output_size(const NVSDK_NGX_Parameter* p, const CreateSizes& c, uint32_t re
     p->Get("OutHeight", &eh);
     const uint32_t mode = output_rect_mode();
     if (mode == 2) { *w = res_w; *h = res_h; return; }
-    if (mode == 1) { *w = ew ? ew : res_w; *h = eh ? eh : res_h; return; }
+    if (mode == 1) {
+        // Declared: the evaluate's OutWidth x OutHeight - an output size where OptiScaler takes one (above the evaluate's
+        // Width: upscalers/IFeature.cpp GetRenderResolution). Not above it, the block carries the render size there (a
+        // game reusing the block GetOptimalSettings filled) and the output is the feature's as OptiScaler made it - the
+        // create's (as_optiscaler_reads) - else the resource's. [Menu] ExtendedLimits = true: as given.
+        unsigned int iw = 0, ih = 0;   // (each axis the evaluate gives: one below Width / Height rules the pair out)
+        const bool gw = p->Get("Width", &iw) == NVSDK_NGX_Result_Success && iw, gh = p->Get("Height", &ih) == NVSDK_NGX_Result_Success && ih;
+        if ((ew || eh) && ((gw && ew && iw > ew) || (gh && eh && ih > eh)) && !c.extended) {
+            static std::atomic<int> said{0};
+            if (said.fetch_add(1, std::memory_order_relaxed) < 4)
+                log("[nr] the game's evaluate gives Width x Height %ux%u above OutWidth x OutHeight %ux%u: read as OptiScaler "
+                    "reads it, the output is %ux%u", iw, ih, ew, eh, c.out_w ? c.out_w : res_w, c.out_h ? c.out_h : res_h);
+            // (the create not seen: the larger of the evaluate's pair, as a create's is read)
+            const uint32_t pw = std::max<uint32_t>(iw, ew), ph = std::max<uint32_t>(ih, eh);
+            ew = c.out_w ? c.out_w : pw;
+            eh = c.out_h ? c.out_h : ph;
+        }
+        *w = ew ? ew : res_w;
+        *h = eh ? eh : res_h;
+        return;
+    }
     if (c.out_w && c.out_h) {
         *w = c.out_w; *h = c.out_h;
         static int said = 0;
@@ -487,21 +607,18 @@ void forget(Tracked& t) {
 
 NVSDK_NGX_Result NR_NGX_MSABI hk_create(ID3D12GraphicsCommandList* cmd, NVSDK_NGX_Feature feature,
                                         NVSDK_NGX_Parameter* p, NVSDK_NGX_Handle** out) {
+    CreateBlock block = create_block_before(p);
     const NVSDK_NGX_Result r = real_create(cmd, feature, p, out);
     if (r == NVSDK_NGX_Result_Success && out && *out) {
+        create_block_after(block, p);
         std::lock_guard<std::mutex> guard(g_lock);
         Tracked& t = g_features[(*out)->Id];
         forget(t);
         t = Tracked{};
         t.feature = int(feature);
-        t.create = create_sizes(p);
-        if (p) {
-            int flags = 0;
-            if (p->Get("DLSS.Feature.Create.Flags", &flags) == NVSDK_NGX_Result_Success) {
-                t.flags = uint32_t(flags);
-                t.flags_known = true;
-            }
-        }
+        t.create = block.sizes;
+        t.flags = block.flags;
+        t.flags_known = block.flags_known;
         log("[nr] OptiScaler feature %u made: NGX feature %d, flags 0x%x%s", (*out)->Id, int(feature), t.flags,
             t.flags_known ? "" : " (not given)");
     }
@@ -773,14 +890,13 @@ bool read_frame(const NVSDK_NGX_Parameter* p, const Tracked& t, Frame& f) {
     const D3D12_RESOURCE_DESC cd = f.color->GetDesc(), od = f.output->GetDesc();
     f.render_w = f.subrect_w = get_uint(p, "DLSS.Render.Subrect.Dimensions.Width");
     f.render_h = f.subrect_h = get_uint(p, "DLSS.Render.Subrect.Dimensions.Height");
-    if (!f.render_w || !f.render_h) {   // the evaluate's Width / Height, else the create block's, else the colour's
-        f.render_w = get_uint(p, "Width", t.create.in_w ? t.create.in_w : uint32_t(cd.Width));
-        f.render_h = get_uint(p, "Height", t.create.in_h ? t.create.in_h : cd.Height);
-    }
+    if (!f.render_w || !f.render_h)   // as OptiScaler takes it: the evaluate's Width / Height or the create's render size
+        evaluate_render_size(p, t.create, uint32_t(cd.Width), cd.Height, &f.render_w, &f.render_h);
     f.color_x = get_uint(p, "DLSS.Input.Color.Subrect.Base.X");
     f.color_y = get_uint(p, "DLSS.Input.Color.Subrect.Base.Y");
-    f.out_x = get_uint(p, "DLSS.Output.Subrect.Base.X");
-    f.out_y = get_uint(p, "DLSS.Output.Subrect.Base.Y");
+    // (the output's base only where the create turned output subrects on, as OptiScaler places it; create not seen: given)
+    f.out_x = t.create.out_subrects != 0 ? get_uint(p, "DLSS.Output.Subrect.Base.X") : 0;
+    f.out_y = t.create.out_subrects != 0 ? get_uint(p, "DLSS.Output.Subrect.Base.Y") : 0;
     output_size(p, t.create, uint32_t(od.Width), od.Height, &f.out_w, &f.out_h);
     if (!f.out_w || !f.out_h) { f.out_w = uint32_t(od.Width); f.out_h = od.Height; }
     // a region that does not fit the resource: clamped to it
@@ -792,7 +908,7 @@ bool read_frame(const NVSDK_NGX_Parameter* p, const Tracked& t, Frame& f) {
     f.depth_rect = {get_uint(p, "DLSS.Input.Depth.Subrect.Base.X"), get_uint(p, "DLSS.Input.Depth.Subrect.Base.Y"),
                     f.render_w, f.render_h};
     const bool low_res_mv = !f.flags_known || (f.flags & kFlagMvLowRes) != 0;
-    f.motion_rect = {get_uint(p, "DLSS.Input.MV.SubrectBase.X"), get_uint(p, "DLSS.Input.MV.SubrectBase.Y"),
+    f.motion_rect = {get_uint(p, "DLSS.Input.MV.Subrect.Base.X"), get_uint(p, "DLSS.Input.MV.Subrect.Base.Y"),
                      low_res_mv ? f.render_w : f.out_w, low_res_mv ? f.render_h : f.out_h};
     if (!low_res_mv && f.motion) {   // display-size vectors declared that the resource cannot hold: the part it holds (0.0.7's)
         const D3D12_RESOURCE_DESC md = f.motion->GetDesc();
@@ -3297,10 +3413,9 @@ void on_shown(IDXGISwapChain* sc, ID3D12CommandQueue* queue) {
 // and as RenoDX's pre-FG composition runs NR once a game frame before DLSS-G. Found through the game's dxgi.dll
 // (OptiScaler as dxgi.dll): CreateDXGIFactory*, its factories' CreateSwapChain*, and the swap chains returned to the
 // game (only the outermost creation: the ones frame generation makes inside it are under OptiScaler); every function
-// hooked once. MinHook patches the function itself; each hooked function gets a detour of its own (an instance of the
-// templates below) holding its own original, written by MH_CreateHook before the hook is enabled - so a call that
-// arrives the moment the hook goes live finds it, and so does one through an object whose vtable someone else (an
-// overlay) has since pointed elsewhere.
+// hooked once. Each hooked function gets a detour of its own (an instance of the templates below) holding its own
+// original, written before the hook goes live - so a call that arrives the moment it does finds it. The system's DXGI
+// functions are patched in place by MinHook (hook_slot); any other module's only through the vtable slot.
 std::mutex g_sc_lock;
 std::unordered_map<IDXGISwapChain*, ID3D12CommandQueue*> g_game_swapchains;   // the game's, with its queue (AddRef)
 std::unordered_map<IDXGISwapChain*, ID3D11Device*> g_game_swapchains11;       // a D3D11 game's, with its device (AddRef)
@@ -3318,8 +3433,9 @@ enum DetourKind { kDetourPresent, kDetourPresent1, kDetourCreate, kDetourCreateH
 constexpr int kDetoursPerKind = 8;   // functions of one kind: one per class of swap chain / factory the game makes
 void* g_detour_original[kDetourKinds][kDetoursPerKind] = {};   // never cleared: a hook is never removed
 int g_detours_used[kDetourKinds] = {};                         // g_sc_lock
-std::unordered_map<void*, int> g_hooked_functions;             // hooked (or not hookable) function -> instance, -1 not
-                                                                // hookable, -2 hooked by NR Control (g_sc_lock)
+std::unordered_map<void*, int> g_hooked_functions[kDetourKinds];   // per kind: hooked (or not hookable) function ->
+                                                                   // instance, -1 not hookable, -2 hooked by NR
+                                                                   // Control (g_sc_lock)
 
 // FSR frame generation paces its presents by a moving average of the last frames' times (FidelityFX SDK,
 // FrameInterpolationSwapchainDX12.cpp interpolationThread: half the average less its variance), and starts that average
@@ -3658,12 +3774,73 @@ void* detour_of(DetourKind kind, int k) {
 }
 static_assert(kDetoursPerKind == 8, "detour_of lists eight instances");
 
-// The function in `object`'s vtable `slot`, hooked with the next free detour of `kind` (once per function). False when
-// it runs unhooked.
+// What `object`'s vtable `slot` calls: the slot's function, or - when hook_slot pointed the slot at one of the detours
+// above - that detour's original (the class's own function).
+void* slot_function(void* object, int slot) {
+    void* const fn = (*reinterpret_cast<void***>(object))[slot];
+    for (int kind = 0; kind < kDetourKinds; ++kind)
+        for (int k = 0; k < kDetoursPerKind; ++k)
+            if (fn == detour_of(DetourKind(kind), k) && g_detour_original[kind][k]) return g_detour_original[kind][k];
+    return fn;
+}
+
+// The module of `fn` (`name`: its file name in lower case): true for the system's DXGI / Direct3D (or DXVK's /
+// vkd3d-proton's in their place) and for code in no module; never OptiScaler, also when it is installed as dxgi.dll.
+bool system_function(void* fn, HMODULE* owner, std::wstring* name) {
+    *owner = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       static_cast<LPCWSTR>(fn), owner);
+    wchar_t path[MAX_PATH] = {};
+    if (*owner) GetModuleFileNameW(*owner, path, MAX_PATH);
+    *name = path;
+    if (const size_t cut = name->find_last_of(L"\\/"); cut != std::wstring::npos) *name = name->substr(cut + 1);
+    for (wchar_t& c : *name) c = wchar_t(std::towlower(c));
+    if (*owner == g_opti) return false;
+    return !*owner || *name == L"dxgi.dll" || *name == L"d3d11.dll" || *name == L"d3d12.dll" || *name == L"d3d12core.dll" ||
+           *name == L"d3d10core.dll" || *name == L"d3d10_1.dll" || *name == L"d3d10.dll" || name->rfind(L"dxvk", 0) == 0 ||
+           name->rfind(L"vkd3d", 0) == 0;
+}
+
+// One vtable entry pointed at `value`. A class's table is read-only data: made writable for the store, then put back.
+bool write_slot(void** entry, void* value) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(entry, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT) return false;
+    const DWORD prot = mbi.Protect & 0xff;
+    const bool writable = prot == PAGE_READWRITE || prot == PAGE_WRITECOPY || prot == PAGE_EXECUTE_READWRITE ||
+                          prot == PAGE_EXECUTE_WRITECOPY;
+    const bool exec = prot == PAGE_EXECUTE || prot == PAGE_EXECUTE_READ;
+    DWORD was = 0;
+    if (!writable && !VirtualProtect(entry, sizeof(void*), exec ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE, &was))
+        return false;
+    InterlockedExchangePointer(entry, value);
+    if (!writable) VirtualProtect(entry, sizeof(void*), was, &was);
+    return true;
+}
+
+// `object`'s vtable `slot` hooked with the next free detour of `kind` (each function once). False when it runs
+// unhooked. The system's functions are patched in place by MinHook, so every call of one reaches its detour. Any other
+// module's (the game's executable, a frame generator, OptiScaler, another wrapper) only through the slot: its code may be
+// one body shared with unrelated functions (MSVC's /OPT:ICF folds identical ones), and patched in place every caller of
+// that body ran the detour with its arguments taken as the method's - in Black Myth Wukong an audio thread's call through
+// a body its FSR 3 proxy's Present1 shared, its pointers cut to the UINTs of Present1 (0xC0000005).
 bool hook_slot(void* object, int slot, DetourKind kind) {
-    void* fn = (*reinterpret_cast<void***>(object))[slot];
+    void** const entry = *reinterpret_cast<void***>(object) + slot;
     std::lock_guard<std::mutex> guard(g_sc_lock);
-    if (const auto it = g_hooked_functions.find(fn); it != g_hooked_functions.end()) return it->second != -1;
+    void* const fn = *entry;
+    std::unordered_map<void*, int>& hooked = g_hooked_functions[kind];   // (a body folded into two kinds: one detour each)
+    for (int k = 0; k < g_detours_used[kind]; ++k)
+        if (fn == detour_of(kind, k)) return true;   // the slot leads to our detour already (another object of the class)
+    HMODULE owner = nullptr;
+    std::wstring name;
+    const bool in_place = system_function(fn, &owner, &name);
+    if (const auto it = hooked.find(fn); it != hooked.end()) {
+        if (in_place || it->second < 0) return it->second != -1;
+        // the same function in another table (another class's, or an object's own copy): this slot to its detour too
+        if (write_slot(entry, detour_of(kind, it->second))) return true;
+        log("[nr] Present layers: a DXGI function could not be hooked (slot %d, its vtable not writable); they run under "
+            "OptiScaler's Present", slot);
+        return false;
+    }
     if (kind == kDetourPresent || kind == kDetourPresent1) {
         // The system's DXGI's Present (no wrapper between the game and it) is NR Control's to hook (nr_pe_menu.cpp, from
         // its own thread: hooking it here too would race it); its hook calls on_present / on_present11, the same place.
@@ -3671,37 +3848,38 @@ bool hook_slot(void* object, int slot, DetourKind kind) {
         // handed - with OptiScaler's FSR frame generation on, amd_fidelityfx_framegeneration_dx12.dll's, whose Present
         // takes the game's frames and presents them and the generated ones from a thread of its own. Left to the
         // system's Present, the layers ran there on every present, generated ones too, at twice the cost.
-        HMODULE owner = nullptr;
-        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           static_cast<LPCWSTR>(fn), &owner);
-        if (owner != g_opti) {
-            wchar_t path[MAX_PATH] = {};
-            if (owner) GetModuleFileNameW(owner, path, MAX_PATH);
-            std::wstring name = path;
-            if (const size_t cut = name.find_last_of(L"\\/"); cut != std::wstring::npos) name = name.substr(cut + 1);
-            for (wchar_t& c : name) c = wchar_t(std::towlower(c));
-            const bool system = !owner || name == L"dxgi.dll" || name == L"d3d11.dll" || name == L"d3d12.dll" ||
-                                name == L"d3d12core.dll" || name == L"d3d10core.dll" || name == L"d3d10_1.dll" ||
-                                name == L"d3d10.dll" || name.rfind(L"dxvk", 0) == 0 || name.rfind(L"vkd3d", 0) == 0;
-            if (system) {
-                g_hooked_functions[fn] = -2;
-                return true;
-            }
+        if (in_place) {
+            hooked[fn] = -2;
+            return true;
+        }
+        if (owner != g_opti)
             log("[nr] Present layers: the game's swap chain is %s's (frame generation's, or another wrapper's): its "
                 "Present (slot %d) hooked", nr::u8::narrow(name).c_str(), slot);
-        }
     }
     if (g_detours_used[kind] >= kDetoursPerKind) {
-        g_hooked_functions[fn] = -1;
+        hooked[fn] = -1;
         log("[nr] Present layers: more than %d DXGI functions of one kind (slot %d); this one runs unhooked",
             kDetoursPerKind, slot);
         return false;
     }
     const int k = g_detours_used[kind];
+    if (!in_place) {
+        g_detour_original[kind][k] = fn;   // before the slot leads to the detour
+        if (!write_slot(entry, detour_of(kind, k))) {
+            g_detour_original[kind][k] = nullptr;
+            hooked[fn] = -1;
+            log("[nr] Present layers: a DXGI function could not be hooked (slot %d, its vtable not writable); they run "
+                "under OptiScaler's Present", slot);
+            return false;
+        }
+        ++g_detours_used[kind];
+        hooked[fn] = k;
+        return true;
+    }
     const MH_STATUS created = MH_CreateHook(fn, detour_of(kind, k), &g_detour_original[kind][k]);
-    g_hooked_functions[fn] = -1;
+    hooked[fn] = -1;
     if (created == MH_ERROR_ALREADY_CREATED) {   // the system's Present, hooked by NR Control: the same place
-        g_hooked_functions[fn] = -2;
+        hooked[fn] = -2;
         return true;
     }
     if (created != MH_OK) {
@@ -3716,7 +3894,7 @@ bool hook_slot(void* object, int slot, DetourKind kind) {
             slot, MH_StatusToString(e));
         return false;
     }
-    g_hooked_functions[fn] = k;
+    hooked[fn] = k;
     return true;
 }
 
@@ -3798,7 +3976,7 @@ void adopt_swapchain(IUnknown* device, IDXGISwapChain* sc) {
         slot = queue;
     }
     {   // whose Present this is: a frame generator's (fg_library_name) or not; the game's newest chain decides
-        void* fn = (*reinterpret_cast<void***>(sc))[8];
+        void* fn = slot_function(sc, 8);   // (the class's own: the slot may lead to our detour)
         HMODULE owner = nullptr;
         wchar_t path[MAX_PATH] = {};
         if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -4154,7 +4332,7 @@ uint32_t hk_ffx_destroy(void** context, const void* alloc) {
 // fsrfg30 input) hands out its own swap chain, already followed: left alone.
 void fsr3_adopt(Fsr3Call& call, int32_t rc, IDXGISwapChain4** out, ID3D12CommandQueue* queue) {
     if (call.nested || rc != 0 || !out || !*out || !queue) return;
-    void* present = (*reinterpret_cast<void***>(*out))[8];
+    void* present = slot_function(*out, 8);
     if (in_range(g_opti_range, present)) return;
     static int key;   // one FSR 3.0 swap chain at a time
     if (!adopt_fg_proxy(&key, *out, queue, "FSR 3 frame generation")) return;
@@ -4366,7 +4544,7 @@ nr::asi::Wilsjo2Frame wilsjo2_frame(const NVSDK_NGX_Parameter* p, const Frame& f
     w.depth_rect = guide_subrect(f.depth, f.subrect_w, f.subrect_h, get_uint(p, "DLSS.Input.Depth.Subrect.Base.X"),
                                  get_uint(p, "DLSS.Input.Depth.Subrect.Base.Y"));
     w.motion_rect = guide_subrect(f.motion, low_res_mv ? f.subrect_w : f.out_w, low_res_mv ? f.subrect_h : f.out_h,
-                                  get_uint(p, "DLSS.Input.MV.SubrectBase.X"), get_uint(p, "DLSS.Input.MV.SubrectBase.Y"));
+                                  get_uint(p, "DLSS.Input.MV.Subrect.Base.X"), get_uint(p, "DLSS.Input.MV.Subrect.Base.Y"));
     return w;
 }
 
@@ -5176,19 +5354,89 @@ bool is_vulkan_ngx_engine(HMODULE m) {
     const HMODULE client = g_ngx_vk_client.load(std::memory_order_acquire);
     return (client && m == client) || is_rtx_remix_module(m);
 }
-// Whether `address` (a vkCreateDevice caller) is in vkd3d-proton's or DXVK's modules.
+bool is_translator_module(HMODULE m) {
+    // (never OptiScaler - also when it is installed as dxgi.dll - nor this module: their hooks pass others' calls on)
+    if (!m || m == g_opti || m == g_self || is_vulkan_ngx_engine(m)) return false;
+    // by its own file name (GetModuleHandleW of a name finds the first module of that name: OptiScaler's, as dxgi.dll)
+    wchar_t path[MAX_PATH * 4]{};
+    const DWORD len = GetModuleFileNameW(m, path, DWORD(std::size(path)));
+    if (len == 0 || len >= std::size(path)) return false;
+    const wchar_t* base = path;
+    for (const wchar_t* c = path; *c; ++c)
+        if (*c == L'\\' || *c == L'/') base = c + 1;
+    for (const wchar_t* name : {L"d3d12core.dll", L"d3d12.dll", L"d3d11.dll", L"dxgi.dll", L"d3d10core.dll", L"d3d9.dll"})
+        if (_wcsicmp(base, name) == 0) return true;
+    return false;
+}
+// A module whose hooks may sit between a translator and us: this one, OptiScaler, OpenRR.
+bool is_peer_or_wrapper_module(HMODULE m) {
+    if (!m) return false;
+    if (m == g_self || m == g_opti) return true;
+    wchar_t path[MAX_PATH * 4]{};
+    const DWORD len = GetModuleFileNameW(m, path, DWORD(std::size(path)));
+    if (len == 0 || len >= std::size(path)) return false;
+    const wchar_t* base = path;
+    for (const wchar_t* c = path; *c; ++c)
+        if (*c == L'\\' || *c == L'/') base = c + 1;
+    return _wcsnicmp(base, L"openrr-amd", 10) == 0;
+}
+// The Vulkan loader's modules a call passes on its way (vulkan-1.dll, winevulkan.dll; by their own file names): skipped
+// in in_translator's walk.
+bool is_vulkan_loader_module(HMODULE m) {
+    wchar_t path[MAX_PATH * 4]{};
+    const DWORD len = m ? GetModuleFileNameW(m, path, DWORD(std::size(path))) : 0;
+    if (len == 0 || len >= std::size(path)) return false;
+    const wchar_t* base = path;
+    for (const wchar_t* c = path; *c; ++c)
+        if (*c == L'\\' || *c == L'/') base = c + 1;
+    return _wcsicmp(base, L"vulkan-1.dll") == 0 || _wcsicmp(base, L"winevulkan.dll") == 0;
+}
+// Whether `address` (a vkCreateDevice caller) is in vkd3d-proton's or DXVK's modules. A call can come through OptiScaler's
+// hook (it hands out its vkCreateDevice through vkGetInstanceProcAddr and passes the game's call on - it makes no device
+// of its own), OpenRR's or ours: then the first caller up the stack that is none of those, nor the Vulkan loader, decides.
 bool in_translator(void* address) {
     HMODULE m = nullptr;
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                             reinterpret_cast<LPCWSTR>(address), &m) || !m)
         return false;
-    if (is_vulkan_ngx_engine(m)) return false;
-    for (const wchar_t* name : {L"d3d12core.dll", L"d3d12.dll", L"d3d11.dll", L"dxgi.dll", L"d3d10core.dll", L"d3d9.dll"})
-        if (HMODULE t = GetModuleHandleW(name); t && t == m) return true;
+    if (is_translator_module(m)) return true;
+    if (!is_peer_or_wrapper_module(m) && !is_vulkan_loader_module(m)) return false;
+    void* frames[16]{};
+    const USHORT count = RtlCaptureStackBackTrace(1, 16, frames, nullptr);
+    for (USHORT i = 0; i < count; ++i) {
+        HMODULE fm = nullptr;
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                reinterpret_cast<LPCWSTR>(frames[i]), &fm) || !fm)
+            continue;
+        if (is_peer_or_wrapper_module(fm) || is_vulkan_loader_module(fm)) continue;
+        return is_translator_module(fm);
+    }
     return false;
 }
 std::mutex g_devices_lock;
 std::vector<SeenDevice> g_devices;                       // the devices made, oldest first
+// OpenRR's own Vulkan instances (application name "openrr...", as OpenRR itself tells its own from the game's), their
+// physical devices and devices: not the game's - no extensions added, not recorded, their queues not either, nothing
+// of NR's on them (g_devices_lock; g_internal_any: one was ever made).
+std::unordered_set<VkInstance> g_internal_instances;
+std::unordered_map<VkPhysicalDevice, VkInstance> g_internal_physical_instance;
+std::unordered_map<VkInstance, PFN_vkCreateDevice> g_internal_create_device_procs;
+std::unordered_set<VkDevice> g_internal_devices;
+std::atomic<bool> g_internal_any{false};
+bool is_internal_vk_app(const VkInstanceCreateInfo* ci) {
+    return ci && ci->pApplicationInfo && ci->pApplicationInfo->pApplicationName &&
+           _strnicmp(ci->pApplicationInfo->pApplicationName, "openrr", 6) == 0;
+}
+bool is_internal_vk_instance(VkInstance instance) {
+    if (!instance || !g_internal_any.load(std::memory_order_acquire)) return false;
+    std::lock_guard<std::mutex> guard(g_devices_lock);
+    return g_internal_instances.count(instance) != 0;
+}
+bool is_internal_vk_device(VkDevice device) {
+    if (!device || !g_internal_any.load(std::memory_order_acquire)) return false;
+    std::lock_guard<std::mutex> guard(g_devices_lock);
+    return g_internal_devices.count(device) != 0;
+}
 // The device NGX's Vulkan init was given (OptiScaler's NVSDK_NGX_VULKAN_Init forms): the device of a game
 // whose vkCreateDevice ran before this module was loaded (0.0.7 took its device from there) - g_devices_lock
 SeenDevice g_ngx_vk;
@@ -5260,6 +5508,24 @@ VkResult create_device(PFN_vkCreateDevice create, VkInstance instance, VkPhysica
                        const VkAllocationCallbacks* a, VkDevice* out, void* caller) {
     nr::pe::watchdog::Phase phase("the game's vkCreateDevice (int4 extensions)");
     struct Inside { Inside() { ++t_in_create; } ~Inside() { --t_in_create; } } inside;
+    if (g_internal_any.load(std::memory_order_acquire)) {   // OpenRR's own device: passed straight through, kept apart
+        bool internal = false;
+        {
+            std::lock_guard<std::mutex> guard(g_devices_lock);
+            internal = (instance && g_internal_instances.count(instance) != 0) ||
+                       (phys && g_internal_physical_instance.count(phys) != 0);
+        }
+        if (internal) {
+            const VkResult r = create(phys, ci, a, out);
+            if (r == VK_SUCCESS && out && *out) {
+                std::lock_guard<std::mutex> guard(g_devices_lock);
+                g_internal_devices.insert(*out);
+            }
+            static std::atomic<bool> said{false};
+            if (!said.exchange(true)) log("[nr] OpenRR's own vkCreateDevice: passed through as it is (not the game's device)");
+            return r;
+        }
+    }
     VkDeviceCreateInfo patched = *ci;
     std::unique_ptr<nr::DeviceFeatures> features;
     std::vector<const char*> ext;
@@ -5317,6 +5583,8 @@ VkResult create_device(PFN_vkCreateDevice create, VkInstance instance, VkPhysica
         d.physical = phys;
         d.device = *out;
         d.translator = in_translator(caller);
+        log("[nr] the game's vkCreateDevice: %s", d.translator ? "a D3D translator's device (vkd3d-proton / DXVK)"
+                                                               : "a device of the game's own");
         bool maintenance = false;
         for (uint32_t i = 0; i < patched.enabledExtensionCount; ++i)
             maintenance |= !std::strcmp(patched.ppEnabledExtensionNames[i], VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME) ||
@@ -5331,6 +5599,7 @@ VkResult create_device(PFN_vkCreateDevice create, VkInstance instance, VkPhysica
         }
         nr::asi::hudcap::vk_device(*out, d.translator);   // HUD FIX's capture: its creations followed (not a translator's)
         std::lock_guard<std::mutex> guard(g_devices_lock);
+        g_internal_devices.erase(*out);   // (a handle one of OpenRR's devices had)
         // the instance that listed this physical device (vkEnumeratePhysicalDevices), else the one the wrapped
         // vkGetInstanceProcAddr was last asked of
         const auto it = g_physical_instance.find(phys);
@@ -5349,6 +5618,63 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_export_create_device(VkPhysicalDevice phys, co
     if (t_in_create) return real_export_create(phys, ci, a, out);
     return create_device(real_export_create, VK_NULL_HANDLE, phys, ci, a, out, __builtin_return_address(0));
 }
+// vkCreateDevice as an OpenRR instance's vkGetInstanceProcAddr hands it out (hk_gipa): straight on, the device kept apart.
+VKAPI_ATTR VkResult VKAPI_CALL hk_internal_create_device(VkPhysicalDevice phys, const VkDeviceCreateInfo* ci,
+                                                         const VkAllocationCallbacks* a, VkDevice* out) {
+    PFN_vkCreateDevice next = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(g_devices_lock);
+        if (phys)
+            if (const auto pit = g_internal_physical_instance.find(phys); pit != g_internal_physical_instance.end())
+                if (const auto cit = g_internal_create_device_procs.find(pit->second); cit != g_internal_create_device_procs.end())
+                    next = cit->second;
+        if (!next && g_internal_create_device_procs.size() == 1) next = g_internal_create_device_procs.begin()->second;
+    }
+    if (!next) next = real_export_create;
+    if (!next) return VK_ERROR_INITIALIZATION_FAILED;
+    struct Inside { Inside() { ++t_in_create; } ~Inside() { --t_in_create; } } inside;
+    const VkResult r = next(phys, ci, a, out);
+    if (r == VK_SUCCESS && out && *out) {
+        std::lock_guard<std::mutex> guard(g_devices_lock);
+        g_internal_devices.insert(*out);
+    }
+    return r;
+}
+// winevulkan's vkCreateInstance / vkDestroyInstance (exports, detoured beside vkCreateDevice): passed straight through;
+// only OpenRR's instances (by their name) are noted, and dropped when they go - nothing else is recorded.
+PFN_vkCreateInstance real_export_create_instance = nullptr;
+PFN_vkDestroyInstance real_export_destroy_instance = nullptr;
+VKAPI_ATTR VkResult VKAPI_CALL hk_export_create_instance(const VkInstanceCreateInfo* ci, const VkAllocationCallbacks* a,
+                                                         VkInstance* out) {
+    const VkResult r = real_export_create_instance(ci, a, out);
+    if (r == VK_SUCCESS && out && *out && is_internal_vk_app(ci)) {
+        {
+            std::lock_guard<std::mutex> guard(g_devices_lock);
+            g_internal_instances.insert(*out);
+            g_internal_any.store(true, std::memory_order_release);
+        }
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true))
+            log("[nr] OpenRR's own Vulkan instance (%s): kept apart - its devices are not the game's",
+                ci->pApplicationInfo->pApplicationName);
+    } else if (r == VK_SUCCESS && out && *out && g_internal_any.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> guard(g_devices_lock);
+        g_internal_instances.erase(*out);   // (a handle one of OpenRR's had)
+    }
+    return r;
+}
+VKAPI_ATTR void VKAPI_CALL hk_export_destroy_instance(VkInstance instance, const VkAllocationCallbacks* a) {
+    if (instance && g_internal_any.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> guard(g_devices_lock);
+        if (g_internal_instances.erase(instance)) {
+            g_internal_create_device_procs.erase(instance);
+            for (auto it = g_internal_physical_instance.begin(); it != g_internal_physical_instance.end();)
+                if (it->second == instance) it = g_internal_physical_instance.erase(it);
+                else ++it;
+        }
+    }
+    real_export_destroy_instance(instance, a);
+}
 // The game's vkDestroyDevice (winevulkan's export, detoured beside vkCreateDevice): the device leaves the record, and
 // when NR's Vulkan route runs on it everything of ours on it goes first, while it is still there (vk_route_teardown).
 void vk_route_teardown(VkDevice device);
@@ -5357,6 +5683,18 @@ PFN_vkDestroyDevice real_destroy_device = nullptr;
 bool g_destroy_hooked = false;
 void forget_queues(VkDevice device);   // the game's queue records (below, with their hooks)
 VKAPI_ATTR void VKAPI_CALL hk_destroy_device(VkDevice device, const VkAllocationCallbacks* a) {
+    if (device && g_internal_any.load(std::memory_order_acquire)) {   // OpenRR's own device: nothing of NR's was on it
+        bool internal = false;
+        {
+            std::lock_guard<std::mutex> guard(g_devices_lock);
+            internal = g_internal_devices.erase(device) != 0;
+        }
+        if (internal) {
+            nr::pe::vkdevice::forget_device(device);   // (as the Windows .asi: the ReShade route's records of it too)
+            real_destroy_device(device, a);
+            return;
+        }
+    }
     if (device) {
         nr::pe::menu::vulkan_forget(device);
         vk_route_teardown(device);
@@ -5374,13 +5712,28 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_enumerate_physical(VkInstance instance, uint32
     const VkResult r = real_enumerate_physical(instance, n, list);
     if ((r == VK_SUCCESS || r == VK_INCOMPLETE) && list && n) {
         std::lock_guard<std::mutex> guard(g_devices_lock);
-        for (uint32_t i = 0; i < *n; ++i) g_physical_instance[list[i]] = instance;
+        if (g_internal_any.load(std::memory_order_acquire) && g_internal_instances.count(instance)) {   // OpenRR's
+            for (uint32_t i = 0; i < *n; ++i) g_internal_physical_instance[list[i]] = instance;
+            return r;
+        }
+        for (uint32_t i = 0; i < *n; ++i) {
+            g_physical_instance[list[i]] = instance;
+            if (!g_internal_physical_instance.empty()) g_internal_physical_instance.erase(list[i]);   // (a handle OpenRR's had)
+        }
     }
     return r;
 }
 
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL hk_gipa(VkInstance instance, const char* name) {
     const PFN_vkVoidFunction f = real_gipa(instance, name);
+    if (f && name && !std::strcmp(name, "vkCreateDevice") && is_internal_vk_instance(instance)) {   // OpenRR's
+        if (f == reinterpret_cast<PFN_vkVoidFunction>(&hk_internal_create_device)) return f;
+        {
+            std::lock_guard<std::mutex> guard(g_devices_lock);
+            g_internal_create_device_procs[instance] = reinterpret_cast<PFN_vkCreateDevice>(f);
+        }
+        return reinterpret_cast<PFN_vkVoidFunction>(&hk_internal_create_device);
+    }
     if (f && name && !std::strcmp(name, "vkCreateDevice")) {
         g_next_create_device.store(reinterpret_cast<PFN_vkCreateDevice>(f));
         if (instance) g_create_instance.store(instance);
@@ -5418,11 +5771,11 @@ void forget_queues(VkDevice device) {
 }
 VKAPI_ATTR void VKAPI_CALL hk_get_queue(VkDevice device, uint32_t family, uint32_t index, VkQueue* out) {
     real_get_queue(device, family, index, out);
-    if (out) record_queue(device, *out, family);
+    if (out && !is_internal_vk_device(device)) record_queue(device, *out, family);
 }
 VKAPI_ATTR void VKAPI_CALL hk_get_queue2(VkDevice device, const VkDeviceQueueInfo2* info, VkQueue* out) {
     real_get_queue2(device, info, out);
-    if (out && info) record_queue(device, *out, info->queueFamilyIndex);
+    if (out && info && !is_internal_vk_device(device)) record_queue(device, *out, info->queueFamilyIndex);
 }
 
 void hook_device_creation() {
@@ -5442,6 +5795,13 @@ void hook_device_creation() {
         MH_EnableHook(gipa) != MH_OK)
         log("[nr] winevulkan.dll's vkGetInstanceProcAddr could not be hooked: the int4 network's device extensions are "
             "not added");
+    // OpenRR's own instances (by name; passed straight through)
+    for (auto [name, detour, real] : {std::tuple{"vkCreateInstance", reinterpret_cast<void*>(&hk_export_create_instance), reinterpret_cast<void**>(&real_export_create_instance)},
+                                      std::tuple{"vkDestroyInstance", reinterpret_cast<void*>(&hk_export_destroy_instance), reinterpret_cast<void**>(&real_export_destroy_instance)}}) {
+        void* fn = reinterpret_cast<void*>(GetProcAddress(m, name));
+        if (!fn || MH_CreateHook(fn, detour, real) != MH_OK || MH_EnableHook(fn) != MH_OK)
+            log("[nr] winevulkan.dll's %s could not be hooked: OpenRR's own Vulkan devices are not told from the game's", name);
+    }
     void* create = reinterpret_cast<void*>(GetProcAddress(m, "vkCreateDevice"));
     void* enumerate = reinterpret_cast<void*>(GetProcAddress(m, "vkEnumeratePhysicalDevices"));
     void* destroy = reinterpret_cast<void*>(GetProcAddress(m, "vkDestroyDevice"));
@@ -5975,7 +6335,8 @@ bool vk_route_ready(VkDevice wanted) {
         const bool unseen = test_device_unseen();
         for (auto it = g_devices.rbegin(); !unseen && it != g_devices.rend() && !g_vk.dev.device; ++it)
             if (wanted ? it->device == wanted : !it->translator) g_vk.dev = *it;
-        if (!unseen && !g_vk.dev.device && !wanted && !g_devices.empty()) g_vk.dev = g_devices.back();
+        // (none of the game's own: the device NGX's Vulkan init was given, below, before the newest of any)
+        if (!unseen && !g_vk.dev.device && !wanted && !g_devices.empty() && !g_ngx_vk.device) g_vk.dev = g_devices.back();
         // its creation not seen (this module loaded after it): the device NGX's Vulkan init was given, its queue the
         // first of a graphics family (the game's queues are not known: the one nearly every game makes)
         if (!g_vk.dev.device && g_ngx_vk.device && (!wanted || wanted == g_ngx_vk.device)) {
@@ -6185,33 +6546,34 @@ void vk_route_teardown(VkDevice device) {
     g_vk = VkRoute{};   // a later Vulkan evaluate may start the route on the game's next device
 }
 
-void vk_track(NVSDK_NGX_Handle** out, NVSDK_NGX_Feature feature, NVSDK_NGX_Parameter* p, VkDevice device) {
+void vk_track(NVSDK_NGX_Handle** out, NVSDK_NGX_Feature feature, NVSDK_NGX_Parameter* p, VkDevice device,
+              CreateBlock block) {
+    create_block_after(block, p);
     std::lock_guard<std::mutex> guard(g_lock);
     VkTracked& t = g_vk_features[(*out)->Id];
     vk_forget(t);
     t = VkTracked{};
     t.feature = int(feature);
     t.device = device;
-    t.create = create_sizes(p);
+    t.create = block.sizes;
     if (device) g_vk_created_on = device;
-    int flags = 0;
-    if (p && p->Get("DLSS.Feature.Create.Flags", &flags) == NVSDK_NGX_Result_Success) {
-        t.flags = uint32_t(flags);
-        t.flags_known = true;
-    }
+    t.flags = block.flags;
+    t.flags_known = block.flags_known;
     log("[nr] OptiScaler Vulkan feature %u made: NGX feature %d, flags 0x%x%s", (*out)->Id, int(feature), t.flags,
         t.flags_known ? "" : " (not given)");
 }
 NVSDK_NGX_Result NR_NGX_MSABI hk_vk_create1(VkDevice dev, VkCommandBuffer cmd, NVSDK_NGX_Feature feature,
                                            NVSDK_NGX_Parameter* p, NVSDK_NGX_Handle** out) {
+    const CreateBlock block = create_block_before(p);
     const NVSDK_NGX_Result r = real_vk_create1(dev, cmd, feature, p, out);
-    if (r == NVSDK_NGX_Result_Success && out && *out) vk_track(out, feature, p, dev);
+    if (r == NVSDK_NGX_Result_Success && out && *out) vk_track(out, feature, p, dev, block);
     return r;
 }
 NVSDK_NGX_Result NR_NGX_MSABI hk_vk_create(VkCommandBuffer cmd, NVSDK_NGX_Feature feature, NVSDK_NGX_Parameter* p,
                                           NVSDK_NGX_Handle** out) {
+    const CreateBlock block = create_block_before(p);
     const NVSDK_NGX_Result r = real_vk_create(cmd, feature, p, out);
-    if (r == NVSDK_NGX_Result_Success && out && *out) vk_track(out, feature, p, VK_NULL_HANDLE);
+    if (r == NVSDK_NGX_Result_Success && out && *out) vk_track(out, feature, p, VK_NULL_HANDLE, block);
     return r;
 }
 NVSDK_NGX_Result NR_NGX_MSABI hk_vk_release(NVSDK_NGX_Handle* h) {
@@ -6338,14 +6700,12 @@ bool read_frame_dims(const NVSDK_NGX_Parameter* p, VkFrame& f, const CreateSizes
     const auto& oi = f.output->Resource.ImageViewInfo;
     f.render_w = f.subrect_w = get_uint(p, "DLSS.Render.Subrect.Dimensions.Width");
     f.render_h = f.subrect_h = get_uint(p, "DLSS.Render.Subrect.Dimensions.Height");
-    if (!f.render_w || !f.render_h) {   // as read_frame: the evaluate's, the create block's, the colour's
-        f.render_w = get_uint(p, "Width", create.in_w ? create.in_w : ci.Width);
-        f.render_h = get_uint(p, "Height", create.in_h ? create.in_h : ci.Height);
-    }
+    if (!f.render_w || !f.render_h)   // as read_frame
+        evaluate_render_size(p, create, ci.Width, ci.Height, &f.render_w, &f.render_h);
     f.color_x = get_uint(p, "DLSS.Input.Color.Subrect.Base.X");
     f.color_y = get_uint(p, "DLSS.Input.Color.Subrect.Base.Y");
-    f.out_x = get_uint(p, "DLSS.Output.Subrect.Base.X");
-    f.out_y = get_uint(p, "DLSS.Output.Subrect.Base.Y");
+    f.out_x = create.out_subrects != 0 ? get_uint(p, "DLSS.Output.Subrect.Base.X") : 0;   // (as read_frame)
+    f.out_y = create.out_subrects != 0 ? get_uint(p, "DLSS.Output.Subrect.Base.Y") : 0;
     output_size(p, create, oi.Width, oi.Height, &f.out_w, &f.out_h);
     if (!f.out_w || !f.out_h) { f.out_w = oi.Width; f.out_h = oi.Height; }
     if (f.out_x >= oi.Width || f.out_y >= oi.Height) { f.out_x = f.out_y = 0; }
@@ -6354,7 +6714,7 @@ bool read_frame_dims(const NVSDK_NGX_Parameter* p, VkFrame& f, const CreateSizes
     f.depth_rect = {get_uint(p, "DLSS.Input.Depth.Subrect.Base.X"), get_uint(p, "DLSS.Input.Depth.Subrect.Base.Y"), f.render_w,
                     f.render_h};
     const bool low_res_mv = !f.flags_known || (f.flags & kFlagMvLowRes) != 0;
-    f.motion_rect = {get_uint(p, "DLSS.Input.MV.SubrectBase.X"), get_uint(p, "DLSS.Input.MV.SubrectBase.Y"),
+    f.motion_rect = {get_uint(p, "DLSS.Input.MV.Subrect.Base.X"), get_uint(p, "DLSS.Input.MV.Subrect.Base.Y"),
                      low_res_mv ? f.render_w : f.out_w, low_res_mv ? f.render_h : f.out_h};
     if (!low_res_mv && f.motion) {   // display-size vectors declared that the image cannot hold: the part it holds (0.0.7's)
         const auto& mi = f.motion->Resource.ImageViewInfo;
@@ -6454,7 +6814,7 @@ nr::asi::Wilsjo2VkFrame wilsjo2_vk_frame(const NVSDK_NGX_Parameter* p, const VkF
     w.depth_rect = vk_guide_subrect(f.depth, f.subrect_w, f.subrect_h, get_uint(p, "DLSS.Input.Depth.Subrect.Base.X"),
                                     get_uint(p, "DLSS.Input.Depth.Subrect.Base.Y"));
     w.motion_rect = vk_guide_subrect(f.motion, low_res_mv ? f.subrect_w : f.out_w, low_res_mv ? f.subrect_h : f.out_h,
-                                     get_uint(p, "DLSS.Input.MV.SubrectBase.X"), get_uint(p, "DLSS.Input.MV.SubrectBase.Y"));
+                                     get_uint(p, "DLSS.Input.MV.Subrect.Base.X"), get_uint(p, "DLSS.Input.MV.Subrect.Base.Y"));
     return w;
 }
 // As wilsjo2_before_ok: the colour at origin 0 and a valid active extent (`aw` x `ah`).
@@ -9333,19 +9693,18 @@ void d11_present_layers(IDXGISwapChain* sc, ID3D11Device* device) {
 
 NVSDK_NGX_Result NR_NGX_MSABI hk_d11_create(ID3D11DeviceContext* ctx, NVSDK_NGX_Feature feature, NVSDK_NGX_Parameter* p,
                                            NVSDK_NGX_Handle** out) {
+    CreateBlock block = create_block_before(p);
     const NVSDK_NGX_Result r = real_d11_create(ctx, feature, p, out);
     if (r == NVSDK_NGX_Result_Success && out && *out) {
+        create_block_after(block, p);
         std::lock_guard<std::mutex> guard(g_lock);
         D11Tracked& t = g_d11_features[(*out)->Id];
         d11_forget(t);
         t = D11Tracked{};
         t.vk.feature = int(feature);
-        t.vk.create = create_sizes(p);
-        int flags = 0;
-        if (p && p->Get("DLSS.Feature.Create.Flags", &flags) == NVSDK_NGX_Result_Success) {
-            t.vk.flags = uint32_t(flags);
-            t.vk.flags_known = true;
-        }
+        t.vk.create = block.sizes;
+        t.vk.flags = block.flags;
+        t.vk.flags_known = block.flags_known;
         log("[nr] OptiScaler D3D11 feature %u made: NGX feature %d, flags 0x%x%s", (*out)->Id, int(feature), t.vk.flags,
             t.vk.flags_known ? "" : " (not given)");
     }

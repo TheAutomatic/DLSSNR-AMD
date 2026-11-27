@@ -67,7 +67,11 @@ void write_dump(EXCEPTION_POINTERS* ep) {
                                      MiniDumpWithUnloadedModules),
                        &info, nullptr, nullptr);
     CloseHandle(f);
-    log("[nr]   minidump %s: %s", path, ok ? "written" : "FAILED");
+    // the path in UTF-8 for the log (%ls would go through the C runtime's locale: a CJK user or folder name garbled or
+    // cut); into a buffer of the module's own, not the stack (written once: `dumped` / dump_state)
+    static char shown[MAX_PATH * 6];
+    if (!WideCharToMultiByte(CP_UTF8, 0, path, -1, shown, int(sizeof shown), nullptr, nullptr)) std::strcpy(shown, "?");
+    log("[nr]   minidump %s: %s", shown, ok ? "written" : "FAILED");
 }
 
 LONG CALLBACK on_exception(EXCEPTION_POINTERS* ep) {

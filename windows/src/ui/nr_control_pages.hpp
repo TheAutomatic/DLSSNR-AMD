@@ -14,9 +14,11 @@
 #include "nr_ini_network.hpp"
 #include "nr_pe_events.hpp"
 #include "nr_pe_diag.hpp"
+#include "nr_path_win.hpp"
 #include "nr_pe_stats.hpp"
 
 #include <windows.h>
+#include <shellapi.h>
 
 #include <algorithm>
 #include <cctype>
@@ -26,6 +28,7 @@
 #include <functional>
 #include <map>
 #include <string>
+#include <cwchar>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -372,10 +375,10 @@ inline void draw_diag_package(const std::function<nr::pe::diag::Request()>& make
     ImGui::EndDisabled();
     ImGui::SameLine();
     ImGui::Checkbox(tr("with a screenshot pair"), &shots);
-    help("One zip in the game's folder (dlssnr-amd-diag-<date>-<time>.zip) to attach to a bug report: the report "
-         "below with this session's run statistics, the versions and checksums of the installed programs, the system "
-         "(Windows or Wine, the GPU and its driver), every log and settings file in the game's folder and a crash "
-         "dump if there is one. Ticked: also the before / after screenshot pair of the current frame. It holds the "
+    help("One zip in the game's folder (dlssnr-amd-diag-<date>-<time>.zip; in NR's folder in Documents when the game's "
+         "folder cannot be written) to attach to a bug report: the report below with this session's run statistics, the "
+         "versions and checksums of the installed programs, the system (Windows or Wine, the GPU and its driver), every "
+         "log and settings file in the game's folder (and in NR's folder in Documents) and a crash dump if there is one. Ticked: also the before / after screenshot pair of the current frame. It holds the "
          "game's folder path and the system's description; it stays on this computer, nothing is sent anywhere.");
     const std::string said = nr::pe::diag::said();
     if (!said.empty()) text_dim_wrapped("%s", tr_text(said).c_str());
@@ -912,6 +915,57 @@ inline std::string report_text(const nr::control::Shared* s, const char* module,
     t += "\ndlssnr-amd.log (last lines):\n" + file_text(log, 80);
     return t;
 }
+// ---- NR's own files when the game's folder cannot be written (nr::u8::writable_folder) ----
+// Diagnostics: where they are (Documents\DLSSNR-AMD\<game>), with a button that opens the folder; nowhere writable:
+// said in red. Nothing when the game's folder can be written.
+// (Explorer from a thread of its own: the frame does not wait for it. The thread holds this module - the ReShade add-on
+// may be unloaded meanwhile - by a reference open_folder takes and the thread gives back as it ends.)
+inline DWORD WINAPI open_folder_thread(void* arg) {
+    wchar_t* w = static_cast<wchar_t*>(arg);
+    const HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    ShellExecuteW(nullptr, L"open", w, nullptr, nullptr, SW_SHOWNORMAL);
+    if (SUCCEEDED(co)) CoUninitialize();
+    delete[] w;
+    HMODULE self = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCWSTR>(&open_folder_thread), &self);
+    FreeLibraryAndExitThread(self, 0);
+}
+inline void open_folder(const std::string& path) {
+    HMODULE self = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, reinterpret_cast<LPCWSTR>(&open_folder_thread), &self))
+        return;
+    const std::wstring w = nr::u8::wide(path);
+    wchar_t* copy = new wchar_t[w.size() + 1];
+    std::wcscpy(copy, w.c_str());
+    if (const HANDLE h = CreateThread(nullptr, 0, &open_folder_thread, copy, 0, nullptr)) {
+        CloseHandle(h);
+    } else {
+        delete[] copy;
+        FreeLibrary(self);
+    }
+}
+inline void draw_files_place(const std::string& game) {
+    const nr::u8::WritableFolder& w = nr::u8::writable_folder_of(game);
+    if (w.moved) {
+        text_dim_wrapped("This game's folder cannot be written: NR's files (dlssnr-amd.ini, the log, NR Screenshots) are in %s",
+                         w.path.c_str());
+        if (ImGui::Button(tr("Open the folder"))) open_folder(w.path);
+    } else if (w.refused) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.f, 0.45f, 0.4f, 1.f));
+        ImGui::TextWrapped("%s", tr("This game's folder cannot be written, nor a folder in Documents: settings, screenshots "
+                                    "and caches are not saved."));
+        ImGui::PopStyleColor();
+    }
+}
+// The last save of dlssnr-amd.ini failed (nr::ini_edit::Ini::save_error): the change made here was not kept.
+inline void draw_save_error(uint32_t error) {
+    if (!error) return;
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.f, 0.45f, 0.4f, 1.f));
+    ImGui::TextWrapped(tr("Settings not saved: dlssnr-amd.ini cannot be written (error %lu)."), static_cast<unsigned long>(error));
+    ImGui::PopStyleColor();
+}
+
 // The report copied to the clipboard and saved as `path`; what happened, in a line.
 inline std::string copy_report(const std::string& text, const std::string& path) {
     bool saved = false;
@@ -1065,7 +1119,7 @@ inline void draw_hotkeys(nr::ini_edit::Ini& ini, nr::ini_edit::KeyValues& renodx
                        "run only, never written to the file."), true});
     rows.push_back({tr("Screenshot"), "RenoDX", "NRScreenshotKey", "F5",
                     tr("[RenoDX] NRScreenshotKey. The same frame without and with NR, into NR Screenshots in the game's "
-                       "folder."), true});
+                       "folder (in NR's folder in Documents when the game's folder cannot be written)."), true});
     rows.push_back({tr("Preprocess on / off (this run)"), "Preprocess", "Hotkey", "Ctrl+F10",
                     tr("[Preprocess] Hotkey. The whole preprocess off or on for this run, never written to the file.")});
     rows.push_back({tr("Next network"), "Network", "Hotkey", "Ctrl+F11",
@@ -1754,7 +1808,8 @@ inline void draw_preprocess(nr::ini_edit::Ini& ini) {
 inline void draw_log(nr::ini_edit::Ini& ini) {
     if (!section("Log")) return;
     ini_flag(ini, "Write the log", "Log", "Enabled", "1",
-             "[Log] Enabled. dlssnr-amd.log in the game's folder. Takes effect after a restart.");
+             "[Log] Enabled. dlssnr-amd.log in the game's folder (in NR's folder in Documents when the game's folder "
+             "cannot be written). Takes effect after a restart.");
     ini_flag(ini, "Clear on start", "Log", "ClearOnStart", "1",
              "[Log] ClearOnStart. On: each start of the game begins a new log; off: appends to the last one. "
              "Takes effect after a restart.");

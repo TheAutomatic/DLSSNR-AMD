@@ -128,12 +128,24 @@ class Ini {
     void save() {
         if (!dirty_) return;
         const auto tmp = path_.wstring() + L".nrcontrol";
+        bool wrote = false;
+        DWORD error = 0;
         {
             std::ofstream f(std::filesystem::path(tmp), std::ios::trunc | std::ios::binary);
             for (const auto& l : lines_) f << l << "\r\n";
+            f.flush();
+            wrote = f.is_open() && f.good();
+            if (!wrote) error = GetLastError();
         }
-        if (!MoveFileExW(tmp.c_str(), path_.wstring().c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
-            nr::pe::log("[nr] NR Control: could not save dlssnr-amd.ini (error %lu)", GetLastError());
+        if (!wrote) {   // (a folder that cannot be written: NR Control says so, save_error)
+            nr::pe::log("[nr] NR Control: could not save dlssnr-amd.ini (its temporary file: error %lu)", error);
+            DeleteFileW(tmp.c_str());
+        } else if (!MoveFileExW(tmp.c_str(), path_.wstring().c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            error = GetLastError();
+            nr::pe::log("[nr] NR Control: could not save dlssnr-amd.ini (error %lu)", error);
+            DeleteFileW(tmp.c_str());
+        }
+        save_error_ = wrote && !error ? 0 : (error ? uint32_t(error) : 1u);
         dirty_ = false;
         nr::pe::touch_config();   // the DLL takes it at its next look, now
         std::error_code ec;
@@ -141,7 +153,11 @@ class Ini {
         if (!ec) stamp_ = int64_t(t.time_since_epoch().count());
     }
 
+    // The last save's Windows error (0: saved): NR Control shows it - the settings changed were not kept.
+    uint32_t save_error() const { return save_error_; }
+
   private:
+    uint32_t save_error_ = 0;
     static std::string trim(std::string s) {
         const auto a = s.find_first_not_of(" \t\r\n");
         const auto b = s.find_last_not_of(" \t\r\n");

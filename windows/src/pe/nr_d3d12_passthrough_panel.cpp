@@ -11,13 +11,22 @@ using nr::lang::tr;
 
 namespace {
 int g_written = -1;   // what the checkbox wrote this run (takes effect at the next launch)
+uint32_t g_error = 0;  // its last write's error (0: written)
 }
 
 void draw_network() {
     const Status s = status();
     if (!nr::control_ui::section("D3D12 passthrough (experimental)")) return;
     bool on = g_written >= 0 ? g_written == 1 : s.enabled;
-    if (ImGui::Checkbox(tr("D3D12 passthrough (next launch)"), &on)) { set_enabled(on); g_written = on ? 1 : 0; }
+    if (ImGui::Checkbox(tr("D3D12 passthrough (next launch)"), &on)) {
+        g_error = set_enabled(on);
+        if (!g_error) g_written = on ? 1 : 0;   // (not written: the checkbox shows the file's value again)
+    }
+    if (g_error) {   // (as NR Control's other settings say it)
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.f, 0.45f, 0.4f, 1.f));
+        ImGui::TextWrapped(tr("Settings not saved: dlssnr-amd.ini cannot be written (error %lu)."), static_cast<unsigned long>(g_error));
+        ImGui::PopStyleColor();
+    }
     nr::control_ui::help("On the OptiScaler route in D3D12 games on RDNA4, RDNA3 or RDNA3.5: NR's network runs on the game's "
                          "own D3D12 device instead of through the Vulkan bridge. A game it cannot serve uses the bridge.");
     // (its state - the check, the frames on the device or through the bridge - is on the Diagnostics page)

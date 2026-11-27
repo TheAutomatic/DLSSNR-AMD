@@ -138,12 +138,16 @@ After installation the game folder has
 plus the route's own files: on the OptiScaler route dxgi.dll (that is OptiScaler.dll), OptiScaler.ini
 and OptiScaler/ (the NR plugin is OptiScaler/plugins/dlssnr-amd.asi, OptiScaler's licences are in
 OptiScaler/Licenses/); on the ReShade routes ReShade's DLL, ini files and shaders.
+Files of the same name already in the game folder are first moved to dlssnr-amd-backup/ and put
+back on uninstall. Other OptiScaler plugins in OptiScaler/plugins/ (OpenRR's, for example) stay
+where they are.
 Screenshots of the RenoDX style go to NR Screenshots/ (made at the first screenshot, not removed by
 uninstall).
 
 Installing again (another route, another package) first uninstalls by
 the installation record, and dlssnr-amd.ini is replaced by a fresh default file: earlier settings are
-not kept, back the file up if you need them.
+not kept, back the file up if you need them. To go back to an earlier package, uninstall with this one
+first (remove), then install the earlier one.
 
 Use
 ---
@@ -408,5 +412,5 @@ Uninstall
     bash install.sh "/path/to/<game folder>" remove
 
 Only the files in the installation record are deleted (dlssnr-amd.ini and the logs included). A file
-of the game folder that the installation overwrote (for example another mod's dxgi.dll) is not
-brought back.
+of the game folder that the installation replaced (for example another mod's dxgi.dll) is put back
+from dlssnr-amd-backup/.

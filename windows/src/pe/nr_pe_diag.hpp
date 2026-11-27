@@ -7,6 +7,7 @@
 // screenshot pair F5 takes of the current frame. Written on a thread of its own (the game keeps running); stored, not
 // compressed (no compression library in the program; a zip tool shrinks it further). Nothing is sent anywhere.
 #include "nr_path_u8.hpp"
+#include "nr_path_win.hpp"
 #include "nr_pe_log.hpp"
 
 #include <windows.h>
@@ -266,7 +267,11 @@ inline bool start(Request r) {
             char stamp[32];
             std::snprintf(stamp, sizeof stamp, "%04u%02u%02u-%02u%02u%02u", now.wYear, now.wMonth, now.wDay, now.wHour,
                           now.wMinute, now.wSecond);
-            const std::filesystem::path out = r.game / (std::string("dlssnr-amd-diag-") + stamp + ".zip");
+            // (the game's folder read-only: NR's files and this package in its folder in Documents, nr::u8::writable_folder)
+            const std::string game_u8 = nr::u8::narrow(r.game.wstring());
+            const nr::u8::WritableFolder& moved = nr::u8::writable_folder_of(game_u8);
+            const std::filesystem::path files = moved.moved ? nr::u8::path(moved.path) : r.game;
+            const std::filesystem::path out = files / (std::string("dlssnr-amd-diag-") + stamp + ".zip");
             Zip zip(out);
             zip.stamp(now);
             zip.add("report.txt", r.report);
@@ -284,18 +289,23 @@ inline bool start(Request r) {
                 zip.add(as, size > kCap ? "(the last 20 MB of " + std::to_string(size) + " bytes)\n" + data : data);
             };
             take(r.log, "logs/" + nr::u8::narrow(r.log.filename().wstring()));
-            for (std::filesystem::directory_iterator it(r.game, ec), end; !ec && it != end; it.increment(ec)) {
-                if (!it->is_regular_file(ec)) continue;
-                std::string ext = it->path().extension().string();
-                for (char& c : ext) c = char(std::tolower(static_cast<unsigned char>(c)));
-                const std::string name = nr::u8::narrow(it->path().filename().wstring());
-                if (ext == ".log") take(it->path(), "logs/" + name);
-                else if (ext == ".ini" || name == "dlssnr-amd-install.txt") take(it->path(), "settings/" + name);
-                else if (ext == ".dmp") take(it->path(), "crash/" + name);
+            for (const auto& [folder, under] : {std::pair<std::filesystem::path, std::string>{r.game, ""},
+                                                std::pair<std::filesystem::path, std::string>{files, "documents-folder/"}}) {
+                if (!under.empty() && !moved.moved) break;
+                ec.clear();
+                for (std::filesystem::directory_iterator it(folder, ec), end; !ec && it != end; it.increment(ec)) {
+                    if (!it->is_regular_file(ec)) continue;
+                    std::string ext = it->path().extension().string();
+                    for (char& c : ext) c = char(std::tolower(static_cast<unsigned char>(c)));
+                    const std::string name = nr::u8::narrow(it->path().filename().wstring());
+                    if (ext == ".log") take(it->path(), under + "logs/" + name);
+                    else if (ext == ".ini" || name == "dlssnr-amd-install.txt") take(it->path(), under + "settings/" + name);
+                    else if (ext == ".dmp") take(it->path(), under + "crash/" + name);
+                }
             }
-            take(r.game / "dlssnr-amd" / "nr-report.txt", "settings/nr-report.txt");
+            take(nr::u8::path(nr::u8::writable_data(game_u8)) / "nr-report.txt", "settings/nr-report.txt");
             if (r.shots) {   // NR's screenshot pair of the current frame: written within a few seconds of the request
-                const std::filesystem::path shots = r.game / "NR Screenshots";
+                const std::filesystem::path shots = files / "NR Screenshots";
                 const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(8);
                 std::vector<std::filesystem::path> fresh;
                 while (fresh.size() < 2 && std::chrono::steady_clock::now() < until) {

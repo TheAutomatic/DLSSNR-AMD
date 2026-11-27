@@ -233,7 +233,7 @@ nr::Preprocess preprocess_now() {
         epoch = nr::pe::config_epoch();
         next = now + 1000;
         const char* folder = nr::pe::module_folder();
-        if (*folder) file.poll(std::string(folder) + "\\dlssnr-amd.ini", config);
+        if (*folder) file.poll(nr::u8::ini_file(folder), config);
     }
     return toggle.frame(config);
 }
@@ -244,7 +244,7 @@ nr::pe::RenoDXConfig renodx_now() {
     static nr::pe::RenoDXFile file;
     static nr::pe::RenoDXConfig config;
     const char* folder = nr::pe::module_folder();
-    if (*folder && file.poll(std::string(folder) + "\\dlssnr-amd.ini", config))
+    if (*folder && file.poll(nr::u8::ini_file(folder), config))
         nr::pe::log("[nr] RenoDX-style option: dlssnr-amd.ini [RenoDX] read (intensity %.2f, %u pass%s, look %s, hook point %u, "
                     "colour %.2f, transfer %.2f, detail stability %u)",
                     config.values.intensity, config.values.passes, config.values.passes == 1 ? "" : "es",

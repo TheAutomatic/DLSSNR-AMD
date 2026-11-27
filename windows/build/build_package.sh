@@ -55,8 +55,8 @@ command -v "$cxx" >/dev/null || { echo "no mingw cross compiler ($cxx)" >&2; exi
 minhook=artifacts/ref/DLSS5-Feeder/external/minhook
 reshade_inc=artifacts/ref/DLSS5-Feeder/external/reshade/include
 dxvk=${NR_DXVK:-artifacts/ref/dxvk-ge}   # DXVK from the latest GE-Proton release (fetch_deps.sh --windows)
-opti_7z=${NR_OPTI_ARCHIVE:-artifacts/ref/downloads/OptiScaler_v10.0.0-pre1_20261030.7z}
-opti_license=${NR_OPTI_LICENSE:-artifacts/ref/optiscaler-nightly-20261030/LICENSE}
+opti_7z=${NR_OPTI_ARCHIVE:-artifacts/ref/downloads/OptiScaler_v10.0.0-pre1_20261127_a1e0e193.7z}
+opti_license=${NR_OPTI_LICENSE:-artifacts/ref/optiscaler-nightly-20261127/LICENSE}
 for dir in "$minhook" "$reshade_inc" artifacts/ref/reshade-shaders artifacts/ref/vort_Shaders \
            "$dxvk/x86_64-windows"; do
     [[ -d "$dir" ]] || { echo "missing: $dir" >&2; exit 1; }
@@ -237,6 +237,40 @@ PY
     cp -- linux/data/CC_SMALL_FP8_OPTIMIZED-ultra/rdna4/CC_SMALL_FP8_OPTIMIZED_INT4.bin.sha256 "$pkg/model-tools/CC_SMALL_FP8_OPTIMIZED_INT4.bin.sha256"
     cp -- linux/data/CC_SMALL_FP8_OPTIMIZED-ultra/rdna4/CC_SMALL_FP8_OPTIMIZED_INT4_SINK.bin.sha256 "$pkg/model-tools/CC_SMALL_FP8_OPTIMIZED_INT4_SINK.bin.sha256"
 fi
+# Every network kernel ACO Mode gets with cooperative matrices has its template among the native shaders (its own name or
+# its line in shell-aliases.txt, as nr_pipeline_binary.hpp create_aco looks for it): without one the driver compiles the
+# Linux SPIR-V for the container, and AMD's Windows driver fails on its cooperative-matrix loops (the Windows build
+# unrolls them in its own copies). A kernel without cooperative matrices may go without one (the small model's g_poolvkv).
+python3 - "$pkg/dlssnr-amd" <<'PY'
+import struct, sys
+from pathlib import Path
+d = Path(sys.argv[1]); aco = d / 'aco'
+aliases = dict(line.split() for line in (aco / 'shell-aliases.txt').read_text().splitlines() if line.strip())
+dirs = [aco / 'shell', d / 'shaders', d / 'shaders' / 'temporal']
+def template(name):   # as nr_pipeline_binary.hpp create_aco looks for it
+    for n in filter(None, (name, aliases.get(name))):
+        for t in dirs:
+            if (name.startswith('temporal_') and (t / 'temporal' / n).is_file()) or (t / n).is_file():
+                return True
+    return False
+def cooperative_matrix(data):   # OpCapability CooperativeMatrixKHR in the module's header
+    w = struct.unpack(f'<{len(data) // 4}I', data); p = 5
+    while p < len(w) and w[p] >> 16:
+        if w[p] & 0xffff == 17 and w[p + 1] == 6022: return True
+        if w[p] & 0xffff == 54: break
+        p += w[p] >> 16
+    return False
+missing = []
+for root in [aco / 'shaders', aco / 'int4' / 'shaders'] + sorted(p / 'shaders' for p in d.glob('CC_*')):
+    for f in sorted(root.rglob('*.spv')):
+        if not f.name.startswith(('g_', 'temporal_pre_fp32', 'temporal_post_fp32')): continue   # network_path
+        data = f.read_bytes()
+        if b'nr-aco-record ' in data or template(f.name) or not cooperative_matrix(data): continue
+        missing.append(str(f.relative_to(d)))
+if missing:
+    raise SystemExit('ACO Mode: cooperative-matrix kernels without a template among the native shaders '
+                     '(windows/data/aco/shell-aliases.txt):\n  ' + '\n  '.join(missing))
+PY
 # model-tools/: the extractor install.ps1 runs when the package has no model.
 bash windows/package/model-tools/build_extract_model.sh "$out/extract" > /dev/null
 mkdir -p -- "$pkg/model-tools"
@@ -322,8 +356,8 @@ for f in "$rs/ReShade.ini" "$rs/ReShadePreset.ini" "$rs/ReShadePreset-d3d9.ini";
 # game's own upscaler call and draws NR Control, with NR Control's swap-chain probe (into dlssnr-amd\) and the notices of
 # what the plugin has compiled in (NR Control's font Inter, SIL OFL 1.1; Dear ImGui, MIT).
 if [[ -z "${NR_OPTI_ARCHIVE:-}" ]]; then   # the archive the package was tested with
-    [[ "$(sha256sum -- "$opti_7z" | cut -d' ' -f1)" == db4fe2deae7edd9f6657f5cb223edc694ebdec62b52f15a3a59913f8b656c176 ]] ||
-        { echo "$opti_7z is not the tested OptiScaler nightly-20261030" >&2; exit 1; }
+    [[ "$(sha256sum -- "$opti_7z" | cut -d' ' -f1)" == 272f073566fa2634e2c9827abcc496d5b3f3e9b4575b9520e472f4fda3d575f7 ]] ||
+        { echo "$opti_7z is not the tested OptiScaler nightly-20261127" >&2; exit 1; }
 fi
 command -v 7z >/dev/null || { echo "7z is needed to unpack $opti_7z" >&2; exit 1; }
 op="$pkg/optiscaler"
@@ -332,6 +366,19 @@ mkdir -p -- "$op/release" "$op/asi"
 [[ -f "$op/release/OptiScaler.dll" && -f "$op/release/OptiScaler.ini" && -d "$op/release/OptiScaler" ]] ||
     { echo "$opti_7z is not laid out as OptiScaler v10" >&2; exit 1; }
 cp -- "$opti_license" "$op/OptiScaler_LICENSE.txt"
+# Where OptiScaler's source is (GPL-3.0: directions to the corresponding source beside the binaries): the commit and
+# the release archive fetch_deps.sh takes; an NR_OPTI_ARCHIVE of one's own: the repository only.
+{
+    echo "OptiScaler (optiscaler/release) is shipped unmodified under the GNU General Public License v3.0 (OptiScaler_LICENSE.txt)."
+    echo "Its source: https://github.com/optiscaler/OptiScaler"
+    if [[ -z "${NR_OPTI_ARCHIVE:-}" ]]; then
+        opti_commit=$(sed -n 's|.*raw\.githubusercontent\.com/optiscaler/OptiScaler/\([0-9a-f]\{40\}\)/LICENSE.*|\1|p' fetch_deps.sh | head -1)
+        opti_url=$(sed -n 's|.*\(https://github\.com/optiscaler/[^ ]*\.7z\).*|\1|p' fetch_deps.sh | head -1)
+        [[ -n "$opti_commit" && -n "$opti_url" ]] || { echo "fetch_deps.sh names no OptiScaler commit / archive" >&2; exit 1; }
+        echo "The source of this build: https://github.com/optiscaler/OptiScaler/tree/$opti_commit"
+        echo "The release archive it was unpacked from: $opti_url"
+    fi
+} > "$op/OptiScaler_SOURCE.txt"
 cp -- artifacts/windows/asi/dlssnr-amd.asi artifacts/windows/asi/nr_present_probe.exe "$op/asi/"
 cp -- "${NR_MENU_FONT_LICENSE:-toolchain/fonts/inter-4.1/LICENSE.txt}" "$op/asi/Inter-LICENSE.txt"
 cp -- "${NR_IMGUI_ROOT:-toolchain/imgui-nr}/LICENSE.txt" "$op/asi/DearImGui-LICENSE.txt"

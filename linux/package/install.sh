@@ -56,7 +56,7 @@
 # --no-lumenite  do not install it (default): the VORT in this package. With neither, the ReShade routes ask once; Enter = no
 #                (not asked when not run in a terminal: no).
 #
-# Every installed file is listed in dlssnr-amd-install.txt in the game folder; remove deletes by it.
+# Every installed file is listed in dlssnr-amd-install.txt in the game folder; files of the game's it would overwrite are first moved to dlssnr-amd-backup/, and remove deletes ours and puts them back.
 set -euo pipefail
 here=$(cd -- "$(dirname -- "$0")" && pwd)
 # The package's models: bundled, or kept there by the first --dll install. Checked by SHA256.
@@ -141,18 +141,90 @@ if [[ -z "$route" ]]; then
     esac
 fi
 
+# dlssnr-amd-install.txt, one line each: "F <path>" a file of ours, "D <path>" a folder all ours, "M <path>" a folder
+# made for files of ours (removed on uninstall only when nothing else is left in it), "B <path>" a file or folder that
+# was there before and was moved to dlssnr-amd-backup/ (put back on uninstall). Packages up to 0.1.0 wrote bare paths
+# ("<path>/" a folder).
+backup="$game/dlssnr-amd-backup"
 record() { printf '%s\n' "$1" >> "$manifest"; }
-put_file() { cp -- "$1" "$game/$2"; record "$2"; }
-put_tree() { mkdir -p -- "$game/$2"; cp -r -- "$1"/. "$game/$2/"; record "$2/"; }
+save_existing() {   # a target that exists and was not installed by us: moved to the backup folder
+    [[ -e "$game/$1" || -L "$game/$1" ]] || return 0
+    mkdir -p -- "$(dirname -- "$backup/$1")"
+    mv -- "$game/$1" "$backup/$1"
+    record "B $1"
+}
+put_file() { save_existing "$2"; cp -- "$1" "$game/$2"; record "F $2"; }
+# files the game (or the install, dlssnr-amd.ini) writes later: one of the name already there (another OptiScaler's log,
+# a dlssnr-amd.ini put there by hand) moved aside first, as every file the installation replaces
+record_logs() { local n; for n in "$@"; do save_existing "$n"; record "F $n"; done; }
+put_tree() { save_existing "$2"; mkdir -p -- "$game/$2"; cp -r -- "$1"/. "$game/$2/"; record "D $2"; }
+put_dir() {   # a folder others put files into too (OptiScaler/: other OptiScaler plugins in OptiScaler/plugins)
+    [[ -d "$game/$1" ]] && return 0
+    [[ "$1" == */* ]] && put_dir "${1%/*}"
+    mkdir -- "$game/$1"; record "M $1"
+}
+put_files() {   # its files one by one, each recorded (and each existing one moved aside)
+    local f
+    put_dir "$2"
+    for f in "$1"/* "$1"/.[!.]*; do
+        [[ -e "$f" ]] || continue
+        if [[ -d "$f" ]]; then put_files "$f" "$2/$(basename -- "$f")"; else put_file "$f" "$2/$(basename -- "$f")"; fi
+    done
+}
+restore_saved() {   # a folder whose place has files again is merged back; a file there again stays (its copy stays saved
+    local keep=$1 path=$2 f   # unless it is the same file)
+    if [[ ! -e "$path" && ! -L "$path" ]]; then mv -- "$keep" "$path"; return; fi
+    if [[ -f "$keep" && ! -L "$keep" && -f "$path" && ! -L "$path" ]]; then cmp -s -- "$keep" "$path" && rm -f -- "$keep"; return 0; fi
+    [[ -d "$keep" && ! -L "$keep" && -d "$path" && ! -L "$path" ]] || return 0
+    for f in "$keep"/* "$keep"/.[!.]*; do [[ -e "$f" || -L "$f" ]] && restore_saved "$f" "$path/$(basename -- "$f")"; done
+    rmdir -- "$keep" 2>/dev/null || true
+}
+remove_old_optiscaler_dir() {   # OptiScaler/ as one entry (up to 0.1.0): only what those packages put there is removed -
+    # OptiScaler's files by the names this package's OptiScaler has, its licences, our plugin - and folders left empty;
+    # anything else (other plugins, a provider of one's own in OptiScaler/custom) stays
+    local dir=$game/OptiScaler rel=$here/optiscaler/release f left
+    [[ -d "$dir" ]] || return 0
+    if [[ -d "$rel/OptiScaler" ]]; then
+        while IFS= read -r -d '' f; do rm -f -- "$dir/$f"; done < <(cd -- "$rel/OptiScaler" && find . -type f -printf '%P\0')
+    fi
+    if [[ -d "$rel/Licenses" ]]; then
+        while IFS= read -r -d '' f; do rm -f -- "$dir/Licenses/$f"; done < <(cd -- "$rel/Licenses" && find . -type f -printf '%P\0')
+    fi
+    rm -f -- "$dir/Licenses/OptiScaler_LICENSE.txt" "$dir/Licenses/OptiScaler_SOURCE.txt" "$dir/plugins/dlssnr-amd.asi"
+    find "$dir" -depth -mindepth 1 -type d -empty -delete 2>/dev/null || true
+    left=$(find "$dir" \( -type f -o -type l \) | wc -l)
+    if (( left == 0 )); then rm -rf -- "$dir"; else echo "Kept $left file(s) in $dir that this package did not put there (other plugins, files of one's own)."; fi
+}
 
 remove_installed() {
     [[ -f "$manifest" ]] || { echo "$manifest not found, nothing to uninstall."; return; }
+    local entry kind rel
+    # A path whose saved original is no longer in the backup folder holds that original again (an uninstall that stopped
+    # half way and is run again): it is left, never removed as this installation's file.
+    declare -A back=()
+    while IFS= read -r entry; do
+        [[ "$entry" =~ ^B\ (.+)$ ]] && [[ ! -e "$backup/${BASH_REMATCH[1]}" && ! -L "$backup/${BASH_REMATCH[1]}" ]] && back["${BASH_REMATCH[1]}"]=1
+    done < "$manifest"
+    # last first: a file is removed before what it replaced is put back, a folder's files before the folder
     while IFS= read -r entry; do
         [[ -n "$entry" ]] || continue
-        case "$entry" in /*|..*|*/..*) echo "skipping suspicious entry: $entry" >&2; continue;; esac
-        rm -rf -- "$game/$entry"
-    done < "$manifest"
+        if [[ "$entry" =~ ^([FDMB])\ (.+)$ ]]; then kind=${BASH_REMATCH[1]}; rel=${BASH_REMATCH[2]}
+        elif [[ "$entry" == */ ]]; then kind=D; rel=${entry%/}
+        else kind=F; rel=$entry; fi
+        case "$rel" in /*|..|../*|*/..|*/../*) echo "skipping suspicious entry: $entry" >&2; continue;; esac
+        [[ "$kind" != B && -n "${back[$rel]:-}" ]] && continue
+        case "$kind" in
+            D) if [[ "$rel" == OptiScaler ]]; then remove_old_optiscaler_dir; else rm -rf -- "$game/$rel"; fi ;;
+            F) rm -rf -- "$game/$rel" ;;
+            M) rmdir -- "$game/$rel" 2>/dev/null || true ;;
+            B) [[ -e "$backup/$rel" || -L "$backup/$rel" ]] && restore_saved "$backup/$rel" "$game/$rel" ;;
+        esac
+    done < <(tac -- "$manifest")
     rm -f -- "$manifest"
+    if [[ -d "$backup" ]]; then
+        if [[ -z "$(find "$backup" \( -type f -o -type l \) -print -quit)" ]]; then rm -rf -- "$backup"
+        else echo "Note: files in $backup were not put back; please check them by hand."; fi
+    fi
     echo "Uninstalled from $game."
 }
 
@@ -205,6 +277,20 @@ case "$route" in
         echo "unknown route: $route (this route is now called reshade-feeder$([[ "$route" == reshade ]] || echo "-$route"))" >&2; exit 1;;
     *) echo "unknown route: $route" >&2; exit 1;;
 esac
+# Files in dlssnr-amd-backup/ that the installation record does not name (an earlier uninstall could not put them back):
+# an install would move the game's files of those names there too, over them - stopped before anything is changed.
+if [[ -d "$backup" ]]; then
+    named=()
+    [[ -f "$manifest" ]] && while IFS= read -r entry; do [[ "$entry" =~ ^B\ (.+)$ ]] && named+=("$backup/${BASH_REMATCH[1]}"); done < "$manifest"
+    while IFS= read -r -d '' item; do
+        covered=0
+        for n in ${named[@]+"${named[@]}"}; do [[ "$item" == "$n" || "$item" == "$n"/* ]] && { covered=1; break; }; done
+        if (( ! covered )); then
+            echo "$backup holds files an earlier uninstall did not put back ($item). Put them where they belong (or delete them), then install again." >&2
+            exit 1
+        fi
+    done < <(find "$backup" -mindepth 1 \( -type f -o -type l \) -print0)
+fi
 if [[ "$kind" == optiscaler && ! -d "$here/optiscaler" ]]; then
     echo "The OptiScaler route is only in the 64-bit package." >&2; exit 1
 fi
@@ -457,11 +543,18 @@ if [[ -f "$manifest" ]]; then
     echo "Found a previous installation, removing it first."
     remove_installed
 fi
+# Files an earlier uninstall could not put back are still in dlssnr-amd-backup/: an install now would move the game's
+# files of those names there too, over them - stopped (the files not named by an installation record already before
+# anything was changed, above; these: what this uninstall could not put back).
+if [[ -d "$backup" && -n "$(find "$backup" -mindepth 1 -print -quit)" ]]; then
+    echo "$backup holds files an earlier uninstall did not put back. Put them where they belong (or delete them), then install again." >&2
+    exit 1
+fi
 if (( has32 != has64 )) && (( bits == 64 ? has32 : has64 )); then
     echo "Note: this is the $bits-bit package but the game exe is $(( has64 ? 64 : 32 ))-bit; DLLs of the other bitness will not load." >&2
 fi
 
-: > "$manifest"; record "dlssnr-amd-install.txt"
+: > "$manifest"; record "F dlssnr-amd-install.txt"
 put_tree "$here/dlssnr-amd" dlssnr-amd
 [[ -n "$model_src" ]] && cp -- "$model_src" "$game/dlssnr-amd/CC_SILVER_AARDWOLD.bin"
 [[ -n "$small_fp8_src" ]] && cp -- "$small_fp8_src" "$game/dlssnr-amd/CC_SMALL_FP8.bin"
@@ -473,14 +566,18 @@ case "$kind" in
         # OptiScaler as released (its files unmodified): OptiScaler.dll as dxgi.dll, its ini, its OptiScaler\ folder;
         # its licences go into that folder (a Licenses folder of the game's own is not touched); its setup scripts are
         # not needed. Our NR plugin into OptiScaler\plugins; NR Control's probe into dlssnr-amd\ (the wilsjo2 shaders are in it).
+        # OptiScaler\ file by file: other plugins in OptiScaler\plugins (OpenRR's openrr-amd.asi) stay where they are,
+        # before and after our install and on uninstall.
         rel=$here/optiscaler/release
         put_file "$rel/OptiScaler.dll" dxgi.dll
         put_file "$rel/OptiScaler.ini" OptiScaler.ini
-        put_tree "$rel/OptiScaler" OptiScaler
-        if [[ -d "$rel/Licenses" ]]; then mkdir -p -- "$game/OptiScaler/Licenses"; cp -r -- "$rel/Licenses"/. "$game/OptiScaler/Licenses/"; fi
-        cp -- "$here/optiscaler/OptiScaler_LICENSE.txt" "$game/OptiScaler/Licenses/OptiScaler_LICENSE.txt"
-        mkdir -p -- "$game/OptiScaler/plugins"
-        cp -- "$here/optiscaler/asi/dlssnr-amd.asi" "$game/OptiScaler/plugins/dlssnr-amd.asi"
+        put_files "$rel/OptiScaler" OptiScaler
+        put_dir OptiScaler/Licenses
+        [[ -d "$rel/Licenses" ]] && put_files "$rel/Licenses" OptiScaler/Licenses
+        put_file "$here/optiscaler/OptiScaler_LICENSE.txt" OptiScaler/Licenses/OptiScaler_LICENSE.txt
+        put_file "$here/optiscaler/OptiScaler_SOURCE.txt" OptiScaler/Licenses/OptiScaler_SOURCE.txt
+        put_dir OptiScaler/plugins
+        put_file "$here/optiscaler/asi/dlssnr-amd.asi" OptiScaler/plugins/dlssnr-amd.asi
         cp -- "$here/optiscaler/asi/nr_present_probe.exe" "$game/dlssnr-amd/"
         # vulkan-1.dll forwarding to winevulkan.dll, as Proton's own: with Proton's native Vulkan loader (which Steam
         # turns on for some games) OptiScaler's menu would not show (linux/vulkan-loader/vulkan1_forwarder.c). A
@@ -491,7 +588,7 @@ case "$kind" in
             put_file "$here/optiscaler/vulkan-1.dll" vulkan-1.dll
         fi
         python3 "$here/optiscaler/patch_ini.py" "$game"
-        record OptiScaler.log; record dlssnr-amd.log; record dlssnr-amd.ini
+        record_logs OptiScaler.log dlssnr-amd.log dlssnr-amd.ini
         overrides="dxgi=n,b"
         ;;
     reshade)
@@ -511,7 +608,7 @@ case "$kind" in
         overrides="winevulkan=n,b;vulkan-1=n,b"
         ;;
 esac
-[[ "$kind" != optiscaler ]] && { record dlssnr-amd.ini; record dlssnr-amd.log; record ReShade.log; }
+[[ "$kind" != optiscaler ]] && record_logs dlssnr-amd.ini dlssnr-amd.log ReShade.log
 if [[ $lumenite == 1 ]]; then
     # into reshade-shaders/ (the whole folder is recorded and removed with the rest); ReShadePreset.ini switched to LumeniteFX:
     # DLSS5_MV_PROVIDER=3, Lumenite_Kernel on (VORT off), sorted before DLSS5_Feed
@@ -544,7 +641,8 @@ if [[ $int4 == 1 ]]; then
     [[ $small_fp8_int4_weights == 1 && -f "$small_fp8_int4_tmp/CC_SMALL_FP8_OPTIMIZED_INT4_SINK.bin" ]] &&
         mv -- "$small_fp8_int4_tmp/CC_SMALL_FP8_OPTIMIZED_INT4_SINK.bin" "$game/dlssnr-amd/CC_SMALL_FP8_OPTIMIZED_INT4_SINK.bin"
 fi
-# dlssnr-amd.ini is put in place at install, with every setting and its description (a reinstall puts a fresh default)
+# dlssnr-amd.ini is put in place at install, with every setting and its description (a reinstall puts a fresh default;
+# one put there by hand was moved aside with the logs' names when they were recorded)
 ini_dir=$here/ini
 if [[ "$kind" == optiscaler && $renodx == 1 ]]; then cp -- "$ini_dir/dlssnr-amd-optiscaler-renodx.ini" "$game/dlssnr-amd.ini"
 elif [[ "$kind" == optiscaler ]]; then cp -- "$ini_dir/dlssnr-amd-optiscaler.ini" "$game/dlssnr-amd.ini"

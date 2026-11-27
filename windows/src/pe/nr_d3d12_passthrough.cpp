@@ -6,19 +6,23 @@
 #include "nr_gpu_arch.hpp"
 #include "nr_pipeline_binary.hpp"
 #include "nr_path_u8.hpp"
+#include "nr_path_win.hpp"
 #include "nr_d3d12_direct_state.hpp"
 #include "nr_pe_log.hpp"
 #include "nr_pe_session.hpp"
 #include "nr_pe_vkdevice.hpp"
 #include <dxgi1_4.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace nr::pe::d3d12_passthrough {
 namespace {
@@ -31,6 +35,8 @@ std::mutex g_lock;            // the strings below
 std::string g_ini;            // dlssnr-amd.ini (UTF-8)
 bool g_enabled = false;
 std::string g_backend = "not run", g_network, g_adapter;
+constexpr size_t kMaxBackendLogged = 16;
+std::vector<std::string> g_backend_logged;
 std::atomic<int> g_canary{int(Canary::kNotRun)};
 std::atomic<bool> g_canary_started{false};
 std::string g_canary_line = "not run";
@@ -92,7 +98,7 @@ bool read_enabled(const std::string& path, bool def) {
 }
 // [D3D12Passthrough] Enabled in the file, everything else as it was (the line rewritten in place, or added to its
 // section, or the section added at the end) - as NetworkSwitch::write_key does for [Network].
-void write_enabled(const std::string& path, bool on) {
+DWORD write_enabled(const std::string& path, bool on) {
     const std::string text = read_file(path), value = on ? "1" : "0";
     const bool crlf = text.find("\r\n") != std::string::npos;
     const std::string nl = crlf ? "\r\n" : "\n";
@@ -125,10 +131,7 @@ void write_enabled(const std::string& path, bool on) {
         }
         out += "Enabled = " + value + nl;
     }
-    if (FILE* f = nr::u8::fopen(path.c_str(), "wb")) {
-        std::fwrite(out.data(), 1, out.size(), f);
-        std::fclose(f);
-    }
+    return nr::u8::write_whole(path, out);   // (0, else the Windows error)
 }
 template <class T> void release(T*& p) { if (p) { p->Release(); p = nullptr; } }
 
@@ -408,7 +411,7 @@ void set_gfx11_mach(uint32_t mach) { g_gfx11_mach = mach; }
 Canary canary() { return Canary(g_canary.load()); }
 
 void start() {
-    g_ini = std::string(nr::pe::module_folder()) + "\\dlssnr-amd.ini";
+    g_ini = nr::u8::ini_file(nr::pe::module_folder());
     g_enabled = read_enabled(g_ini, kDefaultEnabled);
     log("[d3d12] D3D12 passthrough %s (dlssnr-amd.ini [%s] Enabled = %d)", g_enabled ? "on" : "off", kSection,
         g_enabled ? 1 : 0);
@@ -496,10 +499,12 @@ void on_device(ID3D12Device* device) {
     }
 }
 
-void set_enabled(bool on) {
-    if (g_ini.empty()) return;
-    write_enabled(g_ini, on);
-    log("[d3d12] dlssnr-amd.ini [%s] Enabled = %d written (from the next launch)", kSection, on ? 1 : 0);
+uint32_t set_enabled(bool on) {
+    if (g_ini.empty()) return ERROR_FILE_NOT_FOUND;
+    const DWORD e = write_enabled(g_ini, on);
+    if (e) log("[d3d12] dlssnr-amd.ini [%s] Enabled = %d could not be written (error %lu)", kSection, on ? 1 : 0, e);
+    else log("[d3d12] dlssnr-amd.ini [%s] Enabled = %d written (from the next launch)", kSection, on ? 1 : 0);
+    return e;
 }
 
 std::wstring aco_folder() {
@@ -527,13 +532,19 @@ bool fell_back_recently() {
     return g_enabled && t && GetTickCount64() - t < 2000;
 }
 void note_backend(const char* line, bool ran, bool waiting) {
+    const char* msg = line ? line : "";
     (ran ? g_runs : waiting ? g_waits : g_fallbacks)++;
     if (!ran && !waiting) note_bridge_fallback();
     std::lock_guard<std::mutex> g(g_lock);
-    if (g_backend != line) {
-        g_backend = line;
-        log("[d3d12] backend: %s", line);
+    if (g_backend != msg) g_backend = msg;
+    const auto it = std::find(g_backend_logged.begin(), g_backend_logged.end(), msg);
+    if (it != g_backend_logged.end()) {
+        if (std::next(it) != g_backend_logged.end()) std::rotate(it, std::next(it), g_backend_logged.end());
+        return;
     }
+    if (g_backend_logged.size() >= kMaxBackendLogged) g_backend_logged.erase(g_backend_logged.begin());
+    g_backend_logged.emplace_back(msg);
+    log("[d3d12] backend: %s", msg);
 }
 void note_network(const char* name) {
     std::lock_guard<std::mutex> g(g_lock);

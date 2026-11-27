@@ -60,7 +60,7 @@ inline uint32_t lin_pitch(uint32_t width, uint32_t bytes_per_texel) {
 }
 
 // NR Control's switch (Network page): Enabled written to dlssnr-amd.ini (takes effect at the next launch).
-void set_enabled(bool on);
+uint32_t set_enabled(bool on);   // 0 written, else the Windows error (the file as it was)
 
 // The ACO records' folder, dlssnr-amd\aco beside OptiScaler (UTF-16).
 std::wstring aco_folder();

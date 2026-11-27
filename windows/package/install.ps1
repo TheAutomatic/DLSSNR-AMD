@@ -46,7 +46,8 @@
 # Every file put into the game folder is listed in dlssnr-amd-install.txt; existing files it would
 # overwrite are first moved to dlssnr-amd-backup\, and uninstall deletes ours and puts them back.
 param([string]$Target = '', [string]$Route = '', [string]$Dll = '', [string]$Model = '',
-      [string]$RenoDX = '', [string]$Lumenite = '', [string]$LumeniteZip = '', [switch]$Pause)
+      [string]$RenoDX = '', [string]$Lumenite = '', [string]$LumeniteZip = '', [switch]$Pause,
+      [string]$UserDocuments = '', [switch]$Elevated)
 
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
@@ -169,6 +170,45 @@ if ($Lumenite -eq 'on' -and $Route -eq 'optiscaler') {
     Fail 'LumeniteFX is for the ReShade routes only (the OptiScaler route uses the game''s own motion vectors).'
 }
 
+# NR's folder in Documents for this game (the game's folder cannot be written - Game Pass, Program Files - NR keeps
+# dlssnr-amd.ini, its log, NR Screenshots and its caches there: Documents\DLSSNR-AMD\<the exe's name>[ (2)..(9)], its
+# game-folder.txt naming the game's folder, as dlssnr-amd.asi chooses it), when there is one; else $null.
+function Get-NrDocumentsFolder {
+    $docs = if ($UserDocuments) { $UserDocuments } else { [Environment]::GetFolderPath('MyDocuments') }
+    if (-not $docs) { return @() }
+    $want = $game.TrimEnd('\')
+    $base = Join-Path $docs 'DLSSNR-AMD'
+    $found = @()
+    try {
+        if (-not (Test-Path -LiteralPath $base -PathType Container)) { return @() }
+        # every folder there whose game-folder.txt names this game's folder (whatever its name: each exe the game ran as,
+        # a free slot " (2)" ...)
+        foreach ($dir in @(Get-ChildItem -LiteralPath $base -Directory -Force)) {
+            $mark = Join-Path $dir.FullName 'game-folder.txt'
+            try {
+                if (-not (Test-Path -LiteralPath $mark -PathType Leaf)) { continue }
+                $named = ([System.IO.File]::ReadAllText($mark)).Trim().TrimEnd('\')
+            } catch { continue }
+            if ($named -ieq $want) { $found += $dir.FullName }
+        }
+    } catch { Say "Note: $base could not be read ($($_.Exception.Message))." }
+    return $found
+}
+# The game's dlssnr-amd.ini written over each copy NR keeps in Documents (the game's folder cannot be written while it
+# runs) - the file itself, where it is one; a copy that cannot be written is said and left.
+function Set-NrDocumentsIni([string]$from) {
+    foreach ($nrDocs in @(Get-NrDocumentsFolder)) {
+        $to = Join-Path $nrDocs 'dlssnr-amd.ini'
+        try {
+            if (-not (Test-Path -LiteralPath $to -PathType Leaf) -or -not (Test-Path -LiteralPath $from -PathType Leaf)) { continue }
+            [System.IO.File]::WriteAllBytes($to, [System.IO.File]::ReadAllBytes($from))
+            Say "This game's folder cannot be written while it runs; NR's settings there were set again too: $to"
+        } catch {
+            Say "Note: NR's settings in Documents could not be set again ($($_.Exception.Message)); the game keeps using $to as it is."
+        }
+    }
+}
+
 # ---- games under Program Files need administrator rights -------------------------------------
 if ($Route -ne 'logs') {
     $probe = Join-Path $game ('dlssnr-amd-write-test-' + [guid]::NewGuid().ToString('N'))
@@ -184,7 +224,14 @@ if ($Route -ne 'logs') {
         $elevated += " -Lumenite $Lumenite"
         if ($LumeniteZip) { $elevated += " -LumeniteZip `"$LumeniteZip`"" }
         if ($Dll) { $elevated += " -Dll `"$Dll`"" }
+        # the player's Documents (NR's folder there for a read-only game folder): an administrator account that
+        # approves the request has Documents of its own. The administrator run leaves them alone; this run (the
+        # player's) sets the settings there again after it, as the player.
+        $elevated += ' -Elevated'
+        $docs = [Environment]::GetFolderPath('MyDocuments')
+        if ($docs) { $elevated += " -UserDocuments `"$($docs.TrimEnd('\'))`"" }
         $p = Start-Process powershell -Verb RunAs -ArgumentList $elevated -PassThru -Wait
+        if ($p.ExitCode -eq 0 -and $Route -ne 'remove') { Set-NrDocumentsIni (Join-Path $game 'dlssnr-amd.ini') }
         exit $p.ExitCode
     }
 }
@@ -213,38 +260,136 @@ function Put-Tree([string]$src, [string]$rel) {
     Get-ChildItem -LiteralPath (Join-Path $game $rel) -Recurse -File | Unblock-File -ErrorAction SilentlyContinue
     Record "D $rel"
 }
+# A folder others put files into too (OptiScaler\: other OptiScaler plugins in OptiScaler\plugins, e.g. OpenRR's
+# openrr-amd.asi): its files one by one, each recorded (and each existing one moved aside); the folders made for them
+# recorded too, removed on uninstall only when nothing else is left in them.
+function Put-Dir([string]$rel) {
+    $path = Join-Path $game $rel
+    if (Test-Path -LiteralPath $path -PathType Container) { return }
+    $parent = Split-Path -Parent $rel
+    if ($parent) { Put-Dir $parent }
+    New-Item -ItemType Directory -Force -Path $path | Out-Null
+    Record "M $rel"
+}
+function Put-Files([string]$src, [string]$rel) {
+    Put-Dir $rel
+    foreach ($item in Get-ChildItem -LiteralPath $src -Force) {
+        $sub = Join-Path $rel $item.Name
+        if ($item.PSIsContainer) { Put-Files $item.FullName $sub } else { Put-File $item.FullName $sub }
+    }
+}
+
+
+# A file, or a folder with all in it - a link or junction in it removed as a link, never gone through (.NET's recursive
+# delete; Windows PowerShell 5.1's Remove-Item -Recurse may follow one).
+function Remove-Path([string]$path) {
+    if (Test-Path -LiteralPath $path -PathType Container) { [System.IO.Directory]::Delete($path, $true) }
+    elseif (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
+}
+# Put a moved-aside file or folder back. A folder whose place has files again (another plugin put into OptiScaler\plugins
+# while ours was installed) is merged back file by file; a file already there again stays, its saved copy stays in the
+# backup folder (named at the end) unless it is the same file.
+function Restore-Saved([string]$keep, [string]$path) {
+    if (-not (Test-Path -LiteralPath $path)) { Move-Item -LiteralPath $keep -Destination $path -Force; return }
+    if ((Test-Path -LiteralPath $keep -PathType Leaf) -and (Test-Path -LiteralPath $path -PathType Leaf)) {
+        if ((Get-FileHash -LiteralPath $keep).Hash -eq (Get-FileHash -LiteralPath $path).Hash) { Remove-Item -LiteralPath $keep -Force }
+        return
+    }
+    if (-not ((Test-Path -LiteralPath $keep -PathType Container) -and (Test-Path -LiteralPath $path -PathType Container))) { return }
+    foreach ($item in @(Get-ChildItem -LiteralPath $keep -Force)) { Restore-Saved $item.FullName (Join-Path $path $item.Name) }
+    if (@(Get-ChildItem -LiteralPath $keep -Force).Count -eq 0) { Remove-Item -LiteralPath $keep -Force }
+}
+# OptiScaler\ recorded as one folder (packages up to 0.1.0): only what those packages put there is removed - OptiScaler's
+# files by the names this package's OptiScaler has, its licences, our plugin - and folders left empty; anything else
+# (other plugins, a provider of one's own in OptiScaler\custom) stays.
+function Remove-OldOptiScalerDir([string]$path) {
+    if (-not (Test-Path -LiteralPath $path -PathType Container)) { return }
+    $rel = Join-Path $here 'optiscaler\release'
+    $ours = New-Object System.Collections.Generic.List[string]
+    $from = Join-Path $rel 'OptiScaler'
+    if (Test-Path -LiteralPath $from) {
+        foreach ($f in Get-ChildItem -LiteralPath $from -Recurse -File -Force) { $ours.Add($f.FullName.Substring($from.Length).TrimStart('\', '/')) }
+    }
+    $lic = Join-Path $rel 'Licenses'
+    if (Test-Path -LiteralPath $lic) {
+        foreach ($f in Get-ChildItem -LiteralPath $lic -Recurse -File -Force) { $ours.Add((Join-Path 'Licenses' $f.FullName.Substring($lic.Length).TrimStart('\', '/'))) }
+    }
+    foreach ($f in 'Licenses\OptiScaler_LICENSE.txt', 'Licenses\OptiScaler_SOURCE.txt', 'plugins\dlssnr-amd.asi') { $ours.Add($f) }
+    foreach ($f in $ours) {
+        $p = Join-Path $path $f
+        if (Test-Path -LiteralPath $p -PathType Leaf) { Remove-Item -LiteralPath $p -Force }
+    }
+    Remove-EmptyDirs $path
+    if (Test-Path -LiteralPath $path) {
+        Say "Kept what is left in ${path}: this package did not put it there (other plugins, files of one's own)."
+    }
+}
+# The empty folders under (and of) $path removed, deepest first; a link or junction is an entry, never entered or removed.
+function Remove-EmptyDirs([string]$path) {
+    if (-not (Test-Path -LiteralPath $path -PathType Container)) { return }
+    $plain = { param($d) -not ($d.Attributes -band [System.IO.FileAttributes]::ReparsePoint) }
+    foreach ($d in @(Get-ChildItem -LiteralPath $path -Recurse -Directory -Force | Where-Object { & $plain $_ } |
+                     Sort-Object { $_.FullName.Length } -Descending)) {
+        if (@(Get-ChildItem -LiteralPath $d.FullName -Force).Count -eq 0) { Remove-Item -LiteralPath $d.FullName -Force }
+    }
+    if (@(Get-ChildItem -LiteralPath $path -Force).Count -eq 0) { Remove-Item -LiteralPath $path -Force }
+}
 
 function Remove-Installed {
     if (-not (Test-Path -LiteralPath $manifest)) { Say 'No installation record found, nothing to uninstall.'; return }
     $lines = @(Get-Content -LiteralPath $manifest -Encoding UTF8)
     [array]::Reverse($lines)
+    # A path whose saved original is no longer in the backup folder holds that original again (an uninstall that stopped
+    # half way - a file in use - and is run again): it is left, never removed as this installation's file.
+    $back = @{}
+    foreach ($line in $lines) {
+        $line = $line.TrimStart([char]0xFEFF)
+        if ($line.Length -ge 3 -and $line.Substring(0, 1) -eq 'B' -and -not (Test-Path -LiteralPath (Join-Path $backup $line.Substring(2)))) {
+            $back[$line.Substring(2).ToLowerInvariant()] = 1
+        }
+    }
     foreach ($line in $lines) {
         $line = $line.TrimStart([char]0xFEFF)
         if ($line.Length -lt 3) { continue }
         $kind = $line.Substring(0, 1); $rel = $line.Substring(2)
         if ($rel -match '(^|[\\/])\.\.([\\/]|$)' -or [System.IO.Path]::IsPathRooted($rel)) { Say "Skipping suspicious entry: $rel"; continue }
         $path = Join-Path $game $rel
+        if ($kind -ne 'B' -and $back.ContainsKey($rel.ToLowerInvariant())) { continue }
         switch ($kind) {
-            { 'F', 'D', 'L' -contains $_ } { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force } }
+            'D' {
+                # OptiScaler\ as one entry (packages up to 0.1.0): everything in it was ours except other plugins put
+                # into OptiScaler\plugins after the install - those stay
+                if ($rel -ieq 'OptiScaler') { Remove-OldOptiScalerDir $path }
+                else { Remove-Path $path }
+            }
+            { 'F', 'L' -contains $_ } { Remove-Path $path }
+            'M' {
+                if ((Test-Path -LiteralPath $path -PathType Container) -and
+                    @(Get-ChildItem -LiteralPath $path -Force).Count -eq 0) { Remove-Item -LiteralPath $path -Force }
+            }
             'B' {
                 $keep = Join-Path $backup $rel
-                if (Test-Path -LiteralPath $keep) {
-                    if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force }
-                    Move-Item -LiteralPath $keep -Destination $path -Force
-                }
+                if (Test-Path -LiteralPath $keep) { Restore-Saved $keep $path }
             }
         }
     }
     if (Test-Path -LiteralPath $manifest) { Remove-Item -LiteralPath $manifest -Force }
-    if (Test-Path -LiteralPath $backup) {
-        if (@(Get-ChildItem -LiteralPath $backup -Recurse -File).Count -eq 0) { Remove-Item -LiteralPath $backup -Recurse -Force }
-        else { Say "Note: files in $backup were not put back; please check them by hand." }
-    }
+    Remove-EmptyDirs $backup
+    if (Test-Path -LiteralPath $backup) { Say "Note: files in $backup were not put back; please check them by hand." }
     Say "Uninstalled from $game."
+    foreach ($nrDocs in @(Get-NrDocumentsFolder)) { Say "NR's files of this game in Documents are kept (settings, log, NR Screenshots): $nrDocs" }
 }
 
 # Files the game creates while running; removed on uninstall as well.
-function Record-Logs([string[]]$names) { foreach ($n in $names) { Record "L $n" } }
+# A file of such a name already in the game folder (not this installation's - an earlier one was removed first; another
+# OptiScaler's log, a dlssnr-amd.ini put there by hand) is moved aside first, as every file the installation replaces;
+# -Ours: the file is the one this run has just written (moved aside before it was written).
+function Record-Logs([string[]]$names, [switch]$Ours) {
+    foreach ($n in $names) {
+        if (-not $Ours) { Save-Existing $n }
+        Record "L $n"
+    }
+}
 
 # ---- collect logs ----------------------------------------------------------------------------
 if ($Route -eq 'logs') {
@@ -257,7 +402,17 @@ if ($Route -eq 'logs') {
     foreach ($p in $patterns) {
         Get-ChildItem -LiteralPath $game -Filter $p -File -ErrorAction SilentlyContinue | Copy-Item -Destination $tmp
     }
-    $info = @("game: $game", "exe: $exe", "exe bits: $(Get-ExeBits $exe)", "package: $here", '')
+    # NR's folder in Documents (the game's folder could not be written): its log, settings and crash dump too
+    # (each of the game's folders there - one per exe it ran as - under its own name)
+    $nrDocsAll = @(Get-NrDocumentsFolder)
+    foreach ($nrDocs in $nrDocsAll) {
+        $inDocs = Join-Path (Join-Path $tmp 'documents-folder') (Split-Path -Leaf $nrDocs)
+        New-Item -ItemType Directory -Force -Path $inDocs | Out-Null
+        foreach ($p in 'dlssnr-amd.log', 'dlssnr-amd.ini', 'dlssnr-amd-crash.dmp', 'game-folder.txt') {
+            Get-ChildItem -LiteralPath $nrDocs -Filter $p -File -ErrorAction SilentlyContinue | Copy-Item -Destination $inDocs
+        }
+    }
+    $info = @("game: $game", "exe: $exe", "exe bits: $(Get-ExeBits $exe)", "package: $here", "NR's folders in Documents: $(if ($nrDocsAll.Count) { $nrDocsAll -join '; ' } else { 'none' })", '')
     $info += Get-CimInstance Win32_VideoController | ForEach-Object { "GPU: $($_.Name) driver $($_.DriverVersion) ($($_.DriverDate))" }
     $info += Get-CimInstance Win32_OperatingSystem | ForEach-Object { "OS: $($_.Caption) $($_.Version)" }
     $cs = Get-CimInstance Win32_ComputerSystem
@@ -304,6 +459,24 @@ if ($Route -eq 'logs') {
 }
 
 if ($Route -eq 'remove') { Remove-Installed; Finish 0 }
+# Files in dlssnr-amd-backup\ that the installation record does not name (an earlier uninstall could not put them back):
+# an install would move the game's files of those names there too, over them - stopped before anything is changed.
+if (Test-Path -LiteralPath $backup) {
+    $named = @()
+    if (Test-Path -LiteralPath $manifest) {
+        foreach ($line in @(Get-Content -LiteralPath $manifest -Encoding UTF8)) {
+            $line = $line.TrimStart([char]0xFEFF)
+            if ($line.Length -ge 3 -and $line.Substring(0, 1) -eq 'B') { $named += (Join-Path $backup $line.Substring(2)).ToLowerInvariant() }
+        }
+    }
+    foreach ($item in @(Get-ChildItem -LiteralPath $backup -Recurse -Force)) {
+        if ($item.PSIsContainer -and -not ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) { continue }
+        $at = $item.FullName.ToLowerInvariant()
+        if (-not ($named | Where-Object { $at -eq $_ -or $at.StartsWith($_ + '\') -or $at.StartsWith($_ + '/') })) {
+            Fail "$backup holds files an earlier uninstall did not put back ($($item.FullName)). Put them where they belong (or delete them), then install again."
+        }
+    }
+}
 
 # ---- LumeniteFX Kernel (the ReShade routes' optional motion vectors) -------------------------------------------------
 # Nothing of LumeniteFX is in this package (its AGNYA licence allows propagation only through its author's links), and
@@ -700,6 +873,11 @@ if ($Lumenite -eq 'on') {
     }
 }
 if (Test-Path -LiteralPath $manifest) { Say 'Found a previous installation, removing it first.'; Remove-Installed }
+# Files an earlier uninstall could not put back are still in dlssnr-amd-backup\: an install now would move the game's
+# files of those names there too, over them - stopped until they are dealt with.
+if ((Test-Path -LiteralPath $backup) -and @(Get-ChildItem -LiteralPath $backup -Force).Count -gt 0) {
+    Fail "$backup holds files an earlier uninstall did not put back. Put them where they belong (or delete them), then install again."
+}
 
 Set-Content -LiteralPath $manifest -Value "F $ManifestName" -Encoding UTF8
 Put-Tree (Join-Path $here 'dlssnr-amd') 'dlssnr-amd'
@@ -758,17 +936,18 @@ if ($Route -eq 'optiscaler') {
     # OptiScaler as released (its files unmodified): OptiScaler.dll as dxgi.dll, its ini, its OptiScaler\ folder; its
     # licences go into that folder (a Licenses folder of the game's own is not touched). Our NR plugin into
     # OptiScaler\plugins; NR Control's probe into dlssnr-amd\. The game keeps the system's own D3D11 / D3D12: NR runs
-    # on a Vulkan device of its own and shares the frame with it.
+    # on a Vulkan device of its own and shares the frame with it. OptiScaler\ file by file: other plugins in
+    # OptiScaler\plugins (OpenRR's openrr-amd.asi) stay where they are, before and after our install and on uninstall.
     $rel = Join-Path $here 'optiscaler\release'
     Put-File (Join-Path $rel 'OptiScaler.dll') 'dxgi.dll'
     Put-File (Join-Path $rel 'OptiScaler.ini') 'OptiScaler.ini'
-    Put-Tree (Join-Path $rel 'OptiScaler') 'OptiScaler'
-    $lic = Join-Path $game 'OptiScaler\Licenses'
-    New-Item -ItemType Directory -Force -Path $lic | Out-Null
-    if (Test-Path -LiteralPath (Join-Path $rel 'Licenses')) { Copy-Item -Path (Join-Path $rel 'Licenses\*') -Destination $lic -Recurse -Force }
-    Copy-Item -LiteralPath (Join-Path $here 'optiscaler\OptiScaler_LICENSE.txt') -Destination $lic -Force
-    New-Item -ItemType Directory -Force -Path (Join-Path $game 'OptiScaler\plugins') | Out-Null
-    Copy-Item -LiteralPath (Join-Path $here 'optiscaler\asi\dlssnr-amd.asi') -Destination (Join-Path $game 'OptiScaler\plugins\dlssnr-amd.asi') -Force
+    Put-Files (Join-Path $rel 'OptiScaler') 'OptiScaler'
+    Put-Dir 'OptiScaler\Licenses'
+    if (Test-Path -LiteralPath (Join-Path $rel 'Licenses')) { Put-Files (Join-Path $rel 'Licenses') 'OptiScaler\Licenses' }
+    Put-File (Join-Path $here 'optiscaler\OptiScaler_LICENSE.txt') 'OptiScaler\Licenses\OptiScaler_LICENSE.txt'
+    Put-File (Join-Path $here 'optiscaler\OptiScaler_SOURCE.txt') 'OptiScaler\Licenses\OptiScaler_SOURCE.txt'
+    Put-Dir 'OptiScaler\plugins'
+    Put-File (Join-Path $here 'optiscaler\asi\dlssnr-amd.asi') 'OptiScaler\plugins\dlssnr-amd.asi'
     Copy-Item -LiteralPath (Join-Path $here 'optiscaler\asi\nr_present_probe.exe') -Destination (Join-Path $game 'dlssnr-amd') -Force
     Record-Logs @('OptiScaler.log')
 
@@ -854,12 +1033,17 @@ if ($lumeniteFx -and -not $done['lumenite']) { Fail 'dlssnr-amd.ini: could not s
 if (-not $done['model'] -or ($Route -ne 'optiscaler' -and $RenoDX -eq 'on' -and -not $done['renodx'])) {
     Fail 'The package''s dlssnr-amd.ini is not as expected; unpack the package again.'
 }
+Save-Existing 'dlssnr-amd.ini'   # (one put there by hand: moved aside, back on uninstall)
 [System.IO.File]::WriteAllText($iniDst, (($lines -join "`r`n") + "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
 # The same file kept in dlssnr-amd\: a dlssnr-amd.ini that is deleted comes back from it at the next start, with the
 # choices made here (NR writes its built-in defaults only when this copy is missing too).
 [System.IO.File]::WriteAllText((Join-Path $game 'dlssnr-amd\dlssnr-amd.default.ini'), (($lines -join "`r`n") + "`r`n"),
     (New-Object System.Text.UTF8Encoding($false)))
-Record-Logs @('dlssnr-amd.ini')
+# The game's folder cannot be written while the game runs (Game Pass, Program Files): NR reads the copy in its folder in
+# Documents - written again too, so the choices made here count there as well.
+Record-Logs @('dlssnr-amd.ini') -Ours
+# (run elevated by this script: the player's own run does it after this one)
+if (-not $Elevated) { Set-NrDocumentsIni $iniDst }
 
 Say ''
 $style = if ($RenoDX -eq 'on') { 'RenoDX style' } else { 'wilsjo2 style' }
@@ -874,7 +1058,7 @@ if ($Route -eq 'optiscaler') {
     Say 'NR setting: processing, network, Passes); Insert opens the OptiScaler menu (upscaling and frame generation only).'
     Say 'If NR Control keeps waiting for the game''s upscaler, set [Spoofing] Dxgi=false in OptiScaler.ini and try again.'
     Say 'If colours turn green or grainy after NR (007 First Light, for example), try [Preprocess] in dlssnr-amd.ini, or press Ctrl+F10 in the game.'
-    Say 'F5 takes screenshots (the same frame without and with NR) into NR Screenshots in the game folder.'
+    Say 'F5 takes screenshots (the same frame without and with NR) into NR Screenshots in the game folder (in Documents\DLSSNR-AMD when the game folder cannot be written while it runs).'
 } else {
     Say 'In the game, Home opens ReShade; the settings are on the Add-ons page, or edit dlssnr-amd.ini directly.'
     if ($lumeniteFx) {
@@ -887,7 +1071,7 @@ if ($Route -eq 'optiscaler') {
     } else {
         Say 'Processing before and after NR: the wilsjo2 style ([RenoDX] Enabled = 0), settings on the Add-ons page (that is [DlssNr]).'
     }
-    Say 'For stacking use Passes on the Add-ons page. F5 takes screenshots (the same frame without and with NR) into NR Screenshots in the game folder.'
+    Say 'For stacking use Passes on the Add-ons page. F5 takes screenshots (the same frame without and with NR) into NR Screenshots in the game folder (in Documents\DLSSNR-AMD when the game folder cannot be written while it runs).'
 }
 Say 'The first time NR runs in a game the network has to compile; it takes effect after about a minute. This happens once for each game.'
 Say 'Uninstall: run install.bat again and choose 5.'
