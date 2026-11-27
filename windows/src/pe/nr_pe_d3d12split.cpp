@@ -1740,3 +1740,19 @@ void set_split_execution_hooks(SplitBeginFn begin_fn, SplitEndFn end_fn) {
 }
 
 }  // namespace nr::pe::split
+
+extern "C" __declspec(dllexport) void* NR_OrigD3D12ListMethod(void** vt, unsigned slot) {
+#if defined(_M_X64) || defined(__x86_64__)
+    return nr::pe::split::orig_list_method(vt, slot);
+#else
+    return vt ? vt[slot] : nullptr;
+#endif
+}
+
+extern "C" __declspec(dllexport) void* NR_OrigD3D12DeviceCreateCL(void** dvt) {
+#if defined(_M_X64) || defined(__x86_64__)
+    return nr::pe::split::orig_device_create_cl(dvt);
+#else
+    return dvt ? dvt[12] : nullptr;
+#endif
+}

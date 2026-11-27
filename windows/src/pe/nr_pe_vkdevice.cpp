@@ -17,6 +17,8 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace nr::pe::vkdevice {
@@ -24,9 +26,18 @@ namespace {
 
 using nr::pe::log;
 
+bool is_internal_vk_app(const VkInstanceCreateInfo* info) {
+    if (!info || !info->pApplicationInfo || !info->pApplicationInfo->pApplicationName) return false;
+    const char* n = info->pApplicationInfo->pApplicationName;
+    return _strnicmp(n, "openrr", 6) == 0 || _strnicmp(n, "dlssnr-amd", 10) == 0;
+}
+
 std::mutex lock;
 DeviceHandles seen{};
 nr::InstanceApiTracker instance_tracker;
+std::unordered_set<VkInstance> internal_instances;
+std::unordered_map<VkPhysicalDevice, VkInstance> internal_physicals;
+std::unordered_set<VkDevice> internal_devices;
 
 nr::InstanceApiInfo lookup_instance_api(VkPhysicalDevice physical) {
     std::lock_guard<std::mutex> guard(lock);
@@ -47,6 +58,7 @@ using PFN_CreateInstance = VkResult(VKAPI_PTR*)(const VkInstanceCreateInfo*,
 using PFN_DestroyInstance = void(VKAPI_PTR*)(VkInstance, const VkAllocationCallbacks*);
 using PFN_CreateDevice = VkResult(VKAPI_PTR*)(VkPhysicalDevice, const VkDeviceCreateInfo*,
                                               const VkAllocationCallbacks*, VkDevice*);
+using PFN_DestroyDevice = void(VKAPI_PTR*)(VkDevice, const VkAllocationCallbacks*);
 using PFN_GetDeviceQueue = void(VKAPI_PTR*)(VkDevice, uint32_t, uint32_t, VkQueue*);
 // The Vulkan 1.1 form. A game that asks for its queues this way left every one
 // of them unrecorded, and the present queue's family unknown - which is exactly
@@ -57,6 +69,7 @@ using PFN_EnumeratePhysicalDevices = VkResult(VKAPI_PTR*)(VkInstance, uint32_t*,
 PFN_CreateInstance real_create_instance = nullptr;
 PFN_DestroyInstance real_destroy_instance = nullptr;
 PFN_CreateDevice real_create_device = nullptr;
+PFN_DestroyDevice real_destroy_device = nullptr;
 PFN_GetDeviceQueue real_get_device_queue = nullptr;
 PFN_GetDeviceQueue2 real_get_device_queue2 = nullptr;
 PFN_EnumeratePhysicalDevices real_enumerate_physical_devices = nullptr;
@@ -68,16 +81,35 @@ VkResult VKAPI_PTR hooked_create_instance(const VkInstanceCreateInfo* info,
                                           const VkAllocationCallbacks* allocator,
                                           VkInstance* out) {
     const VkResult r = real_create_instance(info, allocator, out);
-    if (r == VK_SUCCESS && out && *out && !nr::pe::bridge::creating_device()) {
-        note_instance(*out, info);
-        std::lock_guard<std::mutex> guard(lock);
-        seen.instance = *out;
+    if (r == VK_SUCCESS && out && *out) {
+        const bool internal = nr::pe::bridge::creating_device() || is_internal_vk_app(info);
+        if (internal) {
+            std::lock_guard<std::mutex> guard(lock);
+            internal_instances.insert(*out);
+        } else {
+            note_instance(*out, info);
+            std::lock_guard<std::mutex> guard(lock);
+            seen.instance = *out;
+        }
     }
     return r;
 }
 
 void VKAPI_PTR hooked_destroy_instance(VkInstance instance, const VkAllocationCallbacks* allocator) {
-    if (instance && !nr::pe::bridge::creating_device()) forget_instance(instance);
+    if (instance) {
+        bool was_internal = false;
+        {
+            std::lock_guard<std::mutex> guard(lock);
+            was_internal = internal_instances.erase(instance) != 0;
+            if (was_internal) {
+                for (auto it = internal_physicals.begin(); it != internal_physicals.end();) {
+                    if (it->second == instance) it = internal_physicals.erase(it);
+                    else ++it;
+                }
+            }
+        }
+        if (!was_internal && !nr::pe::bridge::creating_device()) forget_instance(instance);
+    }
     real_destroy_instance(instance, allocator);
 }
 
@@ -89,11 +121,22 @@ VkResult VKAPI_PTR hooked_enumerate_physical_devices(VkInstance instance, uint32
                                                      VkPhysicalDevice* out) {
     const VkResult r = real_enumerate_physical_devices(instance, count, out);
     if (instance && !nr::pe::bridge::creating_device()) {
-        if ((r == VK_SUCCESS || r == VK_INCOMPLETE) && out && count)
+        bool internal = false;
+        {
+            std::lock_guard<std::mutex> guard(lock);
+            internal = internal_instances.count(instance) != 0;
+            if (internal) {
+                if ((r == VK_SUCCESS || r == VK_INCOMPLETE) && out && count) {
+                    for (uint32_t i = 0; i < *count; ++i)
+                        if (out[i] != VK_NULL_HANDLE) internal_physicals[out[i]] = instance;
+                }
+            } else {
+                if (!seen.instance) log("[nr] Vulkan instance learned from vkEnumeratePhysicalDevices");
+                seen.instance = instance;
+            }
+        }
+        if (!internal && (r == VK_SUCCESS || r == VK_INCOMPLETE) && out && count)
             note_physical_devices(instance, *count, out);
-        std::lock_guard<std::mutex> guard(lock);
-        if (!seen.instance) log("[nr] Vulkan instance learned from vkEnumeratePhysicalDevices");
-        seen.instance = instance;
     }
     return r;
 }
@@ -234,18 +277,27 @@ bool augment(VkPhysicalDevice physical, const VkDeviceCreateInfo* info, Augmente
 
 VkResult VKAPI_PTR hooked_create_device(VkPhysicalDevice physical, const VkDeviceCreateInfo* info,
                                         const VkAllocationCallbacks* allocator, VkDevice* out) {
-    // The bridge's own device (nr_pe_bridge.hpp) is not the game's: passed straight through, unrecorded.
+    // The bridge's own device (nr_pe_bridge.hpp) and peer internal plugin devices are not the game's.
     if (nr::pe::bridge::creating_device()) return real_create_device(physical, info, allocator, out);
-    // The physical device is known before the call; ReShade's Vulkan layer
-    // fires its device events from inside this very call, so anything that
-    // runs then must already find it.
+    bool internal = false;
     {
         std::lock_guard<std::mutex> guard(lock);
-        seen.physical = physical;
-        requested_families.clear();
-        if (info)
-            for (uint32_t i = 0; i < info->queueCreateInfoCount; ++i)
-                requested_families.push_back(info->pQueueCreateInfos[i].queueFamilyIndex);
+        internal = internal_physicals.count(physical) != 0;
+        if (!internal) {
+            seen.physical = physical;
+            requested_families.clear();
+            if (info)
+                for (uint32_t i = 0; i < info->queueCreateInfoCount; ++i)
+                    requested_families.push_back(info->pQueueCreateInfos[i].queueFamilyIndex);
+        }
+    }
+    if (internal) {
+        const VkResult r = real_create_device(physical, info, allocator, out);
+        if (r == VK_SUCCESS && out && *out) {
+            std::lock_guard<std::mutex> guard(lock);
+            internal_devices.insert(*out);
+        }
+        return r;
     }
     Augmented augmented;
     bool added = false;
@@ -267,6 +319,7 @@ VkResult VKAPI_PTR hooked_create_device(VkPhysicalDevice physical, const VkDevic
     if (r == VK_SUCCESS && out && *out) {
         {
             std::lock_guard<std::mutex> guard(lock);
+            internal_devices.erase(*out);
             seen.physical = physical;
             seen.device = *out;
             if (added) augmented_devices.push_back(*out);
@@ -278,12 +331,21 @@ VkResult VKAPI_PTR hooked_create_device(VkPhysicalDevice physical, const VkDevic
     return r;
 }
 
+void VKAPI_PTR hooked_destroy_device(VkDevice device, const VkAllocationCallbacks* allocator) {
+    if (device) {
+        std::lock_guard<std::mutex> guard(lock);
+        internal_devices.erase(device);
+    }
+    real_destroy_device(device, allocator);
+}
+
 void VKAPI_PTR hooked_get_device_queue(VkDevice device, uint32_t family, uint32_t index,
                                        VkQueue* out) {
     real_get_device_queue(device, family, index, out);
     if (!out || !*out) return;
     if (nr::pe::bridge::creating_device() || nr::pe::bridge::is_own_device(device)) return;
     std::lock_guard<std::mutex> guard(lock);
+    if (internal_devices.count(device) != 0) return;
     for (const auto& q : queues)
         if (q.queue == *out) return;
     queues.push_back({device, family, *out});
@@ -295,6 +357,7 @@ void VKAPI_PTR hooked_get_device_queue2(VkDevice device, const VkDeviceQueueInfo
     if (!out || !*out || !info) return;
     if (nr::pe::bridge::creating_device() || nr::pe::bridge::is_own_device(device)) return;
     std::lock_guard<std::mutex> guard(lock);
+    if (internal_devices.count(device) != 0) return;
     for (const auto& q : queues)
         if (q.queue == *out) return;
     queues.push_back({device, info->queueFamilyIndex, *out});
@@ -369,6 +432,8 @@ bool install() {
          reinterpret_cast<void**>(&real_destroy_instance)},
         {"vkCreateDevice", reinterpret_cast<void*>(&hooked_create_device),
          reinterpret_cast<void**>(&real_create_device)},
+        {"vkDestroyDevice", reinterpret_cast<void*>(&hooked_destroy_device),
+         reinterpret_cast<void**>(&real_destroy_device)},
         {"vkGetDeviceQueue", reinterpret_cast<void*>(&hooked_get_device_queue),
          reinterpret_cast<void**>(&real_get_device_queue)},
         {"vkEnumeratePhysicalDevices", reinterpret_cast<void*>(&hooked_enumerate_physical_devices),
@@ -466,6 +531,7 @@ std::string gpu_name() {
 void forget_device(VkDevice device) {
     if (!device) return;
     std::lock_guard<std::mutex> guard(lock);
+    internal_devices.erase(device);
     queues.erase(std::remove_if(queues.begin(), queues.end(), [device](const Queue& q) { return q.device == device; }),
                  queues.end());
     if (seen.device == device) { seen.device = VK_NULL_HANDLE; requested_families.clear(); }

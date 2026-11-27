@@ -10,6 +10,8 @@ namespace nr::pe::d3d12_direct {
 
 // Installs D3D12Core hooks on command list, command allocator, device, and command queue.
 bool install_hooks(ID3D12Device* dev, ID3D12GraphicsCommandList* cl = nullptr, std::string* why = nullptr);
+bool in_record();
+void refresh_peer();
 
 // Records an ID3D12CommandSignature's indirect argument layout (safe to call before install_hooks()).
 void note_command_signature(ID3D12CommandSignature* sig, const D3D12_COMMAND_SIGNATURE_DESC* desc);

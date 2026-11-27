@@ -216,6 +216,7 @@ void read_ini_barriers() {
     g_ini.color = get("ColorResourceBarrier");
     g_ini.depth = get("DepthResourceBarrier");
     g_ini.motion = get("MVResourceBarrier");
+    if (g_ini.motion < 0) g_ini.motion = get("MotionVectorResourceBarrier");
     g_ini.exposure = get("ExposureResourceBarrier");
     g_ini.output = get("OutputResourceBarrier");
 }
@@ -285,6 +286,16 @@ unsigned get_uint(const NVSDK_NGX_Parameter* p, const char* name, unsigned fallb
     int i = 0;
     if (p->Get(name, &i) == NVSDK_NGX_Result_Success) return unsigned(i);
     return fallback;
+}
+unsigned get_motion_base(const NVSDK_NGX_Parameter* p, bool x) {
+    unsigned u = 0;
+    if (p->Get(x ? "DLSS.Input.MV.Subrect.Base.X" : "DLSS.Input.MV.Subrect.Base.Y", &u) == NVSDK_NGX_Result_Success)
+        return u;
+    int i = 0;
+    if (p->Get(x ? "DLSS.Input.MV.Subrect.Base.X" : "DLSS.Input.MV.Subrect.Base.Y", &i) == NVSDK_NGX_Result_Success &&
+        i >= 0)
+        return unsigned(i);
+    return get_uint(p, x ? "DLSS.Input.MV.SubrectBase.X" : "DLSS.Input.MV.SubrectBase.Y");
 }
 bool get_float(const NVSDK_NGX_Parameter* p, const char* name, float* out) {
     float f = 0.f;
@@ -361,24 +372,64 @@ bool hold_released(int row) { return g_hold_released.erase(row) != 0; }
 // OutWidth while the create block and the output resource say the display size; the SDK's evaluate helper never
 // writes OutWidth): Width / Height and OutWidth / OutHeight, 0 not given.
 struct CreateSizes { uint32_t in_w = 0, in_h = 0, out_w = 0, out_h = 0; };
+uint32_t valid_extent(unsigned v) { return (v >= 20u && v <= 16384u) ? uint32_t(v) : 0u; }
 CreateSizes create_sizes(const NVSDK_NGX_Parameter* p) {
     CreateSizes c;
     if (!p) return c;
-    unsigned int v = 0;
-    if (p->Get("Width", &v) == NVSDK_NGX_Result_Success) c.in_w = v;
-    if (p->Get("Height", &v) == NVSDK_NGX_Result_Success) c.in_h = v;
-    if (p->Get("OutWidth", &v) == NVSDK_NGX_Result_Success) c.out_w = v;
-    if (p->Get("OutHeight", &v) == NVSDK_NGX_Result_Success) c.out_h = v;
+    c.in_w = valid_extent(get_uint(p, "Width"));
+    c.in_h = valid_extent(get_uint(p, "Height"));
+    c.out_w = valid_extent(get_uint(p, "OutWidth"));
+    c.out_h = valid_extent(get_uint(p, "OutHeight"));
+    if (c.in_w && c.in_h && c.out_w && c.out_h &&
+        c.in_w >= c.out_w && c.in_h >= c.out_h && (c.in_w > c.out_w || c.in_h > c.out_h)) {
+        std::swap(c.in_w, c.out_w);
+        std::swap(c.in_h, c.out_h);
+    }
     return c;
+}
+struct CreateSnapshot {
+    CreateSizes sizes;
+    bool flags_known = false;
+    uint32_t flags = 0;
+};
+CreateSnapshot snapshot_create(const NVSDK_NGX_Parameter* p) {
+    CreateSnapshot s;
+    s.sizes = create_sizes(p);
+    int flags = 0;
+    if (p && p->Get("DLSS.Feature.Create.Flags", &flags) == NVSDK_NGX_Result_Success) {
+        s.flags = uint32_t(flags);
+        s.flags_known = true;
+    }
+    return s;
+}
+void merge_create_snapshot(CreateSnapshot& s, const NVSDK_NGX_Parameter* p) {
+    if (!p) return;
+    const CreateSizes post = create_sizes(p);
+    if (!s.sizes.in_w) s.sizes.in_w = post.in_w;
+    if (!s.sizes.in_h) s.sizes.in_h = post.in_h;
+    if (!s.sizes.out_w) s.sizes.out_w = post.out_w;
+    if (!s.sizes.out_h) s.sizes.out_h = post.out_h;
+    if (s.sizes.in_w && s.sizes.in_h && s.sizes.out_w && s.sizes.out_h &&
+        s.sizes.in_w >= s.sizes.out_w && s.sizes.in_h >= s.sizes.out_h &&
+        (s.sizes.in_w > s.sizes.out_w || s.sizes.in_h > s.sizes.out_h)) {
+        std::swap(s.sizes.in_w, s.sizes.out_w);
+        std::swap(s.sizes.in_h, s.sizes.out_h);
+    }
+    if (!s.flags_known) {
+        int flags = 0;
+        if (p->Get("DLSS.Feature.Create.Flags", &flags) == NVSDK_NGX_Result_Success) {
+            s.flags = uint32_t(flags);
+            s.flags_known = true;
+        }
+    }
 }
 // NROutputRect: Auto uses create, then evaluate, then resource size. Declared uses evaluate then resource;
 // Resource uses the allocation. Auto logs a disagreement between the create and evaluate sizes.
 uint32_t output_rect_mode();
 void output_size(const NVSDK_NGX_Parameter* p, const CreateSizes& c, uint32_t res_w, uint32_t res_h, uint32_t* w,
                  uint32_t* h) {
-    unsigned int ew = 0, eh = 0;
-    p->Get("OutWidth", &ew);
-    p->Get("OutHeight", &eh);
+    const uint32_t ew = valid_extent(get_uint(p, "OutWidth"));
+    const uint32_t eh = valid_extent(get_uint(p, "OutHeight"));
     const uint32_t mode = output_rect_mode();
     if (mode == 2) { *w = res_w; *h = res_h; return; }
     if (mode == 1) { *w = ew ? ew : res_w; *h = eh ? eh : res_h; return; }
@@ -391,8 +442,15 @@ void output_size(const NVSDK_NGX_Parameter* p, const CreateSizes& c, uint32_t re
                 "output resource is %ux%u)", ew, eh, c.out_w, c.out_h, res_w, res_h);
         }
     } else {
-        *w = ew ? ew : res_w;
-        *h = eh ? eh : res_h;
+        const uint32_t iw = valid_extent(get_uint(p, "Width"));
+        const uint32_t ih = valid_extent(get_uint(p, "Height"));
+        if (iw && ih && ew && eh && iw >= ew && ih >= eh && (iw > ew || ih > eh) && iw <= res_w && ih <= res_h) {
+            *w = iw;
+            *h = ih;
+        } else {
+            *w = ew ? ew : res_w;
+            *h = eh ? eh : res_h;
+        }
     }
 }
 
@@ -487,21 +545,18 @@ void forget(Tracked& t) {
 
 NVSDK_NGX_Result NR_NGX_MSABI hk_create(ID3D12GraphicsCommandList* cmd, NVSDK_NGX_Feature feature,
                                         NVSDK_NGX_Parameter* p, NVSDK_NGX_Handle** out) {
+    CreateSnapshot snap = snapshot_create(p);
     const NVSDK_NGX_Result r = real_create(cmd, feature, p, out);
     if (r == NVSDK_NGX_Result_Success && out && *out) {
+        merge_create_snapshot(snap, p);
         std::lock_guard<std::mutex> guard(g_lock);
         Tracked& t = g_features[(*out)->Id];
         forget(t);
         t = Tracked{};
         t.feature = int(feature);
-        t.create = create_sizes(p);
-        if (p) {
-            int flags = 0;
-            if (p->Get("DLSS.Feature.Create.Flags", &flags) == NVSDK_NGX_Result_Success) {
-                t.flags = uint32_t(flags);
-                t.flags_known = true;
-            }
-        }
+        t.create = snap.sizes;
+        t.flags = snap.flags;
+        t.flags_known = snap.flags_known;
         log("[nr] OptiScaler feature %u made: NGX feature %d, flags 0x%x%s", (*out)->Id, int(feature), t.flags,
             t.flags_known ? "" : " (not given)");
     }
@@ -771,14 +826,37 @@ bool read_frame(const NVSDK_NGX_Parameter* p, const Tracked& t, Frame& f) {
         }
     }
     const D3D12_RESOURCE_DESC cd = f.color->GetDesc(), od = f.output->GetDesc();
-    f.render_w = f.subrect_w = get_uint(p, "DLSS.Render.Subrect.Dimensions.Width");
-    f.render_h = f.subrect_h = get_uint(p, "DLSS.Render.Subrect.Dimensions.Height");
-    if (!f.render_w || !f.render_h) {   // the evaluate's Width / Height, else the create block's, else the colour's
-        f.render_w = get_uint(p, "Width", t.create.in_w ? t.create.in_w : uint32_t(cd.Width));
-        f.render_h = get_uint(p, "Height", t.create.in_h ? t.create.in_h : cd.Height);
+    const uint32_t cw = uint32_t(cd.Width), ch = cd.Height;
+    f.subrect_w = valid_extent(get_uint(p, "DLSS.Render.Subrect.Dimensions.Width"));
+    f.subrect_h = valid_extent(get_uint(p, "DLSS.Render.Subrect.Dimensions.Height"));
+    if (f.subrect_w && f.subrect_h) {
+        f.render_w = f.subrect_w;
+        f.render_h = f.subrect_h;
+    } else {
+        const uint32_t ew = valid_extent(get_uint(p, "Width"));
+        const uint32_t eh = valid_extent(get_uint(p, "Height"));
+        const uint32_t ow = valid_extent(get_uint(p, "OutWidth"));
+        const uint32_t oh = valid_extent(get_uint(p, "OutHeight"));
+        if (ew && eh && ow && oh && ew >= ow && eh >= oh && (ew > ow || eh > oh) && ow <= cw && oh <= ch) {
+            f.render_w = ow;
+            f.render_h = oh;
+        } else if (ew && eh && ew <= cw && eh <= ch) {
+            f.render_w = ew;
+            f.render_h = eh;
+        } else {
+            f.render_w = t.create.in_w ? t.create.in_w : cw;
+            f.render_h = t.create.in_h ? t.create.in_h : ch;
+        }
     }
     f.color_x = get_uint(p, "DLSS.Input.Color.Subrect.Base.X");
     f.color_y = get_uint(p, "DLSS.Input.Color.Subrect.Base.Y");
+    if (f.color_x >= cw || f.color_y >= ch) { f.color_x = f.color_y = 0; }
+    f.render_w = std::max<uint32_t>(1u, std::min<uint32_t>(f.render_w, cw - f.color_x));
+    f.render_h = std::max<uint32_t>(1u, std::min<uint32_t>(f.render_h, ch - f.color_y));
+    if (!f.subrect_w || !f.subrect_h) {
+        f.subrect_w = f.render_w;
+        f.subrect_h = f.render_h;
+    }
     f.out_x = get_uint(p, "DLSS.Output.Subrect.Base.X");
     f.out_y = get_uint(p, "DLSS.Output.Subrect.Base.Y");
     output_size(p, t.create, uint32_t(od.Width), od.Height, &f.out_w, &f.out_h);
@@ -791,21 +869,29 @@ bool read_frame(const NVSDK_NGX_Parameter* p, const Tracked& t, Frame& f) {
     // vectors from theirs at the render extent, or at the output's when the game says they are at display size.
     f.depth_rect = {get_uint(p, "DLSS.Input.Depth.Subrect.Base.X"), get_uint(p, "DLSS.Input.Depth.Subrect.Base.Y"),
                     f.render_w, f.render_h};
+    if (f.depth) {
+        const D3D12_RESOURCE_DESC dd = f.depth->GetDesc();
+        const uint32_t dw = uint32_t(dd.Width), dh = dd.Height;
+        if (f.depth_rect.x >= dw || f.depth_rect.y >= dh) { f.depth_rect.x = f.depth_rect.y = 0; }
+        f.depth_rect.width = std::min<uint32_t>(f.depth_rect.width, dw - f.depth_rect.x);
+        f.depth_rect.height = std::min<uint32_t>(f.depth_rect.height, dh - f.depth_rect.y);
+    }
     const bool low_res_mv = !f.flags_known || (f.flags & kFlagMvLowRes) != 0;
-    f.motion_rect = {get_uint(p, "DLSS.Input.MV.SubrectBase.X"), get_uint(p, "DLSS.Input.MV.SubrectBase.Y"),
+    f.motion_rect = {get_motion_base(p, true), get_motion_base(p, false),
                      low_res_mv ? f.render_w : f.out_w, low_res_mv ? f.render_h : f.out_h};
-    if (!low_res_mv && f.motion) {   // display-size vectors declared that the resource cannot hold: the part it holds (0.0.7's)
+    if (f.motion) {   // vectors declared beyond the resource: clamped to the part it holds
         const D3D12_RESOURCE_DESC md = f.motion->GetDesc();
-        if (f.motion_rect.x + f.motion_rect.width > md.Width || f.motion_rect.y + f.motion_rect.height > md.Height) {
+        const uint32_t mw = uint32_t(md.Width), mh = md.Height;
+        if (!low_res_mv && (uint64_t(f.motion_rect.x) + f.motion_rect.width > mw ||
+                            uint64_t(f.motion_rect.y) + f.motion_rect.height > mh)) {
             static int said = 0;
             if (said++ < 2)
                 log("[nr] the game says its motion vectors are at the output's size (%ux%u) but they are %llux%u: the part "
                     "they cover is read", f.motion_rect.width, f.motion_rect.height, (unsigned long long)md.Width, md.Height);
-            f.motion_rect.x = std::min<uint32_t>(f.motion_rect.x, uint32_t(md.Width));
-            f.motion_rect.y = std::min<uint32_t>(f.motion_rect.y, md.Height);
-            f.motion_rect.width = std::min<uint32_t>(f.motion_rect.width, uint32_t(md.Width) - f.motion_rect.x);
-            f.motion_rect.height = std::min<uint32_t>(f.motion_rect.height, md.Height - f.motion_rect.y);
         }
+        if (f.motion_rect.x >= mw || f.motion_rect.y >= mh) { f.motion_rect.x = f.motion_rect.y = 0; }
+        f.motion_rect.width = std::min<uint32_t>(f.motion_rect.width, mw - f.motion_rect.x);
+        f.motion_rect.height = std::min<uint32_t>(f.motion_rect.height, mh - f.motion_rect.y);
     }
     f.reset = get_uint(p, "Reset") != 0;
     if (!get_float(p, "DLSS.Pre.Exposure", &f.pre_exposure) || !(f.pre_exposure > 1e-6f) || !std::isfinite(f.pre_exposure)) f.pre_exposure = 1.0f;
@@ -2032,13 +2118,14 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
     if (runs.empty()) return;
     // Frame generation (present_path.hpp RunPresentPath): a matching DLSS-G declaration is authoritative; without one
     // the cadence of presents against fresh captures, over windows (nr_present_cadence.hpp)
-    const ULONGLONG now_ms = GetTickCount64();
+    ULONGLONG now_ms = GetTickCount64();
     g_present.back_w = w;
     g_present.back_h = h;
     const auto fresh = [&](const GuideSet& gs) {
         return gs.serial && aspect_matches(gs.out_w, gs.out_h, w, h) &&
-               (g_present.presents - gs.captured_at <= kPresentGuideMaxAge * g_present.multiplier ||
-                now_ms - gs.captured_ms <= kPresentGuideMaxAgeMs);
+               ((g_present.presents <= gs.captured_at ||
+                 g_present.presents - gs.captured_at <= kPresentGuideMaxAge * g_present.multiplier) ||
+                (now_ms <= gs.captured_ms || now_ms - gs.captured_ms <= kPresentGuideMaxAgeMs));
     };   // (the age in presents: generated ones included, where they reach this hook)
     const auto& decl = g_present.declaration;
     const uint32_t declared = decl.multiplier && decl.w == w && decl.h == h &&
@@ -2094,6 +2181,7 @@ void present_layers(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool top, con
         if (g_present.device != device || !g_present.list || !g_present.target || g_present.fence != fence_was ||
             g_present.target != target_was || g_present.slot_value[slot] != waited_for || g_present.submitted != submitted_was)
             return;
+        now_ms = GetTickCount64();
         done = g_present.fence->GetCompletedValue();
         if (!completed || done < waited_for) {
             g_present.slot_wait_off = true;
@@ -4390,7 +4478,7 @@ nr::asi::Wilsjo2Frame wilsjo2_frame(const NVSDK_NGX_Parameter* p, const Frame& f
     w.depth_rect = guide_subrect(f.depth, f.subrect_w, f.subrect_h, get_uint(p, "DLSS.Input.Depth.Subrect.Base.X"),
                                  get_uint(p, "DLSS.Input.Depth.Subrect.Base.Y"));
     w.motion_rect = guide_subrect(f.motion, low_res_mv ? f.subrect_w : f.out_w, low_res_mv ? f.subrect_h : f.out_h,
-                                  get_uint(p, "DLSS.Input.MV.SubrectBase.X"), get_uint(p, "DLSS.Input.MV.SubrectBase.Y"));
+                                  get_motion_base(p, true), get_motion_base(p, false));
     return w;
 }
 
@@ -4924,18 +5012,6 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_evaluate(ID3D12GraphicsCommandList* cmd, const 
     }
     const nr::asi::Wilsjo2Frame wf = wilsjo2_frame(p, f, st);
     g_present.wanted = present_wanted;
-    if (present_wanted) {
-        bool depth_wanted = nr::pe::g_motion_without_depth_now.load() != 1 || chain->inspect.hold;
-        for (const Layer& l : chain->layers)
-            // (Passes (fast) Interleaved reads the depth itself - its anti-ghost's disocclusion test and vector
-            // dilation - whatever the network does: without the copy those tests never ran at Present)
-            // (NRFrameReuse needs it too: its rebuilt frames' surface tests and the uncovered places)
-            depth_wanted |= present_layer(l) && (l.cfg.processing == nr::pe::Processing::kWilsjo2 ||
-                                                 (renodx_layer(l) && l.cfg.renodx.values.passes_mode == 1u &&
-                                                  l.cfg.renodx.values.fast_method == 0u) ||
-                                                 (renodx_layer(l) && l.cfg.renodx.values.frame_reuse));
-        capture_guides(cmd, device, f, st, wf, h->Id, depth_wanted);
-    }
 
     NVSDK_NGX_Result r;
     if (!before.empty()) {
@@ -5093,12 +5169,22 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_evaluate(ID3D12GraphicsCommandList* cmd, const 
     }
 after_layers:
     if (r != NVSDK_NGX_Result_Success) return r;
-    if (after.empty()) return r;
+    if (!present_wanted && after.empty()) return r;
 
     // After the upscaler: the layers on its output, in place, on the same command list.
     guard.lock();
     const auto it = g_features.find(h->Id);   // released meanwhile on another thread: nothing to run on
     if (it == g_features.end()) return r;
+    if (present_wanted) {
+        bool depth_wanted = nr::pe::g_motion_without_depth_now.load() != 1 || chain->inspect.hold;
+        for (const Layer& l : chain->layers)
+            depth_wanted |= present_layer(l) && (l.cfg.processing == nr::pe::Processing::kWilsjo2 ||
+                                                 (renodx_layer(l) && l.cfg.renodx.values.passes_mode == 1u &&
+                                                  l.cfg.renodx.values.fast_method == 0u) ||
+                                                 (renodx_layer(l) && l.cfg.renodx.values.frame_reuse));
+        capture_guides(cmd, device, f, st, wf, h->Id, depth_wanted);
+    }
+    if (after.empty()) return r;
     Tracked& t2 = it->second;
     match_layers(t2, *chain);
     const D3D12_RESOURCE_DESC od = f.output->GetDesc();
@@ -5200,19 +5286,54 @@ bool is_vulkan_ngx_engine(HMODULE m) {
     const HMODULE client = g_ngx_vk_client.load(std::memory_order_acquire);
     return (client && m == client) || is_rtx_remix_module(m);
 }
+bool is_peer_or_wrapper_module(HMODULE m) {
+    if (!m) return false;
+    if (m == g_self || m == g_opti) return true;
+    wchar_t path[MAX_PATH * 4]{};
+    const DWORD len = GetModuleFileNameW(m, path, static_cast<DWORD>(std::size(path)));
+    if (len == 0 || len >= std::size(path)) return false;
+    const wchar_t* slash = std::wcsrchr(path, L'\\');
+    const wchar_t* fslash = std::wcsrchr(path, L'/');
+    const wchar_t* sep = (slash && fslash) ? (slash > fslash ? slash : fslash) : (slash ? slash : fslash);
+    const wchar_t* base = sep ? sep + 1 : path;
+    return _wcsnicmp(base, L"openrr-amd", 10) == 0 || _wcsnicmp(base, L"dlssnr-amd", 10) == 0;
+}
+bool is_translator_module(HMODULE m) {
+    if (!m || is_vulkan_ngx_engine(m)) return false;
+    for (const wchar_t* name : {L"d3d12core.dll", L"d3d12.dll", L"d3d11.dll", L"dxgi.dll", L"d3d10core.dll", L"d3d9.dll"})
+        if (HMODULE t = GetModuleHandleW(name); t && t == m) return true;
+    return false;
+}
 // Whether `address` (a vkCreateDevice caller) is in vkd3d-proton's or DXVK's modules.
 bool in_translator(void* address) {
     HMODULE m = nullptr;
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                             reinterpret_cast<LPCWSTR>(address), &m) || !m)
         return false;
-    if (is_vulkan_ngx_engine(m)) return false;
-    for (const wchar_t* name : {L"d3d12core.dll", L"d3d12.dll", L"d3d11.dll", L"dxgi.dll", L"d3d10core.dll", L"d3d9.dll"})
-        if (HMODULE t = GetModuleHandleW(name); t && t == m) return true;
+    if (is_translator_module(m)) return true;
+    if (!is_peer_or_wrapper_module(m)) return false;
+    void* frames[8]{};
+    const USHORT count = RtlCaptureStackBackTrace(1, 8, frames, nullptr);
+    for (USHORT i = 0; i < count; ++i) {
+        HMODULE fm = nullptr;
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                reinterpret_cast<LPCWSTR>(frames[i]), &fm) || !fm)
+            continue;
+        if (is_peer_or_wrapper_module(fm)) continue;
+        return is_translator_module(fm);
+    }
     return false;
+}
+bool is_internal_vk_app(const VkInstanceCreateInfo* ci) {
+    if (!ci || !ci->pApplicationInfo || !ci->pApplicationInfo->pApplicationName) return false;
+    const char* n = ci->pApplicationInfo->pApplicationName;
+    return _strnicmp(n, "openrr", 6) == 0 || _strnicmp(n, "dlssnr-amd", 10) == 0;
 }
 std::mutex g_devices_lock;
 std::vector<SeenDevice> g_devices;                       // the devices made, oldest first
+std::unordered_set<VkInstance> g_internal_instances;
+std::unordered_map<VkPhysicalDevice, VkInstance> g_internal_physical_instance;
+std::unordered_set<VkDevice> g_internal_devices;
 // The device NGX's Vulkan init was given (OptiScaler's NVSDK_NGX_VULKAN_Init forms): the device of a game
 // whose vkCreateDevice ran before this module was loaded (0.0.7 took its device from there) - g_devices_lock
 SeenDevice g_ngx_vk;
@@ -5274,16 +5395,74 @@ bool int4_wanted() {
 // A native Vulkan game calls winevulkan.dll's exported vkCreateDevice (through vulkan-1.dll) rather than asking
 // vkGetInstanceProcAddr: that export is detoured too, its instance found from the physical device
 // (vkEnumeratePhysicalDevices' export detoured, which instance listed it). A call that came through the wrapped
-// pointer and reaches the export goes straight on (t_in_create).
+// pointer and reaches the export goes straight on (t_in_create / t_in_create_instance / t_in_destroy_instance /
+// t_in_enum_phys).
+PFN_vkCreateInstance real_export_create_instance = nullptr;
+PFN_vkDestroyInstance real_export_destroy_instance = nullptr;
 PFN_vkCreateDevice real_export_create = nullptr;
 PFN_vkEnumeratePhysicalDevices real_enumerate_physical = nullptr;
+std::atomic<PFN_vkCreateInstance> g_next_create_instance{nullptr};
+std::atomic<PFN_vkDestroyInstance> g_next_destroy_instance{nullptr};
+std::atomic<PFN_vkEnumeratePhysicalDevices> g_next_enum_phys{nullptr};
 std::unordered_map<VkPhysicalDevice, VkInstance> g_physical_instance;   // g_devices_lock
+std::unordered_map<VkInstance, PFN_vkDestroyInstance> g_instance_destroy_procs;   // g_devices_lock
+std::unordered_map<VkInstance, PFN_vkEnumeratePhysicalDevices> g_instance_enum_phys_procs;   // g_devices_lock
+std::unordered_map<VkInstance, PFN_vkCreateDevice> g_internal_create_device_procs;   // g_devices_lock
 thread_local int t_in_create = 0;
+thread_local int t_in_create_instance = 0;
+thread_local int t_in_destroy_instance = 0;
+thread_local int t_in_enum_phys = 0;
+
+bool is_internal_vk_instance(VkInstance instance) {
+    if (!instance) return false;
+    std::lock_guard<std::mutex> guard(g_devices_lock);
+    return g_internal_instances.count(instance) != 0;
+}
+
+bool is_internal_vk_device(VkDevice device) {
+    if (!device) return false;
+    std::lock_guard<std::mutex> guard(g_devices_lock);
+    return g_internal_devices.count(device) != 0;
+}
+
+void forget_asi_instance(VkInstance instance) {
+    if (!instance) return;
+    VkInstance expected = instance;
+    g_create_instance.compare_exchange_strong(expected, VK_NULL_HANDLE, std::memory_order_acq_rel);
+    std::lock_guard<std::mutex> guard(g_devices_lock);
+    const bool was_internal = g_internal_instances.erase(instance) != 0;
+    g_instance_destroy_procs.erase(instance);
+    g_instance_enum_phys_procs.erase(instance);
+    g_internal_create_device_procs.erase(instance);
+    if (was_internal) {
+        for (auto it = g_internal_physical_instance.begin(); it != g_internal_physical_instance.end();)
+            if (it->second == instance) it = g_internal_physical_instance.erase(it);
+            else ++it;
+    } else {
+        for (auto it = g_physical_instance.begin(); it != g_physical_instance.end();)
+            if (it->second == instance) it = g_physical_instance.erase(it);
+            else ++it;
+    }
+}
 
 VkResult create_device(PFN_vkCreateDevice create, VkInstance instance, VkPhysicalDevice phys, const VkDeviceCreateInfo* ci,
                        const VkAllocationCallbacks* a, VkDevice* out, void* caller) {
     nr::pe::watchdog::Phase phase("the game's vkCreateDevice (int4 extensions)");
     struct Inside { Inside() { ++t_in_create; } ~Inside() { --t_in_create; } } inside;
+    bool internal = false;
+    {
+        std::lock_guard<std::mutex> guard(g_devices_lock);
+        internal = (instance && g_internal_instances.count(instance) != 0) ||
+                   (phys && g_internal_physical_instance.count(phys) != 0);
+    }
+    if (internal) {
+        const VkResult r = create(phys, ci, a, out);
+        if (r == VK_SUCCESS && out && *out) {
+            std::lock_guard<std::mutex> guard(g_devices_lock);
+            g_internal_devices.insert(*out);
+        }
+        return r;
+    }
     VkDeviceCreateInfo patched = *ci;
     std::unique_ptr<nr::DeviceFeatures> features;
     std::vector<const char*> ext;
@@ -5355,6 +5534,7 @@ VkResult create_device(PFN_vkCreateDevice create, VkInstance instance, VkPhysica
         }
         nr::asi::hudcap::vk_device(*out, d.translator);   // HUD FIX's capture: its creations followed (not a translator's)
         std::lock_guard<std::mutex> guard(g_devices_lock);
+        g_internal_devices.erase(*out);
         // the instance that listed this physical device (vkEnumeratePhysicalDevices), else the one the wrapped
         // vkGetInstanceProcAddr was last asked of
         const auto it = g_physical_instance.find(phys);
@@ -5373,6 +5553,32 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_export_create_device(VkPhysicalDevice phys, co
     if (t_in_create) return real_export_create(phys, ci, a, out);
     return create_device(real_export_create, VK_NULL_HANDLE, phys, ci, a, out, __builtin_return_address(0));
 }
+VKAPI_ATTR VkResult VKAPI_CALL hk_internal_create_device(VkPhysicalDevice phys, const VkDeviceCreateInfo* ci,
+                                                         const VkAllocationCallbacks* a, VkDevice* out) {
+    PFN_vkCreateDevice next = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(g_devices_lock);
+        if (phys) {
+            if (const auto pit = g_internal_physical_instance.find(phys); pit != g_internal_physical_instance.end()) {
+                if (const auto cit = g_internal_create_device_procs.find(pit->second);
+                    cit != g_internal_create_device_procs.end()) {
+                    next = cit->second;
+                }
+            }
+        }
+        if (!next && g_internal_create_device_procs.size() == 1)
+            next = g_internal_create_device_procs.begin()->second;
+    }
+    if (!next) next = real_export_create;
+    if (!next) return VK_ERROR_INITIALIZATION_FAILED;
+    struct Inside { Inside() { ++t_in_create; } ~Inside() { --t_in_create; } } inside;
+    const VkResult r = next(phys, ci, a, out);
+    if (r == VK_SUCCESS && out && *out) {
+        std::lock_guard<std::mutex> guard(g_devices_lock);
+        g_internal_devices.insert(*out);
+    }
+    return r;
+}
 // The game's vkDestroyDevice (winevulkan's export, detoured beside vkCreateDevice): the device leaves the record, and
 // when NR's Vulkan route runs on it everything of ours on it goes first, while it is still there (vk_route_teardown).
 void vk_route_teardown(VkDevice device);
@@ -5382,6 +5588,15 @@ bool g_destroy_hooked = false;
 void forget_queues(VkDevice device);   // the game's queue records (below, with their hooks)
 VKAPI_ATTR void VKAPI_CALL hk_destroy_device(VkDevice device, const VkAllocationCallbacks* a) {
     if (device) {
+        bool internal = false;
+        {
+            std::lock_guard<std::mutex> guard(g_devices_lock);
+            internal = g_internal_devices.erase(device) != 0;
+        }
+        if (internal) {
+            real_destroy_device(device, a);
+            return;
+        }
         nr::pe::menu::vulkan_forget(device);
         vk_route_teardown(device);
         forget_queues(device);
@@ -5394,20 +5609,167 @@ VKAPI_ATTR void VKAPI_CALL hk_destroy_device(VkDevice device, const VkAllocation
     real_destroy_device(device, a);
 }
 
-VKAPI_ATTR VkResult VKAPI_CALL hk_enumerate_physical(VkInstance instance, uint32_t* n, VkPhysicalDevice* list) {
-    const VkResult r = real_enumerate_physical(instance, n, list);
-    if ((r == VK_SUCCESS || r == VK_INCOMPLETE) && list && n) {
+VkResult create_instance_common(PFN_vkCreateInstance create, const VkInstanceCreateInfo* ci,
+                                const VkAllocationCallbacks* a, VkInstance* out) {
+    struct Inside { Inside() { ++t_in_create_instance; } ~Inside() { --t_in_create_instance; } } inside;
+    const VkResult r = create(ci, a, out);
+    if (r == VK_SUCCESS && out && *out && is_internal_vk_app(ci)) {
         std::lock_guard<std::mutex> guard(g_devices_lock);
-        for (uint32_t i = 0; i < *n; ++i) g_physical_instance[list[i]] = instance;
+        g_internal_instances.insert(*out);
     }
     return r;
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL hk_export_create_instance(const VkInstanceCreateInfo* ci,
+                                                         const VkAllocationCallbacks* a, VkInstance* out) {
+    if (t_in_create_instance) return real_export_create_instance(ci, a, out);
+    return create_instance_common(real_export_create_instance, ci, a, out);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL hk_gipa_create_instance(const VkInstanceCreateInfo* ci,
+                                                       const VkAllocationCallbacks* a, VkInstance* out) {
+    PFN_vkCreateInstance next = g_next_create_instance.load(std::memory_order_acquire);
+    if (!next) next = real_export_create_instance;
+    if (!next) return VK_ERROR_INITIALIZATION_FAILED;
+    if (t_in_create_instance) return next(ci, a, out);
+    return create_instance_common(next, ci, a, out);
+}
+
+void destroy_instance_common(PFN_vkDestroyInstance destroy, VkInstance instance, const VkAllocationCallbacks* a) {
+    struct Inside { Inside() { ++t_in_destroy_instance; } ~Inside() { --t_in_destroy_instance; } } inside;
+    forget_asi_instance(instance);
+    destroy(instance, a);
+}
+
+VKAPI_ATTR void VKAPI_CALL hk_export_destroy_instance(VkInstance instance, const VkAllocationCallbacks* a) {
+    if (t_in_destroy_instance) {
+        real_export_destroy_instance(instance, a);
+        return;
+    }
+    destroy_instance_common(real_export_destroy_instance, instance, a);
+}
+
+VKAPI_ATTR void VKAPI_CALL hk_gipa_destroy_instance(VkInstance instance, const VkAllocationCallbacks* a) {
+    PFN_vkDestroyInstance next = nullptr;
+    if (instance) {
+        std::lock_guard<std::mutex> guard(g_devices_lock);
+        if (const auto it = g_instance_destroy_procs.find(instance); it != g_instance_destroy_procs.end()) {
+            next = it->second;
+            g_instance_destroy_procs.erase(it);
+        }
+    }
+    if (!next) next = g_next_destroy_instance.load(std::memory_order_acquire);
+    if (!next) next = real_export_destroy_instance;
+    if (!next) return;
+    if (t_in_destroy_instance) {
+        next(instance, a);
+        return;
+    }
+    destroy_instance_common(next, instance, a);
+}
+
+VkResult enumerate_physical_common(PFN_vkEnumeratePhysicalDevices enumerate, VkInstance instance, uint32_t* n,
+                                   VkPhysicalDevice* list) {
+    struct Inside { Inside() { ++t_in_enum_phys; } ~Inside() { --t_in_enum_phys; } } inside;
+    const VkResult r = enumerate(instance, n, list);
+    if ((r == VK_SUCCESS || r == VK_INCOMPLETE) && instance && list && n) {
+        std::lock_guard<std::mutex> guard(g_devices_lock);
+        const bool internal = g_internal_instances.count(instance) != 0;
+        if (internal) {
+            for (uint32_t i = 0; i < *n; ++i)
+                if (list[i] != VK_NULL_HANDLE) g_internal_physical_instance[list[i]] = instance;
+        } else {
+            for (uint32_t i = 0; i < *n; ++i)
+                if (list[i] != VK_NULL_HANDLE) g_physical_instance[list[i]] = instance;
+        }
+    }
+    return r;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL hk_enumerate_physical(VkInstance instance, uint32_t* n, VkPhysicalDevice* list) {
+    if (t_in_enum_phys) return real_enumerate_physical(instance, n, list);
+    return enumerate_physical_common(real_enumerate_physical, instance, n, list);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL hk_gipa_enumerate_physical(VkInstance instance, uint32_t* n, VkPhysicalDevice* list) {
+    PFN_vkEnumeratePhysicalDevices next = nullptr;
+    if (instance) {
+        std::lock_guard<std::mutex> guard(g_devices_lock);
+        if (const auto it = g_instance_enum_phys_procs.find(instance); it != g_instance_enum_phys_procs.end())
+            next = it->second;
+    }
+    if (!next) next = g_next_enum_phys.load(std::memory_order_acquire);
+    if (!next) next = real_enumerate_physical;
+    if (!next) return VK_ERROR_INITIALIZATION_FAILED;
+    if (t_in_enum_phys) return next(instance, n, list);
+    return enumerate_physical_common(next, instance, n, list);
+}
+
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL hk_gipa(VkInstance instance, const char* name) {
     const PFN_vkVoidFunction f = real_gipa(instance, name);
-    if (f && name && !std::strcmp(name, "vkCreateDevice")) {
+    if (!f || !name) return f;
+    if (instance && is_internal_vk_instance(instance)) {
+        if (!std::strcmp(name, "vkDestroyInstance")) {
+            if (f == reinterpret_cast<PFN_vkVoidFunction>(&hk_gipa_destroy_instance) ||
+                f == reinterpret_cast<PFN_vkVoidFunction>(&hk_export_destroy_instance))
+                return f;
+            {
+                std::lock_guard<std::mutex> guard(g_devices_lock);
+                g_instance_destroy_procs[instance] = reinterpret_cast<PFN_vkDestroyInstance>(f);
+            }
+            return reinterpret_cast<PFN_vkVoidFunction>(&hk_gipa_destroy_instance);
+        }
+        if (!std::strcmp(name, "vkEnumeratePhysicalDevices")) {
+            if (f == reinterpret_cast<PFN_vkVoidFunction>(&hk_gipa_enumerate_physical) ||
+                f == reinterpret_cast<PFN_vkVoidFunction>(&hk_enumerate_physical))
+                return f;
+            {
+                std::lock_guard<std::mutex> guard(g_devices_lock);
+                g_instance_enum_phys_procs[instance] = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(f);
+            }
+            return reinterpret_cast<PFN_vkVoidFunction>(&hk_gipa_enumerate_physical);
+        }
+        if (!std::strcmp(name, "vkCreateDevice")) {
+            if (f == reinterpret_cast<PFN_vkVoidFunction>(&hk_internal_create_device) ||
+                f == reinterpret_cast<PFN_vkVoidFunction>(&hk_export_create_device))
+                return f;
+            {
+                std::lock_guard<std::mutex> guard(g_devices_lock);
+                g_internal_create_device_procs[instance] = reinterpret_cast<PFN_vkCreateDevice>(f);
+            }
+            return reinterpret_cast<PFN_vkVoidFunction>(&hk_internal_create_device);
+        }
+        return f;
+    }
+    if (!std::strcmp(name, "vkCreateInstance")) {
+        if (f == reinterpret_cast<PFN_vkVoidFunction>(&hk_gipa_create_instance)) return f;
+        g_next_create_instance.store(reinterpret_cast<PFN_vkCreateInstance>(f), std::memory_order_release);
+        return reinterpret_cast<PFN_vkVoidFunction>(&hk_gipa_create_instance);
+    }
+    if (!std::strcmp(name, "vkDestroyInstance")) {
+        if (f == reinterpret_cast<PFN_vkVoidFunction>(&hk_gipa_destroy_instance)) return f;
+        if (instance) {
+            std::lock_guard<std::mutex> guard(g_devices_lock);
+            g_instance_destroy_procs[instance] = reinterpret_cast<PFN_vkDestroyInstance>(f);
+        }
+        g_next_destroy_instance.store(reinterpret_cast<PFN_vkDestroyInstance>(f), std::memory_order_release);
+        return reinterpret_cast<PFN_vkVoidFunction>(&hk_gipa_destroy_instance);
+    }
+    if (!std::strcmp(name, "vkEnumeratePhysicalDevices")) {
+        if (f == reinterpret_cast<PFN_vkVoidFunction>(&hk_gipa_enumerate_physical)) return f;
+        if (instance) {
+            std::lock_guard<std::mutex> guard(g_devices_lock);
+            g_instance_enum_phys_procs[instance] = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(f);
+        }
+        g_next_enum_phys.store(reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(f), std::memory_order_release);
+        return reinterpret_cast<PFN_vkVoidFunction>(&hk_gipa_enumerate_physical);
+    }
+    if (!std::strcmp(name, "vkCreateDevice")) {
         g_next_create_device.store(reinterpret_cast<PFN_vkCreateDevice>(f));
-        if (instance) g_create_instance.store(instance);
+        if (instance) {
+            std::lock_guard<std::mutex> guard(g_devices_lock);
+            if (g_internal_instances.count(instance) == 0) g_create_instance.store(instance);
+        }
         return reinterpret_cast<PFN_vkVoidFunction>(&hk_create_device);
     }
     return f;
@@ -5442,11 +5804,11 @@ void forget_queues(VkDevice device) {
 }
 VKAPI_ATTR void VKAPI_CALL hk_get_queue(VkDevice device, uint32_t family, uint32_t index, VkQueue* out) {
     real_get_queue(device, family, index, out);
-    if (out) record_queue(device, *out, family);
+    if (out && !is_internal_vk_device(device)) record_queue(device, *out, family);
 }
 VKAPI_ATTR void VKAPI_CALL hk_get_queue2(VkDevice device, const VkDeviceQueueInfo2* info, VkQueue* out) {
     real_get_queue2(device, info, out);
-    if (out && info) record_queue(device, *out, info->queueFamilyIndex);
+    if (out && info && !is_internal_vk_device(device)) record_queue(device, *out, info->queueFamilyIndex);
 }
 
 void hook_device_creation() {
@@ -5466,6 +5828,18 @@ void hook_device_creation() {
         MH_EnableHook(gipa) != MH_OK)
         log("[nr] winevulkan.dll's vkGetInstanceProcAddr could not be hooked: the int4 network's device extensions are "
             "not added");
+    void* create_inst = reinterpret_cast<void*>(GetProcAddress(m, "vkCreateInstance"));
+    void* destroy_inst = reinterpret_cast<void*>(GetProcAddress(m, "vkDestroyInstance"));
+    if (!create_inst ||
+        MH_CreateHook(create_inst, reinterpret_cast<void*>(&hk_export_create_instance),
+                      reinterpret_cast<void**>(&real_export_create_instance)) != MH_OK ||
+        MH_EnableHook(create_inst) != MH_OK)
+        log("[nr] winevulkan.dll's vkCreateInstance could not be hooked: internal Vulkan probe tracking incomplete");
+    if (!destroy_inst ||
+        MH_CreateHook(destroy_inst, reinterpret_cast<void*>(&hk_export_destroy_instance),
+                      reinterpret_cast<void**>(&real_export_destroy_instance)) != MH_OK ||
+        MH_EnableHook(destroy_inst) != MH_OK)
+        log("[nr] winevulkan.dll's vkDestroyInstance could not be hooked: destroyed instance records may linger");
     void* create = reinterpret_cast<void*>(GetProcAddress(m, "vkCreateDevice"));
     void* enumerate = reinterpret_cast<void*>(GetProcAddress(m, "vkEnumeratePhysicalDevices"));
     void* destroy = reinterpret_cast<void*>(GetProcAddress(m, "vkDestroyDevice"));
@@ -6209,33 +6583,34 @@ void vk_route_teardown(VkDevice device) {
     g_vk = VkRoute{};   // a later Vulkan evaluate may start the route on the game's next device
 }
 
-void vk_track(NVSDK_NGX_Handle** out, NVSDK_NGX_Feature feature, NVSDK_NGX_Parameter* p, VkDevice device) {
+void vk_track(NVSDK_NGX_Handle** out, NVSDK_NGX_Feature feature, NVSDK_NGX_Parameter* p, VkDevice device,
+              CreateSnapshot snap) {
+    merge_create_snapshot(snap, p);
     std::lock_guard<std::mutex> guard(g_lock);
     VkTracked& t = g_vk_features[(*out)->Id];
     vk_forget(t);
     t = VkTracked{};
     t.feature = int(feature);
     t.device = device;
-    t.create = create_sizes(p);
+    t.create = snap.sizes;
     if (device) g_vk_created_on = device;
-    int flags = 0;
-    if (p && p->Get("DLSS.Feature.Create.Flags", &flags) == NVSDK_NGX_Result_Success) {
-        t.flags = uint32_t(flags);
-        t.flags_known = true;
-    }
+    t.flags = snap.flags;
+    t.flags_known = snap.flags_known;
     log("[nr] OptiScaler Vulkan feature %u made: NGX feature %d, flags 0x%x%s", (*out)->Id, int(feature), t.flags,
         t.flags_known ? "" : " (not given)");
 }
 NVSDK_NGX_Result NR_NGX_MSABI hk_vk_create1(VkDevice dev, VkCommandBuffer cmd, NVSDK_NGX_Feature feature,
                                            NVSDK_NGX_Parameter* p, NVSDK_NGX_Handle** out) {
+    const CreateSnapshot snap = snapshot_create(p);
     const NVSDK_NGX_Result r = real_vk_create1(dev, cmd, feature, p, out);
-    if (r == NVSDK_NGX_Result_Success && out && *out) vk_track(out, feature, p, dev);
+    if (r == NVSDK_NGX_Result_Success && out && *out) vk_track(out, feature, p, dev, snap);
     return r;
 }
 NVSDK_NGX_Result NR_NGX_MSABI hk_vk_create(VkCommandBuffer cmd, NVSDK_NGX_Feature feature, NVSDK_NGX_Parameter* p,
                                           NVSDK_NGX_Handle** out) {
+    const CreateSnapshot snap = snapshot_create(p);
     const NVSDK_NGX_Result r = real_vk_create(cmd, feature, p, out);
-    if (r == NVSDK_NGX_Result_Success && out && *out) vk_track(out, feature, p, VK_NULL_HANDLE);
+    if (r == NVSDK_NGX_Result_Success && out && *out) vk_track(out, feature, p, VK_NULL_HANDLE, snap);
     return r;
 }
 NVSDK_NGX_Result NR_NGX_MSABI hk_vk_release(NVSDK_NGX_Handle* h) {
@@ -6360,14 +6735,37 @@ bool read_vk_frame(const NVSDK_NGX_Parameter* p, const VkTracked& t, VkFrame& f)
 bool read_frame_dims(const NVSDK_NGX_Parameter* p, VkFrame& f, const CreateSizes& create) {
     const auto& ci = f.color->Resource.ImageViewInfo;
     const auto& oi = f.output->Resource.ImageViewInfo;
-    f.render_w = f.subrect_w = get_uint(p, "DLSS.Render.Subrect.Dimensions.Width");
-    f.render_h = f.subrect_h = get_uint(p, "DLSS.Render.Subrect.Dimensions.Height");
-    if (!f.render_w || !f.render_h) {   // as read_frame: the evaluate's, the create block's, the colour's
-        f.render_w = get_uint(p, "Width", create.in_w ? create.in_w : ci.Width);
-        f.render_h = get_uint(p, "Height", create.in_h ? create.in_h : ci.Height);
+    const uint32_t cw = ci.Width, ch = ci.Height;
+    f.subrect_w = valid_extent(get_uint(p, "DLSS.Render.Subrect.Dimensions.Width"));
+    f.subrect_h = valid_extent(get_uint(p, "DLSS.Render.Subrect.Dimensions.Height"));
+    if (f.subrect_w && f.subrect_h) {
+        f.render_w = f.subrect_w;
+        f.render_h = f.subrect_h;
+    } else {
+        const uint32_t ew = valid_extent(get_uint(p, "Width"));
+        const uint32_t eh = valid_extent(get_uint(p, "Height"));
+        const uint32_t ow = valid_extent(get_uint(p, "OutWidth"));
+        const uint32_t oh = valid_extent(get_uint(p, "OutHeight"));
+        if (ew && eh && ow && oh && ew >= ow && eh >= oh && (ew > ow || eh > oh) && ow <= cw && oh <= ch) {
+            f.render_w = ow;
+            f.render_h = oh;
+        } else if (ew && eh && ew <= cw && eh <= ch) {
+            f.render_w = ew;
+            f.render_h = eh;
+        } else {
+            f.render_w = create.in_w ? create.in_w : cw;
+            f.render_h = create.in_h ? create.in_h : ch;
+        }
     }
     f.color_x = get_uint(p, "DLSS.Input.Color.Subrect.Base.X");
     f.color_y = get_uint(p, "DLSS.Input.Color.Subrect.Base.Y");
+    if (f.color_x >= cw || f.color_y >= ch) { f.color_x = f.color_y = 0; }
+    f.render_w = std::max<uint32_t>(1u, std::min<uint32_t>(f.render_w, cw - f.color_x));
+    f.render_h = std::max<uint32_t>(1u, std::min<uint32_t>(f.render_h, ch - f.color_y));
+    if (!f.subrect_w || !f.subrect_h) {
+        f.subrect_w = f.render_w;
+        f.subrect_h = f.render_h;
+    }
     f.out_x = get_uint(p, "DLSS.Output.Subrect.Base.X");
     f.out_y = get_uint(p, "DLSS.Output.Subrect.Base.Y");
     output_size(p, create, oi.Width, oi.Height, &f.out_w, &f.out_h);
@@ -6377,21 +6775,27 @@ bool read_frame_dims(const NVSDK_NGX_Parameter* p, VkFrame& f, const CreateSizes
     f.out_h = std::min<uint32_t>(f.out_h, oi.Height - f.out_y);
     f.depth_rect = {get_uint(p, "DLSS.Input.Depth.Subrect.Base.X"), get_uint(p, "DLSS.Input.Depth.Subrect.Base.Y"), f.render_w,
                     f.render_h};
+    if (f.depth) {
+        const auto& di = f.depth->Resource.ImageViewInfo;
+        if (f.depth_rect.x >= di.Width || f.depth_rect.y >= di.Height) { f.depth_rect.x = f.depth_rect.y = 0; }
+        f.depth_rect.width = std::min<uint32_t>(f.depth_rect.width, di.Width - f.depth_rect.x);
+        f.depth_rect.height = std::min<uint32_t>(f.depth_rect.height, di.Height - f.depth_rect.y);
+    }
     const bool low_res_mv = !f.flags_known || (f.flags & kFlagMvLowRes) != 0;
-    f.motion_rect = {get_uint(p, "DLSS.Input.MV.SubrectBase.X"), get_uint(p, "DLSS.Input.MV.SubrectBase.Y"),
+    f.motion_rect = {get_motion_base(p, true), get_motion_base(p, false),
                      low_res_mv ? f.render_w : f.out_w, low_res_mv ? f.render_h : f.out_h};
-    if (!low_res_mv && f.motion) {   // display-size vectors declared that the image cannot hold: the part it holds (0.0.7's)
+    if (f.motion) {   // vectors declared beyond the image: clamped to the part it holds
         const auto& mi = f.motion->Resource.ImageViewInfo;
-        if (f.motion_rect.x + f.motion_rect.width > mi.Width || f.motion_rect.y + f.motion_rect.height > mi.Height) {
+        if (!low_res_mv && (uint64_t(f.motion_rect.x) + f.motion_rect.width > mi.Width ||
+                            uint64_t(f.motion_rect.y) + f.motion_rect.height > mi.Height)) {
             static int said = 0;
             if (said++ < 2)
                 log("[nr] the game says its motion vectors are at the output's size (%ux%u) but they are %ux%u: the part "
                     "they cover is read", f.motion_rect.width, f.motion_rect.height, mi.Width, mi.Height);
-            f.motion_rect.x = std::min<uint32_t>(f.motion_rect.x, mi.Width);
-            f.motion_rect.y = std::min<uint32_t>(f.motion_rect.y, mi.Height);
-            f.motion_rect.width = std::min<uint32_t>(f.motion_rect.width, mi.Width - f.motion_rect.x);
-            f.motion_rect.height = std::min<uint32_t>(f.motion_rect.height, mi.Height - f.motion_rect.y);
         }
+        if (f.motion_rect.x >= mi.Width || f.motion_rect.y >= mi.Height) { f.motion_rect.x = f.motion_rect.y = 0; }
+        f.motion_rect.width = std::min<uint32_t>(f.motion_rect.width, mi.Width - f.motion_rect.x);
+        f.motion_rect.height = std::min<uint32_t>(f.motion_rect.height, mi.Height - f.motion_rect.y);
     }
     f.reset = get_uint(p, "Reset") != 0;
     if (!get_float(p, "DLSS.Pre.Exposure", &f.pre_exposure) || !(f.pre_exposure > 1e-6f) || !std::isfinite(f.pre_exposure)) f.pre_exposure = 1.0f;
@@ -6478,7 +6882,7 @@ nr::asi::Wilsjo2VkFrame wilsjo2_vk_frame(const NVSDK_NGX_Parameter* p, const VkF
     w.depth_rect = vk_guide_subrect(f.depth, f.subrect_w, f.subrect_h, get_uint(p, "DLSS.Input.Depth.Subrect.Base.X"),
                                     get_uint(p, "DLSS.Input.Depth.Subrect.Base.Y"));
     w.motion_rect = vk_guide_subrect(f.motion, low_res_mv ? f.subrect_w : f.out_w, low_res_mv ? f.subrect_h : f.out_h,
-                                     get_uint(p, "DLSS.Input.MV.SubrectBase.X"), get_uint(p, "DLSS.Input.MV.SubrectBase.Y"));
+                                     get_motion_base(p, true), get_motion_base(p, false));
     return w;
 }
 // As wilsjo2_before_ok: the colour at origin 0 and a valid active extent (`aw` x `ah`).
@@ -7172,7 +7576,8 @@ bool vk_present_run(VkCommandBuffer cmd, VkPresentPath& P, const std::shared_ptr
     const ULONGLONG now = GetTickCount64();
     const auto fresh = [&](const VkGuideSet& gs) {
         return gs.serial && aspect_matches(gs.out_w, gs.out_h, w, h) &&
-               (P.presents - gs.captured_at <= kPresentGuideMaxAge || now - gs.captured_ms <= kPresentGuideMaxAgeMs);
+               ((P.presents <= gs.captured_at || P.presents - gs.captured_at <= kPresentGuideMaxAge) ||
+                (now <= gs.captured_ms || now - gs.captured_ms <= kPresentGuideMaxAgeMs));
     };
     VkGuideSet* guides = nullptr;
     for (VkGuideSet& gs : P.sets)
@@ -8752,10 +9157,6 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_vk_evaluate(VkCommandBuffer cmd, const NVSDK_NG
         return real_vk_evaluate(cmd, h, p, callback);
     }
     const nr::asi::Wilsjo2VkFrame wf = wilsjo2_vk_frame(p, f);
-    if (plan.present) {
-        vk_capture_guides(cmd, f, wf,h->Id);
-        if (g_front.load() == 0) decide_front(VK_NULL_HANDLE);   // the game may present through an address of its own
-    }
     ++g_fg_frames;
     NVSDK_NGX_Result r;
     if (!before.empty()) {
@@ -8791,11 +9192,16 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_vk_evaluate(VkCommandBuffer cmd, const NVSDK_NG
         r = real_vk_evaluate(cmd, h, p, callback);
     }
     if (r != NVSDK_NGX_Result_Success) return r;
-    if (after.empty()) return r;
+    if (!plan.present && after.empty()) return r;
     // After the upscaler: the layers on its output (GENERAL), in place, on the same command buffer.
     guard.lock();
     const auto it = g_vk_features.find(h->Id);
     if (it == g_vk_features.end()) return r;
+    if (plan.present) {
+        vk_capture_guides(cmd, f, wf, h->Id);
+        if (g_front.load() == 0) decide_front(VK_NULL_HANDLE);   // the game may present through an address of its own
+    }
+    if (after.empty()) return r;
     VkTracked& t2 = it->second;
     run_after_vk(cmd, t2, after, f, wf, nr_on, plan.chain->inspect, !plan.present_takes);
     return r;
@@ -9357,19 +9763,18 @@ void d11_present_layers(IDXGISwapChain* sc, ID3D11Device* device) {
 
 NVSDK_NGX_Result NR_NGX_MSABI hk_d11_create(ID3D11DeviceContext* ctx, NVSDK_NGX_Feature feature, NVSDK_NGX_Parameter* p,
                                            NVSDK_NGX_Handle** out) {
+    CreateSnapshot snap = snapshot_create(p);
     const NVSDK_NGX_Result r = real_d11_create(ctx, feature, p, out);
     if (r == NVSDK_NGX_Result_Success && out && *out) {
+        merge_create_snapshot(snap, p);
         std::lock_guard<std::mutex> guard(g_lock);
         D11Tracked& t = g_d11_features[(*out)->Id];
         d11_forget(t);
         t = D11Tracked{};
         t.vk.feature = int(feature);
-        t.vk.create = create_sizes(p);
-        int flags = 0;
-        if (p && p->Get("DLSS.Feature.Create.Flags", &flags) == NVSDK_NGX_Result_Success) {
-            t.vk.flags = uint32_t(flags);
-            t.vk.flags_known = true;
-        }
+        t.vk.create = snap.sizes;
+        t.vk.flags = snap.flags;
+        t.vk.flags_known = snap.flags_known;
         log("[nr] OptiScaler D3D11 feature %u made: NGX feature %d, flags 0x%x%s", (*out)->Id, int(feature), t.vk.flags,
             t.vk.flags_known ? "" : " (not given)");
     }
@@ -9480,7 +9885,6 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_d11_evaluate(ID3D11DeviceContext* ctx, const NV
     plan_layers_vk(t.vk, f, nr_on, "D3D11 games", plan, g_d11_present);
     g_d11_present.wanted = plan.present;
     g_present.evaluate_ms = GetTickCount64();
-    if (plan.present) d11_capture_guides(ctx, depth, motion, f,h->Id);
     const nr::asi::Wilsjo2VkFrame wf = wilsjo2_vk_frame(p, f);
     ++g_fg_frames;
     NVSDK_NGX_Result r;
@@ -9579,12 +9983,14 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_d11_evaluate(ID3D11DeviceContext* ctx, const NV
         r = real_d11_evaluate(ctx, h, p, callback);
     }
     if (r != NVSDK_NGX_Result_Success) return r;
-    if (plan.after.empty()) return r;
+    if (!plan.present && plan.after.empty()) return r;
     // After the upscaler: the layers on its output in our command buffer, behind the upscaler's work.
     guard.lock();
     if (!g_d11.ready) return r;   // the route stopped (a failure before the upscaler, or another thread's)
     const auto it = g_d11_features.find(h->Id);
     if (it == g_d11_features.end()) return r;
+    if (plan.present) d11_capture_guides(ctx, depth, motion, f, h->Id);
+    if (plan.after.empty()) return r;
     D11Tracked& t2 = it->second;
     const VkCommandBuffer cmd = d11_begin();
     if (!cmd) return r;

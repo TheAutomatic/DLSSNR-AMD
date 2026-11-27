@@ -438,8 +438,16 @@ void note_allocator_released(ID3D12CommandAllocator* alloc) {
 std::atomic<bool> g_hooks_installed{false};
 std::atomic<bool> g_hooks_ok{false};
 std::atomic<void*> g_failed_device{nullptr};
+using PeerInRecordFn = int (*)();
+std::atomic<PeerInRecordFn> g_peer_in_record{nullptr};
 thread_local int t_in_direct_record = 0;
 thread_local bool t_in_direct_restore = false;
+
+inline bool in_direct_or_peer_record() {
+    if (t_in_direct_record != 0) return true;
+    const PeerInRecordFn fn = g_peer_in_record.load(std::memory_order_acquire);
+    return fn && fn() != 0;
+}
 
 const GUID kIID_List4 = {0x8754318e, 0xd3a9, 0x4541, {0x98, 0xcf, 0x64, 0x5b, 0x50, 0xdc, 0x48, 0x74}};
 const GUID kIID_Dev4 = {0xe865df17, 0xa9ee, 0x46f9, {0xa4, 0x63, 0x30, 0x98, 0x31, 0x5a, 0xa2, 0xe5}};
@@ -513,7 +521,7 @@ ULONG STDMETHODCALLTYPE hk_cl_release(ID3D12GraphicsCommandList* cl) {
 
 HRESULT STDMETHODCALLTYPE hk_cl_reset(ID3D12GraphicsCommandList* cl, ID3D12CommandAllocator* alloc, ID3D12PipelineState* pso) {
     const HRESULT hr = real_cl_reset(cl, alloc, pso);
-    if (SUCCEEDED(hr) && cl && !t_in_direct_record) {
+    if (SUCCEEDED(hr) && cl && !in_direct_or_peer_record()) {
         seal_list_recording(cl);
         note_list_alloc(cl, alloc);
         direct_state_of(cl)->reset(pso);
@@ -522,12 +530,12 @@ HRESULT STDMETHODCALLTYPE hk_cl_reset(ID3D12GraphicsCommandList* cl, ID3D12Comma
 }
 
 void STDMETHODCALLTYPE hk_cl_clear_state(ID3D12GraphicsCommandList* cl, ID3D12PipelineState* pso) {
-    if (cl && !t_in_direct_record) direct_state_of(cl)->clear_state(pso);
+    if (cl && !in_direct_or_peer_record()) direct_state_of(cl)->clear_state(pso);
     real_cl_clear_state(cl, pso);
 }
 
 void STDMETHODCALLTYPE hk_cl_set_pso(ID3D12GraphicsCommandList* cl, ID3D12PipelineState* pso) {
-    if (cl && !t_in_direct_record) {
+    if (cl && !in_direct_or_peer_record()) {
         DirectListState* s = direct_state_of(cl);
         s->pso = pso;
         s->pso_set = true;
@@ -537,7 +545,7 @@ void STDMETHODCALLTYPE hk_cl_set_pso(ID3D12GraphicsCommandList* cl, ID3D12Pipeli
 }
 
 void STDMETHODCALLTYPE hk_cl_set_pso1(ID3D12GraphicsCommandList* cl, ID3D12StateObject* so) {
-    if (cl && !t_in_direct_record) {
+    if (cl && !in_direct_or_peer_record()) {
         DirectListState* s = direct_state_of(cl);
         s->state_object = so;
         s->so_set = true;
@@ -547,7 +555,7 @@ void STDMETHODCALLTYPE hk_cl_set_pso1(ID3D12GraphicsCommandList* cl, ID3D12State
 }
 
 void STDMETHODCALLTYPE hk_cl_exec_bundle(ID3D12GraphicsCommandList* cl, ID3D12GraphicsCommandList* bundle) {
-    if (cl && !t_in_direct_record) {
+    if (cl && !in_direct_or_peer_record()) {
         DirectListState* s = direct_state_of(cl);
         const DirectListState* bs = (bundle && bundle != cl) ? direct_state_of(bundle) : nullptr;
         if (bundle && bundle != cl) direct_state_of(cl);
@@ -577,7 +585,7 @@ void STDMETHODCALLTYPE hk_cl_exec_bundle(ID3D12GraphicsCommandList* cl, ID3D12Gr
 
 // Read-only SetDescriptorHeaps observation: invalidates stale compute descriptor table handles when heaps change.
 void STDMETHODCALLTYPE hk_cl_set_heaps(ID3D12GraphicsCommandList* cl, UINT count, ID3D12DescriptorHeap* const* heaps) {
-    if (cl && !t_in_direct_record) {
+    if (cl && !in_direct_or_peer_record()) {
         DirectListState* s = direct_state_of(cl);
         const UINT n = (std::min)(count, 2u);
         bool same = (n == s->heap_count);
@@ -597,23 +605,23 @@ void STDMETHODCALLTYPE hk_cl_set_heaps(ID3D12GraphicsCommandList* cl, UINT count
 }
 
 void STDMETHODCALLTYPE hk_cl_set_compute_rs(ID3D12GraphicsCommandList* cl, ID3D12RootSignature* rs) {
-    if (cl && !t_in_direct_record) direct_state_of(cl)->compute_root.set_rs(rs);
+    if (cl && !in_direct_or_peer_record()) direct_state_of(cl)->compute_root.set_rs(rs);
     real_cl_set_compute_rs(cl, rs);
 }
 
 void STDMETHODCALLTYPE hk_cl_set_compute_table(ID3D12GraphicsCommandList* cl, UINT index, D3D12_GPU_DESCRIPTOR_HANDLE h) {
-    if (cl && !t_in_direct_record) direct_state_of(cl)->compute_root.set(index, 1, h.ptr);
+    if (cl && !in_direct_or_peer_record()) direct_state_of(cl)->compute_root.set(index, 1, h.ptr);
     else if (cl && t_in_direct_record && !t_in_direct_restore) g_nr_table_sets.fetch_add(1, std::memory_order_relaxed);
     real_cl_set_compute_table(cl, index, h);
 }
 
 void STDMETHODCALLTYPE hk_cl_set_compute_const(ID3D12GraphicsCommandList* cl, UINT index, UINT val, UINT offset) {
-    if (cl && !t_in_direct_record) direct_state_of(cl)->compute_root.constant(index, offset, val);
+    if (cl && !in_direct_or_peer_record()) direct_state_of(cl)->compute_root.constant(index, offset, val);
     real_cl_set_compute_const(cl, index, val, offset);
 }
 
 void STDMETHODCALLTYPE hk_cl_set_compute_consts(ID3D12GraphicsCommandList* cl, UINT index, UINT count, const void* data, UINT offset) {
-    if (cl && data && !t_in_direct_record) {
+    if (cl && data && !in_direct_or_peer_record()) {
         DirectRootArgs& r = direct_state_of(cl)->compute_root;
         const auto* v = static_cast<const uint32_t*>(data);
         for (UINT i = 0; i < count; ++i) r.constant(index, offset + i, v[i]);
@@ -622,24 +630,24 @@ void STDMETHODCALLTYPE hk_cl_set_compute_consts(ID3D12GraphicsCommandList* cl, U
 }
 
 void STDMETHODCALLTYPE hk_cl_set_compute_cbv(ID3D12GraphicsCommandList* cl, UINT index, D3D12_GPU_VIRTUAL_ADDRESS va) {
-    if (cl && !t_in_direct_record) direct_state_of(cl)->compute_root.set(index, 2, va);
+    if (cl && !in_direct_or_peer_record()) direct_state_of(cl)->compute_root.set(index, 2, va);
     real_cl_set_compute_cbv(cl, index, va);
 }
 
 void STDMETHODCALLTYPE hk_cl_set_compute_srv(ID3D12GraphicsCommandList* cl, UINT index, D3D12_GPU_VIRTUAL_ADDRESS va) {
-    if (cl && !t_in_direct_record) direct_state_of(cl)->compute_root.set(index, 3, va);
+    if (cl && !in_direct_or_peer_record()) direct_state_of(cl)->compute_root.set(index, 3, va);
     real_cl_set_compute_srv(cl, index, va);
 }
 
 void STDMETHODCALLTYPE hk_cl_set_compute_uav(ID3D12GraphicsCommandList* cl, UINT index, D3D12_GPU_VIRTUAL_ADDRESS va) {
-    if (cl && !t_in_direct_record) direct_state_of(cl)->compute_root.set(index, 4, va);
+    if (cl && !in_direct_or_peer_record()) direct_state_of(cl)->compute_root.set(index, 4, va);
     real_cl_set_compute_uav(cl, index, va);
 }
 
 void STDMETHODCALLTYPE hk_cl_exec_indirect(ID3D12GraphicsCommandList* cl, ID3D12CommandSignature* sig,
                                            UINT max_count, ID3D12Resource* arg_buf, UINT64 arg_offset,
                                            ID3D12Resource* count_buf, UINT64 count_offset) {
-    if (cl && !t_in_direct_record) apply_direct_execute_indirect(direct_state_of(cl), sig);
+    if (cl && !in_direct_or_peer_record()) apply_direct_execute_indirect(direct_state_of(cl), sig);
     real_cl_exec_indirect(cl, sig, max_count, arg_buf, arg_offset, count_buf, count_offset);
 }
 
@@ -679,7 +687,7 @@ HRESULT STDMETHODCALLTYPE hk_dev_create_cmd_sig(ID3D12Device* dev, const D3D12_C
 HRESULT STDMETHODCALLTYPE hk_dev_create_cl(ID3D12Device* dev, UINT mask, D3D12_COMMAND_LIST_TYPE type,
                                            ID3D12CommandAllocator* alloc, ID3D12PipelineState* pso, REFIID riid, void** out) {
     const HRESULT hr = real_dev_create_cl(dev, mask, type, alloc, pso, riid, out);
-    if (SUCCEEDED(hr) && out && *out && !t_in_direct_record) {
+    if (SUCCEEDED(hr) && out && *out && !in_direct_or_peer_record()) {
         ID3D12GraphicsCommandList* list = nullptr;
         if (SUCCEEDED(static_cast<IUnknown*>(*out)->QueryInterface(IID_PPV_ARGS(&list))) && list) {
             note_list_alloc(list, alloc);
@@ -693,7 +701,7 @@ HRESULT STDMETHODCALLTYPE hk_dev_create_cl(ID3D12Device* dev, UINT mask, D3D12_C
 HRESULT STDMETHODCALLTYPE hk_dev4_create_cl1(void* dev4, UINT mask, D3D12_COMMAND_LIST_TYPE type, UINT flags,
                                              REFIID riid, void** out) {
     const HRESULT hr = real_dev4_create_cl1(dev4, mask, type, flags, riid, out);
-    if (SUCCEEDED(hr) && out && *out && !t_in_direct_record) {
+    if (SUCCEEDED(hr) && out && *out && !in_direct_or_peer_record()) {
         ID3D12GraphicsCommandList* list = nullptr;
         if (SUCCEEDED(static_cast<IUnknown*>(*out)->QueryInterface(IID_PPV_ARGS(&list))) && list) {
             note_list_alloc(list, nullptr);
@@ -923,9 +931,21 @@ bool install_hooks(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, std::string
     g_failed_device.store(nullptr, std::memory_order_release);
     g_hooks_ok.store(true, std::memory_order_relaxed);
     g_hooks_installed.store(true, std::memory_order_release);
+    refresh_peer();
     nr::pe::split::set_split_execution_hooks(&begin_split_execution, &end_split_execution);
     log("[nr] Direct compute-state hooks active (compute-only tracking, read-only heap observer)");
     return true;
+}
+
+bool in_record() { return t_in_direct_record != 0; }
+
+void refresh_peer() {
+    if (g_peer_in_record.load(std::memory_order_acquire)) return;
+    if (HMODULE mod = GetModuleHandleW(L"openrr-amd.asi")) {
+        if (auto fn = reinterpret_cast<PeerInRecordFn>(GetProcAddress(mod, "OpenRR_IsInDirectRecord"))) {
+            g_peer_in_record.store(fn, std::memory_order_release);
+        }
+    }
 }
 
 void note_command_signature(ID3D12CommandSignature* sig, const D3D12_COMMAND_SIGNATURE_DESC* desc) {
@@ -1074,3 +1094,7 @@ size_t tracked_queue_fence_count() {
 }
 
 }  // namespace nr::pe::d3d12_direct
+
+extern "C" __declspec(dllexport) int NR_IsInDirectRecord() {
+    return nr::pe::d3d12_direct::in_record() ? 1 : 0;
+}
