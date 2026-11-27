@@ -323,6 +323,8 @@ struct Config {
     // The ReShade routes' motion-vector source: 0 VORT (shipped), 1 LumeniteFX Kernel (install.bat (LumeniteFX: y) installs it
     // from its author's GitHub; it is not in the package). The add-on applies it to ReShade (nr_reshade_addon.cpp).
     int motion_vectors = 0;
+    // DirectPresent (without DLSS5_Feed.fx): 0 = off, 1 = auto (default: run guide-less NR if DLSS5_Feed is absent), 2 = always (fallback at Present)
+    int direct_present = 1;
     NetworkConfig network{};                 // [Network]
     PreprocessConfig preprocess{};   // [Preprocess]; controls.preprocess is the frame's, see PreprocessSwitch
     RenoDXConfig renodx{};           // [RenoDX]

@@ -239,6 +239,40 @@ bool missing_reported{};
 std::string last_status{};
 unsigned frames_run{};
 unsigned frames_declined{};
+bool frame_fed{};
+bool effects_seen{};
+bool direct_logged{};
+struct DirectRtvEntry { device* dev; uint64_t res; resource_view rtv; };
+std::vector<DirectRtvEntry> direct_rtvs{};
+
+void clear_direct_rtvs(device* dev) {
+    for (size_t i = direct_rtvs.size(); i-- > 0;) {
+        if (dev && direct_rtvs[i].dev != dev) continue;
+        if (direct_rtvs[i].rtv.handle) direct_rtvs[i].dev->destroy_resource_view(direct_rtvs[i].rtv);
+        direct_rtvs.erase(direct_rtvs.begin() + long(i));
+    }
+}
+
+resource_view direct_rtv_for(device* dev, resource back) {
+    if (!dev || !back.handle) return {};
+    for (const DirectRtvEntry& e : direct_rtvs)
+        if (e.dev == dev && e.res == back.handle) return e.rtv;
+    const resource_desc desc = rs::call(dev, &device::get_resource_desc, back);
+    if (desc.type != resource_type::texture_2d || desc.texture.samples > 1) return {};
+    resource_view rtv{};
+    const format typed = format_to_default_typed(desc.texture.format);
+    if (!dev->create_resource_view(back, resource_usage::render_target, resource_view_desc(typed), &rtv) &&
+        !dev->create_resource_view(back, resource_usage::render_target, resource_view_desc(desc.texture.format), &rtv))
+        return {};
+    direct_rtvs.push_back({dev, back.handle, rtv});
+    return rtv;
+}
+
+void on_direct_destroy_swapchain(swapchain* sc, bool) {
+    if (!sc) return;
+    std::lock_guard<std::mutex> guard(lock);
+    clear_direct_rtvs(sc->get_device());
+}
 // ---- the NR chain: [LayerN] sections in dlssnr-amd.ini (nr_pe_config.hpp read_chain), as on the .asi route ----------
 // Each enabled layer is a run of its own on the back buffer, in layer order (on this route every layer runs at Present):
 // its processing (RenoDX, or wilsjo2 = this route's own composition under the original's key names, layer_config), its
@@ -2467,6 +2501,8 @@ void on_reloaded_effects(effect_runtime* rt) {
     if (bound && rt != bound) return;
     bound = rt;
     resolve(rt);
+    frame_fed = false;
+    effects_seen = false;
     // A reload recompiles the provider, which writes zero vectors until its
     // own history refills; do not smear history built on those forward.
     need_reset = true;
@@ -2477,6 +2513,8 @@ void on_destroy_effect_runtime(effect_runtime* rt) {
     if (rt != bound) return;
     bound = nullptr;
     technique = {}; mv_var = {}; depth_var = {};
+    frame_fed = false;
+    effects_seen = false;
 }
 
 bool load_vulkan(device_api api, ID3D12Device* d12 = nullptr) {
@@ -2637,6 +2675,7 @@ void on_destroy_device(device* dev) {
     if (direct < 0)
         log("[nr] the Vulkan driver's own functions were not found: NR's objects of the device being destroyed are left "
             "to it, not freed");
+    clear_direct_rtvs(dev);
     motion_release(dev);
     if (inspect_copies.dev == dev) inspect_release();
     if (inspect_input.dev == dev) inspect_hold_release();
@@ -3836,8 +3875,12 @@ void draw_page() {
                 }
             }
             if (!last_status.empty()) ImGui::TextWrapped("%s", tr_text(last_status.c_str()));
-            nr::control_ui::text_dim_wrapped("DLSS5_Feed: %s; motion %s, depth %s. Frames: %u with NR, %u without",
-                                             technique.handle ? "found" : "MISSING", mv_var.handle ? "found" : "missing",
+            nr::control_ui::text_dim_wrapped("DLSS5_Feed: %s%s; motion %s, depth %s. Frames: %u with NR, %u without",
+                                             technique.handle ? "found" : "MISSING",
+                                             !technique.handle && config.direct_present != 0 ? " (direct Present mode)"
+                                             : config.direct_present == 2                    ? " (DirectPresent=always)"
+                                                                                             : "",
+                                             mv_var.handle ? "found" : "missing",
                                              depth_var.handle ? "found" : "missing", frames_run, frames_declined);
             page_trace("feed line");
             if (!(skip & 2)) {
@@ -3920,6 +3963,27 @@ void draw_page() {
                                        "again to retry."), motion.reason.c_str());
                 else if (motion.lumenite_active)
                     ImGui::TextDisabled(tr("LumeniteFX Kernel%s"), motion.verified ? tr(": its vectors follow the picture") : "");
+            }
+            if (nr::control_ui::section("Direct Present (without DLSS5_Feed.fx)")) {
+                static const char* const modes[] = {"Off", "Auto (when DLSS5_Feed is absent)", "Always (fallback at Present)"};
+                static const char* const mode_words[] = {"off", "auto", "always"};
+                const int cur = std::clamp(config.direct_present, 0, 2);
+                int pick = -1;
+                if (ImGui::BeginCombo(tr("Mode##directpresent"), tr(modes[cur]))) {
+                    for (int i = 0; i < 3; ++i)
+                        if (ImGui::Selectable(tr(modes[i]), cur == i)) pick = i;
+                    ImGui::EndCombo();
+                }
+                nr::control_ui::help("[DlssNr] DirectPresent. Runs NR (guide-less RenoDX) directly without DLSS5_Feed.fx or "
+                                     "motion-vector shaders. Auto (default) activates only when DLSS5_Feed.fx is not loaded; "
+                                     "Always runs as a Present fallback if DLSS5_Feed did not run this frame.");
+                if (pick >= 0 && pick != cur) {
+                    page_ini->set("DlssNr", "DirectPresent", mode_words[pick]);
+                    page_ini->save();
+                    config.direct_present = pick;
+                    direct_logged = false;
+                    log("[nr] direct Present mode set to %s on the add-on page", mode_words[pick]);
+                }
             }
             page_trace("motion");
             break;
@@ -4087,12 +4151,74 @@ void page_test_present(effect_runtime* rt) {
 
 // Two seconds of "Preprocess: ON/OFF" in the corner after it switches, menu open or not. Drawn by
 // ReShade on the finished picture, so nothing processes it.
+bool direct_wanted_now() {
+    return config.direct_present == 2 || (config.direct_present == 1 && !technique.handle);
+}
+
+void feed_direct(effect_runtime* rt, command_list* cl, resource_view rtv) {
+    const nr::Controls& controls = settings();
+    if (!controls.enabled && !renodx_on && !layered) {
+        view.nr_on = 0;
+        view_layers({1});
+        note_layer(1, true, 3, "[DlssNr] Enabled is off", 0, 0, 0, config.white_point);
+        return;
+    }
+    if (!direct_logged) {
+        direct_logged = true;
+        log("[nr] ReShade direct Present mode active (guide-less %s)",
+            renodx_on ? "RenoDX" : layered ? "NR chain" : "wilsjo2");
+    }
+    struct GuardVars {
+        effect_texture_variable mv, depth;
+        bool missing;
+        ~GuardVars() { mv_var = mv; depth_var = depth; missing_reported = missing; }
+    } restore_vars{mv_var, depth_var, missing_reported};
+    mv_var = {};
+    depth_var = {};
+    missing_reported = true;
+    feed(rt, cl, rtv);
+    frame_fed = true;
+}
+
+void on_finish_effects(effect_runtime* rt, command_list* cl, resource_view rtv, resource_view /*rtv_srgb*/) {
+    nr::pe::watchdog::Phase phase("ReShade finish effects (direct NR)");
+    std::lock_guard<std::mutex> guard(lock);
+    if (!bound) { bound = rt; resolve(rt); }
+    if (rt != bound) return;
+    if (cl && rtv.handle) {
+        effects_seen = true;
+        if (!frame_fed && direct_wanted_now()) feed_direct(rt, cl, rtv);
+    }
+}
+
 void on_reshade_present(effect_runtime* rt) {
     nr::pe::watchdog::beat();   // before the lock: a frame that cannot take it is a stall too
     nr::pe::watchdog::Phase phase("ReShade present");
     std::lock_guard<std::mutex> guard(lock);
+    if (!bound) { bound = rt; resolve(rt); }
     if (rt != bound) return;
     ++presents;
+    const bool fed_already = std::exchange(frame_fed, false);
+    const bool effects_ran = std::exchange(effects_seen, false);
+    if (!fed_already && !effects_ran && direct_wanted_now()) {
+        if (command_queue* q = rt->get_command_queue()) {
+            if (command_list* cl = q->get_immediate_command_list()) {
+                const uint32_t back_index = rt->get_current_back_buffer_index();
+                const resource back = rs::call(rt, &effect_runtime::get_back_buffer, back_index);
+                if (back.handle) {
+                    if (const resource_view rtv = direct_rtv_for(rt->get_device(), back); rtv.handle) {
+                        const resource_usage pr = resource_usage::present, rtu = resource_usage::render_target;
+                        resource buf = back;
+                        cl->barrier(1, &buf, &pr, &rtu);
+                        feed_direct(rt, cl, rtv);
+                        cl->barrier(1, &buf, &rtu, &pr);
+                        q->flush_immediate_command_list();
+                        frame_fed = false;
+                    }
+                }
+            }
+        }
+    }
     page_test_present(rt);
     motion_sync(rt);
     if (session) session->idle();   // NR off for a while: [Network] Residency
@@ -4211,6 +4337,7 @@ void on_render_technique(effect_runtime* rt, effect_technique t, command_list* c
         motion_probe(rt, cl, rtv);
     }
     feed(rt, cl, rtv);
+    frame_fed = true;
 }
 
 }  // namespace
@@ -4271,10 +4398,12 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         reshade::register_event<reshade::addon_event::init_device>(on_init_device);
         reshade::register_event<reshade::addon_event::create_swapchain>(on_create_swapchain);
         reshade::register_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
+        reshade::register_event<reshade::addon_event::destroy_swapchain>(on_direct_destroy_swapchain);
         reshade::register_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
         reshade::register_event<reshade::addon_event::destroy_effect_runtime>(on_destroy_effect_runtime);
         reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(on_reloaded_effects);
         reshade::register_event<reshade::addon_event::reshade_render_technique>(on_render_technique);
+        reshade::register_event<reshade::addon_event::reshade_finish_effects>(on_finish_effects);
         reshade::register_event<reshade::addon_event::reshade_present>(on_reshade_present);
         reshade::register_event<reshade::addon_event::destroy_device>(on_destroy_device);
         // A destroyed command list: our GPU completion record of it goes (nr::gpu::reset) - always (once a list, not a
@@ -4345,10 +4474,12 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         reshade::unregister_event<reshade::addon_event::init_device>(on_init_device);
         reshade::unregister_event<reshade::addon_event::create_swapchain>(on_create_swapchain);
         reshade::unregister_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
+        reshade::unregister_event<reshade::addon_event::destroy_swapchain>(on_direct_destroy_swapchain);
         reshade::unregister_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
         reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(on_destroy_effect_runtime);
         reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(on_reloaded_effects);
         reshade::unregister_event<reshade::addon_event::reshade_render_technique>(on_render_technique);
+        reshade::unregister_event<reshade::addon_event::reshade_finish_effects>(on_finish_effects);
         reshade::unregister_event<reshade::addon_event::reshade_present>(on_reshade_present);
         reshade::unregister_event<reshade::addon_event::destroy_device>(on_destroy_device);
         reshade::unregister_event<reshade::addon_event::barrier>(on_cap_barrier);
