@@ -21,6 +21,19 @@ cd "$(dirname "$0")/../.."
 arch=${NR_ARCH:-x86_64}
 case "$arch" in x86_64|i686) ;; *) echo 'NR_ARCH must be x86_64 or i686' >&2; exit 2;; esac
 out=artifacts/windows/vulkan-loader/$arch
+if [[ "${NR_REBUILD_VK_LOADER:-0}" != 1 && -s "$out/vulkan-1.dll" && -s "$out/LICENSE.txt" && -s "$out/PATCHES.diff" ]]; then
+    stale=0
+    for dep in windows/build/build_vulkan_loader.sh \
+               windows/vulkan-loader/patch-local-override.py \
+               windows/vulkan-loader/patch-no-dxgi.py \
+               "windows/vulkan-loader/toolchain-$arch.cmake"; do
+        [[ "$dep" -nt "$out/vulkan-1.dll" ]] && { stale=1; break; }
+    done
+    if [[ $stale == 0 ]]; then
+        echo "reusing $out: $(ls "$out" | tr '\n' ' ')"
+        exit 0
+    fi
+fi
 src=artifacts/ref/Vulkan-Loader
 tag=v1.4.357
 if [[ ! -d "$src" ]]; then
@@ -29,11 +42,21 @@ fi
 root=$PWD
 # The Linux build patches the same checkout differently; start from clean sources every time.
 ( cd "$src" && git checkout -q -- loader && python3 "$root/windows/vulkan-loader/patch-local-override.py" && python3 "$root/windows/vulkan-loader/patch-no-dxgi.py" )
+deps_args=(-DUPDATE_DEPS=ON)
+if [[ -d toolchain/Vulkan-Headers ]]; then
+    vh_install="$PWD/artifacts/ref/vulkan-headers-install"
+    if [[ ! -f "$vh_install/share/cmake/VulkanHeaders/VulkanHeadersConfig.cmake" ]]; then
+        cmake -S toolchain/Vulkan-Headers -B artifacts/ref/vulkan-headers-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DVULKAN_HEADERS_ENABLE_TESTS=OFF -DVULKAN_HEADERS_ENABLE_INSTALL=ON > /dev/null
+        cmake --install artifacts/ref/vulkan-headers-build --prefix "$vh_install" > /dev/null
+    fi
+    deps_args=(-DUPDATE_DEPS=OFF -DVULKAN_HEADERS_INSTALL_DIR="$vh_install")
+fi
 build=$src/build-windows-$arch
 mkdir -p "$out"
 cmake -S "$src" -B "$build" -G Ninja \
     -DCMAKE_TOOLCHAIN_FILE="$PWD/windows/vulkan-loader/toolchain-$arch.cmake" \
-    -DCMAKE_BUILD_TYPE=Release -DUPDATE_DEPS=ON -DBUILD_TESTS=OFF -DUSE_GAS=ON > "$build.cmake.log" 2>&1
+    -DCMAKE_BUILD_TYPE=Release "${deps_args[@]}" -DBUILD_TESTS=OFF -DUSE_GAS=ON > "$build.cmake.log" 2>&1
 ninja -C "$build" > "$build.ninja.log" 2>&1
 cp -- "$build/loader/vulkan-1.dll" "$out/vulkan-1.dll"
 cp -- "$src/LICENSE.txt" "$out/LICENSE.txt"

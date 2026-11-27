@@ -105,7 +105,12 @@ repo artifacts/ref/reshade-shaders https://github.com/crosire/reshade-shaders.gi
 # vort_Shaders (MIT): the motion vectors of the ReShade route.
 repo artifacts/ref/vort_Shaders https://github.com/vortigern11/vort_Shaders.git \
      b410b9f0c0fbb83c8cb42164aaf1655fab386f4a
-# The Vulkan loader source is cloned by linux/build/build_vulkan_loader.sh itself.
+if [[ -d artifacts/ref/Vulkan-Loader ]]; then
+    echo "have artifacts/ref/Vulkan-Loader"
+else
+    echo "fetch artifacts/ref/Vulkan-Loader"
+    git clone -q --depth 1 --branch v1.4.357 https://github.com/KhronosGroup/Vulkan-Loader.git artifacts/ref/Vulkan-Loader
+fi
 
 # ---- binaries the packages carry unmodified ---------------------------------------------------
 # ReShade 6.8.0 with add-on support: the DLLs come out of the official installer, which is a zip.

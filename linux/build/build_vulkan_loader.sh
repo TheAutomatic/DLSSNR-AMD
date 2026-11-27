@@ -26,6 +26,30 @@
 #         to be stated).
 set -euo pipefail
 cd "$(dirname "$0")/../.."
+if [[ "${NR_REBUILD_VK_LOADER:-0}" != 1 ]]; then
+    reuse=1
+    for arch in i686 x86_64; do
+        out=artifacts/vulkan-loader/$arch
+        if [[ ! -s "$out/vulkan-1.dll" || ! -s "$out/winevulkan.dll" || ! -s "$out/LICENSE.txt" || ! -s "$out/PATCHES.diff" ]]; then
+            reuse=0; break
+        fi
+        for dep in linux/build/build_vulkan_loader.sh \
+                   linux/vulkan-loader/patch-local-override.py \
+                   linux/vulkan-loader/patch-no-dxgi.py \
+                   linux/vulkan-loader/patch-queue-info.py \
+                   linux/vulkan-loader/toolchain-i686.cmake \
+                   linux/vulkan-loader/toolchain-x86_64.cmake \
+                   linux/vulkan-loader/winevulkan_forwarder.c \
+                   linux/vulkan-loader/winevulkan_forwarder.def; do
+            [[ "$dep" -nt "$out/vulkan-1.dll" ]] && { reuse=0; break; }
+        done
+        [[ $reuse == 0 ]] && break
+    done
+    if [[ $reuse == 1 ]]; then
+        echo "reusing artifacts/vulkan-loader/{i686,x86_64}"
+        exit 0
+    fi
+fi
 src=artifacts/ref/Vulkan-Loader
 tag=v1.4.357
 if [[ ! -d "$src" ]]; then
@@ -33,12 +57,22 @@ if [[ ! -d "$src" ]]; then
 fi
 root=$PWD
 ( cd "$src" && git checkout -q -- loader && python3 "$root/linux/vulkan-loader/patch-local-override.py" && python3 "$root/linux/vulkan-loader/patch-no-dxgi.py" && python3 "$root/linux/vulkan-loader/patch-queue-info.py" )
+deps_args=(-DUPDATE_DEPS=ON)
+if [[ -d toolchain/Vulkan-Headers ]]; then
+    vh_install="$PWD/artifacts/ref/vulkan-headers-install"
+    if [[ ! -f "$vh_install/share/cmake/VulkanHeaders/VulkanHeadersConfig.cmake" ]]; then
+        cmake -S toolchain/Vulkan-Headers -B artifacts/ref/vulkan-headers-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DVULKAN_HEADERS_ENABLE_TESTS=OFF -DVULKAN_HEADERS_ENABLE_INSTALL=ON > /dev/null
+        cmake --install artifacts/ref/vulkan-headers-build --prefix "$vh_install" > /dev/null
+    fi
+    deps_args=(-DUPDATE_DEPS=OFF -DVULKAN_HEADERS_INSTALL_DIR="$vh_install")
+fi
 for arch in i686 x86_64; do
     out=artifacts/vulkan-loader/$arch
     mkdir -p "$out"
     cmake -S "$src" -B "$src/build-$arch" -G Ninja \
         -DCMAKE_TOOLCHAIN_FILE="$PWD/linux/vulkan-loader/toolchain-$arch.cmake" \
-        -DCMAKE_BUILD_TYPE=Release -DUPDATE_DEPS=ON -DBUILD_TESTS=OFF -DUSE_GAS=ON > "$src/cmake-$arch.log" 2>&1
+        -DCMAKE_BUILD_TYPE=Release "${deps_args[@]}" -DBUILD_TESTS=OFF -DUSE_GAS=ON > "$src/cmake-$arch.log" 2>&1
     ninja -C "$src/build-$arch" > "$src/ninja-$arch.log" 2>&1
     cp -- "$src/build-$arch/loader/vulkan-1.dll" "$out/vulkan-1.dll"
     extra=(); [[ $arch == i686 ]] && extra=(-Wl,--kill-at)
