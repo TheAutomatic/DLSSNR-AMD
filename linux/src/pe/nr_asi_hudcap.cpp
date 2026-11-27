@@ -1799,6 +1799,28 @@ void unfollowed(const char* why) {
         log("[nr] frame reuse's even frames cannot follow frame generation: %s "
             "(said once)", why);
 }
+// A copy handed to frame generation can still be read by its work on the GPU after the even frames stop or the copy is
+// made again at another size (frame generation's own queue and frames in flight: no fence of ours covers them). Every
+// ring's copy no longer used goes after 8 more Presents and 2 s (tick, once a Present).
+struct Retired { ID3D12Resource* res; uint32_t presents; ULONGLONG ms; };
+std::mutex retired_m;
+std::vector<Retired> retired;
+void retire(ID3D12Resource*& r) {
+    if (!r) return;
+    std::lock_guard<std::mutex> lock(retired_m);
+    retired.push_back({r, 8, GetTickCount64() + 2000});
+    r = nullptr;
+}
+void tick() {   // once a Present (fg_delay)
+    std::lock_guard<std::mutex> lock(retired_m);
+    const ULONGLONG now = GetTickCount64();
+    retired.erase(std::remove_if(retired.begin(), retired.end(), [now](Retired& e) {
+                      if (e.presents) --e.presents;
+                      if (e.presents || now < e.ms) return false;
+                      e.res->Release();
+                      return true;
+                  }), retired.end());
+}
 // The ring's copy of `like` (same description: CopyResource takes the pair), resting in `state`.
 bool ring_resource(ID3D12Resource*& res, D3D12_RESOURCE_STATES& rest, ID3D12Resource* like, D3D12_RESOURCE_STATES state,
                    const char* what) {
@@ -1811,8 +1833,7 @@ bool ring_resource(ID3D12Resource*& res, D3D12_RESOURCE_STATES& rest, ID3D12Reso
                           have.SampleDesc.Quality == want.SampleDesc.Quality && have.Layout == want.Layout &&
                           have.Flags == want.Flags;
         if (same && rest == state) return true;
-        res->Release();
-        res = nullptr;
+        retire(res);
     }
     ID3D12Device* d = nullptr;
     if (FAILED(like->GetDevice(IID_PPV_ARGS(&d))) || !d) return false;
@@ -1879,7 +1900,7 @@ std::unordered_map<void*, Ctx> ctxs;   // by the context's handle (the UI's: the
 bool hooked = false;
 uint32_t off_frames = 0;
 void release(Ctx& c) {
-    for (auto& t : c.slots) for (auto& sl : t) if (sl.res) { sl.res->Release(); sl.res = nullptr; sl.valid = false; }
+    for (auto& t : c.slots) for (auto& sl : t) { fgd::retire(sl.res); sl.valid = false; }
     for (auto& p : c.pending) if (p.game) p.game->Release();
     c.pending.clear();
 }
@@ -1940,25 +1961,10 @@ uint32_t off_frames = 0;
 bool any = false;
 std::atomic<uint64_t> seen_ms{0};   // the last evaluate whose inputs are delayed here (fg_followed)
 const char* const kName[kDlssgInputs] = {"depth", "motion vector", "HUD-less", "distortion"};
-// Copies no longer used go after 8 more Presents and 2 s (an evaluate's list may not have run yet when the even frames
-// stop or the size changes: the ring is the provider's input on it)
-struct Retired { ID3D12Resource* res; uint32_t presents; ULONGLONG ms; };
-std::vector<Retired> retired;
-void retire(ID3D12Resource*& r) {
-    if (r) retired.push_back({r, 8, GetTickCount64() + 2000});
-    r = nullptr;
-}
-void tick() {   // (dd::m held; once a Present)
-    const ULONGLONG now = GetTickCount64();
-    retired.erase(std::remove_if(retired.begin(), retired.end(), [now](Retired& e) {
-                      if (e.presents) --e.presents;
-                      if (e.presents || now < e.ms) return false;
-                      e.res->Release();
-                      return true;
-                  }), retired.end());
-}
+// Copies no longer used: fgd::retire (an evaluate's list may not have run yet when the even frames stop or the size
+// changes: the ring is the provider's input on it)
 void release() {
-    for (auto& t : slots) for (Slot& s : t) { retire(s.res); s = Slot{}; }
+    for (auto& t : slots) for (Slot& s : t) { fgd::retire(s.res); s = Slot{}; }
     any = false;
 }
 // The slot's copy of `like` (its description), resting in COPY_DEST; a slot of another description retired first
@@ -1966,7 +1972,7 @@ bool slot_for(Slot& s, ID3D12Resource* like, const char* what) {
     if (s.res) {
         const D3D12_RESOURCE_DESC have = s.res->GetDesc(), want = like->GetDesc();
         if (std::memcmp(&have, &want, sizeof have) == 0) return true;
-        retire(s.res);
+        fgd::retire(s.res);
         s.valid = false;
     }
     D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -2270,11 +2276,10 @@ std::unordered_set<void*> observed_proxies;
 std::atomic<unsigned> proxy_pending{0};
 std::atomic<bool> on{false};
 std::atomic<uint32_t> lag{1};   // frames late (1 or 2)
-uint32_t off_presents = 0;   // Presents since the even frames stopped: the copies go after a few (frame generation may
-                             // still read the last one handed over)
+uint32_t off_presents = 0;   // Presents since the even frames stopped: the copies retired after a few (fgd::retire)
 bool hooked_tags = false, hooked_constants = false;
 void release(Ctx& c) {
-    for (auto& t : c.slots) for (auto& sl : t) if (sl.res) { sl.res->Release(); sl.res = nullptr; sl.valid = false; }
+    for (auto& t : c.slots) for (auto& sl : t) { fgd::retire(sl.res); sl.valid = false; }
     for (auto& p : c.pending) {if(p.at_proxy)--proxy_pending;if(p.game)p.game->Release();}
     c.pending.clear();
 }
@@ -2289,7 +2294,7 @@ Slot* slot(Ctx& c, uint32_t type, uint32_t id, ID3D12Resource* g, D3D12_RESOURCE
                           have.Format == want.Format && have.SampleDesc.Count == want.SampleDesc.Count &&
                           have.SampleDesc.Quality == want.SampleDesc.Quality && have.Layout == want.Layout &&
                           have.Flags == want.Flags;
-        if (!same || sl.state != state) { sl.res->Release(); sl.res = nullptr; sl.valid = false; }
+        if (!same || sl.state != state) { fgd::retire(sl.res); sl.valid = false; }
     }
     if (!sl.res) {
         ID3D12Device* d = nullptr;
@@ -2655,7 +2660,7 @@ void fg_delay(int frames, bool capture) {
     {
         std::lock_guard<std::mutex> lock(xd::m);
         if (on) xd::off_presents = 0;
-        else if (!xd::ctxs.empty() && ++xd::off_presents >= 4) {   // (the last one handed over read by then)
+        else if (!xd::ctxs.empty() && ++xd::off_presents >= 4) {   // (its copies retired: fgd::retire)
             for (auto& [sc, c] : xd::ctxs) xd::release(c);
             xd::ctxs.clear();
         }
@@ -2664,7 +2669,7 @@ void fg_delay(int frames, bool capture) {
         std::lock_guard<std::mutex> lock(dd::m);
         if (on) dd::off_frames = 0;
         else if (dd::any && ++dd::off_frames >= 4) dd::release();
-        dd::tick();
+        fgd::tick();
     }
     std::lock_guard<std::mutex> lock(fd::m);
     if (on) fd::off_frames = 0;

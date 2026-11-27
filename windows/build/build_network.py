@@ -23,9 +23,11 @@ lists the differences (exit 1 if any).
 """
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 R = Path(__file__).resolve().parents[2]
@@ -41,8 +43,31 @@ QUAD = True   # --no-quad: the pair loops as written (A/B)
 # loop variable.
 UNROLLED = {'fswin_t.comp', 'ffwd3_t.comp', 'attn.comp', 'vit_attn.comp'}
 
+# Every glslang run of this build is queued (glslang) and run at the end (run_queued), NR_SHADER_JOBS at a time - by
+# default the CPUs shared with the steps windows/build/parallel.sh runs beside this one (CPUs / its NR_JOBS); each run
+# writes a file of its own, so the outputs do not depend on the order. A failure stops the build with that compiler's
+# messages (the first failure in queue order).
+_queue = []
 
-def glslang(arch, src, defines, out, unroll=False, network=False):
+
+def _jobs():
+    if os.environ.get('NR_SHADER_JOBS'):
+        return max(1, int(os.environ['NR_SHADER_JOBS']))
+    return max(1, (os.cpu_count() or 1) // max(1, int(os.environ.get('NR_JOBS') or 1)))
+
+
+def run_queued():
+    work, _queue[:] = list(_queue), []
+    with ThreadPoolExecutor(_jobs()) as pool:
+        for f in [pool.submit(_compile, *a, **k) for a, k in work]:
+            f.result()
+
+
+def glslang(*a, **k):
+    _queue.append((a, k))
+
+
+def _compile(arch, src, defines, out, unroll=False, network=False):
     if unroll or (network and QUAD):
         pre = out.with_suffix('.pre.comp')
         r = subprocess.run([str(R / 'toolchain/glslang/bin/glslang'), '-E', '-I' + str(R / 'windows/shaders' / arch / 'include'),
@@ -120,6 +145,7 @@ def main():
     shutil.copy2(out / 'shader-constants.txt', out / 'temporal' / 'shader-constants.txt')
     for k in RUNTIME:
         glslang(a.arch, R / 'windows/shaders/passes' / f'{k}.comp', [], out / 'runtime' / f'{k}.spv')
+    run_queued()
     print(f'{out}: {len(pipelines) + len(grade["pipelines"])} network pipelines, '
           f'{len(table["variants"]) + len(grade["variants"]) + len(MOTION)} temporal, '
           f'{len(RUNTIME)} runtime')

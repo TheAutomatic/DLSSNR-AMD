@@ -32,9 +32,11 @@ lists the differences (exit 1 if any).
 """
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 R = Path(__file__).resolve().parents[2]
@@ -48,8 +50,31 @@ NETWORKS = ['CC_SILVER_AARDWOLD_OPTIMIZED', 'CC_SILVER_AARDWOLD_OPTIMIZED-balanc
             'CC_SMALL_FP8_OPTIMIZED-ultra']
 SILVER_AARDWOLD_INT4 = NETWORKS[1:4]   # with int4 layers: the iu4 markers and hs-pipelines.txt
 
+# Every glslang run of this build is queued (glslang) and run at the end (run_queued), NR_SHADER_JOBS at a time - by
+# default the CPUs shared with the steps linux/build/parallel.sh runs beside this one (CPUs / its NR_JOBS); each run
+# writes a file of its own, so the outputs do not depend on the order. A failure stops the build with that compiler's
+# messages (the first failure in queue order).
+_queue = []
 
-def glslang(arch, src, defines, out):
+
+def _jobs():
+    if os.environ.get('NR_SHADER_JOBS'):
+        return max(1, int(os.environ['NR_SHADER_JOBS']))
+    return max(1, (os.cpu_count() or 1) // max(1, int(os.environ.get('NR_JOBS') or 1)))
+
+
+def run_queued():
+    work, _queue[:] = list(_queue), []
+    with ThreadPoolExecutor(_jobs()) as pool:
+        for f in [pool.submit(_compile, *a, **k) for a, k in work]:
+            f.result()
+
+
+def glslang(*a, **k):
+    _queue.append((a, k))
+
+
+def _compile(arch, src, defines, out):
     cmd = [str(R / 'toolchain/glslang/bin/glslang'), '-V', '--target-env', 'vulkan1.3',
            '-I' + str(R / 'linux/shaders' / arch / 'include'), '-I' + str(R / 'linux/shaders/passes/include')]
     cmd += ['-D' + d for d in defines] + [str(src), '-o', str(out)]
@@ -136,6 +161,7 @@ def main():
     else:
         for k in RUNTIME:
             glslang(a.arch, R / 'linux/shaders/passes' / f'{k}.comp', [], out / 'runtime' / f'{k}.spv')
+    run_queued()
     print(f'{out}: {len(pipelines) + len(grade["pipelines"])} network pipelines, '
           f'{len(table["variants"]) + len(grade["variants"]) + len(MOTION)} temporal, '
           f'{0 if overlay else len(RUNTIME)} runtime')
