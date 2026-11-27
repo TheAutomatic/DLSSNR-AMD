@@ -28,9 +28,14 @@ License Scope & Upstream / Third-Party Attributions
 3. Third-Party Components
    Third-party libraries, shaders, loaders, fonts, and host runtimes (including
    OptiScaler, ReShade, DLSS5-Feeder, MinHook, Dear ImGui, Inter, AMD FSR 1,
-   RenoDX, Vulkan-Loader, DXVK, and VORT shaders) retain their respective
-   open-source licenses as documented in THIRD_PARTY.md and alongside shipped
-   package files.
+   RenoDX, Vulkan-Loader, DXVK, and VORT shaders) are distributed as independent
+   aggregates strictly under their own licenses, with no additional restrictions
+   imposed by this project (see THIRD_PARTY.md and alongside shipped package files).
+   In particular, unmodified OptiScaler is licensed under GPL-3.0; corresponding
+   source for the exact bundled release is available from
+   https://github.com/optiscaler/OptiScaler (exact release and commit pinned in
+   fetch_deps.sh of the corresponding repository revision, and recorded in
+   optiscaler/OptiScaler_SOURCE.txt in release packages).
 
 4. Proprietary Exclusions
    This repository and its release packages exclude proprietary NVIDIA binaries

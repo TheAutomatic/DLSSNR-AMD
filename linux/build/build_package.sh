@@ -330,6 +330,14 @@ if [[ "$arch" == x86_64 ]]; then
     [[ -f "$pkg/optiscaler/release/OptiScaler.dll" && -f "$pkg/optiscaler/release/OptiScaler.ini" &&
        -d "$pkg/optiscaler/release/OptiScaler" ]] || { echo "$opti_7z is not laid out as OptiScaler v10" >&2; exit 1; }
     cp -- "$opti_license" "$pkg/optiscaler/OptiScaler_LICENSE.txt"
+    opti_commit=$(sed -n 's|.*raw\.githubusercontent\.com/optiscaler/OptiScaler/\([0-9a-f]\{40\}\)/LICENSE.*|\1|p' fetch_deps.sh | head -1)
+    opti_url=$(sed -n 's|.*\(https://github\.com/optiscaler/[^ ]*\.7z\).*|\1|p' fetch_deps.sh | head -1)
+    {
+        echo "OptiScaler is distributed unmodified as an independent aggregate under the GNU General Public License v3.0 (see OptiScaler_LICENSE.txt), with no additional restrictions."
+        echo "Upstream source repository: https://github.com/optiscaler/OptiScaler"
+        [[ -n "$opti_commit" ]] && echo "Corresponding source commit: https://github.com/optiscaler/OptiScaler/tree/$opti_commit"
+        [[ -n "$opti_url" ]] && echo "Upstream binary archive: $opti_url"
+    } > "$pkg/optiscaler/OptiScaler_SOURCE.txt"
     # stamped with the package's version (its log line and NR Control's title), not the bare commit
     NR_STAMP=$(bash linux/build/version.sh) bash linux/build/build_asi.sh artifacts/optiscaler/asi > /dev/null
     cp -- artifacts/optiscaler/asi/dlssnr-amd.asi artifacts/optiscaler/asi/nr_present_probe.exe "$pkg/optiscaler/asi/"

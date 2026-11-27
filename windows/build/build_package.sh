@@ -332,6 +332,14 @@ mkdir -p -- "$op/release" "$op/asi"
 [[ -f "$op/release/OptiScaler.dll" && -f "$op/release/OptiScaler.ini" && -d "$op/release/OptiScaler" ]] ||
     { echo "$opti_7z is not laid out as OptiScaler v10" >&2; exit 1; }
 cp -- "$opti_license" "$op/OptiScaler_LICENSE.txt"
+opti_commit=$(sed -n 's|.*raw\.githubusercontent\.com/optiscaler/OptiScaler/\([0-9a-f]\{40\}\)/LICENSE.*|\1|p' fetch_deps.sh | head -1)
+opti_url=$(sed -n 's|.*\(https://github\.com/optiscaler/[^ ]*\.7z\).*|\1|p' fetch_deps.sh | head -1)
+{
+    echo "OptiScaler is distributed unmodified as an independent aggregate under the GNU General Public License v3.0 (see OptiScaler_LICENSE.txt), with no additional restrictions."
+    echo "Upstream source repository: https://github.com/optiscaler/OptiScaler"
+    [[ -n "$opti_commit" ]] && echo "Corresponding source commit: https://github.com/optiscaler/OptiScaler/tree/$opti_commit"
+    [[ -n "$opti_url" ]] && echo "Upstream binary archive: $opti_url"
+} > "$op/OptiScaler_SOURCE.txt"
 cp -- artifacts/windows/asi/dlssnr-amd.asi artifacts/windows/asi/nr_present_probe.exe "$op/asi/"
 cp -- "${NR_MENU_FONT_LICENSE:-toolchain/fonts/inter-4.1/LICENSE.txt}" "$op/asi/Inter-LICENSE.txt"
 cp -- "${NR_IMGUI_ROOT:-toolchain/imgui-nr}/LICENSE.txt" "$op/asi/DearImGui-LICENSE.txt"
