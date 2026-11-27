@@ -169,9 +169,15 @@ if [[ $windows == 1 ]]; then
     # already); an unpacked toolchain/<tag>-x86_64 is used as it is.
     ge=${NR_GE_PROTON:-}
     if [[ -z "$ge" ]]; then
-        ge=$(curl -fsSL --retry 3 https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest |
-             python3 -c 'import json, sys; print(json.load(sys.stdin)["tag_name"])') ||
-            { echo "cannot tell the latest GE-Proton release (set NR_GE_PROTON=<tag>)" >&2; exit 1; }
+        ge=$(curl -fsSLI --retry 3 -o /dev/null -w '%{url_effective}' \
+             https://github.com/GloriousEggroll/proton-ge-custom/releases/latest |
+             sed -n 's|.*/releases/tag/\(GE-Proton[0-9][0-9]*-[0-9][0-9]*\)$|\1|p') || true
+        if [[ -z "$ge" ]]; then
+            ge=$(curl -fsSL --retry 3 ${GH_TOKEN:+-H "Authorization: Bearer $GH_TOKEN"} \
+                 https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest |
+                 python3 -c 'import json, sys; print(json.load(sys.stdin)["tag_name"])') ||
+                { echo "cannot tell the latest GE-Proton release (set NR_GE_PROTON=<tag>)" >&2; exit 1; }
+        fi
     fi
     [[ "$ge" =~ ^GE-Proton[0-9]+-[0-9]+$ ]] || { echo "not a GE-Proton release: $ge" >&2; exit 1; }
     dx=artifacts/ref/dxvk-ge
