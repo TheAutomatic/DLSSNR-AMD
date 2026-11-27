@@ -4363,6 +4363,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
             bool ini_fb = false;
             config_path = nr::u8::writable_ini_path(folder, &ini_fb);
             if (ini_fb) log("[nr] settings folder '%s' is read-only; using '%s'", folder.c_str(), config_path.c_str());
+            nr::pe::screenshot::set_folder(nr::u8::wide(nr::u8::writable_app_dir(folder)) + L"\\NR Screenshots");
             nr::pe::restore_ini(folder);   // a deleted dlssnr-amd.ini: the installed one, before it is read
             config.load(config_path);
             {   // HUD FIX at the start: its capture events only for Auto / Captured (registered below)
