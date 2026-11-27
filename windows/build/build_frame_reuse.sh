@@ -11,12 +11,20 @@
 #   build_frame_reuse.sh <out dir>        NR_GLSLANG overrides the compiler
 set -euo pipefail
 cd -- "$(dirname -- "$0")/../.."
+source windows/build/parallel.sh
 out=$(realpath -m -- "${1:?usage: build_frame_reuse.sh <out dir>}")
 glslang=${NR_GLSLANG:-toolchain/glslang/bin/glslang}
 src=windows/shaders/frame-reuse
 mkdir -p -- "$out"
-log=$(mktemp "${TMPDIR:-/tmp}/frame-reuse.XXXXXX"); trap 'rm -f -- "$log"' EXIT
-build() { "$glslang" -V "$@" > "$log" || { cat "$log" >&2; exit 1; }; }
+tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/frame-reuse.XXXXXX"); trap 'rm -rf -- "$tmp_dir"' EXIT
+run_build() {
+    local log_f=$tmp_dir/$(basename -- "${*: -1}").log
+    if ! "$glslang" -V "$@" > "$log_f" 2>&1; then
+        cat "$log_f" >&2
+        return 1
+    fi
+}
+build() { par run_build "$@"; }
 build --target-env vulkan1.3 "$src/guides.comp" -o "$out/guides.spv"
 build --target-env vulkan1.2 "$src/compose.comp" -o "$out/compose.spv"
 build --target-env vulkan1.2 -DUNORM16_OUTPUT "$src/compose.comp" -o "$out/compose16u.spv"
@@ -33,4 +41,5 @@ for k in display frame_copy; do
     build --target-env vulkan1.2 -DFLOAT_OUTPUT=rgba16f "$src/$k.comp" -o "$out/${k}16f.spv"
     build --target-env vulkan1.2 -DFLOAT_OUTPUT=r11f_g11f_b10f "$src/$k.comp" -o "$out/${k}11f.spv"
 done
+par_wait
 echo "$out: $(ls "$out"/*.spv | wc -l) frame reuse shaders"

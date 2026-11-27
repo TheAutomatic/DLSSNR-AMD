@@ -22,7 +22,9 @@ The host must be compiled with the same constants: windows/build/arch/<arch>.sh.
 lists the differences (exit 1 if any).
 """
 import argparse
+import concurrent.futures
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -92,34 +94,44 @@ def main():
     consts = dict(r.split() for r in table['markers']['shader-constants.txt'][1:])
     if consts.get('post_no_out1') == '1' and 'NR_POST_NO_OUT1=1' not in pipelines['fswinimagepost32']['defines']:
         sys.exit('pipelines.json: post_no_out1 1, but fswinimagepost32 is built without NR_POST_NO_OUT1=1')
-    for name, e in pipelines.items():
-        glslang(a.arch, R / 'windows/shaders' / a.arch / e['source'], e['defines'] + a.define, out / f'g_{name}.spv',
-                unroll=e['source'] in UNROLLED, network=True)
     for name, text in table['markers'].items():
         (out / name).write_text('\n'.join(text) + '\n' if isinstance(text, list) else text + '\n')
     (out / 'runtime').mkdir()
     (out / 'temporal').mkdir()
+    shutil.copy2(out / 'shader-constants.txt', out / 'temporal' / 'shader-constants.txt')
+
+    tasks = []
+    for name, e in pipelines.items():
+        tasks.append((R / 'windows/shaders' / a.arch / e['source'], e['defines'] + a.define, out / f'g_{name}.spv',
+                      e['source'] in UNROLLED, True))
     for name, v in table['variants'].items():
         base = pipelines[v['base']]
-        glslang(a.arch, R / 'windows/shaders' / a.arch / base['source'], base['defines'] + v['add'],
-                out / 'temporal' / f'{name}.spv', unroll=base['source'] in UNROLLED, network=True)
+        tasks.append((R / 'windows/shaders' / a.arch / base['source'], base['defines'] + v['add'],
+                      out / 'temporal' / f'{name}.spv', base['source'] in UNROLLED, True))
     grade = table['style_grade']
     # _grade: the table form; _grade_accel: the same grade in closed form ([Network] Style Grade Acceleration)
     for suffix, add in (('_grade', grade['add']), ('_grade_accel', grade['accel_add'])):
         for name in grade['pipelines']:
             e = pipelines[name]
-            glslang(a.arch, R / 'windows/shaders' / a.arch / e['source'], e['defines'] + a.define + add,
-                    out / f'g_{name}{suffix}.spv', unroll=e['source'] in UNROLLED, network=True)
+            tasks.append((R / 'windows/shaders' / a.arch / e['source'], e['defines'] + a.define + add,
+                          out / f'g_{name}{suffix}.spv', e['source'] in UNROLLED, True))
         for name in grade['variants']:
             base = pipelines[table['variants'][name]['base']]
-            glslang(a.arch, R / 'windows/shaders' / a.arch / base['source'],
-                    base['defines'] + table['variants'][name]['add'] + add, out / 'temporal' / f'{name}{suffix}.spv',
-                    unroll=base['source'] in UNROLLED, network=True)
+            tasks.append((R / 'windows/shaders' / a.arch / base['source'],
+                          base['defines'] + table['variants'][name]['add'] + add,
+                          out / 'temporal' / f'{name}{suffix}.spv', base['source'] in UNROLLED, True))
     for k in MOTION:
-        glslang(a.arch, R / 'windows/shaders/passes' / f'{k}.comp', [], out / 'temporal' / f'{k}.spv')
-    shutil.copy2(out / 'shader-constants.txt', out / 'temporal' / 'shader-constants.txt')
+        tasks.append((R / 'windows/shaders/passes' / f'{k}.comp', [], out / 'temporal' / f'{k}.spv', False, False))
     for k in RUNTIME:
-        glslang(a.arch, R / 'windows/shaders/passes' / f'{k}.comp', [], out / 'runtime' / f'{k}.spv')
+        tasks.append((R / 'windows/shaders/passes' / f'{k}.comp', [], out / 'runtime' / f'{k}.spv', False, False))
+
+    env_jobs = os.environ.get('NR_JOBS', '').strip()
+    workers = int(env_jobs) if env_jobs.isdigit() and int(env_jobs) > 0 else (os.cpu_count() or 4)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = [pool.submit(glslang, a.arch, src, defs, dst, unroll=unroll, network=network)
+                for src, defs, dst, unroll, network in tasks]
+        for fut in futs:
+            fut.result()
     print(f'{out}: {len(pipelines) + len(grade["pipelines"])} network pipelines, '
           f'{len(table["variants"]) + len(grade["variants"]) + len(MOTION)} temporal, '
           f'{len(RUNTIME)} runtime')
