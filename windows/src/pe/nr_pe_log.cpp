@@ -41,8 +41,12 @@ std::string resolve_folder() {
     return folder_of(nullptr);
 }
 
-std::string resolve_path() {
+std::string resolve_path(bool* fell_back = nullptr) {
     const std::string folder = resolve_folder();
+    bool fb = false;
+    const std::string target = nr::u8::writable_app_dir(folder, &fb);
+    if (fell_back) *fell_back = fb;
+    if (fb && !target.empty()) return target + "\\dlssnr-amd.log";
     return folder.empty() ? std::string("dlssnr-amd.log")
                           : folder + "\\dlssnr-amd.log";
 }
@@ -54,7 +58,7 @@ struct LogSettings { bool enabled = true, clear = true; };
 LogSettings read_settings() {
     LogSettings s;
     const std::string folder = resolve_folder();
-    FILE* f = nr::u8::fopen((folder.empty() ? std::string("dlssnr-amd.ini") : folder + "\\dlssnr-amd.ini").c_str(), "r");
+    FILE* f = nr::u8::fopen(nr::u8::writable_ini_path(folder).c_str(), "r");
     if (!f) return s;
     auto trim = [](std::string t) {
         const auto b = t.find_first_not_of(" \t\r\n"), e = t.find_last_not_of(" \t\r\n");
@@ -91,7 +95,16 @@ FILE* open_log() {
     char seen[4];
     const bool first = GetEnvironmentVariableA("NR_LOG_OPENED", seen, sizeof seen) == 0;
     if (first) SetEnvironmentVariableA("NR_LOG_OPENED", "1");
-    return nr::u8::fopen(resolve_path().c_str(), s.clear && first ? "w" : "a");
+    bool fb = false;
+    const std::string p = resolve_path(&fb);
+    FILE* f = nr::u8::fopen(p.c_str(), s.clear && first ? "w" : "a");
+    if (f && fb && first) {
+        const std::string orig = resolve_folder();
+        std::fprintf(f, "[nr] log folder '%s' is read-only; writing logs to '%s'\n",
+                     orig.empty() ? "." : orig.c_str(), p.c_str());
+        std::fflush(f);
+    }
+    return f;
 }
 
 FILE* file() {

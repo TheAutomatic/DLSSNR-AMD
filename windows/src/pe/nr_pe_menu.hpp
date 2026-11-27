@@ -76,6 +76,8 @@ bool colour_space_of(IDXGISwapChain* swap_chain, int* space);
 // The process is ending (see nr::dlssnr::abandon_at_exit): the overlays are left as they are, not destroyed (their
 // destructors wait for the GPU and release objects of modules detached already).
 void abandon_at_exit();
+// Arbitrates primary swap-chain ownership when standalone hosts present multiple windows.
+bool is_primary_swapchain(IDXGISwapChain* swap_chain);
 // Native Vulkan Present: same Menu and input watcher as DXGI, its own Vulkan draw/compose passes.
 const VkPresentInfoKHR* vulkan_present(VkInstance instance, VkPhysicalDevice physical, VkDevice device,
         VkQueue queue, uint32_t family, VkSwapchainKHR sc, VkFormat format, VkColorSpaceKHR space,

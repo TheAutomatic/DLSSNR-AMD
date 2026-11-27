@@ -4,10 +4,13 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cctype>
 #include <cstring>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 
 #include "nr_path_u8.hpp"
 
@@ -130,6 +133,251 @@ inline DWORD profile(const char* section, const char* key, const char* def, char
 }
 inline DWORD profile(const char* section, const char* key, const char* def, char* out, DWORD size, const std::string& file) {
     return profile(section, key, def, out, size, file.c_str());
+}
+
+inline bool make_dirs(const char* path) {
+    if (!path || !*path) return false;
+    std::wstring w = wide(path);
+    if (w.empty()) return false;
+    for (wchar_t& c : w) if (c == L'/') c = L'\\';
+    while (w.size() > 1 && w.back() == L'\\') {
+        if (w.size() == 3 && w[1] == L':') break;
+        w.pop_back();
+    }
+    const DWORD existing = GetFileAttributesW(w.c_str());
+    if (existing != INVALID_FILE_ATTRIBUTES) return (existing & FILE_ATTRIBUTE_DIRECTORY) != 0;
+
+    size_t start = 0;
+    if (w.rfind(L"\\\\?\\", 0) == 0) {
+        start = (w.size() >= 6 && w[5] == L':') ? 7 : 4;
+    } else if (w.size() >= 2 && w[1] == L':') {
+        start = (w.size() >= 3 && w[2] == L'\\') ? 3 : 2;
+    } else if (w.rfind(L"\\\\", 0) == 0) {
+        const size_t s1 = w.find(L'\\', 2);
+        const size_t s2 = (s1 != std::wstring::npos) ? w.find(L'\\', s1 + 1) : std::wstring::npos;
+        start = (s2 != std::wstring::npos) ? (s2 + 1) : w.size();
+    } else if (w[0] == L'\\') {
+        start = 1;
+    }
+
+    for (size_t pos = start; pos <= w.size(); ++pos) {
+        if (pos == w.size() || w[pos] == L'\\') {
+            if (pos > start) {
+                const std::wstring sub = w.substr(0, pos);
+                CreateDirectoryW(sub.c_str(), nullptr);
+            }
+        }
+    }
+    const DWORD created = GetFileAttributesW(w.c_str());
+    return created != INVALID_FILE_ATTRIBUTES && (created & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+inline bool dir_writable(const char* path) {
+    const char* target = (path && *path) ? path : ".";
+    if (!make_dirs(target)) return false;
+    static std::atomic<uint32_t> seq{0};
+    std::wstring probe = wide(target);
+    if (probe.empty()) return false;
+    for (wchar_t& c : probe) if (c == L'/') c = L'\\';
+    if (probe.back() != L'\\') probe.push_back(L'\\');
+    probe += L".nr_write_";
+    probe += std::to_wstring(GetCurrentProcessId());
+    probe += L"_";
+    probe += std::to_wstring(seq.fetch_add(1, std::memory_order_relaxed));
+    probe += L".tmp";
+    const HANDLE h = CreateFileW(probe.c_str(), GENERIC_WRITE,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                 nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    CloseHandle(h);
+    DeleteFileW(probe.c_str());
+    return true;
+}
+
+inline std::string local_app_data_root() {
+    auto env_w = [](const wchar_t* name) -> std::wstring {
+        const DWORD need = GetEnvironmentVariableW(name, nullptr, 0);
+        if (!need) return {};
+        std::wstring out(need, L'\0');
+        const DWORD got = GetEnvironmentVariableW(name, out.data(), need);
+        if (!got || got >= need) return {};
+        out.resize(got);
+        return out;
+    };
+    std::wstring base = env_w(L"LOCALAPPDATA");
+    if (base.empty()) {
+        base = env_w(L"USERPROFILE");
+        if (!base.empty()) {
+            if (base.back() != L'\\') base.push_back(L'\\');
+            base += L"AppData\\Local";
+        }
+    }
+    if (base.empty()) {
+        wchar_t tmp[MAX_PATH * 4]{};
+        const DWORD n = GetTempPathW(MAX_PATH * 4, tmp);
+        if (n && n < MAX_PATH * 4) base.assign(tmp, n);
+    }
+    if (base.empty()) return "DLSSNR-AMD";
+    while (base.size() > 3 && base.back() == L'\\') base.pop_back();
+    if (base.back() != L'\\') base.push_back(L'\\');
+    base += L"DLSSNR-AMD";
+    return narrow(base);
+}
+
+inline std::string normalize_dir_key(const std::string& p) {
+    std::string k = p;
+    for (char& c : k) if (c == '/') c = '\\';
+    while (k.size() > 1 && k.back() == '\\') {
+        if (k.size() == 3 && k[1] == ':') break;
+        k.pop_back();
+    }
+    return k;
+}
+
+inline std::string app_storage_tag(const std::string& preferred) {
+    std::string stem = "app";
+    std::wstring exe(32768, L'\0');
+    const DWORD n = GetModuleFileNameW(nullptr, exe.data(), DWORD(exe.size()));
+    if (n && n < exe.size()) {
+        exe.resize(n);
+        std::string u = narrow(exe);
+        const size_t slash = u.find_last_of("\\/");
+        if (slash != std::string::npos) u = u.substr(slash + 1);
+        const size_t dot = u.rfind('.');
+        if (dot != std::string::npos) u.resize(dot);
+        std::string clean;
+        clean.reserve(u.size());
+        for (unsigned char c : u) {
+            if (std::isalnum(c) || c == '-' || c == '_') clean.push_back(char(c));
+            else clean.push_back('_');
+        }
+        if (!clean.empty()) {
+            if (clean.size() > 32) clean.resize(32);
+            stem = std::move(clean);
+        }
+    }
+    const std::string norm = normalize_dir_key(preferred);
+    uint32_t h = 2166136261u;
+    for (unsigned char c : norm) {
+        h ^= static_cast<unsigned char>(std::tolower(c));
+        h *= 16777619u;
+    }
+    char hex[9];
+    for (int i = 7; i >= 0; --i) {
+        const unsigned nib = (h >> (i * 4)) & 0xfu;
+        hex[7 - i] = char(nib < 10 ? '0' + nib : 'a' + (nib - 10));
+    }
+    hex[8] = '\0';
+    return stem + "_" + hex;
+}
+
+inline std::string writable_cache_root(const std::string& preferred, bool* fell_back = nullptr) {
+    struct Entry { std::string path; bool fb; };
+    static std::mutex mu;
+    static std::unordered_map<std::string, Entry> memo;
+    const std::string key = normalize_dir_key(preferred);
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        const auto it = memo.find(key);
+        if (it != memo.end()) {
+            if (fell_back) *fell_back = it->second.fb;
+            return it->second.path;
+        }
+    }
+    Entry e;
+    if (!key.empty() && dir_writable(key.c_str())) {
+        e = {key, false};
+    } else {
+        std::string fb = local_app_data_root() + "\\cache";
+        make_dirs(fb.c_str());
+        e = {std::move(fb), true};
+    }
+    std::lock_guard<std::mutex> lk(mu);
+    const auto [it, _] = memo.emplace(key, std::move(e));
+    if (fell_back) *fell_back = it->second.fb;
+    return it->second.path;
+}
+
+inline std::string writable_app_dir(const std::string& preferred, bool* fell_back = nullptr) {
+    struct Entry { std::string path; bool fb; };
+    static std::mutex mu;
+    static std::unordered_map<std::string, Entry> memo;
+    const std::string key = normalize_dir_key(preferred);
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        const auto it = memo.find(key);
+        if (it != memo.end()) {
+            if (fell_back) *fell_back = it->second.fb;
+            return it->second.path;
+        }
+    }
+    Entry e;
+    if (dir_writable(key.empty() ? "." : key.c_str())) {
+        e = {key, false};
+    } else {
+        std::string fb = local_app_data_root() + "\\apps\\" + app_storage_tag(key);
+        make_dirs(fb.c_str());
+        e = {std::move(fb), true};
+    }
+    std::lock_guard<std::mutex> lk(mu);
+    const auto [it, _] = memo.emplace(key, std::move(e));
+    if (fell_back) *fell_back = it->second.fb;
+    return it->second.path;
+}
+
+inline void clear_readonly(const std::string& p) {
+    const std::wstring w = wide(p);
+    const DWORD a = GetFileAttributesW(w.c_str());
+    if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_READONLY) != 0)
+        SetFileAttributesW(w.c_str(), a & ~FILE_ATTRIBUTE_READONLY);
+}
+
+inline bool seed_writable_ini(const std::string& src_dir, const std::string& target_ini) {
+    if (target_ini.empty() || attributes(target_ini) != INVALID_FILE_ATTRIBUTES) return false;
+    const size_t cut = target_ini.find_last_of("\\/");
+    if (cut != std::string::npos) make_dirs(target_ini.substr(0, cut).c_str());
+    const std::string base = src_dir.empty() ? std::string(".") : normalize_dir_key(src_dir);
+    const std::string sep = (!base.empty() && base.back() == '\\') ? "" : "\\";
+    const std::string src_ini = base + sep + "dlssnr-amd.ini";
+    if (attributes(src_ini) != INVALID_FILE_ATTRIBUTES && copy_file(src_ini, target_ini, TRUE)) {
+        clear_readonly(target_ini);
+        return true;
+    }
+    const std::string src_def = base + sep + "dlssnr-amd\\dlssnr-amd.default.ini";
+    if (attributes(src_def) != INVALID_FILE_ATTRIBUTES && copy_file(src_def, target_ini, TRUE)) {
+        clear_readonly(target_ini);
+        return true;
+    }
+    return false;
+}
+
+inline std::string writable_ini_path(const std::string& folder, bool* fell_back = nullptr) {
+    struct Entry { std::string path; bool fb; };
+    static std::mutex mu;
+    static std::unordered_map<std::string, Entry> memo;
+    const std::string key = normalize_dir_key(folder);
+    std::lock_guard<std::mutex> lk(mu);
+    if (const auto it = memo.find(key); it != memo.end()) {
+        if (fell_back) *fell_back = it->second.fb;
+        return it->second.path;
+    }
+    const auto join_ini = [](const std::string& d) {
+        if (d.empty()) return std::string("dlssnr-amd.ini");
+        return d + (d.back() == '\\' ? "" : "\\") + "dlssnr-amd.ini";
+    };
+    bool fb = false;
+    const std::string app_dir = writable_app_dir(key, &fb);
+    Entry e;
+    if (!fb) {
+        e = {join_ini(key), false};
+    } else {
+        std::string target = join_ini(app_dir);
+        seed_writable_ini(key, target);
+        e = {std::move(target), true};
+    }
+    const auto [it, _] = memo.emplace(key, std::move(e));
+    if (fell_back) *fell_back = it->second.fb;
+    return it->second.path;
 }
 
 }  // namespace nr::u8

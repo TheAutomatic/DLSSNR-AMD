@@ -1318,7 +1318,7 @@ struct Session::Impl {
     // The network this call wants: an NR-chain layer's own (set_call_network) when the run can serve it,
     // else [Network] Model (the switch, which also takes the hotkey: called on every call either way).
     int wanted_network() {
-        const int want = wanted_network_(net_switch.frame(root + "\\dlssnr-amd.ini"));
+        const int want = wanted_network_(net_switch.frame(nr::u8::writable_ini_path(root)));
         net_users[want][call_layer] = std::chrono::steady_clock::now();
         return want;
     }
@@ -3096,7 +3096,7 @@ bool Session::Impl::carry(VkCommandBuffer cmd, uint64_t feature) {
     const auto now = std::chrono::steady_clock::now();
     if (now - resize_history_read > std::chrono::seconds(1)) {
         resize_history_read = now;
-        std::string v = nr::ini_network_key(root + "\\dlssnr-amd.ini", "resize history");
+        std::string v = nr::ini_network_key(nr::u8::writable_ini_path(root), "resize history");
         for (auto& c : v) c = char(std::tolower(static_cast<unsigned char>(c)));
         const bool on = v == "1" || v == "true" || v == "on" || v == "yes";
         if (on != resize_history)

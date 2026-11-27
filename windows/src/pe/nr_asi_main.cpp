@@ -570,7 +570,7 @@ std::shared_ptr<const Chain> chain_now() {
         return c;
     }();
     static std::shared_ptr<const Chain> current;
-    if (!file.poll(std::string(nr::pe::module_folder()) + "\\dlssnr-amd.ini", config) && current) return current;
+    if (!file.poll(nr::u8::writable_ini_path(nr::pe::module_folder()), config) && current) return current;
     auto next = std::make_shared<Chain>();
     Chain& chain = *next;
     chain.version = current ? current->version : 0;
@@ -10285,7 +10285,7 @@ void watch_termination() {
 bool hud_capture_wanted_at_start() {
     nr::pe::ChainFile file;
     nr::pe::ChainConfig config;
-    file.poll(std::string(nr::pe::module_folder()) + "\\dlssnr-amd.ini", config);
+    file.poll(nr::u8::writable_ini_path(nr::pe::module_folder()), config);
     return config.hud.mode == 1 || config.hud.mode == 3;
 }
 // The game asking to quit (PostQuitMessage: its window closed, its main loop ending): the watchdog then holds its stall
@@ -10326,10 +10326,16 @@ extern "C" __declspec(dllexport) void InitializeASI() {
         log("[nr] std::terminate: an exception left one of NR's threads; the process ends");
         std::abort();
     });
-    {   // and RenoDX's NR screenshots go to <game>\NR Screenshots, as on the OptiScaler route
-        nr::pe::screenshot::set_folder(nr::u8::wide(nr::pe::module_folder()) + L"\\NR Screenshots");
+    {   // and RenoDX's NR screenshots go to <game>\NR Screenshots (or %LOCALAPPDATA% when read-only)
+        const std::string shot_base = nr::u8::writable_app_dir(nr::pe::module_folder());
+        nr::pe::screenshot::set_folder(nr::u8::wide(shot_base) + L"\\NR Screenshots");
     }
     log("[nr] dlssnr-amd.asi %s loaded by %s", NR_BUILD_STAMP, nr::u8::module_file(g_opti).c_str());
+    {
+        bool ini_fb = false;
+        const std::string ini_path = nr::u8::writable_ini_path(nr::pe::module_folder(), &ini_fb);
+        if (ini_fb) log("[nr] settings folder '%s' is read-only; using '%s'", nr::pe::module_folder(), ini_path.c_str());
+    }
     nr::pe::restore_ini(nr::pe::module_folder());   // a deleted dlssnr-amd.ini: the installed one, before anything reads it
     nr::pe::apply_debug_env(nr::pe::module_folder());   // [Debug]: before anything reads the environment
     // ACO Mode: decided before any device of ours (or a game's we add features to) is made.
