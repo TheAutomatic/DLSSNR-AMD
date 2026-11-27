@@ -31,12 +31,15 @@ games it is under Binaries\Win64, not the launcher outside), then pick a route:
   1) optiscaler             64-bit games with a DLSS, FSR or XeSS option (DX11 / DX12 / Vulkan). OptiScaler
                             does the upscaling and frame generation (the original OptiScaler, its files
                             unchanged); this project's NR runs as an OptiScaler plugin.
-  2) reshade-feeder         DX10/11 games, also native DX12 in 64-bit games (ReShade + VORT, or the optional
+  2) standalone             64-bit DX11 / DX12 / Vulkan apps, video players, Magpie or capture viewers
+                            without OptiScaler or ReShade (x86_64 package only). Runs guide-less RenoDX
+                            NR directly at Present.
+  3) reshade-feeder         DX10/11 games, also native DX12 in 64-bit games (ReShade + VORT, or the optional
                             LumeniteFX, provide the motion vectors)
-  3) reshade-feeder-dx9     old DX9 games (ReShade)
-  4) reshade-feeder-vulkan  Vulkan games (ReShade)
-  5) Uninstall
-  6) Collect logs           when something goes wrong: writes a zip to the desktop to attach to an
+  4) reshade-feeder-dx9     old DX9 games (ReShade)
+  5) reshade-feeder-vulkan  Vulkan games (ReShade)
+  6) Uninstall
+  7) Collect logs           when something goes wrong: writes a zip to the desktop to attach to an
                             issue (in game, NR Control's Diagnostics has "Save a diagnostic package")
 
 You can also drag the game's exe onto install.bat. Games under Program Files ask for
@@ -190,8 +193,16 @@ optiscaler: turn on DLSS, FSR or XeSS in the game's settings; Insert opens the O
             A layer placed at Present runs only at Present, never moved before or after the upscaler;
             when Present cannot serve it (for example a screen colour format it does not support), the
             layer does not run and its line in the menu says why.
+standalone: 64-bit DX11 / DX12 / Vulkan programs, video players, Magpie or capture viewers without an
+            upscaler or ReShade (x86_64 package only). dxgi.dll beside the executable loads
+            dlssnr-amd.asi (DX11/DX12), and vulkan-1.dll loads it via vk-override\ (Vulkan), running
+            guide-less RenoDX NR directly at Present. End opens NR Control; F6 toggles NR; F5 takes
+            comparison screenshots.
 reshade-feeder routes: Home opens ReShade; the NR settings are on the Add-ons page, laid out as NR
             Control:
+            - Direct Present ([DlssNr] DirectPresent = auto, default): when DLSS5_Feed.fx is not installed
+              (or set DirectPresent = always when DLSS5_Feed is loaded but disabled), ReShade runs guide-less
+              NR directly at Present without motion-vector shaders.
             - The same pages as NR Control (NR settings, Network with the Layers switch, Preprocess, HUD FIX,
               Hotkeys, Screenshot, Compare, Diagnostics, Status), plus Motion vectors (VORT or LumeniteFX
               Kernel) and Language (with Text size); the menu's size and font are ReShade's own settings.
@@ -340,13 +351,15 @@ game.
 
 Files put into the game folder
 ------------------------------
-    dlssnr-amd\                  models and shaders; on the optiscaler route also the wilsjo2 style's
+    dlssnr-amd\                  models and shaders; on the optiscaler and standalone routes also the wilsjo2 style's
                                  shaders and nr_present_probe.exe, which NR Control uses
     dlssnr-amd-install.txt       the installation record, which uninstall follows
     dlssnr-amd.ini               settings, written at install
     optiscaler route:            dxgi.dll (that is OptiScaler.dll), OptiScaler.ini and OptiScaler\ (the NR
                                  plugin is OptiScaler\plugins\dlssnr-amd.asi, OptiScaler's licences are in
                                  OptiScaler\Licenses\)
+    standalone route:            dxgi.dll, dlssnr-amd.asi, vulkan-1.dll, vk-override\ (and
+                                 nr_present_probe.exe + licences in dlssnr-amd\)
     reshade-feeder (DX10/11/12): dxgi.dll (ReShade), dlssnr_amd.addon64 (dlssnr_amd.addon32 from the
                                  i686 package), ReShade's settings and shaders
     reshade-feeder-dx9:          d3d9.dll dxgi.dll (DXVK), vulkan-1.dll (Vulkan loader; never calls
@@ -359,7 +372,7 @@ Installing again (another route, another package) first uninstalls by the instal
 and dlssnr-amd.ini is replaced with a new default file: earlier settings are not kept, so back
 the file up first if you need them.
 
-Logs: dlssnr-amd.log, and OptiScaler.log or ReShade.log, all in the game folder. Option 6 of
+Logs: dlssnr-amd.log, and OptiScaler.log or ReShade.log, all in the game folder. Option 7 of
 install.bat collects them into a zip on the desktop.
 
 Known limits

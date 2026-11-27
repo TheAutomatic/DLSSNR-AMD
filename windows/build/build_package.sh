@@ -11,6 +11,7 @@
 #   CC_SMALL_FP8_OPTIMIZED/        its weights as a difference from CC_SMALL_FP8's (install.ps1 applies it)
 #   CC_SILVER_AARDWOLD_OPTIMIZED/  its weights as a difference from CC_SILVER_AARDWOLD's (the same)
 #   optiscaler/     OptiScaler (the official nightly, unmodified) and our NR plugin for it
+#   standalone/     (x86_64 only) dxgi.dll + vk-override/ for any 64-bit DX11/12/Vulkan app without OptiScaler or ReShade
 #   reshade/        ReShade + our add-on: dxgi.dll in DX10/11/12 games, a Vulkan layer otherwise
 #   dxvk/           D3D9 -> Vulkan, for the DX9 route only
 #   vulkan/         the Khronos loader the Vulkan-layer routes put beside the game
@@ -346,6 +347,30 @@ cp -- "${NR_IMGUI_ROOT:-toolchain/imgui-nr}/LICENSE.txt" "$op/asi/DearImGui-LICE
 cmp -s <(cd artifacts/windows/asi/shaders/wilsjo2 && sha256sum -- *.spv) <(cd "$pkg/dlssnr-amd/shaders/wilsjo2" && sha256sum -- *.spv) ||
     { echo "the plugin's wilsjo2 shaders are not dlssnr-amd/shaders/wilsjo2's" >&2; exit 1; }
 
+# standalone/ (x86_64 only; removed from package-i686 below): DX11 / DX12 / Vulkan apps without OptiScaler or ReShade.
+# install.ps1 reuses optiscaler\asi\dlssnr-amd.asi, nr_present_probe.exe and font/ImGui licences (no duplication here).
+st="$pkg/standalone"
+mkdir -p -- "$st/vk-override/implicit_layer"
+cp -- artifacts/windows/asi/dxgi-standalone.dll "$st/dxgi.dll"
+cat > "$st/vk-override/implicit_layer/dlssnr_standalone.json" <<'JSON'
+{
+  "file_format_version": "1.0.0",
+  "layer": {
+    "name": "VK_LAYER_DLSSNR_standalone",
+    "type": "GLOBAL",
+    "library_path": "..\\..\\dlssnr-amd.asi",
+    "api_version": "1.3.0",
+    "implementation_version": "1",
+    "description": "DLSSNR-AMD standalone layer",
+    "functions": {
+      "vkGetInstanceProcAddr": "NR_Layer_GetInstanceProcAddr",
+      "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion"
+    },
+    "disable_environment": { "NR_DISABLE_VK_STANDALONE": "1" }
+  }
+}
+JSON
+
 # CC_SMALL_FP8_OPTIMIZED/: what install.ps1 makes CC_SMALL_FP8_OPTIMIZED's weights with - the difference of its fitted
 # weights from CC_SMALL_FP8's (linux/data/CC_SMALL_FP8_OPTIMIZED: each changed entry XOR CC_SMALL_FP8's, so it holds none
 # of NVIDIA's weights; Performance's own entries added as "performance/<name>") and the SHA-256 of the result.
@@ -380,7 +405,8 @@ sed -i 's/$/\r/' "$pkg/install.bat"
 # exe of the other kind.
 pkg32="$out/package-i686"
 rm -rf -- "$pkg32"; cp -a --reflink=auto -- "$pkg" "$pkg32"
-rm -rf -- "$pkg32/optiscaler"
+rm -rf -- "$pkg32/optiscaler" "$pkg32/standalone"
+rm -f -- "$pkg32/ini/dlssnr-amd-standalone.ini"
 for f in dxgi.dll d3d9.dll; do mv -f -- "$pkg32/dxvk/x86/$f" "$pkg32/dxvk/$f"; done
 for f in vulkan-1.dll Vulkan-Loader-LICENSE.txt Vulkan-Loader-PATCHES.diff; do mv -f -- "$pkg32/vulkan/x86/$f" "$pkg32/vulkan/$f"; done
 rmdir -- "$pkg32/dxvk/x86" "$pkg32/vulkan/x86"
