@@ -294,10 +294,9 @@ Stage12* programs_impl() {
     return g_programs.state == 2 ? g_programs.impl : nullptr;
 }
 
-// The route's reason, said when it changes.
-void say_route(const std::string& line) {
+// The route's reason, said when it changes for this owner.
+void say_route(std::string& last, const std::string& line) {
     static std::mutex m;
-    static std::string last;
     std::lock_guard<std::mutex> l(m);
     if (line == last) return;
     last = line;
@@ -422,6 +421,7 @@ struct Wilsjo2Owner {
     std::chrono::steady_clock::time_point alloc_retry_after{};
     std::string reuse_failed, reuse_note, reuse_ui;
     std::set<std::string> reuse_said;
+    std::string route_said, native_run_said;
     uint64_t reuse_frames = 0, reuse_epoch = 0;
     nr::pe::d3d12_passthrough::frame_reuse12::Stage::Stats reuse_window{}, reuse_logged{};
     float reuse_share = -1.f;
@@ -1005,7 +1005,7 @@ bool wilsjo2_run(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, Wilsjo2Ow
                     nr::pe::control::layer_reuse_waiting(nr::pe::renodx_route::call_layer(), note.c_str());
                     nr::pe::Session::note_frames_delayed(0);
                 }
-                native::say_route("waiting for the D3D12 passthrough (" + why + "): frames pass through with no NR; the bridge is not used");
+                native::say_route(o.route_said, "waiting for the D3D12 passthrough (" + why + "): frames pass through with no NR; the bridge is not used");
                 return false;
             }
             if (!why.empty()) {
@@ -1013,7 +1013,7 @@ bool wilsjo2_run(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, Wilsjo2Ow
                 // processing, as RenoDX's frame reuse); a group member takes its group along
                 if (reuse && age && !group_bridge) age->need_bridge();
                 if (nr::pe::d3d12_passthrough::enabled()) {
-                    native::say_route("the Vulkan bridge for now: " + why);
+                    native::say_route(o.route_said, "the Vulkan bridge for now: " + why);
                     nr::pe::d3d12_passthrough::note_bridge_fallback();
                 }
                 o.reuse12.reset();   // (the passthrough's frame reuse: not this frame's route)
@@ -1023,7 +1023,8 @@ bool wilsjo2_run(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, Wilsjo2Ow
                 return run_bridged(cmd, device, o, f, s, target, w, h, before_upscale);
             }
             namespace pt = nr::pe::d3d12_passthrough;
-            native::say_route(std::string("on the D3D12 route (canary ") + pt::canary_name(pt::canary()) +
+            native::say_route(o.route_said,
+                              std::string("on the D3D12 route (canary ") + pt::canary_name(pt::canary()) +
                               "): its programs D3D12 compute, its network ACO on the game's device");
         }
     }
@@ -1119,9 +1120,8 @@ static bool run_flow(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, Wilsj
     ff.before_upscale = before_upscale;
     ff.at_present = o.at_present;
     if (!nstage) return w2::flow_run(io, o.flow, ff, s, uint64_t(format));
-    {   // what the native route runs on, said once per change (no per-frame lines)
+    {   // what the native route runs on, said once per change for this owner (no per-frame lines)
         static std::mutex m;
-        static std::string said;
         const D3D12_RESOURCE_DESC td = target->GetDesc(), md = f.motion->GetDesc();
         char line[400];
         std::snprintf(line, sizeof line,
@@ -1136,7 +1136,7 @@ static bool run_flow(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, Wilsj
         // the reset flag and the pointer move between frames; the line is compared without the reset
         std::string key(line);
         key = key.substr(0, key.rfind("; reset"));
-        if (key != said) { said = key; nr::pe::log("%s", line); }
+        if (key != o.native_run_said) { o.native_run_said = key; nr::pe::log("%s", line); }
         // the textures it is handed, each said once (the first 8): at Present the back buffers in turn; elsewhere more
         // than one would be the game's / OptiScaler's outputs in turn (with one feature's history across them)
         static std::set<std::pair<const void*, bool>> seen;
@@ -1154,7 +1154,8 @@ static bool run_flow(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, Wilsj
         o.vk = nullptr;
     }
     if (!ran)
-        native::say_route(io.made() ? "a run on the D3D12 route made its feature (the flow runs it from the next frame); "
+        native::say_route(o.route_said,
+                          io.made() ? "a run on the D3D12 route made its feature (the flow runs it from the next frame); "
                                       "this frame passes through"
                                     : "a run on the D3D12 route was not recorded (see above); the frame passes through");
     return ran;

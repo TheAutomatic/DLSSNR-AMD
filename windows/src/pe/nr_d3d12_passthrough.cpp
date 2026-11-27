@@ -13,13 +13,16 @@
 #include "nr_pe_vkdevice.hpp"
 #include <dxgi1_4.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace nr::pe::d3d12_passthrough {
 namespace {
@@ -32,6 +35,8 @@ std::mutex g_lock;            // the strings below
 std::string g_ini;            // dlssnr-amd.ini (UTF-8)
 bool g_enabled = false;
 std::string g_backend = "not run", g_network, g_adapter;
+constexpr size_t kMaxBackendLogged = 16;
+std::vector<std::string> g_backend_logged;
 std::atomic<int> g_canary{int(Canary::kNotRun)};
 std::atomic<bool> g_canary_started{false};
 std::string g_canary_line = "not run";
@@ -528,13 +533,19 @@ bool fell_back_recently() {
     return g_enabled && t && GetTickCount64() - t < 2000;
 }
 void note_backend(const char* line, bool ran, bool waiting) {
+    const char* msg = line ? line : "";
     (ran ? g_runs : waiting ? g_waits : g_fallbacks)++;
     if (!ran && !waiting) note_bridge_fallback();
     std::lock_guard<std::mutex> g(g_lock);
-    if (g_backend != line) {
-        g_backend = line;
-        log("[d3d12] backend: %s", line);
+    if (g_backend != msg) g_backend = msg;
+    const auto it = std::find(g_backend_logged.begin(), g_backend_logged.end(), msg);
+    if (it != g_backend_logged.end()) {
+        if (std::next(it) != g_backend_logged.end()) std::rotate(it, std::next(it), g_backend_logged.end());
+        return;
     }
+    if (g_backend_logged.size() >= kMaxBackendLogged) g_backend_logged.erase(g_backend_logged.begin());
+    g_backend_logged.emplace_back(msg);
+    log("[d3d12] backend: %s", msg);
 }
 void note_network(const char* name) {
     std::lock_guard<std::mutex> g(g_lock);
