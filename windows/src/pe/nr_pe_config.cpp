@@ -194,12 +194,17 @@ void play_cue(bool on) {
 // Only while one of this process's windows has the focus.
 std::atomic<uint64_t> g_hotkeys_paused_until{0};
 std::atomic<uint64_t> g_nr_toggle_requests{0};
+std::atomic<HWND> g_focus_window{nullptr};
 
 bool focused() {
     if (GetTickCount64() < g_hotkeys_paused_until.load()) return false;   // NR Control takes a key (pause_hotkeys)
     DWORD pid = 0;
     const HWND w = GetForegroundWindow();
-    return w && GetWindowThreadProcessId(w, &pid) && pid == GetCurrentProcessId();
+    if (!w) return false;
+    if (GetWindowThreadProcessId(w, &pid) && pid == GetCurrentProcessId()) return true;
+    const HWND target = g_focus_window.load(std::memory_order_acquire);
+    return target && IsWindow(target) &&
+           (w == target || w == GetAncestor(target, GA_ROOT) || w == GetAncestor(target, GA_ROOTOWNER));
 }
 
 float renodx_float(const std::string& v, float def, float lo, float hi);
@@ -1497,6 +1502,7 @@ void touch_config() { g_config_epoch.fetch_add(1); }
 void request_nr_toggle() { g_nr_toggle_requests.fetch_add(1); }
 bool parse_key(const std::string& text, int* vk, int* mods) { return parse_hotkey(text, *vk, *mods); }
 void pause_hotkeys(uint32_t ms) { g_hotkeys_paused_until.store(GetTickCount64() + ms); }
+void set_focus_window(void* window) { g_focus_window.store(static_cast<HWND>(window), std::memory_order_release); }
 
 void layer_keys_frame() {
     struct State { std::string text; int vk = 0, mods = 0; bool down = false; };

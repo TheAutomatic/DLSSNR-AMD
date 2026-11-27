@@ -860,6 +860,12 @@ struct Menu {
         nr::control_ui::help("Every layer off or on again, for this run only (never written to the file). Its key is on "
                              "the Hotkeys page; whether NR is on when the game starts: the Screenshot page's "
                              "\"Neural Rendering\" ([RenoDX] NeuralUplift).");
+        if (const uint32_t err = ini.save_error()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.f, 0.45f, 0.4f, 1.f));
+            ImGui::TextWrapped(tr("File is not writable; settings were not saved (error %lu)."),
+                               static_cast<unsigned long>(err));
+            ImGui::PopStyleColor();
+        }
     }
     // The render size and the upscaler's output as NR last saw them (0: not known)
     static void upscaling(const nr::control::Shared* s, uint32_t* rw, uint32_t* rh, uint32_t* ow, uint32_t* oh) {

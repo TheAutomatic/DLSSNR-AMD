@@ -69,6 +69,7 @@
 #include "nr_vk_receipts.hpp"
 
 #include <windows.h>
+#include <vulkan/vulkan_win32.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <tlhelp32.h>
@@ -5553,28 +5554,49 @@ PFN_vkCreateInstance real_export_create_instance = nullptr;
 PFN_vkDestroyInstance real_export_destroy_instance = nullptr;
 PFN_vkCreateDevice real_export_create = nullptr;
 PFN_vkEnumeratePhysicalDevices real_enumerate_physical = nullptr;
+PFN_vkCreateWin32SurfaceKHR real_export_create_win32_surface = nullptr;
+PFN_vkDestroySurfaceKHR real_export_destroy_surface = nullptr;
 std::atomic<PFN_vkCreateInstance> g_next_create_instance{nullptr};
 std::atomic<PFN_vkDestroyInstance> g_next_destroy_instance{nullptr};
 std::atomic<PFN_vkEnumeratePhysicalDevices> g_next_enum_phys{nullptr};
+std::atomic<PFN_vkCreateWin32SurfaceKHR> g_next_create_win32_surface{nullptr};
+std::atomic<PFN_vkDestroySurfaceKHR> g_next_destroy_surface{nullptr};
 std::unordered_map<VkPhysicalDevice, VkInstance> g_physical_instance;   // g_devices_lock
 std::unordered_map<VkInstance, PFN_vkDestroyInstance> g_instance_destroy_procs;   // g_devices_lock
 std::unordered_map<VkInstance, PFN_vkEnumeratePhysicalDevices> g_instance_enum_phys_procs;   // g_devices_lock
+struct SurfaceRec { VkInstance instance = VK_NULL_HANDLE; HWND hwnd = nullptr; };
+std::mutex g_surfaces_lock;
+std::unordered_map<VkSurfaceKHR, SurfaceRec> g_surface_windows;   // g_surfaces_lock
+std::unordered_map<VkInstance, PFN_vkCreateWin32SurfaceKHR> g_instance_create_win32_surface_procs;   // g_surfaces_lock
+std::unordered_map<VkInstance, PFN_vkDestroySurfaceKHR> g_instance_destroy_surface_procs;   // g_surfaces_lock
 thread_local int t_in_create = 0;
 thread_local int t_in_create_instance = 0;
 thread_local int t_in_destroy_instance = 0;
 thread_local int t_in_enum_phys = 0;
+thread_local int t_in_create_win32_surface = 0;
+thread_local int t_in_destroy_surface = 0;
 
 void forget_asi_instance(VkInstance instance) {
     if (!instance) return;
     nr::pe::vkdevice::forget_instance(instance);
     VkInstance expected = instance;
     g_create_instance.compare_exchange_strong(expected, VK_NULL_HANDLE, std::memory_order_acq_rel);
-    std::lock_guard<std::mutex> guard(g_devices_lock);
-    g_instance_destroy_procs.erase(instance);
-    g_instance_enum_phys_procs.erase(instance);
-    for (auto it = g_physical_instance.begin(); it != g_physical_instance.end();)
-        if (it->second == instance) it = g_physical_instance.erase(it);
-        else ++it;
+    {
+        std::lock_guard<std::mutex> guard(g_devices_lock);
+        g_instance_destroy_procs.erase(instance);
+        g_instance_enum_phys_procs.erase(instance);
+        for (auto it = g_physical_instance.begin(); it != g_physical_instance.end();)
+            if (it->second == instance) it = g_physical_instance.erase(it);
+            else ++it;
+    }
+    {
+        std::lock_guard<std::mutex> guard(g_surfaces_lock);
+        g_instance_create_win32_surface_procs.erase(instance);
+        g_instance_destroy_surface_procs.erase(instance);
+        for (auto it = g_surface_windows.begin(); it != g_surface_windows.end();)
+            if (it->second.instance == instance) it = g_surface_windows.erase(it);
+            else ++it;
+    }
 }
 
 VkResult create_device(PFN_vkCreateDevice create, VkInstance instance, VkPhysicalDevice phys, const VkDeviceCreateInfo* ci,
@@ -5745,6 +5767,80 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_gipa_enumerate_physical(VkInstance instance, u
     return enumerate_physical_common(next, instance, n, list);
 }
 
+VkResult create_win32_surface_common(PFN_vkCreateWin32SurfaceKHR create, VkInstance instance,
+                                     const VkWin32SurfaceCreateInfoKHR* ci, const VkAllocationCallbacks* a,
+                                     VkSurfaceKHR* out) {
+    struct Inside { Inside() { ++t_in_create_win32_surface; } ~Inside() { --t_in_create_win32_surface; } } inside;
+    const VkResult r = create(instance, ci, a, out);
+    if (r == VK_SUCCESS && out && *out && ci && ci->hwnd && !nr::pe::bridge::creating_device()) {
+        std::lock_guard<std::mutex> guard(g_surfaces_lock);
+        g_surface_windows[*out] = {instance, ci->hwnd};
+    }
+    return r;
+}
+
+void destroy_surface_common(PFN_vkDestroySurfaceKHR destroy, VkInstance instance, VkSurfaceKHR surface,
+                            const VkAllocationCallbacks* a) {
+    struct Inside { Inside() { ++t_in_destroy_surface; } ~Inside() { --t_in_destroy_surface; } } inside;
+    if (surface != VK_NULL_HANDLE && !nr::pe::bridge::creating_device()) {
+        std::lock_guard<std::mutex> guard(g_surfaces_lock);
+        g_surface_windows.erase(surface);
+    }
+    destroy(instance, surface, a);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL hk_export_create_win32_surface(VkInstance instance,
+                                                              const VkWin32SurfaceCreateInfoKHR* ci,
+                                                              const VkAllocationCallbacks* a, VkSurfaceKHR* out) {
+    if (t_in_create_win32_surface) return real_export_create_win32_surface(instance, ci, a, out);
+    return create_win32_surface_common(real_export_create_win32_surface, instance, ci, a, out);
+}
+
+VKAPI_ATTR void VKAPI_CALL hk_export_destroy_surface(VkInstance instance, VkSurfaceKHR surface,
+                                                     const VkAllocationCallbacks* a) {
+    if (t_in_destroy_surface) {
+        real_export_destroy_surface(instance, surface, a);
+        return;
+    }
+    destroy_surface_common(real_export_destroy_surface, instance, surface, a);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL hk_gipa_create_win32_surface(VkInstance instance,
+                                                            const VkWin32SurfaceCreateInfoKHR* ci,
+                                                            const VkAllocationCallbacks* a, VkSurfaceKHR* out) {
+    PFN_vkCreateWin32SurfaceKHR next = nullptr;
+    if (instance) {
+        std::lock_guard<std::mutex> guard(g_surfaces_lock);
+        if (const auto it = g_instance_create_win32_surface_procs.find(instance);
+            it != g_instance_create_win32_surface_procs.end())
+            next = it->second;
+    }
+    if (!next) next = g_next_create_win32_surface.load(std::memory_order_acquire);
+    if (!next) next = real_export_create_win32_surface;
+    if (!next) return VK_ERROR_EXTENSION_NOT_PRESENT;
+    if (t_in_create_win32_surface) return next(instance, ci, a, out);
+    return create_win32_surface_common(next, instance, ci, a, out);
+}
+
+VKAPI_ATTR void VKAPI_CALL hk_gipa_destroy_surface(VkInstance instance, VkSurfaceKHR surface,
+                                                   const VkAllocationCallbacks* a) {
+    PFN_vkDestroySurfaceKHR next = nullptr;
+    if (instance) {
+        std::lock_guard<std::mutex> guard(g_surfaces_lock);
+        if (const auto it = g_instance_destroy_surface_procs.find(instance);
+            it != g_instance_destroy_surface_procs.end())
+            next = it->second;
+    }
+    if (!next) next = g_next_destroy_surface.load(std::memory_order_acquire);
+    if (!next) next = real_export_destroy_surface;
+    if (!next) return;
+    if (t_in_destroy_surface) {
+        next(instance, surface, a);
+        return;
+    }
+    destroy_surface_common(next, instance, surface, a);
+}
+
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL hk_gipa(VkInstance instance, const char* name) {
     const PFN_vkVoidFunction f = real_gipa(instance, name);
     if (!f || !name) return f;
@@ -5775,6 +5871,24 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL hk_gipa(VkInstance instance, const char
         g_next_create_device.store(reinterpret_cast<PFN_vkCreateDevice>(f));
         if (instance) g_create_instance.store(instance);
         return reinterpret_cast<PFN_vkVoidFunction>(&hk_create_device);
+    }
+    if (!std::strcmp(name, "vkCreateWin32SurfaceKHR")) {
+        if (f == reinterpret_cast<PFN_vkVoidFunction>(&hk_gipa_create_win32_surface)) return f;
+        if (instance) {
+            std::lock_guard<std::mutex> guard(g_surfaces_lock);
+            g_instance_create_win32_surface_procs[instance] = reinterpret_cast<PFN_vkCreateWin32SurfaceKHR>(f);
+        }
+        g_next_create_win32_surface.store(reinterpret_cast<PFN_vkCreateWin32SurfaceKHR>(f), std::memory_order_release);
+        return reinterpret_cast<PFN_vkVoidFunction>(&hk_gipa_create_win32_surface);
+    }
+    if (!std::strcmp(name, "vkDestroySurfaceKHR")) {
+        if (f == reinterpret_cast<PFN_vkVoidFunction>(&hk_gipa_destroy_surface)) return f;
+        if (instance) {
+            std::lock_guard<std::mutex> guard(g_surfaces_lock);
+            g_instance_destroy_surface_procs[instance] = reinterpret_cast<PFN_vkDestroySurfaceKHR>(f);
+        }
+        g_next_destroy_surface.store(reinterpret_cast<PFN_vkDestroySurfaceKHR>(f), std::memory_order_release);
+        return reinterpret_cast<PFN_vkVoidFunction>(&hk_gipa_destroy_surface);
     }
     return f;
 }
@@ -5871,6 +5985,11 @@ void hook_device_creation() {
             void* fn = reinterpret_cast<void*>(GetProcAddress(m, name));
             if (!fn || MH_CreateHook(fn, detour, real) != MH_OK || MH_EnableHook(fn) != MH_OK)
                 log("[nr] vulkan-1.dll's %s could not be hooked: the game's queues are known from its vkCreateDevice only", name);
+        }
+        for (auto [name, detour, real] : {std::tuple{"vkCreateWin32SurfaceKHR", reinterpret_cast<void*>(&hk_export_create_win32_surface), reinterpret_cast<void**>(&real_export_create_win32_surface)},
+                                          std::tuple{"vkDestroySurfaceKHR", reinterpret_cast<void*>(&hk_export_destroy_surface), reinterpret_cast<void**>(&real_export_destroy_surface)}}) {
+            void* fn = reinterpret_cast<void*>(GetProcAddress(m, name));
+            if (fn && MH_CreateHook(fn, detour, real) == MH_OK) MH_EnableHook(fn);
         }
     });
 }
@@ -7841,6 +7960,7 @@ struct SwapRec {
     VkSharingMode sharing = VK_SHARING_MODE_EXCLUSIVE;
     std::vector<uint32_t> families;
     std::vector<VkImage> images;   // as the game sees them (asked through the present path's own entry), at first use
+    HWND hwnd = nullptr;
 };
 std::mutex g_swap_lock;
 std::unordered_map<VkSwapchainKHR, SwapRec> g_swaps;
@@ -7905,11 +8025,17 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_create_swapchain(VkDevice device, const VkSwap
         r = real_create_swapchain(device, &c, a, out);
     }
     if (r == VK_SUCCESS && out && *out) {
+        HWND surface_hwnd = nullptr;
+        {
+            std::lock_guard<std::mutex> sguard(g_surfaces_lock);
+            if (const auto it = g_surface_windows.find(ci->surface); it != g_surface_windows.end())
+                surface_hwnd = it->second.hwnd;
+        }
         std::lock_guard<std::mutex> guard(g_swap_lock);
         SwapRec& rec = g_swaps[*out];
         rec = SwapRec{};
         rec.device = device; rec.format = c.imageFormat; rec.space = c.imageColorSpace; rec.extent = c.imageExtent;
-        rec.usage = c.imageUsage; rec.sharing = c.imageSharingMode;
+        rec.usage = c.imageUsage; rec.sharing = c.imageSharingMode; rec.hwnd = surface_hwnd;
         if (c.queueFamilyIndexCount) rec.families.assign(c.pQueueFamilyIndices, c.pQueueFamilyIndices + c.queueFamilyIndexCount);
         rec.path = std::make_shared<VkPresentPath>("Vulkan games");
         rec.signals = std::make_shared<PresentSignals>(); rec.signals->device = device;
@@ -9058,6 +9184,7 @@ const VkPresentInfoKHR* vk_present_menu(VkQueue queue, const VkPresentInfoKHR* i
         }
     }
     const nr::asi::hudcap::Own own;
+    if (rec.hwnd && IsWindow(rec.hwnd)) nr::pe::control::menu_window(rec.hwnd);
     return nr::pe::menu::vulkan_present(dev.instance,dev.physical,dev.device,queue,family,sc,rec.format,rec.space,
                                        rec.extent,rec.images,info);
 }

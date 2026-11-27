@@ -10,6 +10,7 @@
 #include "nr_vram_ledger.hpp"
 
 #include <windows.h>
+#include <tlhelp32.h>
 #include "MinHook.h"
 #include <algorithm>
 #include <atomic>
@@ -51,6 +52,8 @@ nr::control::Shared* shared() {
 // was never the foreground one, End was never read.
 std::atomic<HWND> g_window{nullptr};
 std::atomic<HWND> g_wanted{nullptr};   // the swap chain's window, from the menu
+std::atomic<bool> g_window_cross_process{false};
+bool g_hooks_engaged = false;
 // Every window we subclassed keeps its own previous procedure: the window we read from can change while messages of the
 // last one are still being dispatched on the game's thread.
 struct Subclassed { std::atomic<HWND> window{nullptr}; std::atomic<WNDPROC> previous{nullptr}; };
@@ -192,13 +195,21 @@ bool hook_input() {
 // The menu opened or closed: hold the game's input and lift its clip, or give both back.
 void menu_changed(bool open) {
     log("[nr] NR Control %s", open ? "opened" : "closed");
-    if (!hook_input()) { g_menu_open.store(open); return; }
     if (open) {
+        if (g_window_cross_process.load(std::memory_order_acquire)) {
+            g_hooks_engaged = false;
+            g_menu_open.store(true);
+            return;
+        }
+        if (!hook_input()) { g_hooks_engaged = false; g_menu_open.store(open); return; }
+        g_hooks_engaged = true;
         g_real_getpos(&g_frozen);
         g_menu_open.store(true);
         g_real_clip(nullptr);
     } else {
         g_menu_open.store(false);
+        if (!g_hooks_engaged) return;
+        g_hooks_engaged = false;
         std::lock_guard<std::mutex> lock(g_clip_mutex);
         g_real_clip(g_game_clipped ? &g_game_clip : nullptr);
         g_real_setpos(g_frozen.x, g_frozen.y);   // the cursor back where the game left it
@@ -231,7 +242,13 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 // Read the menu's input from `window` from now on: subclassed once (kept while the process lives - another hook may
 // have subclassed it over ours, so ours is never taken out), its previous procedure its own.
 void take_window(HWND window) {
-    if (!previous_of(window)) {
+    DWORD pid = 0, root_pid = 0;
+    GetWindowThreadProcessId(window, &pid);
+    const HWND root = GetAncestor(window, GA_ROOT);
+    if (root) GetWindowThreadProcessId(root, &root_pid);
+    const bool same_process = (pid == GetCurrentProcessId());
+    const bool cross_process = !same_process || (root_pid != 0 && root_pid != GetCurrentProcessId());
+    if (!cross_process && !previous_of(window)) {
         Subclassed* slot = nullptr;
         for (auto& s : g_subclassed)
             if (!s.window.load()) { slot = &s; break; }
@@ -243,15 +260,20 @@ void take_window(HWND window) {
             SetWindowLongPtrW(window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&window_proc)));
         if (was && was != &window_proc) slot->previous.store(was);
     }
+    g_window_cross_process.store(cross_process, std::memory_order_release);
     g_window.store(window);
+    nr::pe::set_focus_window(cross_process ? window : nullptr);
     wchar_t cls[64] = {};
     GetClassNameW(window, cls, 64);
     RECT r{};
     GetClientRect(window, &r);
     char name[192] = {};
     WideCharToMultiByte(CP_UTF8, 0, cls, -1, name, sizeof name - 1, nullptr, nullptr);
+    const char* origin = window == g_wanted.load()
+        ? (cross_process ? ", its swap chain's, cross-process read-only" : ", its swap chain's")
+        : (cross_process ? ", parent process fallback, cross-process read-only" : ", the largest of the process");
     log("[nr] NR Control: the menu's input comes from the game's window %p (%s, %ldx%ld%s)", static_cast<void*>(window),
-        name, long(r.right), long(r.bottom), window == g_wanted.load() ? ", its swap chain's" : ", the largest of the process");
+        name, long(r.right), long(r.bottom), origin);
 }
 
 bool is_overlay_helper_window(HWND h) {
@@ -319,6 +341,60 @@ void read_pass_key() {   // [NRControl] PassOptiScalerKey and OptiScaler's [Menu
     }
 }
 
+std::wstring process_image_path(DWORD pid) {
+    using QueryNameFn = BOOL(WINAPI*)(HANDLE, DWORD, LPWSTR, PDWORD);
+    static const QueryNameFn query_name = [] {
+        const HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+        return k32 ? reinterpret_cast<QueryNameFn>(reinterpret_cast<void*>(GetProcAddress(k32, "QueryFullProcessImageNameW")))
+                   : nullptr;
+    }();
+    if (!query_name || !pid) return {};
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return {};
+    std::wstring path(32768, L'\0');
+    DWORD len = DWORD(path.size());
+    const BOOL ok = query_name(h, 0, path.data(), &len);
+    CloseHandle(h);
+    if (!ok || !len) return {};
+    path.resize(len);
+    return path;
+}
+
+DWORD same_exe_parent_pid() {
+    static const DWORD cached = []() -> DWORD {
+        const DWORD self = GetCurrentProcessId();
+        DWORD ppid = 0;
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap != INVALID_HANDLE_VALUE) {
+            PROCESSENTRY32W pe{};
+            pe.dwSize = sizeof pe;
+            for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe)) {
+                if (pe.th32ProcessID == self) { ppid = pe.th32ParentProcessID; break; }
+            }
+            CloseHandle(snap);
+        }
+        if (!ppid || ppid == self) return 0;
+        const std::wstring self_exe = process_image_path(self);
+        const std::wstring parent_exe = process_image_path(ppid);
+        if (self_exe.empty() || parent_exe.empty() || _wcsicmp(self_exe.c_str(), parent_exe.c_str()) != 0) return 0;
+        return ppid;
+    }();
+    return cached;
+}
+
+HWND parent_foreground_window() {
+    const DWORD ppid = same_exe_parent_pid();
+    if (!ppid) return nullptr;
+    const HWND fg = GetForegroundWindow();
+    if (!fg || !IsWindowVisible(fg) || is_overlay_helper_window(fg)) return nullptr;
+    DWORD fg_pid = 0;
+    GetWindowThreadProcessId(fg, &fg_pid);
+    if (fg_pid != ppid) return nullptr;
+    RECT r{};
+    if (!GetClientRect(fg, &r) || r.right < 320 || r.bottom < 200) return nullptr;
+    return fg;
+}
+
 void watch() {
     g_watch_thread.store(GetCurrentThreadId());
     for (;;) {
@@ -326,7 +402,7 @@ void watch() {
         nr::control::Shared* s = g_shared;
         const bool open = s && s->menu_open != 0;
         if (s && open != g_menu_open.load()) menu_changed(open);
-        if (open && g_real_clip) {   // a clip set some other way while the menu is open
+        if (open && g_hooks_engaged && g_real_clip) {   // a clip set some other way while the menu is open
             RECT clip{}, screen{GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN), 0, 0};
             screen.right = screen.left + GetSystemMetrics(SM_CXVIRTUALSCREEN);
             screen.bottom = screen.top + GetSystemMetrics(SM_CYVIRTUALSCREEN);
@@ -346,19 +422,29 @@ void watch() {
             else if (!wanted) {
                 if (!window || !IsWindow(window) || is_overlay_helper_window(window)) {
                     if (HWND largest = game_window(); largest && largest != window) take_window(largest);
+                    else if (!window || !IsWindow(window)) {
+                        if (HWND parent_fg = parent_foreground_window()) take_window(parent_fg);
+                    }
                 } else {
                     const HWND fg = GetForegroundWindow();
                     DWORD fg_pid = 0;
                     if (fg) GetWindowThreadProcessId(fg, &fg_pid);
                     RECT fr{};
-                    if (fg && fg_pid == GetCurrentProcessId() && fg != window && fg != GetAncestor(window, GA_ROOT) &&
+                    const DWORD ppid = g_window_cross_process.load(std::memory_order_acquire) ? same_exe_parent_pid() : 0;
+                    const bool allow_pid = fg_pid == GetCurrentProcessId() || (ppid != 0 && fg_pid == ppid);
+                    if (fg && allow_pid && fg != window && fg != GetAncestor(window, GA_ROOT) &&
                         IsWindowVisible(fg) && !is_overlay_helper_window(fg) && GetClientRect(fg, &fr) &&
                         fr.right >= 320 && fr.bottom >= 200)
                         take_window(fg);
                 }
             }
             window = g_window.load();
-            if (window && !IsWindow(window)) window = nullptr;
+            if (window && !IsWindow(window)) {
+                window = nullptr;
+                g_window.store(nullptr);
+                g_window_cross_process.store(false, std::memory_order_release);
+                nr::pe::set_focus_window(nullptr);
+            }
             if (window) {
                 CURSORINFO ci{};
                 ci.cbSize = sizeof ci;
