@@ -3792,12 +3792,7 @@ void draw_page() {
         nr::control_ui::help("Every layer off or on again, for this run only (never written to the file). Its key is on "
                              "the Hotkeys page; whether NR is on when the game starts: the Screenshot page's "
                              "\"Neural Rendering\" ([RenoDX] NeuralUplift).");
-        if (const uint32_t err = page_ini->save_error()) {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.f, 0.45f, 0.4f, 1.f));
-            ImGui::TextWrapped(tr("File is not writable; settings were not saved (error %lu)."),
-                               static_cast<unsigned long>(err));
-            ImGui::PopStyleColor();
-        }
+        nr::control_ui::draw_save_error(page_ini->save_error());
     }
     page_trace("lines");
     const float u = ImGui::GetFontSize() / 17.f;
@@ -4014,13 +4009,14 @@ void draw_page() {
                     const std::string folder = nr::pe::module_folder();
                     report_said = nr::control_ui::copy_report(
                         nr::control_ui::report_text(&view, "dlssnr_amd.addon", config_path, nr::pe::log_path()),
-                        nr::u8::writable_app_dir(folder + "\\dlssnr-amd") + "\\nr-report.txt");
+                        nr::u8::writable_data(folder) + "\\nr-report.txt");
                 }
                 nr::control_ui::help("For a bug report: the layers as they run, their engine data, the video memory and its "
                                      "residency, the events above, dlssnr-amd.ini and the last lines of dlssnr-amd.log, as text. "
-                                     "Copied to the clipboard and saved as dlssnr-amd\\nr-report.txt next to the game. Nothing "
-                                     "is sent anywhere.");
+                                     "Copied to the clipboard and saved as dlssnr-amd\\nr-report.txt next to the game (in NR's "
+                                     "folder in Documents when the game's folder cannot be written). Nothing is sent anywhere.");
                 if (!report_said.empty()) { ImGui::SameLine(); ImGui::TextDisabled("%s", tr(report_said.c_str())); }
+                nr::control_ui::draw_files_place(nr::pe::module_folder());
                 nr::control_ui::draw_diag_package([&] {
                     nr::pe::diag::Request r;
                     r.game = nr::u8::path(nr::pe::module_folder());
@@ -4360,10 +4356,10 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         nr::pe::watchdog::start();
         const std::string folder = nr::pe::module_folder();
         if (!folder.empty()) {
-            bool ini_fb = false;
-            config_path = nr::u8::writable_ini_path(folder, &ini_fb);
-            if (ini_fb) log("[nr] settings folder '%s' is read-only; using '%s'", folder.c_str(), config_path.c_str());
-            nr::pe::screenshot::set_folder(nr::u8::wide(nr::u8::writable_app_dir(folder)) + L"\\NR Screenshots");
+            config_path = nr::u8::ini_file(folder);   // (the game's folder read-only: the one in Documents)
+            // (the game's folder read-only: the log's first line says where NR's files are)
+            if (bool moved = false; (nr::u8::writable_folder(folder, &moved), moved))
+                nr::pe::screenshot::set_folder(nr::u8::wide(nr::u8::writable_folder(folder)) + L"\\NR Screenshots");
             nr::pe::restore_ini(folder);   // a deleted dlssnr-amd.ini: the installed one, before it is read
             config.load(config_path);
             {   // HUD FIX at the start: its capture events only for Auto / Captured (registered below)

@@ -939,13 +939,17 @@ bool install_hooks(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, std::string
 
 bool in_record() { return t_in_direct_record != 0; }
 
+// OpenRR (openrr-amd.asi) records its own lists on the D3D12 Direct route too: while it does, its calls are not the
+// game's state (its OpenRR_IsInDirectRecord; it asks ours, NR_IsInDirectRecord, the same). Looked for at each feature
+// creation until found; without OpenRR in_direct_or_peer_record() is the record flag of this module alone, as before.
 void refresh_peer() {
     if (g_peer_in_record.load(std::memory_order_acquire)) return;
-    if (HMODULE mod = GetModuleHandleW(L"openrr-amd.asi")) {
-        if (auto fn = reinterpret_cast<PeerInRecordFn>(GetProcAddress(mod, "OpenRR_IsInDirectRecord"))) {
-            g_peer_in_record.store(fn, std::memory_order_release);
-        }
-    }
+    for (const wchar_t* name : {L"openrr-amd.asi", L"openrr-amd-loadlate.asi"})
+        if (HMODULE mod = GetModuleHandleW(name))
+            if (auto fn = reinterpret_cast<PeerInRecordFn>(GetProcAddress(mod, "OpenRR_IsInDirectRecord"))) {
+                g_peer_in_record.store(fn, std::memory_order_release);
+                return;
+            }
 }
 
 void note_command_signature(ID3D12CommandSignature* sig, const D3D12_COMMAND_SIGNATURE_DESC* desc) {

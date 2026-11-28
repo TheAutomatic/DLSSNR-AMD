@@ -1425,7 +1425,7 @@ void find_locks(const Module& m, IMAGE_NT_HEADERS* nt) {
     std::thread([all = missing.empty()] {
         RenoDXFile file;
         RenoDXConfig cfg;
-        const std::string ini = nr::u8::writable_ini_path(module_folder());
+        const std::string ini = nr::u8::ini_file(module_folder());
         read_renodx(ini, cfg);
         for (;;) {
             file.poll(ini, cfg);
@@ -1697,7 +1697,7 @@ void fix_optiscaler() {
     fix_feature_resize(m);
     // The RenoDX-style option, only when it is on at start (nothing of it is installed otherwise).
     RenoDXConfig renodx{};
-    if (read_renodx(nr::u8::writable_ini_path(module_folder()), renodx) && renodx.enabled)
+    if (read_renodx(nr::u8::ini_file(module_folder()), renodx) && renodx.enabled)
         renodx_impl::install(m);
     else
         renodx_impl::install_observer(m);   // read-only, for the engine-data panel (and NR_OPTI_PROF's timestamps)

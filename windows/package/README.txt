@@ -366,14 +366,17 @@ Files put into the game folder
                                  DXGI and loads the ReShade layer from the game folder), ReShade's files
     reshade-feeder-vulkan:       vulkan-1.dll and ReShade's files
 Files of the same name already in the game folder are first moved to dlssnr-amd-backup\ and
-put back on uninstall. Screenshots go to NR Screenshots\ (made at the first screenshot, not removed
+put back on uninstall. Other OptiScaler plugins in OptiScaler\plugins\ (OpenRR's, for example)
+stay where they are. Screenshots go to NR Screenshots\ (made at the first screenshot, not removed
 by uninstall).
 Installing again (another route, another package) first uninstalls by the installation record,
 and dlssnr-amd.ini is replaced with a new default file: earlier settings are not kept, so back
-the file up first if you need them.
+the file up first if you need them. To go back to an earlier package, uninstall with this one first
+(option 6), then install the earlier one.
 
-Logs: dlssnr-amd.log, and OptiScaler.log or ReShade.log, all in the game folder. Option 7 of
-install.bat collects them into a zip on the desktop.
+Logs: dlssnr-amd.log, and OptiScaler.log or ReShade.log, all in the game folder (dlssnr-amd.log in
+Documents\DLSSNR-AMD\<game> when the game folder cannot be written while it runs: NR Control's
+Diagnostics shows the folder). Option 7 of install.bat collects them into a zip on the desktop.
 
 Known limits
 ------------
@@ -390,7 +393,7 @@ Known limits
 
 Third-party components
 ----------------------
-OptiScaler (GPL-3.0; the official nightly v10.0.0-pre1 of 2026-10-30, unchanged; licences in
+OptiScaler (GPL-3.0; the official nightly v10.0.0-pre1 of 2026-11-27, unchanged; licences in
 OptiScaler\Licenses\ of the game folder). DXVK (zlib licence); the version is in dxvk\version.txt,
 source https://github.com/doitsujin/dxvk . The licence files of ReShade 6.8.0, the Vulkan Loader (with
 a description of the changes), vort_Shaders, DLSS5-Feeder, RenoDX, Dear ImGui and the Inter font (NR

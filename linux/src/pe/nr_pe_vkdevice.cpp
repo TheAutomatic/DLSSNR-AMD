@@ -21,6 +21,8 @@ namespace {
 
 using nr::pe::log;
 
+// OpenRR's own Vulkan instances (openrr-amd.asi beside this module; application name "openrr...") and what they make:
+// not the game's - nothing recorded, no features added. Nothing changes while OpenRR makes none.
 bool is_internal_vk_app(const VkInstanceCreateInfo* info) {
     if (!info || !info->pApplicationInfo || !info->pApplicationInfo->pApplicationName) return false;
     const char* n = info->pApplicationInfo->pApplicationName;
@@ -72,6 +74,7 @@ VkResult VKAPI_PTR hooked_create_instance(const VkInstanceCreateInfo* info,
         if (is_internal_vk_app(info)) {
             internal_instances.insert(*out);
         } else {
+            internal_instances.erase(*out);   // (a handle one of OpenRR's instances had: this tree does not see them go)
             seen.instance = *out;
         }
     }
@@ -108,6 +111,8 @@ VkResult VKAPI_PTR hooked_enumerate_physical_devices(VkInstance instance, uint32
                     if (out[i] != VK_NULL_HANDLE) internal_physicals[out[i]] = instance;
             }
         } else {
+            if ((r == VK_SUCCESS || r == VK_INCOMPLETE) && out && count && !internal_physicals.empty())
+                for (uint32_t i = 0; i < *count; ++i) internal_physicals.erase(out[i]);   // (handles OpenRR's had)
             if (!seen.instance) log("[nr] Vulkan instance learned from vkEnumeratePhysicalDevices");
             seen.instance = instance;
         }

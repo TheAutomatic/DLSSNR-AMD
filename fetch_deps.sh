@@ -105,12 +105,7 @@ repo artifacts/ref/reshade-shaders https://github.com/crosire/reshade-shaders.gi
 # vort_Shaders (MIT): the motion vectors of the ReShade route.
 repo artifacts/ref/vort_Shaders https://github.com/vortigern11/vort_Shaders.git \
      b410b9f0c0fbb83c8cb42164aaf1655fab386f4a
-if [[ -d artifacts/ref/Vulkan-Loader ]]; then
-    echo "have artifacts/ref/Vulkan-Loader"
-else
-    echo "fetch artifacts/ref/Vulkan-Loader"
-    git clone -q --depth 1 --branch v1.4.357 https://github.com/KhronosGroup/Vulkan-Loader.git artifacts/ref/Vulkan-Loader
-fi
+# The Vulkan loader source is cloned by linux/build/build_vulkan_loader.sh itself.
 
 # ---- binaries the packages carry unmodified ---------------------------------------------------
 # ReShade 6.8.0 with add-on support: the DLLs come out of the official installer, which is a zip.
@@ -134,14 +129,14 @@ EOF
 get "$rs/ReShade-LICENSE.md" https://raw.githubusercontent.com/crosire/reshade/v6.8.0/LICENSE.md \
     237ded5b8344f820113efab1e65e91e1f159d9202c5b4856606a0590d3ffdab0
 # OptiScaler (GPL-3.0), the OptiScaler route's host on Linux and Windows, shipped as released: the official nightly
-# the packages were tested with (OptiScaler v10.0.0-pre1, nightly-20261030), and its licence from its source tree at
+# the packages were tested with (OptiScaler v10.0.0-pre1, nightly-20261127), and its licence from its source tree at
 # that nightly.
-get artifacts/ref/downloads/OptiScaler_v10.0.0-pre1_20261030.7z \
-    https://github.com/optiscaler/OptiScaler-nightly/releases/download/nightly-20261030/OptiScaler_v10.0.0-pre1_20261030.7z \
-    db4fe2deae7edd9f6657f5cb223edc694ebdec62b52f15a3a59913f8b656c176
-mkdir -p artifacts/ref/optiscaler-nightly-20261030
-get artifacts/ref/optiscaler-nightly-20261030/LICENSE \
-    https://raw.githubusercontent.com/optiscaler/OptiScaler/e7e3872d410f704479d94d318d68d163b6b58947/LICENSE \
+get artifacts/ref/downloads/OptiScaler_v10.0.0-pre1_20261127_a1e0e193.7z \
+    https://github.com/optiscaler/OptiScaler-nightly/releases/download/nightly-20261127/OptiScaler_v10.0.0-pre1_20261127_a1e0e193.7z \
+    272f073566fa2634e2c9827abcc496d5b3f3e9b4575b9520e472f4fda3d575f7
+mkdir -p artifacts/ref/optiscaler-nightly-20261127
+get artifacts/ref/optiscaler-nightly-20261127/LICENSE \
+    https://raw.githubusercontent.com/optiscaler/OptiScaler/a1e0e19335c1da2366d12ee2fdb9276daec7d080/LICENSE \
     3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986
 # Inter 4.1 (SIL Open Font License 1.1), NR Control's font on the Linux OptiScaler route (embedded in dlssnr-amd.asi).
 get artifacts/ref/downloads/Inter-4.1.zip https://github.com/rsms/inter/releases/download/v4.1/Inter-4.1.zip \
@@ -167,17 +162,20 @@ if [[ $windows == 1 ]]; then
     # release they came from). NR_GE_PROTON=<tag> (for example GE-Proton11-14) takes that release instead. The release
     # tarball is checked against the .sha512sum GE-Proton publishes beside it (and deleted after, unless it was there
     # already); an unpacked toolchain/<tag>-x86_64 is used as it is.
+    # The latest release's tag from the page GitHub redirects releases/latest to (no API call: the API allows 60
+    # anonymous calls an hour per address, which shared CI runners use up); the API itself (GH_TOKEN, when set, signs
+    # it) only when that page did not name a release.
     ge=${NR_GE_PROTON:-}
     if [[ -z "$ge" ]]; then
         ge=$(curl -fsSLI --retry 3 -o /dev/null -w '%{url_effective}' \
              https://github.com/GloriousEggroll/proton-ge-custom/releases/latest |
              sed -n 's|.*/releases/tag/\(GE-Proton[0-9][0-9]*-[0-9][0-9]*\)$|\1|p') || true
-        if [[ -z "$ge" ]]; then
-            ge=$(curl -fsSL --retry 3 ${GH_TOKEN:+-H "Authorization: Bearer $GH_TOKEN"} \
-                 https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest |
-                 python3 -c 'import json, sys; print(json.load(sys.stdin)["tag_name"])') ||
-                { echo "cannot tell the latest GE-Proton release (set NR_GE_PROTON=<tag>)" >&2; exit 1; }
-        fi
+    fi
+    if [[ -z "$ge" ]]; then
+        ge=$(curl -fsSL --retry 3 ${GH_TOKEN:+-H "Authorization: Bearer $GH_TOKEN"} \
+             https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest |
+             python3 -c 'import json, sys; print(json.load(sys.stdin)["tag_name"])') ||
+            { echo "cannot tell the latest GE-Proton release (set NR_GE_PROTON=<tag>)" >&2; exit 1; }
     fi
     [[ "$ge" =~ ^GE-Proton[0-9]+-[0-9]+$ ]] || { echo "not a GE-Proton release: $ge" >&2; exit 1; }
     dx=artifacts/ref/dxvk-ge

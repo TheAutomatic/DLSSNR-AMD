@@ -98,7 +98,7 @@ bool read_enabled(const std::string& path, bool def) {
 }
 // [D3D12Passthrough] Enabled in the file, everything else as it was (the line rewritten in place, or added to its
 // section, or the section added at the end) - as NetworkSwitch::write_key does for [Network].
-void write_enabled(const std::string& path, bool on) {
+DWORD write_enabled(const std::string& path, bool on) {
     const std::string text = read_file(path), value = on ? "1" : "0";
     const bool crlf = text.find("\r\n") != std::string::npos;
     const std::string nl = crlf ? "\r\n" : "\n";
@@ -131,10 +131,7 @@ void write_enabled(const std::string& path, bool on) {
         }
         out += "Enabled = " + value + nl;
     }
-    if (FILE* f = nr::u8::fopen(path.c_str(), "wb")) {
-        std::fwrite(out.data(), 1, out.size(), f);
-        std::fclose(f);
-    }
+    return nr::u8::write_whole(path, out);   // (0, else the Windows error)
 }
 template <class T> void release(T*& p) { if (p) { p->Release(); p = nullptr; } }
 
@@ -414,7 +411,7 @@ void set_gfx11_mach(uint32_t mach) { g_gfx11_mach = mach; }
 Canary canary() { return Canary(g_canary.load()); }
 
 void start() {
-    g_ini = nr::u8::writable_ini_path(nr::pe::module_folder());
+    g_ini = nr::u8::ini_file(nr::pe::module_folder());
     g_enabled = read_enabled(g_ini, kDefaultEnabled);
     log("[d3d12] D3D12 passthrough %s (dlssnr-amd.ini [%s] Enabled = %d)", g_enabled ? "on" : "off", kSection,
         g_enabled ? 1 : 0);
@@ -502,10 +499,12 @@ void on_device(ID3D12Device* device) {
     }
 }
 
-void set_enabled(bool on) {
-    if (g_ini.empty()) return;
-    write_enabled(g_ini, on);
-    log("[d3d12] dlssnr-amd.ini [%s] Enabled = %d written (from the next launch)", kSection, on ? 1 : 0);
+uint32_t set_enabled(bool on) {
+    if (g_ini.empty()) return ERROR_FILE_NOT_FOUND;
+    const DWORD e = write_enabled(g_ini, on);
+    if (e) log("[d3d12] dlssnr-amd.ini [%s] Enabled = %d could not be written (error %lu)", kSection, on ? 1 : 0, e);
+    else log("[d3d12] dlssnr-amd.ini [%s] Enabled = %d written (from the next launch)", kSection, on ? 1 : 0);
+    return e;
 }
 
 std::wstring aco_folder() {

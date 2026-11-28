@@ -26,6 +26,9 @@ uintptr_t g_host_end = 0;
 std::atomic<int> veh_reports{0};
 std::atomic<int> uef_reports{0};
 std::atomic<int> dump_state{0};   // 0 = idle/retryable, 1 = writing, 2 = written
+// The dump's file when the game's folder cannot be written (nr::u8::writable_folder: Documents\DLSSNR-AMD\<game>),
+// made at install_crash_watch - no heap use at the crash; empty: beside the game's exe, as always.
+wchar_t moved_dump[MAX_PATH * 2] = {};
 
 struct LastErrorGuard {
     DWORD err = GetLastError();
@@ -115,12 +118,16 @@ void write_dump(EXCEPTION_POINTERS* ep) {
     }
     // (the wide path on the stack: no heap use here, the heap may be what broke)
     wchar_t path[MAX_PATH * 2] = {};
-    const DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH * 2);
-    if (!n || n >= MAX_PATH * 2 - 24) {
-        dump_state.store(0, std::memory_order_release);
-        return;
+    if (moved_dump[0]) {
+        std::wcscpy(path, moved_dump);
+    } else {
+        const DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH * 2);
+        if (!n || n >= MAX_PATH * 2 - 24) {
+            dump_state.store(0, std::memory_order_release);
+            return;
+        }
+        if (wchar_t* s = std::wcsrchr(path, L'\\')) std::wcscpy(s + 1, L"dlssnr-amd-crash.dmp");
     }
-    if (wchar_t* s = std::wcsrchr(path, L'\\')) std::wcscpy(s + 1, L"dlssnr-amd-crash.dmp");
     HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) {
         dump_state.store(0, std::memory_order_release);
@@ -138,7 +145,11 @@ void write_dump(EXCEPTION_POINTERS* ep) {
     } else {
         dump_state.store(2, std::memory_order_release);
     }
-    log("[nr]   minidump %s: %s", path, ok ? "written" : "FAILED");
+    // the path in UTF-8 for the log (%ls would go through the C runtime's locale: a CJK user or folder name garbled or
+    // cut); into a buffer of the module's own, not the stack (written once: `dumped` / dump_state)
+    static char shown[MAX_PATH * 6];
+    if (!WideCharToMultiByte(CP_UTF8, 0, path, -1, shown, int(sizeof shown), nullptr, nullptr)) std::strcpy(shown, "?");
+    log("[nr]   minidump %s: %s", shown, ok ? "written" : "FAILED");
 }
 
 void report_exception(const char* label, EXCEPTION_POINTERS* ep, std::atomic<int>& quota) {
@@ -225,6 +236,18 @@ void install_crash_watch(void* host_addr) {
         module_bounds(host_mod, g_host_begin, g_host_end);
     // Do not call LoadLibraryW under loader lock in InitializeASI; inspect already-loaded dbghelp only.
     dbghelp = GetModuleHandleW(L"dbghelp.dll");
+    {   // the game's folder cannot be written: the dump goes beside NR's other files in Documents (the folder they are
+        // decided for: the module's, else the exe's)
+        std::string exe = nr::pe::module_folder();
+        if (exe.empty()) {
+            exe = nr::u8::module_file(nullptr);
+            if (const size_t cut = exe.find_last_of("\\/"); cut != std::string::npos) exe.resize(cut);
+        }
+        bool moved = false;
+        const std::string folder = nr::u8::writable_folder(exe, &moved);
+        const std::wstring w = nr::u8::wide(folder + "\\dlssnr-amd-crash.dmp");
+        if (moved && w.size() < MAX_PATH * 2) std::wcscpy(moved_dump, w.c_str());
+    }
     // First in line: a game's or another hook's own handler may end the process before a later one is asked (PBZ:
     // games ended with nothing logged). Filtered to our own modules and stack so benign host SEH is untouched.
     handler = AddVectoredExceptionHandler(1, &on_exception);

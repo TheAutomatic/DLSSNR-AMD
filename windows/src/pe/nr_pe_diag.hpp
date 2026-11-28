@@ -267,9 +267,11 @@ inline bool start(Request r) {
             char stamp[32];
             std::snprintf(stamp, sizeof stamp, "%04u%02u%02u-%02u%02u%02u", now.wYear, now.wMonth, now.wDay, now.wHour,
                           now.wMinute, now.wSecond);
-            const std::string game_u8 = nr::u8::text(r.game);
-            const std::filesystem::path out_dir = nr::u8::path(nr::u8::writable_app_dir(game_u8));
-            const std::filesystem::path out = out_dir / (std::string("dlssnr-amd-diag-") + stamp + ".zip");
+            // (the game's folder read-only: NR's files and this package in its folder in Documents, nr::u8::writable_folder)
+            const std::string game_u8 = nr::u8::narrow(r.game.wstring());
+            const nr::u8::WritableFolder& moved = nr::u8::writable_folder_of(game_u8);
+            const std::filesystem::path files = moved.moved ? nr::u8::path(moved.path) : r.game;
+            const std::filesystem::path out = files / (std::string("dlssnr-amd-diag-") + stamp + ".zip");
             Zip zip(out);
             zip.stamp(now);
             zip.add("report.txt", r.report);
@@ -287,27 +289,23 @@ inline bool start(Request r) {
                 zip.add(as, size > kCap ? "(the last 20 MB of " + std::to_string(size) + " bytes)\n" + data : data);
             };
             take(r.log, "logs/" + nr::u8::narrow(r.log.filename().wstring()));
-            bool ini_fb = false;
-            const std::filesystem::path active_ini = nr::u8::path(nr::u8::writable_ini_path(game_u8, &ini_fb));
-            if (ini_fb) take(active_ini, "settings/dlssnr-amd.ini");
-            for (std::filesystem::directory_iterator it(r.game, ec), end; !ec && it != end; it.increment(ec)) {
-                if (!it->is_regular_file(ec)) continue;
-                std::string ext = it->path().extension().string();
-                for (char& c : ext) c = char(std::tolower(static_cast<unsigned char>(c)));
-                const std::string name = nr::u8::narrow(it->path().filename().wstring());
-                std::string lname = name;
-                for (char& c : lname) c = char(std::tolower(static_cast<unsigned char>(c)));
-                if (ext == ".log") take(it->path(), "logs/" + name);
-                else if (ext == ".ini" || name == "dlssnr-amd-install.txt") {
-                    if (ini_fb && lname == "dlssnr-amd.ini") continue;
-                    take(it->path(), "settings/" + name);
-                } else if (ext == ".dmp") take(it->path(), "crash/" + name);
+            for (const auto& [folder, under] : {std::pair<std::filesystem::path, std::string>{r.game, ""},
+                                                std::pair<std::filesystem::path, std::string>{files, "documents-folder/"}}) {
+                if (!under.empty() && !moved.moved) break;
+                ec.clear();
+                for (std::filesystem::directory_iterator it(folder, ec), end; !ec && it != end; it.increment(ec)) {
+                    if (!it->is_regular_file(ec)) continue;
+                    std::string ext = it->path().extension().string();
+                    for (char& c : ext) c = char(std::tolower(static_cast<unsigned char>(c)));
+                    const std::string name = nr::u8::narrow(it->path().filename().wstring());
+                    if (ext == ".log") take(it->path(), under + "logs/" + name);
+                    else if (ext == ".ini" || name == "dlssnr-amd-install.txt") take(it->path(), under + "settings/" + name);
+                    else if (ext == ".dmp") take(it->path(), under + "crash/" + name);
+                }
             }
-            const std::filesystem::path report_dir =
-                nr::u8::path(nr::u8::writable_app_dir(nr::u8::text(r.game / "dlssnr-amd")));
-            take(report_dir / "nr-report.txt", "settings/nr-report.txt");
+            take(nr::u8::path(nr::u8::writable_data(game_u8)) / "nr-report.txt", "settings/nr-report.txt");
             if (r.shots) {   // NR's screenshot pair of the current frame: written within a few seconds of the request
-                const std::filesystem::path shots = out_dir / "NR Screenshots";
+                const std::filesystem::path shots = files / "NR Screenshots";
                 const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(8);
                 std::vector<std::filesystem::path> fresh;
                 while (fresh.size() < 2 && std::chrono::steady_clock::now() < until) {

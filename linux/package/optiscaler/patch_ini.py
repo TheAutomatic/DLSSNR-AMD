@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Rewrite the keys our install needs in OptiScaler's own OptiScaler.ini.
 
-Key names and sections were read from the bundled OptiScaler's OptiScaler.ini and Config.cpp (nightly-20261020,
-artifacts/ref/optiscaler-nightly-20261020; nightly-20261030's OptiScaler.ini has the same [Plugins] LoadAsiPlugins). Nothing is added that is not already in the file: every key here ships as
+Key names and sections were read from the bundled OptiScaler's OptiScaler.ini and Config.cpp (nightly-20261127,
+commit a1e0e193: [Plugins] LoadAsiPlugins and [Menu] FGShortcutKey, both shipped as `auto`). Nothing is added that is not already in the file: every key here ships as
 `<key>=auto` and is rewritten in place, so a key renamed upstream shows up as an error rather than as a silently
 ignored line.
 """

@@ -326,7 +326,7 @@ void read_pass_key() {   // [NRControl] PassOptiScalerKey and OptiScaler's [Menu
     last = now;
     const std::string folder = module_folder();
     char v[32] = {};
-    nr::u8::profile("NRControl", "PassOptiScalerKey", "0", v, sizeof v, nr::u8::writable_ini_path(folder));
+    nr::u8::profile("NRControl", "PassOptiScalerKey", "0", v, sizeof v, nr::u8::ini_file(folder));
     int vk = 0;
     if (std::atoi(v) == 1 || !_stricmp(v, "true")) {
         char k[32] = {};

@@ -316,12 +316,12 @@ sed 's/^PreprocessorDefinitions=.*/&,RESHADE_DEPTH_INPUT_IS_REVERSED=0/' "$rs/Re
 # wilsjo2 processing's shaders are in dlssnr-amd\shaders\wilsjo2 for every route, assemble_product_data.sh). The plugin
 # is built with the int4 layers (it adds the device extensions they need itself: no Vulkan layer on this route).
 if [[ "$arch" == x86_64 ]]; then
-    opti_7z=${NR_OPTI_ARCHIVE:-artifacts/ref/downloads/OptiScaler_v10.0.0-pre1_20261030.7z}
-    opti_license=${NR_OPTI_LICENSE:-artifacts/ref/optiscaler-nightly-20261030/LICENSE}
+    opti_7z=${NR_OPTI_ARCHIVE:-artifacts/ref/downloads/OptiScaler_v10.0.0-pre1_20261127_a1e0e193.7z}
+    opti_license=${NR_OPTI_LICENSE:-artifacts/ref/optiscaler-nightly-20261127/LICENSE}
     [[ -f "$opti_7z" && -f "$opti_license" ]] || { echo "missing $opti_7z or $opti_license" >&2; exit 1; }
     if [[ -z "${NR_OPTI_ARCHIVE:-}" ]]; then   # the archive the package was tested with
-        [[ "$(sha256sum -- "$opti_7z" | cut -d' ' -f1)" == db4fe2deae7edd9f6657f5cb223edc694ebdec62b52f15a3a59913f8b656c176 ]] ||
-            { echo "$opti_7z is not the tested OptiScaler nightly-20261030" >&2; exit 1; }
+        [[ "$(sha256sum -- "$opti_7z" | cut -d' ' -f1)" == 272f073566fa2634e2c9827abcc496d5b3f3e9b4575b9520e472f4fda3d575f7 ]] ||
+            { echo "$opti_7z is not the tested OptiScaler nightly-20261127" >&2; exit 1; }
     fi
     command -v 7z >/dev/null || { echo "7z is needed to unpack $opti_7z" >&2; exit 1; }
     rm -rf -- "$pkg/optiscaler"
@@ -330,13 +330,18 @@ if [[ "$arch" == x86_64 ]]; then
     [[ -f "$pkg/optiscaler/release/OptiScaler.dll" && -f "$pkg/optiscaler/release/OptiScaler.ini" &&
        -d "$pkg/optiscaler/release/OptiScaler" ]] || { echo "$opti_7z is not laid out as OptiScaler v10" >&2; exit 1; }
     cp -- "$opti_license" "$pkg/optiscaler/OptiScaler_LICENSE.txt"
-    opti_commit=$(sed -n 's|.*raw\.githubusercontent\.com/optiscaler/OptiScaler/\([0-9a-f]\{40\}\)/LICENSE.*|\1|p' fetch_deps.sh | head -1)
-    opti_url=$(sed -n 's|.*\(https://github\.com/optiscaler/[^ ]*\.7z\).*|\1|p' fetch_deps.sh | head -1)
+    # Where OptiScaler's source is (GPL-3.0: directions to the corresponding source beside the binaries): the commit and
+    # the release archive fetch_deps.sh takes; an NR_OPTI_ARCHIVE of one's own: the repository only.
     {
-        echo "OptiScaler is distributed unmodified as an independent aggregate under the GNU General Public License v3.0 (see OptiScaler_LICENSE.txt), with no additional restrictions."
-        echo "Upstream source repository: https://github.com/optiscaler/OptiScaler"
-        [[ -n "$opti_commit" ]] && echo "Corresponding source commit: https://github.com/optiscaler/OptiScaler/tree/$opti_commit"
-        [[ -n "$opti_url" ]] && echo "Upstream binary archive: $opti_url"
+        echo "OptiScaler (optiscaler/release) is shipped unmodified under the GNU General Public License v3.0 (OptiScaler_LICENSE.txt)."
+        echo "Its source: https://github.com/optiscaler/OptiScaler"
+        if [[ -z "${NR_OPTI_ARCHIVE:-}" ]]; then
+            opti_commit=$(sed -n 's|.*raw\.githubusercontent\.com/optiscaler/OptiScaler/\([0-9a-f]\{40\}\)/LICENSE.*|\1|p' fetch_deps.sh | head -1)
+            opti_url=$(sed -n 's|.*\(https://github\.com/optiscaler/[^ ]*\.7z\).*|\1|p' fetch_deps.sh | head -1)
+            [[ -n "$opti_commit" && -n "$opti_url" ]] || { echo "fetch_deps.sh names no OptiScaler commit / archive" >&2; exit 1; }
+            echo "The source of this build: https://github.com/optiscaler/OptiScaler/tree/$opti_commit"
+            echo "The release archive it was unpacked from: $opti_url"
+        fi
     } > "$pkg/optiscaler/OptiScaler_SOURCE.txt"
     # stamped with the package's version (its log line and NR Control's title), not the bare commit
     NR_STAMP=$(bash linux/build/version.sh) bash linux/build/build_asi.sh artifacts/optiscaler/asi > /dev/null

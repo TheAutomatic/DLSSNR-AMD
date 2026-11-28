@@ -293,7 +293,7 @@ std::atomic<bool> g_game_frame_new{false};
 struct Menu {
     ImGuiContext* context{};
     std::chrono::steady_clock::time_point previous = std::chrono::steady_clock::now();
-    Ini ini{nr::u8::path(nr::u8::writable_ini_path(nr::pe::module_folder()))};
+    Ini ini{nr::u8::path(nr::u8::ini_file(nr::pe::module_folder()))};
     KeyValues renodx;            // [RenoDX]: NR on / off and the screenshot keys (all layers)
     // the NR chain's list and the selected layer's page (nr_control_pages.hpp); the selected layer's number at start:
     // NR_CONTROL_LAYER=<n>, for tests
@@ -523,7 +523,7 @@ struct Menu {
         marks = nr::control_ui::inspect_marks(ini);
         const std::string v = ini.get("Inspect", "SpatialOutlines", "0");
         if (v != "1" && v != "true") return;
-        marks_chain_file.poll(nr::u8::writable_ini_path(nr::pe::module_folder()), marks_chain);
+        marks_chain_file.poll(nr::u8::ini_file(nr::pe::module_folder()), marks_chain);
         const int chosen = std::max(1, marks_chain.inspect.layer);   // the final picture: the first layer's
         for (const nr::pe::LayerConfig& l : marks_chain.layers) {
             if (!l.enabled || std::max(l.number, 1) != chosen || l.processing != nr::pe::Processing::kWilsjo2) continue;
@@ -678,7 +678,7 @@ struct Menu {
             if (menu_key_read && now - menu_key_read < 1000) return;
             menu_key_read = now;
             char v[64] = {};
-            const std::string path = nr::u8::writable_ini_path(nr::pe::module_folder());
+            const std::string path = nr::u8::ini_file(nr::pe::module_folder());
             nr::u8::profile("NRControl", "MenuKey", "End", v, sizeof v, path.c_str());
             text = v;
         }
@@ -731,12 +731,9 @@ struct Menu {
     // (nr_control_pages.hpp) ----
     std::string report_said;
     void copy_report(const nr::control::Shared* s) {
-        const std::string mod_dir = nr::pe::module_folder();
-        const std::string text = nr::control_ui::report_text(s, "dlssnr-amd.asi",
-                                                             nr::u8::writable_ini_path(mod_dir),
+        const std::string text = nr::control_ui::report_text(s, "dlssnr-amd.asi", nr::u8::ini_file(nr::pe::module_folder()),
                                                              nr::pe::log_path());
-        const std::string report_dir = nr::u8::writable_app_dir(mod_dir + "\\dlssnr-amd");
-        report_said = nr::control_ui::copy_report(text, report_dir + "\\nr-report.txt");
+        report_said = nr::control_ui::copy_report(text, nr::u8::writable_data(nr::pe::module_folder()) + "\\nr-report.txt");
     }
     void draw_diagnostics(const nr::control::Shared* s) {
         static const bool diag_test = [] { const char* e = std::getenv("NR_CONTROL_DIAG_OPEN"); return e && e[0] == '1'; }();
@@ -752,9 +749,10 @@ struct Menu {
         if (ImGui::Button(tr("Copy a report"))) copy_report(s);
         nr::control_ui::help("For a bug report: the layers as they run, their engine data, the video memory and its "
                              "residency, the events above, dlssnr-amd.ini and the last lines of dlssnr-amd.log, as text. "
-                             "Copied to the clipboard and saved as dlssnr-amd\\nr-report.txt next to the game. Nothing "
-                             "is sent anywhere.");
+                             "Copied to the clipboard and saved as dlssnr-amd\\nr-report.txt next to the game (in NR's "
+                             "folder in Documents when the game's folder cannot be written). Nothing is sent anywhere.");
         if (!report_said.empty()) nr::control_ui::text_dim_wrapped("%s", report_said.c_str());
+        nr::control_ui::draw_files_place(nr::pe::module_folder());
         nr::control_ui::draw_diag_package([s] { return diag_request(s); });
         ImGui::Separator();
         nr::control_ui::draw_session_stats();
@@ -765,7 +763,7 @@ struct Menu {
         nr::pe::diag::Request r;
         r.game = nr::u8::path(nr::pe::module_folder());
         r.log = nr::u8::path(nr::pe::log_path());
-        r.report = nr::control_ui::report_text(s, "dlssnr-amd.asi", nr::u8::writable_ini_path(nr::pe::module_folder()),
+        r.report = nr::control_ui::report_text(s, "dlssnr-amd.asi", nr::u8::ini_file(nr::pe::module_folder()),
                                                nr::pe::log_path());
         r.gpu = nr::pe::vkdevice::gpu_name();
         r.driver = nr::pe::vkdevice::driver_name();
@@ -862,12 +860,7 @@ struct Menu {
         nr::control_ui::help("Every layer off or on again, for this run only (never written to the file). Its key is on "
                              "the Hotkeys page; whether NR is on when the game starts: the Screenshot page's "
                              "\"Neural Rendering\" ([RenoDX] NeuralUplift).");
-        if (const uint32_t err = ini.save_error()) {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.f, 0.45f, 0.4f, 1.f));
-            ImGui::TextWrapped(tr("File is not writable; settings were not saved (error %lu)."),
-                               static_cast<unsigned long>(err));
-            ImGui::PopStyleColor();
-        }
+        nr::control_ui::draw_save_error(ini.save_error());
     }
     // The render size and the upscaler's output as NR last saw them (0: not known)
     static void upscaling(const nr::control::Shared* s, uint32_t* rw, uint32_t* rh, uint32_t* ow, uint32_t* oh) {
@@ -1020,9 +1013,9 @@ struct Menu {
         if (report_every > 0 && ++draws % report_every == 0) {
             const std::string mod_dir = nr::pe::module_folder();
             const std::string text = nr::control_ui::report_text(s, "dlssnr-amd.asi",
-                                                                 nr::u8::writable_ini_path(mod_dir),
+                                                                 nr::u8::ini_file(nr::pe::module_folder()),
                                                                  nr::pe::log_path());
-            if (FILE* f = nr::u8::fopen((nr::u8::writable_app_dir(mod_dir) + "\\nr-report-series.txt").c_str(), "ab")) {
+            if (FILE* f = nr::u8::fopen((nr::u8::writable_folder(nr::pe::module_folder()) + "\\nr-report-series.txt").c_str(), "ab")) {
                 std::fprintf(f, "--- draw %d\n%s\n", draws, text.c_str());
                 std::fclose(f);
             }
@@ -1978,7 +1971,7 @@ void install_now() {
     const std::string folder = nr::pe::module_folder();
     {
         char v[16] = {};
-        const std::string ini_path = nr::u8::writable_ini_path(folder);
+        const std::string ini_path = nr::u8::ini_file(folder);
         nr::u8::profile("NRControl", "SystemPresentHook", "1", v, sizeof v, ini_path.c_str());
         if (v[0] == '0' && v[1] == '\0') {
             say("[NRControl] SystemPresentHook = 0 in dlssnr-amd.ini; skipping System32\\dxgi.dll Present hooks");

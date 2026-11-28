@@ -26,6 +26,8 @@ namespace {
 
 using nr::pe::log;
 
+// OpenRR's own Vulkan instances (openrr-amd.asi beside this module; application name "openrr...") and what they make:
+// not the game's - nothing recorded, no features added. Nothing changes while OpenRR makes none.
 bool is_internal_vk_app(const VkInstanceCreateInfo* info) {
     if (!info || !info->pApplicationInfo || !info->pApplicationInfo->pApplicationName) return false;
     const char* n = info->pApplicationInfo->pApplicationName;
@@ -81,12 +83,15 @@ VkResult VKAPI_PTR hooked_create_instance(const VkInstanceCreateInfo* info,
                                           const VkAllocationCallbacks* allocator,
                                           VkInstance* out) {
     const VkResult r = real_create_instance(info, allocator, out);
-    if (r == VK_SUCCESS && out && *out) {
-        const bool internal = nr::pe::bridge::creating_device() || is_internal_vk_app(info);
-        if (internal) {
+    if (r == VK_SUCCESS && out && *out && !nr::pe::bridge::creating_device()) {
+        if (is_internal_vk_app(info)) {
             std::lock_guard<std::mutex> guard(lock);
             internal_instances.insert(*out);
         } else {
+            {
+                std::lock_guard<std::mutex> guard(lock);
+                internal_instances.erase(*out);
+            }
             note_instance(*out, info);
             std::lock_guard<std::mutex> guard(lock);
             seen.instance = *out;
@@ -121,22 +126,22 @@ VkResult VKAPI_PTR hooked_enumerate_physical_devices(VkInstance instance, uint32
                                                      VkPhysicalDevice* out) {
     const VkResult r = real_enumerate_physical_devices(instance, count, out);
     if (instance && !nr::pe::bridge::creating_device()) {
-        bool internal = false;
         {
             std::lock_guard<std::mutex> guard(lock);
-            internal = internal_instances.count(instance) != 0;
-            if (internal) {
-                if ((r == VK_SUCCESS || r == VK_INCOMPLETE) && out && count) {
+            if (internal_instances.count(instance) != 0) {   // OpenRR's: its physical devices kept apart
+                if ((r == VK_SUCCESS || r == VK_INCOMPLETE) && out && count)
                     for (uint32_t i = 0; i < *count; ++i)
                         if (out[i] != VK_NULL_HANDLE) internal_physicals[out[i]] = instance;
-                }
-            } else {
-                if (!seen.instance) log("[nr] Vulkan instance learned from vkEnumeratePhysicalDevices");
-                seen.instance = instance;
+                return r;
             }
         }
-        if (!internal && (r == VK_SUCCESS || r == VK_INCOMPLETE) && out && count)
+        if ((r == VK_SUCCESS || r == VK_INCOMPLETE) && out && count)
             note_physical_devices(instance, *count, out);
+        std::lock_guard<std::mutex> guard(lock);
+        if ((r == VK_SUCCESS || r == VK_INCOMPLETE) && out && count && !internal_physicals.empty())
+            for (uint32_t i = 0; i < *count; ++i) internal_physicals.erase(out[i]);   // (handles OpenRR's had)
+        if (!seen.instance) log("[nr] Vulkan instance learned from vkEnumeratePhysicalDevices");
+        seen.instance = instance;
     }
     return r;
 }
@@ -277,8 +282,11 @@ bool augment(VkPhysicalDevice physical, const VkDeviceCreateInfo* info, Augmente
 
 VkResult VKAPI_PTR hooked_create_device(VkPhysicalDevice physical, const VkDeviceCreateInfo* info,
                                         const VkAllocationCallbacks* allocator, VkDevice* out) {
-    // The bridge's own device (nr_pe_bridge.hpp) and peer internal plugin devices are not the game's.
+    // The bridge's own device (nr_pe_bridge.hpp) is not the game's: passed straight through, unrecorded; nor OpenRR's.
     if (nr::pe::bridge::creating_device()) return real_create_device(physical, info, allocator, out);
+    // The physical device is known before the call; ReShade's Vulkan layer
+    // fires its device events from inside this very call, so anything that
+    // runs then must already find it.
     bool internal = false;
     {
         std::lock_guard<std::mutex> guard(lock);
