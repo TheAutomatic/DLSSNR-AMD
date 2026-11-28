@@ -469,7 +469,7 @@ ResourceHandle d3d11_image(IUnknown* texture, IUnknown* device) {
         if (trace)
             log("[nr] d3d11_image: description 0x%08lx, %ux%u format %u usage 0x%x", long(described),
                 info.extent.width, info.extent.height, unsigned(info.format), unsigned(info.usage));
-        if (SUCCEEDED(described) && info.extent.width && info.format != VK_FORMAT_UNDEFINED) {
+        if (SUCCEEDED(described) && info.extent.width && info.extent.height && info.format != VK_FORMAT_UNDEFINED) {
             out.format = info.format;
             out.width = info.extent.width;
             out.height = info.extent.height;

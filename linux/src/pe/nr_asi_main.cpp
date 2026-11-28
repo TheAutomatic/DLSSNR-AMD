@@ -895,11 +895,10 @@ bool read_frame(const NVSDK_NGX_Parameter* p, const Tracked& t, Frame& f) {
     f.color_x = get_uint(p, "DLSS.Input.Color.Subrect.Base.X");
     f.color_y = get_uint(p, "DLSS.Input.Color.Subrect.Base.Y");
     const uint32_t cw = uint32_t(cd.Width), ch = cd.Height;
-    if (!cw || !ch) return false;
-    if (f.color_x >= cw || f.color_y >= ch) { f.color_x = f.color_y = 0; }
-    if (!f.render_w || !f.render_h) { f.render_w = cw - f.color_x; f.render_h = ch - f.color_y; }
-    f.render_w = std::min<uint32_t>(f.render_w, cw - f.color_x);
-    f.render_h = std::min<uint32_t>(f.render_h, ch - f.color_y);
+    if (!cw || !ch || !f.render_w || !f.render_h ||
+        f.color_x >= cw || f.color_y >= ch ||
+        f.render_w > cw - f.color_x || f.render_h > ch - f.color_y)
+        return false;
     // (the output's base only where the create turned output subrects on, as OptiScaler places it; create not seen: given)
     f.out_x = t.create.out_subrects != 0 ? get_uint(p, "DLSS.Output.Subrect.Base.X") : 0;
     f.out_y = t.create.out_subrects != 0 ? get_uint(p, "DLSS.Output.Subrect.Base.Y") : 0;
@@ -5657,7 +5656,9 @@ VkResult create_device(PFN_vkCreateDevice create, VkInstance instance, VkPhysica
 
 VKAPI_ATTR VkResult VKAPI_CALL hk_create_device(VkPhysicalDevice phys, const VkDeviceCreateInfo* ci,
                                                 const VkAllocationCallbacks* a, VkDevice* out) {
-    return create_device(g_next_create_device.load(), g_create_instance.load(), phys, ci, a, out, __builtin_return_address(0));
+    PFN_vkCreateDevice next = g_next_create_device.load();
+    if (t_in_create) return next ? next(phys, ci, a, out) : VK_ERROR_INITIALIZATION_FAILED;
+    return create_device(next, g_create_instance.load(), phys, ci, a, out, __builtin_return_address(0));
 }
 VKAPI_ATTR VkResult VKAPI_CALL hk_export_create_device(VkPhysicalDevice phys, const VkDeviceCreateInfo* ci,
                                                        const VkAllocationCallbacks* a, VkDevice* out) {
@@ -5685,6 +5686,11 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_internal_create_device(VkPhysicalDevice phys, 
         g_internal_devices.insert(*out);
     }
     return r;
+}
+bool is_own_create_device(PFN_vkVoidFunction f) {
+    return f == reinterpret_cast<PFN_vkVoidFunction>(&hk_create_device) ||
+           f == reinterpret_cast<PFN_vkVoidFunction>(&hk_export_create_device) ||
+           f == reinterpret_cast<PFN_vkVoidFunction>(&hk_internal_create_device);
 }
 // The game's vkDestroyDevice (winevulkan's export, detoured beside vkCreateDevice): the device leaves the record, and
 // when NR's Vulkan route runs on it everything of ours on it goes first, while it is still there (vk_route_teardown).
@@ -5855,10 +5861,7 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL hk_gipa(VkInstance instance, const char
             return reinterpret_cast<PFN_vkVoidFunction>(&hk_gipa_enumerate_physical);
         }
         if (!std::strcmp(name, "vkCreateDevice")) {
-            if (f == reinterpret_cast<PFN_vkVoidFunction>(&hk_internal_create_device) ||
-                f == reinterpret_cast<PFN_vkVoidFunction>(&hk_export_create_device) ||
-                f == reinterpret_cast<PFN_vkVoidFunction>(&hk_create_device))
-                return f;
+            if (is_own_create_device(f)) return f;
             {
                 std::lock_guard<std::mutex> guard(g_devices_lock);
                 g_internal_create_device_procs[instance] = reinterpret_cast<PFN_vkCreateDevice>(f);
@@ -5891,9 +5894,7 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL hk_gipa(VkInstance instance, const char
         return reinterpret_cast<PFN_vkVoidFunction>(&hk_gipa_enumerate_physical);
     }
     if (!std::strcmp(name, "vkCreateDevice")) {
-        if (f == reinterpret_cast<PFN_vkVoidFunction>(&hk_create_device) ||
-            f == reinterpret_cast<PFN_vkVoidFunction>(&hk_internal_create_device))
-            return f;
+        if (is_own_create_device(f)) return f;
         g_next_create_device.store(reinterpret_cast<PFN_vkCreateDevice>(f));
         if (instance) {
             std::lock_guard<std::mutex> guard(g_devices_lock);
@@ -6866,11 +6867,10 @@ bool read_frame_dims(const NVSDK_NGX_Parameter* p, VkFrame& f, const CreateSizes
         evaluate_render_size(p, create, ci.Width, ci.Height, &f.render_w, &f.render_h);
     f.color_x = get_uint(p, "DLSS.Input.Color.Subrect.Base.X");
     f.color_y = get_uint(p, "DLSS.Input.Color.Subrect.Base.Y");
-    if (!ci.Width || !ci.Height) return false;
-    if (f.color_x >= ci.Width || f.color_y >= ci.Height) { f.color_x = f.color_y = 0; }
-    if (!f.render_w || !f.render_h) { f.render_w = ci.Width - f.color_x; f.render_h = ci.Height - f.color_y; }
-    f.render_w = std::min<uint32_t>(f.render_w, ci.Width - f.color_x);
-    f.render_h = std::min<uint32_t>(f.render_h, ci.Height - f.color_y);
+    if (!ci.Width || !ci.Height || !f.render_w || !f.render_h ||
+        f.color_x >= ci.Width || f.color_y >= ci.Height ||
+        f.render_w > ci.Width - f.color_x || f.render_h > ci.Height - f.color_y)
+        return false;
     f.out_x = create.out_subrects != 0 ? get_uint(p, "DLSS.Output.Subrect.Base.X") : 0;   // (as read_frame)
     f.out_y = create.out_subrects != 0 ? get_uint(p, "DLSS.Output.Subrect.Base.Y") : 0;
     output_size(p, create, oi.Width, oi.Height, &f.out_w, &f.out_h);
@@ -9984,7 +9984,11 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_d11_evaluate(ID3D11DeviceContext* ctx, const NV
         int flags = 0;
         if (p->Get("DLSS.Feature.Create.Flags", &flags) == NVSDK_NGX_Result_Success) { f.flags = uint32_t(flags); f.flags_known = true; }
     }
-    read_frame_dims(p, f, t.vk.create);
+    if (!read_frame_dims(p, f, t.vk.create)) {
+        cut_reuse_guides(g_d11_present.sets, h->Id);
+        guard.unlock();
+        return real_d11_evaluate(ctx, h, p, callback);
+    }
     const bool nr_on = nr::dlssnr::frame_keys();
     VkPlan plan;
     plan_layers_vk(t.vk, f, nr_on, "D3D11 games", plan, g_d11_present);
