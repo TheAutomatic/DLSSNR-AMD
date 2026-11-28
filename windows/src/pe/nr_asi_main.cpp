@@ -810,6 +810,13 @@ void layer_note(const Layer& l, uint32_t placement, uint32_t state, const char* 
                                note);
 }
 
+void skip_before_layers(const std::vector<const Layer*>& before, bool nr_on, const char* note) {
+    for (const Layer* l : before) {
+        if (l->cfg.processing == nr::pe::Processing::kWilsjo2 && !nr_on) continue;
+        layer_note(*l, 1u, 3u, note);
+    }
+}
+
 LayerState& layer_state(Tracked& t, const Layer& l) {
     LayerState& s = t.layers[l.cfg.number];
     s.processing = l.cfg.processing;
@@ -5430,6 +5437,7 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_evaluate(ID3D12GraphicsCommandList* cmd, const 
         const D3D12_RESOURCE_DESC cdesc = f.color->GetDesc();
         const DXGI_FORMAT format = cdesc.Format;
         if (!rect_fits(rx, ry, rw, rh, cdesc.Width, cdesc.Height)) {
+            skip_before_layers(before, nr_on, "colour subrect outside texture");
             guard.unlock();
             r = real_evaluate(cmd, h, p, callback);
             goto after_layers;
@@ -5497,6 +5505,7 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_evaluate(ID3D12GraphicsCommandList* cmd, const 
         if (!ensure_texture(device, t.copy, t.copy_state, copy_fmt, rw, rh)) {
             // the layers before the upscaler cannot run this frame: the upscaler and the layers after it still do
             // (0.0.7 ran its after-SR NR on its own)
+            skip_before_layers(before, nr_on, "colour copy could not be made before the upscaler");
             static bool said = false;
             if (!said) { said = true; log("[nr] the colour's copy could not be made; the layers before the upscaler skip such frames, the layers after it run"); }
             guard.unlock();
@@ -9898,6 +9907,11 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_vk_evaluate(VkCommandBuffer cmd, const NVSDK_NG
         if (!copy_in(cmd, f.color, f.color_layout, f.color_usage, rx, ry, rw, rh, t.copy, VK_IMAGE_LAYOUT_GENERAL)) {
             // the layers before the upscaler cannot run this frame (said by copy_in's caller once): the upscaler and the
             // layers after it still do (0.0.7 ran its after-SR NR on its own)
+            const auto& ci = f.color->Resource.ImageViewInfo;
+            skip_before_layers(before, nr_on,
+                               rect_fits(rx, ry, rw, rh, ci.Width, ci.Height)
+                                   ? "colour could not be read before the upscaler"
+                                   : "colour subrect outside texture");
             static bool said = false;
             if (!said) { said = true; log("[nr] Vulkan route: the colour could not be read for the layers before the upscaler; they skip such frames, the layers after it run"); }
             guard.unlock();
@@ -10740,7 +10754,8 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_d11_evaluate(ID3D11DeviceContext* ctx, const NV
         const DXGI_FORMAT copy_fmt = writable(cd.Format);
         D11Image copy;
         VkCommandBuffer cmd = VK_NULL_HANDLE;
-        if (rect_fits(rx, ry, rw, rh, cd.Width, cd.Height)) {
+        const bool copy_fits = rect_fits(rx, ry, rw, rh, cd.Width, cd.Height);
+        if (copy_fits) {
             D3D11_TEXTURE2D_DESC have{};
             if (t.copy) t.copy->GetDesc(&have);
             if (!t.copy || have.Format != copy_fmt || have.Width != rw || have.Height != rh) {
@@ -10816,6 +10831,10 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_d11_evaluate(ID3D11DeviceContext* ctx, const NV
             if (colour.as_resource) p->Set(f.color_key, colour.res); else p->Set(f.color_key, static_cast<void*>(colour.res));
             if (moved) { p->Set("DLSS.Input.Color.Subrect.Base.X", f.color_x); p->Set("DLSS.Input.Color.Subrect.Base.Y", f.color_y); }
         } else {
+            skip_before_layers(plan.before, nr_on,
+                               copy_fits
+                                   ? "could not run before the upscaler"
+                                   : "colour subrect outside texture");
             guard.unlock();
             r = real_d11_evaluate(ctx, h, p, callback);
         }
