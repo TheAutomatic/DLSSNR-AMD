@@ -1013,9 +1013,9 @@ struct Menu {
         if (report_every > 0 && ++draws % report_every == 0) {
             const std::string mod_dir = nr::pe::module_folder();
             const std::string text = nr::control_ui::report_text(s, "dlssnr-amd.asi",
-                                                                 nr::u8::ini_file(nr::pe::module_folder()),
+                                                                 nr::u8::ini_file(mod_dir),
                                                                  nr::pe::log_path());
-            if (FILE* f = nr::u8::fopen((nr::u8::writable_folder(nr::pe::module_folder()) + "\\nr-report-series.txt").c_str(), "ab")) {
+            if (FILE* f = nr::u8::fopen((nr::u8::writable_folder(mod_dir) + "\\nr-report-series.txt").c_str(), "ab")) {
                 std::fprintf(f, "--- draw %d\n%s\n", draws, text.c_str());
                 std::fclose(f);
             }

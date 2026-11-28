@@ -925,6 +925,12 @@ bool read_frame(const NVSDK_NGX_Parameter* p, const Tracked& t, Frame& f) {
         evaluate_render_size(p, t.create, uint32_t(cd.Width), cd.Height, &f.render_w, &f.render_h);
     f.color_x = get_uint(p, "DLSS.Input.Color.Subrect.Base.X");
     f.color_y = get_uint(p, "DLSS.Input.Color.Subrect.Base.Y");
+    const uint32_t cw = uint32_t(cd.Width), ch = cd.Height;
+    if (!cw || !ch) return false;
+    if (f.color_x >= cw || f.color_y >= ch) { f.color_x = f.color_y = 0; }
+    if (!f.render_w || !f.render_h) { f.render_w = cw - f.color_x; f.render_h = ch - f.color_y; }
+    f.render_w = std::min<uint32_t>(f.render_w, cw - f.color_x);
+    f.render_h = std::min<uint32_t>(f.render_h, ch - f.color_y);
     // (the output's base only where the create turned output subrects on, as OptiScaler places it; create not seen: given)
     f.out_x = t.create.out_subrects != 0 ? get_uint(p, "DLSS.Output.Subrect.Base.X") : 0;
     f.out_y = t.create.out_subrects != 0 ? get_uint(p, "DLSS.Output.Subrect.Base.Y") : 0;
@@ -6376,7 +6382,10 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL hk_gipa(VkInstance instance, const char
         return reinterpret_cast<PFN_vkVoidFunction>(&hk_gipa_enumerate_physical);
     }
     if (!std::strcmp(name, "vkCreateDevice")) {
-        if (f == reinterpret_cast<PFN_vkVoidFunction>(&hk_layer_create_device)) return f;
+        if (f == reinterpret_cast<PFN_vkVoidFunction>(&hk_layer_create_device) ||
+            f == reinterpret_cast<PFN_vkVoidFunction>(&hk_create_device) ||
+            f == reinterpret_cast<PFN_vkVoidFunction>(&hk_internal_create_device))
+            return f;
         g_next_create_device.store(reinterpret_cast<PFN_vkCreateDevice>(f));
         if (instance) {
             std::lock_guard<std::mutex> guard(g_devices_lock);
@@ -7385,6 +7394,11 @@ bool read_frame_dims(const NVSDK_NGX_Parameter* p, VkFrame& f, const CreateSizes
         evaluate_render_size(p, create, ci.Width, ci.Height, &f.render_w, &f.render_h);
     f.color_x = get_uint(p, "DLSS.Input.Color.Subrect.Base.X");
     f.color_y = get_uint(p, "DLSS.Input.Color.Subrect.Base.Y");
+    if (!ci.Width || !ci.Height) return false;
+    if (f.color_x >= ci.Width || f.color_y >= ci.Height) { f.color_x = f.color_y = 0; }
+    if (!f.render_w || !f.render_h) { f.render_w = ci.Width - f.color_x; f.render_h = ci.Height - f.color_y; }
+    f.render_w = std::min<uint32_t>(f.render_w, ci.Width - f.color_x);
+    f.render_h = std::min<uint32_t>(f.render_h, ci.Height - f.color_y);
     f.out_x = create.out_subrects != 0 ? get_uint(p, "DLSS.Output.Subrect.Base.X") : 0;   // (as read_frame)
     f.out_y = create.out_subrects != 0 ? get_uint(p, "DLSS.Output.Subrect.Base.Y") : 0;
     output_size(p, create, oi.Width, oi.Height, &f.out_w, &f.out_h);
@@ -10920,12 +10934,6 @@ extern "C" __declspec(dllexport) void InitializeASI() {
         nr::pe::screenshot::set_folder(nr::u8::wide(nr::u8::writable_folder(nr::pe::module_folder())) + L"\\NR Screenshots");
     }
     log("[nr] dlssnr-amd.asi %s loaded by %s", NR_BUILD_STAMP, nr::u8::module_file(g_opti).c_str());
-    {
-        bool moved = false;
-        const std::string ini_path = nr::u8::ini_file(nr::pe::module_folder());
-        nr::u8::writable_folder(nr::pe::module_folder(), &moved);
-        if (moved) log("[nr] settings folder '%s' is read-only; using '%s'", nr::pe::module_folder(), ini_path.c_str());
-    }
     nr::pe::restore_ini(nr::pe::module_folder());   // a deleted dlssnr-amd.ini: the installed one, before anything reads it
     nr::pe::apply_debug_env(nr::pe::module_folder());   // [Debug]: before anything reads the environment
     // ACO Mode: decided before any device of ours (or a game's we add features to) is made.
@@ -11153,7 +11161,8 @@ NR_Layer_GetInstanceProcAddr(VkInstance instance, const char* name) {
         if (f && name && !std::strcmp(name, "vkCreateDevice")) {
             if (f == reinterpret_cast<PFN_vkVoidFunction>(&hk_layer_create_device) ||
                 f == reinterpret_cast<PFN_vkVoidFunction>(&hk_internal_create_device) ||
-                f == reinterpret_cast<PFN_vkVoidFunction>(&hk_export_create_device))
+                f == reinterpret_cast<PFN_vkVoidFunction>(&hk_export_create_device) ||
+                f == reinterpret_cast<PFN_vkVoidFunction>(&hk_create_device))
                 return f;
             {
                 std::lock_guard<std::mutex> guard(g_devices_lock);
@@ -11164,6 +11173,9 @@ NR_Layer_GetInstanceProcAddr(VkInstance instance, const char* name) {
         return f;
     }
     if (f && name && !std::strcmp(name, "vkCreateDevice")) {
+        if (f == reinterpret_cast<PFN_vkVoidFunction>(&hk_layer_create_device) ||
+            f == reinterpret_cast<PFN_vkVoidFunction>(&hk_internal_create_device))
+            return f;
         g_layer_next_create_device.store(reinterpret_cast<PFN_vkCreateDevice>(f), std::memory_order_release);
         g_layer_create_instance.store(instance, std::memory_order_relaxed);
         return reinterpret_cast<PFN_vkVoidFunction>(&hk_layer_create_device);

@@ -226,18 +226,18 @@ if ($Route -ne 'logs') {
         Say 'This folder needs administrator rights, asking for them...'
         # the chosen exe, not its folder: from a folder the first exe would be taken again (another bitness)
         $again = if ($exe) { $exe } else { $game }
-        $elevated = "-NoProfile -ExecutionPolicy Bypass -STA -File `"$PSCommandPath`" -Target `"$again`" -Route $Route -RenoDX $RenoDX -Pause"
-        if ($Model) { $elevated += " -Model $Model" }
-        $elevated += " -Lumenite $Lumenite"
-        if ($LumeniteZip) { $elevated += " -LumeniteZip `"$LumeniteZip`"" }
-        if ($Dll) { $elevated += " -Dll `"$Dll`"" }
+        $elevationArgs = "-NoProfile -ExecutionPolicy Bypass -STA -File `"$PSCommandPath`" -Target `"$again`" -Route $Route -RenoDX $RenoDX -Pause"
+        if ($Model) { $elevationArgs += " -Model $Model" }
+        $elevationArgs += " -Lumenite $Lumenite"
+        if ($LumeniteZip) { $elevationArgs += " -LumeniteZip `"$LumeniteZip`"" }
+        if ($Dll) { $elevationArgs += " -Dll `"$Dll`"" }
         # the player's Documents (NR's folder there for a read-only game folder): an administrator account that
         # approves the request has Documents of its own. The administrator run leaves them alone; this run (the
         # player's) sets the settings there again after it, as the player.
-        $elevated += ' -Elevated'
+        $elevationArgs += ' -Elevated'
         $docs = [Environment]::GetFolderPath('MyDocuments')
-        if ($docs) { $elevated += " -UserDocuments `"$($docs.TrimEnd('\'))`"" }
-        $p = Start-Process powershell -Verb RunAs -ArgumentList $elevated -PassThru -Wait
+        if ($docs) { $elevationArgs += " -UserDocuments `"$($docs.TrimEnd('\'))`"" }
+        $p = Start-Process powershell -Verb RunAs -ArgumentList $elevationArgs -PassThru -Wait
         if ($p.ExitCode -eq 0 -and $Route -ne 'remove') { Set-NrDocumentsIni (Join-Path $game 'dlssnr-amd.ini') }
         exit $p.ExitCode
     }

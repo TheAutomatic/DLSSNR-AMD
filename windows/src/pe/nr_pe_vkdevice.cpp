@@ -88,12 +88,9 @@ VkResult VKAPI_PTR hooked_create_instance(const VkInstanceCreateInfo* info,
             std::lock_guard<std::mutex> guard(lock);
             internal_instances.insert(*out);
         } else {
-            {
-                std::lock_guard<std::mutex> guard(lock);
-                internal_instances.erase(*out);
-            }
-            note_instance(*out, info);
             std::lock_guard<std::mutex> guard(lock);
+            internal_instances.erase(*out);
+            instance_tracker.note_instance(*out, info);
             seen.instance = *out;
         }
     }

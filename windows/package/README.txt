@@ -4,7 +4,7 @@ DLSSNR-AMD-Vulkan (Windows)
 Runs the neural rendering (NR) model of DLSS 5 in games on AMD graphics cards. The network is
 reimplemented in Vulkan; NVIDIA's runtime is neither needed nor called.
 
-Some releases may be Linux only. If something breaks, uninstall with option 5 of install.bat.
+Some releases may be Linux only. If something breaks, uninstall with option 6 of install.bat.
 
 In 64-bit DX12 games NR can run on the game's own device (D3D12 passthrough, below); otherwise DX10/11/12
 games run it on a Vulkan device of its own on the same graphics card, and the frame is handed between

@@ -894,6 +894,12 @@ bool read_frame(const NVSDK_NGX_Parameter* p, const Tracked& t, Frame& f) {
         evaluate_render_size(p, t.create, uint32_t(cd.Width), cd.Height, &f.render_w, &f.render_h);
     f.color_x = get_uint(p, "DLSS.Input.Color.Subrect.Base.X");
     f.color_y = get_uint(p, "DLSS.Input.Color.Subrect.Base.Y");
+    const uint32_t cw = uint32_t(cd.Width), ch = cd.Height;
+    if (!cw || !ch) return false;
+    if (f.color_x >= cw || f.color_y >= ch) { f.color_x = f.color_y = 0; }
+    if (!f.render_w || !f.render_h) { f.render_w = cw - f.color_x; f.render_h = ch - f.color_y; }
+    f.render_w = std::min<uint32_t>(f.render_w, cw - f.color_x);
+    f.render_h = std::min<uint32_t>(f.render_h, ch - f.color_y);
     // (the output's base only where the create turned output subrects on, as OptiScaler places it; create not seen: given)
     f.out_x = t.create.out_subrects != 0 ? get_uint(p, "DLSS.Output.Subrect.Base.X") : 0;
     f.out_y = t.create.out_subrects != 0 ? get_uint(p, "DLSS.Output.Subrect.Base.Y") : 0;
@@ -5885,6 +5891,9 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL hk_gipa(VkInstance instance, const char
         return reinterpret_cast<PFN_vkVoidFunction>(&hk_gipa_enumerate_physical);
     }
     if (!std::strcmp(name, "vkCreateDevice")) {
+        if (f == reinterpret_cast<PFN_vkVoidFunction>(&hk_create_device) ||
+            f == reinterpret_cast<PFN_vkVoidFunction>(&hk_internal_create_device))
+            return f;
         g_next_create_device.store(reinterpret_cast<PFN_vkCreateDevice>(f));
         if (instance) {
             std::lock_guard<std::mutex> guard(g_devices_lock);
@@ -6857,6 +6866,11 @@ bool read_frame_dims(const NVSDK_NGX_Parameter* p, VkFrame& f, const CreateSizes
         evaluate_render_size(p, create, ci.Width, ci.Height, &f.render_w, &f.render_h);
     f.color_x = get_uint(p, "DLSS.Input.Color.Subrect.Base.X");
     f.color_y = get_uint(p, "DLSS.Input.Color.Subrect.Base.Y");
+    if (!ci.Width || !ci.Height) return false;
+    if (f.color_x >= ci.Width || f.color_y >= ci.Height) { f.color_x = f.color_y = 0; }
+    if (!f.render_w || !f.render_h) { f.render_w = ci.Width - f.color_x; f.render_h = ci.Height - f.color_y; }
+    f.render_w = std::min<uint32_t>(f.render_w, ci.Width - f.color_x);
+    f.render_h = std::min<uint32_t>(f.render_h, ci.Height - f.color_y);
     f.out_x = create.out_subrects != 0 ? get_uint(p, "DLSS.Output.Subrect.Base.X") : 0;   // (as read_frame)
     f.out_y = create.out_subrects != 0 ? get_uint(p, "DLSS.Output.Subrect.Base.Y") : 0;
     output_size(p, create, oi.Width, oi.Height, &f.out_w, &f.out_h);
