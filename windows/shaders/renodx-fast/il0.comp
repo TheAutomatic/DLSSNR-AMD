@@ -77,7 +77,8 @@ layout(set = 0, binding = 42) uniform texture2D DP6;
 // pass's Intensity and Style grade are applied here, pass after pass, as the network's post block does on its answer:
 // styles = 2 bits a pass, inten = the Intensity, for passes 1..3 and 4 and later (the session's pass_controls)
 layout(push_constant) uniform Push { uvec2 size, mbase, mgrid; vec2 mscale; uint mode, slot, n, flags; float k0, k1; uvec2 dbase, dgrid;
-                                     uint styles, pad0; vec4 inten; } pc;
+                                     uint styles, pad0; vec4 inten;
+                                     uint gflags; } pc;
 // pass k's answer from its input `base` and its network's own output `rgb` (fswin_t.comp's compose + grade)
 vec3 post(uint k, vec3 base, vec3 rgb) {
     if ((pc.flags & 2048u) == 0u) return rgb;
@@ -193,12 +194,37 @@ vec4 lvb(uint l, uint i, vec2 p, bool bil, vec4 wb) {
     return sw > 1e-4 ? (a * wb.x + b * wb.y + cc * wb.z + d * wb.w) / sw * min(sw * 4.0, 1.0) : vec4(0.0);
 }
 // slot i's usable increments around p, filled from the coarsest level down; wl[l - 1]: level l's bilateral weights
-vec3 pull(uint i, vec2 p, bool bil, const vec4 wl[6]) {
-    const vec4 top0 = lvb(6u, i, p, false, vec4(0.0)), topd = bil ? lvb(6u, i, p, true, wl[5]) : top0;
-    const vec4 top = topd.a > 1e-4 ? topd : top0;   // (nothing at its depth even at the top: the plain mean)
+// (gflags bits 1..3: NR_IL_FILL_L, the deepest level the fill may reach - 0 keeps the pyramid's own six. A hole only
+//  the coarse levels reach takes their value as one block, so this says where such a block starts.)
+// (gflags 65536: NR_IL_PULL_BIL, the top level from its four texels weighted - premultiplied, coverage kept - instead
+//  of the one nearest texel, whose edge is a square in the picture.)
+// (gflags 256: NR_IL_FILL_ONE - one level, bilinear, and nothing else. Blending the levels into each other
+//  (m.rgb + (1 - m.a) x e) puts a step at 2 / 4 / 8 / 16 px wherever one level's coverage starts and the next stops:
+//  the squares, rounded, that the pyramid leaves on leaves and grass. One level is one bilinear ramp of that level's
+//  size and no step at all - a smear, not a tile.)
+vec3 pull(uint i, vec2 p, bool bil, const vec4 wl[6], uint maxl, bool topbil, bool one, vec3 own) {
+    if (one) {
+        const vec4 t = lvb(maxl, i, p, false, vec4(0.0));   // (bilinear, coverage included)
+        // (coverage short: a box with no usable increment in it has no mean to give - returning 0 there is the black
+        //  blotch (the slot's contribution empties out). It fades to the slot's own moved increment instead.)
+        const float cov = t.a;
+        if (cov <= 0.02f) return own;
+        return mix(own, t.rgb / cov, smoothstep(0.02f, 0.25f, cov));
+    }
+    vec4 top;
+    if (topbil) {
+        ivec2 c[4]; int wx; vec2 t;
+        lvgeo(maxl, p, c, wx, t);
+        const ivec2 off = ivec2(int(i) * wx, 0);
+        top = lv(maxl, c[0] + off) * ((1.0 - t.x) * (1.0 - t.y)) + lv(maxl, c[1] + off) * (t.x * (1.0 - t.y)) +
+              lv(maxl, c[2] + off) * ((1.0 - t.x) * t.y) + lv(maxl, c[3] + off) * (t.x * t.y);
+    } else {
+        const vec4 top0 = lvb(maxl, i, p, false, vec4(0.0)), topd = bil ? lvb(maxl, i, p, true, wl[maxl - 1u]) : top0;
+        top = topd.a > 1e-4 ? topd : top0;   // (nothing at its depth even at the top: the plain mean)
+    }
     vec3 e = top.a > 1e-4 ? top.rgb / top.a : vec3(0.0);
-    for (uint l = 5u; l >= 1u; --l) {
-        const vec4 m = lvb(l, i, p, bil, wl[l - 1u]);
+    for (int l = int(maxl) - 1; l >= 1; --l) {
+        const vec4 m = lvb(uint(l), i, p, bil, wl[l - 1]);
         e = m.rgb + (1.0 - m.a) * e;
     }
     return e;
@@ -295,12 +321,45 @@ void body(uvec2 px) {
             const float near = imageLoad(DepthCur, ip).r;
             for (uint l = 1u; l <= 6u; ++l) wl[l - 1u] = lvw(l, vec2(px) + 0.5, near);
         }
+        // NR_IL_FILL_L (gflags bits 1..3: 1..6, 0 the pyramid's own end) and NR_IL_PULL_BIL (65536)
+        const uint fl = (pc.gflags >> 1u) & 7u;
+        const uint maxl = fl == 0u ? 6u : min(fl, 6u);
+        const bool topbil = (pc.gflags & 65536u) != 0u;
+        // (gflags 256: NR_IL_FILL_ONE - one level, bilinear, no level steps: a smear of the level's size, not tiles)
+        const bool one = (pc.gflags & 256u) != 0u;
         const bool keep = (pc.flags & 268435456u) != 0u;
+        // (gflags 16384: NR_IL_FILL_SMOOTH. The pyramid fill replaces a pixel's increment with a mean over 4 / 8 / 16 px -
+        //  a square on leaves and grass, where the pixel is fine detail that only failed a test, not a hole. So where the
+        //  3 x 3 around it disagrees (spread >= 0.02) the pixel is filled from its eight neighbours' usable increments
+        //  instead, weighted by their Trust: that value changes pixel by pixel, so it smears the hole rather than tiling
+        //  it, and the hole's edge still gives way (a solid ghost is what the pyramid's absence left).)
+        const bool fsmooth = (pc.gflags & 16384u) != 0u;
+        const ivec2 fillhi = ivec2(pc.size) - 1;
         vec3 z = keep ? imageLoad(Proxy, ip).rgb : imageLoad(Base, ip).rgb;
         for (uint i = 0u; i < pc.n; ++i) {
-            const vec3 v = mix(pull(i, vec2(px) + 0.5, bil, wl), ld(i, ip), trust);
+            const vec3 own = ld(i, ip);
+            vec3 v = mix(pull(i, vec2(px) + 0.5, bil, wl, maxl, topbil, one, own), own, trust);
+            if (fsmooth && !one && trust < 1.0) {
+                float spread = 0.0f, wa = 0.0f;
+                vec3 la = vec3(0.0f);
+                for (int dy = -1; dy <= 1; ++dy)
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        if (dx == 0 && dy == 0) continue;
+                        const ivec2 q = clamp(ip + ivec2(dx, dy), ivec2(0), fillhi);
+                        const vec3 t = ld(i, q);
+                        const float wt = imageLoad(Trust, q).r;
+                        la += wt * t; wa += wt;
+                        spread = max(spread, max(max(abs(t.r - own.r), abs(t.g - own.g)), abs(t.b - own.b)));
+                    }
+                // (flat here: the pyramid's fill stands. Detail: its neighbours' own increments, so no block appears)
+                const float detail = smoothstep(0.02f, 0.09f, spread);
+                v = mix(v, wa > 1e-4f ? la / wa : own, detail);
+            }
             st(i, ip, v);
-            if (i < pc.slot) z = post(i, z, z + v);
+            // (gflags 16: NR_IL_FILL_INPUT=0 - the fill is shown in the composite but not fed to the network: a 64 px
+            //  smear in the network's own input comes back as a blotch of its answer, which is what the fill's value
+            //  should never be asked to do. The input keeps the slots' own moved increments, as mode 0 made them.)
+            if (i < pc.slot) z = post(i, z, z + ((pc.gflags & 16u) != 0u ? own : v));
         }
         if (keep) imageStore(Base, ip, vec4(clamp(z, 0.0, 1.0), imageLoad(Proxy, ip).a));
         else imageStore(Proxy, ip, vec4(clamp(z, 0.0, 1.0), imageLoad(Base, ip).a));

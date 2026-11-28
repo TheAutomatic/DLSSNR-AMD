@@ -861,7 +861,7 @@ Stage::Stage(const HostDevice& host, const std::string& shaders) : impl_(std::ma
     try {   // Passes (fast) Interleaved: optional (without them an Interleaved layer runs one plain network pass, and says so)
         m.load_program(m.il[0], shaders + "/wilsjo2_il.spv", 96, 0x7Bu, m.il_steps.data());
         m.load_program(m.il[1], shaders + "/wilsjo2_il_pp.spv", 28);
-        m.load_program(m.il[2], shaders + "/wilsjo2_il0.spv", 96, 0x3Bu, m.il0_steps.data());
+        m.load_program(m.il[2], shaders + "/wilsjo2_il0.spv", 100, 0x3Bu, m.il0_steps.data());
         m.il_dir = shaders;
         m.il_loaded = m.fast_loaded;
         if (!m.il_loaded) m.il_clear();
@@ -1023,7 +1023,7 @@ void Stage::record_il(VkCommandBuffer cmd, uint32_t program, uint32_t step, cons
     if (program >= 3u && !m.il[program].pipeline) {   // (Style Grade Acceleration's, made at its first use)
         try {
             if (program == 3u) m.load_program(m.il[3], m.il_dir + "/wilsjo2_il_ga.spv", 96, 0x7Bu, m.il_ga_steps.data());
-            else m.load_program(m.il[4], m.il_dir + "/wilsjo2_il0_ga.spv", 96, 0x3Bu, m.il0_ga_steps.data());
+            else m.load_program(m.il[4], m.il_dir + "/wilsjo2_il0_ga.spv", 100, 0x3Bu, m.il0_ga_steps.data());
         } catch (const std::exception&) {
             m.il_ga_failed = true;
             throw;

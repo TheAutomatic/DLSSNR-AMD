@@ -144,11 +144,11 @@ struct FlowFrame {
 // RenoDX-style stage's defaults (vector test with the flow's gradient, box test, the game's depth for disocclusion and
 // dilation, content from outside the picture filled; the increments not usable replaced by stand-ins from the usable
 // ones around at the hole's depth). Its surfaces at the model's extent, kept between frames.
-struct IlPush {   // il.comp's push block (96 bytes, as the RenoDX-style stage's)
+struct IlPush {   // il0.comp's push block (100 bytes, as the RenoDX-style stage's: gflags its fill's shape)
     uint32_t size[2], mbase[2], mgrid[2]; float mscale[2]; uint32_t mode, slot, n, flags; float k0, k1;
-    uint32_t dbase[2], dgrid[2]; uint32_t styles; float pad0; float inten[4];
+    uint32_t dbase[2], dgrid[2]; uint32_t styles; float pad0; float inten[4]; uint32_t gflags;
 };
-static_assert(sizeof(IlPush) == 96, "il.comp's push block");
+static_assert(sizeof(IlPush) == 100, "il0.comp's push block");
 // Interleaved preset 1 (FastInterleavedPreset = 1): 0.0.8.4's method - its surfaces (the fill's pyramid and
 // its depth pyramid in place of the stand-ins' maps), il_pp.comp's push block; its code below as it was
 struct IlState1 {
@@ -347,6 +347,20 @@ inline bool il_run1(FlowIo& io, FlowState& o, const FlowFrame& f, const Settings
     ip.mscale[0] = f.mv_x * float(mw) / float(ip.mgrid[0]);
     ip.mscale[1] = f.mv_y * float(mh) / float(ip.mgrid[1]);
     ip.n = n;
+    // the fill's shape (gflags, the push block's tail): the RenoDX layer's defaults - anti-ghost on, so one level of the
+    // pyramid only, its top from the four texels weighted, the 3 x 3 smooth guard, and the network's input on the passes'
+    // own increments (FILL_INPUT=0, gflags 16). The keys are the same as nr_renodx.cpp's.
+    {
+        static const bool il_ag = [] { const char* e = std::getenv("NR_IL_ANTIGHOST"); return !(e && e[0] == '0'); }();
+        const auto il_switch = [](const char* name) { const char* e = std::getenv(name); return e && e[0] ? e[0] != '0' : il_ag; };
+        static const uint32_t il_fill_l = [] { const char* e = std::getenv("NR_IL_FILL_L"); return e && e[0] ? uint32_t(std::atoi(e)) : 0u; }();
+        if (il_fill_l >= 1u) ip.gflags |= (std::min<uint32_t>(il_fill_l, 6u) << 1u);
+        if (il_switch("NR_IL_PULL_BIL")) ip.gflags |= 65536u;
+        if (il_switch("NR_IL_FILL_SMOOTH")) ip.gflags |= 16384u;
+        if (il_switch("NR_IL_FILL_ONE")) ip.gflags |= 256u;
+        static const bool il_fill_input = [] { const char* e = std::getenv("NR_IL_FILL_INPUT"); return e && e[0] ? e[0] != '0' : false; }();
+        if (!il_fill_input) ip.gflags |= 16u;
+    }
     ip.k0 = 0.02f; ip.k1 = 0.06f;   // the box test's range (the RenoDX-style stage's default)
     ip.dbase[0] = f.depth_rect.x; ip.dbase[1] = f.depth_rect.y;
     ip.dgrid[0] = depth ? std::max(f.depth_rect.width, 1u) : 1u; ip.dgrid[1] = depth ? std::max(f.depth_rect.height, 1u) : 1u;

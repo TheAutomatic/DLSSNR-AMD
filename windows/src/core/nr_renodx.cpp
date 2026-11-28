@@ -635,7 +635,7 @@ struct Stage::Impl {
     bool il_depth_const = false;   // (il_depth[il_dcur] holds the constant nearness of a frame without the game's depth)
     Stage::NetworkMotion network_motion;   // what Stage::network_motion() reports inside a Network call
     void ensure_il(VkCommandBuffer cmd, uint32_t nw, uint32_t nh, uint32_t slots, uint32_t preset) {
-        if (preset == 1u) { if (!programs[kIl0].pipeline) load(programs[kIl0], "il0", 96, 0x3Bu); }
+        if (preset == 1u) { if (!programs[kIl0].pipeline) load(programs[kIl0], "il0", 100, 0x3Bu); }
         else if (!programs[kIl].pipeline) load(programs[kIl], "il", 96, 0x7Bu);
         if (!programs[kIlPp].pipeline) load(programs[kIlPp], "il_pp", 28);
         if (!programs[kIlMv].pipeline) load(programs[kIlMv], "il_mv", 44);
@@ -675,7 +675,7 @@ struct Stage::Impl {
     void ensure_il_ga(P program) {
         if (programs[program].pipeline) return;
         if (program == kIlGa) load(programs[kIlGa], "il_ga", 96, 0x7Bu);
-        else load(programs[kIl0Ga], "il0_ga", 96, 0x3Bu);
+        else load(programs[kIl0Ga], "il0_ga", 100, 0x3Bu);
     }
     void retire_il() {
         retire(il_base); retire(il_base2); retire(il_trust); retire(il_tdbg); retire(il_comp); retire(il_hist);
@@ -2121,10 +2121,10 @@ uint32_t Stage::record_impl(VkCommandBuffer cmd, const StageFrame& fr, const Net
                                      to_general ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : fr.depth.after_stage, 0, 0, nullptr, 0, nullptr, 1, &b);
             };
             struct { uint32_t size[2], mbase[2], mgrid[2]; float mscale[2]; uint32_t mode, slot, n, flags; float k0, k1; uint32_t dbase[2], dgrid[2];
-                     uint32_t styles; float pad0; float inten[4]; } ip{
+                     uint32_t styles; float pad0; float inten[4]; uint32_t gflags; } ip{
                 {NW, NH}, {mv_base[0], mv_base[1]}, {fr.motion.width, fr.motion.height}, {mv_scale[0], mv_scale[1]}, 0u, 0u, il_n, 0u,
                 il_judge.second.first, il_judge.second.second, {fr.depth_x, fr.depth_y}, {fr.depth.width ? fr.depth.width : 1u, fr.depth.height ? fr.depth.height : 1u},
-                0u, 0.f, {1.f, 1.f, 1.f, 1.f}};
+                0u, 0.f, {1.f, 1.f, 1.f, 1.f}, 0u};
             // Each pass's Intensity and Style as the session gives them (pass_controls: pass 1's, or the pass's own once its
             // "Same as pass 1" is off; the Intensity always the pass's own). Not plain (a Style, an Intensity other than 1):
             // the slots' networks run plain and the stage composes - the slots' histories must be the network's own
@@ -2166,6 +2166,30 @@ uint32_t Stage::record_impl(VkCommandBuffer cmd, const StageFrame& fr, const Net
             static const bool il_edge = il_switch("NR_IL_EDGE");
             // The fill takes from what lies at the hole's depth (a depth pyramid, joint bilateral; NR_IL_DFILL=0: from all around)
             static const bool il_dfill = il_switch("NR_IL_DFILL");
+            // The fill's shape (gflags, the push block's tail, 16 B more than 0.1.0's block: 100 B). FILL_L the deepest level
+            // the fill may reach (0 the pyramid's own six); FILL_ONE one level only; PULL_BIL the top level from its four
+            // texels weighted; FILL_SMOOTH the 3 x 3 guard; FILL_INPUT=0 keeps the network's own input on the slots' own
+            // moved increments (gflags 16) - the fill shows in the composite, not in the network's input.
+            static const uint32_t il_fill_l = [] { const char* e = std::getenv("NR_IL_FILL_L"); return e && e[0] ? uint32_t(std::atoi(e)) : 0u; }();
+            static const bool il_pull_bil = il_switch("NR_IL_PULL_BIL");
+            static const bool il_fill_smooth = il_switch("NR_IL_FILL_SMOOTH");
+            static const bool il_fill_one = il_switch("NR_IL_FILL_ONE");
+            static const bool il_fill_input = [] { const char* e = std::getenv("NR_IL_FILL_INPUT"); return e && e[0] ? e[0] != '0' : false; }();
+            if (il_fill_l >= 1u) ip.gflags |= (std::min<uint32_t>(il_fill_l, 6u) << 1u);
+            if (il_pull_bil) ip.gflags |= 65536u;
+            if (il_fill_smooth) ip.gflags |= 16384u;
+            if (il_fill_one) ip.gflags |= 256u;
+            if (!il_fill_input) ip.gflags |= 16u;
+            {
+                static bool il_fill_said = false;
+                if (!il_fill_said) {
+                    il_fill_said = true;
+                    nr::logf("[nr] RenoDX stage: Interleaved's fill: FILL=%d DFILL=%d, level %u at most, top %s, one level %s, input %s, smooth %s",
+                             il_fill ? 1 : 0, il_dfill ? 1 : 0, il_fill_l ? std::min<uint32_t>(il_fill_l, 6u) : 6u,
+                             il_pull_bil ? "weighted (four texels)" : "nearest texel",
+                             il_fill_one ? "only" : "blended", il_fill_input ? "filled" : "own", il_fill_smooth ? "on" : "off");
+                }
+            }
             // NR_IL_DEBUG (research): 1 the moved increments not used shown red, 2 each test in its colour, 3 the game's depth
             static const uint32_t il_debug = [] { const char* e = std::getenv("NR_IL_DEBUG"); return e && e[0] ? uint32_t(std::atoi(e)) : 0u; }();
             // the network's input: this frame's Base image, where steps 0 / 4 put the slot's input (the proxy kept)

@@ -1124,13 +1124,37 @@ struct Stage::Impl {
             il_docc_said = int(s.fast_interleaved_depth_disocclusion);
             nr::pe::log("[nr] RenoDX stage (D3D12): Interleaved depth disocclusion check %s", il_docc_said ? "on" : "off");
         }
+        // The fill's shape travels in gflags, the push block's tail (nr_renodx.cpp's il block: the same keys, the same
+        // defaults - the anti-ghost set on, so one level, weighted top, smooth, and the network's input on the slots' own
+        // moved increments). FILL_L bits 1..3, PULL_BIL 65536, FILL_SMOOTH 16384, FILL_ONE 256, FILL_INPUT=0 bit 16.
+        static const bool il_ag = [] { const char* e = std::getenv("NR_IL_ANTIGHOST"); return !(e && e[0] == '0'); }();
+        const auto il_switch = [](const char* name) { const char* e = std::getenv(name); return e && e[0] ? e[0] != '0' : il_ag; };
+        static const uint32_t il_fill_l = [] { const char* e = std::getenv("NR_IL_FILL_L"); return e && e[0] ? uint32_t(std::atoi(e)) : 0u; }();
+        static const bool il_pull_bil = il_switch("NR_IL_PULL_BIL");
+        static const bool il_fill_smooth = il_switch("NR_IL_FILL_SMOOTH");
+        static const bool il_fill_one = il_switch("NR_IL_FILL_ONE");
+        static const bool il_fill_input = [] { const char* e = std::getenv("NR_IL_FILL_INPUT"); return e && e[0] ? e[0] != '0' : false; }();
+        uint32_t gflags = 0u;
+        if (il_fill_l >= 1u) gflags |= (std::min<uint32_t>(il_fill_l, 6u) << 1u);
+        if (il_pull_bil) gflags |= 65536u;
+        if (il_fill_smooth) gflags |= 16384u;
+        if (il_fill_one) gflags |= 256u;
+        if (!il_fill_input) gflags |= 16u;
+        static bool il_fill_said = false;
+        if (!il_fill_said) {
+            il_fill_said = true;
+            nr::pe::log("[nr] RenoDX stage (D3D12): Interleaved's fill: FILL=1 DFILL=%d, level %u at most, top %s, one level %s, input %s, smooth %s",
+                        depth ? 1 : 0, il_fill_l ? std::min<uint32_t>(il_fill_l, 6u) : 6u,
+                        il_pull_bil ? "weighted (four texels)" : "nearest texel",
+                        il_fill_one ? "only" : "blended", il_fill_input ? "filled" : "own", il_fill_smooth ? "on" : "off");
+        }
         struct { uint32_t size[2], mbase[2], mgrid[2]; float mscale[2]; uint32_t mode, slot, n, flags; float k0, k1;
-                 uint32_t dbase[2], dgrid[2]; uint32_t styles; float pad0; float inten[4]; } ip{
+                 uint32_t dbase[2], dgrid[2]; uint32_t styles; float pad0; float inten[4]; uint32_t gflags; } ip{
             {NW, NH}, {motion_direct ? m_rx : 0u, motion_direct ? m_ry : 0u},
             {motion_direct ? m_rw : f.motion_w, motion_direct ? m_rh : f.motion_h},
             {f.motion_scale_x * s.mvec_scale_x * float(NW), f.motion_scale_y * s.mvec_scale_y * float(NH)}, 0u, 0u, n, 0u,
-            0.02f, 0.06f, {f.depth_x, f.depth_y}, {dw, dh}, 0u, 0.f, {1.f, 1.f, 1.f, 1.f}};
-        static_assert(sizeof ip == 96, "il's push block");
+            0.02f, 0.06f, {f.depth_x, f.depth_y}, {dw, dh}, 0u, 0.f, {1.f, 1.f, 1.f, 1.f}, gflags};
+        static_assert(sizeof ip == 100, "il's push block");
         // Each pass's Intensity and Style (pass_controls); not plain: the slots' networks run plain and il composes
         bool graded = false;
         for (uint32_t k = 0; k < 4; ++k) {
@@ -1195,7 +1219,7 @@ struct Stage::Impl {
             for (const auto& x : b) {
                 if (d3d12_il::has_binding(k, x.binding, x.write)) used.push_back(x);
             }
-            dispatch_il(cmd, k, used, &ip, 24u, nx, ny);
+            dispatch_il(cmd, k, used, &ip, 25u, nx, ny);
         };
         const auto pyramid = [&] {
             uint32_t sw = NW, sh = NH;
