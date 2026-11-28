@@ -855,6 +855,10 @@ bool ensure_mirror(ID3D12Device* device, ID3D12Resource*& tex, D3D12_RESOURCE_ST
     return true;
 }
 
+bool rect_fits(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint64_t tw, uint32_t th) {
+    return w && h && x < tw && y < th && w <= tw - x && h <= th - y;
+}
+
 void copy_region(ID3D12GraphicsCommandList* cmd, ID3D12Resource* dst, uint32_t dx, uint32_t dy, ID3D12Resource* src,
                  uint32_t sx, uint32_t sy, uint32_t w, uint32_t h) {
     D3D12_TEXTURE_COPY_LOCATION d{}, s{};
@@ -895,10 +899,7 @@ bool read_frame(const NVSDK_NGX_Parameter* p, const Tracked& t, Frame& f) {
     f.color_x = get_uint(p, "DLSS.Input.Color.Subrect.Base.X");
     f.color_y = get_uint(p, "DLSS.Input.Color.Subrect.Base.Y");
     const uint32_t cw = uint32_t(cd.Width), ch = cd.Height;
-    if (!cw || !ch || !f.render_w || !f.render_h ||
-        f.color_x >= cw || f.color_y >= ch ||
-        f.render_w > cw - f.color_x || f.render_h > ch - f.color_y)
-        return false;
+    if (!cw || !ch) return false;
     // (the output's base only where the create turned output subrects on, as OptiScaler places it; create not seen: given)
     f.out_x = t.create.out_subrects != 0 ? get_uint(p, "DLSS.Output.Subrect.Base.X") : 0;
     f.out_y = t.create.out_subrects != 0 ? get_uint(p, "DLSS.Output.Subrect.Base.Y") : 0;
@@ -5102,13 +5103,18 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_evaluate(ID3D12GraphicsCommandList* cmd, const 
         // extent at origin 0.
         const uint32_t rx = before_renodx ? f.color_x : 0u, ry = before_renodx ? f.color_y : 0u;
         const uint32_t rw = before_renodx ? f.render_w : w2_aw, rh = before_renodx ? f.render_h : w2_ah;
-        const DXGI_FORMAT format = f.color->GetDesc().Format;
+        const D3D12_RESOURCE_DESC cdesc = f.color->GetDesc();
+        const DXGI_FORMAT format = cdesc.Format;
+        if (!rect_fits(rx, ry, rw, rh, cdesc.Width, cdesc.Height)) {
+            guard.unlock();
+            r = real_evaluate(cmd, h, p, callback);
+            goto after_layers;
+        }
         // The first layer, a RenoDX one, reads the game's colour where it is and stores its answer into the mirror
         // handed to the upscaler - no copy of the colour's region, no copy of the colour into the mirror, no copy of the
         // region back (three render-size copies; t.copy not needed). Where the region is the whole colour and nothing
         // reads the frame before that layer (no comparison, no held frame). NR_BEFORE_DIRECT=0: as before.
         static const bool before_direct_off = [] { const char* e = std::getenv("NR_BEFORE_DIRECT"); return e && e[0] == '0'; }();
-        const D3D12_RESOURCE_DESC cdesc = f.color->GetDesc();
         size_t ia0 = 0, ib0 = 0;
         const bool before_direct = !before_direct_off && before.front()->cfg.processing == nr::pe::Processing::kRenoDX &&
             rx == 0 && ry == 0 && uint64_t(rw) == cdesc.Width && rh == cdesc.Height &&
@@ -6228,6 +6234,7 @@ bool copy_in(VkCommandBuffer cmd, const NVSDK_NGX_Resource_VK* r, VkImageLayout 
              uint32_t sx, uint32_t sy, uint32_t w, uint32_t h, OwnImage& dst, VkImageLayout dst_end, bool wide = false,
              bool written = false) {
     const auto& v = r->Resource.ImageViewInfo;
+    if (!rect_fits(sx, sy, w, h, v.Width, v.Height)) return false;
     const VkFormat format = VkFormat(v.Format);
     const VkImage game = reinterpret_cast<VkImage>(v.Image);
     const bool depth = depth_format(format);
@@ -6867,10 +6874,7 @@ bool read_frame_dims(const NVSDK_NGX_Parameter* p, VkFrame& f, const CreateSizes
         evaluate_render_size(p, create, ci.Width, ci.Height, &f.render_w, &f.render_h);
     f.color_x = get_uint(p, "DLSS.Input.Color.Subrect.Base.X");
     f.color_y = get_uint(p, "DLSS.Input.Color.Subrect.Base.Y");
-    if (!ci.Width || !ci.Height || !f.render_w || !f.render_h ||
-        f.color_x >= ci.Width || f.color_y >= ci.Height ||
-        f.render_w > ci.Width - f.color_x || f.render_h > ci.Height - f.color_y)
-        return false;
+    if (!ci.Width || !ci.Height) return false;
     f.out_x = create.out_subrects != 0 ? get_uint(p, "DLSS.Output.Subrect.Base.X") : 0;   // (as read_frame)
     f.out_y = create.out_subrects != 0 ? get_uint(p, "DLSS.Output.Subrect.Base.Y") : 0;
     output_size(p, create, oi.Width, oi.Height, &f.out_w, &f.out_h);
@@ -10008,28 +10012,30 @@ NVSDK_NGX_Result NR_NGX_MSABI hk_d11_evaluate(ID3D11DeviceContext* ctx, const NV
             src->GetDesc(&cd);
             src->Release();
         }
-        D3D11_TEXTURE2D_DESC have{};
-        if (t.copy) t.copy->GetDesc(&have);
         const DXGI_FORMAT copy_fmt = writable(cd.Format);
-        if (!t.copy || have.Format != copy_fmt || have.Width != rw || have.Height != rh) {
-            retire_texture(t.copy);
-            D3D11_TEXTURE2D_DESC d{};
-            d.Width = rw; d.Height = rh; d.MipLevels = 1; d.ArraySize = 1; d.Format = copy_fmt;
-            d.SampleDesc.Count = 1; d.Usage = D3D11_USAGE_DEFAULT;
-            d.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
-            if (!copy_fmt || FAILED(g_d11.device->CreateTexture2D(&d, nullptr, &t.copy))) {
-                t.copy = nullptr;
-                static bool said = false;
-                if (!said) { said = true; log("[nr] D3D11 route: the colour's copy (DXGI format %d) could not be made; NR "
-                                              "before the upscaler does not run", int(copy_fmt)); }
-            }
-        }
         D11Image copy;
         VkCommandBuffer cmd = VK_NULL_HANDLE;
-        if (t.copy && d11_image(t.copy, copy)) {
-            const D3D11_BOX box{rx, ry, 0, rx + rw, ry + rh, 1};
-            ctx->CopySubresourceRegion(t.copy, 0, 0, 0, 0, colour.res, 0, &box);
-            cmd = d11_begin();
+        if (rect_fits(rx, ry, rw, rh, cd.Width, cd.Height)) {
+            D3D11_TEXTURE2D_DESC have{};
+            if (t.copy) t.copy->GetDesc(&have);
+            if (!t.copy || have.Format != copy_fmt || have.Width != rw || have.Height != rh) {
+                retire_texture(t.copy);
+                D3D11_TEXTURE2D_DESC d{};
+                d.Width = rw; d.Height = rh; d.MipLevels = 1; d.ArraySize = 1; d.Format = copy_fmt;
+                d.SampleDesc.Count = 1; d.Usage = D3D11_USAGE_DEFAULT;
+                d.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+                if (!copy_fmt || FAILED(g_d11.device->CreateTexture2D(&d, nullptr, &t.copy))) {
+                    t.copy = nullptr;
+                    static bool said = false;
+                    if (!said) { said = true; log("[nr] D3D11 route: the colour's copy (DXGI format %d) could not be made; NR "
+                                                  "before the upscaler does not run", int(copy_fmt)); }
+                }
+            }
+            if (t.copy && d11_image(t.copy, copy)) {
+                const D3D11_BOX box{rx, ry, 0, rx + rw, ry + rh, 1};
+                ctx->CopySubresourceRegion(t.copy, 0, 0, 0, 0, colour.res, 0, &box);
+                cmd = d11_begin();
+            }
         }
         if (cmd) {
             nr::gpu::Scope recording(nr::gpu::recording(cmd));
